@@ -499,11 +499,30 @@ static int make_config(const char *binary_root, const char *guest, const char *a
         cursor = copy;
         while (cursor != NULL) {
             char *next = strchr(cursor, ';'), *equals = strchr(cursor, '=');
+            char isolated_cache[1024];
+            const char *option_value;
             int option;
             if (next != NULL) *next++ = 0;
             if (equals == NULL) return 1;
             *equals++ = 0;
-            option = config_option(&wire, cursor, equals);
+            option_value = equals;
+            /*
+             * Translation runs in the macOS engine, so HL_PCACHE_DIR is a
+             * host path rather than a guest path covered by the per-case
+             * /tmp volume below.  A literal /tmp path in a manifest otherwise
+             * collides across parallel runners and can consume stale code
+             * from another build.  Keep the manifest as the opt-in signal,
+             * but always isolate its storage inside this case's unique host
+             * scratch directory.
+             */
+            if (scratch != NULL && strcmp(cursor, "HL_PCACHE_DIR") == 0) {
+                if (snprintf(isolated_cache, sizeof isolated_cache, "%s/pcache", scratch) >=
+                        (int)sizeof isolated_cache ||
+                    mkdir(isolated_cache, 0700) != 0)
+                    return 1;
+                option_value = isolated_cache;
+            }
+            option = config_option(&wire, cursor, option_value);
             if (option == 1 || (option == 2 && strncmp(cursor, "HL_", 3) == 0)) return 1;
             if (option == 2) {
                 size_t record = strlen(cursor) + 1 + strlen(equals);

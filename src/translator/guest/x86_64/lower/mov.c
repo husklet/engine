@@ -39,9 +39,10 @@ int hl_x86_lower_mov(struct insn *I, uint64_t next, const hl_x86_move_image *ima
         int w = op == 0xC6 ? 1 : I->opsize;
         if (I->is_mem) {
             emit_ea(I, next);
-            emit_bus_guard(17, (uint64_t)w, next - (uint64_t)I->len);
+            emit_memory_guard(17, (uint64_t)w, next - (uint64_t)I->len, X86_SOFT_WRITE);
             e_movconst(16, (uint64_t)I->imm);
             e_store(w, 16, 17);
+            emit_soft_store_commit((uint64_t)w);
         } else if (op == 0xC7 && I->opsize == 2) { // mov r16, imm16: PRESERVE bits 63:16
             e_movconst(16, (uint64_t)(uint16_t)I->imm);
             e_bfi(I->rm_reg, 16, 0, 16, 1);
@@ -67,7 +68,7 @@ int hl_x86_lower_mov(struct insn *I, uint64_t next, const hl_x86_move_image *ima
         I->m_hasbase = I->m_hasindex = I->rip_rel = 0;
         I->disp = I->imm; // absolute address (already addr-size sized by the decoder)
         emit_ea(I, next); // x17 = host address (seg base + non-PIE bias applied)
-        emit_bus_guard(17, (uint64_t)w, next - (uint64_t)I->len);
+        emit_memory_guard(17, (uint64_t)w, next - (uint64_t)I->len, load ? X86_SOFT_READ : X86_SOFT_WRITE);
         if (load) {
             if (w == 1) {
                 e_load(1, 16, 17);
@@ -80,6 +81,7 @@ int hl_x86_lower_mov(struct insn *I, uint64_t next, const hl_x86_move_image *ima
         } else {
             int sv = (w == 1) ? byte_val(I, 0, 16) : 0; // byte src = AL; else RAX
             e_store(w, sv, 17);
+            emit_soft_store_commit((uint64_t)w);
         }
         return TX_NEXT;
     }
@@ -90,15 +92,30 @@ int hl_x86_lower_mov(struct insn *I, uint64_t next, const hl_x86_move_image *ima
         if (I->is_mem) {
             if (to_reg) {     // mov reg, [mem]  -- folded into one ldr when [base+disp]
                 if (w == 1) { // byte dest: ah/bh/ch/dh -> bits 8-15; lo8 preserves upper
-                    emit_load_mem(I, next, 1, 16);
+                    if (emit_soft_memory_active()) {
+                        emit_ea(I, next);
+                        emit_memory_guard(17, 1, next - (uint64_t)I->len, X86_SOFT_READ);
+                        e_load(1, 16, 17);
+                    } else
+                        emit_load_mem(I, next, 1, 16);
                     byte_wb(I, I->reg, 16);
-                } else if (w == 2) {               // mov r16, m16: PRESERVE bits 63:16 (a 16-bit
-                    emit_load_mem(I, next, 2, 16); // write never zero-extends, unlike 32-bit)
+                } else if (w == 2) { // mov r16, m16: PRESERVE bits 63:16 (a 16-bit
+                    if (emit_soft_memory_active()) {
+                        emit_ea(I, next);
+                        emit_memory_guard(17, 2, next - (uint64_t)I->len, X86_SOFT_READ);
+                        e_load(2, 16, 17);
+                    } else
+                        emit_load_mem(I, next, 2, 16); // write never zero-extends, unlike 32-bit)
                     e_bfi(I->reg, 16, 0, 16, 1);
+                } else if (emit_soft_memory_active()) {
+                    emit_ea(I, next);
+                    emit_memory_guard(17, (uint64_t)w, next - (uint64_t)I->len, X86_SOFT_READ);
+                    e_load(w, I->reg, 17);
                 } else
                     emit_load_mem(I, next, w, I->reg);
             } else { // mov [mem], reg  -- folded into one str when [base+disp]
                 int rn, off, f = ea_imm_fold(I, w, &rn, &off);
+                if (emit_soft_memory_active()) f = 0;
                 if (f) {
                     int sv = (w == 1) ? byte_val(I, I->reg, 16) : I->reg;
                     if (f == 1)
@@ -107,9 +124,10 @@ int hl_x86_lower_mov(struct insn *I, uint64_t next, const hl_x86_move_image *ima
                         e_stur(w, sv, rn, off);
                 } else {
                     emit_ea(I, next); // may clobber x16
-                    emit_bus_guard(17, (uint64_t)w, next - (uint64_t)I->len);
+                    emit_memory_guard(17, (uint64_t)w, next - (uint64_t)I->len, X86_SOFT_WRITE);
                     int sv = (w == 1) ? byte_val(I, I->reg, 16) : I->reg; // byte src: ah/bh/ch/dh -> bits 8-15
                     e_store(w, sv, 17);
+                    emit_soft_store_commit((uint64_t)w);
                 }
             }
         } else if (w == 1) {
@@ -206,18 +224,29 @@ int hl_x86_lower_mov(struct insn *I, uint64_t next, const hl_x86_move_image *ima
     if (op >= 0x50 && op <= 0x57) {
         int r = (op - 0x50) | (I->rexB << 3);
         int w = (I->opsize == 2) ? 2 : 8;
-        e_subi(4, 4, w, 1);
-        e_store(w, r, 4);
+        if (emit_soft_memory_active()) {
+            e_subi(17, 4, (unsigned)w, 1);
+            emit_memory_guard(17, (uint64_t)w, next - (uint64_t)I->len, X86_SOFT_WRITE);
+            e_subi(4, 4, (unsigned)w, 1);
+            e_store(w, r, 17);
+        } else {
+            e_subi(4, 4, (unsigned)w, 1);
+            e_store(w, r, 4);
+        }
         return TX_NEXT;
     } // push
     if (op >= 0x58 && op <= 0x5F) {
         int r = (op - 0x58) | (I->rexB << 3);
+        if (emit_soft_memory_active()) {
+            e_mov_rr(17, 4, 1);
+            emit_memory_guard(17, I->opsize == 2 ? 2u : 8u, next - (uint64_t)I->len, X86_SOFT_READ);
+        }
         if (I->opsize == 2) { // pop r16: writes only bits 15:0, RSP += 2
-            e_load(2, 16, 4);
+            e_load(2, 16, emit_soft_memory_active() ? 17 : 4);
             e_bfi(r, 16, 0, 16, 1);
             e_addi(4, 4, 2, 1);
         } else {
-            e_load(8, r, 4);
+            e_load(8, r, emit_soft_memory_active() ? 17 : 4);
             e_addi(4, 4, 8, 1);
         }
         return TX_NEXT;

@@ -1,4 +1,4 @@
-#include "../../src/core/provider_namespace.h"
+#include "../../src/core/provider/namespace.h"
 #include "test.h"
 
 #include <errno.h>

@@ -165,13 +165,12 @@ static long seccomp_install_filter(uint64_t fprog_ptr, uint32_t flags) {
     // NEW_LISTENER would have us return a userspace-notification fd and run a supervisor protocol we do not
     // implement; reject it honestly rather than hand back a listener that never delivers notifications.
     if (flags & HL_LINUX_SECCOMP_FILTER_FLAG_NEW_LISTENER) return -EINVAL;
-    if (!fprog_ptr || !host_range_mapped((uintptr_t)fprog_ptr, 16)) return -EFAULT;
-
     // struct sock_fprog on LP64: u16 len at +0, 8-byte filter pointer at +8.
     uint16_t len;
     uint64_t insn_ptr;
-    memcpy(&len, (const void *)(uintptr_t)fprog_ptr, sizeof len);
-    memcpy(&insn_ptr, (const void *)(uintptr_t)(fprog_ptr + 8), sizeof insn_ptr);
+    if (guest_copy_from(&len, fprog_ptr, sizeof len) != sizeof len ||
+        guest_copy_from(&insn_ptr, fprog_ptr + 8, sizeof insn_ptr) != sizeof insn_ptr)
+        return -EFAULT;
     /* sock_fprog contains a second guest pointer.  Static ET_EXEC guests may
      * embed its low link address even after the outer syscall argument was
      * rebased, so translate the nested pointer by the same image model. */
@@ -179,14 +178,10 @@ static long seccomp_install_filter(uint64_t fprog_ptr, uint32_t flags) {
     if (len == 0 || len > HL_LINUX_BPF_MAXINSNS) return -EINVAL;
     if (!insn_ptr) return -EFAULT;
     size_t bytes = (size_t)len * sizeof(struct hl_linux_sock_filter);
-    if (!host_range_mapped((uintptr_t)insn_ptr, bytes)) return -EFAULT;
-
     // Linux copies and validates the user program before checking installation
     // authority.  Consequently an unreadable program is EFAULT even when the
     // caller also lacks CAP_SYS_ADMIN/no_new_privs (LTP prctl02).  Keeping this
     // ordering also guarantees no guest pointer reaches memcpy unchecked.
-    if (!g_nnp && !(g_cap_eff & (1ull << CAP_SYS_ADMIN))) return -EACCES;
-
     struct hl_linux_bpf_filter *node = (struct hl_linux_bpf_filter *)malloc(sizeof *node);
     if (!node) return -ENOMEM;
     node->insns = (struct hl_linux_sock_filter *)malloc(bytes);
@@ -194,7 +189,16 @@ static long seccomp_install_filter(uint64_t fprog_ptr, uint32_t flags) {
         free(node);
         return -ENOMEM;
     }
-    memcpy(node->insns, (const void *)(uintptr_t)insn_ptr, bytes);
+    if (guest_copy_from(node->insns, insn_ptr, bytes) != (ssize_t)bytes) {
+        free(node->insns);
+        free(node);
+        return -EFAULT;
+    }
+    if (!g_nnp && !(g_cap_eff & (1ull << CAP_SYS_ADMIN))) {
+        free(node->insns);
+        free(node);
+        return -EACCES;
+    }
     node->len = len;
     node->prev = t_seccomp_filters;
     t_seccomp_filters = node;
@@ -212,9 +216,8 @@ static long seccomp_install_filter(uint64_t fprog_ptr, uint32_t flags) {
 // action support saw the whole seccomp facility as broken.
 static long seccomp_get_action_avail(uint64_t flags, uint64_t act_ptr) {
     if (flags) return -EINVAL;
-    if (!act_ptr || !host_range_mapped((uintptr_t)act_ptr, sizeof(uint32_t))) return -EFAULT;
     uint32_t action;
-    memcpy(&action, (const void *)(uintptr_t)act_ptr, sizeof action);
+    if (guest_copy_from(&action, act_ptr, sizeof action) != sizeof action) return -EFAULT;
     switch (action) {
     case HL_LINUX_SECCOMP_RET_KILL_PROCESS:
     case HL_LINUX_SECCOMP_RET_KILL_THREAD:
@@ -235,9 +238,8 @@ static long seccomp_get_action_avail(uint64_t flags, uint64_t act_ptr) {
 // Linux rather than see -EINVAL. seccomp_data is our own 64-byte struct; notif/resp mirror the kernel ABI.
 static long seccomp_get_notif_sizes(uint64_t flags, uint64_t sz_ptr) {
     if (flags) return -EINVAL;
-    if (!sz_ptr || !host_range_mapped((uintptr_t)sz_ptr, 3 * sizeof(uint16_t))) return -EFAULT;
     uint16_t sizes[3] = {80 /*seccomp_notif*/, 24 /*seccomp_notif_resp*/,
                          (uint16_t)sizeof(struct hl_linux_seccomp_data) /*seccomp_data = 64*/};
-    memcpy((void *)(uintptr_t)sz_ptr, sizes, sizeof sizes);
+    if (guest_copy_to(sz_ptr, sizes, sizeof sizes) != sizeof sizes) return -EFAULT;
     return 0;
 }

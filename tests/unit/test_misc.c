@@ -11,9 +11,18 @@ typedef struct fixture {
     uint8_t random_byte;
 } fixture;
 
-static int mapped(void *context, uintptr_t address, size_t size) {
+static ssize_t copy_from(void *context, void *destination, uint64_t source, size_t size) {
     fixture *state = context;
-    return state->allow_mapping && (address != 0 || size == 0);
+    if (!state->allow_mapping || (!source && size)) return -EFAULT;
+    memcpy(destination, (const void *)(uintptr_t)source, size);
+    return (ssize_t)size;
+}
+
+static ssize_t copy_to(void *context, uint64_t destination, const void *source, size_t size) {
+    fixture *state = context;
+    if (!state->allow_mapping || (!destination && size)) return -EFAULT;
+    memcpy((void *)(uintptr_t)destination, source, size);
+    return (ssize_t)size;
 }
 
 static void random_bytes(void *context, void *output, size_t size) {
@@ -37,7 +46,8 @@ int main(void) {
         .memory_used = 256,
         .process_count = 64,
         .machine = "aarch64",
-        .mapped = mapped,
+        .copy_from = copy_from,
+        .copy_to = copy_to,
         .random = random_bytes,
         .callback_context = &state,
     };

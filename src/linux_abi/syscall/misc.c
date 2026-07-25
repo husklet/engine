@@ -9,17 +9,16 @@ int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, cons
     uint64_t size = arguments[1];
     switch (number) {
     case 160: {
-        char *output = (char *)(uintptr_t)address;
-        if (!context->mapped(context->callback_context, (uintptr_t)address, 6 * 65)) {
-            *guest_result = -EFAULT;
-            break;
-        }
-        memset(output, 0, 6 * 65);
+        char output[6 * 65] = {0};
         strcpy(output, "Linux");
         strcpy(output + 65, context->hostname[0] ? context->hostname : "jit");
         strcpy(output + 130, "6.1.0");
         strcpy(output + 195, "#1 jit");
         strcpy(output + 260, context->machine);
+        if (context->copy_to(context->callback_context, address, output, sizeof output) != sizeof output) {
+            *guest_result = -EFAULT;
+            break;
+        }
         *guest_result = 0;
         break;
     }
@@ -27,11 +26,12 @@ int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, cons
         int length = (int)size;
         if (length > 64) length = 64;
         if (length > 0) {
-            if (!context->mapped(context->callback_context, (uintptr_t)address, (size_t)length)) {
+            char hostname[64];
+            if (context->copy_from(context->callback_context, hostname, address, (size_t)length) != length) {
                 *guest_result = -EFAULT;
                 break;
             }
-            memcpy(context->hostname, (const void *)(uintptr_t)address, (size_t)length);
+            memcpy(context->hostname, hostname, (size_t)length);
             context->hostname[length < (int)context->hostname_capacity ? length : (int)context->hostname_capacity - 1] =
                 0;
         }
@@ -40,14 +40,9 @@ int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, cons
     }
     case 162: *guest_result = 0; break;
     case 179: {
-        char *output = (char *)(uintptr_t)address;
+        unsigned char output[112] = {0};
         uint64_t total;
         uint64_t free_memory;
-        if (!context->mapped(context->callback_context, (uintptr_t)address, 112)) {
-            *guest_result = -EFAULT;
-            break;
-        }
-        memset(output, 0, 112);
         // totalram MUST agree with /proc/meminfo MemTotal and /sys/fs/cgroup/memory.max: a cgroup memory cap
         // wins; otherwise report the host RAM total (the same figure vfs.c serves to MemTotal). The old
         // hardcoded 8 GiB disagreed with /proc/meminfo whenever the container was unconstrained, so a runtime
@@ -71,6 +66,10 @@ int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, cons
         memcpy(output + 40, &free_memory, sizeof(free_memory));
         memcpy(output + 80, &procs, sizeof(uint16_t));
         memcpy(output + 104, &(uint32_t){1}, sizeof(uint32_t));
+        if (context->copy_to(context->callback_context, address, output, sizeof output) != sizeof output) {
+            *guest_result = -EFAULT;
+            break;
+        }
         *guest_result = 0;
         break;
     }
@@ -83,12 +82,19 @@ int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, cons
             *guest_result = -EINVAL;
             break;
         }
-        if (!context->mapped(context->callback_context, (uintptr_t)address, (size_t)size)) {
-            *guest_result = -EFAULT;
-            break;
+        unsigned char random[4096];
+        uint64_t done = 0;
+        while (done < size) {
+            size_t chunk = size - done < sizeof random ? (size_t)(size - done) : sizeof random;
+            context->random(context->callback_context, random, chunk);
+            ssize_t copied = context->copy_to(context->callback_context, address + done, random, chunk);
+            if (copied != (ssize_t)chunk) {
+                *guest_result = done || copied > 0 ? (int64_t)(done + (copied > 0 ? (uint64_t)copied : 0)) : -EFAULT;
+                break;
+            }
+            done += chunk;
         }
-        context->random(context->callback_context, (void *)(uintptr_t)address, (size_t)size);
-        *guest_result = (int64_t)size;
+        if (done == size) *guest_result = (int64_t)done;
         break;
     }
     case 293: *guest_result = -ENOSYS; break;

@@ -29,6 +29,45 @@ static void bus_end(void *p) {
 
 static const hl_guest_bus_ops bus_ops = {bus_activate, bus_begin, bus_end};
 static hl_target_bus g_target_bus;
+static _Atomic int g_guest_soft_active;
+
+static int jit_guest_soft_activate(void) {
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(&g_guest_soft_active, &expected, 1,
+                                                 memory_order_acq_rel, memory_order_acquire))
+        return 1;
+    /* Publish the translation gate before flushing: every block admitted
+       after the synchronous rotation contains soft guards. */
+    if (bus_activate(NULL)) return 1;
+    atomic_store_explicit(&g_guest_soft_active, 0, memory_order_release);
+    return 0;
+}
+
+/* Restore runs before any saved guest thread can execute and, for the init
+ * process, before a dispatcher CPU is registered.  There is therefore no old
+ * translation to flush; publish the gate directly so the first restored block
+ * is compiled with logical-memory guards. */
+static void jit_guest_soft_restore_activate(void) {
+    atomic_store_explicit(&g_guest_soft_active, 1, memory_order_release);
+}
+
+static void jit_guest_soft_restore_deactivate(void) {
+    atomic_store_explicit(&g_guest_soft_active, 0, memory_order_release);
+}
+
+static void jit_guest_soft_deactivate(void) {
+    int expected = 1;
+    if (!atomic_compare_exchange_strong_explicit(&g_guest_soft_active, &expected, 0,
+                                                 memory_order_acq_rel, memory_order_acquire))
+        return;
+    /* Existing guarded blocks remain correct while the flush runs; misses
+       resolve identity after the logical snapshot became empty. */
+    (void)bus_activate(NULL);
+}
+
+static int jit_guest_soft_active(void) {
+    return atomic_load_explicit(&g_guest_soft_active, memory_order_acquire);
+}
 
 void jit_guest_bus_changed(void *opaque, uint64_t generation, int active) {
     (void)opaque;
@@ -136,7 +175,10 @@ __attribute__((naked)) static void block_return(void) {
 #endif
 // Post-translate chaining. aarch64 chains in the dispatcher (here); x86 chains inside translate_block.
 #ifndef G_DISPATCH_CHAIN
-#define G_DISPATCH_CHAIN(c) patch_links_to(G_PC(c), map_body(G_PC(c)))
+#define G_DISPATCH_CHAIN(c)                                                                                           \
+    do {                                                                                                              \
+        if (!smc_seen()) patch_links_to(G_PC(c), map_body(G_PC(c)));                                                  \
+    } while (0)
 #endif
 // Post-translate per-arch step. aarch64 has none; x86 does W6A SMC source-page write-protect.
 #ifndef G_AFTER_TRANSLATE
@@ -331,13 +373,20 @@ static void run_guest(struct cpu *c) {
         // flush may swap g_rw2rx (and g_cache) the instant we drop it, yet `code` is an address in the cache
         // that was current under the lock -- so J_RX(code) must use the matching g_rw2rx. (Single-threaded
         // takes no lock and cannot race a flush; the computation is identical.)
-        void *rxcode = J_RX(code);
+        void *rxcode;
+        uint64_t selected_cache_gen;
+        if (!jit_resolve_rw_code(code, &rxcode, &selected_cache_gen)) {
+            if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
+            c->exit_code = 70;
+            c->exited = 1;
+            continue;
+        }
         uint64_t selected_bus_epoch = atomic_load_explicit(&g_dispatch_request, memory_order_acquire);
         // Publish the generation of the cache we are about to execute so a peer's stop-the-world flush can
         // reclaim a retired cache only once no thread is still running in it (see reclaim_retired). Done
         // under g_jit_lock (a flush holds it) so the value is consistent with g_cache_gen; threaded-only,
         // so the single-thread hot path stays zero-overhead.
-        if (g_threaded) atomic_store_explicit(g_my_exec_gen, g_cache_gen, memory_order_relaxed);
+        if (g_threaded) atomic_store_explicit(g_my_exec_gen, selected_cache_gen, memory_order_relaxed);
         if (g_threaded) pthread_mutex_unlock(&g_jit_lock);
         // Frontend hook: per-block JT trace dump (per-arch register/flag layout). See §A.3 (5th divergence).
         G_TRACE_DUMP(c);

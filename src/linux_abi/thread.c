@@ -3,6 +3,7 @@
 #include "../host/range.h"
 #include "../host/system.h"
 #include "bus.h"
+#include "logical_vma.h"
 #include "shared.h"
 
 // ---------------- syscalls ----------------
@@ -81,8 +82,7 @@ static void fbk_wait_unregister(struct futex_bucket *b, int slot) {
     b->waddr[slot] = 0;
 }
 
-static int fbk_wait_grant(struct futex_bucket *b, uintptr_t address, int count, uint32_t mask,
-                          int *has_registered) {
+static int fbk_wait_grant(struct futex_bucket *b, uintptr_t address, int count, uint32_t mask, int *has_registered) {
     int granted = 0;
     *has_registered = 0;
     int start = b->wcursor % FUTEX_WSLOTS;
@@ -166,8 +166,7 @@ static __thread struct futex_bucket *g_fbk_active;
 static struct futex_bucket *futex_table_alloc(const hl_host_services *host, int shared) {
     size_t sz = sizeof(struct futex_bucket) * FUTEX_NBUCKET;
     void *mem = NULL;
-    if (hl_linux_memory_create(host, sz, shared ? HL_HOST_MEMORY_SHARED : HL_HOST_MEMORY_PRIVATE, &mem) !=
-        HL_STATUS_OK)
+    if (hl_linux_memory_create(host, sz, shared ? HL_HOST_MEMORY_SHARED : HL_HOST_MEMORY_PRIVATE, &mem) != HL_STATUS_OK)
         abort();
     struct futex_bucket *t = (struct futex_bucket *)mem;
     pthread_mutexattr_t ma;
@@ -360,6 +359,18 @@ static struct {
 
 static int g_ngna;
 static void gna_clear(uint64_t lo, uint64_t hi);
+static void gna_clear_raw(uint64_t lo, uint64_t hi);
+#define GNA_NEGATIVE_N 1024u
+static _Atomic uint64_t g_gna_generation = 2;
+static atomic_flag g_gna_writer = ATOMIC_FLAG_INIT;
+static _Thread_local uint64_t g_gna_negative_page[GNA_NEGATIVE_N];
+static _Thread_local uint64_t g_gna_negative_generation[GNA_NEGATIVE_N];
+static void gna_writer_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_gna_writer, memory_order_acquire)) sched_yield();
+}
+static void gna_writer_unlock(void) {
+    atomic_flag_clear_explicit(&g_gna_writer, memory_order_release);
+}
 
 // Guest read-only ranges physically protected on the host. The x86 lazy-map fault handler must not
 // reinterpret a legitimate write-protection fault as demand-zero growth and silently make it writable.
@@ -370,7 +381,9 @@ static struct {
 static int g_ngro;
 static void gro_clear(uint64_t lo, uint64_t hi);
 
-struct guest_bus_range { uint64_t lo, hi; };
+struct guest_bus_range {
+    uint64_t lo, hi;
+};
 static struct guest_bus_range g_gbus[GNA_MAX];
 static _Atomic int g_ngbus;
 static _Atomic uint64_t g_bus_generation = 1;
@@ -396,18 +409,30 @@ static pthread_once_t g_bus_atfork_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t g_bus_transition = PTHREAD_MUTEX_INITIALIZER;
 static void gbus_clear(uint64_t lo, uint64_t hi);
 static int gbus_add(uint64_t lo, uint64_t hi);
+
 static int gbus_clear_locked(uint64_t lo, uint64_t hi) {
     int changed = 0;
     for (int index = 0; index < g_ngbus;) {
         uint64_t base = g_gbus[index].lo, end = g_gbus[index].hi;
-        if (lo >= end || hi <= base) { index++; continue; }
+        if (lo >= end || hi <= base) {
+            index++;
+            continue;
+        }
         changed = 1;
         int head = base < lo, tail = hi < end;
-        if (!head && !tail) { g_gbus[index] = g_gbus[--g_ngbus]; continue; }
-        if (head) g_gbus[index].hi = lo; else g_gbus[index].lo = hi;
+        if (!head && !tail) {
+            g_gbus[index] = g_gbus[--g_ngbus];
+            continue;
+        }
+        if (head)
+            g_gbus[index].hi = lo;
+        else
+            g_gbus[index].lo = hi;
         if (head && tail) {
-            if (g_ngbus < GNA_MAX) g_gbus[g_ngbus++] = (struct guest_bus_range){hi, end};
-            else g_bus_fail_closed = 1;
+            if (g_ngbus < GNA_MAX)
+                g_gbus[g_ngbus++] = (struct guest_bus_range){hi, end};
+            else
+                g_bus_fail_closed = 1;
         }
         index++;
     }
@@ -443,11 +468,13 @@ static pthread_mutex_t g_filemap_lock = PTHREAD_MUTEX_INITIALIZER;
    which is the same visibility boundary that ordered the mutating process's
    pipe/socket/file notification. */
 #define FILEMAP_EVENT_COUNT 65536u
+
 struct filemap_event {
     _Atomic uint64_t sequence;
     uint64_t device, inode, first, second;
     uint32_t kind;
 };
+
 struct filemap_events {
     _Atomic uint64_t next;
     struct filemap_event event[FILEMAP_EVENT_COUNT];
@@ -541,20 +568,19 @@ static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t o
         if (shared) {
             uint64_t old = atomic_load_explicit(&g_filemap_shared_lo, memory_order_relaxed);
             while (address < old &&
-                   !atomic_compare_exchange_weak_explicit(&g_filemap_shared_lo, &old, address,
-                                                          memory_order_release, memory_order_relaxed)) {}
+                   !atomic_compare_exchange_weak_explicit(&g_filemap_shared_lo, &old, address, memory_order_release,
+                                                          memory_order_relaxed)) {}
             uint64_t end = address + size;
             old = atomic_load_explicit(&g_filemap_shared_hi, memory_order_relaxed);
-            while (end > old &&
-                   !atomic_compare_exchange_weak_explicit(&g_filemap_shared_hi, &old, end,
-                                                          memory_order_release, memory_order_relaxed)) {}
+            while (end > old && !atomic_compare_exchange_weak_explicit(&g_filemap_shared_hi, &old, end,
+                                                                       memory_order_release, memory_order_relaxed)) {}
         }
         // Publish the conservative envelope before the entry itself. A lock-free
         // refresher that observes the wider bounds then takes g_filemap_lock and
         // cannot scan until this fully initialized entry is visible.
-        g_filemap[g_nfilemap++] = (struct guest_file_mapping){address, address + size, offset,
-                                                              (uint64_t)st.st_dev, (uint64_t)st.st_ino,
-                                                              0, 0, retained, (uint32_t)shared, (uint32_t)emulated};
+        g_filemap[g_nfilemap++] = (struct guest_file_mapping){
+            address, address + size, offset,           (uint64_t)st.st_dev, (uint64_t)st.st_ino, 0,
+            0,       retained,       (uint32_t)shared, (uint32_t)emulated};
         if (shared) atomic_fetch_add_explicit(&g_filemap_shared_epoch, 1, memory_order_seq_cst);
     } else if (retained >= 0) {
         int shared_source = 0;
@@ -623,7 +649,10 @@ static void filemap_unmap(uint64_t lo, uint64_t hi) {
     pthread_mutex_lock(&g_filemap_lock);
     for (int i = 0; i < g_nfilemap;) {
         struct guest_file_mapping *mapping = &g_filemap[i];
-        if (hi <= mapping->lo || lo >= mapping->hi) { i++; continue; }
+        if (hi <= mapping->lo || lo >= mapping->hi) {
+            i++;
+            continue;
+        }
         uint64_t old_lo = mapping->lo, old_hi = mapping->hi;
         if (lo <= old_lo && hi >= old_hi) {
             int retained = mapping->fd;
@@ -683,7 +712,8 @@ static void filemap_resize_identity(uint64_t device, uint64_t inode, uint64_t ol
         if (mapping->device != device || mapping->inode != inode) continue;
         uint64_t old_accessible = filemap_accessible(mapping, old_size);
         uint64_t new_accessible = filemap_accessible(mapping, new_size);
-        if (new_size < old_size && new_size > mapping->offset && new_size < mapping->offset + (mapping->hi - mapping->lo)) {
+        if (new_size < old_size && new_size > mapping->offset &&
+            new_size < mapping->offset + (mapping->hi - mapping->lo)) {
             uint64_t tail = new_size - mapping->offset;
             uint64_t partial_end = (tail + UINT64_C(4095)) & ~UINT64_C(4095);
             if (partial_end > mapping->hi - mapping->lo) partial_end = mapping->hi - mapping->lo;
@@ -736,15 +766,14 @@ static int filemap_source_fd(struct guest_file_mapping *mapping) {
     return -1;
 }
 
-static void filemap_written_identity(uint64_t device, uint64_t inode, int source_fd, uint64_t offset,
-                                     uint64_t size) {
+static void filemap_written_identity(uint64_t device, uint64_t inode, int source_fd, uint64_t offset, uint64_t size) {
     if (size == 0 || offset > UINT64_MAX - size) return;
     uint64_t end = offset + size;
     pthread_mutex_lock(&g_filemap_lock);
     for (int i = 0; i < g_nfilemap; ++i) {
         struct guest_file_mapping *mapping = &g_filemap[i];
-        if (mapping->shared || mapping->follow_hi <= mapping->follow_lo ||
-            mapping->device != device || mapping->inode != inode)
+        if (mapping->shared || mapping->follow_hi <= mapping->follow_lo || mapping->device != device ||
+            mapping->inode != inode)
             continue;
         uint64_t map_lo = mapping->offset + mapping->follow_lo;
         uint64_t map_hi = mapping->offset + mapping->follow_hi;
@@ -754,8 +783,8 @@ static void filemap_written_identity(uint64_t device, uint64_t inode, int source
         if (hi > lo && fd >= 0) {
             ssize_t loaded;
             do {
-                loaded = pread(fd, (void *)(uintptr_t)(mapping->lo + lo - mapping->offset), (size_t)(hi - lo),
-                               (off_t)lo);
+                loaded =
+                    pread(fd, (void *)(uintptr_t)(mapping->lo + lo - mapping->offset), (size_t)(hi - lo), (off_t)lo);
             } while (loaded < 0 && errno == EINTR);
             // A short read intentionally leaves the anonymous-zero tail intact; an error leaves the
             // prior MAP_PRIVATE snapshot intact, matching a failed external refresh.
@@ -808,9 +837,14 @@ static void filemap_replay(void) {
 }
 
 static void gbus_lock(void) {
-    while (atomic_flag_test_and_set_explicit(&g_bus_lock, memory_order_acquire)) sched_yield();
+    while (atomic_flag_test_and_set_explicit(&g_bus_lock, memory_order_acquire))
+        sched_yield();
 }
-static void gbus_unlock(void) { atomic_flag_clear_explicit(&g_bus_lock, memory_order_release); }
+
+static void gbus_unlock(void) {
+    atomic_flag_clear_explicit(&g_bus_lock, memory_order_release);
+}
+
 static void gbus_filter_rebuild_locked(void) {
     uint64_t lo = UINT64_MAX, hi = 0;
     if (g_bus_fail_closed || g_bus_prepares != 0) {
@@ -825,9 +859,11 @@ static void gbus_filter_rebuild_locked(void) {
     atomic_store_explicit(&g_bus_filter_lo, lo, memory_order_relaxed);
     atomic_store_explicit(&g_bus_filter_hi, hi, memory_order_release);
 }
+
 static unsigned gbus_page_hash(uint64_t page) {
     return (unsigned)page & (BUS_FILTER_BITS - 1u);
 }
+
 static void gbus_page_mark_locked(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
     uint64_t first = lo >> 12;
@@ -846,10 +882,12 @@ static void gbus_page_mark_locked(uint64_t lo, uint64_t hi) {
         if (page == last) break;
     }
 }
+
 static void gbus_page_reset_locked(void) {
     for (unsigned i = 0; i < BUS_FILTER_WORDS; ++i)
         atomic_store_explicit(&g_bus_page_filter[i], 0, memory_order_release);
 }
+
 static void gbus_page_rebuild_locked(void) {
     gbus_page_reset_locked();
     if (g_bus_fail_closed) {
@@ -860,10 +898,26 @@ static void gbus_page_rebuild_locked(void) {
     for (int index = 0; index < g_ngbus; ++index)
         gbus_page_mark_locked(g_gbus[index].lo, g_gbus[index].hi);
 }
-static void gbus_atfork_prepare(void) { pthread_mutex_lock(&g_bus_transition); gbus_lock(); }
-static void gbus_atfork_parent(void) { gbus_unlock(); pthread_mutex_unlock(&g_bus_transition); }
-static void gbus_atfork_child(void) { gbus_unlock(); pthread_mutex_unlock(&g_bus_transition); }
-static void gbus_atfork_install(void) { (void)pthread_atfork(gbus_atfork_prepare, gbus_atfork_parent, gbus_atfork_child); }
+
+static void gbus_atfork_prepare(void) {
+    pthread_mutex_lock(&g_bus_transition);
+    gbus_lock();
+}
+
+static void gbus_atfork_parent(void) {
+    gbus_unlock();
+    pthread_mutex_unlock(&g_bus_transition);
+}
+
+static void gbus_atfork_child(void) {
+    gbus_unlock();
+    pthread_mutex_unlock(&g_bus_transition);
+}
+
+static void gbus_atfork_install(void) {
+    (void)pthread_atfork(gbus_atfork_prepare, gbus_atfork_parent, gbus_atfork_child);
+}
+
 static void gbus_notify(uint64_t generation, int active) {
     gbus_lock();
     hl_linux_bus_change_fn callback = g_bus_callback;
@@ -922,15 +976,31 @@ static void gbus_prepare_release(void) {
 /* A host MAP_FIXED replacement must not run concurrently with a translated
    peer accessing the replaced range.  This is only a mapping transaction: it
    deliberately does not activate BUS instrumentation or change the ledger. */
-static void gbus_mapping_prepare(void) {
+static void gbus_mapping_transition_lock(void) {
     (void)pthread_once(&g_bus_atfork_once, gbus_atfork_install);
     pthread_mutex_lock(&g_bus_transition);
+}
+
+static void gbus_mapping_stw_begin(void) {
     if (g_bus_transition_begin != NULL) g_bus_transition_begin(g_bus_transition_opaque);
 }
 
-static void gbus_mapping_prepare_release(void) {
+static void gbus_mapping_stw_end(void) {
     if (g_bus_transition_end != NULL) g_bus_transition_end(g_bus_transition_opaque);
+}
+
+static void gbus_mapping_transition_unlock(void) {
     pthread_mutex_unlock(&g_bus_transition);
+}
+
+static void gbus_mapping_prepare(void) {
+    gbus_mapping_transition_lock();
+    gbus_mapping_stw_begin();
+}
+
+static void gbus_mapping_prepare_release(void) {
+    gbus_mapping_stw_end();
+    gbus_mapping_transition_unlock();
 }
 
 int hl_linux_bus_transition_begin(hl_linux_bus_transition *transition) {
@@ -1006,8 +1076,7 @@ static void gbus_clear(uint64_t lo, uint64_t hi) {
                                   : atomic_load_explicit(&g_bus_generation, memory_order_relaxed);
     int active = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
     if (changed)
-        atomic_store_explicit(&g_bus_filter_force, g_bus_prepares != 0 ? 3 : (active ? 1 : 0),
-                              memory_order_release);
+        atomic_store_explicit(&g_bus_filter_force, g_bus_prepares != 0 ? 3 : (active ? 1 : 0), memory_order_release);
     gbus_unlock();
     if (changed) gbus_notify(generation, active);
 }
@@ -1033,7 +1102,10 @@ retry:
         sched_yield();
         goto retry;
     }
-    if (g_bus_fail_closed) { gbus_unlock(); return address != 0 ? address : 1; }
+    if (g_bus_fail_closed) {
+        gbus_unlock();
+        return address != 0 ? address : 1;
+    }
     for (int index = 0; index < g_ngbus; ++index)
         if (address < g_gbus[index].hi && end > g_gbus[index].lo) {
             uint64_t fault = address > g_gbus[index].lo ? address : g_gbus[index].lo;
@@ -1044,9 +1116,14 @@ retry:
     return 0;
 }
 
-int hl_linux_bus_hit(uint64_t address, uint64_t length) { return hl_linux_bus_fault(address, length) != 0; }
+int hl_linux_bus_hit(uint64_t address, uint64_t length) {
+    return hl_linux_bus_fault(address, length) != 0;
+}
 
-uint64_t hl_linux_bus_generation(void) { return atomic_load_explicit(&g_bus_generation, memory_order_acquire); }
+uint64_t hl_linux_bus_generation(void) {
+    return atomic_load_explicit(&g_bus_generation, memory_order_acquire);
+}
+
 int hl_linux_bus_active(void) {
     gbus_lock();
     int active = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
@@ -1056,12 +1133,16 @@ int hl_linux_bus_active(void) {
 
 static void gna_add(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
-    gna_clear(lo, hi); // coalesce: drop any prior coverage so re-marking never double-counts
+    gna_writer_lock();
+    atomic_fetch_add_explicit(&g_gna_generation, 1, memory_order_acq_rel);
+    gna_clear_raw(lo, hi); // coalesce inside the same odd-generation transaction
     if (g_ngna < GNA_MAX) {
         g_gna[g_ngna].lo = lo;
         g_gna[g_ngna].hi = hi;
         __atomic_store_n(&g_ngna, g_ngna + 1, __ATOMIC_RELEASE);
     }
+    atomic_fetch_add_explicit(&g_gna_generation, 1, memory_order_release);
+    gna_writer_unlock();
 }
 
 // Remove [lo,hi) from the set (access granted, or the range unmapped/re-mapped), splitting any interval
@@ -1069,6 +1150,14 @@ static void gna_add(uint64_t lo, uint64_t hi) {
 // keeps the still-inaccessible remainder tracked.
 static void gna_clear(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
+    gna_writer_lock();
+    atomic_fetch_add_explicit(&g_gna_generation, 1, memory_order_acq_rel);
+    gna_clear_raw(lo, hi);
+    atomic_fetch_add_explicit(&g_gna_generation, 1, memory_order_release);
+    gna_writer_unlock();
+}
+
+static void gna_clear_raw(uint64_t lo, uint64_t hi) {
     for (int i = 0; i < g_ngna;) {
         uint64_t b = g_gna[i].lo, e = g_gna[i].hi;
         if (lo >= e || hi <= b) {
@@ -1095,10 +1184,22 @@ static void gna_clear(uint64_t lo, uint64_t hi) {
 
 // True iff any byte of [a,a+len) lies in a tracked guest PROT_NONE region.
 static int gna_hit(uint64_t a, uint64_t len) {
-    if (!len || __atomic_load_n(&g_ngna, __ATOMIC_ACQUIRE) == 0) return 0; // lock-free fast path (common)
+    if (!len || __atomic_load_n(&g_ngna, __ATOMIC_ACQUIRE) == 0) return 0;
     uint64_t end = a + len;
-    for (int i = 0; i < g_ngna; i++)
+    uint64_t generation = atomic_load_explicit(&g_gna_generation, memory_order_acquire);
+    uint64_t first_page = a >> 12, last_page = (end - 1) >> 12;
+    uint32_t slot = (uint32_t)(first_page * 2654435761u) & (GNA_NEGATIVE_N - 1);
+    if (!(generation & 1) && first_page == last_page &&
+        g_gna_negative_generation[slot] == generation && g_gna_negative_page[slot] == first_page)
+        return 0;
+    for (int i = 0; i < g_ngna; i++) {
         if (a < g_gna[i].hi && end > g_gna[i].lo) return 1;
+    }
+    if (!(generation & 1) && first_page == last_page &&
+        atomic_load_explicit(&g_gna_generation, memory_order_acquire) == generation) {
+        g_gna_negative_page[slot] = first_page;
+        g_gna_negative_generation[slot] = generation;
+    }
     return 0;
 }
 
@@ -1164,7 +1265,11 @@ static int gro_hit(uint64_t a, uint64_t len) {
 // execve replaces the whole address space -> drop all tracked PROT_NONE ranges (they're gone with the old
 // image; a stale entry could otherwise wrongly EFAULT a fresh mapping the new image lays at the same address).
 static void gna_reset(void) {
+    gna_writer_lock();
+    atomic_fetch_add_explicit(&g_gna_generation, 1, memory_order_acq_rel);
     __atomic_store_n(&g_ngna, 0, __ATOMIC_RELEASE);
+    atomic_fetch_add_explicit(&g_gna_generation, 1, memory_order_release);
+    gna_writer_unlock();
     __atomic_store_n(&g_ngro, 0, __ATOMIC_RELEASE);
     pthread_mutex_lock(&g_filemap_lock);
     for (int index = 0; index < g_nfilemap; ++index) {
@@ -1176,6 +1281,7 @@ static void gna_reset(void) {
     }
     g_nfilemap = 0;
     pthread_mutex_unlock(&g_filemap_lock);
+    hl_logical_vma_global_reset_quiescent();
     pthread_mutex_lock(&g_bus_transition);
     gbus_lock();
     int changed = g_ngbus != 0 || g_bus_fail_closed || g_bus_prepares != 0;
@@ -1190,13 +1296,20 @@ static void gna_reset(void) {
     gbus_unlock();
     if (changed) gbus_notify(generation, 0);
     pthread_mutex_unlock(&g_bus_transition);
+    /* Soft mode is intentionally sticky across temporary empty logical-VMA
+       intervals.  exec/checkpoint image reset is the lifecycle boundary where
+       old guarded translations are no longer useful; rotate once here before
+       admitting direct, unguarded translations for the replacement image. */
+    jit_guest_soft_deactivate();
 }
 
 // True iff host virtual address `a` is currently mapped. mincore() is useless on macOS (returns 0 for ANY
 // address), so query the VM map directly: mach_vm_region returns the first region at-or-above `a`, and `a`
 // is mapped iff it falls inside [start, start+size). Same technique as the x86 loader's lazy_addr_mapped.
 // Used to mirror the kernel's fault-tolerant put_user() on the CLEARTID teardown path (futex_wake_addr).
-static int host_addr_mapped(uintptr_t a) { return hl_host_address_mapped(a); }
+static int host_addr_mapped(uintptr_t a) {
+    return hl_host_address_mapped(a);
+}
 
 // per-thread ALTERNATE signal stack for the synchronous-fault guards. On the aarch64 frontend the
 // host SP == the guest SP while a translated block runs, so a guest STACK OVERFLOW leaves no room for the
@@ -1224,9 +1337,9 @@ static void install_host_sigaltstack(void) {
         if (host == NULL || host->memory == NULL || host->memory->map_anonymous == NULL ||
             host->memory->release == NULL)
             return;
-        result = host->memory->map_anonymous(host->context, 0, HOST_ALTSTK_SZ,
-                                             HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_PRIVATE,
-                                             &mapped);
+        result =
+            host->memory->map_anonymous(host->context, 0, HOST_ALTSTK_SZ, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                        HL_HOST_MEMORY_PRIVATE, &mapped);
         if (result.status != HL_STATUS_OK || mapped.handle == HL_HOST_HANDLE_INVALID || mapped.address == 0 ||
             mapped.address > UINTPTR_MAX || mapped.mapped_size < HOST_ALTSTK_SZ) {
             if (mapped.handle != HL_HOST_HANDLE_INVALID) (void)host->memory->release(host->context, mapped.handle);
@@ -1255,8 +1368,8 @@ static void uninstall_host_sigaltstack(void) {
     for (unsigned attempt = 0; attempt < 3 && released.status != HL_STATUS_OK; ++attempt)
         released = host->memory->release(host->context, g_altstk_mapping.handle);
     if (released.status == HL_STATUS_OK)
-        g_altstk_mapping = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(hl_host_memory_mapping),
-                                                    HL_HOST_HANDLE_INVALID, 0, 0, 0};
+        g_altstk_mapping = (hl_host_memory_mapping){
+            HL_HOST_MEMORY_MAPPING_ABI, sizeof(hl_host_memory_mapping), HL_HOST_HANDLE_INVALID, 0, 0, 0};
 }
 
 // Range form of host_addr_mapped: true iff every page spanning [a, a+len) is mapped. Used to validate a
@@ -1344,7 +1457,9 @@ static int host_range_mapped(uintptr_t a, size_t len) {
 static int host_range_writable(uintptr_t a, size_t len) {
     if (!len) return 1;
     uintptr_t end = a + len;
-    if (end < a || gna_hit((uint64_t)a, (uint64_t)len) || hl_linux_bus_hit((uint64_t)a, (uint64_t)len)) return 0;
+    if (end < a || gna_hit((uint64_t)a, (uint64_t)len) || gro_hit((uint64_t)a, (uint64_t)len) ||
+        hl_linux_bus_hit((uint64_t)a, (uint64_t)len))
+        return 0;
     uintptr_t lo = a & ~(uintptr_t)0xfff;
     volatile int ok = 1;
     if (sigsetjmp(g_hrm_jb, 0)) {
@@ -1466,8 +1581,8 @@ static inline void ts_wait_leave(void);
 // `grant_all` selects EVERY matching waiter (returning only the first `n` as the woken count) for the
 // REQUEUE family, whose parked peers have no secondary queue to be woken from later, so this
 // approximation moves them by waking them all; plain FUTEX_WAKE(n) passes 0 and grants exactly `n`.
-static int futex_wake_bucket(const int *uaddr, int n, uint32_t match, int grant_all) {
-    struct futex_bucket *b = fbk_of(uaddr);
+static int futex_wake_bucket(const void *key, int n, uint32_t match, int grant_all) {
+    struct futex_bucket *b = fbk_of(key);
     if (g_prof) {
         if (atomic_load_explicit(&b->waiters, memory_order_relaxed))
             g_futex_wake_slow++;
@@ -1477,21 +1592,21 @@ static int futex_wake_bucket(const int *uaddr, int n, uint32_t match, int grant_
     pthread_mutex_lock(&b->m);
     // FUTEX_WAKE_BITSET only wakes waiters whose bitset overlaps `match`; a plain FUTEX_WAKE passes ~0u.
     // If no parked waiter on this address can match, wake nobody (Linux does not disturb them).
-    if (!fbk_match(b, futex_key(uaddr), match)) {
+    if (!fbk_match(b, futex_key(key), match)) {
         pthread_mutex_unlock(&b->m);
         return 0;
     }
     int registered = 0;
-    int woke = fbk_wait_grant(b, futex_key(uaddr), n, match, &registered);
+    int woke = fbk_wait_grant(b, futex_key(key), n, match, &registered);
     if (grant_all && registered) { // REQUEUE approximation: also release the peers left behind
         int r2 = 0;
-        (void)fbk_wait_grant(b, futex_key(uaddr), INT_MAX, match, &r2);
+        (void)fbk_wait_grant(b, futex_key(key), INT_MAX, match, &r2);
     }
     // PI and overflow fallback waiters do not occupy ordinary-wait slots;
     // their loops re-check ownership/value after a broadcast, so the old
     // bounded parked count remains correct for that exceptional path.
     if (!registered) {
-        woke = fbk_parked(b, futex_key(uaddr));
+        woke = fbk_parked(b, futex_key(key));
         if (woke > n) woke = n;
     }
     pthread_cond_broadcast(&b->c); // waiters re-check their own word; spurious wakes are legal
@@ -1556,10 +1671,11 @@ static int cpu_tid(const struct cpu *c);
 // returns 0 without the word actually naming this thread as the owner. `mono`: the (absolute) timeout is on
 // CLOCK_MONOTONIC (FUTEX_LOCK_PI2) rather than the FUTEX_LOCK_PI default of CLOCK_REALTIME. Interruptible
 // (a thread-directed signal returns -EINTR, exactly as a real LOCK_PI is interrupted -> glibc retries).
-static long futex_lock_pi(struct cpu *c, int *uaddr, int trylock, const struct timespec *ts, int mono) {
+static long futex_lock_pi(struct cpu *c, int *uaddr, const void *key, int trylock, const struct timespec *ts,
+                          int mono) {
     if (!uaddr || !host_addr_mapped((uintptr_t)uaddr)) return -EFAULT;
     int mytid = cpu_tid(c);
-    struct futex_bucket *b = fbk_of(uaddr);
+    struct futex_bucket *b = fbk_of(key);
     pthread_mutex_lock(&b->m);
     int parked = 0;
     long ret;
@@ -1568,7 +1684,7 @@ static long futex_lock_pi(struct cpu *c, int *uaddr, int trylock, const struct t
         uint32_t v = (uint32_t)expect;
         uint32_t owner = v & HL_FUTEX_TID_MASK;
         if (owner == 0) { // free (owner slot 0; FUTEX_OWNER_DIED may still be set on a robust mutex)
-            int others = fbk_parked(b, futex_key(uaddr)) - (parked ? 1 : 0); // waiters left behind
+            int others = fbk_parked(b, futex_key(key)) - (parked ? 1 : 0); // waiters left behind
             int nv = (int)((uint32_t)mytid | (others > 0 ? HL_FUTEX_WAITERS : 0));
             // Acquire atomically vs a racing userspace fast-path locker (cmpxchg 0->tid): if the word moved
             // underfoot, retry from the re-read instead of clobbering the new owner (double-ownership bug).
@@ -1593,7 +1709,7 @@ static long futex_lock_pi(struct cpu *c, int *uaddr, int trylock, const struct t
             continue;
         if (!parked) {
             atomic_fetch_add_explicit(&b->waiters, 1, memory_order_relaxed);
-            fbk_park(b, futex_key(uaddr), ~0u); // PI-mutex waiter: matches any wake bitset
+            fbk_park(b, futex_key(key), ~0u); // PI-mutex waiter: matches any wake bitset
             parked = 1;
         }
         thread_wait_publish(&b->m, &b->c);
@@ -1629,7 +1745,7 @@ static long futex_lock_pi(struct cpu *c, int *uaddr, int trylock, const struct t
         // otherwise loop and re-read the word (the releaser cleared the owner; race for ownership under b->m)
     }
     if (parked) {
-        fbk_unpark(b, futex_key(uaddr));
+        fbk_unpark(b, futex_key(key));
         if (atomic_fetch_sub_explicit(&b->waiters, 1, memory_order_relaxed) == 1) b->imprecise = 0;
     }
     pthread_mutex_unlock(&b->m);
@@ -1640,17 +1756,17 @@ static long futex_lock_pi(struct cpu *c, int *uaddr, int trylock, const struct t
 // clearing the owner TID; if waiters remain, keep FUTEX_WAITERS set (word = FUTEX_WAITERS, owner 0) so a
 // userspace fast-path locker can't steal in ahead of a parked waiter, and broadcast -- the woken waiters
 // re-contend for ownership under the bucket mutex in futex_lock_pi, so exactly one acquires. Returns 0.
-static long futex_unlock_pi(struct cpu *c, int *uaddr) {
+static long futex_unlock_pi(struct cpu *c, int *uaddr, const void *key) {
     if (!uaddr || !host_addr_mapped((uintptr_t)uaddr)) return -EFAULT;
     int mytid = cpu_tid(c);
-    struct futex_bucket *b = fbk_of(uaddr);
+    struct futex_bucket *b = fbk_of(key);
     pthread_mutex_lock(&b->m);
     uint32_t v = (uint32_t)__atomic_load_n(uaddr, __ATOMIC_SEQ_CST);
     if ((v & HL_FUTEX_TID_MASK) != (uint32_t)mytid) {
         pthread_mutex_unlock(&b->m);
         return -EPERM; // not the owner -- Linux rejects an UNLOCK_PI from a non-owner
     }
-    int waiters = fbk_parked(b, futex_key(uaddr));
+    int waiters = fbk_parked(b, futex_key(key));
     __atomic_store_n(uaddr, (int)(waiters > 0 ? HL_FUTEX_WAITERS : 0), __ATOMIC_SEQ_CST);
     if (waiters > 0) pthread_cond_broadcast(&b->c);
     pthread_mutex_unlock(&b->m);
@@ -1660,8 +1776,8 @@ static long futex_unlock_pi(struct cpu *c, int *uaddr) {
 // nr_wake2 is the raw 4th syscall arg (a3) reinterpreted as a count for FUTEX_WAKE_OP (WAIT ops use a3 as a
 // timespec instead -- the two never overlap because op selects one interpretation); uaddr2 (a4) + val3 (a5)
 // carry the WAKE_OP / REQUEUE second-address operands, and are ignored by the WAIT/plain-WAKE branches.
-static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, const struct timespec *ts, int nr_wake2,
-                     int *uaddr2, uint32_t val3) {
+static long futex_op(struct cpu *c, int *uaddr, const void *key, int op, int private, int val,
+                     const struct timespec *ts, int nr_wake2, int *uaddr2, const void *key2, uint32_t val3) {
     // Linux FUTEX_PRIVATE_FLAG promises that no other process can participate. Keep those high-frequency
     // pthread waits on process-private host mutexes/condvars; macOS process-shared pthread primitives are
     // substantially heavier and eventually fault/livelock under sustained condvar churn. Non-private ops
@@ -1673,23 +1789,23 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
     // PI-mutex ops use per-address ownership tracked in the (always-present) buckets, independent of the
     // legacy single-queue mode below, so dispatch them first. FUTEX_LOCK_PI=6, UNLOCK_PI=7, TRYLOCK_PI=8,
     // WAIT_REQUEUE_PI=11, CMP_REQUEUE_PI=12, LOCK_PI2=13.
-    if (op == 6) return futex_lock_pi(c, uaddr, 0, ts, 0);
-    if (op == 13) return futex_lock_pi(c, uaddr, 0, ts, 1);
-    if (op == 8) return futex_lock_pi(c, uaddr, 1, NULL, 0);
-    if (op == 7) return futex_unlock_pi(c, uaddr);
+    if (op == 6) return futex_lock_pi(c, uaddr, key, 0, ts, 0);
+    if (op == 13) return futex_lock_pi(c, uaddr, key, 0, ts, 1);
+    if (op == 8) return futex_lock_pi(c, uaddr, key, 1, NULL, 0);
+    if (op == 7) return futex_unlock_pi(c, uaddr, key);
     if (op == 11) { // FUTEX_WAIT_REQUEUE_PI: wait on uaddr (while *uaddr==val), then acquire the PI mutex uaddr2.
         // Modern glibc (>=2.25) condvars no longer use requeue_pi, so this path is cold; implement it as a
         // plain WAIT followed by a LOCK_PI on uaddr2 -- semantically what pthread_cond_wait on a PI mutex
         // needs, and always CORRECT (a woken waiter re-acquires uaddr2 itself; see CMP_REQUEUE_PI below).
         if (!uaddr || !host_addr_mapped((uintptr_t)uaddr)) return -EFAULT;
-        struct futex_bucket *b = fbk_of(uaddr);
+        struct futex_bucket *b = fbk_of(key);
         pthread_mutex_lock(&b->m);
         if ((uint32_t)__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != (uint32_t)val) {
             pthread_mutex_unlock(&b->m);
             return -EAGAIN;
         }
         atomic_fetch_add_explicit(&b->waiters, 1, memory_order_relaxed);
-        fbk_park(b, futex_key(uaddr), ~0u); // PI-mutex waiter: matches any wake bitset
+        fbk_park(b, futex_key(key), ~0u); // PI-mutex waiter: matches any wake bitset
         thread_wait_publish(&b->m, &b->c);
         long ret = 0;
         if (cpu_wait_interrupted(c)) {
@@ -1712,11 +1828,11 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
                 ret = -ETIMEDOUT;
         }
         thread_wait_clear();
-        fbk_unpark(b, futex_key(uaddr));
+        fbk_unpark(b, futex_key(key));
         if (atomic_fetch_sub_explicit(&b->waiters, 1, memory_order_relaxed) == 1) b->imprecise = 0;
         pthread_mutex_unlock(&b->m);
-        if (ret < 0) return ret;                   // on error the caller does NOT own uaddr2 (kernel-exact)
-        return futex_lock_pi(c, uaddr2, 0, ts, 0); // woken -> acquire the target PI mutex before returning
+        if (ret < 0) return ret;                         // on error the caller does NOT own uaddr2 (kernel-exact)
+        return futex_lock_pi(c, uaddr2, key2, 0, ts, 0); // woken -> acquire the target PI mutex before returning
     }
     if (op == 12) { // FUTEX_CMP_REQUEUE_PI: verify *uaddr==val3, wake uaddr waiters (they self-acquire uaddr2).
         // We don't physically move queues -- each woken WAIT_REQUEUE_PI waiter re-acquires uaddr2's PI lock on
@@ -1727,7 +1843,7 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
         // Wake up to `val` signalled + `nr_wake2` requeue-budget waiters in one broadcast; each self-acquires
         // uaddr2, so the physical requeue is unnecessary. (A single broadcast wakes all parked in the bucket.)
         long budget = (long)(val < 1 ? 1 : val) + (nr_wake2 > 0 ? nr_wake2 : 0);
-        return futex_wake_bucket(uaddr, budget > 0x7fffffff ? 0x7fffffff : (int)budget, ~0u, 1);
+        return futex_wake_bucket(key, budget > 0x7fffffff ? 0x7fffffff : (int)budget, ~0u, 1);
     }
     if (!g_futexq) {
         // ---- legacy single global queue ----
@@ -1787,7 +1903,7 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
         return 0;
     }
     // ---- W5C per-address buckets ----
-    struct futex_bucket *b = fbk_of(uaddr);
+    struct futex_bucket *b = fbk_of(key);
     // FUTEX_WAIT / WAIT_BITSET: sleep while *uaddr == val
     if (op == 0 || op == 9) {
         if (g_prof) g_futex_wait_n++;
@@ -1814,8 +1930,8 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
         // process or, across a shared page, another) can report the true woken count. Kept in the SHARED
         // bucket, so a cross-fork waker sees it. Carry the wait bitset (op 9 = FUTEX_WAIT_BITSET's val3;
         // plain FUTEX_WAIT matches any) so FUTEX_WAKE_BITSET can skip a non-overlapping wake.
-        fbk_park(b, futex_key(uaddr), op == 9 ? val3 : ~0u);
-        int wait_slot = fbk_wait_register(b, futex_key(uaddr), op == 9 ? val3 : ~0u);
+        fbk_park(b, futex_key(key), op == 9 ? val3 : ~0u);
+        int wait_slot = fbk_wait_register(b, futex_key(key), op == 9 ? val3 : ~0u);
         ts_wait_enter(); // 'S' (sleeping) while parked in FUTEX_WAIT; peer /proc/<pid>/stat|status must not show 'R'
         int rc = 0;
         struct timespec abs;
@@ -1834,15 +1950,21 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
         int intr = 0;
         for (;;) {
             rc = ts ? pthread_cond_timedwait(&b->c, &b->m, &abs) : pthread_cond_wait(&b->c, &b->m);
-            if (cpu_wait_interrupted(c)) { intr = 1; break; }
+            if (cpu_wait_interrupted(c)) {
+                intr = 1;
+                break;
+            }
             if (rc == ETIMEDOUT) break;
             if (wait_slot < 0) break;
-            if (b->wgrant[wait_slot]) { b->wgrant[wait_slot] = 0; break; }
+            if (b->wgrant[wait_slot]) {
+                b->wgrant[wait_slot] = 0;
+                break;
+            }
         }
         ts_wait_leave();
         thread_wait_clear();
         fbk_wait_unregister(b, wait_slot);
-        fbk_unpark(b, futex_key(uaddr));
+        fbk_unpark(b, futex_key(key));
         // fetch_sub returns the PREVIOUS value; == 1 means the bucket just fully drained -> a stale
         // `imprecise` flag (set by a past slot overflow) can be cleared so exact counting resumes.
         if (atomic_fetch_sub_explicit(&b->waiters, 1, memory_order_relaxed) == 1) b->imprecise = 0;
@@ -1870,7 +1992,7 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
         // FUTEX_WAKE_BITSET (op 10) wakes only waiters whose bitset overlaps val3; the others match any.
         // REQUEUE(3)/CMP_REQUEUE(4) have no modelled secondary queue, so wake every parked peer (grant_all);
         // plain WAKE(1)/WAKE_BITSET(10) must release EXACTLY `val` -- unselected peers re-park (see WAIT loop).
-        int woke = futex_wake_bucket(uaddr, val, op == 10 ? val3 : ~0u, op == 3 || op == 4);
+        int woke = futex_wake_bucket(key, val, op == 10 ? val3 : ~0u, op == 3 || op == 4);
         return woke;
     }
     if (op == 5) { // FUTEX_WAKE_OP: atomically mutate *uaddr2, wake uaddr waiters, conditionally uaddr2's.
@@ -1881,8 +2003,8 @@ static long futex_op(struct cpu *c, int *uaddr, int op, int private, int val, co
         int do_wake2 = 0;
         int rc = futex_wake_op_apply(uaddr2, val3, &do_wake2);
         if (rc < 0) return rc; // -EFAULT (bad uaddr2) / -ENOSYS (unknown op|cmp): report to the guest as-is
-        int woke = futex_wake_bucket(uaddr, val, ~0u, 0);
-        if (do_wake2) woke += futex_wake_bucket(uaddr2, nr_wake2, ~0u, 0);
+        int woke = futex_wake_bucket(key, val, ~0u, 0);
+        if (do_wake2) woke += futex_wake_bucket(key2, nr_wake2, ~0u, 0);
         return woke;
     }
     // A genuinely undefined command (the removed FUTEX_FD=2, or any value >= 14 that names no futex op) is
@@ -2261,21 +2383,52 @@ static inline uint64_t robust_guest_to_host(uint64_t address) {
     return (g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi) ? address + g_nonpie_bias : address;
 }
 
+static int robust_pin(uint64_t address, size_t length, uint32_t protection, hl_logical_vma_pin *pin, void **host) {
+    memset(pin, 0, sizeof(*pin));
+    int logical = hl_logical_vma_pin_data(address, length, protection, pin);
+    if (logical < 0 || pin->contiguous < length) {
+        hl_logical_vma_unpin(pin);
+        return 0;
+    }
+    if (logical > 0) {
+        *host = pin->host;
+        return 1;
+    }
+    if (!host_range_mapped((uintptr_t)address, length)) {
+        hl_logical_vma_unpin(pin);
+        return 0;
+    }
+    *host = (void *)(uintptr_t)address;
+    return 1;
+}
+
+static int robust_copy_from(void *destination, uint64_t source, size_t length) {
+    hl_logical_vma_pin pin;
+    void *host;
+    if (!robust_pin(source, length, HL_LOGICAL_VMA_READ, &pin, &host)) return 0;
+    memcpy(destination, host, length);
+    hl_logical_vma_unpin(&pin);
+    return 1;
+}
+
 // If the dying thread still owns *futex_addr, set FUTEX_OWNER_DIED (preserving FUTEX_WAITERS) and wake one
 // waiter. cmpxchg-loops so a concurrent lock/unlock on the same word can't clobber the OWNER_DIED marking.
 static void robust_handle_death(uint64_t futex_addr, int mytid) {
-    if (!futex_addr || !host_range_mapped((uintptr_t)futex_addr, 4)) return;
-    int *w = (int *)(uintptr_t)futex_addr;
+    hl_logical_vma_pin pin;
+    void *host;
+    if (!futex_addr || !robust_pin(futex_addr, 4, HL_LOGICAL_VMA_WRITE, &pin, &host)) return;
+    int *w = host;
     int v = __atomic_load_n(w, __ATOMIC_SEQ_CST);
     for (;;) {
-        if (((uint32_t)v & HL_FUTEX_TID_MASK) != (uint32_t)mytid) return; // not (or no longer) ours
+        if (((uint32_t)v & HL_FUTEX_TID_MASK) != (uint32_t)mytid) break; // not (or no longer) ours
         int nv = (int)(((uint32_t)v & HL_FUTEX_WAITERS) | HL_FUTEX_OWNER_DIED);
         if (__atomic_compare_exchange_n(w, &v, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
             if ((uint32_t)v & HL_FUTEX_WAITERS) futex_wake_bucket(w, 1, ~0u, 0); // one waiter -> EOWNERDEAD
-            return;
+            break;
         }
         // v was reloaded with the current word by the failed cmpxchg -> re-check ownership and retry
     }
+    hl_logical_vma_unpin(&pin);
 }
 
 // Walk this thread's robust list (if any) and mark+wake each still-owned mutex. Clears c->robust_list so a
@@ -2286,16 +2439,21 @@ static void futex_robust_exit(struct cpu *c) {
     g_fbk_active = g_fbk;
     uint64_t head = c->robust_list;
     c->robust_list = 0;
-    if (!head || !host_range_mapped((uintptr_t)head, 24)) return;
-    uint64_t raw_first = *(uint64_t *)(uintptr_t)head;  // head->list.next (LSB = PI flag)
-    long futex_offset = *(long *)(uintptr_t)(head + 8); // head->futex_offset
-    uint64_t pending = robust_guest_to_host((*(uint64_t *)(uintptr_t)(head + 16)) & ~1ULL); // head->list_op_pending
+    uint8_t head_copy[24];
+    if (!head || !robust_copy_from(head_copy, head, sizeof(head_copy))) return;
+    uint64_t raw_first, raw_pending;
+    long futex_offset;
+    memcpy(&raw_first, head_copy, sizeof(raw_first));
+    memcpy(&futex_offset, head_copy + 8, sizeof(futex_offset));
+    memcpy(&raw_pending, head_copy + 16, sizeof(raw_pending));
+    uint64_t pending = robust_guest_to_host(raw_pending & ~1ULL); // head->list_op_pending
     int mytid = cpu_tid(c);
     uint64_t entry = robust_guest_to_host(raw_first & ~1ULL);
     for (int limit = 0; limit < HL_ROBUST_LIST_LIMIT; limit++) {
         if (entry == head) break; // wrapped back to &head->list -> done
-        if (!host_range_mapped((uintptr_t)entry, 8)) break;
-        uint64_t next = robust_guest_to_host((*(uint64_t *)(uintptr_t)entry) & ~1ULL); // entry->next
+        uint64_t raw_next;
+        if (!robust_copy_from(&raw_next, entry, sizeof(raw_next))) break;
+        uint64_t next = robust_guest_to_host(raw_next & ~1ULL); // entry->next
         if (entry != pending) robust_handle_death(entry + (uint64_t)futex_offset, mytid);
         entry = next;
     }
@@ -2383,6 +2541,9 @@ static int spawn_thread(struct cpu *parent, uint64_t flags, uint64_t stack_top, 
     child->in_service = 0;
     child->exited = 0;
     child->redirect = 0;
+#ifdef G_SOFT_STATE_RESET
+    G_SOFT_STATE_RESET(child);
+#endif
     // CLONE_SETTLS
     if (flags & 0x00080000) G_TLS(child) = tls;
     int tid = __sync_add_and_fetch(&g_next_tid, 1);

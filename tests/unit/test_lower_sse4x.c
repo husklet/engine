@@ -12,13 +12,17 @@ typedef struct calls {
     unsigned stores;
     unsigned addresses;
     unsigned drops;
+    unsigned commits;
+    uint64_t committed_size;
     uint32_t instructions[8];
 } calls;
 
 static calls seen;
+static int soft_active;
 
 static void reset_calls(void) {
     memset(&seen, 0, sizeof(seen));
+    soft_active = 0;
 }
 
 void emit32(uint32_t instruction) {
@@ -44,6 +48,22 @@ void e_store(int width, int source, int address) {
     (void)source;
     (void)address;
     seen.stores++;
+}
+
+void emit_memory_guard(int address, uint64_t size, uint64_t rip, uint32_t required) {
+    (void)address;
+    (void)size;
+    (void)rip;
+    (void)required;
+}
+
+int emit_soft_memory_active(void) {
+    return soft_active;
+}
+
+void emit_soft_store_commit(uint64_t size) {
+    seen.commits++;
+    seen.committed_size = size;
 }
 
 int byte_val(struct insn *insn, int register_number, int scratch) {
@@ -126,5 +146,18 @@ int main(void) {
     HL_CHECK(hl_x86_lower_sse4x(&insn, 0, &enabled) == TX_NEXT);
     HL_CHECK(seen.raw == 1);
     HL_CHECK(seen.instructions[0] == UINT32_C(0x4E181CC4));
+
+    reset_calls();
+    memset(&insn, 0, sizeof(insn));
+    insn.map3 = 3;
+    insn.op = 0x16;
+    insn.opsize = 8;
+    insn.rexW = 1;
+    insn.is_mem = 1;
+    insn.reg = 3;
+    soft_active = 1;
+    HL_CHECK(hl_x86_lower_sse4x(&insn, 8, &enabled) == TX_NEXT);
+    HL_CHECK(seen.addresses == 1 && seen.stores == 1);
+    HL_CHECK(seen.commits == 1 && seen.committed_size == 8);
     return 0;
 }

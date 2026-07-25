@@ -256,6 +256,9 @@ static void vfork_release_parent(void) {
 // never drift (clone3 was missing the W^X re-assert and the DIR*-cache drop).
 
 static void fork_child_hooks(struct cpu *c) {
+#ifdef G_SOFT_STATE_RESET
+    G_SOFT_STATE_RESET(c);
+#endif
     hl_engine_child_result_after_fork();
     atomic_flag_clear_explicit(&g_bus_lock, memory_order_release);
     // Re-assert MAP_JIT execute mode: the per-thread W^X/APRR state isn't reliable across fork(),
@@ -274,8 +277,8 @@ static void fork_child_hooks(struct cpu *c) {
         c->exit_code = 70;
         c->exited = 1;
         return;
-    }                           // dual map: re-alias RX from the child's COW RW pages at the same VA (~1us; keeps
-                                // every inherited translation valid) -- or, threaded parent, rebuild a fresh cache
+    } // dual map: re-alias RX from the child's COW RW pages at the same VA (~1us; keeps
+      // every inherited translation valid) -- or, threaded parent, rebuild a fresh cache
 #ifdef PCACHE_FORK_HOOK
     PCACHE_FORK_HOOK; // drop inherited reloc records + bar child saves (an execve re-keys + unbars)
 #endif
@@ -290,8 +293,8 @@ static void fork_child_hooks(struct cpu *c) {
     // S2: invalidate inherited path/metadata caches so the child cannot serve an
     // entry populated before the filesystem diverged.
     hl_fdcache_reset();
-    g_ndirs = 0; // the getdents DIR* cache is the PARENT's -- closedir'ing inherited handles
-                 // (on the child's close) crashes; drop it so the child re-fdopendir's fresh
+    g_ndirs = 0;                 // the getdents DIR* cache is the PARENT's -- closedir'ing inherited handles
+                                 // (on the child's close) crashes; drop it so the child re-fdopendir's fresh
     kqueue_rebuild_after_fork(); // macOS kqueue() fds (epoll/timerfd/inotify) don't survive fork ->
                                  // rebuild them so the child doesn't EBADF on its inherited event fds
                                  // (also reinits g_ep_mtx, inherited-locked if a peer forked mid-epoll)
@@ -343,8 +346,9 @@ static int bound_fork_prepare(bound_fork_state *state) {
     // Records are populated only up to plan->count (each written via a fully-designated compound literal) and
     // read only over [0,count); the tail is never inspected, so the worst-case-sized buffer needs no zero-fill.
     // malloc avoids the per-fork memset of a capacity-sized (ofd_capacity) block that calloc would perform.
-    state->watch_plan.records =
-        state->watch_plan.capacity == 0 ? NULL : malloc((size_t)state->watch_plan.capacity * sizeof(*state->watch_plan.records));
+    state->watch_plan.records = state->watch_plan.capacity == 0
+                                    ? NULL
+                                    : malloc((size_t)state->watch_plan.capacity * sizeof(*state->watch_plan.records));
     if (state->watch_plan.capacity != 0 && state->watch_plan.records == NULL) { return -ENOMEM; }
     if (bound_mapping_fork_prepare(&state->watch_plan) != 0) {
         free(state->watch_plan.records);
@@ -446,12 +450,12 @@ static int bound_fork_complete(bound_fork_state *state, int child, int child_pid
 // prctl per-process flags the kernel tracks and reports back on the matching GET (lsys-prctl-*):
 // no-new-privs is sticky (once set it can never clear), dumpable defaults to 1, pdeathsig defaults to 0.
 // (g_nnp lives in container/state.c so the /proc/self/status builder can report NoNewPrivs consistently.)
-static int g_dumpable = 1;              // PR_SET/GET_DUMPABLE
-static int g_pdeathsig;                  // PR_SET/GET_PDEATHSIG
+static int g_dumpable = 1;                 // PR_SET/GET_DUMPABLE
+static int g_pdeathsig;                    // PR_SET/GET_PDEATHSIG
 static unsigned long g_timerslack = 50000; // PR_SET/GET_TIMERSLACK (ns); Linux default is 50us
-static int g_thp_disable;  // PR_SET/GET_THP_DISABLE (per-process transparent-hugepage opt-out)
-static int g_subreaper;    // PR_SET/GET_CHILD_SUBREAPER (this process is a reaper for orphans)
-static int g_mce_kill = 2;  // PR_MCE_KILL/PR_MCE_KILL_GET machine-check policy: LATE=0, EARLY=1, DEFAULT=2
+static int g_thp_disable;                  // PR_SET/GET_THP_DISABLE (per-process transparent-hugepage opt-out)
+static int g_subreaper;                    // PR_SET/GET_CHILD_SUBREAPER (this process is a reaper for orphans)
+static int g_mce_kill = 2; // PR_MCE_KILL/PR_MCE_KILL_GET machine-check policy: LATE=0, EARLY=1, DEFAULT=2
 // The process EFFECTIVE capability set. The container starts as full root (all caps); we don't model
 // per-capability ENFORCEMENT in general, but we DO track what capset(2) leaves in the effective set so the
 // few prctl options the kernel gates on a specific capability (PR_SET_SECUREBITS / PR_CAPBSET_DROP need
@@ -551,13 +555,14 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // 0, so libcap-ng negotiated a bogus (0) version and capng_apply() then failed WITHOUT setting errno
     // -> setpriv aborts "activate capabilities: Success" before it ever reaches capset. Model it properly.
     case 90: {
-        // header (version + pid = 8 bytes) must be readable; NULL / outside the address space -> EFAULT
-        // (LTP capget02 "bad address header"). guest_bad_ptr also catches a PROT_NONE tst_get_bad_addr page.
-        if (!a0 || guest_bad_ptr(a0, 8)) {
+        uint32_t header[2];
+        // Import through the logical-VMA resolver: the header may live in canonical storage rather than at
+        // its Linux-visible address.
+        if (!a0 || guest_copy_from(header, a0, sizeof header) != sizeof header) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        uint32_t ver = *(uint32_t *)a0;
+        uint32_t ver = header[0];
         int u32s; // number of __user_cap_data_struct the version spans
         switch (ver) {
         case 0x19980330: u32s = 1; break; // _LINUX_CAPABILITY_VERSION_1 (1 u32 mask)
@@ -567,13 +572,17 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             // kernel cap_validate_magic: rewrite header->version to its preferred (v3). A pure version
             // probe (data==NULL) then succeeds; otherwise it is EINVAL (LTP capget02 "bad version" +
             // the libcap-ng negotiation probe). The rewrite is what the test asserts on afterwards.
-            *(uint32_t *)a0 = 0x20080522;
+            header[0] = 0x20080522;
+            if (guest_copy_to(a0, header, sizeof(uint32_t)) != sizeof(uint32_t)) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
             G_RET(c) = a1 ? (uint64_t)(-EINVAL) : 0;
             goto cap_done;
         }
         // header->pid selects the target task: <0 -> EINVAL, a dead pid -> ESRCH (LTP capget02
         // "bad pid"/"unused pid"). 0/self/our own tid/pid resolve to this process (capget01 uses getpid()).
-        int tpid = *(int *)(a0 + 4);
+        int tpid = (int)header[1];
         if (tpid < 0) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
@@ -588,11 +597,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // ACTUAL effective set -- g_cap_eff, narrowed by any capset() drop (e.g. a dropped CAP_NET_RAW,
         // LTP capget01 / task D) -- rather than a blanket all-ones that over-reports capabilities.
         if (a1) {
-            if (guest_bad_ptr(a1, (size_t)u32s * 12)) {
-                G_RET(c) = (uint64_t)(-EFAULT);
-                break;
-            }
-            uint32_t *d = (uint32_t *)a1;
+            uint32_t d[6] = {0};
             for (int i = 0; i < u32s; i++) {
                 uint32_t eff = (i == 0) ? (uint32_t)g_cap_eff : (uint32_t)(g_cap_eff >> 32);
                 // permitted = the docker default 14-cap set (HL_CAP_DEFAULT), NOT a blanket all-ones: a
@@ -603,6 +608,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 d[i * 3 + 1] = prm; // permitted: the docker default bounding/permitted set
                 d[i * 3 + 2] = 0;   // inheritable: empty (Docker default)
             }
+            size_t bytes = (size_t)u32s * 12;
+            if (guest_copy_to(a1, d, bytes) != (ssize_t)bytes) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
         }
         G_RET(c) = 0;
     cap_done:
@@ -612,13 +622,19 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // rewritten to v3), so a libcap-ng probe sees a consistent kernel; otherwise honour the request (the
     // container is root -- we don't model per-cap enforcement, so any well-formed set "succeeds").
     case 91: {
-        if (a0 && host_range_mapped(a0, 4)) {
-            uint32_t ver = *(uint32_t *)a0;
-            if (ver != 0x19980330 && ver != 0x20071026 && ver != 0x20080522) {
-                *(uint32_t *)a0 = 0x20080522;
+        uint32_t header[2];
+        if (!a0 || guest_copy_from(header, a0, sizeof header) != sizeof header) {
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
+        uint32_t ver = header[0];
+        if (ver != 0x19980330 && ver != 0x20071026 && ver != 0x20080522) {
+            uint32_t preferred = 0x20080522;
+            if (guest_copy_to(a0, &preferred, sizeof preferred) != sizeof preferred)
+                G_RET(c) = (uint64_t)(-EFAULT);
+            else
                 G_RET(c) = (uint64_t)(-EINVAL);
-                break;
-            }
+            break;
         }
         // a capset re-raises EFFECTIVE caps from the PERMITTED set (the only bits it may set). After a
         // KEEPCAPS uid drop this is how setpriv restores effective CAP_SETGID so its following setresgid works.
@@ -627,16 +643,16 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // Track the effective set the guest just asked for, so a capability-gated prctl (PR_SET_SECUREBITS /
         // PR_CAPBSET_DROP) reflects a dropped CAP_SETPCAP. datap is {effective,permitted,inheritable}[u32s];
         // effective words are at data[i*3+0]. v1 spans the low 32 caps, v3 the full 64.
-        if (a1 && host_range_mapped(a1, 12)) {
-            uint32_t ver = (a0 && host_range_mapped(a0, 4)) ? *(uint32_t *)a0 : 0x20080522u;
-            int u32s = (ver == 0x19980330u) ? 1 : 2;
-            uint32_t *d = (uint32_t *)a1;
-            if (u32s == 1 || host_range_mapped(a1, 24)) {
-                uint64_t eff = d[0];
-                if (u32s == 2) eff |= (uint64_t)d[3] << 32;
-                g_cap_eff = eff;
-            }
+        int u32s = (ver == 0x19980330u) ? 1 : 2;
+        uint32_t d[6];
+        size_t bytes = (size_t)u32s * 12;
+        if (!a1 || guest_copy_from(d, a1, bytes) != (ssize_t)bytes) {
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
         }
+        uint64_t eff = d[0];
+        if (u32s == 2) eff |= (uint64_t)d[3] << 32;
+        g_cap_eff = eff;
         G_RET(c) = 0;
         break;
     }
@@ -645,8 +661,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // host path -- then record it as the new chroot prefix. Subsequent absolute guest paths are walked
     // under this prefix yet stay confined to g_root_fd, so the guest cannot escape to the real host fs.
     case 51: {
-        char gabs[4200];
-        abs_guest(-100, (const char *)nonpie_p(a0), gabs, sizeof gabs); // (AT_FDCWD, path) -> guest-view abs
+        char guest_path[4200], gabs[4200];
+        int imported = guest_copy_string(guest_path, sizeof guest_path, a0);
+        if (imported < 0) {
+            G_RET(c) = (uint64_t)(int64_t)imported;
+            break;
+        }
+        abs_guest(-100, guest_path, gabs, sizeof gabs); // (AT_FDCWD, path) -> guest-view abs
         char hp[4200];
         const char *h = xresolve_overlay(gabs, hp, sizeof hp); // host backing (honors any chroot already set)
         struct stat st;
@@ -702,11 +723,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
 #ifdef PCACHE_SAVE_HOOK
         PCACHE_SAVE_HOOK; // persist the translated arena before one-shot exit when HL_PCACHE is active
 #endif
-        futex_robust_exit(c); // robust mutexes still held by the calling thread -> OWNER_DIED + wake waiters
+        futex_robust_exit(c);   // robust mutexes still held by the calling thread -> OWNER_DIED + wake waiters
         udp_ref_process_exit(); // unlink AF_UNIX rendezvous inodes whose last owner is this exiting process
-        acct_proc_leave();    // release this process's cgroup accounting slot (_exit bypasses atexit)
-        proc_reg_unlink();    // drop our /proc process-table entry (_exit bypasses the atexit handler)
-        proc_fdvis_cleanup(); // retire typed logical-fd identities (_exit bypasses the atexit handler)
+        acct_proc_leave();      // release this process's cgroup accounting slot (_exit bypasses atexit)
+        proc_reg_unlink();      // drop our /proc process-table entry (_exit bypasses the atexit handler)
+        proc_fdvis_cleanup();   // retire typed logical-fd identities (_exit bypasses the atexit handler)
         hl_host_process_fd_private_cleanup(); // retire provider-private descriptors for this process identity
         poslk_on_exit();                      // release this process's in-engine fcntl advisory locks
         sysv_on_exit();                       // apply SEM_UNDO + GC this container's SysV objects (_exit skips atexit)
@@ -733,11 +754,55 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // first). Fake success on setns(-1, ...) would let isolation setup proceed on a false premise.
     case 268: G_RET(c) = ((int)a0 < 0) ? (uint64_t)(int64_t)(-EBADF) : 0; break;
     // futex
-    case 98: // futex(uaddr, op, val, timeout|nr_wake2=a3, uaddr2=a4, val3=a5); a3 is a timespec* for WAIT
-        // ops and a wake count for WAKE_OP -- pass it both ways, the op selects the interpretation.
-        G_RET(c) = (uint64_t)futex_op(c, (int *)a0, (int)a1 & 0x7f, ((int)a1 & 0x80) != 0, (int)a2,
-                                      (struct timespec *)a3, (int)a3, (int *)a4, (uint32_t)a5);
+    case 98: { // futex(uaddr, op, val, timeout|nr_wake2=a3, uaddr2=a4, val3=a5)
+        int operation = (int)a1 & 0x7f;
+        void *primary = NULL, *secondary = NULL, *timeout = (void *)(uintptr_t)a3;
+        hl_logical_vma_pin primary_pin = {0}, secondary_pin = {0}, timeout_pin = {0};
+        if (a0 & 3) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
+        uint32_t primary_access = HL_LOGICAL_VMA_READ;
+        if (operation == 6 || operation == 7 || operation == 8 || operation == 13)
+            primary_access |= HL_LOGICAL_VMA_WRITE;
+        if (guest_atomic_address(a0, sizeof(uint32_t), primary_access, &primary, &primary_pin) < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
+        if (a4 && (operation == 3 || operation == 4 || operation == 5 || operation == 11 || operation == 12)) {
+            if (a4 & 3) {
+                hl_logical_vma_unpin(&primary_pin);
+                G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+                break;
+            }
+            uint32_t secondary_access = HL_LOGICAL_VMA_READ;
+            if (operation == 5 || operation == 11 || operation == 12) secondary_access |= HL_LOGICAL_VMA_WRITE;
+            if (guest_atomic_address(a4, sizeof(uint32_t), secondary_access, &secondary, &secondary_pin) < 0) {
+                hl_logical_vma_unpin(&primary_pin);
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+        } else {
+            secondary = (void *)(uintptr_t)a4;
+        }
+        if (a3 && (operation == 0 || operation == 6 || operation == 9 || operation == 11 || operation == 13) &&
+            guest_atomic_address(a3, sizeof(struct timespec), HL_LOGICAL_VMA_READ, &timeout, &timeout_pin) < 0) {
+            hl_logical_vma_unpin(&primary_pin);
+            hl_logical_vma_unpin(&secondary_pin);
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
+        // a3 is a timespec* for waits and a wake count for WAKE_OP; operation selects its interpretation.
+        int is_private = ((int)a1 & 0x80) != 0;
+        const void *primary_key = is_private ? (const void *)(uintptr_t)a0 : primary;
+        const void *secondary_key = is_private ? (const void *)(uintptr_t)a4 : secondary;
+        G_RET(c) = (uint64_t)futex_op(c, primary, primary_key, operation, is_private, (int)a2, timeout, (int)a3,
+                                      secondary, secondary_key, (uint32_t)a5);
+        hl_logical_vma_unpin(&timeout_pin);
+        hl_logical_vma_unpin(&secondary_pin);
+        hl_logical_vma_unpin(&primary_pin);
         break;
+    }
     // set_robust_list(head, len): record the per-thread robust-list head (walked on exit to mark OWNER_DIED +
     // wake robust-mutex waiters). Linux rejects len != sizeof(struct robust_list_head) (24 on LP64).
     case 99:
@@ -754,11 +819,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // set) so a later getaffinity reflects the pin; -EINVAL if it selects no online CPU, as on Linux.
     case 122: {
         size_t n = (size_t)a1;
+        size_t copy = n < 128 ? n : 128;
+        uint8_t mask[128] = {0};
         // Linux get_user_cpu_mask() copy_from_user()s min(len, cpumask_size) bytes FIRST -> a bad mask pointer
         // (with len>0) is -EFAULT before anything else. The old handler read the guest mask straight through in
         // hl_linux_affinity_set(), so an unmapped pointer SEGV'd the engine instead of returning EFAULT. len==0
         // copies nothing (no fault) and falls through to the empty-mask -EINVAL below.
-        if (n && !host_range_mapped((uintptr_t)a2, n < 128 ? n : 128)) {
+        if (copy && guest_copy_from(mask, a2, copy) != (ssize_t)copy) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
@@ -768,7 +835,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-ESRCH);
             break;
         }
-        if (!hl_linux_affinity_set(&g_affinity, (const uint8_t *)a2, n, linux_online_cpus())) {
+        if (!hl_linux_affinity_set(&g_affinity, mask, copy, linux_online_cpus())) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
@@ -798,14 +865,18 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // NULL is not exempt: the size check above already guarantees n >= sizeof(long), so Linux always
         // copies out and sched_getaffinity(0, sizeof(mask), NULL) is -EFAULT. The old `a2 &&` guard made a
         // NULL mask "succeed" (returning the byte count) while writing nothing.
-        if (n && !host_range_mapped((uintptr_t)a2, n < 128 ? n : 128)) {
+        size_t copy = n < 128 ? n : 128;
+        if (copy && guest_accessible_prefix(a2, copy, HL_LOGICAL_VMA_WRITE) != copy) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        if (n > 128) n = 128;
-        if (n) memcpy((void *)a2, hl_linux_affinity_get(&g_affinity, linux_online_cpus()), n);
+        if (copy &&
+            guest_copy_to(a2, hl_linux_affinity_get(&g_affinity, linux_online_cpus()), copy) != (ssize_t)copy) {
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
         // Return the number of bytes the mask spans (glibc zeroes the remainder); 8 covers <=64 CPUs.
-        G_RET(c) = n < 8 ? (uint64_t)n : 8;
+        G_RET(c) = copy < 8 ? (uint64_t)copy : 8;
         break;
     }
     // sched_yield
@@ -820,12 +891,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         } // do_sched_setscheduler: !param||pid<0
-        if (guest_bad_ptr(a1, sizeof(int))) {
+        int prio;
+        if (guest_copy_from(&prio, a1, sizeof prio) != sizeof prio) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        int prio;
-        memcpy(&prio, (void *)a1, sizeof(int));
         if (sched_pid_live(pid) < 0) {
             G_RET(c) = (uint64_t)(-ESRCH);
             break;
@@ -847,12 +917,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         } // !param || pid<0
-        if (guest_bad_ptr(a2, sizeof(int))) {
+        int prio;
+        if (guest_copy_from(&prio, a2, sizeof prio) != sizeof prio) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         } // copy_from_user(param)
-        int prio;
-        memcpy(&prio, (void *)a2, sizeof(int));
         if (sched_pid_live(pid) < 0) {
             G_RET(c) = (uint64_t)(-ESRCH);
             break;
@@ -903,11 +972,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-ESRCH);
             break;
         }
-        if (guest_bad_ptr(a1, sizeof(int))) {
+        if (guest_copy_to(a1, &g_sched_prio, sizeof g_sched_prio) != sizeof g_sched_prio) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        memcpy((void *)a1, &g_sched_prio, sizeof(int)); // struct sched_param{int sched_priority}
         G_RET(c) = 0;
         break;
     }
@@ -943,12 +1011,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-ESRCH);
             break;
         }
-        if (guest_bad_ptr(a1, sizeof(struct timespec))) {
+        const uint64_t interval[2] = {0, 100000000};
+        if (guest_copy_to(a1, interval, sizeof interval) != sizeof interval) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        ((uint64_t *)a1)[0] = 0;         // tv_sec
-        ((uint64_t *)a1)[1] = 100000000; // tv_nsec = 100ms
         G_RET(c) = 0;
         break;
     }
@@ -1108,26 +1175,32 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // getresuid(r,e,s) -- report the overlay so a runtime drop is observed (apt verifies all three).
         // Linux faults the whole call if any output pointer is NULL/unwritable (EFAULT), writing none.
         cred_init();
-        if (!a0 || !a1 || !a2 || guest_bad_ptr(a0, 4) || guest_bad_ptr(a1, 4) || guest_bad_ptr(a2, 4)) {
+        if (!a0 || !a1 || !a2 || guest_accessible_prefix(a0, 4, HL_LOGICAL_VMA_WRITE) != 4 ||
+            guest_accessible_prefix(a1, 4, HL_LOGICAL_VMA_WRITE) != 4 ||
+            guest_accessible_prefix(a2, 4, HL_LOGICAL_VMA_WRITE) != 4) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        *(uint32_t *)a0 = (uint32_t)g_ruid;
-        *(uint32_t *)a1 = (uint32_t)g_euid;
-        *(uint32_t *)a2 = (uint32_t)g_suid;
+        uint32_t ids[3] = {(uint32_t)g_ruid, (uint32_t)g_euid, (uint32_t)g_suid};
+        (void)guest_copy_to(a0, ids, 4);
+        (void)guest_copy_to(a1, ids + 1, 4);
+        (void)guest_copy_to(a2, ids + 2, 4);
         G_RET(c) = 0;
         break;
     }
     case 150: {
         // getresgid(r,e,s) -- report the overlay (see getresuid above). NULL/unwritable pointer -> EFAULT.
         cred_init();
-        if (!a0 || !a1 || !a2 || guest_bad_ptr(a0, 4) || guest_bad_ptr(a1, 4) || guest_bad_ptr(a2, 4)) {
+        if (!a0 || !a1 || !a2 || guest_accessible_prefix(a0, 4, HL_LOGICAL_VMA_WRITE) != 4 ||
+            guest_accessible_prefix(a1, 4, HL_LOGICAL_VMA_WRITE) != 4 ||
+            guest_accessible_prefix(a2, 4, HL_LOGICAL_VMA_WRITE) != 4) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        *(uint32_t *)a0 = (uint32_t)g_rgid;
-        *(uint32_t *)a1 = (uint32_t)g_egid;
-        *(uint32_t *)a2 = (uint32_t)g_sgid;
+        uint32_t ids[3] = {(uint32_t)g_rgid, (uint32_t)g_egid, (uint32_t)g_sgid};
+        (void)guest_copy_to(a0, ids, 4);
+        (void)guest_copy_to(a1, ids + 1, 4);
+        (void)guest_copy_to(a2, ids + 2, 4);
         G_RET(c) = 0;
         break;
     }
@@ -1214,13 +1287,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 break;
             }
             if (a1) {
-                if (!host_range_mapped((uintptr_t)a1, (size_t)cnt * sizeof(gid_t))) {
+                size_t bytes = (size_t)cnt * sizeof(gid_t);
+                if (guest_copy_to(a1, g_groups, bytes) != (ssize_t)bytes) {
                     G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                     break;
                 }
-                gid_t *out = (gid_t *)a1;
-                for (int i = 0; i < cnt; i++)
-                    out[i] = g_groups[i];
             }
             G_RET(c) = (uint64_t)cnt;
             break;
@@ -1228,11 +1299,28 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if (g_gid >= 0) {
             // getgroups -> [effective gid]. Tracking the overlay's egid means apt's drop to _apt's group
             // is reflected here too (it setgroups(1,&_apt_gid) right before switching).
-            if ((int)a0 >= 1 && a1) *(gid_t *)a1 = (gid_t)cred_egid();
+            gid_t egid = (gid_t)cred_egid();
+            if ((int)a0 >= 1 && a1 && guest_copy_to(a1, &egid, sizeof egid) != sizeof egid) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
             G_RET(c) = 1;
             break;
         }
-        int r = getgroups((int)a0, (gid_t *)a1);
+        int count = (int)a0;
+        gid_t *groups = count > 0 ? calloc((size_t)count, sizeof *groups) : NULL;
+        if (count > 0 && !groups) {
+            G_RET(c) = (uint64_t)(-ENOMEM);
+            break;
+        }
+        int r = getgroups(count, groups);
+        if (r >= 0 && count > 0 && a1 &&
+            guest_copy_to(a1, groups, (size_t)r * sizeof *groups) != (ssize_t)((size_t)r * sizeof *groups)) {
+            free(groups);
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
+        free(groups);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -1250,14 +1338,12 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        if (ng > 0 && a1) {
-            if (!host_range_mapped((uintptr_t)a1, (size_t)ng * sizeof(gid_t))) {
+        if (ng > 0) {
+            if (!a1 || guest_copy_from(g_groups, a1, (size_t)ng * sizeof(gid_t)) !=
+                           (ssize_t)((size_t)ng * sizeof(gid_t))) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
-            const gid_t *in = (const gid_t *)a1;
-            for (long i = 0; i < ng; i++)
-                g_groups[i] = in[i];
         }
         g_ngroups = (int)ng;
         G_RET(c) = 0;
@@ -1280,14 +1366,16 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // bad/unmapped pointer must return -EFAULT here rather than fault the engine (access_ok).
         // NULL is NOT exempt: Linux always copy_to_user()s the buffer, so getrusage(RUSAGE_SELF, NULL)
         // is -EFAULT. The old `if (a1)` guard silently skipped the copy-out and returned success.
-        if (!host_range_mapped((uintptr_t)a1, 144)) {
+        if (guest_accessible_prefix(a1, 144, HL_LOGICAL_VMA_WRITE) != 144) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        uint8_t *d = (uint8_t *)a1;
-        // Linux struct rusage layout (18 longs)
-        memset(d, 0, 144);
-        if (getrusage(who, &ru) == 0) rusage_to_linux(d, &ru);
+        uint8_t linux_ru[144] = {0};
+        if (getrusage(who, &ru) == 0) rusage_to_linux(linux_ru, &ru);
+        if (guest_copy_to(a1, linux_ru, sizeof linux_ru) != sizeof linux_ru) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         G_RET(c) = 0;
         break;
     }
@@ -1296,21 +1384,32 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if ((int)a0 == 15) {
             // PR_SET_NAME: kernel copies up to 16 bytes from arg2 -> -EFAULT on an unreadable pointer
             // (LTP prctl02 PR_SET_NAME/bad_addr). Validate before the deref.
-            if (guest_bad_ptr((uintptr_t)a1, 1)) {
+            char name[16] = {0};
+            int name_fault = 0;
+            for (size_t i = 0; i < sizeof name; ++i) {
+                if (guest_copy_from(name + i, a1 + i, 1) != 1) {
+                    name_fault = 1;
+                    break;
+                }
+                if (!name[i]) break;
+            }
+            if (name_fault) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
-            snprintf(g_procname, sizeof g_procname, "%.15s", (const char *)a1);
+            name[15] = 0;
+            snprintf(g_procname, sizeof g_procname, "%.15s", name);
             set_guest_comm_name(g_procname); // keep /proc/self/{comm,status,stat} in sync with the new name
             G_RET(c) = 0;
             break;
         } // PR_SET_NAME
         if ((int)a0 == 16) {
-            if (guest_bad_ptr((uintptr_t)a1, 16)) {
+            char name[16] = {0};
+            snprintf(name, sizeof name, "%s", g_procname);
+            if (guest_copy_to(a1, name, sizeof name) != sizeof name) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
-            snprintf((char *)a1, 16, "%s", g_procname);
             G_RET(c) = 0;
             break;
         } // PR_GET_NAME
@@ -1358,11 +1457,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         if ((int)a0 == 2) {
-            if (guest_bad_ptr((uintptr_t)a1, sizeof(int))) {
+            if (guest_copy_to(a1, &g_pdeathsig, sizeof g_pdeathsig) != sizeof g_pdeathsig) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
-            *(int *)a1 = g_pdeathsig;
             G_RET(c) = 0;
             break;
         }
@@ -1420,11 +1518,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         if ((int)a0 == 37) {
-            if (guest_bad_ptr((uintptr_t)a1, sizeof(int))) {
+            if (guest_copy_to(a1, &g_subreaper, sizeof g_subreaper) != sizeof g_subreaper) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
-            *(int *)a1 = g_subreaper;
             G_RET(c) = 0;
             break;
         }
@@ -1734,7 +1831,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             // the child's *ctid (a4). CLONE_CHILD_CLEARTID(0x00200000): remember ctid so thread/process exit
             // zeroes it and FUTEX_WAKEs a joiner. The old code ignored both, so pthread/runtime handshakes
             // that read the child tid from these slots saw stale memory.
-            if ((a0 & 0x01000000) && a4) *(int *)a4 = (int)getpid();
+            if ((a0 & 0x01000000) && a4) {
+                int tid = (int)getpid();
+                (void)guest_copy_to(a4, &tid, sizeof tid);
+            }
             if (a0 & 0x00200000) c->ctid = a4;
         }
         // CLONE_PIDFD(0x1000): the kernel stores a pidfd for the new child at the address in `parent_tid`
@@ -1744,7 +1844,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // seeds it 0 -> fd 0 = stdin) and the wait blocks forever at 0% CPU -- the go/npm/cargo build hang.
         if (pid > 0 && (a0 & 0x1000) && a2) {
             int pfd = pidfd_make(pid);
-            if (pfd >= 0) *(int *)a2 = pfd;
+            if (pfd >= 0 && guest_copy_to(a2, &pfd, sizeof pfd) != sizeof pfd) {
+                close(pfd);
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
         }
         if (pid > 0) { // parent side of a successful fork: count it for /proc/stat processes + pids.current
             atomic_fetch_add(&g_forks_since_boot, 1);
@@ -1762,7 +1866,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         // CLONE_PARENT_SETTID(0x00100000): store the child's tid (its pid) into the PARENT's *ptid (a2).
         // Mutually exclusive with CLONE_PIDFD (which also uses the ptid slot), so it never clobbers a pidfd.
-        if (pid > 0 && (a0 & 0x00100000) && !(a0 & 0x1000) && a2) *(int *)a2 = (int)pid;
+        if (pid > 0 && (a0 & 0x00100000) && !(a0 & 0x1000) && a2) {
+            int parent_tid = (int)pid;
+            if (guest_copy_to(a2, &parent_tid, sizeof parent_tid) != sizeof parent_tid) {
+                G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+                break;
+            }
+        }
         // parent: pid, child: 0
         G_RET(c) = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
         // A fork/vfork that was normalized to clone repurposed the guest's arg registers; put them back so
@@ -1920,7 +2030,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                              realpath(interpreter, canonical) != NULL &&
                              strcmp(canonical, g_authorized_executable_path) == 0;
             }
-            if (!authorized) { G_RET(c) = (uint64_t)(-2); break; }
+            if (!authorized) {
+                G_RET(c) = (uint64_t)(-2);
+                break;
+            }
         }
         if (access(p, F_OK) != 0) {
             G_RET(c) = (uint64_t)(-2);
@@ -2098,8 +2211,8 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 g_sigact[s].mask = 0;
             }
         uint64_t heap;
-        if (hl_gmap_map_anonymous(0, 256u << 20, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
-                                  HL_HOST_MEMORY_PRIVATE, &heap) != HL_STATUS_OK)
+        if (hl_gmap_map_anonymous(0, 256u << 20, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_PRIVATE,
+                                  &heap) != HL_STATUS_OK)
             _exit(127);
         brk_lo = brk_cur = heap;
         brk_hi = brk_lo + (256u << 20);
@@ -2111,7 +2224,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         proc_reg_publish(gexe, ac, argv); // republish the process table entry (comm/argv changed on exec)
         free(xpath);
         for (int i = 0; i < ac && i < HL_MAXARGV - 1; i++) // mirror the strdup loop bound above; a 255 cap
-            free(xargv[i]);                                 // leaked xargv[255..ac-1] on every argc>255 execve
+            free(xargv[i]);                                // leaked xargv[255..ac-1] on every argc>255 execve
         G_RESET_REGS(c);
         c->nzcv = 0;
         G_TLS(c) = 0;
@@ -2124,7 +2237,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // wait4(pid, *status, opts, *rusage)
     case 260: {
         int st = 0;
+        int status_efault = 0;
         pid_t r;
+        struct rusage ruloc;
+        memset(&ruloc, 0, sizeof ruloc);
         // Linux validates the option bits BEFORE any child lookup: anything outside
         // WNOHANG|WUNTRACED|WCONTINUED|__WNOTHREAD|__WALL|__WCLONE is -EINVAL (waitpid04 case 3 passes
         // options 0xffffffff and expects EINVAL, not the ECHILD a permissive host wait4 returns). macOS
@@ -2140,6 +2256,10 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-ESRCH);
             break;
         }
+        if (a3 && guest_accessible_prefix(a3, 144, HL_LOGICAL_VMA_WRITE) != 144) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         // checkpoint restore: a wait targeting a specific checkpoint-time guest pid must name the live host
         // pid the tree was re-forked with (identity no-op on a normal launch when the pid map is empty).
         if (hl_linux_pidmap_count(&g_pidmap) != 0 && (int)a0 > 0)
@@ -2152,17 +2272,24 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // so this predicate is false. Returns 1 when it produced a result (r/st Linux-encoded).
         if (ptrace_wait_active()) {
             pid_t pr;
-            int handled = ptrace_wait(c, (pid_t)(int)a0, (int)a2, (struct rusage *)a3, &st, &pr);
+            int handled = ptrace_wait(c, (pid_t)(int)a0, (int)a2, a3 ? &ruloc : NULL, &st, &pr);
             if (handled) {
                 if (pr < 0) {
                     G_RET(c) = (uint64_t)(int64_t)pr;
                     break;
                 } // -errno / -EINTR
-                if (a1 && guest_bad_ptr((uintptr_t)a1, sizeof(int))) {
+                if (a1 && guest_copy_to(a1, &st, sizeof st) != sizeof st) {
                     G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                     break;
                 }
-                if (a1) *(int *)a1 = st;
+                if (a3) {
+                    uint8_t linux_ru[144];
+                    rusage_to_linux(linux_ru, &ruloc);
+                    if (guest_copy_to(a3, linux_ru, sizeof linux_ru) != sizeof linux_ru) {
+                        G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                        break;
+                    }
+                }
                 G_RET(c) = (uint64_t)pr;
                 break;
             }
@@ -2186,12 +2313,6 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if ((int)a2 & 1) mopt |= WNOHANG;
         if ((int)a2 & 2) mopt |= WUNTRACED;
         if ((int)a2 & 8) mopt |= WCONTINUED;
-        struct rusage ruloc;
-        memset(&ruloc, 0, sizeof ruloc);
-        if (a3 && !host_range_mapped((uintptr_t)a3, 144)) {
-            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
-            break;
-        }
         struct sigaction pt_saved;
         int pt_armed = ((int)a2 & 1 /*WNOHANG*/) ? 0 : pt_wait_arm(&pt_saved);
         // SA_RESTART: a wait interrupted by a handler that asked to restart (e.g. a SIGCHLD reaper, or
@@ -2203,18 +2324,25 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             // while blocked). Gated on nactive>0 -> the non-ptrace matrix never enters this branch.
             if (r < 0 && errno == EINTR && ptrace_wait_active() && ptrace_any_tracee_of_self()) {
                 pid_t pr;
-                if (ptrace_wait(c, (pid_t)(int)a0, (int)a2, (struct rusage *)a3, &st, &pr)) {
+                if (ptrace_wait(c, (pid_t)(int)a0, (int)a2, a3 ? &ruloc : NULL, &st, &pr)) {
                     pt_wait_disarm(pt_armed, &pt_saved);
                     ts_wait_leave();
                     if (pr < 0) {
                         G_RET(c) = (uint64_t)(int64_t)pr;
                         goto wait_done;
                     }
-                    if (a1 && guest_bad_ptr((uintptr_t)a1, sizeof(int))) {
+                    if (a1 && guest_copy_to(a1, &st, sizeof st) != sizeof st) {
                         G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                         goto wait_done;
                     }
-                    if (a1) *(int *)a1 = st;
+                    if (a3) {
+                        uint8_t linux_ru[144];
+                        rusage_to_linux(linux_ru, &ruloc);
+                        if (guest_copy_to(a3, linux_ru, sizeof linux_ru) != sizeof linux_ru) {
+                            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                            goto wait_done;
+                        }
+                    }
                     G_RET(c) = (uint64_t)pr;
                     goto wait_done;
                 }
@@ -2261,13 +2389,20 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             if (sigexit_lookup(r, &gsig, &gcore, 1)) st = (gsig & 0x7f) | (gcore ? 0x80 : 0);
         }
         // Fill the guest's Linux-layout rusage from the reaped child's host accounting (kilobyte-scaled).
-        if (a3 && r > 0) rusage_to_linux((uint8_t *)a3, &ruloc);
+        if (a3 && r > 0) {
+            uint8_t linux_ru[144];
+            rusage_to_linux(linux_ru, &ruloc);
+            if (guest_copy_to(a3, linux_ru, sizeof linux_ru) != sizeof linux_ru) {
+                status_efault = 1;
+                goto wait_reap_bookkeeping;
+            }
+        }
         // status copy_to_user: a non-NULL but unwritable status pointer is -EFAULT, exactly as the kernel's
         // put_user(status, stat_addr) after the child is already reaped (native wait4 releases the zombie THEN
         // faults, leaving nothing to re-reap -- verified on aarch64). Guard the direct guest write so a bad
         // pointer returns EFAULT instead of faulting the engine; the reap-side bookkeeping below still runs.
-        int status_efault = (a1 && guest_bad_ptr((uintptr_t)a1, sizeof(int)));
-        if (a1 && !status_efault) *(int *)a1 = st;
+        status_efault = a1 && guest_copy_to(a1, &st, sizeof st) != sizeof st;
+    wait_reap_bookkeeping:
         // guest-pid namespace: a reaped child that TERMINATED (exited or signalled -- not merely stopped
         // 0x7f / continued 0xffff) leaves the pid table; drop its container-registry record here so a
         // signal-killed child (which never ran its own exit cleanup) can't leave a stale membership marker
@@ -2305,14 +2440,21 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        if ((a2 && guest_bad_ptr((uintptr_t)a2, sizeof(uint64_t) * 2)) ||
-            (a3 && guest_bad_ptr((uintptr_t)a3, sizeof(uint64_t) * 2))) {
+        uint64_t new_limit[2], old_limit[2];
+        if ((a2 && guest_copy_from(new_limit, a2, sizeof(new_limit)) != sizeof(new_limit)) ||
+            (a3 && guest_accessible_prefix(a3, sizeof(old_limit), PROT_WRITE) != sizeof(old_limit))) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        if (a3) svc_fill_rlimit(res, (uint64_t *)a3);
+        if (a3) {
+            svc_fill_rlimit(res, old_limit);
+            if (guest_copy_to(a3, old_limit, sizeof(old_limit)) != sizeof(old_limit)) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+        }
         if (a2) {
-            const uint64_t *nl = (const uint64_t *)a2;
+            const uint64_t *nl = new_limit;
             uint64_t ncur = nl[0], nmax = nl[1];
             // Linux: soft may not exceed hard -> EINVAL (RLIM_INFINITY == ~0 is the max, so it never trips).
             if (ncur != ~0ull && nmax != ~0ull && ncur > nmax) {
@@ -2342,11 +2484,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        if (!host_range_mapped(a0, a1)) {
+        uint64_t ca[8];
+        if (guest_copy_from(ca, a0, sizeof ca) != sizeof ca) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        uint64_t *ca = (uint64_t *)a0;
         uint64_t flags = ca[0];
         // CLONE_THREAD: sp = stack + stack_size
         if (flags & 0x10000) {
@@ -2387,14 +2529,21 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             fork_child_hooks(c);
             // clone_args: child_tid = ca[2]. CLONE_CHILD_SETTID stores the child's tid there; CLONE_CHILD_
             // CLEARTID remembers it so exit zeroes it + wakes a joiner (mirrors case 220).
-            if ((flags & 0x01000000) && ca[2]) *(int *)ca[2] = (int)getpid();
+            if ((flags & 0x01000000) && ca[2]) {
+                int tid = (int)getpid();
+                (void)guest_copy_to(ca[2], &tid, sizeof tid);
+            }
             if (flags & 0x00200000) c->ctid = ca[2];
         }
         // CLONE_PIDFD: clone3 stores the child pidfd via the `pidfd` field (clone_args[1]); back it the same
         // way as case 220 so a clone3-based spawn (newer glibc/runtimes) can epoll_wait/poll it to reap.
         if (pid > 0 && (flags & 0x1000) && ca[1]) {
             int pfd = pidfd_make(pid);
-            if (pfd >= 0) *(int *)ca[1] = pfd;
+            if (pfd >= 0 && guest_copy_to(ca[1], &pfd, sizeof pfd) != sizeof pfd) {
+                close(pfd);
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
         }
         if (pid > 0) { // parent side of a successful clone3 fork: count it (see case 220)
             atomic_fetch_add(&g_forks_since_boot, 1);
@@ -2403,7 +2552,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         // clone_args: parent_tid = ca[3]. CLONE_PARENT_SETTID stores the child's tid (pid) into the PARENT's
         // parent_tid (a distinct field from pidfd in clone3, so it never conflicts with CLONE_PIDFD).
-        if (pid > 0 && (flags & 0x00100000) && ca[3]) *(int *)ca[3] = (int)pid;
+        if (pid > 0 && (flags & 0x00100000) && ca[3]) {
+            int tid = (int)pid;
+            if (guest_copy_to(ca[3], &tid, sizeof tid) != sizeof tid) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+        }
         G_RET(c) = pid < 0 ? (uint64_t)(-errno) : (uint64_t)pid;
         break;
     }

@@ -28,6 +28,7 @@
 // already reports current readiness), so only EPOLLET arms reach here -- level semantics are untouched.
 static struct kevent *g_ep_prime[HL_NFD];
 static int g_ep_primen[HL_NFD], g_ep_primecap[HL_NFD];
+
 static void ep_prime_push(int ep, uintptr_t ident, int16_t filt, void *udata) {
     if (ep < 0 || ep >= HL_NFD) return;
     struct kevent *a = g_ep_prime[ep];
@@ -122,6 +123,7 @@ static pthread_mutex_t g_ep_mtx = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t *g_ep_member[HL_NFD];
 
 #define EP_NATIVE_WATCH_LIMIT 16384
+
 typedef struct ep_native_watch {
     volatile uint8_t active;
     uint8_t owned;
@@ -132,6 +134,7 @@ typedef struct ep_native_watch {
     uint32_t armed;
     uint64_t data;
 } ep_native_watch;
+
 static ep_native_watch g_ep_native_watches[EP_NATIVE_WATCH_LIMIT];
 
 static ep_native_watch *ep_native_find(int epoll, int descriptor) {
@@ -160,8 +163,8 @@ static int ep_native_set(int epoll, int descriptor, int op, uint32_t events, uin
     if (!watch) {
         for (uint32_t index = 0; index < EP_NATIVE_WATCH_LIMIT; ++index) {
             uint8_t empty = 0;
-            if (__atomic_compare_exchange_n(&g_ep_native_watches[index].active, &empty, 2, 0,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            if (__atomic_compare_exchange_n(&g_ep_native_watches[index].active, &empty, 2, 0, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE)) {
                 watch = &g_ep_native_watches[index];
                 watch->epoll = epoll;
                 watch->descriptor = descriptor;
@@ -245,7 +248,8 @@ static int kqueue_scm_import(int fd, const struct hl_cmsg_kqueue_meta *metadata,
             if (dup2(source, fd) < 0) return -1;
             g_ep_dupd[source] = 1;
             hl_native_kqueue_duplicate(source, fd);
-        } else return epoll_scm_image_import(fd, metadata, marker) == 0 ? 1 : -1;
+        } else
+            return epoll_scm_image_import(fd, metadata, marker) == 0 ? 1 : -1;
         g_epoll[fd] = 1;
         g_ep_dupd[fd] = 1;
         g_ep_cslot[fd] = (uint16_t)(slot + 1);
@@ -270,7 +274,7 @@ static int kqueue_scm_import(int fd, const struct hl_cmsg_kqueue_meta *metadata,
             if (bound_snapshot((uint64_t)(uint32_t)source, &source_snapshot)) {
                 if (bound_shadow_install(fd) != fd) return -1;
                 int64_t duplicated = hl_linux_dup3(g_linux_box, (hl_linux_fd)source, (hl_linux_fd)fd,
-                                                    metadata->descriptor_flags ? HL_LINUX_O_CLOEXEC : 0);
+                                                   metadata->descriptor_flags ? HL_LINUX_O_CLOEXEC : 0);
                 hl_linux_fd_snapshot snapshot;
                 if (duplicated < 0 || !bound_snapshot((uint64_t)(uint32_t)fd, &snapshot) ||
                     bound_fdvis_publish_snapshot(fd, &snapshot) != 0) {
@@ -303,8 +307,8 @@ int epoll_scm_image_export(struct hl_cmsg_kqueue_meta *metadata, int marker) {
     for (uint32_t index = 0; index < EP_NATIVE_WATCH_LIMIT; ++index) {
         ep_native_watch *watch = &g_ep_native_watches[index];
         if (__atomic_load_n(&watch->active, __ATOMIC_ACQUIRE) != 1 || watch->epoll != slot) continue;
-        saved[written++] = (struct hl_cmsg_epoll_watch){watch->logical_descriptor, watch->events, watch->armed, 0,
-                                                        watch->data};
+        saved[written++] =
+            (struct hl_cmsg_epoll_watch){watch->logical_descriptor, watch->events, watch->armed, 0, watch->data};
     }
     int result = pwrite(marker, image, size, (off_t)sizeof *metadata) == (ssize_t)size ? 0 : -1;
     free(image);
@@ -317,9 +321,7 @@ static int epoll_scm_hidden_export(struct hl_cmsg_kqueue_meta *metadata, int *fd
     int count = 0;
     for (uint32_t index = 0; index < EP_NATIVE_WATCH_LIMIT; ++index) {
         ep_native_watch *watch = &g_ep_native_watches[index];
-        if (__atomic_load_n(&watch->active, __ATOMIC_ACQUIRE) != 1 ||
-            watch->epoll != metadata->canonical_fd)
-            continue;
+        if (__atomic_load_n(&watch->active, __ATOMIC_ACQUIRE) != 1 || watch->epoll != metadata->canonical_fd) continue;
         if (fds != NULL) {
             if (count >= capacity || fcntl(watch->descriptor, F_GETFD) < 0) return -1;
             fds[count] = watch->descriptor;
@@ -332,8 +334,7 @@ static int epoll_scm_hidden_export(struct hl_cmsg_kqueue_meta *metadata, int *fd
 
 static int epoll_scm_image_remap(const struct hl_cmsg_kqueue_meta *metadata, int marker, const int *fds) {
     if (metadata == NULL || metadata->kind != 1 || metadata->hidden_count == 0) return 0;
-    if (metadata->image_size != sizeof(uint32_t) +
-                                    (size_t)metadata->hidden_count * sizeof(struct hl_cmsg_epoll_watch))
+    if (metadata->image_size != sizeof(uint32_t) + (size_t)metadata->hidden_count * sizeof(struct hl_cmsg_epoll_watch))
         return -1;
     for (uint32_t index = 0; index < metadata->hidden_count; ++index) {
         off_t offset = (off_t)sizeof *metadata + (off_t)sizeof(uint32_t) +
@@ -382,8 +383,7 @@ int epoll_scm_image_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, i
     g_epoll_family_seen = 1;
     const struct hl_cmsg_epoll_watch *saved = (const void *)(image + sizeof count);
     for (uint32_t index = 0; index < count; ++index) {
-        if (saved[index].descriptor < 0 ||
-            (metadata->hidden_count == 0 && saved[index].descriptor >= HL_NFD) ||
+        if (saved[index].descriptor < 0 || (metadata->hidden_count == 0 && saved[index].descriptor >= HL_NFD) ||
             fcntl(saved[index].descriptor, F_GETFD) < 0) {
             fprintf(stderr, "[scm-epoll] hidden fd validation failed index=%u fd=%d errno=%d\n", index,
                     saved[index].descriptor, errno);
@@ -414,8 +414,8 @@ int epoll_scm_image_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, i
         if (native) {
             native->armed = saved[index].armed;
             native->owned = metadata->hidden_count != 0;
-            native->logical_descriptor = metadata->hidden_count != 0 ? (int32_t)saved[index].reserved
-                                                                      : saved[index].descriptor;
+            native->logical_descriptor =
+                metadata->hidden_count != 0 ? (int32_t)saved[index].reserved : saved[index].descriptor;
         }
         if (saved[index].descriptor < HL_NFD) {
             g_ep_owner[saved[index].descriptor] = fd + 1;
@@ -530,10 +530,10 @@ static void ep_close_rehome(int fd) {
         int count = 0;
         uint16_t flags = (uint16_t)((watch->events & UINT32_C(0x80000000) ? EV_CLEAR : 0) |
                                     (watch->events & UINT32_C(0x40000000) ? EV_ONESHOT : 0));
-        if (watch->armed & 1u) EV_SET(&changes[count++], y, EVFILT_READ, EV_ADD | flags, 0, 0,
-                                      (void *)(uintptr_t)watch->data);
-        if (watch->armed & 2u) EV_SET(&changes[count++], y, EVFILT_WRITE, EV_ADD | flags, 0, 0,
-                                      (void *)(uintptr_t)watch->data);
+        if (watch->armed & 1u)
+            EV_SET(&changes[count++], y, EVFILT_READ, EV_ADD | flags, 0, 0, (void *)(uintptr_t)watch->data);
+        if (watch->armed & 2u)
+            EV_SET(&changes[count++], y, EVFILT_WRITE, EV_ADD | flags, 0, 0, (void *)(uintptr_t)watch->data);
         if (count) (void)kevent(owner, changes, count, NULL, 0, NULL);
 #endif
         watch->descriptor = y;
@@ -544,7 +544,7 @@ static void ep_close_rehome(int fd) {
     if (!g_ep_owner[fd] || y < 0 || y >= HL_NFD || y == fd) return;
     int ep = g_ep_owner[fd] - 1;
     if (ep < 0 || ep >= HL_NFD || !g_epoll[ep] || fcntl(ep, F_GETFD) == -1) return; // epoll instance gone
-    if (g_ep_owner[y]) return;                   // the alias is already a watched fd of its own -> don't clobber
+    if (g_ep_owner[y]) return; // the alias is already a watched fd of its own -> don't clobber
     /* Native epoll keys the registration by the watched open-file description and retains it until its
        final alias closes.  Re-adding y would create or collide with a second registration; only the guest
        bookkeeping needs to follow the surviving descriptor. */
@@ -726,9 +726,8 @@ reinit_ep_mtx:
 // unblocked signal interrupt the host poll/select/kevent -- previously the mask was ignored and a
 // signal-driven wait slept the full timeout. `smptr` is the guest sigset_t address (bit signo-1), or 0 for
 // "no temporary mask". Returns 1 if a mask was installed (previous mask stored in *saved).
-static int poll_sigmask_enter(struct cpu *c, uint64_t smptr, uint64_t *saved) {
-    if (!smptr) return 0;
-    uint64_t nm = *(uint64_t *)smptr;
+static int poll_sigmask_enter(struct cpu *c, int have_mask, uint64_t nm, uint64_t *saved) {
+    if (!have_mask) return 0;
     nm &= ~((1ull << (9 - 1)) | (1ull << (19 - 1))); // SIGKILL/SIGSTOP can never be blocked
     *saved = c->sigmask;
     c->sigmask = nm;
@@ -794,9 +793,10 @@ static int socket_poll_error_fixup(struct pollfd *fds, nfds_t n, int r) {
 // and `sm_set` the guest sigset_t address (0 = no temporary mask). Sets G_RET(c) to the ready count
 // (>=0) or a negative errno. Extracted verbatim from case 22 so both entry points share one contract;
 // the only generalization is the ms->ns timeout so epoll_pwait2 honors sub-ms timespecs exactly.
-static void svc_epoll_wait_common(struct cpu *c, int ep, uint8_t *out, int maxev, int64_t timeout_ns,
-                                  uint64_t sm_set) {
+static void svc_epoll_wait_common(struct cpu *c, int ep, uint64_t guest_out, int maxev, int64_t timeout_ns,
+                                  int have_mask, uint64_t sm_set) {
     struct kevent kv[256];
+    uint8_t out[256 * G_EPEV_SZ];
     uint64_t sm_saved = 0;
     // A dup'd instance opts out of the deferred-changelist machinery (its interest was submitted straight
     // to the shared kqueue), so it just blocks on the kqueue like the immediate path.
@@ -819,7 +819,7 @@ static void svc_epoll_wait_common(struct cpu *c, int ep, uint8_t *out, int maxev
         }
     }
     int oi = 0;
-    int sm_on = poll_sigmask_enter(c, sm_set, &sm_saved);
+    int sm_on = poll_sigmask_enter(c, have_mask, sm_set, &sm_saved);
     for (;;) {
         struct timespec ts, *tp = NULL;
         if (timeout_ns == 0) {
@@ -901,7 +901,7 @@ static void svc_epoll_wait_common(struct cpu *c, int ep, uint8_t *out, int maxev
                     struct pollfd pf = {.fd = (int)kv[i].ident, .events = POLLIN, .revents = 0};
                     if (poll(&pf, 1, 0) >= 0) hup = (pf.revents & POLLHUP) != 0;
                 }
-                if (hup) ev |= 0x10u; // EPOLLHUP
+                if (hup) ev |= 0x10u;                                                            // EPOLLHUP
                 if (kv[i].ident < HL_NFD && (g_ep_events[kv[i].ident] & 0x2000u)) ev |= 0x2000u; // EPOLLRDHUP
             }
             // EPOLLERR (immediate-path semantics preserved when opt is off)
@@ -924,17 +924,15 @@ static void svc_epoll_wait_common(struct cpu *c, int ep, uint8_t *out, int maxev
         int registry_ep = epoll_slot(ep);
         uint32_t provider_ep_generation =
             registry_ep >= 0 && registry_ep < HL_NFD ? g_ep_provider_generations[registry_ep] : 0;
-        for (uint32_t provider_index = 0; provider_index < EP_PROVIDER_WATCH_LIMIT && oi < maxev;
-             ++provider_index) {
+        for (uint32_t provider_index = 0; provider_index < EP_PROVIDER_WATCH_LIMIT && oi < maxev; ++provider_index) {
             ep_provider_watch *provider_watch = &g_ep_provider_watches[provider_index];
             if (atomic_load_explicit(&provider_watch->state, memory_order_acquire) != EP_PROVIDER_ACTIVE ||
-                provider_watch->epoll != registry_ep ||
-                provider_watch->epoll_generation != provider_ep_generation)
+                provider_watch->epoll != registry_ep || provider_watch->epoll_generation != provider_ep_generation)
                 continue;
             hl_linux_fd_snapshot provider_snapshot;
             if (g_linux_box == NULL ||
-                hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)provider_watch->descriptor,
-                                         &provider_snapshot) != HL_STATUS_OK ||
+                hl_linux_fd_snapshot_get(g_linux_box, (hl_linux_fd)provider_watch->descriptor, &provider_snapshot) !=
+                    HL_STATUS_OK ||
                 provider_snapshot.descriptor_generation != provider_watch->descriptor_generation ||
                 provider_snapshot.host_handle != provider_watch->handle) {
                 ep_provider_retire(provider_watch);
@@ -942,14 +940,12 @@ static void svc_epoll_wait_common(struct cpu *c, int ep, uint8_t *out, int maxev
             }
             uint32_t level = 0;
             if (!(provider_watch->events & 0x80000000u) && !(provider_watch->events & 0x40000000u))
-                level = hl_provider_files_cached_readiness(provider_watch->handle,
-                                                           provider_watch->interests);
+                level = hl_provider_files_cached_readiness(provider_watch->handle, provider_watch->interests);
             int unsubscribe = 0;
             uint32_t provider_ready = ep_provider_take_ready(provider_watch, level, &unsubscribe);
             if (provider_ready == 0) continue;
             *(uint32_t *)(out + (size_t)oi * G_EPEV_SZ) = ep_provider_linux_events(provider_ready);
-            memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF,
-                   &provider_watch->data, sizeof(provider_watch->data));
+            memcpy(out + (size_t)oi * G_EPEV_SZ + G_EPEV_DOFF, &provider_watch->data, sizeof(provider_watch->data));
             if (unsubscribe) {
                 hl_provider_files_unsubscribe(provider_watch->handle, provider_watch,
                                               atomic_load(&provider_watch->serial));
@@ -1005,8 +1001,7 @@ static void svc_epoll_wait_common(struct cpu *c, int ep, uint8_t *out, int maxev
                     ep_object_free(ow); // the watched fd was closed or reused
                     continue;
                 }
-                if (hl_linux_object_pin_fd(g_linux_box, (hl_linux_fd)ow->descriptor, &opin) != HL_STATUS_OK)
-                    continue;
+                if (hl_linux_object_pin_fd(g_linux_box, (hl_linux_fd)ow->descriptor, &opin) != HL_STATUS_OK) continue;
                 uint32_t readiness = hl_linux_object_ready(&opin, ow->interests);
                 hl_linux_object_unpin(&opin);
                 uint32_t oev = ep_provider_linux_events(readiness);
@@ -1028,7 +1023,10 @@ static void svc_epoll_wait_common(struct cpu *c, int ep, uint8_t *out, int maxev
             int64_t rem = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);
             if (rem > 0) continue;
         }
-        G_RET(c) = (uint64_t)oi;
+        if (oi > 0 && guest_copy_to(guest_out, out, (size_t)oi * G_EPEV_SZ) != (ssize_t)((size_t)oi * G_EPEV_SZ))
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+        else
+            G_RET(c) = (uint64_t)oi;
         break;
     }
     if (sm_on) poll_sigmask_leave(c, sm_saved);
@@ -1091,10 +1089,10 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         }
         g_eventfd_peer[fds[0]] = peer + 1;
         g_eventfd_cslot[fds[0]] = fds[0] + 1;
-        g_eventfd_sema[fds[0]] = (a1 & 1) != 0;    // EFD_SEMAPHORE
+        g_eventfd_sema[fds[0]] = (a1 & 1) != 0;          // EFD_SEMAPHORE
         eventfd_guest_nb_set(fds[0], (a1 & 0x800) != 0); // OFD-shared guest non-blocking intent
-        g_eventfd_count[fds[0]] = a0;              // initval
-        g_eventfd_refs[fds[0]] = 1;                // one alias (this fd); dup() bumps it (fd_carry_virt)
+        g_eventfd_count[fds[0]] = a0;                    // initval
+        g_eventfd_refs[fds[0]] = 1;                      // one alias (this fd); dup() bumps it (fd_carry_virt)
         if (a0 > 0) {
             char b = 1;
             if (write(peer, &b, 1) < 0) {}
@@ -1133,6 +1131,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
     // epoll_ctl(epfd, op, fd, event) -> kevent
     case 21: {
         int op = (int)a1, fd = (int)a2, epfd = (int)a0;
+        uint8_t event[G_EPEV_SZ];
         int registry_ep = epoll_slot(epfd);
         uint32_t ev = 0;
         uint64_t data = (uint64_t)(unsigned)fd;
@@ -1142,7 +1141,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // so a well-formed ADD/MOD/DEL is behaviourally unchanged (it costs one extra fstat for the EBADF/
         // EPERM probe -- the ADD path already did that fstat).
         // (1) EFAULT: ADD(1)/MOD(3) -- any op that "has an event" (op != DEL) -- dereference `event`.
-        if (op != 2 && (!a3 || guest_bad_ptr((uintptr_t)a3, G_EPEV_SZ))) {
+        if (op != 2 && (!a3 || guest_copy_from(event, a3, G_EPEV_SZ) != G_EPEV_SZ)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
@@ -1179,23 +1178,23 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             break;
         }
         if (a3) {
-            ev = *(uint32_t *)a3;
-            memcpy(&data, (void *)(a3 + G_EPEV_DOFF), 8);
+            if (op == 2 && guest_copy_from(event, a3, G_EPEV_SZ) != G_EPEV_SZ) memset(event, 0, sizeof(event));
+            memcpy(&ev, event, sizeof(ev));
+            memcpy(&data, event + G_EPEV_DOFF, 8);
             // struct epoll_event {u32 events; [pad;] u64 data} -- layout per guest arch (see G_EPEV_*)
         }
         // EPOLLEXCLUSIVE (1<<28) may be specified only at EPOLL_CTL_ADD. Linux (fs/eventpoll.c) rejects it in
         // an EPOLL_CTL_MOD event, and rejects any EPOLL_CTL_MOD of a registration that was ADDed exclusive,
         // both with EINVAL. Checked before the membership ENOENT probe to match the kernel's error order.
-        if (op == 3 && ((ev & 0x10000000u) ||
-                        (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && fd >= 0 && fd < HL_NFD &&
-                         (g_ep_events[fd] & 0x10000000u)))) {
+        if (op == 3 && ((ev & 0x10000000u) || (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && fd >= 0 && fd < HL_NFD &&
+                                               (g_ep_events[fd] & 0x10000000u)))) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
         // (7/8/9) EEXIST (ADD an already-registered fd) / ENOENT (MOD|DEL an absent fd) on a engine-tracked epoll
         // instance (membership bitmap). Confined to fd < HL_NFD, matching the readiness path below.
-        if (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && registry_ep >= 0 && registry_ep < HL_NFD &&
-            fd >= 0 && fd < HL_NFD) {
+        if (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && registry_ep >= 0 && registry_ep < HL_NFD && fd >= 0 &&
+            fd < HL_NFD) {
             int ep = registry_ep;
             int member = ep_mem_test(ep, fd);
             if (op == 1 && member) {
@@ -1212,8 +1211,8 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // survives fork (re-armed on the rebuilt child kqueue) and a watched-fd close whose OFD lives on via a
         // dup (re-homed onto the surviving alias). DEL drops the entry. Confined to in-range epfd/fd, matching
         // the readiness path; a couple of fd-indexed stores, so the epoll_ctl hot path is essentially unchanged.
-        if (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && registry_ep >= 0 && registry_ep < HL_NFD &&
-            fd >= 0 && fd < HL_NFD) {
+        if (epfd >= 0 && epfd < HL_NFD && g_epoll[epfd] && registry_ep >= 0 && registry_ep < HL_NFD && fd >= 0 &&
+            fd < HL_NFD) {
             if (op == 2) { // DEL
                 g_ep_owner[fd] = 0;
                 g_ep_events[fd] = 0;
@@ -1240,8 +1239,10 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             if (want_rd) {
                 ep_push(ep, fd, EVFILT_READ, EV_ADD | xf, (void *)data);
                 g_ep_rd[fd] = 1;
-                if (xf & EV_CLEAR) ep_prime_if_ready(ep, fd, EVFILT_READ, (void *)data);
-                else if (lk) ep_submit_ready_level(ep, fd, EVFILT_READ, xf, (void *)data);
+                if (xf & EV_CLEAR)
+                    ep_prime_if_ready(ep, fd, EVFILT_READ, (void *)data);
+                else if (lk)
+                    ep_submit_ready_level(ep, fd, EVFILT_READ, xf, (void *)data);
             } else if (g_ep_rd[fd]) {
                 ep_push(ep, fd, EVFILT_READ, EV_DELETE, (void *)data);
                 g_ep_rd[fd] = 0;
@@ -1249,8 +1250,10 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             if (want_wr) {
                 ep_push(ep, fd, EVFILT_WRITE, EV_ADD | xf, (void *)data);
                 g_ep_wr[fd] = 1;
-                if (xf & EV_CLEAR) ep_prime_if_ready(ep, fd, EVFILT_WRITE, (void *)data);
-                else if (lk) ep_submit_ready_level(ep, fd, EVFILT_WRITE, xf, (void *)data);
+                if (xf & EV_CLEAR)
+                    ep_prime_if_ready(ep, fd, EVFILT_WRITE, (void *)data);
+                else if (lk)
+                    ep_submit_ready_level(ep, fd, EVFILT_WRITE, xf, (void *)data);
             } else if (g_ep_wr[fd]) {
                 ep_push(ep, fd, EVFILT_WRITE, EV_DELETE, (void *)data);
                 g_ep_wr[fd] = 0;
@@ -1314,22 +1317,23 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // epoll_pwait(epfd, events, max, tmo, sigmask, sigsetsize): a4 is the guest sigset_t pointer, a5 its
         // size. Apply the temporary signal mask for the wait (Linux swaps it atomically); NULL a4 = no mask.
         uint64_t sm_set = 0;
+        int have_mask = 0;
         if (a4) {
             if ((size_t)a5 != 8) {
                 G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
                 break;
             }
-            if (guest_bad_ptr(a4, 8)) {
+            if (guest_copy_from(&sm_set, a4, sizeof(sm_set)) != sizeof(sm_set)) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
-            sm_set = a4;
+            have_mask = 1;
         }
         // guest timeout ms (a3): <0 = infinite, 0 = poll, >0 = finite. Widen to nanoseconds for the
         // shared wait core (which epoll_pwait2 also drives with a sub-ms timespec).
         int32_t tmo_ms = (int32_t)a3;
         int64_t timeout_ns = tmo_ms < 0 ? -1 : (int64_t)tmo_ms * 1000000LL;
-        svc_epoll_wait_common(c, (int)a0, (uint8_t *)a1, maxev, timeout_ns, sm_set);
+        svc_epoll_wait_common(c, (int)a0, a1, maxev, timeout_ns, have_mask, sm_set);
         break;
     }
     // epoll_pwait2(epfd, events, max, timeout(const struct timespec*), sigmask, sigsetsize)
@@ -1349,31 +1353,32 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // and fold it to a single nanosecond budget for the shared wait core.
         int64_t timeout_ns = -1;
         if (a3) {
-            if (guest_bad_ptr(a3, sizeof(struct timespec))) {
+            struct timespec to;
+            if (guest_copy_from(&to, a3, sizeof(to)) != sizeof(to)) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
-            const struct timespec *to = (const struct timespec *)a3;
-            if (to->tv_sec < 0 || to->tv_nsec < 0 || to->tv_nsec >= 1000000000L) {
+            if (to.tv_sec < 0 || to.tv_nsec < 0 || to.tv_nsec >= 1000000000L) {
                 G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
                 break;
             }
-            timeout_ns = (int64_t)to->tv_sec * 1000000000LL + to->tv_nsec;
+            timeout_ns = (int64_t)to.tv_sec * 1000000000LL + to.tv_nsec;
         }
         // sigmask (a4) + sigsetsize (a5): identical contract to epoll_pwait -- size must be 8, mask readable.
         uint64_t sm_set = 0;
+        int have_mask = 0;
         if (a4) {
             if ((size_t)a5 != 8) {
                 G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
                 break;
             }
-            if (guest_bad_ptr(a4, 8)) {
+            if (guest_copy_from(&sm_set, a4, sizeof(sm_set)) != sizeof(sm_set)) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
-            sm_set = a4;
+            have_mask = 1;
         }
-        svc_epoll_wait_common(c, (int)a0, (uint8_t *)a1, maxev, timeout_ns, sm_set);
+        svc_epoll_wait_common(c, (int)a0, a1, maxev, timeout_ns, have_mask, sm_set);
         break;
     }
     case 26: {
@@ -1412,17 +1417,18 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
     // inotify_add_watch(fd, path, mask) -- kqueue EVFILT_VNODE
     case 27: {
         char pb[4200];
+        char imported_path[4200];
         // EFAULT on an inaccessible path pointer BEFORE atpath dereferences it -- inotify_add_watch(fd, NULL,
         // mask) and a wild/unmapped path both return -EFAULT on Linux; without this guard atpath reads the
         // unmapped guest address and the engine SIGSEGVs (guest-triggerable crash). guest_bad_ptr also catches
         // a PROT_NONE guard page that host_range_mapped alone would miss. Mirrors the sibling *at path syscalls
         // in fs.c (openat/newfstatat/unlinkat all guard `!a1 || guest_bad_ptr(a1, 1)` first).
-        if (!a1 || guest_bad_ptr((uintptr_t)a1, 1)) {
+        if (guest_copy_string(imported_path, sizeof imported_path, a1) < 0) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
         // confined (realpath gate)
-        const char *p = atpath(-100, (const char *)a1, pb, sizeof pb, 0);
+        const char *p = atpath(-100, imported_path, pb, sizeof pb, 0);
 #if defined(__linux__)
         int wd = inotify_add_watch((int)a0, p, (uint32_t)a2);
         if (wd >= 0 && wd < HL_NFD) {
@@ -1492,20 +1498,28 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
     case 72: { // pselect6(nfds, readfds, writefds, exceptfds, timeout(timespec), sigmask) -> pselect.
         // The Linux/macOS fd_set byte-layout is identical (bit N at byte N/8), so pass the sets through.
         int have_to = a4 != 0;
+        fd_set read_set, write_set, except_set;
+        fd_set *read_host = NULL, *write_host = NULL, *except_host = NULL;
+        struct timespec timeout_value;
         // EFAULT on any inaccessible fd_set / timeout pointer -- incl. a PROT_NONE guard page (LTP's
         // tst_get_bad_addr), which host_range_mapped alone misses since hl force-maps guest anon host-RW.
         int selnfds = (int)a0;
         size_t nb = selnfds > 0 ? ((size_t)selnfds + 7) / 8 : 0;
         if (nb > sizeof(fd_set)) nb = sizeof(fd_set);
-        if ((a1 && guest_bad_ptr(a1, nb)) || (a2 && guest_bad_ptr(a2, nb)) || (a3 && guest_bad_ptr(a3, nb)) ||
-            (have_to && guest_bad_ptr(a4, sizeof(struct timespec)))) {
+        if ((a1 && guest_copy_from(&read_set, a1, nb) != (ssize_t)nb) ||
+            (a2 && guest_copy_from(&write_set, a2, nb) != (ssize_t)nb) ||
+            (a3 && guest_copy_from(&except_set, a3, nb) != (ssize_t)nb) ||
+            (have_to && guest_copy_from(&timeout_value, a4, sizeof(timeout_value)) != sizeof(timeout_value))) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
+        if (a1) read_host = &read_set;
+        if (a2) write_host = &write_set;
+        if (a3) except_host = &except_set;
         // Linux rejects an out-of-range timeout nanoseconds field (tv_nsec < 0 or >= 1e9) with EINVAL
         // before waiting; hl must not treat it as a normal timeout and hide the caller bug.
         if (have_to) {
-            long tns = ((const struct timespec *)a4)->tv_nsec;
+            long tns = timeout_value.tv_nsec;
             if (tns < 0 || tns >= 1000000000L) {
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
@@ -1515,23 +1529,24 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // address so the wait honours the temporary signal mask Linux swaps in atomically (see
         // poll_sigmask_enter). NULL a5 (or a NULL inner ss) = no temporary mask.
         uint64_t sm_set = 0, sm_saved = 0;
+        int have_mask = 0;
         if (a5) {
-            if (guest_bad_ptr(a5, 16)) {
+            uint64_t pk[2];
+            if (guest_copy_from(pk, a5, sizeof(pk)) != sizeof(pk)) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
-            const uint64_t *pk = (const uint64_t *)a5;
             uint64_t ssp = pk[0], sslen = pk[1];
             if (ssp) {
                 if (sslen != 8) {
                     G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
                     break;
                 }
-                if (guest_bad_ptr(ssp, 8)) {
+                if (guest_copy_from(&sm_set, ssp, sizeof(sm_set)) != sizeof(sm_set)) {
                     G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                     break;
                 }
-                sm_set = ssp;
+                have_mask = 1;
             }
         }
         // a spurious EINTR (a signal hl hooks with host_sigh but the guest has BLOCKED or defaults to
@@ -1543,7 +1558,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // back into the timeout struct (both select(2) and the raw pselect6(2) syscall do), so mirror that.
         struct timespec deadline = {0, 0};
         if (have_to) {
-            struct timespec ts = *(struct timespec *)a4;
+            struct timespec ts = timeout_value;
             hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &deadline);
             deadline.tv_sec += ts.tv_sec;
             deadline.tv_nsec += ts.tv_nsec;
@@ -1552,7 +1567,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 deadline.tv_nsec -= 1000000000L;
             }
         }
-        int sm_on = poll_sigmask_enter(c, sm_set, &sm_saved);
+        int sm_on = poll_sigmask_enter(c, have_mask, sm_set, &sm_saved);
         int r;
         for (;;) {
             struct timespec rem, *tsp = NULL;
@@ -1566,7 +1581,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 tsp = &rem;
             }
             ts_wait_enter();
-            r = pselect((int)a0, (fd_set *)a1, (fd_set *)a2, (fd_set *)a3, tsp, NULL);
+            r = pselect((int)a0, read_host, write_host, except_host, tsp, NULL);
             ts_wait_leave(); // S while blocked (glibc pause on aarch64 lands in ppoll below; select here)
             // pselect is never restarted by a handler; loop only on a spurious EINTR (svc_poll_retry),
             // and then only for the time that remains (recomputed above), never the full budget again.
@@ -1579,14 +1594,23 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
             int64_t ns = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);
             if (ns < 0) ns = 0;
-            ((struct timespec *)a4)->tv_sec = (time_t)(ns / 1000000000LL);
-            ((struct timespec *)a4)->tv_nsec = (long)(ns % 1000000000LL);
+            timeout_value.tv_sec = (time_t)(ns / 1000000000LL);
+            timeout_value.tv_nsec = (long)(ns % 1000000000LL);
         }
-        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        int copy_fault = 0;
+        if (r >= 0) {
+            if ((a1 && guest_copy_to(a1, &read_set, nb) != (ssize_t)nb) ||
+                (a2 && guest_copy_to(a2, &write_set, nb) != (ssize_t)nb) ||
+                (a3 && guest_copy_to(a3, &except_set, nb) != (ssize_t)nb) ||
+                (have_to && guest_copy_to(a4, &timeout_value, sizeof(timeout_value)) != sizeof(timeout_value)))
+                copy_fault = 1;
+        }
+        G_RET(c) = copy_fault ? (uint64_t)(int64_t)(-EFAULT) : r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     case 73: {
-        struct pollfd *fds = (void *)a0;
+        struct pollfd *fds = NULL;
+        struct timespec timeout_value;
         // ppoll -> poll. macOS has no ppoll, so collapse the timespec deadline into poll's int-ms timeout.
         // skalibs iopause (s6-supervise et al.) hands a huge but FINITE relative deadline for an
         // idle-but-up service -- settimeout_infinite() makes the delta exactly tain_infinite_relative,
@@ -1594,31 +1618,46 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // Here the naive (int)(tv_sec*1000) truncates: 2^61 * 1000 == 0 (mod 2^32), so tmo became 0 ->
         // poll returned immediately -> s6 saw a spurious timeout in the UP state and busy-looped printing
         // "can't happen: timeout while the service is up!". Clamp the conversion to [0, 0x7fffffff] ms.
-        struct timespec *ts = (void *)a2;
+        struct timespec *ts = a2 ? &timeout_value : NULL;
         // EFAULT on an inaccessible pollfd array (a0, a1=nfds) or timeout (a2), PROT_NONE guard page too.
-        if ((a0 && a1 && guest_bad_ptr(a0, (size_t)a1 * sizeof(struct pollfd))) ||
-            (ts && guest_bad_ptr(a2, sizeof(struct timespec)))) {
+        if (a1 > SIZE_MAX / sizeof(struct pollfd)) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        size_t fds_bytes = (size_t)a1 * sizeof(struct pollfd);
+        fds = calloc(a1 ? (size_t)a1 : 1, sizeof(*fds));
+        if (!fds) {
+            G_RET(c) = (uint64_t)(-ENOMEM);
+            break;
+        }
+        if ((a0 && a1 && guest_copy_from(fds, a0, fds_bytes) != (ssize_t)fds_bytes) ||
+            (ts && guest_copy_from(ts, a2, sizeof(*ts)) != sizeof(*ts))) {
+            free(fds);
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
         // Linux rejects an out-of-range timeout nanoseconds field (tv_nsec < 0 or >= 1e9) with EINVAL.
         if (ts && (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L)) {
+            free(fds);
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
         // ppoll(fds, n, tmo, sigmask, sigsetsize): a3 is the guest sigset_t pointer, a4 its size. Apply the
         // temporary signal mask for the duration of the wait (Linux swaps it atomically); NULL a3 = no mask.
         uint64_t sm_set = 0, sm_saved = 0;
+        int have_mask = 0;
         if (a3) {
             if ((size_t)a4 != 8) {
                 G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+                free(fds);
                 break;
             }
-            if (guest_bad_ptr(a3, 8)) {
+            if (guest_copy_from(&sm_set, a3, sizeof(sm_set)) != sizeof(sm_set)) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                free(fds);
                 break;
             }
-            sm_set = a3;
+            have_mask = 1;
         }
         int have_to = ts != NULL;
         // like pselect (case 72), a spurious EINTR must re-block only for the REMAINING time, not the
@@ -1636,7 +1675,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 deadline.tv_nsec -= 1000000000L;
             }
         }
-        int sm_on = poll_sigmask_enter(c, sm_set, &sm_saved);
+        int sm_on = poll_sigmask_enter(c, have_mask, sm_set, &sm_saved);
         int r;
         for (;;) {
             r = socket_poll_error_fixup(fds, (nfds_t)a1, 0);
@@ -1645,8 +1684,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             if (have_to && ts->tv_sec >= 0) {
                 struct timespec now;
                 hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
-                int64_t ns = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL +
-                             (deadline.tv_nsec - now.tv_nsec);
+                int64_t ns = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);
                 if (ns > 0) {
                     rem.tv_sec = (time_t)(ns / 1000000000LL);
                     rem.tv_nsec = (long)(ns % 1000000000LL);
@@ -1677,8 +1715,8 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             if (r == 0 && have_to) {
                 struct timespec now;
                 hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
-                int64_t left = (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL +
-                               (deadline.tv_nsec - now.tv_nsec);
+                int64_t left =
+                    (int64_t)(deadline.tv_sec - now.tv_sec) * 1000000000LL + (deadline.tv_nsec - now.tv_nsec);
                 if (left > 0) continue;
             }
             // poll/ppoll is never restarted by a handler; loop only on a spurious EINTR (svc_poll_retry).
@@ -1702,7 +1740,10 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             }
             *ts = left;
         }
-        G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
+        int copy_fault = r >= 0 && a0 && a1 && guest_copy_to(a0, fds, fds_bytes) != (ssize_t)fds_bytes;
+        if (r >= 0 && have_to && guest_copy_to(a2, ts, sizeof(*ts)) != sizeof(*ts)) copy_fault = 1;
+        free(fds);
+        G_RET(c) = copy_fault ? (uint64_t)(int64_t)(-EFAULT) : r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     // signalfd4(fd, mask, sizemask, flags)
@@ -1720,7 +1761,8 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             break;
         }
         // (1c) EFAULT: a non-null but inaccessible mask pointer must return EFAULT, never fault the engine.
-        if (a1 && guest_bad_ptr(a1, 8)) {
+        uint64_t lm = 0;
+        if (a1 && guest_copy_from(&lm, a1, sizeof(lm)) != sizeof(lm)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
@@ -1742,7 +1784,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             sslot = g_sigfd_slot[(int)a0] - 1;
         }
         // sigset bit (signo-1) -> g_pending bit signo
-        uint64_t lm = a1 ? *(uint64_t *)a1 : 0, pm = 0;
+        uint64_t pm = 0;
         for (int s = 1; s < 64; s++)
             if (lm & (1ull << (s - 1))) pm |= (1ull << s);
         // Create: allocate an INDEPENDENT OFD (its own self-pipe + mask). The read end is the guest's signalfd;
@@ -1826,9 +1868,11 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
     // timerfd_settime(fd, flags, new, old)
     case 86: {
         struct kevent kv;
+        uint64_t new_value[4];
+        uint64_t old_value[4] = {0};
         // timerfd_settime(2) error surface, in Linux order (LTP timerfd_settime01).
         // (1) EFAULT: new_value must be a readable itimerspec (the kernel copy_from_user's it first).
-        if (guest_bad_ptr((uintptr_t)a2, 32)) {
+        if (guest_copy_from(new_value, a2, sizeof(new_value)) != sizeof(new_value)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
@@ -1838,10 +1882,10 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             break;
         }
         uint64_t iv_s = 0, iv_n = 0, vl_s = 0, vl_n = 0;
-        memcpy(&iv_s, (void *)a2, 8);
-        memcpy(&iv_n, (void *)(a2 + 8), 8);
-        memcpy(&vl_s, (void *)(a2 + 16), 8);
-        memcpy(&vl_n, (void *)(a2 + 24), 8);
+        memcpy(&iv_s, new_value + 0, 8);
+        memcpy(&iv_n, new_value + 1, 8);
+        memcpy(&vl_s, new_value + 2, 8);
+        memcpy(&vl_n, new_value + 3, 8);
         // (3) EINVAL: itimerspec tv_nsec must be in [0,1e9) and tv_sec non-negative (itimerspec64_valid).
         if (iv_n >= 1000000000ull || vl_n >= 1000000000ull || (int64_t)iv_s < 0 || (int64_t)vl_s < 0) {
             G_RET(c) = (uint64_t)(-EINVAL);
@@ -1862,14 +1906,13 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             }
         }
         // (5) EFAULT: a non-NULL old_value must be writable -- the kernel reports the previous setting there.
-        if (a3 && guest_bad_ptr((uintptr_t)a3, 32)) {
+        if (a3 && guest_accessible_prefix(a3, sizeof(old_value), PROT_WRITE) != sizeof(old_value)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
         // Report the PREVIOUS setting into old_value before re-arming (remaining it_value + it_interval),
         // mirroring timerfd_gettime's math against the stashed deadline.
         if (a3) {
-            memset((void *)a3, 0, 32);
             int ofd = (int)a0;
             int64_t odl = (ofd >= 0 && ofd < HL_NFD) ? g_tfd_deadline[ofd] : 0;
             int64_t oiv = (ofd >= 0 && ofd < HL_NFD) ? g_tfd_interval[ofd] : 0;
@@ -1880,10 +1923,14 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 int64_t orem = odl - onow_ns;
                 if (orem < 0 && oiv > 0) orem += ((-orem) / oiv + 1) * oiv;
                 if (orem < 0) orem = 0;
-                *(int64_t *)(a3 + 0) = oiv / 1000000000LL;
-                *(int64_t *)(a3 + 8) = oiv % 1000000000LL;
-                *(int64_t *)(a3 + 16) = orem / 1000000000LL;
-                *(int64_t *)(a3 + 24) = orem % 1000000000LL;
+                old_value[0] = (uint64_t)(oiv / 1000000000LL);
+                old_value[1] = (uint64_t)(oiv % 1000000000LL);
+                old_value[2] = (uint64_t)(orem / 1000000000LL);
+                old_value[3] = (uint64_t)(orem % 1000000000LL);
+            }
+            if (guest_copy_to(a3, old_value, sizeof(old_value)) != sizeof(old_value)) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
             }
         }
         int64_t interval_ns = (int64_t)(iv_s * 1000000000ull + iv_n);
@@ -1946,6 +1993,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         break;
     }
     case 87: {
+        uint64_t current_value[4] = {0};
         // timerfd_gettime(fd, curr): report the remaining time to the next expiry (it_value) and the
         // interval (it_interval), computed from the deadline timerfd_settime stashed. A disarmed timer
         // (deadline 0) reports {0,0}; an expired periodic timer reports the time to its next tick.
@@ -1963,11 +2011,10 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
             }
         }
         if (a1) {
-            if (guest_bad_ptr((uintptr_t)a1, 32)) {
+            if (guest_accessible_prefix(a1, sizeof(current_value), PROT_WRITE) != sizeof(current_value)) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
-            memset((void *)a1, 0, 32);
             int fd = (int)a0;
             int64_t deadline = (fd >= 0 && fd < HL_NFD) ? g_tfd_deadline[fd] : 0;
             int64_t interval = (fd >= 0 && fd < HL_NFD) ? g_tfd_interval[fd] : 0;
@@ -1978,10 +2025,14 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
                 int64_t rem = deadline - now_ns;
                 if (rem < 0 && interval > 0) rem += ((-rem) / interval + 1) * interval; // next periodic tick
                 if (rem < 0) rem = 0;
-                *(int64_t *)(a1 + 0) = interval / 1000000000LL; // it_interval.tv_sec
-                *(int64_t *)(a1 + 8) = interval % 1000000000LL; // it_interval.tv_nsec
-                *(int64_t *)(a1 + 16) = rem / 1000000000LL;     // it_value.tv_sec
-                *(int64_t *)(a1 + 24) = rem % 1000000000LL;     // it_value.tv_nsec
+                current_value[0] = (uint64_t)(interval / 1000000000LL);
+                current_value[1] = (uint64_t)(interval % 1000000000LL);
+                current_value[2] = (uint64_t)(rem / 1000000000LL);
+                current_value[3] = (uint64_t)(rem % 1000000000LL);
+            }
+            if (guest_copy_to(a1, current_value, sizeof(current_value)) != sizeof(current_value)) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
             }
         }
         G_RET(c) = 0;

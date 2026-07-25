@@ -167,12 +167,12 @@ struct sembuf_guest {
 #define HL_IPC_MSGMNI_ADV 512
 // Table capacities we allocate and enforce. They agree exactly with the
 // discovery plane above and the generated procfs values.
-#define HL_IPC_SHMMNI 4096            // shm segment descriptors (metadata only; data in a per-segment object)
-#define HL_IPC_SEMMNI 512             // semaphore SETS
-#define HL_IPC_SEMMSL 256             // semaphores per set (inline values)
-#define HL_IPC_MSGMNI 512             // message queues (metadata; data in a per-queue object)
-#define HL_MSG_SLOTS 512                    // messages a single queue can hold
-#define HL_MSG_MAX_SIZE 8192                // == MSGMAX: largest single message body
+#define HL_IPC_SHMMNI 4096                     // shm segment descriptors (metadata only; data in a per-segment object)
+#define HL_IPC_SEMMNI 512                      // semaphore SETS
+#define HL_IPC_SEMMSL 256                      // semaphores per set (inline values)
+#define HL_IPC_MSGMNI 512                      // message queues (metadata; data in a per-queue object)
+#define HL_MSG_SLOTS 512                       // messages a single queue can hold
+#define HL_MSG_MAX_SIZE 8192                   // == MSGMAX: largest single message body
 #define HL_IPC_CTRL_MAGIC UINT32_C(0x43494c48) // "HLIC" (LE)
 #define HL_MSG_MAGIC UINT32_C(0x514d4c48)      // "HLMQ" (LE)
 
@@ -242,8 +242,8 @@ struct hl_ipc_msg_store {
 
 // ---- in-process (COW-inherited across fork) state ------------------------------------------------
 static struct hl_ipc_ctrl *g_ctrl; // this process's mapping of the control block
-static uint32_t g_ns_hash;        // namespace id (0 == not yet computed)
-static int g_ipc_creator;         // did THIS process create the control block?
+static uint32_t g_ns_hash;         // namespace id (0 == not yet computed)
+static int g_ipc_creator;          // did THIS process create the control block?
 static int g_ipc_atexit_armed;
 static int g_ipc_ctor_pid;                                        // engine-root pid (constructor; COW-inherited)
 static pthread_mutex_t g_ipc_local_m = PTHREAD_MUTEX_INITIALIZER; // guards the in-process caches below
@@ -545,19 +545,18 @@ static void shm_free(struct hl_ipc_ctrl *C, uint32_t idx) {
 
 // Marshal descriptor idx -> the guest shmid64_ds at gbuf (already access-checked). Returns 0 or -errno.
 static uint64_t shm_stat_to_guest(struct hl_ipc_ctrl *C, uint32_t idx, uint64_t gbuf) {
-    if (!host_range_mapped((uintptr_t)gbuf, sizeof(struct shmid64_ds_guest))) return (uint64_t)(-EFAULT);
     struct hl_shm_entry *s = &C->shm[idx];
-    struct shmid64_ds_guest *g = (struct shmid64_ds_guest *)gbuf;
-    memset(g, 0, sizeof *g);
-    hl_perm_to_guest(&g->shm_perm, &s->perm);
-    g->shm_segsz = s->segsz;
-    g->shm_atime = s->atime;
-    g->shm_dtime = s->dtime;
-    g->shm_ctime = s->ctime;
-    g->shm_cpid = s->cpid;
-    g->shm_lpid = s->lpid;
-    g->shm_nattch = s->nattch;
-    return 0;
+    struct shmid64_ds_guest g;
+    memset(&g, 0, sizeof g);
+    hl_perm_to_guest(&g.shm_perm, &s->perm);
+    g.shm_segsz = s->segsz;
+    g.shm_atime = s->atime;
+    g.shm_dtime = s->dtime;
+    g.shm_ctime = s->ctime;
+    g.shm_cpid = s->cpid;
+    g.shm_lpid = s->lpid;
+    g.shm_nattch = s->nattch;
+    return guest_copy_to(gbuf, &g, sizeof(g)) == sizeof(g) ? 0 : (uint64_t)(-EFAULT);
 }
 
 // ============================================================================================
@@ -582,15 +581,14 @@ static void sem_free(struct hl_ipc_ctrl *C, uint32_t idx) {
 }
 
 static uint64_t sem_stat_to_guest(struct hl_ipc_ctrl *C, uint32_t idx, uint64_t gbuf) {
-    if (!host_range_mapped((uintptr_t)gbuf, sizeof(struct semid64_ds_guest))) return (uint64_t)(-EFAULT);
     struct hl_sem_entry *s = &C->sem[idx];
-    struct semid64_ds_guest *g = (struct semid64_ds_guest *)gbuf;
-    memset(g, 0, sizeof *g);
-    hl_perm_to_guest(&g->sem_perm, &s->perm);
-    g->sem_otime = s->otime;
-    g->sem_ctime = s->ctime;
-    g->sem_nsems = s->nsems;
-    return 0;
+    struct semid64_ds_guest g;
+    memset(&g, 0, sizeof g);
+    hl_perm_to_guest(&g.sem_perm, &s->perm);
+    g.sem_otime = s->otime;
+    g.sem_ctime = s->ctime;
+    g.sem_nsems = s->nsems;
+    return guest_copy_to(gbuf, &g, sizeof(g)) == sizeof(g) ? 0 : (uint64_t)(-EFAULT);
 }
 
 // Drop this process's undo record for (idx,semnum) -- SETVAL/SETALL clear the semadj (Linux semantics).
@@ -645,20 +643,19 @@ static void msg_free(struct hl_ipc_ctrl *C, uint32_t idx) {
 }
 
 static uint64_t msg_stat_to_guest(struct hl_ipc_ctrl *C, uint32_t idx, uint64_t gbuf) {
-    if (!host_range_mapped((uintptr_t)gbuf, sizeof(struct msqid64_ds_guest))) return (uint64_t)(-EFAULT);
     struct hl_msg_queue *q = &C->msg[idx];
-    struct msqid64_ds_guest *g = (struct msqid64_ds_guest *)gbuf;
-    memset(g, 0, sizeof *g);
-    hl_perm_to_guest(&g->msg_perm, &q->perm);
-    g->msg_stime = q->stime;
-    g->msg_rtime = q->rtime;
-    g->msg_ctime = q->ctime;
-    g->msg_cbytes = q->cbytes;
-    g->msg_qnum = q->qnum;
-    g->msg_qbytes = q->qbytes;
-    g->msg_lspid = q->lspid;
-    g->msg_lrpid = q->lrpid;
-    return 0;
+    struct msqid64_ds_guest g;
+    memset(&g, 0, sizeof g);
+    hl_perm_to_guest(&g.msg_perm, &q->perm);
+    g.msg_stime = q->stime;
+    g.msg_rtime = q->rtime;
+    g.msg_ctime = q->ctime;
+    g.msg_cbytes = q->cbytes;
+    g.msg_qnum = q->qnum;
+    g.msg_qbytes = q->qbytes;
+    g.msg_lspid = q->lspid;
+    g.msg_lrpid = q->lrpid;
+    return guest_copy_to(gbuf, &g, sizeof(g)) == sizeof(g) ? 0 : (uint64_t)(-EFAULT);
 }
 
 // ---- IPC_INFO / *_INFO fill (Linux-like limits + live counts) ------------------------------------
@@ -1037,25 +1034,15 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             int maxid = -1, n = shm_count(C, &maxid);
             uint64_t rc = 0;
             if (cmd == L_IPC_INFO) {
-                if (!host_range_mapped((uintptr_t)a2, sizeof(struct shminfo_guest)))
-                    rc = (uint64_t)(-EFAULT);
-                else {
-                    struct shminfo_guest *g = (struct shminfo_guest *)a2;
-                    memset(g, 0, sizeof *g);
-                    g->shmmax = HL_IPC_SHMMAX;
-                    g->shmmin = 1;
-                    g->shmmni = HL_IPC_SHMMNI_ADV;
-                    g->shmseg = HL_IPC_SHMMNI_ADV;
-                    g->shmall = HL_IPC_SHMMAX / 4096;
-                }
+                struct shminfo_guest info = {.shmmax = HL_IPC_SHMMAX,
+                                             .shmmin = 1,
+                                             .shmmni = HL_IPC_SHMMNI_ADV,
+                                             .shmseg = HL_IPC_SHMMNI_ADV,
+                                             .shmall = HL_IPC_SHMMAX / 4096};
+                if (guest_copy_to(a2, &info, sizeof(info)) != sizeof(info)) rc = (uint64_t)(-EFAULT);
             } else {
-                if (!host_range_mapped((uintptr_t)a2, sizeof(struct shm_info_guest)))
-                    rc = (uint64_t)(-EFAULT);
-                else {
-                    struct shm_info_guest *g = (struct shm_info_guest *)a2;
-                    memset(g, 0, sizeof *g);
-                    g->used_ids = n;
-                }
+                struct shm_info_guest info = {.used_ids = n};
+                if (guest_copy_to(a2, &info, sizeof(info)) != sizeof(info)) rc = (uint64_t)(-EFAULT);
             }
             hl_ipc_unlock(&C->lock);
             G_RET(c) = rc ? rc : (uint64_t)(maxid < 0 ? 0 : maxid);
@@ -1103,14 +1090,14 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 rc = (uint64_t)perr;
                 break;
             }
-            if (!host_range_mapped((uintptr_t)a2, sizeof(struct shmid64_ds_guest))) {
+            struct shmid64_ds_guest value;
+            if (guest_copy_from(&value, a2, sizeof(value)) != sizeof(value)) {
                 rc = (uint64_t)(-EFAULT);
                 break;
             }
-            struct shmid64_ds_guest *g = (struct shmid64_ds_guest *)a2;
-            s->perm.uid = g->shm_perm.uid;
-            s->perm.gid = g->shm_perm.gid;
-            s->perm.mode = (s->perm.mode & ~0777u) | (g->shm_perm.mode & 0777);
+            s->perm.uid = value.shm_perm.uid;
+            s->perm.gid = value.shm_perm.gid;
+            s->perm.mode = (s->perm.mode & ~0777u) | (value.shm_perm.mode & 0777);
             s->ctime = hl_ipc_now();
             rc = 0;
             break;
@@ -1224,21 +1211,29 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(nsops == 0 ? -EINVAL : -E2BIG);
             break;
         }
-        if (!host_range_mapped((uintptr_t)a1, nsops * sizeof(struct sembuf_guest))) {
+        struct sembuf_guest *sops = malloc(nsops * sizeof(*sops));
+        if (!sops) {
+            G_RET(c) = (uint64_t)(-ENOMEM);
+            break;
+        }
+        if (guest_copy_from(sops, a1, nsops * sizeof(*sops)) != (ssize_t)(nsops * sizeof(*sops))) {
+            free(sops);
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        struct sembuf_guest *sops = (struct sembuf_guest *)a1;
         // Optional relative timeout (semtimedop): compute an absolute monotonic deadline.
         struct timespec deadline;
         int have_deadline = 0;
         if (nr == 192 && a3) {
-            if (!host_range_mapped((uintptr_t)a3, sizeof(struct timespec))) {
+            struct timespec timeout;
+            if (guest_copy_from(&timeout, a3, sizeof(timeout)) != sizeof(timeout)) {
+                free(sops);
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
-            struct timespec *to = (struct timespec *)a3;
+            struct timespec *to = &timeout;
             if (to->tv_nsec < 0 || to->tv_nsec >= 1000000000L || to->tv_sec < 0) {
+                free(sops);
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
             }
@@ -1371,6 +1366,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             }
         }
     sem_done:
+        free(sops);
         break;
     }
     case 191: { // semctl(semid, semnum, cmd, arg)
@@ -1384,24 +1380,21 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             hl_ipc_lock(&C->lock);
             int maxid = -1, n = sem_count(C, &maxid);
             uint64_t rc = 0;
-            if (!host_range_mapped((uintptr_t)a3, sizeof(struct seminfo_guest)))
-                rc = (uint64_t)(-EFAULT);
-            else {
-                struct seminfo_guest *g = (struct seminfo_guest *)a3;
-                memset(g, 0, sizeof *g);
-                g->semmni = HL_IPC_SEMMNI_ADV;
-                g->semmsl = HL_IPC_SEMMSL_ADV;
-                g->semmns = HL_IPC_SEMMNS_ADV;
-                g->semopm = HL_IPC_SEMOPM_ADV;
-                g->semvmx = HL_IPC_SEMVMX;
-                g->semaem = HL_IPC_SEMVMX;
-                g->semmnu = 2147483647;
-                g->semume = HL_IPC_SEMOPM_ADV;
-                if (cmd == L_SEM_INFO) {
-                    g->semusz = n;
-                    g->semaem = n;
-                }
+            struct seminfo_guest info;
+            memset(&info, 0, sizeof info);
+            info.semmni = HL_IPC_SEMMNI_ADV;
+            info.semmsl = HL_IPC_SEMMSL_ADV;
+            info.semmns = HL_IPC_SEMMNS_ADV;
+            info.semopm = HL_IPC_SEMOPM_ADV;
+            info.semvmx = HL_IPC_SEMVMX;
+            info.semaem = HL_IPC_SEMVMX;
+            info.semmnu = 2147483647;
+            info.semume = HL_IPC_SEMOPM_ADV;
+            if (cmd == L_SEM_INFO) {
+                info.semusz = n;
+                info.semaem = n;
             }
+            if (guest_copy_to(a3, &info, sizeof(info)) != sizeof(info)) rc = (uint64_t)(-EFAULT);
             hl_ipc_unlock(&C->lock);
             G_RET(c) = rc ? rc : (uint64_t)(maxid < 0 ? 0 : maxid);
             break;
@@ -1448,14 +1441,14 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 rc = (uint64_t)perr;
                 break;
             }
-            if (!host_range_mapped((uintptr_t)a3, sizeof(struct semid64_ds_guest))) {
+            struct semid64_ds_guest value;
+            if (guest_copy_from(&value, a3, sizeof(value)) != sizeof(value)) {
                 rc = (uint64_t)(-EFAULT);
                 break;
             }
-            struct semid64_ds_guest *g = (struct semid64_ds_guest *)a3;
-            s->perm.uid = g->sem_perm.uid;
-            s->perm.gid = g->sem_perm.gid;
-            s->perm.mode = (s->perm.mode & ~0777u) | (g->sem_perm.mode & 0777);
+            s->perm.uid = value.sem_perm.uid;
+            s->perm.gid = value.sem_perm.gid;
+            s->perm.mode = (s->perm.mode & ~0777u) | (value.sem_perm.mode & 0777);
             s->ctime = hl_ipc_now();
             rc = 0;
             break;
@@ -1539,13 +1532,13 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 rc = (uint64_t)perr;
                 break;
             }
-            if (!host_range_mapped((uintptr_t)a3, s->nsems * sizeof(uint16_t))) {
+            uint16_t values[HL_IPC_SEMMSL_ADV];
+            for (uint32_t i = 0; i < s->nsems; i++)
+                values[i] = s->val[i];
+            if (guest_copy_to(a3, values, s->nsems * sizeof(uint16_t)) != (ssize_t)(s->nsems * sizeof(uint16_t))) {
                 rc = (uint64_t)(-EFAULT);
                 break;
             }
-            uint16_t *arr = (uint16_t *)a3;
-            for (uint32_t i = 0; i < s->nsems; i++)
-                arr[i] = s->val[i];
             rc = 0;
             break;
         }
@@ -1555,11 +1548,11 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 rc = (uint64_t)perr;
                 break;
             }
-            if (!host_range_mapped((uintptr_t)a3, s->nsems * sizeof(uint16_t))) {
+            uint16_t arr[HL_IPC_SEMMSL_ADV];
+            if (guest_copy_from(arr, a3, s->nsems * sizeof(uint16_t)) != (ssize_t)(s->nsems * sizeof(uint16_t))) {
                 rc = (uint64_t)(-EFAULT);
                 break;
             }
-            uint16_t *arr = (uint16_t *)a3;
             for (uint32_t i = 0; i < s->nsems; i++) {
                 if (arr[i] > HL_IPC_SEMVMX) {
                     rc = (uint64_t)(-ERANGE);
@@ -1664,16 +1657,24 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        if (!host_range_mapped((uintptr_t)a1, sizeof(long) + msgsz)) {
+        uint8_t *message = malloc(sizeof(long) + msgsz);
+        if (!message) {
+            G_RET(c) = (uint64_t)(-ENOMEM);
+            break;
+        }
+        if (guest_copy_from(message, a1, sizeof(long) + msgsz) != (ssize_t)(sizeof(long) + msgsz)) {
+            free(message);
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        long mtype = *(long *)a1;
+        long mtype;
+        memcpy(&mtype, message, sizeof(mtype));
         if (mtype < 1) {
+            free(message);
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        const uint8_t *body = (const uint8_t *)(a1 + sizeof(long));
+        const uint8_t *body = message + sizeof(long);
         int did_wait = 0;
         for (;;) {
             hl_ipc_lock(&C->lock);
@@ -1742,6 +1743,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = 0;
             break;
         }
+        free(message);
         break;
     }
     case 188: { // msgrcv(msqid, msgp, msgsz, msgtyp, msgflg)
@@ -1754,7 +1756,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        if (!host_range_mapped((uintptr_t)a1, sizeof(long) + msgsz)) {
+        if (guest_accessible_prefix(a1, sizeof(long) + msgsz, PROT_WRITE) != sizeof(long) + msgsz) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
@@ -1814,8 +1816,21 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                     break;
                 }
                 size_t copy = sl->size > msgsz ? msgsz : sl->size;
-                *(long *)a1 = sl->mtype;
-                if (copy) memcpy((void *)(a1 + sizeof(long)), sl->data, copy);
+                uint8_t *message = malloc(sizeof(long) + copy);
+                if (!message) {
+                    hl_ipc_unlock(&C->lock);
+                    G_RET(c) = (uint64_t)(-ENOMEM);
+                    break;
+                }
+                memcpy(message, &sl->mtype, sizeof(long));
+                if (copy) memcpy(message + sizeof(long), sl->data, copy);
+                if (guest_copy_to(a1, message, sizeof(long) + copy) != (ssize_t)(sizeof(long) + copy)) {
+                    free(message);
+                    hl_ipc_unlock(&C->lock);
+                    G_RET(c) = (uint64_t)(-EFAULT);
+                    break;
+                }
+                free(message);
                 // unlink best from the list
                 if (bestprev < 0)
                     st->head = sl->next;
@@ -1858,22 +1873,19 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             hl_ipc_lock(&C->lock);
             int maxid = -1, n = msg_count(C, &maxid);
             uint64_t rc = 0;
-            if (!host_range_mapped((uintptr_t)a2, sizeof(struct msginfo_guest)))
-                rc = (uint64_t)(-EFAULT);
-            else {
-                struct msginfo_guest *g = (struct msginfo_guest *)a2;
-                memset(g, 0, sizeof *g);
-                g->msgmax = HL_IPC_MSGMAX;
-                g->msgmni = HL_IPC_MSGMNI_ADV;
-                g->msgmnb = HL_IPC_MSGMNB;
-                g->msgssz = 16;
-                g->msgtql = HL_IPC_MSGMNI_ADV;
-                g->msgseg = 0xffff;
-                if (cmd == L_MSG_INFO) {
-                    g->msgpool = n;
-                    g->msgtql = n;
-                }
+            struct msginfo_guest info;
+            memset(&info, 0, sizeof info);
+            info.msgmax = HL_IPC_MSGMAX;
+            info.msgmni = HL_IPC_MSGMNI_ADV;
+            info.msgmnb = HL_IPC_MSGMNB;
+            info.msgssz = 16;
+            info.msgtql = HL_IPC_MSGMNI_ADV;
+            info.msgseg = 0xffff;
+            if (cmd == L_MSG_INFO) {
+                info.msgpool = n;
+                info.msgtql = n;
             }
+            if (guest_copy_to(a2, &info, sizeof(info)) != sizeof(info)) rc = (uint64_t)(-EFAULT);
             hl_ipc_unlock(&C->lock);
             G_RET(c) = rc ? rc : (uint64_t)(maxid < 0 ? 0 : maxid);
             break;
@@ -1920,20 +1932,20 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 rc = (uint64_t)perr;
                 break;
             }
-            if (!host_range_mapped((uintptr_t)a2, sizeof(struct msqid64_ds_guest))) {
+            struct msqid64_ds_guest value;
+            if (guest_copy_from(&value, a2, sizeof(value)) != sizeof(value)) {
                 rc = (uint64_t)(-EFAULT);
                 break;
             }
-            struct msqid64_ds_guest *g = (struct msqid64_ds_guest *)a2;
             // Raising qbytes above the default ceiling needs privilege (CAP_SYS_RESOURCE); lowering is free.
-            if (g->msg_qbytes > HL_IPC_MSGMNB && cred_euid() != 0) {
+            if (value.msg_qbytes > HL_IPC_MSGMNB && cred_euid() != 0) {
                 rc = (uint64_t)(-EPERM);
                 break;
             }
-            q->perm.uid = g->msg_perm.uid;
-            q->perm.gid = g->msg_perm.gid;
-            q->perm.mode = (q->perm.mode & ~0777u) | (g->msg_perm.mode & 0777);
-            if (g->msg_qbytes) q->qbytes = g->msg_qbytes;
+            q->perm.uid = value.msg_perm.uid;
+            q->perm.gid = value.msg_perm.gid;
+            q->perm.mode = (q->perm.mode & ~0777u) | (value.msg_perm.mode & 0777);
+            if (value.msg_qbytes) q->qbytes = value.msg_qbytes;
             q->ctime = hl_ipc_now();
             rc = 0;
             break;

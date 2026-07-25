@@ -280,14 +280,15 @@ int main(int argc, char **argv) {
     void *server_result = (void *)99;
     ssize_t count;
     hl_status status;
-    if (argc != 2 || realpath(argv[0], executable) == NULL || make_config(argv[1], config) != 0 ||
+    hl_guest_isa isa = argc == 3 && strcmp(argv[2], "x86_64") == 0 ? HL_GUEST_ISA_X86_64 : HL_GUEST_ISA_AARCH64;
+    if ((argc != 2 && argc != 3) || realpath(argv[0], executable) == NULL || make_config(argv[1], config) != 0 ||
         socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0 ||
         pipe(output) != 0)
         return 1;
     state = (provider){.fd = pair[1], .bytes = {'h', 'e', 'l', 'l', 'o'}};
     if (pthread_create(&thread, NULL, serve, &state) != 0) return 2;
     stdio = (hl_activation_stdio){.input = -1, .output = output[1], .error = output[1]};
-    status = hl_activation_start_with_transport(executable, HL_GUEST_ISA_AARCH64, config, &stdio, pair[0], &process);
+    status = hl_activation_start_with_transport(executable, isa, config, &stdio, pair[0], &process);
     close(pair[0]);
     close(output[1]);
     count = read(output[0], text, sizeof(text) - 1);

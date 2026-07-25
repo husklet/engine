@@ -83,7 +83,8 @@ struct cpu {
     // when that guest page was actually translated, instead of nuking everything on every guest icache
     // flush (V8 issues one per freshly-written line). Appended after the baked-offset fields.
     uint64_t smc_va;
-    uint64_t smc_ranges[8][2];
+#define SMC_RANGE_CAP 64
+    uint64_t smc_ranges[SMC_RANGE_CAP][2];
     uint64_t smc_range_count;
     uint64_t smc_range_overflow;
     // (SIMD-clean syscall exit): RUNTIME "guest vector state may be stale in cpu->V" flag. Set
@@ -99,6 +100,32 @@ struct cpu {
     /* Runtime-owned monotonic BUS page filter; emitted guards read these pointers. */
     uint64_t bus_filter;
     uint64_t bus_force;
+    /*
+     * Sparse logical-VMA data TLB.  Mapping mutations happen under the
+     * process stop-the-world barrier and invalidate soft_page before retired
+     * snapshots/backings are reclaimed.  A translated hit therefore needs
+     * only a page comparison, permission test, and host delta add.
+     */
+    uint64_t soft_page;
+    uint64_t soft_limit;
+    /* Conservative hull of all sparse logical VMAs. Accesses wholly outside
+       this interval bypass the software TLB without a dispatcher crossing. */
+    uint64_t soft_filter_first;
+    uint64_t soft_filter_last;
+    uint64_t soft_delta;
+    uint64_t soft_protection;
+    uint64_t soft_ea;
+    uint64_t soft_bytes;
+    uint64_t soft_required;
+    uint64_t soft_pc;
+    uint64_t soft_span_ea;
+    uint64_t soft_span_bytes;
+    uint64_t soft_span_delta;
+    uint64_t soft_span_protection;
+    uint64_t soft_bounce_pending;
+    uint64_t soft_bounce_write;
+    _Alignas(16) unsigned char soft_bounce_host_mask[128];
+    _Alignas(64) unsigned char soft_bounce[64];
     // Published while this thread is inside service(). A directed signal
     // needs a host interrupt only in that window; translated code observes
     // irq itself and dispatcher code is already at a delivery boundary.
@@ -203,7 +230,46 @@ static int is_stolen(int r) {
 #define R_BRANCH 0
 #define R_SYSCALL 1
 #define R_BUS 5
+#define R_FETCHFAULT 7
+#define R_SOFTMISS 8
+#define R_SOFTSPAN 9
+#define R_SOFTCOMMIT 10
 #define OFF_FAULT_ADDR ((int)offsetof(struct cpu, fault_addr))
 #define OFF_BUS_EA ((int)offsetof(struct cpu, bus_ea))
 #define OFF_BUS_FILTER ((int)offsetof(struct cpu, bus_filter))
 #define OFF_BUS_FORCE ((int)offsetof(struct cpu, bus_force))
+#define OFF_SOFT_PAGE ((int)offsetof(struct cpu, soft_page))
+#define OFF_SOFT_LIMIT ((int)offsetof(struct cpu, soft_limit))
+#define OFF_SOFT_FILTER_FIRST ((int)offsetof(struct cpu, soft_filter_first))
+#define OFF_SOFT_FILTER_LAST ((int)offsetof(struct cpu, soft_filter_last))
+#define OFF_SOFT_DELTA ((int)offsetof(struct cpu, soft_delta))
+#define OFF_SOFT_PROTECTION ((int)offsetof(struct cpu, soft_protection))
+#define OFF_SOFT_EA ((int)offsetof(struct cpu, soft_ea))
+#define OFF_SOFT_BYTES ((int)offsetof(struct cpu, soft_bytes))
+#define OFF_SOFT_REQUIRED ((int)offsetof(struct cpu, soft_required))
+#define OFF_SOFT_PC ((int)offsetof(struct cpu, soft_pc))
+#define OFF_SOFT_SPAN_EA ((int)offsetof(struct cpu, soft_span_ea))
+#define OFF_SOFT_SPAN_BYTES ((int)offsetof(struct cpu, soft_span_bytes))
+#define OFF_SOFT_SPAN_DELTA ((int)offsetof(struct cpu, soft_span_delta))
+#define OFF_SOFT_SPAN_PROTECTION ((int)offsetof(struct cpu, soft_span_protection))
+#define OFF_SOFT_BOUNCE_PENDING ((int)offsetof(struct cpu, soft_bounce_pending))
+#define OFF_SOFT_BOUNCE ((int)offsetof(struct cpu, soft_bounce))
+#define G_SOFT_STATE_RESET(c)                                                                                         \
+    do {                                                                                                              \
+        (c)->soft_page = UINT64_MAX;                                                                                  \
+        (c)->soft_limit = 0;                                                                                          \
+        (c)->soft_filter_first = UINT64_MAX;                                                                          \
+        (c)->soft_filter_last = 0;                                                                                    \
+        (c)->soft_delta = 0;                                                                                          \
+        (c)->soft_protection = 0;                                                                                     \
+        (c)->soft_ea = 0;                                                                                             \
+        (c)->soft_bytes = 0;                                                                                          \
+        (c)->soft_required = 0;                                                                                       \
+        (c)->soft_pc = 0;                                                                                             \
+        (c)->soft_span_ea = 0;                                                                                        \
+        (c)->soft_span_bytes = 0;                                                                                     \
+        (c)->soft_span_delta = 0;                                                                                     \
+        (c)->soft_span_protection = 0;                                                                                \
+        (c)->soft_bounce_pending = 0;                                                                                 \
+        (c)->soft_bounce_write = 0;                                                                                   \
+    } while (0)

@@ -55,6 +55,7 @@
 #include <poll.h>
 #include "../../host/native_compat.h"
 #include "../../host/native_context.h"
+#include "../../linux_abi/logical_vma.h"
 #include <dirent.h>
 #include <signal.h>
 #include <termios.h>
@@ -84,7 +85,13 @@ hl_status hl_run_linux_guest_status(void) {
 }
 
 static uint64_t g_host_launch_monotonic_ns;
+static uint64_t g_emit_next;
 static void filemap_refresh_emulated(uint64_t lo, uint64_t hi);
+static int jit_guest_soft_activate(void);
+static void jit_guest_soft_restore_activate(void);
+static void jit_guest_soft_restore_deactivate(void);
+static void jit_guest_soft_deactivate(void);
+static int jit_guest_soft_active(void);
 
 #include "../../translator/guest/x86_64/cpu.h"
 #include "../../translator/guest/x86_64/frame.h"
@@ -108,18 +115,59 @@ static void filemap_refresh_emulated(uint64_t lo, uint64_t hi);
 #include "../../linux_abi/container/owner.h"
 static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
 #include "../../translator/guest/x86_64/avx.h"
-static const hl_x86_avx_state g_avx_state = {&g_nonpie_lo, &g_nonpie_hi, &g_nonpie_bias};
+static int jit86_avx_memory_read(uint64_t guest, void *destination, size_t length);
+static int jit86_avx_memory_write(uint64_t guest, const void *source, size_t length);
+static const hl_x86_avx_state g_avx_state = {&g_nonpie_lo, &g_nonpie_hi, &g_nonpie_bias, jit86_avx_memory_read,
+                                             jit86_avx_memory_write};
 #include "../../translator/guest/x86_64/glue.h" // independently compiled x86 target state
-#include "../../translator/cache.c"             // SHARED translator: code cache + block map
+#include "../../translator/guest_fetch.h"
+#include "../../translator/cache.c" // SHARED translator: code cache + block map
 
 uint64_t hl_x86_guest_pointer(uint64_t address) {
     return g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi ? address + g_nonpie_bias : address;
 }
 
-static int guestfold_on(void) { return g_nonpie_lo != 0; }
+static int guestfold_on(void) {
+    return g_nonpie_lo != 0;
+}
 
 static const hl_host_services *effective_host_services(void) {
     return hl_target_services_effective(&g_target_services);
+}
+
+static void jit86_store_alias_changed(uint64_t guest, uint64_t size);
+static int jit86_store_alias_observation_active(void);
+
+static int jit86_avx_memory_read(uint64_t guest, void *destination, size_t length) {
+    hl_logical_vma_pin pin = {0};
+    int logical = hl_logical_vma_pin_data(guest, length, HL_LOGICAL_VMA_READ, &pin);
+    if (logical <= 0) return logical;
+    if (pin.contiguous < length) {
+        hl_logical_vma_unpin(&pin);
+        return -1;
+    }
+    memcpy(destination, pin.host, length);
+    hl_logical_vma_unpin(&pin);
+    return 1;
+}
+
+static int jit86_avx_memory_write(uint64_t guest, const void *source, size_t length) {
+    hl_logical_vma_pin pin = {0};
+    int logical = hl_logical_vma_pin_data(guest, length, HL_LOGICAL_VMA_WRITE, &pin);
+    if (logical < 0) return -1;
+    if (logical == 0) {
+        memcpy((void *)(uintptr_t)guest, source, length);
+        jit86_store_alias_changed(guest, length);
+        return 1;
+    }
+    if (pin.contiguous < length) {
+        hl_logical_vma_unpin(&pin);
+        return -1;
+    }
+    memcpy(pin.host, source, length);
+    hl_logical_vma_unpin(&pin);
+    jit86_store_alias_changed(guest, length);
+    return 1;
 }
 
 #include "../../translator/guest/x86_64/emit.c" // x86 engine: arm64 emitters + SSE + x87
@@ -252,8 +300,168 @@ void emit_load_mem(struct insn *insn, uint64_t next, int width, int rt) {
 #include "../../translator/guest/x86_64/translate.c" // x86-64 translate_block + trampolines
 #include "../../translator/guest/x86_64/cache.c"     // persistent translated-code cache (HL_PCACHE=1)
 #include "../../linux_abi/thread.c"                  // SHARED: clone->pthread, per-thread cpu, futex
+
+static void jit86_store_alias_changed(uint64_t guest, uint64_t size) {
+    if (size == 0 || guest > UINT64_MAX - size) return;
+    struct cpu *cpu = pthread_getspecific(g_cpu_key);
+    if (cpu == NULL) return;
+    uint64_t ranges[GNA_MAX + 1][2];
+    uint32_t range_count = 1;
+    ranges[0][0] = guest;
+    ranges[0][1] = guest + size;
+
+    pthread_mutex_lock(&g_filemap_lock);
+    uint64_t device = 0, inode = 0, offset = 0, length = 0;
+    int source_shared = 0;
+    for (int index = 0; index < g_nfilemap; ++index) {
+        const struct guest_file_mapping *mapping = &g_filemap[index];
+        if (guest < mapping->lo || guest >= mapping->hi) continue;
+        uint64_t span = mapping->hi - guest;
+        length = size < span ? size : span;
+        offset = mapping->offset + (guest - mapping->lo);
+        device = mapping->device;
+        inode = mapping->inode;
+        source_shared = mapping->shared != 0;
+        break;
+    }
+    if (source_shared && length != 0) {
+        uint64_t file_last = offset + length;
+        for (int index = 0; index < g_nfilemap && range_count < GNA_MAX + 1; ++index) {
+            const struct guest_file_mapping *mapping = &g_filemap[index];
+            if (!mapping->shared || mapping->device != device || mapping->inode != inode) continue;
+            uint64_t mapping_length = mapping->hi - mapping->lo;
+            if (mapping->offset > UINT64_MAX - mapping_length) continue;
+            uint64_t mapping_last = mapping->offset + mapping_length;
+            uint64_t first = offset > mapping->offset ? offset : mapping->offset;
+            uint64_t last = file_last < mapping_last ? file_last : mapping_last;
+            if (last <= first) continue;
+            uint64_t alias_first = mapping->lo + (first - mapping->offset);
+            ranges[range_count][0] = alias_first;
+            ranges[range_count][1] = alias_first + (last - first);
+            range_count++;
+        }
+    }
+    pthread_mutex_unlock(&g_filemap_lock);
+    for (uint32_t r = 0; r < range_count; ++r) {
+        uint64_t lo = ranges[r][0], hi = ranges[r][1];
+        int merged = 0;
+        for (uint64_t i = 0; i < cpu->smc_range_count; ++i) {
+            if (hi < cpu->smc_ranges[i][0] || lo > cpu->smc_ranges[i][1]) continue;
+            if (lo < cpu->smc_ranges[i][0]) cpu->smc_ranges[i][0] = lo;
+            if (hi > cpu->smc_ranges[i][1]) cpu->smc_ranges[i][1] = hi;
+            merged = 1;
+            break;
+        }
+        if (merged) continue;
+        if (cpu->smc_range_count == X86_SMC_RANGE_CAP) {
+            cpu->smc_range_overflow = 1;
+            break;
+        }
+        cpu->smc_ranges[cpu->smc_range_count][0] = lo;
+        cpu->smc_ranges[cpu->smc_range_count][1] = hi;
+        cpu->smc_range_count++;
+    }
+}
+
+static int jit86_store_alias_observation_active(void) {
+    return g_rwx_guest != 0 && g_nfilemap != 0;
+}
+
+static void jit86_smc_commit(struct cpu *cpu) {
+    stw_mapping_begin();
+    uint32_t removed;
+    if (cpu->smc_range_overflow) {
+        removed = g_live_map_count;
+        map_clear();
+        memset(g_ibtc, 0, sizeof g_ibtc);
+        memset(g_xibtc, 0, sizeof g_xibtc);
+    } else {
+        removed = map_invalidate_source_ranges((const uint64_t (*)[2])cpu->smc_ranges,
+                                               (uint32_t)cpu->smc_range_count);
+        if (removed) {
+            memset(g_ibtc, 0, sizeof g_ibtc);
+            memset(g_xibtc, 0, sizeof g_xibtc);
+        }
+    }
+    (void)removed;
+    cpu->smc_range_count = 0;
+    cpu->smc_range_overflow = 0;
+    stw_mapping_end();
+}
+
 #define HL_GUEST_SIGACTION_HAS_RESTORER 1
-#include "../../linux_abi/signal.c"                  // SHARED: signal delivery driver + translation
+#include "../../linux_abi/signal.c" // SHARED: signal delivery driver + translation
+
+static int soft_tlb_miss(struct cpu *c) {
+    uint64_t address = c->bus_ea;
+    uint64_t width = c->soft_width;
+    uint32_t required = (uint32_t)c->soft_required;
+    const _Atomic(hl_logical_vma_snapshot *) *source = hl_logical_vma_global_snapshot_source();
+    hl_logical_vma_snapshot *snapshot = atomic_load_explicit(source, memory_order_acquire);
+    const hl_logical_vma_view *view = NULL;
+    if (snapshot != NULL) {
+        size_t low = 0, high = snapshot->count;
+        while (low < high) {
+            size_t middle = low + (high - low) / 2;
+            const hl_logical_vma_view *candidate = &snapshot->views[middle];
+            if (address < candidate->guest_first)
+                high = middle;
+            else if (address >= candidate->guest_last)
+                low = middle + 1;
+            else {
+                view = candidate;
+                break;
+            }
+        }
+    }
+    if (view != NULL) {
+        if ((view->protection & required) != required) {
+            c->fault_addr = address;
+            return raise_guest_fetch_fault(c);
+        }
+        uint64_t last = view->guest_last;
+        size_t index = (size_t)(view - snapshot->views) + 1;
+        while (index < snapshot->count && snapshot->views[index].guest_first == last &&
+               snapshot->views[index].host_delta == view->host_delta &&
+               (snapshot->views[index].protection & required) == required) {
+            last = snapshot->views[index++].guest_last;
+        }
+        if (width > last - address) {
+            c->reason = R_SOFTSPAN;
+            return 0;
+        }
+        c->soft_delta = view->host_delta;
+        c->soft_protection = view->protection;
+        c->soft_last = last;
+    } else {
+        /* Ordinary directly represented guest page.  Native protection/fault
+           handling remains authoritative after the identity rewrite. */
+        c->soft_delta = 0;
+        c->soft_protection = HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_WRITE | HL_LOGICAL_VMA_EXEC;
+        if (width > UINT64_MAX - address || !host_range_mapped((uintptr_t)address, (size_t)width)) {
+            c->fault_addr = address;
+            return raise_guest_data_map_fault(c);
+        }
+        uint64_t end = address + width;
+        uint64_t last = (address & ~UINT64_C(4095)) + UINT64_C(4096);
+        if (end > last) last = end;
+        if (snapshot != NULL) {
+            for (size_t index = 0; index < snapshot->count; ++index) {
+                if (snapshot->views[index].guest_first < end && snapshot->views[index].guest_last > address) {
+                    c->reason = R_SOFTSPAN;
+                    return 0;
+                }
+                if (snapshot->views[index].guest_first >= end && snapshot->views[index].guest_first < last)
+                    last = snapshot->views[index].guest_first;
+            }
+        }
+        c->soft_last = last;
+    }
+    c->soft_page = address & ~UINT64_C(4095);
+    c->soft_snapshot = snapshot != NULL ? (uint64_t)(uintptr_t)snapshot : 1;
+    c->reason = R_BRANCH;
+    return 0;
+}
 
 static int x86_signal_cache_contains(void *context, uint64_t pc) {
     (void)context;
@@ -368,8 +576,8 @@ static int legacy_set_alarm(void *context, uint64_t seconds, uint64_t *remaining
 }
 
 static char g_authorized_executable_path[4200];
-#include "../../linux_abi/syscall/dispatch.c"  // SHARED: the canonical syscall layer
-#include "../../linux_abi/sentry.c"            // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
+#include "../../linux_abi/syscall/dispatch.c" // SHARED: the canonical syscall layer
+#include "../../linux_abi/sentry.c"           // untrusted-guest isolation: SPSC ring + sentry split (g_untrusted)
 static void ckpt_poll(struct cpu *c);
 #define G_CKPT_POLL(c) ckpt_poll(c)
 #define G_CKPT_ARCH 1
@@ -387,11 +595,12 @@ static void ckpt_poll(struct cpu *c);
         (c)->bus_ea = 0;                                                                                               \
         (c)->bus_filter = 0;                                                                                           \
         (c)->bus_force = 0;                                                                                            \
-        memset((c)->bus_scratch, 0, sizeof (c)->bus_scratch);                                                          \
+        memset((c)->bus_scratch, 0, sizeof(c)->bus_scratch);                                                           \
+        G_SOFT_TLB_CLEAR(c);                                                                                           \
     } while (0)
 static int container_init(const char *rootfs);
 static int engine_global_init(void);
-#include "../dispatch.c"                       // SHARED engine: run_guest loop (x86 drives it via dispatch.h;
+#include "../dispatch.c" // SHARED engine: run_guest loop (x86 drives it via dispatch.h;
 // keeps its own run_block/block_return in translate.c, G_OWN_TRAMPOLINES)
 static const void *g_initial_executable_image;
 static size_t g_initial_executable_size;
@@ -503,7 +712,8 @@ static int container_init(const char *rootfs) {
     }
     if (g_rootfs) {
         const char *owner_lowers[8];
-        for (int i = 0; i < g_nlower; ++i) owner_lowers[i] = g_lower[i].canon;
+        for (int i = 0; i < g_nlower; ++i)
+            owner_lowers[i] = g_lower[i].canon;
         if (hl_owner_seed(g_rootfs, hl_option_get("HL_FILE_OWNERS"), owner_lowers, (size_t)g_nlower) != 0) return -1;
     }
     if (g_rootfs && chdir(g_rootfs) != 0) return -1; // guest cwd "/" maps to the rootfs root
@@ -520,7 +730,15 @@ static int container_init(const char *rootfs) {
 // W3D: idempotent engine init (pthread key + MAP_JIT arena + trace env + fault handlers). Returns 0
 // on success, nonzero exit code on failure. First call wins; later calls are no-ops (g_engine_inited),
 // so the resident parent pays this once and the standalone path runs it exactly as before.
+static int guest_fetch_direct_valid(uint64_t address, size_t length) {
+    return host_range_mapped((uintptr_t)address, length);
+}
+
 static int engine_global_init(void) {
+    hl_x86_decode_set_instruction_fetch(hl_guest_fetch_exec);
+    hl_guest_fetch_set_direct_validator(guest_fetch_direct_valid);
+    hl_x86_rep_set_store_commit(jit86_store_alias_changed, jit86_store_alias_observation_active);
+    hl_x86_rep_set_access_validators(guest_fetch_direct_valid, guest_fetch_direct_valid);
     if (hl_target_services_bind(&g_target_services) != 0) return 1;
     if (g_engine_inited) return 0;
     if (pthread_key_create(&g_cpu_key, NULL) != 0) {
@@ -638,8 +856,7 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
     uint64_t heap;
     uint64_t heap_address = hl_option_get("HL_CHECKPOINT_DIR") ? UINT64_C(0x0000050000000000) : 0;
     if (hl_gmap_map_anonymous(heap_address, 256u << 20, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
-                              HL_HOST_MEMORY_PRIVATE,
-                              &heap) != HL_STATUS_OK)
+                              HL_HOST_MEMORY_PRIVATE, &heap) != HL_STATUS_OK)
         return 70;
     brk_lo = brk_cur = heap;
     brk_hi = brk_lo + (256u << 20);
@@ -663,7 +880,8 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
     return c.exit_code;
 }
 
-int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable, const void *executable_image, size_t executable_size, uint32_t argument_count,
+int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable,
+                       const void *executable_image, size_t executable_size, uint32_t argument_count,
                        char *const argv[]) {
     int argc;
     g_engine_result_status = HL_STATUS_OK;
@@ -774,9 +992,9 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     } while (0)
 // Bind the same per-guest host-service tables a cold hl_run_linux_guest() would, so the fork-server prewarm
 // parent (which runs guests via run_loaded()) allocates them once and every warm COW worker inherits them.
-#define FSRV_GUEST_HOST_INIT()                                                                                          \
+#define FSRV_GUEST_HOST_INIT()                                                                                         \
     do {                                                                                                               \
-        const hl_host_services *fsrv_host_ = hl_target_services_effective(&g_target_services);                        \
+        const hl_host_services *fsrv_host_ = hl_target_services_effective(&g_target_services);                         \
         futex_table_init(fsrv_host_);                                                                                  \
         seq_ref_arena_init(fsrv_host_);                                                                                \
         eventfd_count_init(fsrv_host_);                                                                                \
@@ -796,8 +1014,8 @@ void hl_target_runtime_init(void) {
 // harness) launching identically.
 int hl_engine_entry(int argc, char **argv);
 
-static int hl_standalone_run(const char *rootfs, const char *executable_host, uint32_t argc, char *const argv[], const hl_options *options,
-                             const char *result_path) {
+static int hl_standalone_run(const char *rootfs, const char *executable_host, uint32_t argc, char *const argv[],
+                             const hl_options *options, const char *result_path) {
     (void)executable_host;
     return hl_native_engine_run(HL_GUEST_ISA_X86_64, rootfs, argc, argv, options, result_path);
 }

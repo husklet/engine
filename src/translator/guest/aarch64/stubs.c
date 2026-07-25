@@ -509,7 +509,65 @@ static void chain_exit_dedup_finish(void) {
     emit_blockret(9);
     e_br(9);
 }
+
+/*
+ * Post-SMC constant edge through the invalidatable shared IBTC.  Unlike a
+ * baked `b body`, this has no hidden ingress after smc_commit clears g_ibtc;
+ * unlike a dispatcher-only exit, a hot unchanged edge refills once and then
+ * remains entirely in translated code.
+ *
+ * x16/x17 are engine-private in the normal steal configuration.  x9 is saved
+ * to its architectural cpu slot before serving as the constant target and is
+ * restored on both paths.  The miss advertises ic_site==1 (shared-only), so
+ * the ordinary dispatcher fill publishes precisely the table this probe uses.
+ */
+static void emit_smc_chain_exit(uint64_t target) {
+    if (!g_steal1617) {
+        emit_exit_const(target, R_BRANCH);
+        return;
+    }
+    e_str(9, CPUREG, 9 * 8);
+    e_movconst(9, target);
+    emit32(0xD3424400u | (9u << 5) | 16u); /* ubfx x16,x9,#2,#16 */
+    emit_ibtcptr(17);
+    emit32(0x8B000000u | (16u << 16) | (4u << 10) | (17u << 5) | 16u);
+    e_ldp(17, 16, 16, 0);
+    uint32_t *empty_branch = (uint32_t *)g_cp;
+    emit32(0); /* cbz x16,miss: never treat an all-zero empty slot as a PC-0 hit */
+    emit32(0xCB000000u | (9u << 16) | (17u << 5) | 17u); /* sub x17,x17,x9 */
+    uint32_t *miss_branch = (uint32_t *)g_cp;
+    emit32(0); /* cbnz x17,miss */
+    e_ldr(9, CPUREG, 9 * 8);
+    e_br(16);
+
+    uint8_t *miss = g_cp;
+    e_str(9, CPUREG, OFF_PC);
+    e_ldr(9, CPUREG, 9 * 8);
+    emit_spill();
+    e_movconst(16, 1);
+    e_str(16, CPUREG, OFF_ICSITE);
+    e_movconst(9, R_BRANCH);
+    e_str(9, CPUREG, OFF_RSN);
+    emit_blockret(9);
+    e_br(9);
+    *empty_branch = 0xB4000000u |
+                    (((uint32_t)((miss - (uint8_t *)empty_branch) / 4) & 0x7ffffu) << 5) | 16u;
+    *miss_branch = 0xB5000000u |
+                   (((uint32_t)((miss - (uint8_t *)miss_branch) / 4) & 0x7ffffu) << 5) | 17u;
+}
+
 static void emit_chain_exit_from(uint64_t target, uint64_t source_gpc) {
+    /*
+     * The first SMC event performs one conservative wholesale map drop, which
+     * makes every pre-SMC direct edge unreachable.  Thereafter translations
+     * must remain individually removable: always return through the
+     * dispatcher rather than baking a branch to another block's immutable old
+     * body or registering a pending patch into it.
+     */
+    if (smc_seen()) {
+        emit_smc_chain_exit(target);
+        return;
+    }
     void *body = map_body(target);
     uint32_t *slot = (uint32_t *)g_cp;
     // IRQSLIM: a FORWARD direct edge may enter past the block's 2-insn poll (body+8) -- any

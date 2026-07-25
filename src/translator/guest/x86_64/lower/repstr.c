@@ -2,10 +2,39 @@
 
 #include "../cpu.h"
 #include "../encoding.h"
+#include "../../../../linux_abi/logical_vma.h"
 
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+
+static hl_x86_rep_store_commit_fn g_rep_store_commit;
+static hl_x86_rep_store_observation_active_fn g_rep_store_observation_active;
+static hl_x86_rep_access_fn g_rep_readable;
+static hl_x86_rep_access_fn g_rep_writable;
+
+void hl_x86_rep_set_store_commit(hl_x86_rep_store_commit_fn callback,
+                                 hl_x86_rep_store_observation_active_fn active) {
+    g_rep_store_commit = callback;
+    g_rep_store_observation_active = active;
+}
+
+void hl_x86_rep_set_access_validators(hl_x86_rep_access_fn readable, hl_x86_rep_access_fn writable) {
+    g_rep_readable = readable;
+    g_rep_writable = writable;
+}
+
+static uint64_t rep_fault(struct cpu *cpu, uint64_t address, uint64_t width, uint32_t required, uint64_t rip,
+                          uint64_t completed) {
+    if (cpu != NULL) {
+        cpu->bus_ea = address;
+        cpu->soft_width = width;
+        cpu->soft_required = required;
+        cpu->rip = rip;
+        cpu->reason = R_SOFTMISS;
+    }
+    return completed;
+}
 
 // translator/guest/x86_64 -- rep movs/stos idiom upgrade.
 // Generalizes the LSE idiom-upgrade lever to the x86 string ops: a `rep movs`/`rep stos`
@@ -24,13 +53,53 @@
 // rip-relative lea into the type/rodata section); rebase it to the real high mapping so these bulk C string
 // helpers touch the mapped bytes (the single-access fault path nonpie_fixup cannot serve a libc memcpy).
 // Inert for PIE/static-PIE (the translator's non-PIE range is empty).
-void hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes, int w, int df) {
+uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes, int w, int df,
+                         struct cpu *cpu, uint64_t rip) {
     uint8_t *dst = destination;
     const uint8_t *src = source;
     hl_x86_count_rep_movs();
     dst = (uint8_t *)(uintptr_t)hl_x86_guest_pointer((uint64_t)(uintptr_t)dst);
     src = (const uint8_t *)(uintptr_t)hl_x86_guest_pointer((uint64_t)(uintptr_t)src);
-    if (nbytes == 0) return;
+    if (nbytes == 0) return 0;
+    if (hl_logical_vma_global_active()) {
+        uint64_t n = nbytes / (unsigned)w;
+        for (uint64_t i = 0; i < n; ++i) {
+            uint64_t step = i * (uint64_t)w;
+            uint64_t dg = (uint64_t)(uintptr_t)(df ? dst - step : dst + step);
+            uint64_t sg = (uint64_t)(uintptr_t)(df ? src - step : src + step);
+            hl_logical_vma_pin dpin = {0}, spin = {0};
+            int sr = hl_logical_vma_pin_data(sg, (size_t)w, HL_LOGICAL_VMA_READ, &spin);
+            if (sr < 0 || spin.contiguous < (size_t)w ||
+                (sr == 0 && g_rep_readable != NULL && !g_rep_readable(sg, (size_t)w))) {
+                if (sr > 0) hl_logical_vma_unpin(&spin);
+                return rep_fault(cpu, sg, (uint64_t)w, X86_SOFT_READ, rip, i);
+            }
+            int dr = hl_logical_vma_pin_data(dg, (size_t)w, HL_LOGICAL_VMA_WRITE, &dpin);
+            if (dr < 0 || dpin.contiguous < (size_t)w ||
+                (dr == 0 && g_rep_writable != NULL && !g_rep_writable(dg, (size_t)w))) {
+                if (dr > 0) hl_logical_vma_unpin(&dpin);
+                hl_logical_vma_unpin(&spin);
+                return rep_fault(cpu, dg, (uint64_t)w, X86_SOFT_WRITE, rip, i);
+            }
+            memcpy(dpin.host, spin.host, (size_t)w);
+            if (g_rep_store_commit != NULL) g_rep_store_commit(dg, (uint64_t)w);
+            hl_logical_vma_unpin(&dpin);
+            hl_logical_vma_unpin(&spin);
+        }
+        return n;
+    }
+    if (g_rep_store_commit != NULL && g_rep_store_observation_active != NULL &&
+        g_rep_store_observation_active()) {
+        uint64_t n = nbytes / (unsigned)w;
+        for (uint64_t i = 0; i < n; ++i) {
+            uint64_t step = i * (uint64_t)w;
+            uint8_t *element_dst = df ? dst - step : dst + step;
+            const uint8_t *element_src = df ? src - step : src + step;
+            memcpy(element_dst, element_src, (size_t)w);
+            g_rep_store_commit((uint64_t)(uintptr_t)element_dst, (uint64_t)w);
+        }
+        return n;
+    }
     if (df) { // DF=1 backward: dst/src point at the HIGHEST element; copy high->low, element-granular (the
         // x86 `std; rep movs` used by memmove for dst>src overlap). Element-by-element replays the scalar
         // loop's exact bytes for every overlap/width; byte-identical to the -w element loop below.
@@ -39,11 +108,11 @@ void hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes, int
             uint64_t o = i * (uint64_t)w;
             memcpy(dst - o, src - o, (size_t)w); // one whole w-wide element per step
         }
-        return;
+        return n;
     }
     if (dst <= src || dst >= src + nbytes) { // disjoint, or forward-safe (dst before src)
         memcpy(dst, src, nbytes);
-        return;
+        return nbytes / (unsigned)w;
     }
     switch (w) { // forward-overlap smear, element-granular (matches per-element rep movs)
     case 2: {
@@ -51,70 +120,98 @@ void hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes, int
         const uint16_t *s = (const uint16_t *)src;
         for (uint64_t i = 0, n = nbytes >> 1; i < n; i++)
             d[i] = s[i];
-        return;
+        return nbytes / (unsigned)w;
     }
     case 4: {
         uint32_t *d = (uint32_t *)dst;
         const uint32_t *s = (const uint32_t *)src;
         for (uint64_t i = 0, n = nbytes >> 2; i < n; i++)
             d[i] = s[i];
-        return;
+        return nbytes / (unsigned)w;
     }
     case 8: {
         uint64_t *d = (uint64_t *)dst;
         const uint64_t *s = (const uint64_t *)src;
         for (uint64_t i = 0, n = nbytes >> 3; i < n; i++)
             d[i] = s[i];
-        return;
+        return nbytes / (unsigned)w;
     }
     default:
         for (uint64_t i = 0; i < nbytes; i++)
             dst[i] = src[i];
-        return;
+        return nbytes;
     }
 }
 
 // Host helper for `rep stos`: fill `n` elements of width `w` with `val` (AL/AX/EAX/RAX).
-void hl_x86_rep_stos(void *destination, uint64_t val, uint64_t n, int w, int df) {
+uint64_t hl_x86_rep_stos(void *destination, uint64_t val, uint64_t n, int w, int df,
+                         struct cpu *cpu, uint64_t rip) {
     uint8_t *dst = destination;
     hl_x86_count_rep_stos();
     dst = (uint8_t *)(uintptr_t)hl_x86_guest_pointer((uint64_t)(uintptr_t)dst);
+    if (hl_logical_vma_global_active()) {
+        for (uint64_t i = 0; i < n; ++i) {
+            uint64_t step = i * (uint64_t)w;
+            uint64_t dg = (uint64_t)(uintptr_t)(df ? dst - step : dst + step);
+            hl_logical_vma_pin pin;
+            int result = hl_logical_vma_pin_data(dg, (size_t)w, HL_LOGICAL_VMA_WRITE, &pin);
+            if (result < 0 || pin.contiguous < (size_t)w ||
+                (result == 0 && g_rep_writable != NULL && !g_rep_writable(dg, (size_t)w))) {
+                if (result > 0) hl_logical_vma_unpin(&pin);
+                return rep_fault(cpu, dg, (uint64_t)w, X86_SOFT_WRITE, rip, i);
+            }
+            memcpy(pin.host, &val, (size_t)w);
+            if (g_rep_store_commit != NULL) g_rep_store_commit(dg, (uint64_t)w);
+            hl_logical_vma_unpin(&pin);
+        }
+        return n;
+    }
+    if (g_rep_store_commit != NULL && g_rep_store_observation_active != NULL &&
+        g_rep_store_observation_active()) {
+        for (uint64_t i = 0; i < n; ++i) {
+            uint64_t step = i * (uint64_t)w;
+            uint8_t *element_dst = df ? dst - step : dst + step;
+            memcpy(element_dst, &val, (size_t)w);
+            g_rep_store_commit((uint64_t)(uintptr_t)element_dst, (uint64_t)w);
+        }
+        return n;
+    }
     if (df) { // DF=1 backward: dst points at the highest element; write val at dst, dst-w, dst-2w, ...
         uint8_t *p = dst;
         for (uint64_t i = 0; i < n; i++, p -= (unsigned)w)
             memcpy(p, &val, (size_t)w); // low w bytes of RAX, little-endian (== AL/AX/EAX/RAX)
-        return;
+        return n;
     }
     switch (w) {
     case 2: {
         uint16_t *p = (uint16_t *)dst, v = (uint16_t)val;
         for (uint64_t i = 0; i < n; i++)
             p[i] = v;
-        return;
+        return n;
     }
     case 4: {
         uint32_t *p = (uint32_t *)dst, v = (uint32_t)val;
         for (uint64_t i = 0; i < n; i++)
             p[i] = v;
-        return;
+        return n;
     }
     case 8: {
         uint64_t *p = (uint64_t *)dst, v = val;
         for (uint64_t i = 0; i < n; i++)
             p[i] = v;
-        return;
+        return n;
     }
-    default: memset(dst, (int)(val & 0xff), n); return;
+    default: memset(dst, (int)(val & 0xff), n); return n;
     }
 }
 
 // Codegen for the idiom: spill guest state, marshal args, blr the host helper, then fix up
-// RDI/RSI (+= count*w) and RCX (->0) in the membank snapshot, and reload. Guest GPRs live in
+// RDI/RSI (+= completed*w) and RCX (-= completed) in the membank snapshot, and reload. Guest GPRs live in
 // host x0..x15 (caller-saved) so the spill/reload around the call is mandatory; x28 (cpu) is
 // callee-saved and survives; the host SP is untouched (guest RSP is x4), so ABI alignment holds.
 // df_static is the block-static direction shadow. The helper takes the runtime direction as its fifth
 // argument; for a dynamic direction we load cpu->df and negate the pointer delta at runtime when backward.
-static void emit_rep_string(int movs, int w, int shift, enum hl_x86_direction df_static) {
+static void emit_rep_string(int movs, int w, int shift, enum hl_x86_direction df_static, uint64_t rip) {
     // emit_spill (below) clears cpu->vdirty and republishes cpu->V, and emit_reload restores host
     // v0..v15 FROM cpu->V, so this leaves cpu->V current -> no vdirty mark needed (a later syscall may slim).
     hl_x86_emit_spill();                   // x0..x15 + xmm0..15 + flags -> cpu (membank)
@@ -126,6 +223,8 @@ static void emit_rep_string(int movs, int w, int shift, enum hl_x86_direction df
         e_ldr(4, 28, OFF_DF); // x4 = cpu->df (0 fwd / 1 bwd) -- runtime direction
     else
         e_movconst(4, (uint64_t)(df_static == HL_X86_DIRECTION_BACKWARD)); // x4 = statically-known direction
+    e_mov_rr(5, 28, 1); // x5 = cpu, used to publish a precise soft-memory fault
+    e_movconst(6, rip);  // x6 = faulting guest instruction
     if (movs) {
         if (shift) e_lsl_i(2, 2, shift, 1); // x2 = nbytes = count << shift
         hl_x86_emit_host_pointer(16, (uint64_t)(uintptr_t)&hl_x86_rep_movs);
@@ -133,12 +232,13 @@ static void emit_rep_string(int movs, int w, int shift, enum hl_x86_direction df
         hl_x86_emit_host_pointer(16, (uint64_t)(uintptr_t)&hl_x86_rep_stos);
     }
     emit32(0xD63F0000u | (16 << 5)); // blr x16
+    e_mov_rr(21, 0, 1);              // x21 = completed element count returned by helper
     // membank still holds the pre-call rcx/rdi/rsi (the helper takes its args by value):
     e_ldr(17, 28, R_OFF(RCX)); // x17 = original element count
     if (shift)
-        e_lsl_i(16, 17, shift, 1); // x16 = nbytes = count << shift
+        e_lsl_i(16, 21, shift, 1); // x16 = completed bytes
     else
-        e_mov_rr(16, 17, 1);
+        e_mov_rr(16, 21, 1);
     // signed pointer delta: forward => +nbytes, backward => -nbytes.
     if (df_static == HL_X86_DIRECTION_BACKWARD) {
         e_rrr(A_SUB, 16, 31, 16, 1, 0); // x16 = -nbytes
@@ -155,7 +255,21 @@ static void emit_rep_string(int movs, int w, int shift, enum hl_x86_direction df
         e_rrr(A_ADD, 19, 19, 16, 1, 0); // rsi += delta
         e_str(19, 28, R_OFF(RSI));
     }
-    e_str(31, 28, R_OFF(RCX)); // rcx = 0 (str xzr); EFLAGS unchanged by movs/stos
+    e_rrr(A_SUB, 17, 17, 21, 1, 0);
+    e_str(17, 28, R_OFF(RCX)); // rcx -= completed; EFLAGS unchanged by movs/stos
+    e_ldr(16, 28, OFF_RSN);
+    uint32_t *complete = hl_x86_emit_cursor();
+    emit32(0); // cbz x16, complete
+    hl_x86_emit_block_return();
+    uint32_t *done = hl_x86_emit_cursor();
+    *complete = 0xB4000000u | (((uint32_t)(done - complete) & 0x7ffffu) << 5) | 16u;
+    /*
+     * The helper may have queued one or more executable-alias writes.  RDI,
+     * RSI and RCX now describe the exact completed architectural instruction,
+     * so this is the first safe point to leave at `g_emit_next`; draining
+     * inside the helper would either replay or skip non-idempotent elements.
+     */
+    emit_soft_store_drain();
     hl_x86_emit_reload();
     // the emit_spill above cleared cpu->vdirty at RUNTIME, so the once-per-trace mark latch must
     // reset -- a later xmm write in this same region has to re-mark or a following slim syscall exit would
@@ -177,9 +291,10 @@ int hl_x86_lower_repstr(struct insn *I, uint64_t next, hl_x86_repstr_state *stat
         // so this fast path serves BOTH forward and backward. Fall back to the scalar loop only for NOREP=1,
         // `lods` (result is RAX, not a bulk move), or a segment override / 32-bit address size (the scalar
         // loop ignores both too).
-        if (I->rep && !lods && !I->seg && !I->addr32 && (w == 1 || w == 2 || w == 4 || w == 8) && state->optimize) {
+        if (I->rep && !lods && !I->seg && !I->addr32 && (w == 1 || w == 2 || w == 4 || w == 8) &&
+            (state->optimize || emit_soft_memory_active())) {
             int shift = w == 1 ? 0 : w == 2 ? 1 : w == 4 ? 2 : 3;
-            emit_rep_string(movs, w, shift, state->direction);
+            emit_rep_string(movs, w, shift, state->direction, next - (uint64_t)I->len);
             return TX_NEXT;
         }
         // Scalar element loop. DF stride: forward +w, backward -w. When DF is statically known
@@ -209,15 +324,44 @@ int hl_x86_lower_repstr(struct insn *I, uint64_t next, hl_x86_repstr_state *stat
             emit32(0);
         } // cbz RCX,done
         if (movs) {
-            e_load(w, 16, RSI);
-            e_store(w, 16, RDI);
+            if (emit_soft_memory_active()) {
+                e_mov_rr(17, RSI, 1);
+                emit_memory_guard(17, (uint64_t)w, next - (uint64_t)I->len, X86_SOFT_READ);
+                e_mov_rr(26, 17, 1);
+                e_mov_rr(17, RDI, 1);
+                emit_memory_guard(17, (uint64_t)w, next - (uint64_t)I->len, X86_SOFT_WRITE);
+                e_load(w, 16, 26);
+                e_store(w, 16, 17);
+                /*
+                 * REP is one architectural instruction.  Record each
+                 * completed element, but do not leave for SMC service until
+                 * RCX/RSI/RDI describe the completed instruction; resuming at
+                 * `next` after the first element would silently skip the
+                 * remaining non-idempotent stores.
+                 */
+                emit_soft_store_observe((uint64_t)w);
+            } else {
+                e_load(w, 16, RSI);
+                e_store(w, 16, RDI);
+            }
             REP_STEP(RSI);
             REP_STEP(RDI);
         } else if (lods) {
-            e_load(w, RAX, RSI);
+            if (emit_soft_memory_active()) {
+                e_mov_rr(17, RSI, 1);
+                emit_memory_guard(17, (uint64_t)w, next - (uint64_t)I->len, X86_SOFT_READ);
+                e_load(w, RAX, 17);
+            } else
+                e_load(w, RAX, RSI);
             REP_STEP(RSI);
         } else {
-            e_store(w, RAX, RDI);
+            if (emit_soft_memory_active()) {
+                e_mov_rr(17, RDI, 1);
+                emit_memory_guard(17, (uint64_t)w, next - (uint64_t)I->len, X86_SOFT_WRITE);
+                e_store(w, RAX, 17);
+                emit_soft_store_observe((uint64_t)w);
+            } else
+                e_store(w, RAX, RDI);
             REP_STEP(RDI);
         } // stos
 #undef REP_STEP
@@ -228,6 +372,7 @@ int hl_x86_lower_repstr(struct insn *I, uint64_t next, hl_x86_repstr_state *stat
             int64_t d = (hl_x86_emit_cursor() - cbz);
             *cbz = 0xB4000000u | (((uint32_t)d & 0x7FFFF) << 5) | RCX; // cbz x_rcx,done
         }
+        if (movs || op == 0xAA || op == 0xAB) emit_soft_store_drain();
         return TX_NEXT;
     }
     // cmps (A6/A7) / scas (AE/AF): the whole (possibly REP/REPE/REPNE) compare+scan is done in ONE C round-

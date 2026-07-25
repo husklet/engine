@@ -284,8 +284,6 @@ static void sentry_ctl_op(uint32_t op, uint64_t a0, uint64_t a1) {
     atomic_store_explicit(&R->busy, 0, memory_order_release);
 }
 
-
-
 // SCM_RIGHTS fd passing over a control socketpair. sentry_send_fd lends one fd; sentry_recv_fd borrows it.
 // A NULL control message (fd<0) is still sent so the worker's recv stays in lockstep with the round-trip.
 static void sentry_send_fd(int sock, int fd) {
@@ -530,12 +528,12 @@ static void worker_sandbox(void) {
 #define SENTRY_NPROC 64u     // worker processes the sentry tracks a table for at once (the init guest + forks)
 
 struct sentry_proc {
-    int inuse;                        // 0 = free slot, 1 = a live worker process owns this table
-    pid_t wpid;                       // the owning worker process pid (stamped on every request, R->wpid)
-    int real[SENTRY_VFD_MAX];         // virtual fd -> real sentry fd (-1 = unused slot)
-    uint8_t borrowed[SENTRY_VFD_MAX]; // 1 = inherited/borrowed real fd (stdio): never close() it on drop
-    uint8_t cloexec[SENTRY_VFD_MAX];  // 1 = FD_CLOEXEC set (O_CLOEXEC open / F_SETFD): swept on guest execve
-    uint8_t typed[SENTRY_VFD_MAX];    // 1 = real[] names an opaque ABI descriptor shadow, not a native fd
+    int inuse;                          // 0 = free slot, 1 = a live worker process owns this table
+    pid_t wpid;                         // the owning worker process pid (stamped on every request, R->wpid)
+    int real[SENTRY_VFD_MAX];           // virtual fd -> real sentry fd (-1 = unused slot)
+    uint8_t borrowed[SENTRY_VFD_MAX];   // 1 = inherited/borrowed real fd (stdio): never close() it on drop
+    uint8_t cloexec[SENTRY_VFD_MAX];    // 1 = FD_CLOEXEC set (O_CLOEXEC open / F_SETFD): swept on guest execve
+    uint8_t typed[SENTRY_VFD_MAX];      // 1 = real[] names an opaque ABI descriptor shadow, not a native fd
     uint8_t procfd_dir[SENTRY_VFD_MAX]; // 1 = open description is the synthetic /proc/self/fd directory
     uint8_t cloned;                     // 1 = a fork clone already populated this table (see sentry_proc_fork)
 };
@@ -582,8 +580,6 @@ static struct sentry_proc *proc_find_locked(pid_t wpid) {
     free_slot->inuse = 1;
     return free_slot;
 }
-
-
 
 // Allocate the lowest free virtual fd >= minv, map it to (owned, closeable) real fd `rfd`. Returns vfd, or -1
 // if the table is full (caller closes `rfd` and returns -EMFILE -- never leaks the real fd to the guest).
@@ -700,8 +696,7 @@ static void sentry_proc_fork(pid_t parent, pid_t child) {
             } else {
                 hl_linux_fd_snapshot typed;
                 int d = pp->typed[v] && bound_snapshot((uint64_t)(uint32_t)pp->real[v], &typed)
-                            ? (int)bound_dup_at_least(typed.fd, 0,
-                                                      cp->cloexec[v] ? HL_LINUX_FD_CLOEXEC : 0)
+                            ? (int)bound_dup_at_least(typed.fd, 0, cp->cloexec[v] ? HL_LINUX_FD_CLOEXEC : 0)
                             : dup(pp->real[v]);
                 cp->real[v] = d;
                 cp->borrowed[v] = (d < 0); // dup failure: leave the slot unusable but never closeable
@@ -1063,7 +1058,7 @@ static void sentry_service_one(struct sentry_ring *R) {
         case 56:
         case 78:
         case 79:
-        case 291:                           // openat / newfstatat / statx: force the in-path NUL-terminated within
+        case 291: // openat / newfstatat / statx: force the in-path NUL-terminated within
         case 439:
             R->buf[SENTRY_PATHCAP - 1] = 0; // its window so service_local()'s C-string walk can't run off buf
             break;
@@ -1210,8 +1205,7 @@ static void sentry_service_one(struct sentry_ring *R) {
         g_bound_second_native = 0;
         if (p && (fd_in_a0(snr) || snr == 48 || snr == 56 || snr == 78 || snr == 79 || snr == 291 || snr == 439)) {
             int v = (int)(int64_t)G_A0(&tmp);
-            if (v >= 0 && (uint32_t)v < SENTRY_VFD_MAX && p->real[v] >= 0 && !p->typed[v])
-                g_bound_source_native = 1;
+            if (v >= 0 && (uint32_t)v < SENTRY_VFD_MAX && p->real[v] >= 0 && !p->typed[v]) g_bound_source_native = 1;
         }
         if (p) switch (snr) {
             case 71: { // sendfile: a0=output, a1=input; both are virtual descriptors
@@ -1253,12 +1247,12 @@ static void sentry_service_one(struct sentry_ring *R) {
                         if (!procfd_directory && relative[0] != '/') {
                             char descriptor_path[64];
                             char backing[HL_LINUX_PATH_MAX + 1];
-                            int descriptor_length = snprintf(descriptor_path, sizeof descriptor_path,
-                                                             "/proc/self/fd/%d", r);
-                            ssize_t backing_length = descriptor_length > 0 &&
-                                                             (size_t)descriptor_length < sizeof descriptor_path
-                                                         ? readlink(descriptor_path, backing, sizeof backing - 1u)
-                                                         : -1;
+                            int descriptor_length =
+                                snprintf(descriptor_path, sizeof descriptor_path, "/proc/self/fd/%d", r);
+                            ssize_t backing_length =
+                                descriptor_length > 0 && (size_t)descriptor_length < sizeof descriptor_path
+                                    ? readlink(descriptor_path, backing, sizeof backing - 1u)
+                                    : -1;
                             if (backing_length > 0) {
                                 backing[backing_length] = 0;
                                 procfd_directory = strstr(backing, "/.hl-proc-fd") != NULL;
@@ -1342,8 +1336,7 @@ static void sentry_service_one(struct sentry_ring *R) {
                 }
                 hl_linux_fd_snapshot typed;
                 int rnew = p->typed[oldv] && bound_snapshot((uint64_t)(uint32_t)rold, &typed)
-                               ? (int)bound_dup_at_least(typed.fd, 0,
-                                                         (flags & LX_O_CLOEXEC) ? HL_LINUX_FD_CLOEXEC : 0)
+                               ? (int)bound_dup_at_least(typed.fd, 0, (flags & LX_O_CLOEXEC) ? HL_LINUX_FD_CLOEXEC : 0)
                                : fcntl(rold, (flags & O_CLOEXEC) ? F_DUPFD_CLOEXEC : F_DUPFD, 0);
                 if (rnew < 0) {
                     local_ret = -errno;
@@ -1761,9 +1754,9 @@ static void sentry_shutdown(void) {
 // derived purely from worker-process state. The descriptor table (fd, fdinfo) IS sentry state and must
 // keep forwarding.
 static int sentry_worker_proc_leaf(const char *path) {
-    static const char *const leaves[] = {"auxv",    "maps",    "smaps", "stat",      "status", "statm",
-                                         "environ", "cmdline", "comm",  "exe",       "limits", "mountinfo",
-                                         "pagemap", "task/1/maps", NULL};
+    static const char *const leaves[] = {"auxv",   "maps",      "smaps",   "stat",        "status",
+                                         "statm",  "environ",   "cmdline", "comm",        "exe",
+                                         "limits", "mountinfo", "pagemap", "task/1/maps", NULL};
     if (path == NULL || strncmp(path, "/proc/", 6) != 0) return 0;
     const char *rest = path + 6;
     // "/proc/self" itself: glibc realpath("/proc/self/exe") readlinks every component, and the pid this
@@ -1836,29 +1829,74 @@ static void syscall_route(struct cpu *c) {
      * addresses (observed as empty paths and zero-filled pipe writes after exec). */
     if (g_nonpie_lo) {
         switch (nr) {
-        case 48: case 56: case 439: G_A1(c) = nonpie_p(G_A1(c)); break;
-        case 78: case 79:
+        case 48:
+        case 56:
+        case 439: G_A1(c) = nonpie_p(G_A1(c)); break;
+        case 78:
+        case 79:
             G_A1(c) = nonpie_p(G_A1(c));
             G_A2(c) = nonpie_p(G_A2(c));
+            break;
+        case 279: G_A0(c) = nonpie_p(G_A0(c)); break;
+        case 71: G_A2(c) = nonpie_p(G_A2(c)); break;
+        case 76:
+        case 285:
+            G_A1(c) = nonpie_p(G_A1(c));
+            G_A3(c) = nonpie_p(G_A3(c));
             break;
         case 291:
             G_A1(c) = nonpie_p(G_A1(c));
             G_A4(c) = nonpie_p(G_A4(c));
             break;
-        case 61: case 63: case 64: case 67: case 68: case 80:
-        case 200: case 202: case 203: case 204: case 205:
+        case 61:
+        case 63:
+        case 64:
+        case 67:
+        case 68:
+        case 80:
+        case 200:
+        case 203:
+        case 65:
+        case 66: G_A1(c) = nonpie_p(G_A1(c)); break;
+        case 202:
+        case 242:
+        case 204:
+        case 205:
             G_A1(c) = nonpie_p(G_A1(c));
+            G_A2(c) = nonpie_p(G_A2(c));
             break;
-        case 206: case 207:
+        case 206:
             G_A1(c) = nonpie_p(G_A1(c));
             G_A4(c) = nonpie_p(G_A4(c));
             break;
-        case 208: case 209: G_A3(c) = nonpie_p(G_A3(c)); break;
+        case 207:
+            G_A1(c) = nonpie_p(G_A1(c));
+            G_A4(c) = nonpie_p(G_A4(c));
+            G_A5(c) = nonpie_p(G_A5(c));
+            break;
+        case 208: G_A3(c) = nonpie_p(G_A3(c)); break;
+        case 209:
+            G_A3(c) = nonpie_p(G_A3(c));
+            G_A4(c) = nonpie_p(G_A4(c));
+            break;
         case 21: G_A3(c) = nonpie_p(G_A3(c)); break;
         case 22: G_A1(c) = nonpie_p(G_A1(c)); break;
+        case 25:
+        case 29: G_A2(c) = nonpie_p(G_A2(c)); break;
         case 59: G_A0(c) = nonpie_p(G_A0(c)); break;
         case 199: G_A3(c) = nonpie_p(G_A3(c)); break;
-        case 211: case 212: G_A1(c) = nonpie_p(G_A1(c)); break;
+        case 72:
+            G_A1(c) = nonpie_p(G_A1(c));
+            G_A2(c) = nonpie_p(G_A2(c));
+            G_A3(c) = nonpie_p(G_A3(c));
+            G_A4(c) = nonpie_p(G_A4(c));
+            break;
+        case 73:
+            G_A0(c) = nonpie_p(G_A0(c));
+            G_A2(c) = nonpie_p(G_A2(c));
+            break;
+        case 211:
+        case 212: G_A1(c) = nonpie_p(G_A1(c)); break;
         default: break;
         }
     }
@@ -1885,8 +1923,13 @@ static void syscall_route(struct cpu *c) {
     // parent's lane + sentry-ownership, so re-init its bookkeeping; the PARENT counts the new child so a
     // later wait4 with no real children doesn't deadlock on the hidden sentry child.
     if (nr == 220 || nr == 435) {
-        int is_thread =
-            (nr == 220) ? ((G_A0(c) & 0x10000) != 0) : (G_A0(c) ? ((*(uint64_t *)G_A0(c) & 0x10000) != 0) : 0);
+        uint64_t clone3_flags = 0;
+        if (nr == 435 && G_A0(c) &&
+            guest_copy_from(&clone3_flags, G_A0(c), sizeof clone3_flags) != sizeof clone3_flags) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            return;
+        }
+        int is_thread = (nr == 220) ? ((G_A0(c) & 0x10000) != 0) : ((clone3_flags & 0x10000) != 0);
         service_local(c);                // spawn_thread (CLONE_THREAD) or fork() -- both worker-local
         if (getpid() != g_worker_pid) {  // we are the new child worker
             pid_t parent = g_worker_pid; // still the parent's pid until sentry_fork_child() rewrites it
@@ -1920,8 +1963,10 @@ static void syscall_route(struct cpu *c) {
     // sentry_worker_proc_leaf). readlinkat is pure state (bytes into a guest buffer). openat yields a real
     // worker-local fd, which must not leak into the guest's (fully virtual) descriptor space -- hand it to
     // the sentry for adoption so read/lseek/close forward exactly like any sentry-opened descriptor.
-    if ((nr == 56 || nr == 78) && G_A1(c) && host_addr_mapped((uintptr_t)G_A1(c)) &&
-        sentry_worker_proc_leaf((const char *)G_A1(c))) {
+    char worker_proc_path[SENTRY_PATHCAP];
+    int worker_proc_path_len =
+        ((nr == 56 || nr == 78) && G_A1(c)) ? guest_copy_string(worker_proc_path, sizeof worker_proc_path, G_A1(c)) : -1;
+    if (worker_proc_path_len >= 0 && sentry_worker_proc_leaf(worker_proc_path)) {
         service_local(c);
         if (nr == 56 && (int64_t)G_RET(c) >= 0) {
             int rfd = (int)G_RET(c);
@@ -1953,9 +1998,10 @@ static void syscall_route(struct cpu *c) {
             // WUNTRACED/WCONTINUED necessarily reaped a terminated child. With either reporting option,
             // inspect the Linux status when supplied; for a NULL status, a reaped pid no longer exists.
             int terminated = (G_A2(c) & (2u | 8u)) == 0;
-            if (!terminated && G_A1(c) && host_range_mapped((uintptr_t)G_A1(c), sizeof(int))) {
-                int status = *(const int *)G_A1(c);
-                terminated = (status & 0xff) != 0x7f && status != 0xffff;
+            if (!terminated && G_A1(c)) {
+                int status;
+                if (guest_copy_from(&status, G_A1(c), sizeof status) == sizeof status)
+                    terminated = (status & 0xff) != 0x7f && status != 0xffff;
             } else if (!terminated && !G_A1(c)) {
                 errno = 0;
                 terminated = kill((pid_t)r, 0) < 0 && errno == ESRCH;
@@ -2025,43 +2071,81 @@ static void syscall_route(struct cpu *c) {
     R->iovn = 0;
     R->inlen = 0;
 
+    /*
+     * Import every guest descriptor exactly once before publishing the ring.
+     * These snapshots survive the synchronous round trip and are also used for
+     * copy-back, closing both the sentry pointer escape and worker-side TOCTOU
+     * window where an iovec/msghdr was formerly reread after the host call.
+     */
+    struct iovec worker_iov[SENTRY_IOVMAX];
+    uint32_t worker_iovn = 0;
+    uint8_t worker_msghdr[SENTRY_MSGHDR_SZ];
+    struct iovec worker_msg_iov[SENTRY_IOVMAX];
+    uint32_t worker_msg_iovn = 0;
+    int worker_msghdr_valid = 0;
+    socklen_t worker_socklen = 0;
+    int worker_socklen_valid = 0;
+
+#define SENTRY_IMPORT_EXACT(dst, src, len)                                                                              \
+    do {                                                                                                                \
+        size_t _n = (size_t)(len);                                                                                      \
+        if (_n && guest_copy_from((dst), (uint64_t)(src), _n) != (ssize_t)_n) {                                        \
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);                                                                    \
+            atomic_store_explicit(&R->busy, 0, memory_order_release);                                                    \
+            return;                                                                                                     \
+        }                                                                                                               \
+    } while (0)
+#define SENTRY_IMPORT_STRING(dst, cap, src)                                                                             \
+    do {                                                                                                                \
+        int _r = guest_copy_string((dst), (cap), (uint64_t)(src));                                                      \
+        if (_r < 0) {                                                                                                   \
+            G_RET(c) = (uint64_t)(int64_t)_r;                                                                           \
+            atomic_store_explicit(&R->busy, 0, memory_order_release);                                                    \
+            return;                                                                                                     \
+        }                                                                                                               \
+        R->inlen = (uint32_t)_r + 1u;                                                                                   \
+    } while (0)
+#define SENTRY_REQUIRE_WRITE(ptr, len)                                                                                  \
+    do {                                                                                                                \
+        size_t _n = (size_t)(len);                                                                                      \
+        if (_n && guest_accessible_prefix((uint64_t)(ptr), _n, HL_LOGICAL_VMA_WRITE) != _n) {                          \
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);                                                                    \
+            atomic_store_explicit(&R->busy, 0, memory_order_release);                                                    \
+            return;                                                                                                     \
+        }                                                                                                               \
+    } while (0)
+
     switch (nr) {
     case 48:  // faccessat
     case 56:  // openat
     case 439: // faccessat2
     {         // dfd, a1=path: in-path
-        const char *p = (const char *)G_A1(c);
-        uint32_t n = 0;
-        if (p)
-            while (n < SENTRY_PATHCAP - 1 && p[n])
-                n++;
-        if (p) memcpy(R->buf, p, n);
-        R->buf[n] = 0;
-        R->inlen = n + 1;
+        if (!G_A1(c)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            atomic_store_explicit(&R->busy, 0, memory_order_release);
+            return;
+        }
+        SENTRY_IMPORT_STRING((char *)R->buf, SENTRY_PATHCAP, G_A1(c));
         R->redir[1] = 0;
         break;
     }
     case 279: { // memfd_create(a0=name, a1=flags): in-name
-        const char *p = (const char *)G_A0(c);
-        uint32_t n = 0;
-        if (p)
-            while (n < SENTRY_PATHCAP - 1 && p[n])
-                n++;
-        if (p) memcpy(R->buf, p, n);
-        R->buf[n] = 0;
-        R->inlen = n + 1;
+        if (!G_A0(c)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            atomic_store_explicit(&R->busy, 0, memory_order_release);
+            return;
+        }
+        SENTRY_IMPORT_STRING((char *)R->buf, SENTRY_PATHCAP, G_A0(c));
         R->redir[0] = 0;
         break;
     }
     case 78: { // readlinkat(dfd, a1=path, a2=buf, a3=size): in-path + bounded out-buffer
-        const char *p = (const char *)G_A1(c);
-        uint32_t n = 0;
-        if (p)
-            while (n < SENTRY_PATHCAP - 1 && p[n])
-                n++;
-        if (p) memcpy(R->buf, p, n);
-        R->buf[n] = 0;
-        R->inlen = n + 1;
+        if (!G_A1(c)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            atomic_store_explicit(&R->busy, 0, memory_order_release);
+            return;
+        }
+        SENTRY_IMPORT_STRING((char *)R->buf, SENTRY_PATHCAP, G_A1(c));
         R->redir[1] = 0;
         R->redir[2] = SENTRY_PATHCAP;
         uint32_t cap = SENTRY_BUFSZ - SENTRY_PATHCAP;
@@ -2071,7 +2155,15 @@ static void syscall_route(struct cpu *c) {
     case 64:   // write(fd, a1=buf, a2=len)
     case 68: { // pwrite64(fd, a1=buf, a2=len, a3=off): copy the payload into the ring; cap to BUFSZ
         uint32_t n = G_A2(c) > SENTRY_BUFSZ ? SENTRY_BUFSZ : (uint32_t)G_A2(c);
-        if (n) memcpy(R->buf, (const void *)G_A1(c), n);
+        if (n) {
+            ssize_t copied = guest_copy_from(R->buf, G_A1(c), n);
+            if (copied <= 0) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                atomic_store_explicit(&R->busy, 0, memory_order_release);
+                return;
+            }
+            n = (uint32_t)copied; /* Linux permits a short write up to the first inaccessible byte. */
+        }
         R->inlen = n;
         R->redir[1] = 0;
         R->a[2] = n; // ship exactly n bytes; a short (p)write is legal -> guest loops
@@ -2079,18 +2171,18 @@ static void syscall_route(struct cpu *c) {
     }
     case 71: // sendfile(out, in, offset*, count): optional in/out offset
         if (G_A2(c)) {
-            memcpy(R->buf, (const void *)G_A2(c), sizeof(int64_t));
+            SENTRY_IMPORT_EXACT(R->buf, G_A2(c), sizeof(int64_t));
             R->redir[2] = 0;
         }
         break;
     case 76:    // splice(fd_in, off_in*, fd_out, off_out*, len, flags)
     case 285: { // copy_file_range(fd_in, off_in*, fd_out, off_out*, len, flags): both offsets optional in/out
         if (G_A1(c)) {
-            memcpy(R->buf, (const void *)G_A1(c), sizeof(int64_t));
+            SENTRY_IMPORT_EXACT(R->buf, G_A1(c), sizeof(int64_t));
             R->redir[1] = 0;
         }
         if (G_A3(c)) {
-            memcpy(R->buf + sizeof(int64_t), (const void *)G_A3(c), sizeof(int64_t));
+            SENTRY_IMPORT_EXACT(R->buf + sizeof(int64_t), G_A3(c), sizeof(int64_t));
             R->redir[3] = (int32_t)sizeof(int64_t);
         }
         break;
@@ -2099,35 +2191,43 @@ static void syscall_route(struct cpu *c) {
     case 67:   // pread64(fd, a1=buf, a2=len, a3=off)
     case 61: { // getdents64(fd, a1=buf, a2=count): reserve the out window; cap to BUFSZ
         uint32_t n = G_A2(c) > SENTRY_BUFSZ ? SENTRY_BUFSZ : (uint32_t)G_A2(c);
+        if (n) {
+            size_t prefix = guest_accessible_prefix(G_A1(c), n, HL_LOGICAL_VMA_WRITE);
+            if (!prefix) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                atomic_store_explicit(&R->busy, 0, memory_order_release);
+                return;
+            }
+            n = (uint32_t)prefix;
+        }
         R->redir[1] = 0;
         R->a[2] = n; // short read / partial getdents is legal -> guest loops
         break;
     }
     case 80: // fstat(fd, a1=statbuf): out-struct only
+        SENTRY_REQUIRE_WRITE(G_A1(c), SENTRY_STATSZ);
         R->redir[1] = 0;
         break;
     case 79: { // newfstatat(dfd, a1=path, a2=statbuf, flags): in-path + out-struct (two-buffer)
-        const char *p = (const char *)G_A1(c);
-        uint32_t n = 0;
-        if (p)
-            while (n < SENTRY_PATHCAP - 1 && p[n])
-                n++;
-        if (p) memcpy(R->buf, p, n);
-        R->buf[n] = 0;
-        R->inlen = n + 1;
+        if (!G_A1(c)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            atomic_store_explicit(&R->busy, 0, memory_order_release);
+            return;
+        }
+        SENTRY_IMPORT_STRING((char *)R->buf, SENTRY_PATHCAP, G_A1(c));
+        SENTRY_REQUIRE_WRITE(G_A2(c), SENTRY_STATSZ);
         R->redir[1] = 0;              // path     -> buf[0]
         R->redir[2] = SENTRY_PATHCAP; // statbuf -> buf[SENTRY_PATHCAP]; copied back below on success
         break;
     }
     case 291: { // statx(dfd, a1=path, a2=flags, a3=mask, a4=statxbuf): in-path + out-struct
-        const char *p = (const char *)G_A1(c);
-        uint32_t n = 0;
-        if (p)
-            while (n < SENTRY_PATHCAP - 1 && p[n])
-                n++;
-        if (p) memcpy(R->buf, p, n);
-        R->buf[n] = 0;
-        R->inlen = n + 1;
+        if (!G_A1(c)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            atomic_store_explicit(&R->busy, 0, memory_order_release);
+            return;
+        }
+        SENTRY_IMPORT_STRING((char *)R->buf, SENTRY_PATHCAP, G_A1(c));
+        SENTRY_REQUIRE_WRITE(G_A4(c), SENTRY_STATXSZ);
         R->redir[1] = 0;              // path      -> buf[0]
         R->redir[4] = SENTRY_PATHCAP; // statxbuf -> buf[SENTRY_PATHCAP]
         break;
@@ -2138,19 +2238,61 @@ static void syscall_route(struct cpu *c) {
         // scatter/gather data. For writev we gather the guest segments now; for readv we just reserve
         // the windows and scatter back after the round-trip. iov_base offsets are bounds-checked and
         // rebased to ring pointers by the sentry, so no guest pointer ever crosses.
-        const struct iovec *giov = (const struct iovec *)G_A1(c);
         uint32_t n = (uint32_t)G_A2(c);
         if (n > SENTRY_IOVMAX) n = SENTRY_IOVMAX; // partial scatter/gather is legal -> guest loops
-        if (!giov) n = 0;                         // malformed (NULL iov, cnt>0): forward an empty vector
+        const struct iovec *giov = worker_iov;
+        if (n) {
+            if (guest_iov_import(G_A1(c), n, worker_iov) < 0) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                atomic_store_explicit(&R->busy, 0, memory_order_release);
+                return;
+            }
+            if (g_nonpie_lo)
+                for (uint32_t i = 0; i < n; i++)
+                    worker_iov[i].iov_base = (void *)(uintptr_t)nonpie_p((uint64_t)(uintptr_t)worker_iov[i].iov_base);
+        }
+        worker_iovn = n;
         struct iovec *biov = (struct iovec *)R->buf;
         uint32_t cur = n * (uint32_t)sizeof(struct iovec); // data region starts after the iovec header
+        uint32_t payload = 0;
         for (uint32_t i = 0; i < n; i++) {
             uint32_t room = SENTRY_BUFSZ - cur;
             uint32_t want = (giov && giov[i].iov_len < room) ? (uint32_t)giov[i].iov_len : room;
-            if (nr == 66 && want && giov) memcpy(R->buf + cur, giov[i].iov_base, want); // gather (writev)
+            if (nr == 65 && want) {
+                size_t prefix = guest_accessible_prefix((uint64_t)(uintptr_t)giov[i].iov_base, want,
+                                                        HL_LOGICAL_VMA_WRITE);
+                if (!prefix) {
+                    if (!payload) {
+                        G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                        atomic_store_explicit(&R->busy, 0, memory_order_release);
+                        return;
+                    }
+                    n = i;
+                    worker_iovn = n;
+                    break;
+                }
+                want = (uint32_t)prefix;
+            }
+            if (nr == 66 && want && giov) {
+                ssize_t copied = guest_copy_from(R->buf + cur, (uint64_t)(uintptr_t)giov[i].iov_base, want);
+                if (copied != (ssize_t)want) {
+                    if (copied <= 0 && payload == 0) {
+                        G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                        atomic_store_explicit(&R->busy, 0, memory_order_release);
+                        return;
+                    }
+                    if (copied <= 0) {
+                        n = i;
+                        worker_iovn = n;
+                        break;
+                    }
+                    want = (uint32_t)copied;
+                }
+            }
             biov[i].iov_base = (void *)(uintptr_t)cur; // buf-relative offset; sentry rebases + checks
             biov[i].iov_len = want;
             cur += want;
+            payload += want;
         }
         R->inlen = cur;
         R->redir[1] = 0;
@@ -2166,7 +2308,7 @@ static void syscall_route(struct cpu *c) {
         if (sa) {
             uint32_t n = (uint32_t)G_A2(c);
             if (n > SENTRY_SADDRCAP) n = SENTRY_SADDRCAP; // real sockaddrs are <=128; cap defensively
-            memcpy(R->buf + SENTRY_SADDR_OFF, sa, n);
+            SENTRY_IMPORT_EXACT(R->buf + SENTRY_SADDR_OFF, G_A1(c), n);
             R->redir[1] = SENTRY_SADDR_OFF;
             R->a[2] = n;
             R->inlen = n;
@@ -2179,21 +2321,35 @@ static void syscall_route(struct cpu *c) {
     case 205: { // getpeername(fd, a1=addr_out, a2=addrlen_inout): out-sockaddr + in/out socklen
         if (G_A1(c)) R->redir[1] = SENTRY_SADDR_OFF; // out sockaddr -> tail window
         if (G_A2(c)) {                               // in/out socklen: ship the guest cap
-            *(socklen_t *)(R->buf + SENTRY_SLEN_OFF) = *(socklen_t *)G_A2(c);
+            SENTRY_IMPORT_EXACT(R->buf + SENTRY_SLEN_OFF, G_A2(c), sizeof(socklen_t));
+            memcpy(&worker_socklen, R->buf + SENTRY_SLEN_OFF, sizeof worker_socklen);
+            worker_socklen_valid = 1;
+            if (G_A1(c)) {
+                size_t need = worker_socklen < SENTRY_SADDRCAP ? worker_socklen : SENTRY_SADDRCAP;
+                SENTRY_REQUIRE_WRITE(G_A1(c), need);
+            }
             R->redir[2] = SENTRY_SLEN_OFF;
         }
         break;
     }
     case 206: { // sendto(fd, a1=buf, a2=len, a3=flags, a4=destaddr, a5=addrlen): in-data + in-destaddr
         uint32_t n = G_A2(c) > SENTRY_DATACAP ? SENTRY_DATACAP : (uint32_t)G_A2(c);
-        if (n) memcpy(R->buf, (const void *)G_A1(c), n);
+        if (n) {
+            ssize_t copied = guest_copy_from(R->buf, G_A1(c), n);
+            if (copied <= 0) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                atomic_store_explicit(&R->busy, 0, memory_order_release);
+                return;
+            }
+            n = (uint32_t)copied;
+        }
         R->redir[1] = 0;
         R->a[2] = n; // short send is legal -> guest loops
         R->inlen = n;
         if (G_A4(c)) { // optional dest addr (UDP) -> tail window
             uint32_t dl = (uint32_t)G_A5(c);
             if (dl > SENTRY_SADDRCAP) dl = SENTRY_SADDRCAP;
-            memcpy(R->buf + SENTRY_SADDR_OFF, (const void *)G_A4(c), dl);
+            SENTRY_IMPORT_EXACT(R->buf + SENTRY_SADDR_OFF, G_A4(c), dl);
             R->redir[4] = SENTRY_SADDR_OFF;
             R->a[5] = dl;
         }
@@ -2201,11 +2357,26 @@ static void syscall_route(struct cpu *c) {
     }
     case 207: { // recvfrom(fd, a1=buf, a2=len, a3=flags, a4=srcaddr_out, a5=addrlen_inout)
         uint32_t n = G_A2(c) > SENTRY_DATACAP ? SENTRY_DATACAP : (uint32_t)G_A2(c);
+        if (n) {
+            size_t prefix = guest_accessible_prefix(G_A1(c), n, HL_LOGICAL_VMA_WRITE);
+            if (!prefix) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                atomic_store_explicit(&R->busy, 0, memory_order_release);
+                return;
+            }
+            n = (uint32_t)prefix;
+        }
         R->redir[1] = 0;
         R->a[2] = n;                                 // short recv is legal -> guest loops
         if (G_A4(c)) R->redir[4] = SENTRY_SADDR_OFF; // out src sockaddr -> tail window
         if (G_A5(c)) {                               // in/out socklen: ship the guest cap
-            *(socklen_t *)(R->buf + SENTRY_SLEN_OFF) = *(socklen_t *)G_A5(c);
+            SENTRY_IMPORT_EXACT(R->buf + SENTRY_SLEN_OFF, G_A5(c), sizeof(socklen_t));
+            memcpy(&worker_socklen, R->buf + SENTRY_SLEN_OFF, sizeof worker_socklen);
+            worker_socklen_valid = 1;
+            if (G_A4(c)) {
+                size_t need = worker_socklen < SENTRY_SADDRCAP ? worker_socklen : SENTRY_SADDRCAP;
+                SENTRY_REQUIRE_WRITE(G_A4(c), need);
+            }
             R->redir[5] = SENTRY_SLEN_OFF;
         }
         break;
@@ -2214,7 +2385,7 @@ static void syscall_route(struct cpu *c) {
         if (G_A3(c)) {
             uint32_t n = (uint32_t)G_A4(c);
             if (n > SENTRY_OPTCAP) n = SENTRY_OPTCAP;
-            if (n) memcpy(R->buf + SENTRY_OPT_OFF, (const void *)G_A3(c), n);
+            SENTRY_IMPORT_EXACT(R->buf + SENTRY_OPT_OFF, G_A3(c), n);
             R->redir[3] = SENTRY_OPT_OFF;
             R->a[4] = n;
             R->inlen = n;
@@ -2223,7 +2394,14 @@ static void syscall_route(struct cpu *c) {
     }
     case 209: {        // getsockopt(fd, a1=level, a2=optname, a3=optval_out, a4=optlen_inout)
         if (G_A4(c)) { // in/out optlen: ship the guest cap (clamped so the kernel can't overrun the window)
-            socklen_t cap = *(socklen_t *)G_A4(c);
+            socklen_t cap;
+            SENTRY_IMPORT_EXACT(&cap, G_A4(c), sizeof cap);
+            worker_socklen = cap;
+            worker_socklen_valid = 1;
+            if (G_A3(c)) {
+                size_t need = cap < SENTRY_OPTCAP ? cap : SENTRY_OPTCAP;
+                SENTRY_REQUIRE_WRITE(G_A3(c), need);
+            }
             if (cap > SENTRY_OPTCAP) cap = SENTRY_OPTCAP;
             *(socklen_t *)(R->buf + SENTRY_SLEN_OFF) = cap;
             R->redir[4] = SENTRY_SLEN_OFF;
@@ -2234,41 +2412,89 @@ static void syscall_route(struct cpu *c) {
     // ---- sendmsg/recvmsg (item 2): flatten the guest msghdr GRAPH into the ring ----
     case 211:   // sendmsg(fd, a1=msghdr, flags)
     case 212: { // recvmsg(fd, a1=msghdr, flags)
-        uint8_t *g = (uint8_t *)G_A1(c);
-        if (!g) {
-            memset(R->buf, 0, SENTRY_MSGHDR_SZ);
-            R->redir[1] = 0;
-            break;
-        } // NULL msghdr: ship a clean
-          // zero hdr so the sentry never
-          // derefs NULL (no crash)
-        uint64_t g_name = *(uint64_t *)(g + 0);
-        uint32_t g_namelen = *(uint32_t *)(g + 8);
-        uint64_t g_iov = *(uint64_t *)(g + 16), g_iovlen = *(uint64_t *)(g + 24);
-        uint64_t g_ctl = *(uint64_t *)(g + 32), g_ctllen = *(uint64_t *)(g + 40);
-        uint32_t g_flags = *(uint32_t *)(g + 48);
+        if (!G_A1(c)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            atomic_store_explicit(&R->busy, 0, memory_order_release);
+            return;
+        }
+        SENTRY_IMPORT_EXACT(worker_msghdr, G_A1(c), SENTRY_MSGHDR_SZ);
+        worker_msghdr_valid = 1;
+        uint64_t g_name = *(uint64_t *)(worker_msghdr + 0);
+        uint32_t g_namelen = *(uint32_t *)(worker_msghdr + 8);
+        uint64_t g_iov = *(uint64_t *)(worker_msghdr + 16);
+        uint64_t g_iovlen = *(uint64_t *)(worker_msghdr + 24);
+        uint64_t g_ctl = *(uint64_t *)(worker_msghdr + 32);
+        uint64_t g_ctllen = *(uint64_t *)(worker_msghdr + 40);
+        uint32_t g_flags = *(uint32_t *)(worker_msghdr + 48);
+        if (g_nonpie_lo) {
+            g_name = nonpie_p(g_name);
+            g_iov = nonpie_p(g_iov);
+            g_ctl = nonpie_p(g_ctl);
+        }
         uint8_t *h = R->buf; // the 56-byte msghdr COPY at [0,56)
         memset(h, 0, SENTRY_MSGHDR_SZ);
         // msg_name: offset into the sockaddr tail window (send copies the addr; recv just reserves it).
         if (g_name && g_namelen) {
             uint32_t nl = g_namelen > SENTRY_SADDRCAP ? SENTRY_SADDRCAP : g_namelen;
-            if (nr == 211) memcpy(R->buf + SENTRY_MSGNAME_OFF, (const void *)g_name, nl);
+            if (nr == 211) SENTRY_IMPORT_EXACT(R->buf + SENTRY_MSGNAME_OFF, g_name, nl);
             *(uint64_t *)(h + 0) = SENTRY_MSGNAME_OFF; // nonzero offset == present
             *(uint32_t *)(h + 8) = nl;                 // capped to the ring window (real addrs fit)
         }
         // msg_iov: iovec[] header (iov_base = OFFSET) + data, flattened like readv/writev, capped to DATACAP.
-        const struct iovec *giov = (const struct iovec *)g_iov;
         uint32_t n = g_iovlen > SENTRY_IOVMAX ? SENTRY_IOVMAX : (uint32_t)g_iovlen;
-        if (!giov) n = 0;
+        if (n && guest_iov_import(g_iov, n, worker_msg_iov) < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            atomic_store_explicit(&R->busy, 0, memory_order_release);
+            return;
+        }
+        if (g_nonpie_lo)
+            for (uint32_t i = 0; i < n; i++)
+                worker_msg_iov[i].iov_base =
+                    (void *)(uintptr_t)nonpie_p((uint64_t)(uintptr_t)worker_msg_iov[i].iov_base);
+        worker_msg_iovn = n;
+        const struct iovec *giov = worker_msg_iov;
         struct iovec *biov = (struct iovec *)(R->buf + SENTRY_MSGIOV_OFF);
         uint32_t cur = SENTRY_MSGIOV_OFF + n * (uint32_t)sizeof(struct iovec);
+        uint32_t msg_payload = 0;
         for (uint32_t i = 0; i < n; i++) {
             uint32_t room = (cur < SENTRY_DATACAP) ? (SENTRY_DATACAP - cur) : 0; // keep data clear of the tail
             uint32_t want = (giov && giov[i].iov_len < room) ? (uint32_t)giov[i].iov_len : room;
-            if (nr == 211 && want && giov) memcpy(R->buf + cur, giov[i].iov_base, want); // gather (send)
+            if (nr == 212 && want) {
+                size_t prefix = guest_accessible_prefix((uint64_t)(uintptr_t)giov[i].iov_base, want,
+                                                        HL_LOGICAL_VMA_WRITE);
+                if (!prefix) {
+                    if (!msg_payload) {
+                        G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                        atomic_store_explicit(&R->busy, 0, memory_order_release);
+                        return;
+                    }
+                    n = i;
+                    worker_msg_iovn = n;
+                    break;
+                }
+                want = (uint32_t)prefix;
+            }
+            if (nr == 211 && want) {
+                ssize_t copied =
+                    guest_copy_from(R->buf + cur, (uint64_t)(uintptr_t)giov[i].iov_base, want);
+                if (copied != (ssize_t)want) {
+                    if (copied <= 0 && i == 0) {
+                        G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                        atomic_store_explicit(&R->busy, 0, memory_order_release);
+                        return;
+                    }
+                    if (copied <= 0) {
+                        n = i;
+                        worker_msg_iovn = n;
+                        break;
+                    }
+                    want = (uint32_t)copied;
+                }
+            }
             biov[i].iov_base = (void *)(uintptr_t)cur;
             biov[i].iov_len = want;
             cur += want;
+            msg_payload += want;
         }
         *(uint64_t *)(h + 16) = SENTRY_MSGIOV_OFF;
         *(uint64_t *)(h + 24) = n;
@@ -2276,7 +2502,7 @@ static void syscall_route(struct cpu *c) {
         // fds inside are sentry fds, so the bytes cross verbatim.
         if (g_ctl && g_ctllen) {
             uint32_t cl = g_ctllen > SENTRY_MSGCTLCAP ? SENTRY_MSGCTLCAP : (uint32_t)g_ctllen;
-            if (nr == 211) memcpy(R->buf + SENTRY_MSGCTL_OFF, (const void *)g_ctl, cl);
+            if (nr == 211) SENTRY_IMPORT_EXACT(R->buf + SENTRY_MSGCTL_OFF, g_ctl, cl);
             *(uint64_t *)(h + 32) = SENTRY_MSGCTL_OFF; // nonzero offset == present
             *(uint64_t *)(h + 40) = cl;                // controllen (send: actual; recv: cap)
         }
@@ -2293,11 +2519,11 @@ static void syscall_route(struct cpu *c) {
             bytes = SENTRY_DATACAP;
             nfds = bytes / 8u;
         }
-        if (G_A0(c) && bytes) memcpy(R->buf, (const void *)G_A0(c), bytes);
+        if (G_A0(c) && bytes) SENTRY_IMPORT_EXACT(R->buf, G_A0(c), bytes);
         R->redir[0] = 0;
         R->a[1] = nfds;
         if (G_A2(c)) {
-            memcpy(R->buf + SENTRY_POLL_TMO, (const void *)G_A2(c), 16);
+            SENTRY_IMPORT_EXACT(R->buf + SENTRY_POLL_TMO, G_A2(c), 16);
             R->redir[2] = SENTRY_POLL_TMO;
         } else
             R->a[2] = 0; // NULL timeout == block forever
@@ -2310,22 +2536,22 @@ static void syscall_route(struct cpu *c) {
         uint32_t fb = (nfds + 7u) / 8u;
         if (fb > 128u) fb = 128u; // fd_set caps at FD_SETSIZE/8 == 128
         if (G_A1(c)) {
-            memcpy(R->buf + SENTRY_PSEL_RD, (const void *)G_A1(c), fb);
+            SENTRY_IMPORT_EXACT(R->buf + SENTRY_PSEL_RD, G_A1(c), fb);
             R->redir[1] = SENTRY_PSEL_RD;
         } else
             R->a[1] = 0;
         if (G_A2(c)) {
-            memcpy(R->buf + SENTRY_PSEL_WR, (const void *)G_A2(c), fb);
+            SENTRY_IMPORT_EXACT(R->buf + SENTRY_PSEL_WR, G_A2(c), fb);
             R->redir[2] = SENTRY_PSEL_WR;
         } else
             R->a[2] = 0;
         if (G_A3(c)) {
-            memcpy(R->buf + SENTRY_PSEL_EX, (const void *)G_A3(c), fb);
+            SENTRY_IMPORT_EXACT(R->buf + SENTRY_PSEL_EX, G_A3(c), fb);
             R->redir[3] = SENTRY_PSEL_EX;
         } else
             R->a[3] = 0;
         if (G_A4(c)) {
-            memcpy(R->buf + SENTRY_PSEL_TMO, (const void *)G_A4(c), 16);
+            SENTRY_IMPORT_EXACT(R->buf + SENTRY_PSEL_TMO, G_A4(c), 16);
             R->redir[4] = SENTRY_PSEL_TMO;
         } else
             R->a[4] = 0;
@@ -2334,11 +2560,18 @@ static void syscall_route(struct cpu *c) {
     }
     case 21: // epoll_ctl(epfd, op, fd, a3=event): in epoll_event (SENTRY_EPEV_SZ, per guest arch)
         if (G_A3(c)) {
-            memcpy(R->buf, (const void *)G_A3(c), SENTRY_EPEV_SZ);
+            SENTRY_IMPORT_EXACT(R->buf, G_A3(c), SENTRY_EPEV_SZ);
             R->redir[3] = 0;
         }
         break;
     case 22: // epoll_pwait(epfd, a1=events_out, maxevents, timeout, sigmask): reserve out window, drop sigmask
+        if ((int64_t)G_A2(c) > 0) {
+            uint64_t maxevents = G_A2(c);
+            if (maxevents > SENTRY_BUFSZ / SENTRY_EPEV_SZ) maxevents = SENTRY_BUFSZ / SENTRY_EPEV_SZ;
+            uint64_t bytes = maxevents * SENTRY_EPEV_SZ;
+            SENTRY_REQUIRE_WRITE(G_A1(c), bytes);
+            R->a[2] = maxevents;
+        }
         R->redir[1] = 0;
         R->a[4] = 0;
         break;
@@ -2347,7 +2580,7 @@ static void syscall_route(struct cpu *c) {
              // to the ring for those (so the sentry's flock deref can never hit a guest/NULL pointer); copy
              // the inbound lock only if the guest pointer is real.
         if ((int)G_A1(c) >= 5 && (int)G_A1(c) <= 7) {
-            if (G_A2(c)) memcpy(R->buf, (const void *)G_A2(c), SENTRY_FLOCKSZ);
+            if (G_A2(c)) SENTRY_IMPORT_EXACT(R->buf, G_A2(c), SENTRY_FLOCKSZ);
             R->redir[2] = 0;
         }
         break;
@@ -2357,15 +2590,17 @@ static void syscall_route(struct cpu *c) {
             uint32_t isz, osz;
             sentry_ioctl_sizes((unsigned long)G_A1(c), &isz, &osz);
             if (isz > SENTRY_IOCTLCAP) isz = SENTRY_IOCTLCAP;
-            if (isz) memcpy(R->buf, (const void *)G_A2(c), isz);
+            if (isz) SENTRY_IMPORT_EXACT(R->buf, G_A2(c), isz);
         }
         R->redir[2] = 0;
         break;
     }
     case 59: // pipe2(a0=int[2], flags): out fd pair
+        SENTRY_REQUIRE_WRITE(G_A0(c), 8);
         R->redir[0] = 0;
         break;
     case 199: // socketpair(domain, type, proto, a3=int[2]): out fd pair
+        SENTRY_REQUIRE_WRITE(G_A3(c), 8);
         R->redir[3] = 0;
         break;
     default:
@@ -2386,18 +2621,23 @@ static void syscall_route(struct cpu *c) {
     // ---- copy outputs back into guest memory (guest pointers only ever touched here, on the worker) ----
     int64_t ret = R->ret;
     if (nr == 56 && ret >= 0 && ret < HL_NFD) {
-        const char *opened_path = (const char *)G_A1(c);
-        if (opened_path != NULL &&
-            (!strcmp(opened_path, "/proc") || !strncmp(opened_path, "/proc/", 6) ||
-             !strcmp(opened_path, "/dev/fd")))
-            snprintf(g_fdpath[(int)ret], sizeof g_fdpath[(int)ret], "%s", opened_path);
+        const char *opened_path = (const char *)R->buf; /* canonical path snapshot, never reread guest memory */
+        if (!strcmp(opened_path, "/proc") || !strncmp(opened_path, "/proc/", 6) || !strcmp(opened_path, "/dev/fd"))
+            snprintf(g_fdpath[(int)ret], sizeof g_fdpath[(int)ret], "%.*s",
+                     (int)sizeof(g_fdpath[(int)ret]) - 1, opened_path);
     }
+#define SENTRY_EXPORT_EXACT(dst, src, len)                                                                              \
+    do {                                                                                                                \
+        size_t _n = (size_t)(len);                                                                                      \
+        if (_n && guest_copy_to((uint64_t)(dst), (src), _n) != (ssize_t)_n) ret = -EFAULT;                             \
+    } while (0)
     switch (nr) {
     case 78: // readlinkat: sentry landed the non-NUL-terminated link bytes after the path window
         if (ret > 0) {
             uint32_t n = (uint32_t)ret;
             if (n > (uint32_t)R->a[3]) n = (uint32_t)R->a[3];
-            memcpy((void *)G_A2(c), R->buf + SENTRY_PATHCAP, n);
+            ssize_t copied = guest_copy_to(G_A2(c), R->buf + SENTRY_PATHCAP, n);
+            if (copied != (ssize_t)n) ret = copied > 0 ? copied : -EFAULT;
         }
         break;
     case 63: // read
@@ -2406,38 +2646,46 @@ static void syscall_route(struct cpu *c) {
         if (ret > 0) {
             uint32_t n = (uint32_t)ret;
             if (n > (uint32_t)R->a[2]) n = (uint32_t)R->a[2]; // never exceed the window we shipped
-            memcpy((void *)G_A1(c), R->buf, n);
+            ssize_t copied = guest_copy_to(G_A1(c), R->buf, n);
+            if (copied != (ssize_t)n) ret = copied > 0 ? copied : -EFAULT;
         }
         break;
     case 80: // fstat: struct landed at buf[0]
-        if (ret == 0) memcpy((void *)G_A1(c), R->buf, SENTRY_STATSZ);
+        if (ret == 0) SENTRY_EXPORT_EXACT(G_A1(c), R->buf, SENTRY_STATSZ);
         break;
     case 79: // newfstatat: struct landed at buf[SENTRY_PATHCAP]
-        if (ret == 0) memcpy((void *)G_A2(c), R->buf + SENTRY_PATHCAP, SENTRY_STATSZ);
+        if (ret == 0) SENTRY_EXPORT_EXACT(G_A2(c), R->buf + SENTRY_PATHCAP, SENTRY_STATSZ);
         break;
     case 291: // statx: struct landed at buf[SENTRY_PATHCAP]
-        if (ret == 0) memcpy((void *)G_A4(c), R->buf + SENTRY_PATHCAP, SENTRY_STATXSZ);
+        if (ret == 0) SENTRY_EXPORT_EXACT(G_A4(c), R->buf + SENTRY_PATHCAP, SENTRY_STATXSZ);
         break;
     case 71:
-        if (ret >= 0 && G_A2(c)) memcpy((void *)G_A2(c), R->buf, sizeof(int64_t));
+        if (ret >= 0 && G_A2(c)) SENTRY_EXPORT_EXACT(G_A2(c), R->buf, sizeof(int64_t));
         break;
     case 76:  // splice: advanced in/out offsets land back in the guest's off_in/off_out
     case 285: // copy_file_range: same offset writeback shape
         if (ret >= 0) {
-            if (G_A1(c)) memcpy((void *)G_A1(c), R->buf, sizeof(int64_t));
-            if (G_A3(c)) memcpy((void *)G_A3(c), R->buf + sizeof(int64_t), sizeof(int64_t));
+            if (G_A1(c)) SENTRY_EXPORT_EXACT(G_A1(c), R->buf, sizeof(int64_t));
+            if (G_A3(c)) SENTRY_EXPORT_EXACT(G_A3(c), R->buf + sizeof(int64_t), sizeof(int64_t));
         }
         break;
     case 65: // readv: scatter the ret bytes the sentry fetched back into the guest iovecs
         if (ret > 0) {
-            const struct iovec *giov = (const struct iovec *)G_A1(c);
+            const struct iovec *giov = worker_iov;
             const struct iovec *biov = (const struct iovec *)R->buf;
-            uint32_t n = (uint32_t)R->a[2], remaining = (uint32_t)ret;
+            uint32_t n = worker_iovn, remaining = (uint32_t)ret;
+            uint32_t delivered = 0;
             for (uint32_t i = 0; i < n && remaining; i++) {
                 uint32_t seg = (uint32_t)biov[i].iov_len; // window length the sentry scattered into
                 if (seg > remaining) seg = remaining;
                 // the sentry rebased iov_base to a pointer into buf[] (shared at the same VA -> usable here)
-                memcpy(giov[i].iov_base, biov[i].iov_base, seg);
+                ssize_t copied = guest_copy_to((uint64_t)(uintptr_t)giov[i].iov_base, biov[i].iov_base, seg);
+                if (copied != (ssize_t)seg) {
+                    if (copied > 0) delivered += (uint32_t)copied;
+                    ret = delivered ? (int64_t)delivered : -EFAULT;
+                    break;
+                }
+                delivered += seg;
                 remaining -= seg;
             }
         }
@@ -2450,80 +2698,90 @@ static void syscall_route(struct cpu *c) {
         // accept/accept4 succeed with ret>=0 (the new fd); getsockname/getpeername with ret==0.
         if (ret >= 0 && G_A2(c)) {
             socklen_t outlen = *(socklen_t *)(R->buf + SENTRY_SLEN_OFF); // length service_local reported
-            socklen_t gcap = *(socklen_t *)G_A2(c);                      // guest buffer capacity
-            *(socklen_t *)G_A2(c) = outlen;                              // return the (possibly larger) length
+            socklen_t gcap = worker_socklen_valid ? worker_socklen : 0;
             if (G_A1(c)) {
                 socklen_t cpy = outlen < gcap ? outlen : gcap; // truncate to the guest buffer
                 if (cpy > SENTRY_SADDRCAP) cpy = SENTRY_SADDRCAP;
-                memcpy((void *)G_A1(c), R->buf + SENTRY_SADDR_OFF, cpy);
+                SENTRY_EXPORT_EXACT(G_A1(c), R->buf + SENTRY_SADDR_OFF, cpy);
             }
+            if (ret >= 0) SENTRY_EXPORT_EXACT(G_A2(c), &outlen, sizeof outlen);
         }
         break;
     case 207: // recvfrom: recv data landed at buf[0]; src sockaddr + its length in the tail windows
         if (ret > 0) {
             uint32_t n = (uint32_t)ret;
             if (n > (uint32_t)R->a[2]) n = (uint32_t)R->a[2]; // never exceed the window we shipped
-            memcpy((void *)G_A1(c), R->buf, n);
+            ssize_t copied = guest_copy_to(G_A1(c), R->buf, n);
+            if (copied != (ssize_t)n) ret = copied > 0 ? copied : -EFAULT;
         }
         if (ret >= 0 && G_A5(c)) {
             socklen_t outlen = *(socklen_t *)(R->buf + SENTRY_SLEN_OFF);
-            socklen_t gcap = *(socklen_t *)G_A5(c);
-            *(socklen_t *)G_A5(c) = outlen;
+            socklen_t gcap = worker_socklen_valid ? worker_socklen : 0;
             if (G_A4(c)) {
                 socklen_t cpy = outlen < gcap ? outlen : gcap;
                 if (cpy > SENTRY_SADDRCAP) cpy = SENTRY_SADDRCAP;
-                memcpy((void *)G_A4(c), R->buf + SENTRY_SADDR_OFF, cpy);
+                SENTRY_EXPORT_EXACT(G_A4(c), R->buf + SENTRY_SADDR_OFF, cpy);
             }
+            if (ret >= 0) SENTRY_EXPORT_EXACT(G_A5(c), &outlen, sizeof outlen);
         }
         break;
     case 209: // getsockopt: optval landed at the opt window; its length at SLEN
         if (ret == 0 && G_A4(c)) {
             socklen_t outlen = *(socklen_t *)(R->buf + SENTRY_SLEN_OFF);
-            socklen_t gcap = *(socklen_t *)G_A4(c);
+            socklen_t gcap = worker_socklen_valid ? worker_socklen : 0;
             socklen_t eff = gcap < SENTRY_OPTCAP ? gcap : SENTRY_OPTCAP; // we shipped at most OPTCAP
-            *(socklen_t *)G_A4(c) = outlen;
             if (G_A3(c)) {
                 socklen_t cpy = outlen < eff ? outlen : eff;
-                memcpy((void *)G_A3(c), R->buf + SENTRY_OPT_OFF, cpy);
+                SENTRY_EXPORT_EXACT(G_A3(c), R->buf + SENTRY_OPT_OFF, cpy);
             }
+            if (ret == 0) SENTRY_EXPORT_EXACT(G_A4(c), &outlen, sizeof outlen);
         }
         break;
     // ---- recvmsg (item 2): scatter received data + write back name/control/flags into the guest msghdr ----
     case 212:
-        if (ret >= 0 && G_A1(c)) {
-            uint8_t *g = (uint8_t *)G_A1(c); // the original guest msghdr
+        if (ret >= 0 && worker_msghdr_valid) {
             uint8_t *h = R->buf;             // the ring msghdr copy service_local filled
-            uint64_t g_name = *(uint64_t *)(g + 0);
-            uint32_t g_namecap = *(uint32_t *)(g + 8); // guest-supplied name capacity (unmodified yet)
+            uint64_t g_name = *(uint64_t *)(worker_msghdr + 0);
+            if (g_nonpie_lo) g_name = nonpie_p(g_name);
+            uint32_t g_namecap = *(uint32_t *)(worker_msghdr + 8);
             uint32_t outnl = *(uint32_t *)(h + 8);     // length the sentry reported
             if (g_name && g_namecap) {
                 uint32_t cpy = outnl < g_namecap ? outnl : g_namecap;
                 if (cpy > SENTRY_SADDRCAP) cpy = SENTRY_SADDRCAP;
-                memcpy((void *)g_name, R->buf + SENTRY_MSGNAME_OFF, cpy);
+                SENTRY_EXPORT_EXACT(g_name, R->buf + SENTRY_MSGNAME_OFF, cpy);
             }
-            *(uint32_t *)(g + 8) = outnl; // updated msg_namelen
-            uint64_t g_ctl = *(uint64_t *)(g + 32), g_ctlcap = *(uint64_t *)(g + 40);
+            *(uint32_t *)(worker_msghdr + 8) = outnl;
+            uint64_t g_ctl = *(uint64_t *)(worker_msghdr + 32);
+            if (g_nonpie_lo) g_ctl = nonpie_p(g_ctl);
+            uint64_t g_ctlcap = *(uint64_t *)(worker_msghdr + 40);
             uint64_t outcl = *(uint64_t *)(h + 40); // control length the sentry wrote
             if (g_ctl && g_ctlcap) {
                 uint64_t cpy = outcl < g_ctlcap ? outcl : g_ctlcap;
                 if (cpy > SENTRY_MSGCTLCAP) cpy = SENTRY_MSGCTLCAP;
-                memcpy((void *)g_ctl, R->buf + SENTRY_MSGCTL_OFF,
-                       cpy); // SCM_RIGHTS fds here are sentry fds == guest fds
+                SENTRY_EXPORT_EXACT(g_ctl, R->buf + SENTRY_MSGCTL_OFF, cpy);
             }
-            *(uint64_t *)(g + 40) = outcl;                 // updated msg_controllen
-            *(uint32_t *)(g + 48) = *(uint32_t *)(h + 48); // updated msg_flags (MSG_TRUNC/CTRUNC/...)
+            *(uint64_t *)(worker_msghdr + 40) = outcl;
+            *(uint32_t *)(worker_msghdr + 48) = *(uint32_t *)(h + 48);
             // scatter the ret payload bytes back into the guest's iovec segments
             if (ret > 0) {
-                const struct iovec *giov = (const struct iovec *)*(uint64_t *)(g + 16);
                 const struct iovec *biov = (const struct iovec *)(R->buf + SENTRY_MSGIOV_OFF);
-                uint32_t n = (uint32_t)*(uint64_t *)(h + 24), remaining = (uint32_t)ret;
-                for (uint32_t i = 0; i < n && remaining && giov; i++) {
+                uint32_t n = worker_msg_iovn;
+                uint32_t remaining = (uint32_t)ret, delivered = 0;
+                for (uint32_t i = 0; i < n && remaining; i++) {
                     uint32_t seg = (uint32_t)biov[i].iov_len;
                     if (seg > remaining) seg = remaining;
-                    memcpy(giov[i].iov_base, biov[i].iov_base, seg); // biov[i].iov_base rebased to ring VA (shared)
+                    ssize_t copied = guest_copy_to((uint64_t)(uintptr_t)worker_msg_iov[i].iov_base,
+                                                   biov[i].iov_base, seg);
+                    if (copied != (ssize_t)seg) {
+                        if (copied > 0) delivered += (uint32_t)copied;
+                        ret = delivered ? (int64_t)delivered : -EFAULT;
+                        break;
+                    }
+                    delivered += seg;
                     remaining -= seg;
                 }
             }
+            if (ret >= 0) SENTRY_EXPORT_EXACT(G_A1(c), worker_msghdr, SENTRY_MSGHDR_SZ);
         }
         break;
     // ---- multiplexing copy-back (item 3) ----
@@ -2532,47 +2790,55 @@ static void syscall_route(struct cpu *c) {
         if (ret >= 0 && G_A0(c)) {
             uint32_t nf = (uint32_t)R->a[1];
             for (uint32_t k = 0; k < nf; k++)
-                memcpy((uint8_t *)G_A0(c) + (size_t)k * 8u + 6u, R->buf + (size_t)k * 8u + 6u, 2u);
+                if (guest_copy_to(G_A0(c) + (size_t)k * 8u + 6u, R->buf + (size_t)k * 8u + 6u, 2u) != 2) {
+                    ret = -EFAULT;
+                    break;
+                }
         }
         break;
     case 72: // pselect6: the three fd_sets were narrowed in place
         if (ret >= 0) {
             uint32_t fb = ((uint32_t)G_A0(c) + 7u) / 8u;
             if (fb > 128u) fb = 128u;
-            if (G_A1(c)) memcpy((void *)G_A1(c), R->buf + SENTRY_PSEL_RD, fb);
-            if (G_A2(c)) memcpy((void *)G_A2(c), R->buf + SENTRY_PSEL_WR, fb);
-            if (G_A3(c)) memcpy((void *)G_A3(c), R->buf + SENTRY_PSEL_EX, fb);
+            if (G_A1(c)) SENTRY_EXPORT_EXACT(G_A1(c), R->buf + SENTRY_PSEL_RD, fb);
+            if (G_A2(c)) SENTRY_EXPORT_EXACT(G_A2(c), R->buf + SENTRY_PSEL_WR, fb);
+            if (G_A3(c)) SENTRY_EXPORT_EXACT(G_A3(c), R->buf + SENTRY_PSEL_EX, fb);
         }
         break;
     case 22: // epoll_pwait: ret ready events (SENTRY_EPEV_SZ each, per guest arch) landed at buf[0]
         if (ret > 0 && G_A1(c)) {
             uint32_t mx = (uint32_t)G_A2(c);
             uint32_t got = (uint32_t)ret < mx ? (uint32_t)ret : mx;
-            memcpy((void *)G_A1(c), R->buf, got * SENTRY_EPEV_SZ);
+            SENTRY_EXPORT_EXACT(G_A1(c), R->buf, got * SENTRY_EPEV_SZ);
         }
         break;
     case 25: // fcntl F_GETLK: the conflicting lock was written back into the ring flock
-        if ((int)G_A1(c) == 5 && ret >= 0 && G_A2(c)) memcpy((void *)G_A2(c), R->buf, SENTRY_FLOCKSZ);
+        if ((int)G_A1(c) == 5 && ret >= 0 && G_A2(c))
+            SENTRY_EXPORT_EXACT(G_A2(c), R->buf, SENTRY_FLOCKSZ);
         break;
     case 29: // ioctl: write back exactly the out bytes the request defines (never clobber past them)
         if (ret >= 0 && G_A2(c)) {
             uint32_t isz, osz;
             sentry_ioctl_sizes((unsigned long)G_A1(c), &isz, &osz);
             if (osz > SENTRY_IOCTLCAP) osz = SENTRY_IOCTLCAP;
-            if (osz) memcpy((void *)G_A2(c), R->buf, osz);
+            if (osz) SENTRY_EXPORT_EXACT(G_A2(c), R->buf, osz);
         }
         break;
     case 59: // pipe2: out fd pair (both ends sentry fds, virtual to the guest)
-        if (ret == 0 && G_A0(c)) memcpy((void *)G_A0(c), R->buf, 8);
+        if (ret == 0 && G_A0(c)) SENTRY_EXPORT_EXACT(G_A0(c), R->buf, 8);
         break;
     case 199: // socketpair: out fd pair
-        if (ret == 0 && G_A3(c)) memcpy((void *)G_A3(c), R->buf, 8);
+        if (ret == 0 && G_A3(c)) SENTRY_EXPORT_EXACT(G_A3(c), R->buf, 8);
         break;
     default:
         break; // 56 openat / 57 close / 62 lseek / 64 write / 66 writev / 68 pwrite / 198 socket /
                // 200 bind / 203 connect / 206 sendto / 208 setsockopt / 210 shutdown / 211 sendmsg /
                // 20 epoll_create1 / 21 epoll_ctl / 23 dup / 24 dup3: no out bytes
     }
+#undef SENTRY_EXPORT_EXACT
+#undef SENTRY_REQUIRE_WRITE
+#undef SENTRY_IMPORT_STRING
+#undef SENTRY_IMPORT_EXACT
     G_RET(c) = (uint64_t)ret;
     atomic_store_explicit(&R->busy, 0, memory_order_release); // release the producer lock (round-trip done)
 }

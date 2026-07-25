@@ -8,16 +8,21 @@
 
 typedef struct calls {
     int ea, ea_core, load_mem, guards, loads, stores, constants, moves, inserts, bytes, writebacks;
+    int commits;
     int width, destination, source, base, offset, bias;
+    uint32_t required;
+    int order, guard_order, rsp_order;
     uint64_t value, rip;
 } calls;
 
 static calls seen;
 static int fold;
+static int soft_active;
 
 static void reset(void) {
     memset(&seen, 0, sizeof(seen));
     fold = 0;
+    soft_active = 0;
 }
 
 int byte_val(struct insn *i, int r, int s) {
@@ -68,6 +73,21 @@ void emit_bus_guard(int r, uint64_t s, uint64_t pc) {
     seen.base = r;
     seen.width = (int)s;
     seen.rip = pc;
+}
+
+void emit_memory_guard(int r, uint64_t s, uint64_t pc, uint32_t required) {
+    emit_bus_guard(r, s, pc);
+    seen.required = required;
+    seen.guard_order = ++seen.order;
+}
+
+int emit_soft_memory_active(void) {
+    return soft_active;
+}
+
+void emit_soft_store_commit(uint64_t size) {
+    seen.commits++;
+    seen.width = (int)size;
 }
 
 void e_movz(int d, uint32_t v, int s) {
@@ -140,6 +160,7 @@ void e_addi(int d, int s, unsigned v, int sf) {
     seen.destination = d;
     seen.source = s;
     seen.value = v;
+    if (d == 4) seen.rsp_order = ++seen.order;
 }
 
 void e_subi(int d, int s, unsigned v, int sf) {
@@ -226,6 +247,8 @@ int main(void) {
     i.imm = -4;
     HL_CHECK(hl_x86_lower_mov(&i, 100, &image) == TX_NEXT);
     HL_CHECK(seen.ea == 1 && seen.guards == 1 && seen.stores == 1 && seen.rip == 95);
+    HL_CHECK(seen.required == X86_SOFT_WRITE);
+    HL_CHECK(seen.commits == 1 && seen.width == 8);
 
     /* moffs is normalized into the standard effective-address path. */
     reset();
@@ -236,6 +259,7 @@ int main(void) {
     HL_CHECK(hl_x86_lower_mov(&i, 100, &image) == TX_NEXT);
     HL_CHECK(i.is_mem && !i.m_hasbase && !i.m_hasindex && !i.rip_rel && i.disp == i.imm);
     HL_CHECK(seen.ea == 1 && seen.loads == 1 && seen.destination == 0);
+    HL_CHECK(seen.required == X86_SOFT_READ);
 
     /* A foldable memory store uses the direct displacement emitter and no EA temporary. */
     reset();
@@ -246,6 +270,30 @@ int main(void) {
     fold = 1;
     HL_CHECK(hl_x86_lower_mov(&i, 100, &image) == TX_NEXT);
     HL_CHECK(seen.ea == 0 && seen.stores == 1 && seen.base == 7 && seen.offset == 24);
+
+    reset();
+    fold = 1;
+    soft_active = 1;
+    HL_CHECK(hl_x86_lower_mov(&i, 100, &image) == TX_NEXT);
+    HL_CHECK(seen.ea == 1 && seen.guards == 1 && seen.required == X86_SOFT_WRITE && seen.stores == 1);
+    HL_CHECK(seen.commits == 1 && seen.width == 8);
+
+    reset();
+    fold = 0;
+    HL_CHECK(hl_x86_lower_mov(&i, 100, &image) == TX_NEXT);
+    HL_CHECK(seen.ea == 1 && seen.guards == 1 && seen.required == X86_SOFT_WRITE && seen.stores == 1);
+    HL_CHECK(seen.commits == 1 && seen.width == 8);
+
+    reset();
+    i.op = 0x8b;
+    i.is_mem = 1;
+    i.reg = 5;
+    i.opsize = 8;
+    soft_active = 1;
+    fold = 1;
+    HL_CHECK(hl_x86_lower_mov(&i, 100, &image) == TX_NEXT);
+    HL_CHECK(seen.ea == 1 && seen.load_mem == 0 && seen.guards == 1 && seen.required == X86_SOFT_READ &&
+             seen.loads == 1 && seen.destination == 5);
 
     /* A non-PIE type LEA materializes its low identity; other LEAs retain the generic path. */
     reset();
@@ -273,6 +321,21 @@ int main(void) {
     i.rexB = 1;
     HL_CHECK(hl_x86_lower_mov(&i, 100, &image) == TX_NEXT);
     HL_CHECK(seen.moves == 1 && seen.destination == 4 && seen.value == 8 && seen.stores == 1 && seen.source == 8);
+
+    reset();
+    soft_active = 1;
+    HL_CHECK(hl_x86_lower_mov(&i, 100, &image) == TX_NEXT);
+    HL_CHECK(seen.guards == 1 && seen.required == X86_SOFT_WRITE && seen.base == 17 && seen.stores == 1);
+    HL_CHECK(seen.guard_order != 0 && seen.rsp_order > seen.guard_order);
+
+    reset();
+    i.op = 0x58;
+    i.rexB = 0;
+    i.opsize = 8;
+    soft_active = 1;
+    HL_CHECK(hl_x86_lower_mov(&i, 100, &image) == TX_NEXT);
+    HL_CHECK(seen.guards == 1 && seen.required == X86_SOFT_READ && seen.base == 17 && seen.loads == 1);
+    HL_CHECK(seen.guard_order != 0 && seen.rsp_order > seen.guard_order);
 
     reset();
     i.op = 0x63;

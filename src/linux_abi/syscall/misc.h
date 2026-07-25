@@ -3,9 +3,11 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
-typedef int (*hl_linux_misc_mapped_fn)(void *context, uintptr_t address, size_t size);
 typedef void (*hl_linux_misc_random_fn)(void *context, void *output, size_t size);
+typedef ssize_t (*hl_linux_misc_copy_from_fn)(void *context, void *destination, uint64_t source, size_t size);
+typedef ssize_t (*hl_linux_misc_copy_to_fn)(void *context, uint64_t destination, const void *source, size_t size);
 
 typedef struct hl_linux_misc_context {
     char *hostname;
@@ -20,7 +22,8 @@ typedef struct hl_linux_misc_context {
     uint64_t loads[3];          // 1-, 5-, 15-minute load, already scaled by 1<<16 (SI_LOAD_SHIFT)
     uint32_t process_count;     // sysinfo procs
     const char *machine;
-    hl_linux_misc_mapped_fn mapped;
+    hl_linux_misc_copy_from_fn copy_from;
+    hl_linux_misc_copy_to_fn copy_to;
     hl_linux_misc_random_fn random;
     void *callback_context;
 } hl_linux_misc_context;

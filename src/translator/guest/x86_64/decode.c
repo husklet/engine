@@ -4,6 +4,18 @@
 
 #include <string.h>
 
+static hl_x86_instruction_fetch_fn g_instruction_fetch;
+
+void hl_x86_decode_set_instruction_fetch(hl_x86_instruction_fetch_fn fetch) {
+    g_instruction_fetch = fetch;
+}
+
+static int instruction_fetch(uint64_t guest, void *destination, size_t length) {
+    if (g_instruction_fetch != NULL) return g_instruction_fetch(guest, destination, length);
+    memcpy(destination, (const void *)(uintptr_t)guest, length);
+    return 0;
+}
+
 // ---------------- x86-64 decoder ----------------
 static int op_has_modrm(int two, uint8_t op) {
     if (two) {
@@ -96,9 +108,9 @@ static int op_imm_bytes(struct insn *I) {
 
 // returns instruction length, fills I. On a decode it can't handle for length, returns
 // the bytes consumed so far so the reporter can show them.
-int hl_x86_decode(uint64_t pc, hl_x86_insn *I) {
+static int decode_bytes(const uint8_t bytes[15], hl_x86_insn *I) {
     memset(I, 0, sizeof *I);
-    const uint8_t *p = (const uint8_t *)pc;
+    const uint8_t *p = bytes;
     int n = 0;
     I->opsize = 4;
     I->m_scale = 0;
@@ -289,4 +301,28 @@ int hl_x86_decode(uint64_t pc, hl_x86_insn *I) {
     }
     I->len = n;
     return n;
+}
+
+int hl_x86_decode(uint64_t pc, hl_x86_insn *I) {
+    uint8_t bytes[15] = {0};
+    size_t available = 4096u - (size_t)(pc & UINT64_C(4095));
+    if (available > sizeof bytes) available = sizeof bytes;
+    if (instruction_fetch(pc, bytes, available) != 0) {
+        memset(I, 0, sizeof *I);
+        return -1;
+    }
+    int length = decode_bytes(bytes, I);
+    if (length <= (int)available) return length;
+
+    /*
+     * Only touch the following guest page when decoding proves that the
+     * instruction actually reaches it.  Eagerly fetching all fifteen bytes
+     * would incorrectly fault a short instruction at the end of an executable
+     * VMA merely because the following page is inaccessible.
+     */
+    if (instruction_fetch(pc, bytes, sizeof bytes) != 0) {
+        memset(I, 0, sizeof *I);
+        return -1;
+    }
+    return decode_bytes(bytes, I);
 }

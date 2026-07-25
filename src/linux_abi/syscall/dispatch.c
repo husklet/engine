@@ -28,11 +28,6 @@ int g_rwx_guest;
 #include "../../host/directory.h"
 #include "../../host/process.h"
 #include "../../host/system.h" // host memory/boot snapshot feeding sysinfo(2), consistent with /proc/meminfo
-// seccomp: the classic-BPF interpreter + per-thread filter storage + the service() entry gate. Included
-// here (before the fs/proc/rare family includes below) so proc.c's PR_SET_SECCOMP and rare.c's seccomp(2)
-// handlers can call seccomp_install_filter/seccomp_set_strict, and so service() can call seccomp_gate.
-#include "../seccomp.c"
-
 // Linux AT_FDCWD(-100) -> host AT_FDCWD; real directory descriptors pass through unchanged.
 #define ATFD(value) (((int)(value) == -100) ? AT_FDCWD : (int)(value))
 // ================= ptrace(2) — in-hl tracer/tracee coordination ========================
@@ -195,6 +190,11 @@ static void ep_object_retire_endpoint(int fd) {
 }
 
 #include "helpers.c"
+#include "guest_copy.c"
+// Included after the canonical guest-copy helpers and before proc/rare so all
+// seccomp user objects, including nested filter pointers, use the same access
+// path as the rest of syscall emulation.
+#include "../seccomp.c"
 #include "sysv.c"
 #include "mem.c"
 #include "signal.c"
@@ -219,14 +219,19 @@ static int g_untrusted;                   // gate (defined + env-parsed in os/li
 static void syscall_route(struct cpu *c); // sentry router (defined in os/linux/sentry.c)
 static void service_local(struct cpu *c); // fwd: the canonical syscall switch (this file)
 
-static int misc_mapped(void *context, uintptr_t address, size_t size) {
-    (void)context;
-    return host_range_mapped(address, size);
-}
-
 static void misc_random(void *context, void *output, size_t size) {
     (void)context;
     arc4random_buf(output, size);
+}
+
+static ssize_t misc_copy_from(void *context, void *destination, uint64_t source, size_t size) {
+    (void)context;
+    return guest_copy_from(destination, source, size);
+}
+
+static ssize_t misc_copy_to(void *context, uint64_t destination, const void *source, size_t size) {
+    (void)context;
+    return guest_copy_to(destination, source, size);
 }
 
 // g2h-style redirect for non-PIE ET_EXEC pointer args. A non-PIE links at a fixed low vaddr but is biased
@@ -849,14 +854,13 @@ static void service_local(struct cpu *c) {
         case 70: { // pwritev(fd, IOVEC, n, off)
             a1 = nonpie_p(a1);
             int niov = (int)a2;
-            if (niov > 0 && niov <= 1024 && host_range_mapped((uintptr_t)a1, (size_t)niov * sizeof(struct iovec))) {
+            if (niov > 0 && niov <= 1024) {
                 static _Thread_local struct iovec reb[1024];
-                const struct iovec *src = (const struct iovec *)a1;
-                for (int i = 0; i < niov; i++) {
-                    reb[i].iov_base = (void *)nonpie_p((uint64_t)(uintptr_t)src[i].iov_base);
-                    reb[i].iov_len = src[i].iov_len;
+                if (guest_iov_import(a1, (size_t)niov, reb) == 0) {
+                    for (int i = 0; i < niov; i++)
+                        reb[i].iov_base = (void *)nonpie_p((uint64_t)(uintptr_t)reb[i].iov_base);
+                    a1 = (uint64_t)(uintptr_t)reb;
                 }
-                a1 = (uint64_t)(uintptr_t)reb;
             }
             break;
         }
@@ -1173,9 +1177,9 @@ static void service_local(struct cpu *c) {
         // a2 is a raw guest pointer to struct open_how; peek how[0] (flags) only if it is actually mapped, so
         // a bad pointer doesn't fault the engine in this pre-dispatch cache-invalidation probe. If it is
         // unmapped we simply skip the resolution bump -- the real openat2 handler (svc_fs) returns -EFAULT below.
-        uint64_t *how = (uint64_t *)a2;
-        if (how && host_range_mapped((uintptr_t)a2, sizeof(uint64_t)) &&
-            ((how[0] & 0x40) || (g_nlower && (how[0] & 3))))
+        uint64_t flags;
+        if (guest_copy_from(&flags, a2, sizeof flags) == sizeof flags &&
+            ((flags & 0x40) || (g_nlower && (flags & 3))))
             hl_fdcache_resolution_bump();
         break;
     }
@@ -1218,7 +1222,8 @@ static void service_local(struct cpu *c) {
             .uptime_seconds = uptime_s,
             .loads = {loads[0], loads[1], loads[2]},
             .machine = G_UNAME_MACHINE,
-            .mapped = misc_mapped,
+            .copy_from = misc_copy_from,
+            .copy_to = misc_copy_to,
             .random = misc_random,
             .callback_context = NULL,
         };

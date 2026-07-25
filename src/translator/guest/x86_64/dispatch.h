@@ -65,6 +65,11 @@ static uint64_t smc_page_size(void) {
 }
 static void smc_protect(uint64_t pc) {
     if (!g_rwx_guest) return; // no JIT guest -> inert (matrix bit-exact)
+    const void *canonical = NULL;
+    size_t contiguous = 0;
+    int resolved = hl_logical_vma_resolve_exec(pc, 1, &canonical, &contiguous);
+    if (resolved < 0) return;
+    if (resolved > 0) pc = (uint64_t)(uintptr_t)canonical;
     uint64_t size = smc_page_size();
     uint64_t pg = pc & ~(size - 1);
     for (int i = 0; i < g_smc_n; i++)
@@ -225,6 +230,10 @@ static int smc_on_write(uint64_t a) {
 // Each non-syscall case `continue`s the shared while-loop (so the shared `if (reason==R_TIER2) ...`
 // tail line never re-fires for x86). Verbatim from frontend/x86_64/dispatch.c. `break` exits the loop.
 #define G_DISPATCH_REASON(c)                                                                                           \
+    if ((c)->reason == R_SOFTMISS) {                                                                                   \
+        if (soft_tlb_miss(c)) maybe_deliver_signal(c);                                                                 \
+        continue;                                                                                                      \
+    }                                                                                                                  \
     if ((c)->reason == 99) {                                                                                           \
         fprintf(stderr, "[hl] aborting at rip marker %llx (unimplemented opcode)\n", (unsigned long long)(c)->rip);    \
         if (g_trace) {                                                                                                 \
@@ -331,9 +340,15 @@ static int smc_on_write(uint64_t a) {
         if (raise_guest_bus(c)) { maybe_deliver_signal(c); continue; }                                                \
         break;                                                                                                         \
     }                                                                                                                  \
+    if ((c)->reason == R_SMC) {                                                                                        \
+        jit86_smc_commit(c);                                                                                           \
+        (c)->reason = R_BRANCH;                                                                                        \
+        continue;                                                                                                      \
+    }                                                                                                                  \
     if ((c)->reason == R_SYSCALL) {                                                                                    \
         service(c);                                                                                                    \
         if ((c)->exited) break;                                                                                        \
+        if ((c)->smc_range_count || (c)->smc_range_overflow) jit86_smc_commit(c);                                     \
         if ((c)->redirect) (c)->redirect = 0; /* else rip already = next (set at exit) */                              \
     }                                                                                                                  \
     /* R_BRANCH: c->rip already holds the target */

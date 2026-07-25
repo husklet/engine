@@ -818,6 +818,11 @@ extern void block_return(void) __attribute__((visibility("hidden")));
 static void block_return(void);
 #endif
 
+void hl_x86_emit_block_return(void) {
+    emit_host_ptr(16, (uint64_t)block_return, PRELOC_BLOCKRET);
+    e_br(16);
+}
+
 // ---------------- prologue / spill / exits ----------------
 // Prologue: entered x0 = &cpu. Pin cpu in x28, restore flags + 16 guest GPRs (x0 last).
 static void emit_prologue(void) {
@@ -907,7 +912,96 @@ uint32_t *hl_x86_emit_cursor(void) {
 }
 
 /* Emitted only in BUS-active translation generations. */
-void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
+static void emit_soft_guard(int address_register, uint64_t size, uint64_t rip, uint32_t required) {
+    if (!jit_guest_soft_active()) return;
+    e_str(address_register, 28, OFF_BUS_EA);
+    e_str(9, 28, OFF_BUS_SCRATCH);
+    e_ldr(16, 28, OFF_SOFT_SNAPSHOT);
+    uint32_t *invalid = (uint32_t *)g_cp;
+    emit32(0); /* cbz x16,miss */
+    e_lsr_i(9, address_register, 12, 1);
+    emit32(0xD374CC00u | (9u << 5) | 9u); /* lsl x9,x9,#12 */
+    e_ldr(16, 28, OFF_SOFT_PAGE);
+    e_rrr(A_EOR, 9, 9, 16, 1, 0);
+    uint32_t *wrong_page = (uint32_t *)g_cp;
+    emit32(0); /* cbnz x9,miss */
+    e_ldr(16, 28, OFF_SOFT_PROTECTION);
+    uint32_t *denied_read = NULL, *denied_write = NULL;
+    if (required & 1u) {
+        denied_read = (uint32_t *)g_cp;
+        emit32(0); /* tbz x16,#0,miss */
+    }
+    if (required & 2u) {
+        denied_write = (uint32_t *)g_cp;
+        emit32(0); /* tbz x16,#1,miss */
+    }
+    emit32(0xD53B4200u | 16u);
+    e_str(16, 28, OFF_NZCV);
+    emit32(0xB1000000u | (((uint32_t)size & 0xfffu) << 10) |
+           ((unsigned)address_register << 5) | 9u);
+    uint32_t *overflow_branch = (uint32_t *)g_cp;
+    emit32(0);
+    e_ldr(16, 28, OFF_SOFT_LAST);
+    emit32(0xEB00001Fu | (16u << 16) | (9u << 5));
+    uint32_t *span_branch = (uint32_t *)g_cp;
+    emit32(0);
+    e_ldr(16, 28, OFF_NZCV);
+    emit32(0xD51B4200u | 16u);
+    e_ldr(16, 28, OFF_SOFT_DELTA);
+    e_ldr(9, 28, OFF_BUS_SCRATCH);
+    e_rrr(A_ADD, address_register, address_register, 16, 1, 0);
+    uint32_t *resume_branch = (uint32_t *)g_cp;
+    emit32(0); /* b resume */
+
+    uint8_t *miss = g_cp;
+    e_ldr(9, 28, OFF_BUS_SCRATCH);
+    emit_spill();
+    e_ldr(16, 28, OFF_BUS_EA);
+    e_str(16, 28, OFF_BUS_EA);
+    e_movconst(16, size);
+    e_str(16, 28, OFF_SOFT_WIDTH);
+    e_movconst(16, required);
+    e_str(16, 28, OFF_SOFT_REQUIRED);
+    e_movconst(16, rip);
+    e_str(16, 28, OFF_RIP);
+    e_movconst(16, R_SOFTMISS);
+    e_str(16, 28, OFF_RSN);
+    emit_host_ptr(16, (uint64_t)block_return, PRELOC_BLOCKRET);
+    e_br(16);
+
+    uint8_t *span = g_cp;
+    e_ldr(16, 28, OFF_NZCV);
+    emit32(0xD51B4200u | 16u);
+    e_ldr(9, 28, OFF_BUS_SCRATCH);
+    emit_spill();
+    e_movconst(16, size);
+    e_str(16, 28, OFF_SOFT_WIDTH);
+    e_movconst(16, required);
+    e_str(16, 28, OFF_SOFT_REQUIRED);
+    e_movconst(16, rip);
+    e_str(16, 28, OFF_RIP);
+    e_movconst(16, R_SOFTSPAN);
+    e_str(16, 28, OFF_RSN);
+    emit_host_ptr(16, (uint64_t)block_return, PRELOC_BLOCKRET);
+    e_br(16);
+
+    uint8_t *resume = g_cp;
+#define PATCH_CBZ_X(p, target) (*(p) = 0xB4000000u | (((uint32_t)(((target) - (uint8_t *)(p)) / 4) & 0x7ffffu) << 5) | 16u)
+    PATCH_CBZ_X(invalid, miss);
+    *wrong_page = 0xB5000000u | (((uint32_t)((miss - (uint8_t *)wrong_page) / 4) & 0x7ffffu) << 5) | 9u;
+    if (denied_read)
+        *denied_read = 0x36000000u | (((uint32_t)((miss - (uint8_t *)denied_read) / 4) & 0x3fffu) << 5) | 16u;
+    if (denied_write)
+        *denied_write = 0x36080000u | (((uint32_t)((miss - (uint8_t *)denied_write) / 4) & 0x3fffu) << 5) | 16u;
+    *overflow_branch =
+        0x54000002u | (((uint32_t)((span - (uint8_t *)overflow_branch) / 4) & 0x7ffffu) << 5);
+    *span_branch = 0x54000008u | (((uint32_t)((span - (uint8_t *)span_branch) / 4) & 0x7ffffu) << 5);
+    *resume_branch = 0x14000000u | ((uint32_t)((resume - (uint8_t *)resume_branch) / 4) & 0x03ffffffu);
+#undef PATCH_CBZ_X
+}
+
+void emit_memory_guard(int address_register, uint64_t size, uint64_t rip, uint32_t required) {
+    emit_soft_guard(address_register, size, rip, required);
     if (!jit_guest_bus_active()) return;
     /* Sticky guarded translations become nearly inert after the final BUS
        range is released: two loads plus this flag-free state branch, with no
@@ -966,6 +1060,50 @@ void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
     uint8_t *resume_inactive = g_cp;
     *inactive_fast = 0x36000000u | (((uint32_t)((resume_inactive - (uint8_t *)inactive_fast) / 4) & 0x3FFFu) << 5) |
                      16u;
+}
+
+void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
+    emit_memory_guard(address_register, size, rip, 1u);
+}
+
+int emit_soft_memory_active(void) {
+    /*
+     * Soft mappings need address translation. Once the guest has exposed
+     * executable memory, direct 4 KiB shared mappings additionally need the
+     * post-store observer so writes through a disjoint RW alias can retire RX
+     * translations. Before either condition is present, store lowering emits
+     * exactly the historical fast path.
+     */
+    return jit_guest_soft_active() || g_rwx_guest;
+}
+
+void emit_soft_store_observe(uint64_t size) {
+    if (!jit_guest_soft_active() && !g_rwx_guest) return;
+    emit_spill();
+    e_ldr(0, 28, OFF_BUS_EA);
+    e_movconst(1, size);
+    emit_host_ptr(16, (uint64_t)(uintptr_t)&jit86_store_alias_changed, PRELOC_HOSTGLOBAL);
+    emit32(0xD63F0000u | (16 << 5));
+    emit_reload_full();
+}
+
+void emit_soft_store_drain(void) {
+    if (!jit_guest_soft_active() && !g_rwx_guest) return;
+    e_ldr(16, 28, OFF_SMC_RANGE_COUNT);
+    uint32_t *none = (uint32_t *)g_cp;
+    emit32(0); /* cbz x16, reload */
+    e_movconst(16, g_emit_next);
+    e_str(16, 28, OFF_RIP);
+    e_movconst(16, R_SMC);
+    e_str(16, 28, OFF_RSN);
+    emit_host_ptr(16, (uint64_t)block_return, PRELOC_BLOCKRET);
+    e_br(16);
+    *none = UINT32_C(0xB4000000) | (((uint32_t)(((uint8_t *)g_cp - (uint8_t *)none) / 4) & 0x7ffffu) << 5) | 16u;
+}
+
+void emit_soft_store_commit(uint64_t size) {
+    emit_soft_store_observe(size);
+    emit_soft_store_drain();
 }
 
 static void emit_bus_guard_mem17(uint64_t size, int offset) {

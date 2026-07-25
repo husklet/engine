@@ -76,7 +76,7 @@ set(CORE_SOURCES
   src/core/target/run.c src/core/target/services.c ${PROVIDER_SOURCES})
 
 set(IR_SOURCES
-  src/translator/arena.c src/translator/codegen.c src/translator/digest.c
+  src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/guest_fetch.c
   src/translator/identity.c src/translator/persist.c src/translator/reloc.c
   src/translator/window.c src/translator/guest/x86_64/decode.c
   src/translator/guest/x86_64/address.c src/translator/host/aarch64/codegen.c
@@ -108,7 +108,7 @@ set(LINUX_ABI_SOURCES
   src/linux_abi/affinity.c src/linux_abi/container/key.c src/linux_abi/container/pidmap.c
   src/linux_abi/container/ports.c src/linux_abi/container/snapshot.c
   src/linux_abi/container/vfs/gmap.c src/linux_abi/container/shm.c src/linux_abi/device.c
-  src/linux_abi/dns.c src/linux_abi/image.c
+  src/linux_abi/dns.c src/linux_abi/image.c src/linux_abi/logical_vma.c
   src/linux_abi/fdcache.c
   src/linux_abi/epoll.c src/linux_abi/eventfd.c src/linux_abi/fork_codec.c
   src/linux_abi/inotify.c src/linux_abi/pipe.c src/linux_abi/placement.c

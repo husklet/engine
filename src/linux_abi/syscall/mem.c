@@ -1,6 +1,7 @@
 // Extracted from service(): Memory — mmap/brk/mprotect/madvise syscalls. Returns 1 if nr was handled, 0 otherwise.
 // Included by service.c after service/helpers.c, before service() — same TU scope (globals + helpers).
 #include "../page.h"
+#include "../logical_vma.h"
 
 // process_vm_readv/writev between two iovec arrays. In this single-address-space DBT the "remote"
 // process is always the guest itself, so both vectors point into directly-dereferenceable guest memory
@@ -30,14 +31,29 @@ static ssize_t svc_vm_iov_copy(const struct iovec *dst, unsigned long dcnt, cons
             // Either endpoint may be an unmapped/straddling guest buffer. A raw memcpy would fault the ENGINE
             // (a guest-crashes-engine isolation break); mirror the kernel's copy_{to,from}_user instead --
             // stop at the first inaccessible byte, returning the bytes already transferred, or -EFAULT if none.
-            char *dp = (char *)dst[di].iov_base + doff;
-            char *sp = (char *)src[si].iov_base + soff;
-            if (!host_range_mapped((uintptr_t)dp, n) || !host_range_mapped((uintptr_t)sp, n))
-                return total > 0 ? total : -EFAULT;
-            memcpy(dp, sp, n);
-            total += (ssize_t)n;
-            doff += n;
-            soff += n;
+            uint64_t dg = (uint64_t)(uintptr_t)dst[di].iov_base + doff;
+            uint64_t sg = (uint64_t)(uintptr_t)src[si].iov_base + soff;
+            size_t moved = 0;
+            while (moved < n) {
+                void *dp, *sp;
+                size_t da, sa;
+                hl_logical_vma_pin dpin = {0}, spin = {0};
+                if (guest_span(dg + moved, n - moved, HL_LOGICAL_VMA_WRITE, &dp, &da, &dpin) < 0 ||
+                    guest_span(sg + moved, n - moved, HL_LOGICAL_VMA_READ, &sp, &sa, &spin) < 0) {
+                    hl_logical_vma_unpin(&dpin);
+                    hl_logical_vma_unpin(&spin);
+                    return total > 0 ? total : -EFAULT;
+                }
+                size_t chunk = da < sa ? da : sa;
+                memcpy(dp, sp, chunk);
+                guest_smc_copyout(&dpin, dg + moved, chunk);
+                hl_logical_vma_unpin(&dpin);
+                hl_logical_vma_unpin(&spin);
+                moved += chunk;
+                total += (ssize_t)chunk;
+                doff += chunk;
+                soff += chunk;
+            }
         }
         if (doff == dst[di].iov_len) di++, doff = 0;
         if (soff == src[si].iov_len) si++, soff = 0;
@@ -239,6 +255,16 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
         }
+        int logical_mapping_prepared = 0;
+        int logical_transition_locked = 0;
+        if (jit_guest_soft_active()) {
+            gbus_mapping_transition_lock();
+            logical_transition_locked = 1;
+            if (hl_logical_vma_global_overlap(a0, a1)) {
+                gbus_mapping_stw_begin();
+                logical_mapping_prepared = 1;
+            }
+        }
         // Drop any guest PROT_NONE coverage for the unmapped range (the EFAULT registry, thread.c): the
         // addresses no longer name an inaccessible mapping. Uses the guest logical [a0,a1) even when the
         // physical release below is partial -- the guest's mapping is logically gone either way.
@@ -300,9 +326,9 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             hl_gmap_unmap_range(u_lo, u_hi);
             anon_split_unmap(u_lo, u_hi);
             filemap_unmap(u_lo, u_hi);
-            futex_shared_unmap(u_lo, u_hi);  // drop/trim shared-futex-key coverage for the released range
-            wipefork_del(u_lo, u_hi - u_lo); // a wipe-on-fork range that was unmapped no longer applies
-            dontfork_del(u_lo, u_hi - u_lo); // ...nor does a dont-fork marking on the released range
+            futex_shared_unmap(u_lo, u_hi);         // drop/trim shared-futex-key coverage for the released range
+            wipefork_del(u_lo, u_hi - u_lo);        // a wipe-on-fork range that was unmapped no longer applies
+            dontfork_del(u_lo, u_hi - u_lo);        // ...nor does a dont-fork marking on the released range
             hl_gmap_lock_remove(u_lo, u_hi - u_lo); // an unmapped range is implicitly unlocked (mlock -> VmLck)
             // The host pages [u_lo,u_hi) are now genuinely released, so a guest access there must fault
             // (SIGSEGV). Without this the JIT's lazy zero-page grower (jit86_lazyguard) would re-serve the
@@ -321,9 +347,22 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             atomic_fetch_sub(&g_mem_charged, d > cur ? cur : d);
             acct_publish_mem(); // publish the reduced charge into this process's cross-process memory slot
         }
+        if (r == 0 && logical_mapping_prepared) {
+            (void)hl_logical_vma_global_unmap(a0, a1);
+            hl_logical_vma_global_reclaim_quiescent();
+        }
         // stale-translation: the guest may re-map DIFFERENT code at this now-free VA -> drop any cached block
         // translations for the unmapped range so the dispatcher re-translates the new bytes (JITs/trampolines).
         if (r == 0) G_SMC_UNMAP(a0, a0 + (uint64_t)a1);
+        if (logical_mapping_prepared) gbus_mapping_stw_end();
+        /* Keep soft translation active when the last logical view disappears.
+           File-backed 4K views commonly oscillate between zero and one entry
+           (CoreCLR does this while replacing JIT/runtime mappings).  Empty
+           snapshots resolve through the identity path, so guarded blocks
+           remain correct; deactivating here would rotate the entire code cache
+           only to rotate it again at the next mapping.  Whole-image reset owns
+           the eventual guarded -> direct transition. */
+        if (logical_transition_locked) gbus_mapping_transition_unlock();
         G_RET(c) = (uint64_t)r;
         break;
     }
@@ -621,13 +660,40 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             }
         }
         size_t hp = (size_t)getpagesize();
-        void *r;
+        void *r = MAP_FAILED;
         int off_emul = 0;
         void *physical_mapping = NULL;
         size_t physical_mapping_size = 0;
         uint64_t bus_accessible = a1;
         int bus_prepared = 0;
         int mapping_prepared = 0;
+        hl_logical_vma_plan *logical_plan = NULL;
+        int logical_prepare_failed = 0;
+        int logical_prepare_errno = 0;
+        int soft_activated_here = 0;
+        int logical_transition_locked = 0;
+        int logical_candidate =
+            hp > (size_t)guest_pagesz() && (a3 & 0x10) && (a3 & 0x01) && !(a3 & 0x20) && (int)a4 >= 0 && a1;
+        if (logical_candidate) {
+            /* One lock order for every logical mutation:
+               transition -> translation flush -> mapping STW -> ledger. */
+            gbus_mapping_transition_lock();
+            logical_transition_locked = 1;
+            if (jit_guest_soft_activate())
+                soft_activated_here = 1;
+            else {
+                logical_prepare_failed = 1;
+                logical_prepare_errno = ENOMEM;
+            }
+            if (!logical_prepare_failed) {
+                gbus_mapping_stw_begin();
+                mapping_prepared = 1;
+                if (hl_logical_vma_global_prepare_shared(a0, a1, (uint32_t)a2, (int)a4, a5, hp, &logical_plan) != 0) {
+                    logical_prepare_failed = 1;
+                    logical_prepare_errno = errno;
+                }
+            }
+        }
         // The past-EOF SIGBUS ledger + tail zero-fill below are keyed off st_size, which only bounds the
         // readable data of a REGULAR file. A character device (/dev/zero, /dev/full backed by /dev/zero,
         // /dev/mem) reports st_size 0 yet mmaps to an unlimited zero page on Linux -- treating it as a
@@ -646,7 +712,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 }
             }
         }
-        if (!bus_prepared && (a3 & 0x10)) {
+        if (!bus_prepared && !mapping_prepared && (a3 & 0x10)) {
             gbus_mapping_prepare();
             mapping_prepared = 1;
         }
@@ -666,8 +732,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // then the non-PIE fold correctly rebased a heap-header store into RX text. Treat such a non-fixed
         // hint as unavailable and let the host choose a genuinely free address. MAP_FIXED retains replacement
         // semantics and is handled separately.
-        if (a0 && !(a3 & 0x10) && g_nonpie_lo && a0 < g_nonpie_hi && a0 + a1 > g_nonpie_lo)
-            a0 = 0;
+        if (a0 && !(a3 & 0x10) && g_nonpie_lo && a0 < g_nonpie_hi && a0 + a1 > g_nonpie_lo) a0 = 0;
         // The anonymous compatibility tail is host-visible but not part of the guest's requested range.
         // Darwin may honor an executable mapping hint placed in a hole between ELF segments even when
         // that hidden tail reaches the next segment; unmapping the generated-code allocation then removes
@@ -696,7 +761,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // on containment, so every fresh/whole-page/free-space fixed map keeps the direct path below and is
         // byte-identical (a non-contained map has no neighbour to protect).
         int fixed286 = 0;
-        if (hp > (size_t)guest_pagesz() && (a3 & 0x10) && a1 && ((a0 & (hp - 1)) || ((a0 + a1) & (hp - 1)))) {
+        if (!logical_prepare_failed && hp > (size_t)guest_pagesz() && (a3 & 0x10) && a1 &&
+            ((a0 & (hp - 1)) || ((a0 + a1) & (hp - 1)))) {
             int aprot = anon_prot_if_contained(a0, (size_t)a1);
             if (aprot >= 0 && (aprot & PROT_WRITE)) {
                 r = host_fixed_map286(a0, a1, prot, (a3 & 0x20) ? 1 : 0, (a3 & 0x20) ? -1 : (int)a4, (off_t)a5) == 0
@@ -706,7 +772,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             }
         }
         if (fixed286 && r != MAP_FAILED && !(a3 & 0x20) && (a3 & 0x01)) off_emul = 2;
-        if (!fixed286)
+        if (!fixed286 && !logical_prepare_failed)
             r = mmap((void *)a0, (size_t)a1 + guard, prot, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4, (off_t)a5);
         // Host-page-unaligned file offset. macOS uses 16 KB pages and its mmap requires the FILE OFFSET to
         // be a multiple of the host page size, but a Linux guest (4 KB pages) may legitimately map a file at
@@ -800,6 +866,12 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         } else if (mapping_prepared) {
             if (r != MAP_FAILED) gbus_clear((uint64_t)(uintptr_t)r, (uint64_t)(uintptr_t)r + a1 + guard);
         }
+        if (logical_plan != NULL) {
+            if (r != MAP_FAILED && off_emul == 2)
+                hl_logical_vma_commit_shared(logical_plan);
+            else
+                hl_logical_vma_abort_shared(logical_plan);
+        }
         // refund
         if (r == MAP_FAILED && charge) {
             atomic_fetch_sub(&g_mem_charged, (uint64_t)a1);
@@ -812,11 +884,10 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 hl_gmap_add_physical((uint64_t)r, (uint64_t)a1 + guard, (uint64_t)physical_mapping,
                                      (uint64_t)physical_mapping_size);
             else
-                hl_gmap_add((uint64_t)r, (uint64_t)a1 + guard); // track for execve() teardown
+                hl_gmap_add((uint64_t)r, (uint64_t)a1 + guard);  // track for execve() teardown
             hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a1); // /proc maps report the guest length (sans guard)
             if (!(a3 & 0x20) && (int)a4 >= 0)
-                filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0,
-                                 off_emul == 2);
+                filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0, off_emul == 2);
             // Shared-futex key (thread.c): a file-backed MAP_SHARED region (memfd/shm, mapped independently
             // by each peer at its own VA) must key its futex words by the shared object identity, not the VA,
             // so a cross-process/cross-mapping FUTEX_WAKE reaches a FUTEX_WAIT (Wall 7). Record its VA range
@@ -890,14 +961,27 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         /* Keep registry publication inside the same serialized mapping
            transaction as the host replacement.  gmap/anon/wipe/protection
            registries are process-global and are not independently locked. */
-        if (bus_prepared)
+        if (bus_prepared) {
+            hl_logical_vma_global_reclaim_quiescent();
             gbus_prepare_release();
-        else if (mapping_prepared)
+        } else if (logical_transition_locked) {
+            if (mapping_prepared) {
+                hl_logical_vma_global_reclaim_quiescent();
+                gbus_mapping_stw_end();
+            }
+            /* A failed/empty transaction leaves a valid empty soft snapshot.
+               Retain guarded translation until whole-image reset rather than
+               churning the global code cache across short-lived mappings. */
+            gbus_mapping_transition_unlock();
+        } else if (mapping_prepared) {
+            hl_logical_vma_global_reclaim_quiescent();
             gbus_mapping_prepare_release();
+        }
         // stale-translation: a MAP_FIXED mmap REPLACES whatever code lived at the destination VA, so drop any
         // translations cached for it (Linux MAP_FIXED implicitly unmaps the range first).
         if (r != MAP_FAILED && (a3 & 0x10 /*MAP_FIXED*/))
             G_SMC_UNMAP((uint64_t)(uintptr_t)r, (uint64_t)(uintptr_t)r + a1);
+        if (logical_prepare_failed) errno = logical_prepare_errno;
         G_RET(c) = (r == MAP_FAILED) ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -913,6 +997,12 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // Linux mm/mprotect.c rejects a start not aligned to the (guest) page size with EINVAL BEFORE
             // touching anything, so a bad-alignment probe must not read as success.
             if (a0 & (uint64_t)(guest_pagesz() - 1)) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
+            if (a2 & ~(uint64_t)(PROT_READ | PROT_WRITE | PROT_EXEC |
+                                 0x01000000 /* PROT_GROWSDOWN */ |
+                                 0x02000000 /* PROT_GROWSUP */)) {
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
             }
@@ -936,16 +1026,24 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 }
             }
             uint64_t glo = a0 & ~(uint64_t)0xfff, ghi = (a0 + a1 + 0xfff) & ~(uint64_t)0xfff;
-            if ((int)a2 == PROT_NONE)
-                gna_add(glo, ghi);
-            else
-                gna_clear(glo, ghi);
-            if ((int)a2 != PROT_NONE && !((int)a2 & PROT_WRITE))
-                gro_add(glo, ghi);
-            else
-                gro_clear(glo, ghi);
-            if ((int)a2 != PROT_NONE && !((int)a2 & PROT_WRITE))
-                filemap_refresh_emulated(physical_a0, physical_a0 + a1);
+            int logical_protect_prepared = 0;
+            int logical_protect_locked = 0;
+            hl_logical_vma_plan *logical_protect_plan = NULL;
+            if (jit_guest_soft_active()) {
+                gbus_mapping_transition_lock();
+                logical_protect_locked = 1;
+                if (hl_logical_vma_global_overlap(a0, a1)) {
+                    gbus_mapping_stw_begin();
+                    logical_protect_prepared = 1;
+                    if (hl_logical_vma_global_prepare_protect(a0, a1, (uint32_t)a2, &logical_protect_plan) != 0) {
+                        int saved = errno;
+                        gbus_mapping_stw_end();
+                        gbus_mapping_transition_unlock();
+                        G_RET(c) = (uint64_t)(int64_t)-saved;
+                        break;
+                    }
+                }
+            }
             // Making translated code writable is itself the guest's declaration that the bytes may change.
             // Drop translations while the SMC page is still tracked, before the host protection below makes
             // the store silent. This also covers 4K guest subpages where a 16K host mprotect is unsafe: the
@@ -958,18 +1056,50 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // while leaving the host page PROT_NONE, so CoreCLR faulted on that first committed write.
             // Guest EXEC is data to this DBT; keep it host-readable for translation and omit host execution.
             int host_protection = (int)a2;
-            if (host_protection & PROT_EXEC)
-                host_protection = (host_protection | PROT_READ) & ~PROT_EXEC;
+            if (host_protection & PROT_EXEC) host_protection = (host_protection | PROT_READ) & ~PROT_EXEC;
             if (mprotect((void *)(uintptr_t)physical_a0, (size_t)a1, host_protection) != 0) {
-                G_RET(c) = (uint64_t)(int64_t)(-errno);
+                int saved = errno;
+                if (logical_protect_plan != NULL) {
+                    hl_logical_vma_abort_shared(logical_protect_plan);
+                    logical_protect_plan = NULL;
+                }
+                if (logical_protect_prepared) {
+                    hl_logical_vma_global_reclaim_quiescent();
+                    gbus_mapping_stw_end();
+                }
+                if (logical_protect_locked) gbus_mapping_transition_unlock();
+                G_RET(c) = (uint64_t)(int64_t)-saved;
                 break;
             }
             // Keep the private-anon registry's CURRENT protection in sync: MADV_DONTNEED re-establishes
             // a tracked range with the recorded prot, so a committed (mprotect'd RW) subrange of a
             // PROT_NONE reservation must not be remapped back to PROT_NONE (mozjs/V8 GC chunks:
             // reserve NONE -> commit RW -> DONTNEED -> store faulted).
-            anon_update_prot(physical_a0 & ~(uint64_t)0xfff, ((physical_a0 + a1 + 0xfff) & ~(uint64_t)0xfff) - (physical_a0 & ~(uint64_t)0xfff), host_protection);
+            anon_update_prot(physical_a0 & ~(uint64_t)0xfff,
+                             ((physical_a0 + a1 + 0xfff) & ~(uint64_t)0xfff) - (physical_a0 & ~(uint64_t)0xfff),
+                             host_protection);
 #endif
+            /* Publish guest-visible permission registries only after every
+               fallible host operation succeeded.  Otherwise a failed
+               mprotect would return an error while leaving syscall uaccess
+               and write-fault classification at the rejected protection. */
+            if ((int)a2 == PROT_NONE)
+                gna_add(glo, ghi);
+            else
+                gna_clear(glo, ghi);
+            if ((int)a2 != PROT_NONE && !((int)a2 & PROT_WRITE)) {
+                gro_add(glo, ghi);
+                filemap_refresh_emulated(physical_a0, physical_a0 + a1);
+            } else {
+                gro_clear(glo, ghi);
+            }
+            if (logical_protect_prepared) {
+                hl_logical_vma_commit_shared(logical_protect_plan);
+                logical_protect_plan = NULL;
+                hl_logical_vma_global_reclaim_quiescent();
+                gbus_mapping_stw_end();
+            }
+            if (logical_protect_locked) gbus_mapping_transition_unlock();
             // Guest permissions remain logical. Translated guest bytes are host data, and a physical
             // mprotect would turn ordinary guest guard/safepoint accesses into Darwin faults before the
             // Linux permission model can classify them. The SMC machinery independently protects translated
@@ -1078,13 +1208,25 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         // Fast path: guest page == host page (aarch64) -- the host vec is already one byte per guest page.
         if (gps == hps || gps == 0 || len == 0) {
-            int r = mincore((void *)a0, len, (char *)a2);
-            if (r == 0 && a2) {
-                size_t npages = (len + hps - 1) / hps;
-                unsigned char *vec = (unsigned char *)a2;
-                for (size_t i = 0; i < npages; i++)
-                    vec[i] &= 1u; // Linux: bit0 = resident
+            size_t npages = len ? (len + hps - 1) / hps : 0;
+            unsigned char stackvec[1024], *vec = stackvec;
+            if (npages > sizeof stackvec) {
+                vec = malloc(npages);
+                if (!vec) {
+                    G_RET(c) = (uint64_t)(int64_t)-ENOMEM;
+                    break;
+                }
             }
+            int r = mincore((void *)a0, len, (char *)vec);
+            if (r == 0)
+                for (size_t i = 0; i < npages; i++)
+                    vec[i] &= 1u;
+            if (r == 0 && npages && guest_copy_to(a2, vec, npages) != (ssize_t)npages) {
+                if (vec != stackvec) free(vec);
+                G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+                break;
+            }
+            if (vec != stackvec) free(vec);
             G_RET(c) = (r < 0) ? (uint64_t)(-errno) : 0;
             break;
         }
@@ -1110,16 +1252,23 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // engine (one byte per guest page). Validate it before the projection loop so a bad/unmapped
             // pointer returns -EFAULT instead of faulting the engine -- the fast path above lets the
             // host mincore fault a2 itself, but this slow path never hands a2 to a host syscall.
-            if (!host_range_mapped((uintptr_t)a2, gpages)) {
+            unsigned char *vec = malloc(gpages ? gpages : 1);
+            if (!vec) {
                 if (hv != stackbuf) free(hv);
-                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                G_RET(c) = (uint64_t)(int64_t)-ENOMEM;
                 break;
             }
-            unsigned char *vec = (unsigned char *)a2;
             for (size_t i = 0; i < gpages; i++) {
                 size_t h = per ? i / per : i;
                 vec[i] = (h < hpages) ? (unsigned char)(hv[h] & 1u) : 0;
             }
+            if (guest_copy_to(a2, vec, gpages) != (ssize_t)gpages) {
+                free(vec);
+                if (hv != stackbuf) free(hv);
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+            free(vec);
         }
         if (hv != stackbuf) free(hv);
         G_RET(c) = (r < 0) ? (uint64_t)(-errno) : 0;
@@ -1282,19 +1431,17 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(int64_t)-EINVAL;
             break;
         }
-        if ((a2 && guest_bad_ptr((uintptr_t)a1, (size_t)a2 * sizeof(struct iovec))) ||
-            (a4 && guest_bad_ptr((uintptr_t)a3, (size_t)a4 * sizeof(struct iovec)))) {
+        struct iovec local_iov[1024], remote_iov[1024];
+        if (guest_iov_import(a1, (size_t)a2, local_iov) < 0 || guest_iov_import(a3, (size_t)a4, remote_iov) < 0) {
             G_RET(c) = (uint64_t)(int64_t)-EFAULT;
             break;
         }
-        long pr = ptrace_pvm(c, 0, (pid_t)(int)a0, (const struct iovec *)a1, (unsigned long)a2,
-                             (const struct iovec *)a3, (unsigned long)a4);
+        long pr = ptrace_pvm(c, 0, (pid_t)(int)a0, local_iov, (unsigned long)a2, remote_iov, (unsigned long)a4);
         if (pr != PT_PVM_LOCAL) {
             G_RET(c) = (uint64_t)pr;
             break;
         }
-        G_RET(c) = (uint64_t)svc_vm_iov_copy((const struct iovec *)a1, (unsigned long)a2, (const struct iovec *)a3,
-                                             (unsigned long)a4);
+        G_RET(c) = (uint64_t)svc_vm_iov_copy(local_iov, (unsigned long)a2, remote_iov, (unsigned long)a4);
         break;
     }
     // process_vm_writev: the mirror -- copy FROM the local iovecs (a1/a2) INTO the remote iovecs (a3/a4).
@@ -1308,19 +1455,17 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(int64_t)-EINVAL;
             break;
         }
-        if ((a2 && guest_bad_ptr((uintptr_t)a1, (size_t)a2 * sizeof(struct iovec))) ||
-            (a4 && guest_bad_ptr((uintptr_t)a3, (size_t)a4 * sizeof(struct iovec)))) {
+        struct iovec local_iov[1024], remote_iov[1024];
+        if (guest_iov_import(a1, (size_t)a2, local_iov) < 0 || guest_iov_import(a3, (size_t)a4, remote_iov) < 0) {
             G_RET(c) = (uint64_t)(int64_t)-EFAULT;
             break;
         }
-        long pr = ptrace_pvm(c, 1, (pid_t)(int)a0, (const struct iovec *)a1, (unsigned long)a2,
-                             (const struct iovec *)a3, (unsigned long)a4);
+        long pr = ptrace_pvm(c, 1, (pid_t)(int)a0, local_iov, (unsigned long)a2, remote_iov, (unsigned long)a4);
         if (pr != PT_PVM_LOCAL) {
             G_RET(c) = (uint64_t)pr;
             break;
         }
-        G_RET(c) = (uint64_t)svc_vm_iov_copy((const struct iovec *)a3, (unsigned long)a4, (const struct iovec *)a1,
-                                             (unsigned long)a2);
+        G_RET(c) = (uint64_t)svc_vm_iov_copy(remote_iov, (unsigned long)a4, local_iov, (unsigned long)a2);
         break;
     }
     // membarrier: CMD_QUERY(0) returns the bitmask of supported commands; the barrier commands issue a

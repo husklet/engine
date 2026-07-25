@@ -143,6 +143,62 @@ static int aio_opcode_supported(uint16_t op) {
     }
 }
 
+static int64_t aio_typed_scalar(int write_operation, hl_linux_fd fd, uint64_t guest, size_t length, uint64_t offset) {
+    void *buffer = malloc(length ? length : 1);
+    if (!buffer) return -ENOMEM;
+    if (write_operation && length && guest_copy_from(buffer, guest, length) != (ssize_t)length) {
+        free(buffer);
+        return -EFAULT;
+    }
+    int64_t result = write_operation ? hl_linux_pwrite64(g_linux_box, fd, buffer, length, offset)
+                                     : hl_linux_pread64(g_linux_box, fd, buffer, length, offset);
+    if (!write_operation && result > 0 && guest_copy_to(guest, buffer, (size_t)result) != result) result = -EFAULT;
+    free(buffer);
+    return result;
+}
+
+static int64_t aio_typed_vector(int write_operation, hl_linux_fd fd, uint64_t guest_vectors, size_t count,
+                                uint64_t offset) {
+    if (count > GUEST_IOV_STACK_MAX) return -EINVAL;
+    struct iovec guest_iov[GUEST_IOV_STACK_MAX];
+    hl_host_iovec host_iov[GUEST_IOV_STACK_MAX];
+    if (guest_iov_import(guest_vectors, count, guest_iov) < 0) return -EFAULT;
+    memset(host_iov, 0, sizeof(host_iov));
+    for (size_t i = 0; i < count; ++i) {
+        host_iov[i].size = guest_iov[i].iov_len;
+        host_iov[i].address = (uint64_t)(uintptr_t)malloc(guest_iov[i].iov_len ? guest_iov[i].iov_len : 1);
+        if (!host_iov[i].address) {
+            for (size_t j = 0; j < i; ++j)
+                free((void *)(uintptr_t)host_iov[j].address);
+            return -ENOMEM;
+        }
+        if (write_operation && guest_iov[i].iov_len &&
+            guest_copy_from((void *)(uintptr_t)host_iov[i].address, (uint64_t)(uintptr_t)guest_iov[i].iov_base,
+                            guest_iov[i].iov_len) != (ssize_t)guest_iov[i].iov_len) {
+            for (size_t j = 0; j <= i; ++j)
+                free((void *)(uintptr_t)host_iov[j].address);
+            return -EFAULT;
+        }
+    }
+    int64_t result = write_operation ? hl_linux_pwritev(g_linux_box, fd, host_iov, (uint32_t)count, offset)
+                                     : hl_linux_preadv(g_linux_box, fd, host_iov, (uint32_t)count, offset);
+    if (!write_operation && result > 0) {
+        size_t remaining = (size_t)result;
+        for (size_t i = 0; i < count && remaining; ++i) {
+            size_t length = host_iov[i].size < remaining ? host_iov[i].size : remaining;
+            if (guest_copy_to((uint64_t)(uintptr_t)guest_iov[i].iov_base, (void *)(uintptr_t)host_iov[i].address,
+                              length) != (ssize_t)length) {
+                result = -EFAULT;
+                break;
+            }
+            remaining -= length;
+        }
+    }
+    for (size_t i = 0; i < count; ++i)
+        free((void *)(uintptr_t)host_iov[i].address);
+    return result;
+}
+
 // Perform ONE iocb synchronously; returns the io_event.res value (bytes transferred, 0 for fsync, or a
 // negative Linux errno). `iocb` is an already-validated 64-byte guest struct.
 static int64_t aio_do_one(const uint8_t *iocb) {
@@ -158,30 +214,20 @@ static int64_t aio_do_one(const uint8_t *iocb) {
     ssize_t r;
     switch (op) {
     case IOCB_CMD_PREAD:
-        if (nbytes && !host_range_mapped((uintptr_t)buf, (size_t)nbytes)) return -EFAULT;
-        if (is_typed) return hl_linux_pread64(g_linux_box, typed.fd, (void *)buf, (size_t)nbytes, (uint64_t)off);
-        r = pread(fd, (void *)buf, (size_t)nbytes, (off_t)off);
+        if (is_typed) return aio_typed_scalar(0, typed.fd, buf, (size_t)nbytes, (uint64_t)off);
+        r = guest_fd_read(fd, buf, (size_t)nbytes, (off_t)off, 1);
         return r < 0 ? -errno : r;
     case IOCB_CMD_PWRITE:
-        if (nbytes && !host_range_mapped((uintptr_t)buf, (size_t)nbytes)) return -EFAULT;
-        if (is_typed)
-            return hl_linux_pwrite64(g_linux_box, typed.fd, (const void *)buf, (size_t)nbytes, (uint64_t)off);
+        if (is_typed) return aio_typed_scalar(1, typed.fd, buf, (size_t)nbytes, (uint64_t)off);
         hl_fdcache_fd_evict(fd);
-        r = pwrite(fd, (const void *)buf, (size_t)nbytes, (off_t)off);
+        r = guest_fd_write(fd, buf, (size_t)nbytes, (off_t)off, 1);
         return r < 0 ? -errno : r;
     case IOCB_CMD_PREADV:
     case IOCB_CMD_PWRITEV: {
         int niov = (int)nbytes; // for the *V ops aio_nbytes IS the iovec count, aio_buf the array base
-        if (niov > 0 && !host_range_mapped((uintptr_t)buf, (size_t)niov * sizeof(struct iovec))) return -EFAULT;
         if (op == IOCB_CMD_PWRITEV) hl_fdcache_fd_evict(fd);
-        if (is_typed)
-            return op == IOCB_CMD_PREADV
-                       ? hl_linux_preadv(g_linux_box, typed.fd, (const hl_host_iovec *)(uintptr_t)buf, (uint32_t)niov,
-                                         (uint64_t)off)
-                       : hl_linux_pwritev(g_linux_box, typed.fd, (const hl_host_iovec *)(uintptr_t)buf,
-                                          (uint32_t)niov, (uint64_t)off);
-        r = op == IOCB_CMD_PREADV ? preadv(fd, (const struct iovec *)buf, niov, (off_t)off)
-                                  : pwritev(fd, (const struct iovec *)buf, niov, (off_t)off);
+        if (is_typed) return aio_typed_vector(op == IOCB_CMD_PWRITEV, typed.fd, buf, (size_t)niov, (uint64_t)off);
+        r = guest_fd_vector(fd, buf, (size_t)niov, (off_t)off, 1, op == IOCB_CMD_PREADV);
         return r < 0 ? -errno : r;
     }
     case IOCB_CMD_FSYNC:
@@ -200,11 +246,12 @@ static int svc_aio(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     switch (nr) {
     case 0: { // io_setup(unsigned nr_events, aio_context_t *ctx_idp)
         unsigned nr_events = (unsigned)a0;
-        if (!a1 || !host_range_mapped((uintptr_t)a1, sizeof(uint64_t))) {
+        uint64_t context_id = 0;
+        if (!a1 || guest_copy_from(&context_id, a1, sizeof(context_id)) != sizeof(context_id)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        if (*(uint64_t *)a1 != 0) {
+        if (context_id != 0) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         } // Linux: *ctx_idp must be 0
@@ -241,7 +288,15 @@ static int svc_aio(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(-EAGAIN);
             break;
         } // out of contexts (matches kernel ENOMEM/EAGAIN)
-        *(uint64_t *)a1 = (uint64_t)(uintptr_t)&g_aioctx[slot];
+        context_id = (uint64_t)(uintptr_t)&g_aioctx[slot];
+        if (guest_copy_to(a1, &context_id, sizeof(context_id)) != sizeof(context_id)) {
+            pthread_mutex_lock(&g_aio_lock);
+            free(g_aioctx[slot].q);
+            memset(&g_aioctx[slot], 0, sizeof(g_aioctx[slot]));
+            pthread_mutex_unlock(&g_aio_lock);
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
         G_RET(c) = 0;
         break;
     }
@@ -276,19 +331,29 @@ static int svc_aio(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = 0;
             break;
         }
+        if ((uint64_t)count > SIZE_MAX / sizeof(uint64_t)) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
         // iocbpp is an array of `count` guest pointers (u64 each).
-        if (!host_range_mapped((uintptr_t)a2, (size_t)count * sizeof(uint64_t))) {
+        uint64_t *pp = malloc((size_t)count * sizeof(uint64_t));
+        if (!pp) {
+            G_RET(c) = (uint64_t)(-ENOMEM);
+            break;
+        }
+        if (guest_copy_from(pp, a2, (size_t)count * sizeof(uint64_t)) != (ssize_t)((size_t)count * sizeof(uint64_t))) {
+            free(pp);
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        const uint64_t *pp = (const uint64_t *)a2;
         long done = 0;
         int64_t sync_err = -EFAULT; // errno reported if NOTHING submits (EFAULT for a bad iocb pointer)
         for (long i = 0; i < count; i++) {
             uint64_t iocb = pp[i];
-            if (!iocb || !host_range_mapped((uintptr_t)iocb, 64))
+            uint8_t cb_storage[64];
+            if (!iocb || guest_copy_from(cb_storage, iocb, sizeof(cb_storage)) != sizeof(cb_storage))
                 break; // stop; report count so far (or EFAULT if first)
-            const uint8_t *cb = (const uint8_t *)iocb;
+            const uint8_t *cb = cb_storage;
             // Linux validates aio_lio_opcode INSIDE io_submit: an unsupported opcode fails the syscall
             // synchronously with EINVAL and queues no completion, instead of surfacing it via io_getevents.
             uint16_t aio_op = *(const uint16_t *)(cb + 16);
@@ -304,6 +369,7 @@ static int svc_aio(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (aio_flags & IOCB_FLAG_RESFD) aio_eventfd_kick((int)aio_resfd);
             done++;
         }
+        free(pp);
         // Linux io_submit returns the number of iocbs submitted, or -errno only if NONE were.
         G_RET(c) = done > 0 ? (uint64_t)done : (uint64_t)sync_err;
         break;
@@ -325,9 +391,19 @@ static int svc_aio(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        uint8_t *ev = (uint8_t *)a3;
+        if ((uint64_t)nr_max > SIZE_MAX / 32) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        uint8_t *ev = calloc(nr_max > 0 ? (size_t)nr_max : 1, 32);
+        if (!ev) {
+            G_RET(c) = (uint64_t)(-ENOMEM);
+            break;
+        }
         // Validate the FULL requested buffer up front (a blocking reap may fill up to nr_max events).
-        if (nr_max > 0 && (!ev || !host_range_mapped((uintptr_t)a3, (size_t)nr_max * 32))) {
+        if (nr_max > 0 &&
+            (!a3 || guest_accessible_prefix(a3, (size_t)nr_max * 32, PROT_WRITE) != (size_t)nr_max * 32)) {
+            free(ev);
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
@@ -342,9 +418,10 @@ static int svc_aio(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // a NULL ("block forever") timeout can never wedge the engine.
         if (min_nr > 0 && got < min_nr) {
             long long budget_ns = 50LL * 1000000LL; // NULL timeout -> block, but return periodically
-            if (a4 && host_range_mapped((uintptr_t)a4, 16)) {
-                long long ts_sec = *(const int64_t *)(uintptr_t)a4;
-                long long ts_nsec = *(const int64_t *)((uintptr_t)a4 + 8);
+            int64_t timeout[2];
+            if (a4 && guest_copy_from(timeout, a4, sizeof(timeout)) == sizeof(timeout)) {
+                long long ts_sec = timeout[0];
+                long long ts_nsec = timeout[1];
                 long long req = ts_sec * 1000000000LL + ts_nsec;
                 if (req < budget_ns) budget_ns = req < 0 ? 0 : req; // honor a shorter guest timeout
             }
@@ -356,6 +433,12 @@ static int svc_aio(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 got += aio_drain(x, ev + (size_t)got * 32, nr_max - got);
             }
         }
+        if (got > 0 && guest_copy_to(a3, ev, (size_t)got * 32) != (ssize_t)((size_t)got * 32)) {
+            free(ev);
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
+        free(ev);
         G_RET(c) = (uint64_t)got;
         break;
     }

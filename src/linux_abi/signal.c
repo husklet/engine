@@ -93,6 +93,7 @@ static uint64_t g_sigaddr[65];
 // All queue operations run in guest-thread / dispatcher context (never a host signal handler), so a plain
 // mutex is safe; host_sig* handlers deliberately never touch the ring.
 #define SIGQ_DEPTH 64
+
 struct sigq_ent {
     int code;       // si_code
     uint64_t value; // si_value (sigqueue) / si_status (SIGCHLD; aliases offset 24)
@@ -100,13 +101,17 @@ struct sigq_ent {
     int uid;        // si_uid
     uint64_t addr;  // si_addr
 };
+
 static struct {
     struct sigq_ent e[SIGQ_DEPTH];
     int head, count;
 } g_sigq[65];
+
 static pthread_mutex_t g_sigq_lk = PTHREAD_MUTEX_INITIALIZER;
 
-static int sig_is_rt(int s) { return s >= 32 && s <= 64; }
+static int sig_is_rt(int s) {
+    return s >= 32 && s <= 64;
+}
 
 // Enqueue one pending instance of Linux signal `sig`. Standard signals coalesce (keep the first queued
 // siginfo, drop extras -- matching Linux non-RT coalescing); realtime signals queue FIFO up to
@@ -448,8 +453,7 @@ static void host_sigh_si(int sig, siginfo_t *si, void *uc) {
     // copy si_value (its union slot is meaningful only then); a plain kill stays SI_USER/0.
     if (si && ls != 17) {
         g_sigcode[ls] = si->si_code;
-        if (si->si_code == SI_QUEUE || si->si_code == SI_TIMER || si->si_code == SI_MESGQ ||
-            si->si_code == SI_ASYNCIO)
+        if (si->si_code == SI_QUEUE || si->si_code == SI_TIMER || si->si_code == SI_MESGQ || si->si_code == SI_ASYNCIO)
             g_sigval[ls] = (uint64_t)(uintptr_t)si->si_value.sival_ptr;
     }
 #endif
@@ -582,9 +586,7 @@ static void maybe_deliver_signal(struct cpu *c) {
             // just the container entrypoint, not an init that must survive, so take the default action and end
             // the container with 128+signo (the code `docker run` reports for a PID 1 killed by a signal).
             // SIG_IGN (h==1) and the default-ignore/stop signals stay dropped here.
-            if (h == 0 && container_pid() == 1 && sig_default_terminates(sig)) {
-                guest_group_fatal(c, sig);
-            }
+            if (h == 0 && container_pid() == 1 && sig_default_terminates(sig)) { guest_group_fatal(c, sig); }
             continue;
         }
         // Claim ONE instance and run the guest handler on this thread. Pop the per-instance siginfo from
@@ -615,9 +617,9 @@ static void maybe_deliver_signal(struct cpu *c) {
             if (c->sig_depth < (int)(sizeof c->sig_defer_stack / sizeof c->sig_defer_stack[0])) {
                 c->sig_defer_stack[c->sig_depth] = c->sig_defer;
                 c->sig_depth++;
-                c->sig_defer |= (__atomic_load_n(&g_pending, __ATOMIC_SEQ_CST) |
-                                 __atomic_load_n(&c->tpending, __ATOMIC_SEQ_CST)) &
-                                ~bit;
+                c->sig_defer |=
+                    (__atomic_load_n(&g_pending, __ATOMIC_SEQ_CST) | __atomic_load_n(&c->tpending, __ATOMIC_SEQ_CST)) &
+                    ~bit;
             }
             uint64_t flags = g_sigact[sig].flags;
             int synchronous = had_t && c->sync_signal == sig;
@@ -636,8 +638,7 @@ static void maybe_deliver_signal(struct cpu *c) {
             // (LTP-style signal()-with-caller-reset semantics; glibc's legacy signal() sets SA_RESETHAND).
             if (flags & 0x80000000ull) {
                 g_sigact[sig].handler = 0;
-                if (sig != 9 && sig != 19 && !sig_is_sync(sig) &&
-                    !sig_host_is_engine_control(sig_l2m(sig)))
+                if (sig != 9 && sig != 19 && !sig_is_sync(sig) && !sig_host_is_engine_control(sig_l2m(sig)))
                     signal(sig_l2m(sig), SIG_DFL);
             }
             return;
@@ -695,9 +696,7 @@ static void raise_guest_signal_si(struct cpu *c, int sig, int code, uint64_t val
     // (proc.c case 260 / rare.c case 95). WCOREDUMP per Linux rules: a coredumping signal with soft
     // RLIMIT_CORE > 0. If the relay slot table is exhausted the parent simply sees the WIFEXITED(128+signo)
     // fallback — the same graceful degradation as before this fix.
-    if (sig_default_terminates(sig)) {
-        guest_group_fatal(c, sig);
-    }
+    if (sig_default_terminates(sig)) { guest_group_fatal(c, sig); }
     // Non-terminating default reaching here = a stop signal (STOP/TSTP/TTIN/TTOU): mirror it onto the host so
     // a real job-control stop happens (the host mask mirrors these too — see rt_sigprocmask). A stop is NOT a
     // termination: the host process stops, the parent's waitpid(WUNTRACED) reaps the stop, and when a later
@@ -776,8 +775,7 @@ static int deliver_guest_fault_hint(struct cpu *cpu_hint, int hostsig, siginfo_t
     // exactly (and only) for genuine bus errors (past-EOF, misalignment) -- there the ledger is empty, so
     // the rewrite would wrongly downgrade every guest SIGBUS to SIGSEGV. Trust the host signo on Linux.
 #if !defined(__linux__)
-    if (hostsig == SIGBUS && !g_in_service && si && !hl_linux_bus_hit((uint64_t)si->si_addr, 1))
-        sig = 11;
+    if (hostsig == SIGBUS && !g_in_service && si && !hl_linux_bus_hit((uint64_t)si->si_addr, 1)) sig = 11;
 #endif
     // SIG_DFL/SIG_IGN: not the guest's to handle -> let the guard re-raise (a real crash).
     if (g_sigact[sig].handler <= 1) return 0;
@@ -811,9 +809,8 @@ static int deliver_guest_fault_hint(struct cpu *cpu_hint, int hostsig, siginfo_t
     // protection violation (SEGV_ACCERR).  JIT safepoint/guard handlers use
     // that distinction; a physically protected g_gna page is ACCERR even
     // when Darwin surfaced the access as SIGBUS.
-    c->sync_code = (sig == 7 ||
-                    (sig == 11 && si &&
-                     (gna_hit((uint64_t)si->si_addr, 1) || host_addr_mapped((uintptr_t)si->si_addr))))
+    c->sync_code = (sig == 7 || (sig == 11 && si &&
+                                 (gna_hit((uint64_t)si->si_addr, 1) || host_addr_mapped((uintptr_t)si->si_addr))))
                        ? 2
                        : 1;
     c->sigmask &= ~(1ull << (sig - 1)); // a sync fault forces delivery even if the guest blocked it
@@ -830,9 +827,7 @@ static int deliver_guest_fault(int hostsig, siginfo_t *si, void *ucv) {
 
 /* Dispatcher-only delivery for a translated access rejected by the file-mapping BUS ledger. */
 static int raise_guest_bus(struct cpu *c) {
-    if (g_sigact[7].handler <= 1) {
-        guest_group_fatal(c, 7);
-    }
+    if (g_sigact[7].handler <= 1) { guest_group_fatal(c, 7); }
     c->sync_signal = 7;
     c->sync_address = c->fault_addr;
     c->sync_code = 2; /* BUS_ADRERR */
@@ -841,6 +836,32 @@ static int raise_guest_bus(struct cpu *c) {
     /* A synchronous memory fault belongs to the faulting thread.  Process-wide
        pending delivery can run the handler on an unrelated mapper thread. */
     __atomic_or_fetch(&c->tpending, 1ull << 7, __ATOMIC_SEQ_CST);
+    return 1;
+}
+
+/* Dispatcher-only delivery for an instruction fetch rejected by a logical
+   executable mapping.  Translation emits a runnable exit stub; the fault is
+   therefore delivered in ordinary guest execution context, never by raising
+   a host signal while the translator is reading source bytes. */
+static int raise_guest_fetch_fault(struct cpu *c) {
+    if (g_sigact[11].handler <= 1) { guest_group_fatal(c, 11); }
+    c->sync_signal = 11;
+    c->sync_address = c->fault_addr;
+    c->sync_code = 2; /* SEGV_ACCERR */
+    c->sigmask &= ~(1ull << 10);
+    c->reason = R_BRANCH;
+    __atomic_or_fetch(&c->tpending, 1ull << 11, __ATOMIC_SEQ_CST);
+    return 1;
+}
+
+static int raise_guest_data_map_fault(struct cpu *c) {
+    if (g_sigact[11].handler <= 1) guest_group_fatal(c, 11);
+    c->sync_signal = 11;
+    c->sync_address = c->fault_addr;
+    c->sync_code = 1; /* SEGV_MAPERR */
+    c->sigmask &= ~(1ull << 10);
+    c->reason = R_BRANCH;
+    __atomic_or_fetch(&c->tpending, 1ull << 11, __ATOMIC_SEQ_CST);
     return 1;
 }
 
@@ -963,18 +984,19 @@ static void sig_diag_raise_default(struct cpu *c, int sig) {
     // exactly like every other engine diagnostic -- gated on the HL_LOG selector and compiled out entirely
     // in a production (HL_ENABLE_LOGGING=0) build. A raw write(STDERR_FILENO) here leaked "[HLRAISE] ..."
     // into the guest's captured stderr on any uncaught fatal signal (e.g. `kill -TERM $$`).
-    HL_LOGF(&g_jit_log, HL_LOG_TAG_SIGNAL,
-            "raise-default pid=%#llx cpid=%#llx tid=%#llx sig=%#llx pc=%#llx sp=%#llx lr=%#llx handler=%#llx mask=%#llx",
-            (unsigned long long)getpid(), (unsigned long long)container_pid(),
-            (unsigned long long)(c ? (uint64_t)cpu_tid(c) : 0), (unsigned long long)sig,
-            (unsigned long long)(c ? G_PC(c) : 0), (unsigned long long)(c ? G_SP(c) : 0),
+    HL_LOGF(
+        &g_jit_log, HL_LOG_TAG_SIGNAL,
+        "raise-default pid=%#llx cpid=%#llx tid=%#llx sig=%#llx pc=%#llx sp=%#llx lr=%#llx handler=%#llx mask=%#llx",
+        (unsigned long long)getpid(), (unsigned long long)container_pid(),
+        (unsigned long long)(c ? (uint64_t)cpu_tid(c) : 0), (unsigned long long)sig,
+        (unsigned long long)(c ? G_PC(c) : 0), (unsigned long long)(c ? G_SP(c) : 0),
 #if G_GPC_HASH_SHIFT == 2
-            (unsigned long long)(c ? c->x[30] : 0),
+        (unsigned long long)(c ? c->x[30] : 0),
 #else
-            0ull,
+        0ull,
 #endif
-            (unsigned long long)((sig >= 1 && sig <= 64) ? g_sigact[sig].handler : 0),
-            (unsigned long long)(c ? c->sigmask : 0));
+        (unsigned long long)((sig >= 1 && sig <= 64) ? g_sigact[sig].handler : 0),
+        (unsigned long long)(c ? c->sigmask : 0));
 }
 
 // a GENUINE synchronous CPU fault (SIGSEGV/SIGBUS/...) taken in translated code for which the guest
@@ -997,7 +1019,7 @@ static int deliver_guest_fatal_fault(int hostsig, siginfo_t *si, void *ucv) {
         !g_in_service && si && !hl_linux_bus_hit((uint64_t)si->si_addr, 1)
 #else
         HOST_SIGNAL_HAS_FAULT_ADDRESS(si) && si->si_addr &&
-            (gna_hit((uint64_t)si->si_addr, 1) || !host_addr_mapped((uintptr_t)si->si_addr))
+        (gna_hit((uint64_t)si->si_addr, 1) || !host_addr_mapped((uintptr_t)si->si_addr))
 #endif
     )
         sig = 11;

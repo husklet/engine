@@ -5,6 +5,7 @@
 
 #include "../../src/translator/guest/x86_64/cpu.h"
 #include "../../src/translator/guest/x86_64/lower/repstr.h"
+#include "../../src/linux_abi/logical_vma.h"
 
 static unsigned movs_count;
 static unsigned stos_count;
@@ -14,7 +15,39 @@ static uint64_t last_constant;
 static int last_store_offset;
 static uint64_t last_exit_rip;
 static uint64_t last_exit_reason;
-static uint32_t code[32];
+static uint32_t code[128];
+static int observe_stores;
+static uint64_t committed_address[16];
+static uint64_t committed_size[16];
+static unsigned committed_count;
+
+static int store_observation_active(void) {
+    return observe_stores;
+}
+
+static void store_committed(uint64_t address, uint64_t size) {
+    if (committed_count < 16) {
+        committed_address[committed_count] = address;
+        committed_size[committed_count] = size;
+    }
+    committed_count++;
+}
+
+int hl_logical_vma_global_active(void) {
+    return 0;
+}
+
+int hl_logical_vma_pin_data(uint64_t address, size_t length, unsigned access, hl_logical_vma_pin *pin) {
+    (void)address;
+    (void)length;
+    (void)access;
+    (void)pin;
+    return 0;
+}
+
+void hl_logical_vma_unpin(hl_logical_vma_pin *pin) {
+    (void)pin;
+}
 
 uint64_t hl_x86_guest_pointer(uint64_t address) {
     return address;
@@ -45,9 +78,28 @@ void hl_x86_emit_reload(void) {
 void hl_x86_emit_vector_reset(void) {
 }
 
+int emit_soft_memory_active(void) {
+    return 0;
+}
+
+void emit_memory_guard(int address, uint64_t size, uint64_t rip, uint32_t required) {
+    (void)address;
+    (void)size;
+    (void)rip;
+    (void)required;
+}
+
+void emit_soft_store_commit(uint64_t size) {
+    (void)size;
+}
+
 void hl_x86_emit_host_pointer(int destination, uint64_t pointer) {
     (void)destination;
     (void)pointer;
+}
+
+void hl_x86_emit_block_return(void) {
+    emit32(UINT32_C(0xd61f0200));
 }
 
 void e_movconst(int destination, uint64_t value) {
@@ -124,27 +176,48 @@ void e_rrr(uint32_t op, int d, int l, int r, int sf, int sh) {
 static int check_copy_semantics(void) {
     uint8_t smear[] = {0, 1, 2, 3, 4, 5, 6, 7};
     const uint8_t smeared[] = {0, 1, 0, 1, 0, 1, 0, 1};
-    hl_x86_rep_movs(smear + 2, smear, 6, 2, 0);
+    HL_CHECK(hl_x86_rep_movs(smear + 2, smear, 6, 2, 0, NULL, 0) == 3);
     HL_CHECK(memcmp(smear, smeared, sizeof(smear)) == 0);
 
     uint8_t backward[] = {0, 1, 2, 3, 4, 5, 6, 7};
     const uint8_t moved[] = {0, 1, 0, 1, 2, 3, 4, 5};
-    hl_x86_rep_movs(backward + 6, backward + 4, 6, 2, 1);
+    HL_CHECK(hl_x86_rep_movs(backward + 6, backward + 4, 6, 2, 1, NULL, 0) == 3);
     HL_CHECK(memcmp(backward, moved, sizeof(backward)) == 0);
     HL_CHECK(movs_count == 2);
+
+    uint8_t observed[] = {0, 1, 2, 3, 4, 5, 6, 7};
+    observe_stores = 1;
+    committed_count = 0;
+    hl_x86_rep_set_store_commit(store_committed, store_observation_active);
+    HL_CHECK(hl_x86_rep_movs(observed + 4, observed, 4, 2, 0, NULL, 0) == 2);
+    HL_CHECK(committed_count == 2);
+    HL_CHECK(committed_address[0] == (uint64_t)(uintptr_t)(observed + 4) && committed_size[0] == 2);
+    HL_CHECK(committed_address[1] == (uint64_t)(uintptr_t)(observed + 6) && committed_size[1] == 2);
+    observe_stores = 0;
     return 0;
 }
 
 static int check_fill_semantics(void) {
     uint8_t bytes[8] = {0};
     const uint8_t forward[] = {0x34, 0x12, 0x34, 0x12, 0x34, 0x12, 0, 0};
-    hl_x86_rep_stos(bytes, UINT64_C(0x1234), 3, 2, 0);
+    HL_CHECK(hl_x86_rep_stos(bytes, UINT64_C(0x1234), 3, 2, 0, NULL, 0) == 3);
     HL_CHECK(memcmp(bytes, forward, sizeof(bytes)) == 0);
 
     memset(bytes, 0, sizeof(bytes));
-    hl_x86_rep_stos(bytes + 4, UINT64_C(0xab), 3, 1, 1);
+    HL_CHECK(hl_x86_rep_stos(bytes + 4, UINT64_C(0xab), 3, 1, 1, NULL, 0) == 3);
     HL_CHECK(bytes[2] == 0xab && bytes[3] == 0xab && bytes[4] == 0xab);
     HL_CHECK(stos_count == 2);
+
+    memset(bytes, 0, sizeof(bytes));
+    observe_stores = 1;
+    committed_count = 0;
+    hl_x86_rep_set_store_commit(store_committed, store_observation_active);
+    HL_CHECK(hl_x86_rep_stos(bytes + 6, UINT64_C(0x1234), 3, 2, 1, NULL, 0) == 3);
+    HL_CHECK(committed_count == 3);
+    HL_CHECK(committed_address[0] == (uint64_t)(uintptr_t)(bytes + 6) && committed_size[0] == 2);
+    HL_CHECK(committed_address[1] == (uint64_t)(uintptr_t)(bytes + 4) && committed_size[1] == 2);
+    HL_CHECK(committed_address[2] == (uint64_t)(uintptr_t)(bytes + 2) && committed_size[2] == 2);
+    observe_stores = 0;
     return 0;
 }
 

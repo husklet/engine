@@ -14,8 +14,9 @@
 // awaited handler stays pending and is delivered by the dispatcher's maybe_deliver_signal once the
 // restarted syscall finally returns.
 static int syscall_should_restart(struct cpu *c) {
-    if (ckpt_pending()) return 0; // a whole-tree checkpoint was requested: return EINTR so this process reaches
-                                  // its dispatcher safepoint (ckpt_poll) instead of transparently re-blocking
+    if (ckpt_pending())
+        return 0; // a whole-tree checkpoint was requested: return EINTR so this process reaches
+                  // its dispatcher safepoint (ckpt_poll) instead of transparently re-blocking
     if (__atomic_load_n(&c->exited, __ATOMIC_SEQ_CST)) return 0; // execve teardown: don't re-block, unwind out
     // Process-wide pending (g_pending) AND this thread's directed-pending (c->tpending, set by tkill/tgkill):
     // a thread blocked in read/accept/recv must be interrupted by a thread-directed signal too, not only a
@@ -118,8 +119,8 @@ static void thread_kill(struct cpu *c, int tid, int sig) {
 static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                       uint64_t a5) {
     if ((nr >= 129 && nr <= 139) || nr == (UINT64_C(0x10000) | 34))
-        HL_LOGF(&g_jit_log, HL_LOG_TAG_SIGNAL, "nr=%llu target=%lld signal=%lld", (unsigned long long)nr,
-                (long long)a0, (long long)a1);
+        HL_LOGF(&g_jit_log, HL_LOG_TAG_SIGNAL, "nr=%llu target=%lld signal=%lld", (unsigned long long)nr, (long long)a0,
+                (long long)a1);
     switch (nr) {
     // ===================== Signals — Linux signal numbers -> macOS; kill/sigaction/sigreturn =====================
     // kill(pid,sig)
@@ -239,15 +240,18 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         // The kernel copy_from_user()s the whole siginfo before it does anything else, so a bad (or NULL)
         // user pointer is -EFAULT (never a fault in the caller). Guard the direct deref below to match --
         // guest_bad_ptr also catches a guest PROT_NONE guard page, as sigaltstack (case 132) does.
-        if (guest_bad_ptr((uintptr_t)a2, 128)) {
+        unsigned char siginfo[128];
+        if (guest_copy_from(siginfo, a2, sizeof siginfo) != (ssize_t)sizeof siginfo) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
         if (sig >= 1 && sig <= 64 && a2) {
-            int code = *(int *)(a2 + 8);            // siginfo.si_code
-            int pid = *(int *)(a2 + 16);            // siginfo.si_pid
-            int uid = *(int *)(a2 + 20);            // siginfo.si_uid
-            uint64_t value = *(uint64_t *)(a2 + 24); // siginfo.si_value (sival_int/ptr)
+            int code, pid, uid;
+            uint64_t value;
+            memcpy(&code, siginfo + 8, sizeof code);
+            memcpy(&pid, siginfo + 16, sizeof pid);
+            memcpy(&uid, siginfo + 20, sizeof uid);
+            memcpy(&value, siginfo + 24, sizeof value);
             raise_guest_signal_si(c, sig, code, value, pid ? pid : container_pid(), uid);
         } else {
             raise_guest_signal(c, sig);
@@ -260,13 +264,17 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         // Linux validates BEFORE writing `old`: bad pointers -> EFAULT; an unknown ss_flags mode -> EINVAL;
         // and, unless SS_DISABLE, a stack smaller than MINSIGSTKSZ -> ENOMEM. Without this hl installs a
         // bogus/tiny altstack that corrupts later SA_ONSTACK signal delivery.
-        if ((a1 && guest_bad_ptr(a1, 24)) || (a0 && guest_bad_ptr(a0, 24))) {
+        unsigned char new_stack[24] = {0};
+        if ((a0 && guest_copy_from(new_stack, a0, sizeof new_stack) != (ssize_t)sizeof new_stack) ||
+            (a1 && guest_accessible_prefix(a1, 24, HL_LOGICAL_VMA_WRITE) != 24)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
         if (a0) {
-            uint32_t nflags = *(uint32_t *)(a0 + 8);
-            uint64_t nsize = *(uint64_t *)(a0 + 16);
+            uint32_t nflags;
+            uint64_t nsize;
+            memcpy(&nflags, new_stack + 8, sizeof nflags);
+            memcpy(&nsize, new_stack + 16, sizeof nsize);
             // valid set-flag bits: SS_ONSTACK(1), SS_DISABLE(2), SS_AUTODISARM(0x80000000).
             if (nflags & ~(uint32_t)(1u | 2u | 0x80000000u)) {
                 G_RET(c) = (uint64_t)(-EINVAL);
@@ -285,14 +293,19 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             uint64_t sp = G_SP(c);
             if (c->alt_sp && !(flags & 2u) && sp >= c->alt_sp && sp < c->alt_sp + c->alt_size)
                 flags |= 1u; // SS_ONSTACK
-            *(uint64_t *)(a1 + 0) = c->alt_sp;
-            *(uint32_t *)(a1 + 8) = flags;
-            *(uint64_t *)(a1 + 16) = c->alt_size;
+            unsigned char old_stack[24] = {0};
+            memcpy(old_stack, &c->alt_sp, sizeof c->alt_sp);
+            memcpy(old_stack + 8, &flags, sizeof flags);
+            memcpy(old_stack + 16, &c->alt_size, sizeof c->alt_size);
+            if (guest_copy_to(a1, old_stack, sizeof old_stack) != (ssize_t)sizeof old_stack) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
         }
         if (a0) {
-            c->alt_sp = *(uint64_t *)(a0 + 0);
-            c->alt_flags = *(uint32_t *)(a0 + 8);
-            c->alt_size = *(uint64_t *)(a0 + 16);
+            memcpy(&c->alt_sp, new_stack, sizeof c->alt_sp);
+            memcpy(&c->alt_flags, new_stack + 8, sizeof c->alt_flags);
+            memcpy(&c->alt_size, new_stack + 16, sizeof c->alt_size);
         }
         G_RET(c) = 0;
         break;
@@ -358,12 +371,12 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        if (a0 == 0 || gna_hit((uint64_t)a0, 8)) {
+        uint64_t newmask;
+        if (a0 == 0 || guest_copy_from(&newmask, a0, 8) != 8) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
         uint64_t oldmask = c->sigmask;
-        uint64_t newmask = *(uint64_t *)a0;
         c->sigmask = newmask;
         // Block all host signals around the pending check so host_sigh cannot fire between the check and
         // the sleep (lost-wakeup race); sigsuspend(&empty) then atomically unblocks + waits.
@@ -420,13 +433,15 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        if (guest_bad_ptr((uintptr_t)a0, 8) || (a1 && guest_bad_ptr((uintptr_t)a1, 128)) ||
-            (a2 && guest_bad_ptr((uintptr_t)a2, 16))) {
+        uint64_t set = 0;
+        struct timespec timeout_copy;
+        if (guest_copy_from(&set, a0, 8) != 8 ||
+            (a1 && guest_accessible_prefix(a1, 128, HL_LOGICAL_VMA_WRITE) != 128) ||
+            (a2 && guest_copy_from(&timeout_copy, a2, 16) != 16)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        uint64_t set = a0 ? *(uint64_t *)a0 : 0; // guest sigset_t (bit signo-1)
-        struct timespec *to = (struct timespec *)a2;
+        struct timespec *to = a2 ? &timeout_copy : NULL;
         const hl_host_services *host = effective_host_services();
         uint64_t deadline = UINT64_MAX;
         uint64_t fallback_waited = 0;
@@ -492,15 +507,22 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
                 __atomic_and_fetch(&c->tpending, ~(1ull << got), __ATOMIC_SEQ_CST);
                 if (!popped) __atomic_and_fetch(&g_pending, ~(1ull << got), __ATOMIC_SEQ_CST);
                 if (a1) { // fill siginfo_t whenever info != NULL (a3 is the sigsetsize, not a size threshold)
-                    memset((void *)a1, 0, 128);
-                    *(int *)(a1 + 0) = got;                                       // si_signo
-                    *(int *)(a1 + 8) = popped ? ent.code : g_sigcode[got];        // si_code
+                    unsigned char result_info[128] = {0};
+                    int code = popped ? ent.code : g_sigcode[got];
+                    memcpy(result_info, &got, sizeof got);
+                    memcpy(result_info + 8, &code, sizeof code);
                     int spid = popped ? ent.pid : g_sigpid[got];
                     if (spid) {
-                        *(int *)(a1 + 16) = spid;
-                        *(int *)(a1 + 20) = popped ? ent.uid : g_siguid[got];
+                        int suid = popped ? ent.uid : g_siguid[got];
+                        memcpy(result_info + 16, &spid, sizeof spid);
+                        memcpy(result_info + 20, &suid, sizeof suid);
                     }
-                    *(uint64_t *)(a1 + 24) = popped ? ent.value : g_sigval[got]; // si_value
+                    uint64_t value = popped ? ent.value : g_sigval[got];
+                    memcpy(result_info + 24, &value, sizeof value);
+                    if (guest_copy_to(a1, result_info, sizeof result_info) != (ssize_t)sizeof result_info) {
+                        G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                        break;
+                    }
                     if (!popped) {
                         g_sigcode[got] = 0;
                         g_sigval[got] = 0;
@@ -538,10 +560,8 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
                     }
                 }
             }
-            if (finite && interval > budget_ns - fallback_waited)
-                interval = budget_ns - fallback_waited;
-            if (host && host->clock && host->clock->backoff_ns)
-                (void)host->clock->backoff_ns(host->context, interval);
+            if (finite && interval > budget_ns - fallback_waited) interval = budget_ns - fallback_waited;
+            if (host && host->clock && host->clock->backoff_ns) (void)host->clock->backoff_ns(host->context, interval);
             if (finite) fallback_waited += interval;
         }
         ts_wait_leave();
@@ -582,32 +602,37 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         // The act/oldact structs are read/written DIRECTLY by the engine, so
         // a bad/unmapped pointer must return -EFAULT rather than fault the engine. Validate in Linux
         // order -- copyin `act` (a1) before copyout `oldact` (a2) -- so no oldact is written when act faults.
-        if (a1 && !host_range_mapped((uintptr_t)a1, (size_t)action_size)) {
+        uint64_t incoming[4] = {0}, outgoing[4] = {0};
+        if (a1 && guest_copy_from(incoming, a1, (size_t)action_size) != (ssize_t)action_size) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        if (a2 && !host_range_mapped((uintptr_t)a2, (size_t)action_size)) {
+        if (a2 && guest_accessible_prefix(a2, (size_t)action_size, HL_LOGICAL_VMA_WRITE) != action_size) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
         if (a2) {
-            *(uint64_t *)(a2 + 0) = g_sigact[sig].handler;
-            *(uint64_t *)(a2 + 8) = g_sigact[sig].flags;
+            outgoing[0] = g_sigact[sig].handler;
+            outgoing[1] = g_sigact[sig].flags;
 #if defined(HL_GUEST_SIGACTION_HAS_RESTORER)
-            *(uint64_t *)(a2 + 16) = g_sigact[sig].restorer;
+            outgoing[2] = g_sigact[sig].restorer;
 #endif
-            *(uint64_t *)(a2 + mask_offset) = g_sigact[sig].mask;
+            outgoing[mask_offset / 8] = g_sigact[sig].mask;
+            if (guest_copy_to(a2, outgoing, (size_t)action_size) != (ssize_t)action_size) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
         }
         if (a1) {
-            uint64_t h = *(uint64_t *)(a1 + 0);
+            uint64_t h = incoming[0];
             g_sigact[sig].handler = h;
-            g_sigact[sig].flags = *(uint64_t *)(a1 + 8);
+            g_sigact[sig].flags = incoming[1];
 #if defined(HL_GUEST_SIGACTION_HAS_RESTORER)
-            g_sigact[sig].restorer = *(uint64_t *)(a1 + 16);
+            g_sigact[sig].restorer = incoming[2];
 #else
             g_sigact[sig].restorer = 0;
 #endif
-            g_sigact[sig].mask = *(uint64_t *)(a1 + mask_offset);
+            g_sigact[sig].mask = incoming[mask_offset / 8];
             // Setting SIG_IGN (or SIG_DFL on a default-ignore signal) DISCARDS any pending instance --
             // Linux flushes the pending queue on an ignore transition. Without this a signal raised while
             // blocked, then set to SIG_IGN, stayed pending (ignore_discards_pending: sigpending must clear).
@@ -711,17 +736,20 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         // pointer is -EFAULT (like rt_sigpending case 136), not an engine fault writing/reading the mask.
         // guest_bad_ptr (not host_range_mapped) so a PROT_NONE guard page is caught too. Validate both
         // before mutating the mask so no partial state is left behind.
-        if (a1 && guest_bad_ptr((uintptr_t)a1, 8)) {
+        uint64_t set = 0;
+        if (a1 && guest_copy_from(&set, a1, 8) != 8) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        if (a2 && guest_bad_ptr((uintptr_t)a2, 8)) {
+        if (a2 && guest_accessible_prefix(a2, 8, HL_LOGICAL_VMA_WRITE) != 8) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        if (a2) *(uint64_t *)a2 = c->sigmask;
+        if (a2 && guest_copy_to(a2, &c->sigmask, 8) != 8) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         if (a1) {
-            uint64_t set = *(uint64_t *)a1;
             if (a0 == 0)
                 // SIG_BLOCK
                 c->sigmask |= set;
@@ -748,7 +776,7 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         // SIG_SETMASK (redefines all) or a set that names one of the three -- so the common SIG_BLOCK/UNBLOCK
         // of SIGCHLD/SIGINT/etc. adds zero host syscalls.
         const uint64_t STOPBITS = (1ull << 19) | (1ull << 20) | (1ull << 21); // SIGTSTP|SIGTTIN|SIGTTOU bits
-        if (a1 && (a0 == 2 || (*(uint64_t *)a1 & STOPBITS))) {
+        if (a1 && (a0 == 2 || (set & STOPBITS))) {
             static const int STOPS[3] = {20, 21, 22}; // Linux SIGTSTP, SIGTTIN, SIGTTOU
             sigset_t blk, unblk;
             sigemptyset(&blk);
@@ -771,7 +799,7 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         // The kernel copy_to_user()s the pending set, so a bad/unmapped `set` pointer is -EFAULT (LTP
         // sigpending02's tst_get_bad_addr case: a PROT_NONE guard page must fault, not be silently written).
         // guest_bad_ptr (not host_range_mapped) so the PROT_NONE probe page is caught. NULL set faults too.
-        if (guest_bad_ptr((uintptr_t)a0, 8)) {
+        if (guest_accessible_prefix(a0, 8, HL_LOGICAL_VMA_WRITE) != 8) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
@@ -785,7 +813,10 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
         for (int s = 1; s <= 64; s++)
             // 1<<N -> sigset_t bit N-1
             if (p & (1ull << s)) out |= (1ull << (s - 1));
-        *(uint64_t *)a0 = out;
+        if (guest_copy_to(a0, &out, 8) != 8) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         G_RET(c) = 0;
         break;
     }

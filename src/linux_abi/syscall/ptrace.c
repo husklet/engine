@@ -367,15 +367,9 @@ static void ptrace_service_mem(struct pt_link *L) {
     if (len > PT_MEMBUF) len = PT_MEMBUF;
     int err = 0;
     if (L->mem_dir == 1) { // read: tracee copies its own guest memory into the shared buffer
-        if (host_range_mapped((uintptr_t)addr, (size_t)len))
-            memcpy((void *)L->mem_buf, (void *)(uintptr_t)addr, len);
-        else
-            err = EIO;
+        if (guest_copy_from((void *)L->mem_buf, addr, (size_t)len) != (ssize_t)len) err = EIO;
     } else if (L->mem_dir == 2) { // write
-        if (host_range_mapped((uintptr_t)addr, (size_t)len))
-            memcpy((void *)(uintptr_t)addr, (void *)L->mem_buf, len);
-        else
-            err = EIO;
+        if (guest_copy_to(addr, (const void *)L->mem_buf, (size_t)len) != (ssize_t)len) err = EIO;
     }
     L->mem_err = err;
     __atomic_store_n(&L->mem_ack, s, __ATOMIC_RELEASE);
@@ -635,7 +629,41 @@ static long ptrace_pvm(struct cpu *c, int is_write, pid_t rpid, const struct iov
         uint64_t n = la < rlen ? la : rlen;
         if (n) {
             // is_write: local (our) -> remote (tracee); else remote (tracee) -> local (our).
-            long r = pt_mem_xfer(L, raddr, lb, n, is_write ? 1 : 0);
+            uint8_t bounce[PT_MEMBUF];
+            uint64_t moved = 0;
+            long r = 0;
+            while (moved < n) {
+                size_t chunk = (size_t)(n - moved);
+                if (chunk > sizeof bounce) chunk = sizeof bounce;
+                int local_short = 0;
+                if (is_write) {
+                    ssize_t copied = guest_copy_from(bounce, (uint64_t)(uintptr_t)lb + moved, chunk);
+                    if (copied <= 0) {
+                        r = moved ? (long)moved : -EFAULT;
+                        break;
+                    }
+                    if ((size_t)copied < chunk) {
+                        chunk = (size_t)copied;
+                        local_short = 1;
+                    }
+                }
+                long one = pt_mem_xfer(L, raddr + moved, bounce, chunk, is_write ? 1 : 0);
+                if (one < 0) {
+                    r = moved ? (long)moved : one;
+                    break;
+                }
+                if (!is_write) {
+                    ssize_t copied = guest_copy_to((uint64_t)(uintptr_t)lb + moved, bounce, (size_t)one);
+                    if (copied != one) {
+                        if (copied > 0) moved += (uint64_t)copied;
+                        r = moved ? (long)moved : -EFAULT;
+                        break;
+                    }
+                }
+                moved += (uint64_t)one;
+                r = (long)moved;
+                if ((size_t)one < chunk || local_short) break;
+            }
             if (r < 0) return total ? total : r;
             total += r;
             if ((uint64_t)r < n) break;
@@ -696,51 +724,49 @@ static int svc_ptrace(struct cpu *c, uint64_t req, uint64_t pid, uint64_t addr, 
     switch (req) {
     case PTRACE_SETOPTIONS: L->options = data; return 0;
     case PTRACE_GETEVENTMSG:
-        if (!host_range_mapped((uintptr_t)data, sizeof(unsigned long))) return -EFAULT;
-        *(unsigned long *)(uintptr_t)data = L->eventmsg;
+        if (guest_copy_to(data, (const void *)&L->eventmsg, sizeof(unsigned long)) != sizeof(unsigned long))
+            return -EFAULT;
         return 0;
     case PTRACE_GETSIGINFO:
-        if (!host_range_mapped((uintptr_t)data, 128)) return -EFAULT;
-        memcpy((void *)(uintptr_t)data, (void *)L->siginfo, 128);
+        if (guest_copy_to(data, (const void *)L->siginfo, 128) != 128) return -EFAULT;
         return 0;
     case PTRACE_SETSIGINFO:
-        if (!host_range_mapped((uintptr_t)data, 128)) return -EFAULT;
-        memcpy((void *)L->siginfo, (void *)(uintptr_t)data, 128);
+        if (guest_copy_from((void *)L->siginfo, data, 128) != 128) return -EFAULT;
         return 0;
     case PTRACE_GETREGS:
         if (!stopped) return -ESRCH;
-        if (!host_range_mapped((uintptr_t)data, (size_t)L->reglen)) return -EFAULT;
-        memcpy((void *)(uintptr_t)data, (void *)L->regs, (size_t)L->reglen);
+        if (guest_copy_to(data, (const void *)L->regs, (size_t)L->reglen) != (ssize_t)L->reglen) return -EFAULT;
         return 0;
     case PTRACE_SETREGS:
         if (!stopped) return -ESRCH;
-        if (!host_range_mapped((uintptr_t)data, (size_t)L->reglen)) return -EFAULT;
-        memcpy((void *)L->regs, (void *)(uintptr_t)data, (size_t)L->reglen);
+        if (guest_copy_from((void *)L->regs, data, (size_t)L->reglen) != (ssize_t)L->reglen) return -EFAULT;
         L->regs_dirty = 1;
         return 0;
     case PTRACE_GETREGSET:
     case PTRACE_SETREGSET: {
         if (!stopped) return -ESRCH;
         if (addr != NT_PRSTATUS_) return -EIO; // NT_PRFPREG/NT_X86_XSTATE are staged (FP/vector batch)
-        if (!host_range_mapped((uintptr_t)data, sizeof(struct iovec))) return -EFAULT;
-        struct iovec *iov = (struct iovec *)(uintptr_t)data;
-        size_t n = iov->iov_len < (size_t)L->reglen ? iov->iov_len : (size_t)L->reglen;
-        if (!host_range_mapped((uintptr_t)iov->iov_base, n)) return -EFAULT;
+        struct iovec iov;
+        if (guest_copy_from(&iov, data, sizeof iov) != sizeof iov) return -EFAULT;
+        size_t n = iov.iov_len < (size_t)L->reglen ? iov.iov_len : (size_t)L->reglen;
         if (req == PTRACE_GETREGSET) {
-            memcpy(iov->iov_base, (void *)L->regs, n);
-            iov->iov_len = (size_t)L->reglen;
+            if (guest_copy_to((uint64_t)(uintptr_t)iov.iov_base, (const void *)L->regs, n) != (ssize_t)n)
+                return -EFAULT;
+            size_t reported = (size_t)L->reglen;
+            if (guest_copy_to(data + offsetof(struct iovec, iov_len), &reported, sizeof reported) != sizeof reported)
+                return -EFAULT;
         } else {
-            memcpy((void *)L->regs, iov->iov_base, n);
+            if (guest_copy_from((void *)L->regs, (uint64_t)(uintptr_t)iov.iov_base, n) != (ssize_t)n)
+                return -EFAULT;
             L->regs_dirty = 1;
         }
         return 0;
     }
     case PTRACE_PEEKUSER: {
         // user-area read: registers live in the low PT_REGBYTES; return that word via *data (raw ABI).
-        if (!host_range_mapped((uintptr_t)data, sizeof(uint64_t))) return -EFAULT;
         uint64_t off = addr, val = 0;
         if (off + 8 <= (uint64_t)L->reglen && (off & 7) == 0) val = L->regs[off / 8];
-        *(uint64_t *)(uintptr_t)data = val;
+        if (guest_copy_to(data, &val, sizeof val) != sizeof val) return -EFAULT;
         return 0;
     }
     case PTRACE_POKEUSER: {
@@ -754,11 +780,10 @@ static int svc_ptrace(struct cpu *c, uint64_t req, uint64_t pid, uint64_t addr, 
     case PTRACE_PEEKTEXT:
     case PTRACE_PEEKDATA: {
         if (!stopped) return -ESRCH;
-        if (!host_range_mapped((uintptr_t)data, sizeof(uint64_t))) return -EFAULT;
         uint64_t word = 0;
         long r = pt_mem_xfer(L, addr, (uint8_t *)&word, 8, 0);
         if (r < 0) return (int)r;
-        *(uint64_t *)(uintptr_t)data = word; // raw ptrace stores the word at *data, returns 0
+        if (guest_copy_to(data, &word, sizeof word) != sizeof word) return -EFAULT;
         return 0;
     }
     case PTRACE_POKETEXT:

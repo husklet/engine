@@ -40,7 +40,12 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
             // CF carry-in (and the following block's flag reload) sees the canonical membank flags.
             uint64_t desc = (uint64_t)w | ((uint64_t)(k == 3) << 8);
             if (I->is_mem) {
-                emit_ea(I, next);         // x17 = host effective address
+                emit_ea(I, next);
+                emit_memory_guard(17, (uint64_t)w, next - (uint64_t)I->len, X86_SOFT_READ | X86_SOFT_WRITE);
+                if (emit_soft_memory_active()) {
+                    emit_soft_store_commit((uint64_t)w);
+                    e_ldr(17, 28, OFF_BUS_EA);
+                }
                 e_str(17, 28, OFF_X87EA); // stash the EA for do_rcl to dereference
                 desc |= (1ull << 9);
             } else {
@@ -53,7 +58,7 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
             emit_exit_const(next, R_RCL);
             return TX_BREAK; // block ends at the exit (rip = next; do_rcl resumes there)
         } // RCL/RCR by CL -> C helper
-        int raw = rm_load(I, next, w, &mem);
+        int raw = rm_load_access(I, next, w, &mem, X86_SOFT_READ | X86_SOFT_WRITE);
         if ((k == 0 || k == 1) && w < 4) {        // 8/16-bit ROL/ROR -- rotate WITHIN the operand width
             int width = 8 * w;                    // (a 64-bit ROR would wrap the wrong bits, e.g. rolw $8)
             e_uxt(16, raw, w);                    // x16 = zero-extended operand (low `width` bits)
@@ -94,7 +99,7 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
                 // entirely; the rotated value in x16 is final. NOSHIFTFLAGELIDE=1 forces the gate off.
                 if (mc && !state->output_flags_dead) e_rot_flags_const(16, k, width, ce ? ce : width);
             }
-            rm_store(I, w, 16); // stores low w bytes
+            rm_store_after_guard(I, w, 16); // stores low w bytes
             return TX_NEXT;
         }
         int ssf = (w >= 4) ? sf : 1; // operate 64-bit on extended byte/word
@@ -135,7 +140,7 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
                 e_rrr(A_AND, 20, 20, 19, ssf, 0); // x20 = (width - n) & (width-1)  -> n==0 maps to rot 0
                 e_shv(S_RORV, 16, src, 20, ssf);  // rorv x16, src, x20
                 e_rot_flags_cl(16, 0, width);     // ROL CF=LSB(result), OF (1-bit) -- SF/ZF unchanged
-                rm_store(I, w, 16);
+                rm_store_after_guard(I, w, 16);
                 return TX_NEXT;
             }
             uint32_t b = k == 4 ? S_LSLV : k == 5 ? S_LSRV : k == 7 ? S_ASRV : S_RORV;
@@ -165,7 +170,7 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
                 // zeroed (a 32-bit op zero-extends). w==8/16/8 register dests keep their bits;
                 // a memory dest is rewritten unchanged.
                 if (mem)
-                    e_store(w, raw, 17);
+                    rm_store_after_guard(I, w, raw);
                 else if (w == 4)
                     e_mov_rr(raw, raw, 0);
                 return TX_NEXT;
@@ -199,8 +204,8 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
         // successor entry (guest-byte scan). AF is never written by this path either way, so it is
         // excluded from the mask (eliding leaves it byte-identical to the materialized path). The
         // value in x16 is final; skip the tst + nzcv/PF synthesis entirely and just store.
-        if (flags_dead) {      // predicate hoisted above (identical to the old inline condition)
-            rm_store(I, w, R); // no-op when direct (R==I->rm_reg); stores x16 otherwise
+        if (flags_dead) {                  // predicate hoisted above (identical to the old inline condition)
+            rm_store_after_guard(I, w, R); // no-op when direct (R==I->rm_reg); stores x16 otherwise
             return TX_NEXT;
         }
         // SF/ZF from result (byte/word via high-bits); CF exact for immediate SHL/SHR/SAR, else approximate
@@ -330,7 +335,7 @@ int hl_x86_lower_shift(struct insn *I, uint64_t next, const hl_x86_shift_state *
             if (!state->parity_aux_dead && (k == 4 || k == 5 || k == 7))
                 e_pf_save(R); // result low byte -> PF lane (R holds result; skip when dead)
         }
-        rm_store(I, w, R); // no-op when direct (R==I->rm_reg); stores x16 otherwise
+        rm_store_after_guard(I, w, R); // no-op when direct (R==I->rm_reg); stores x16 otherwise
         return TX_NEXT;
     }
     return TX_FALL;

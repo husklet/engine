@@ -3,6 +3,15 @@
 // atomic upgrade, §B shadow-return prediction (depth-gated), tier-2 purity gate. See OPTIMIZATIONS.md.
 
 #include <assert.h>
+#include "../../guest_fetch.h"
+#include "../../../linux_abi/logical_vma.h"
+
+static uint32_t a64_fetch_instruction(uint64_t guest, int *ok) {
+    uint32_t instruction = 0;
+    int success = hl_guest_fetch_u32(guest, &instruction) == 0;
+    if (ok != NULL) *ok = success;
+    return success ? instruction : 0;
+}
 
 // Non-PIE ET_EXEC link span + high-map bias. Really defined (and set by load_elf) in os/linux/container/
 // vfs.c and os/linux/elf.c, both compiled LATER in the same unity TU; forward-declared here (static, so
@@ -521,9 +530,10 @@ static int casp_uses_stolen(uint32_t in) {
            is_stolen(Rn);
 }
 
-static void emit_casp_mangled(uint32_t in) {
+static void emit_casp_mangled(uint32_t in, int override_base) {
     int Rs = (in >> 16) & 31, Rt = in & 31, Rn = (in >> 5) & 31;
-    int touch[5] = {Rs, (Rs + 1) & 31, Rt, (Rt + 1) & 31, Rn};
+    int touch[5] = {Rs, (Rs + 1) & 31, Rt, (Rt + 1) & 31,
+                    override_base >= 0 ? override_base : Rn};
     // Two DISTINCT free even host pairs (P = Rs role, Q = Rt role): neither member stolen, neither a guest
     // reg the op names. Register 31 in a CASP field means xzr (not SP), so it is safe to leave in place.
     int P = -1, Q = -1, Nr = -1;
@@ -540,7 +550,7 @@ static void emit_casp_mangled(uint32_t in) {
         }
     }
     // Base scratch only when Xn itself is stolen (a non-stolen Xn -- including SP=31 -- stays in the op).
-    if (is_stolen(Rn))
+    if (override_base < 0 && is_stolen(Rn))
         for (int r = 0; r <= 27; r++) {
             if (is_stolen(r) || r == P || r == P + 1 || r == Q || r == Q + 1) continue;
             int bad = 0;
@@ -573,7 +583,7 @@ static void emit_casp_mangled(uint32_t in) {
     CASP_LOADG(Q + 1, (Rt + 1) & 31);
 #undef CASP_LOADG
     if (Nr >= 0) e_ldr(Nr, CPUREG, Rn * 8);
-    int base = (Nr >= 0) ? Nr : Rn;
+    int base = override_base >= 0 ? override_base : (Nr >= 0) ? Nr : Rn;
     uint32_t m = (in & ~((0x1Fu << 16) | (0x1Fu << 5) | 0x1Fu)) | ((uint32_t)P << 16) |
                  ((uint32_t)base << 5) | (uint32_t)Q;
     emit32(m);
@@ -619,8 +629,7 @@ static int is_foldable_mem(uint32_t in) {
                                                      // handled by emit_fold_mem -- post/pre are the hot form)
     if ((in & 0x3B200C00u) == 0x38200800u) return 1; // register-offset [Xn,Xm{,ext}]: full-EA fold below
     if ((in & 0x3A000000u) == 0x28000000u) {         // LDP/STP family
-        int o = (in >> 23) & 3;
-        return o == 0 || o == 2; // 00 no-alloc, 10 offset; reject 01/11 (writeback)
+        return 1; /* no-alloc, offset, post-index, and pre-index */
     }
     if ((in & 0x3F000000u) == 0x08000000u)           // exclusive / ordered / CAS group ([Xn] base)
         return (in & 0x00800000u) != 0;              // bit23: 1=LDAR/STLR/CAS (single) -> fold; 0=monitor pair
@@ -628,7 +637,16 @@ static int is_foldable_mem(uint32_t in) {
     return 0;
 }
 
+static int is_prfm_register_or_immediate(uint32_t in) {
+    if ((in & 0x04000000u) != 0) return 0; /* SIMD/FP */
+    if (((in >> 30) & 3) != 3 || ((in >> 22) & 3) != 2) return 0;
+    return (in & 0x3B000000u) == 0x39000000u ||
+           (in & 0x3B200000u) == 0x38000000u ||
+           (in & 0x3B200C00u) == 0x38200800u;
+}
+
 static uint64_t a64_mem_bytes(uint32_t in) {
+    if (is_casp(in)) return (in & (1u << 30)) ? 16 : 8;
     int pair = (in & 0x3A000000u) == 0x28000000u;
     int vector = (in >> 26) & 1;
     unsigned size = (in >> 30) & 3;
@@ -641,13 +659,29 @@ static uint64_t a64_mem_bytes(uint32_t in) {
         unsigned scale = ((((in >> 22) & 3u) >> 1) << 2) | size;
         bytes = UINT64_C(1) << scale; /* B/H/S/D/Q scalar or vector */
     }
+    if ((in & 0x3F000000u) == 0x08000000u && !(in & (1u << 23)) &&
+        (in & (1u << 21)))
+        bytes *= 2; /* LDXP/STXP */
     return pair ? bytes * 2 : bytes;
+}
+
+static uint32_t a64_mem_required(uint32_t in) {
+    /* LSE RMW and compare-and-swap instructions both read and write. */
+    if ((in & 0x3B200C00u) == 0x38200000u || is_casp(in) ||
+        ((in & 0x3FA07C00u) == 0x08A07C00u))
+        return HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_WRITE;
+    return (in & (1u << 22)) ? HL_LOGICAL_VMA_READ : HL_LOGICAL_VMA_WRITE;
 }
 
 /* Byte displacement of the access performed by a foldable memory opcode.
    The copied opcode is de-indexed after this displacement is folded into Sb,
    so the BUS query and the native access use exactly the same address. */
 static int64_t a64_fold_mem_offset(uint32_t in, int wb) {
+    if ((in & 0x3a000000u) == 0x28000000u) {
+        if (wb == 2) return 0; /* pair post-index accesses before writeback */
+        int64_t element = (int64_t)(a64_mem_bytes(in) / 2);
+        return sext((in >> 15) & 0x7f, 7) * element;
+    }
     if (wb == 2) return 0; /* post-index accesses before writeback */
     if (wb == 1) return sext((in >> 12) & 0x1ff, 9);
     if ((in & 0x3b000000u) == 0x39000000u) {
@@ -656,11 +690,487 @@ static int64_t a64_fold_mem_offset(uint32_t in, int wb) {
     }
     if ((in & 0x3b200000u) == 0x38000000u)
         return sext((in >> 12) & 0x1ff, 9);
-    if ((in & 0x3a000000u) == 0x28000000u) {
-        int64_t element = (int64_t)(a64_mem_bytes(in) / 2);
-        return sext((in >> 15) & 0x7f, 7) * element;
-    }
     return 0; /* register-offset already materialized; atomics use [Xn] */
+}
+
+/*
+ * Sparse logical-VMA software-TLB guard.
+ *
+ * Mapping activation retires pre-guard translations.  Mapping mutation then
+ * clears soft_page for every CPU while peers are stopped, before an immutable
+ * snapshot/backing can be reclaimed.  A hit consequently needs no global
+ * generation read.  All instructions below are flag-free: in particular, a
+ * guard between LDXR and STXR cannot perturb guest NZCV or perform a store
+ * that would destroy the host exclusive monitor.
+ *
+ * The caller computes the architectural guest EA in `ea`, emits the native
+ * operation against that register between begin/end, and supplies two
+ * engine-owned temporaries.  On a hit `ea` becomes its canonical host
+ * address.  Misses and discontinuous page spans exit before the operation and
+ * retry the same guest PC after dispatcher handling.
+ */
+struct a64_soft_guard {
+    uint32_t *miss[6];
+    uint32_t *direct[2];
+    int miss_bit[6]; /* -1 = CBNZ; otherwise TBZ bit */
+    int miss_reg[6];
+    unsigned nmiss;
+    unsigned ndirect;
+    int ea;
+    int tmp;
+    int tmp2;
+    uint64_t bytes;
+    uint32_t required;
+    uint64_t pc;
+    uint8_t *native;
+    uint8_t *metadata;
+    int shared;
+    int active;
+    int restore_reg[4];
+    int restore_offset[4];
+    unsigned nrestore;
+};
+
+#define SOFT_STUB_PATCH_MAX 65536
+static uint32_t *g_soft_stub_patches[SOFT_STUB_PATCH_MAX];
+static uint32_t g_soft_stub_patch_count;
+static uint32_t *g_soft_legacy_stub_patches[SOFT_STUB_PATCH_MAX];
+static uint32_t g_soft_legacy_stub_patch_count;
+static uint32_t *g_soft_resolver_patches[SOFT_STUB_PATCH_MAX];
+static uint32_t g_soft_resolver_bytes[SOFT_STUB_PATCH_MAX];
+static uint32_t g_soft_resolver_required[SOFT_STUB_PATCH_MAX];
+static uint32_t g_soft_resolver_patch_count;
+
+static void emit_a64_bus_guard(int, uint64_t, uint64_t);
+static void patch_adr(uint32_t *, uint8_t *, unsigned);
+static int shadowgate(void);
+
+static uint32_t a64_cbnz_x(int reg, int64_t words) {
+    return 0xB5000000u | (((uint32_t)words & 0x7ffffu) << 5) | (unsigned)reg;
+}
+
+static uint32_t a64_tbz_x(int reg, unsigned bit, int64_t words) {
+    return 0x36000000u | ((bit & 0x20u) << 26) | ((bit & 0x1fu) << 19) |
+           (((uint32_t)words & 0x3fffu) << 5) | (unsigned)reg;
+}
+
+static struct a64_soft_guard emit_a64_soft_guard_begin(int ea, int tmp, int tmp2, uint64_t bytes,
+                                                       uint32_t required, uint64_t pc) {
+    struct a64_soft_guard guard = {
+        .ea = ea, .tmp = tmp, .tmp2 = tmp2, .bytes = bytes, .required = required, .pc = pc};
+    int resume_ea = ea;
+    if (!jit_guest_soft_active()) return guard;
+    guard.active = 1;
+    assert(ea != tmp && ea != tmp2 && tmp != tmp2);
+    assert(bytes != 0 && bytes <= 4096);
+    /*
+     * With the shadow-RAS disabled x30 carries no live engine return link.
+     * Use it as the resolver's per-site continuation, normalize every EA in
+     * x16, and share the complete interval/permission check once per block.
+     * Shadow-enabled builds retain the proven inline guard below.
+     */
+    guard.shared = shadowgate() < 0 && !g_tier2_build;
+    if (guard.shared) {
+        if (ea != 16) e_movr(16, ea);
+        guard.ea = 16;
+        guard.tmp = 17;
+        guard.tmp2 = 18;
+        ea = 16;
+        tmp = 17;
+        tmp2 = 18;
+    }
+
+    /*
+     * Most accesses in a process with one sparse 4 KiB alias still target
+     * ordinary identity-mapped stack/heap pages. Reject those against the
+     * conservative logical-VMA hull before consulting the per-page software
+     * TLB. All arithmetic and branches are flag-free, preserving guest NZCV
+     * and host exclusive-monitor state.
+     *
+     * Below-hull: first - (ea+bytes) has bit 63 clear when the access ends at
+     * or below first. Above-hull: ea-last has bit 63 clear when ea >= last.
+     * Equality is intentionally classified direct; overlap remains on the
+     * guarded path.
+     */
+    e_ldr(tmp, CPUREG, OFF_SOFT_FILTER_FIRST);
+    e_movconst(tmp2, bytes);
+    emit32(0x8B000000u | ((unsigned)tmp2 << 16) | ((unsigned)ea << 5) | (unsigned)tmp2);
+    emit32(0xCB000000u | ((unsigned)tmp2 << 16) | ((unsigned)tmp << 5) | (unsigned)tmp2);
+    emit32(0xD37FFC00u | ((unsigned)tmp2 << 5) | (unsigned)tmp2);
+    guard.direct[guard.ndirect++] = (uint32_t *)g_cp;
+    emit32(0); /* tbz tmp2,#0,direct */
+
+    e_ldr(tmp, CPUREG, OFF_SOFT_FILTER_LAST);
+    emit32(0xCB000000u | ((unsigned)tmp << 16) | ((unsigned)ea << 5) | (unsigned)tmp2);
+    emit32(0xD37FFC00u | ((unsigned)tmp2 << 5) | (unsigned)tmp2);
+    guard.direct[guard.ndirect++] = (uint32_t *)g_cp;
+    emit32(0); /* tbz tmp2,#0,direct */
+
+    if (guard.shared) {
+        /*
+         * x17 points at fixed metadata and a plain branch enters the shared
+         * resolver. The native continuation immediately follows metadata:
+         *   [pc:u64, miss_delta:i32, pad:u32]
+         */
+        uint32_t *metadata_address = (uint32_t *)g_cp;
+        emit32(0); /* adr x17,metadata */
+        if (g_soft_resolver_patch_count >= SOFT_STUB_PATCH_MAX) {
+            static const char message[] = "too many shared soft-memory guards in one translated block";
+            (void)jit_fail(HL_STATUS_OUT_OF_MEMORY, message, sizeof message - 1u);
+            _exit(70);
+        }
+        uint32_t resolver_index = g_soft_resolver_patch_count++;
+        g_soft_resolver_patches[resolver_index] = (uint32_t *)g_cp;
+        g_soft_resolver_bytes[resolver_index] = (uint32_t)bytes;
+        g_soft_resolver_required[resolver_index] = required;
+        emit32(0); /* b shared_soft_resolver */
+        guard.metadata = g_cp;
+        patch_adr(metadata_address, guard.metadata, 17);
+        memcpy(g_cp, &pc, sizeof pc);
+        g_cp += sizeof pc;
+        memset(g_cp, 0, 4); /* miss displacement, filled by guard end */
+        g_cp += 4;
+        uint16_t narrow_bytes = (uint16_t)bytes;
+        memcpy(g_cp, &narrow_bytes, sizeof narrow_bytes);
+        g_cp += sizeof narrow_bytes;
+        *g_cp++ = (uint8_t)required;
+        *g_cp++ = 0;
+        guard.native = g_cp;
+        if (resume_ea != 16) e_movr(resume_ea, 16);
+        return guard;
+    }
+
+    /* Width-independent cached interval hit, using sign bits of non-setting
+       subtracts. Linux userspace canonical addresses are below 2^63, so an
+       unsigned underflow is exactly the high-bit test here. */
+    e_ldr(tmp, CPUREG, OFF_SOFT_PAGE); /* inclusive first */
+    emit32(0xCB000000u | ((unsigned)tmp << 16) | ((unsigned)ea << 5) | (unsigned)tmp2);
+    emit32(0xD37FFC00u | ((unsigned)tmp2 << 5) | (unsigned)tmp2); /* lsr tmp2,tmp2,#63 */
+    guard.miss[guard.nmiss++] = (uint32_t *)g_cp;
+    guard.miss_bit[guard.nmiss - 1] = -1;
+    guard.miss_reg[guard.nmiss - 1] = tmp2;
+    emit32(0);
+
+    e_ldr(tmp, CPUREG, OFF_SOFT_LIMIT); /* exclusive end */
+    e_movconst(tmp2, bytes);
+    emit32(0x8B000000u | ((unsigned)tmp2 << 16) |
+           ((unsigned)ea << 5) | (unsigned)tmp2);
+    emit32(0xCB000000u | ((unsigned)tmp2 << 16) |
+           ((unsigned)tmp << 5) | (unsigned)tmp2);
+    emit32(0xD37FFC00u | ((unsigned)tmp2 << 5) | (unsigned)tmp2);
+    guard.miss[guard.nmiss++] = (uint32_t *)g_cp;
+    guard.miss_bit[guard.nmiss - 1] = -1;
+    guard.miss_reg[guard.nmiss - 1] = tmp2;
+    emit32(0);
+
+    e_ldr(tmp, CPUREG, OFF_SOFT_PROTECTION);
+    if (required & HL_LOGICAL_VMA_READ) {
+        guard.miss[guard.nmiss++] = (uint32_t *)g_cp;
+        guard.miss_bit[guard.nmiss - 1] = 0;
+        guard.miss_reg[guard.nmiss - 1] = tmp;
+        emit32(0); /* tbz tmp,#0,miss */
+    }
+    if (required & HL_LOGICAL_VMA_WRITE) {
+        guard.miss[guard.nmiss++] = (uint32_t *)g_cp;
+        guard.miss_bit[guard.nmiss - 1] = 1;
+        guard.miss_reg[guard.nmiss - 1] = tmp;
+        emit32(0); /* tbz tmp,#1,miss */
+    }
+    e_ldr(tmp, CPUREG, OFF_SOFT_DELTA);
+    emit32(0x8B000000u | ((unsigned)tmp << 16) | ((unsigned)ea << 5) | (unsigned)ea); /* add ea,ea,tmp */
+    guard.native = g_cp;
+    return guard;
+}
+
+static void a64_soft_guard_restore(struct a64_soft_guard *guard, int reg, int offset) {
+    assert(guard->nrestore < 4);
+    guard->restore_reg[guard->nrestore] = reg;
+    guard->restore_offset[guard->nrestore] = offset;
+    guard->nrestore++;
+}
+
+/*
+ * A soft-TLB miss is cold, but the old lowering put a complete architectural
+ * spill and block-return sequence at every guest memory instruction.  A
+ * memory-heavy straight-line region consequently spent hundreds of bytes per
+ * access on identical code which almost never ran.
+ *
+ * Keep only the site-specific work inline: preserve the guest EA, restore
+ * translator scratch registers, and point x17 at immutable metadata adjacent
+ * to the site.  All miss sites in the translated block branch to one shared
+ * spill/exit stub.  x16/x17 are engine-owned in this ABI and emit_spill()
+ * deliberately preserves them, exactly as for the shared BUS stub.
+ */
+static void emit_a64_soft_exit_site(const struct a64_soft_guard *guard) {
+    assert(g_steal1617);
+    e_str(guard->ea, CPUREG, OFF_SOFT_EA);
+    for (unsigned index = 0; index < guard->nrestore; ++index)
+        e_ldr(guard->restore_reg[index], CPUREG, guard->restore_offset[index]);
+    uint32_t *metadata_address = (uint32_t *)g_cp;
+    emit32(0); /* adr x17,immutable_site_metadata */
+    if (g_soft_legacy_stub_patch_count >= SOFT_STUB_PATCH_MAX) {
+        static const char message[] = "too many soft-memory guards in one translated block";
+        (void)jit_fail(HL_STATUS_OUT_OF_MEMORY, message, sizeof message - 1u);
+        _exit(70);
+    }
+    g_soft_legacy_stub_patches[g_soft_legacy_stub_patch_count++] = (uint32_t *)g_cp;
+    emit32(0); /* b shared_soft_stub */
+    uint8_t *metadata = g_cp;
+    patch_adr(metadata_address, metadata, 17);
+    memcpy(g_cp, &guard->bytes, sizeof(guard->bytes));
+    g_cp += sizeof(guard->bytes);
+    uint64_t required = guard->required;
+    memcpy(g_cp, &required, sizeof(required));
+    g_cp += sizeof(required);
+    memcpy(g_cp, &guard->pc, sizeof(guard->pc));
+    g_cp += sizeof(guard->pc);
+}
+
+static void emit_a64_soft_guard_end(struct a64_soft_guard *guard) {
+    if (!guard->active) return;
+    if (guard->shared) {
+        uint32_t *skip = (uint32_t *)g_cp;
+        emit32(0); /* b resume */
+        uint8_t *miss = g_cp;
+        for (unsigned index = 0; index < guard->nrestore; ++index)
+            e_ldr(guard->restore_reg[index], CPUREG, guard->restore_offset[index]);
+        if (g_soft_stub_patch_count >= SOFT_STUB_PATCH_MAX) {
+            static const char message[] = "too many soft-memory restore stubs in one translated block";
+            (void)jit_fail(HL_STATUS_OUT_OF_MEMORY, message, sizeof message - 1u);
+            _exit(70);
+        }
+        g_soft_stub_patches[g_soft_stub_patch_count++] = (uint32_t *)g_cp;
+        emit32(0); /* b shared_soft_exit */
+        uint8_t *resume = g_cp;
+        *skip = 0x14000000u |
+                ((uint32_t)((resume - (uint8_t *)skip) / 4) & 0x03ffffffu);
+        int64_t miss_delta = miss - guard->native;
+        if (miss_delta < INT32_MIN || miss_delta > INT32_MAX) {
+            static const char message[] = "soft-memory site miss displacement out of range";
+            (void)jit_fail(HL_STATUS_OUT_OF_MEMORY, message, sizeof message - 1u);
+            _exit(70);
+        }
+        int32_t narrow_delta = (int32_t)miss_delta;
+        memcpy(guard->metadata + 8, &narrow_delta, sizeof narrow_delta);
+        for (unsigned i = 0; i < guard->ndirect; ++i)
+            *guard->direct[i] =
+                a64_tbz_x(guard->tmp2, 0,
+                          (guard->native - (uint8_t *)guard->direct[i]) / 4);
+        return;
+    }
+    uint32_t *skip = (uint32_t *)g_cp;
+    emit32(0); /* b resume */
+    uint8_t *miss = g_cp;
+    emit_a64_soft_exit_site(guard);
+    uint8_t *resume = g_cp;
+    *skip = 0x14000000u | ((uint32_t)((resume - (uint8_t *)skip) / 4) & 0x03ffffffu);
+    for (unsigned i = 0; i < guard->nmiss; ++i) {
+        if (guard->miss_bit[i] < 0)
+            *guard->miss[i] =
+                a64_cbnz_x(guard->miss_reg[i], (miss - (uint8_t *)guard->miss[i]) / 4);
+        else
+            *guard->miss[i] = a64_tbz_x(guard->miss_reg[i], (unsigned)guard->miss_bit[i],
+                                        (miss - (uint8_t *)guard->miss[i]) / 4);
+    }
+    for (unsigned i = 0; i < guard->ndirect; ++i)
+        *guard->direct[i] =
+            a64_tbz_x(guard->tmp2, 0, (guard->native - (uint8_t *)guard->direct[i]) / 4);
+}
+
+static void aarch64_soft_filter_refresh(struct cpu *c) {
+    uint64_t first = UINT64_MAX, last = 0;
+    hl_logical_vma_snapshot *snapshot =
+        atomic_load_explicit(hl_logical_vma_global_snapshot_source(), memory_order_acquire);
+    if (snapshot != NULL && snapshot->count != 0) {
+        first = snapshot->views[0].guest_first;
+        last = snapshot->views[snapshot->count - 1].guest_last;
+    }
+    c->soft_filter_first = first;
+    c->soft_filter_last = last;
+}
+
+static void emit_a64_soft_stub(void) {
+    if (!g_soft_stub_patch_count && !g_soft_resolver_patch_count &&
+        !g_soft_legacy_stub_patch_count)
+        return;
+    if (g_soft_resolver_patch_count) {
+        uint32_t *cold_miss_patches[1024];
+        int cold_miss_bits[1024]; /* -1 = CBNZ x18, otherwise TBZ x18,bit */
+        unsigned cold_miss_count = 0;
+        for (;;) {
+            uint32_t first = 0;
+            while (first < g_soft_resolver_patch_count &&
+                   g_soft_resolver_patches[first] == NULL)
+                ++first;
+            if (first == g_soft_resolver_patch_count) break;
+            uint32_t bytes = g_soft_resolver_bytes[first];
+            uint32_t required = g_soft_resolver_required[first];
+            uint8_t *resolver = g_cp;
+            for (uint32_t i = first; i < g_soft_resolver_patch_count; ++i) {
+                if (g_soft_resolver_patches[i] == NULL ||
+                    g_soft_resolver_bytes[i] != bytes ||
+                    g_soft_resolver_required[i] != required)
+                    continue;
+                int64_t displacement =
+                    (resolver - (uint8_t *)g_soft_resolver_patches[i]) / 4;
+                if (displacement < -(INT64_C(1) << 25) ||
+                    displacement >= (INT64_C(1) << 25)) {
+                    static const char message[] = "soft-memory resolver branch out of range";
+                    (void)jit_fail(HL_STATUS_OUT_OF_MEMORY, message, sizeof message - 1u);
+                    _exit(70);
+                }
+                *g_soft_resolver_patches[i] =
+                    0x14000000u | ((uint32_t)displacement & 0x03ffffffu);
+                g_soft_resolver_patches[i] = NULL;
+            }
+
+            /* x16 = guest EA, x17 = immutable site metadata. Only x18 is
+               scratch; x30 remains untouched for precise host-link state. */
+            e_ldr(18, CPUREG, OFF_SOFT_PAGE);
+            emit32(0xCB000000u | (18u << 16) | (16u << 5) | 18u);
+            emit32(0xD37FFC00u | (18u << 5) | 18u);
+            assert(cold_miss_count < sizeof cold_miss_patches / sizeof cold_miss_patches[0]);
+            cold_miss_patches[cold_miss_count] = (uint32_t *)g_cp;
+            cold_miss_bits[cold_miss_count++] = -1;
+            emit32(0);
+
+            e_ldr(18, CPUREG, OFF_SOFT_LIMIT);
+            if (bytes == 4096)
+                emit32(0xD1400000u | (1u << 10) | (18u << 5) | 18u);
+            else
+                e_subi(18, 18, bytes);
+            emit32(0xCB000000u | (16u << 16) | (18u << 5) | 18u);
+            emit32(0xD37FFC00u | (18u << 5) | 18u);
+            assert(cold_miss_count < sizeof cold_miss_patches / sizeof cold_miss_patches[0]);
+            cold_miss_patches[cold_miss_count] = (uint32_t *)g_cp;
+            cold_miss_bits[cold_miss_count++] = -1;
+            emit32(0);
+
+            e_ldr(18, CPUREG, OFF_SOFT_PROTECTION);
+            if (required & HL_LOGICAL_VMA_READ) {
+                assert(cold_miss_count < sizeof cold_miss_patches / sizeof cold_miss_patches[0]);
+                cold_miss_patches[cold_miss_count] = (uint32_t *)g_cp;
+                cold_miss_bits[cold_miss_count++] = 0;
+                emit32(0); /* tbz x18,#READ,miss */
+            }
+            if (required & HL_LOGICAL_VMA_WRITE) {
+                assert(cold_miss_count < sizeof cold_miss_patches / sizeof cold_miss_patches[0]);
+                cold_miss_patches[cold_miss_count] = (uint32_t *)g_cp;
+                cold_miss_bits[cold_miss_count++] = 1;
+                emit32(0); /* tbz x18,#WRITE,miss */
+            }
+            e_ldr(18, CPUREG, OFF_SOFT_DELTA);
+            emit32(0x8B000000u | (18u << 16) | (16u << 5) | 16u);
+            e_addi(17, 17, 16);
+            e_br(17);
+        }
+        uint8_t *resolver_miss = g_cp;
+        for (unsigned i = 0; i < cold_miss_count; ++i) {
+            uint32_t *patch = cold_miss_patches[i];
+            int64_t displacement = (resolver_miss - (uint8_t *)patch) / 4;
+            *patch = cold_miss_bits[i] < 0
+                         ? a64_cbnz_x(18, displacement)
+                         : a64_tbz_x(18, (unsigned)cold_miss_bits[i], displacement);
+        }
+        e_str(16, CPUREG, OFF_SOFT_EA);
+        emit32(0x79400000u | (6u << 10) | (17u << 5) | 18u); /* ldrh w18,[meta,#12] */
+        e_str(18, CPUREG, OFF_SOFT_BYTES);
+        emit32(0x39400000u | (14u << 10) | (17u << 5) | 18u); /* ldrb w18,[meta,#14] */
+        e_str(18, CPUREG, OFF_SOFT_REQUIRED);
+        e_ldr(18, 17, 0);
+        e_str(18, CPUREG, OFF_SOFT_PC);
+        e_str(18, CPUREG, OFF_PC);
+        emit32(0xB9800000u | (2u << 10) | (17u << 5) | 18u); /* ldrsw x18,[meta,#8] */
+        e_addi(17, 17, 16);
+        emit32(0x8B000000u | (18u << 16) | (17u << 5) | 18u);
+        e_br(18);
+    }
+
+    if (g_soft_stub_patch_count) {
+        uint8_t *stub = g_cp;
+        for (uint32_t i = 0; i < g_soft_stub_patch_count; ++i) {
+            int64_t displacement = (stub - (uint8_t *)g_soft_stub_patches[i]) / 4;
+            if (displacement < -(INT64_C(1) << 25) ||
+                displacement >= (INT64_C(1) << 25)) {
+                static const char message[] = "soft-memory stub branch out of range";
+                (void)jit_fail(HL_STATUS_OUT_OF_MEMORY, message, sizeof message - 1u);
+                _exit(70);
+            }
+            *g_soft_stub_patches[i] =
+                0x14000000u | ((uint32_t)displacement & 0x03ffffffu);
+        }
+        emit_spill();
+        e_movconst(9, R_SOFTMISS);
+        e_str(9, 0, OFF_RSN);
+        emit_blockret(9);
+        e_br(9);
+    }
+    if (g_soft_legacy_stub_patch_count) {
+        uint8_t *stub = g_cp;
+        for (uint32_t i = 0; i < g_soft_legacy_stub_patch_count; ++i) {
+            int64_t displacement =
+                (stub - (uint8_t *)g_soft_legacy_stub_patches[i]) / 4;
+            if (displacement < -(INT64_C(1) << 25) ||
+                displacement >= (INT64_C(1) << 25)) {
+                static const char message[] = "legacy soft-memory stub branch out of range";
+                (void)jit_fail(HL_STATUS_OUT_OF_MEMORY, message, sizeof message - 1u);
+                _exit(70);
+            }
+            *g_soft_legacy_stub_patches[i] =
+                0x14000000u | ((uint32_t)displacement & 0x03ffffffu);
+        }
+        emit_spill();
+        e_ldr(9, 17, 0);
+        e_str(9, 0, OFF_SOFT_BYTES);
+        e_ldr(9, 17, 8);
+        e_str(9, 0, OFF_SOFT_REQUIRED);
+        e_ldr(9, 17, 16);
+        e_str(9, 0, OFF_SOFT_PC);
+        e_str(9, 0, OFF_PC);
+        e_movconst(9, R_SOFTMISS);
+        e_str(9, 0, OFF_RSN);
+        emit_blockret(9);
+        e_br(9);
+    }
+}
+
+/* A discontinuous-view retry executes against cpu->soft_bounce.  Force one
+   cold dispatcher crossing after the architectural operation so stores can
+   be scattered before the following guest instruction observes them. */
+static void emit_a64_soft_bounce_commit(uint64_t next_pc) {
+    if (!jit_guest_soft_active()) return;
+    e_ldr(16, CPUREG, OFF_SOFT_BOUNCE_PENDING);
+    uint32_t *clear = (uint32_t *)g_cp;
+    emit32(0); /* cbz x16,resume */
+    emit_exit_const(next_pc, R_SOFTCOMMIT);
+    uint8_t *resume = g_cp;
+    *clear = 0xB4000000u |
+             (((uint32_t)((resume - (uint8_t *)clear) / 4) & 0x7ffffu) << 5) | 16u;
+}
+
+static void emit_a64_soft_exclusive(uint32_t in) {
+    int base = (int)((in >> 5) & 31u);
+    if (base == 31)
+        e_mov_from_sp(16);
+    else if (is_stolen(base))
+        e_ldr(16, CPUREG, base * 8);
+    else
+        e_movr(16, base);
+    emit_a64_bus_guard(16, a64_mem_bytes(in), g_emit_gpc);
+    struct a64_soft_guard soft =
+        emit_a64_soft_guard_begin(16, 17, 18, a64_mem_bytes(in),
+                                  a64_mem_required(in), g_emit_gpc);
+    if (is_casp(in)) {
+        emit_casp_mangled(in, 16);
+    } else {
+        uint32_t rebased = (in & ~(31u << 5)) | (16u << 5);
+        int mask = gpr_field_mask(in) & ~2; /* x16 is the engine EA, not guest x16 */
+        if (uses_x18(in, mask))
+            emit_mangled_x18(rebased, mask);
+        else
+            emit32(rebased);
+    }
+    emit_a64_soft_guard_end(&soft);
 }
 
 /*
@@ -890,6 +1400,12 @@ static void emit_fold_mem(uint32_t in, int emit_bus_guard) {
         int o = (in >> 10) & 3;
         wb = (o == 3) ? 1 : (o == 1) ? 2 : 0;
         if (wb) wbimm = sext((uint64_t)((in >> 12) & 0x1FF), 9);
+    } else if ((in & 0x3A000000u) == 0x28000000u) {
+        int o = (in >> 23) & 3;
+        wb = o == 3 ? 1 : o == 1 ? 2 : 0;
+        if (wb)
+            wbimm = sext((uint64_t)((in >> 15) & 0x7f), 7) *
+                    (int64_t)(a64_mem_bytes(in) / 2);
     }
     int sc[4];
     fold_mem_scratch(in, sc); // shared with fault-time reconstruction: same slot mapping
@@ -902,7 +1418,9 @@ static void emit_fold_mem(uint32_t in, int emit_bus_guard) {
     e_str(T, CPUREG, M + 40);
     e_str(T2, CPUREG, M + 48);
     if (regoff) e_str(Tm, CPUREG, M + 56);
-    if (is_stolen(base))
+    if (base == 31)
+        e_mov_from_sp(Sb);
+    else if (is_stolen(base))
         e_ldr(Sb, CPUREG, base * 8); // guest base from cpu->x[base]
     else
         e_movr(Sb, base); // guest base from the live host reg
@@ -923,31 +1441,33 @@ static void emit_fold_mem(uint32_t in, int emit_bus_guard) {
         emit32((access_off < 0 ? 0xCB000000u : 0x8B000000u) | ((unsigned)T << 16) |
                ((unsigned)Sb << 5) | (unsigned)Sb); /* sub/add Sb,Sb,T */
     }
-    // Bias iff the EA falls in THIS image's span [g_nonpie_lo, g_nonpie_hi). Fast path: a >= 4GiB address is
-    // never the low non-PIE image (stack/heap/mmap/ld.so/libc all live above the 4GiB __PAGEZERO) -> skip
-    // with no flag traffic (the common case). For a < 4GiB EA, do the exact two-sided range test; biasing
-    // ANY low address outside the image's own span (Go's small sentinel pointers in [0,lo), or a PIE peer's
-    // mapping) would corrupt it. The compares set NZCV, so save/restore the guest flags around them.
-    emit32(0xD360FC00u | (Sb << 5) | T); // lsr T, Sb, #32
-    uint32_t *p_hi = (uint32_t *)g_cp;
-    emit32(0);                // cbnz T, Lhi   (>= 4GiB -> skip, flags untouched)
-    emit32(0xD53B4200u | T2); // mrs T2, nzcv  (save guest flags)
-    e_movconst(T, g_nonpie_lo);
-    emit32(0xEB000000u | (T << 16) | (Sb << 5) | 31); // cmp Sb, lo
-    uint32_t *p_lo1 = (uint32_t *)g_cp;
-    emit32(0); // b.lo Llo   (Sb < lo -> not image)
-    e_movconst(T, g_nonpie_hi);
-    emit32(0xEB000000u | (T << 16) | (Sb << 5) | 31); // cmp Sb, hi
-    uint32_t *p_lo2 = (uint32_t *)g_cp;
-    emit32(0); // b.hs Llo   (Sb >= hi -> not image)
-    e_movconst(T, g_nonpie_bias);
-    emit32(0x8B000000u | (T << 16) | (Sb << 5) | Sb); // add Sb, Sb, bias
-    uint8_t *Llo = g_cp;
-    emit32(0xD51B4200u | T2); // msr nzcv, T2  (restore guest flags)
-    uint8_t *Lhi = g_cp;
-    *p_hi = 0xB5000000u | (((uint32_t)(((uint8_t *)Lhi - (uint8_t *)p_hi) / 4) & 0x7FFFF) << 5) | T;
-    *p_lo1 = 0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo1) / 4) & 0x7FFFF) << 5) | 3; // b.lo
-    *p_lo2 = 0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo2) / 4) & 0x7FFFF) << 5) | 2; // b.hs
+    if (guestbase_on()) {
+        // Bias iff the EA falls in THIS image's span [g_nonpie_lo, g_nonpie_hi). Fast path: a >= 4GiB address is
+        // never the low non-PIE image (stack/heap/mmap/ld.so/libc all live above the 4GiB __PAGEZERO) -> skip
+        // with no flag traffic (the common case). For a < 4GiB EA, do the exact two-sided range test.
+        emit32(0xD360FC00u | (Sb << 5) | T); // lsr T, Sb, #32
+        uint32_t *p_hi = (uint32_t *)g_cp;
+        emit32(0);
+        emit32(0xD53B4200u | T2); // mrs T2,nzcv
+        e_movconst(T, g_nonpie_lo);
+        emit32(0xEB000000u | (T << 16) | (Sb << 5) | 31);
+        uint32_t *p_lo1 = (uint32_t *)g_cp;
+        emit32(0);
+        e_movconst(T, g_nonpie_hi);
+        emit32(0xEB000000u | (T << 16) | (Sb << 5) | 31);
+        uint32_t *p_lo2 = (uint32_t *)g_cp;
+        emit32(0);
+        e_movconst(T, g_nonpie_bias);
+        emit32(0x8B000000u | (T << 16) | (Sb << 5) | Sb);
+        uint8_t *Llo = g_cp;
+        emit32(0xD51B4200u | T2);
+        uint8_t *Lhi = g_cp;
+        *p_hi = 0xB5000000u | (((uint32_t)(((uint8_t *)Lhi - (uint8_t *)p_hi) / 4) & 0x7FFFF) << 5) | T;
+        *p_lo1 =
+            0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo1) / 4) & 0x7FFFF) << 5) | 3;
+        *p_lo2 =
+            0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo2) / 4) & 0x7FFFF) << 5) | 2;
+    }
     uint32_t m;
     int emask = mask;
     if (regoff) {
@@ -958,7 +1478,11 @@ static void emit_fold_mem(uint32_t in, int emit_bus_guard) {
         // The architectural access address is already in Sb.  Convert the
         // pre/post-index opcode to an unscaled zero-offset access; writeback is
         // applied separately to the original guest base below.
-        m = in & ~(0x3u << 10) & ~(0x1FFu << 12);
+        if ((in & 0x3A000000u) == 0x28000000u) {
+            m = (in & ~(3u << 23) & ~(0x7fu << 15)) | (2u << 23);
+        } else {
+            m = in & ~(0x3u << 10) & ~(0x1FFu << 12);
+        }
         m = (m & ~(0x1Fu << 5)) | ((unsigned)Sb << 5);
     } else {
         m = (in & ~(0x1Fu << 5)) | ((unsigned)Sb << 5);
@@ -989,10 +1513,17 @@ static void emit_fold_mem(uint32_t in, int emit_bus_guard) {
         *inactive_fast = 0x36000000u |
                          (((uint32_t)((resume_inactive - (uint8_t *)inactive_fast) / 4) & 0x3FFFu) << 5) | 16u;
     }
+    struct a64_soft_guard soft =
+        emit_a64_soft_guard_begin(Sb, T, T2, a64_mem_bytes(in), a64_mem_required(in), g_emit_gpc);
+    a64_soft_guard_restore(&soft, Sb, M + 32);
+    a64_soft_guard_restore(&soft, T, M + 40);
+    a64_soft_guard_restore(&soft, T2, M + 48);
+    if (regoff) a64_soft_guard_restore(&soft, Tm, M + 56);
     if (uses_x18(m, emask))
         emit_mangled_x18(m, emask); // stolen Rt/Rt2/Rs (base now names non-stolen Sb)
     else
         emit32(m);
+    emit_a64_soft_guard_end(&soft);
     if (wb) { // writeback updates the LOW guest base (Rt != base for loads -> safe to do after the access)
         unsigned a = (unsigned)(wbimm < 0 ? -wbimm : wbimm);
         if (is_stolen(base)) {
@@ -1011,6 +1542,7 @@ static void emit_fold_mem(uint32_t in, int emit_bus_guard) {
     e_ldr(Sb, CPUREG, M + 32);
     e_ldr(T, CPUREG, M + 40);
     e_ldr(T2, CPUREG, M + 48);
+    emit_a64_soft_bounce_commit(g_emit_gpc + 4);
 }
 
 // ---- AdvSIMD load/store STRUCTURE bias-fold (ld1/st1 .. ld4/st4, single & multiple, ld1r/ld2r/...) ----
@@ -1071,12 +1603,15 @@ static void emit_fold_advsimd_struct(uint32_t in) {
     e_str(Sb, CPUREG, M + 32);
     e_str(T, CPUREG, M + 40);
     e_str(T2, CPUREG, M + 48);
-    if (is_stolen(base))
+    if (base == 31)
+        e_mov_from_sp(Sb);
+    else if (is_stolen(base))
         e_ldr(Sb, CPUREG, base * 8); // guest base from cpu->x[base]
     else
         e_movr(Sb, base); // guest base from the live host reg
     // Bias iff Sb is in [g_nonpie_lo, g_nonpie_hi); a >= 4GiB base is never the low image -> skip with no flag
     // traffic. The compares clobber NZCV, so save/restore the guest flags. (Same discriminator as emit_fold_mem.)
+    if (guestbase_on()) {
     emit32(0xD360FC00u | (Sb << 5) | T); // lsr T, Sb, #32
     uint32_t *p_hi = (uint32_t *)g_cp;
     emit32(0);                // cbnz T, Lhi   (>= 4GiB -> skip, flags untouched)
@@ -1097,11 +1632,20 @@ static void emit_fold_advsimd_struct(uint32_t in) {
     *p_hi = 0xB5000000u | (((uint32_t)(((uint8_t *)Lhi - (uint8_t *)p_hi) / 4) & 0x7FFFF) << 5) | T;
     *p_lo1 = 0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo1) / 4) & 0x7FFFF) << 5) | 3; // b.lo
     *p_lo2 = 0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo2) / 4) & 0x7FFFF) << 5) | 2; // b.hs
+    }
     // De-index to the no-offset form against Sb: clear post-index (bit23) and Rm[20:16], rebase Xn -> Sb. The
     // V-register list, opcode, R, and size fields are untouched, so the transfer is identical -- only its
     // address is now the biased high pointer.
     emit_a64_bus_guard(Sb, (uint64_t)advsimd_struct_bytes(in), g_emit_gpc);
+    struct a64_soft_guard soft =
+        emit_a64_soft_guard_begin(Sb, T, T2, (uint64_t)advsimd_struct_bytes(in),
+                                  (in & (1u << 22)) ? HL_LOGICAL_VMA_READ : HL_LOGICAL_VMA_WRITE,
+                                  g_emit_gpc);
+    a64_soft_guard_restore(&soft, Sb, M + 32);
+    a64_soft_guard_restore(&soft, T, M + 40);
+    a64_soft_guard_restore(&soft, T2, M + 48);
     emit32((in & ~(1u << 23) & ~(0x1Fu << 16) & ~(0x1Fu << 5)) | ((unsigned)Sb << 5));
+    emit_a64_soft_guard_end(&soft);
     if (post) { // writeback the LOW guest base: Xn += (Rm==31 ? bytes transferred : Xm)
         if (rm == 31) {
             unsigned inc = (unsigned)advsimd_struct_bytes(in);
@@ -1128,13 +1672,14 @@ static void emit_fold_advsimd_struct(uint32_t in) {
     e_ldr(Sb, CPUREG, M + 32); // restore scratch originals
     e_ldr(T, CPUREG, M + 40);
     e_ldr(T2, CPUREG, M + 48);
+    emit_a64_soft_bounce_commit(g_emit_gpc + 4);
 }
 
-// For instructions that WRITE a stolen reg via a special path (adr/adrp/ldr-literal/mrs): save x0,x1
+// For instructions that WRITE a stolen reg via a legacy special path (adr/adrp/mrs): save x0,x1
 // to cpu->mscratch, x1 := cpu. The case then computes a value into x0 and stores it to cpu->x[stolen];
-// x18_epilog restores x0,x1. Reached ONLY when stealfast is off (NOSTEALFAST=1, or NOSTEAL1617=1 -- the
-// steal fast-path materializes stolen writes through engine-private x16/x17 with no spill), so on the
-// strict default engine (g_steal1617 && stealfast) this helper is never emitted.
+// x18_epilog restores x0,x1. Literal loads do not use this path: target
+// initialization permanently reserves x16/x17, so their guarded address
+// materialization has one supported implementation.
 //
 // Spill target is cpu->mscratch[0..1], NOT the guest [sp,#-N] "red zone": AArch64 has NO architectural
 // red zone, so a store below the guest SP faults whenever the page under SP is unmapped (a shallow guest
@@ -1269,7 +1814,7 @@ static int scan_calls(uint64_t target, uint64_t calls[], int max) {
     int64_t reach = 0;
     int n = 0;
     for (int i = 0; i < 64; i++) {
-        uint32_t in = *(uint32_t *)(target + (uint64_t)i * 4);
+        uint32_t in = a64_fetch_instruction(target + (uint64_t)i * 4, NULL);
         // blr -> unknown callee
         if ((in & 0xFFFFFC1Fu) == 0xD63F0000u) return -1;
         if ((in & 0xFC000000u) == 0x94000000u) {
@@ -1363,7 +1908,7 @@ static int context_clone_candidate(uint64_t target, const uint64_t ancestors[], 
         if (offset > remaining || remaining - offset < 4 || offset > UINT64_MAX - target)
             return 0;
         uint64_t pc = target + offset;
-        uint32_t in = *(uint32_t *)pc;
+        uint32_t in = a64_fetch_instruction(pc, NULL);
         total++;
         if ((in & 31u) == 30u &&
             (in & 0xFC000000u) != 0x94000000u &&
@@ -1393,7 +1938,12 @@ static int context_clone_candidate(uint64_t target, const uint64_t ancestors[], 
 
 // §B guest bl: push shadow, host `bl body(target)` (RAS pushes &Lcont), Lcont continues at gpc+4.
 static void emit_bl_ras(uint64_t gpc, uint64_t target) {
-    if (target_is_leaf(target)) {
+    /*
+     * Shadow returns and host BL edges retain host PCs in otherwise unrelated
+     * blocks.  Once SMC is active use the dispatcher-only leaf path so a
+     * targeted source invalidation has no hidden ingress to the old body.
+     */
+    if (smc_seen() || target_is_leaf(target)) {
         if (g_prof) g_prof_bl_leaf++; // A3: depth-gate steered this bl to the cheap leaf Stage-B path
         // Guest LR is a guest-VISIBLE value (the guest spills it to its stack), so it must be the
         // UN-BIASED (low) link vaddr -- non-PIE runs gpc HIGH; the dispatcher re-biases low->high on
@@ -1562,7 +2112,7 @@ static int loop_has_rmw_hazard(uint64_t start, uint64_t endpc) {
     uint64_t stores[32];
     int ns = 0;
     for (uint64_t p = start; p < endpc; p += 4) {
-        uint32_t in = *(uint32_t *)p;
+        uint32_t in = a64_fetch_instruction(p, NULL);
         uint64_t key = 0;
         int opc = -1;
         // load/store unsigned imm12
@@ -1633,7 +2183,8 @@ static void emit_selfloop(uint32_t in, uint64_t start, uint64_t fall, void *body
 // instruction (no monitor), so the injected spill/fill is harmless, making this the correct path. The
 // common clean PIE case still lowers to the bare op -> byte-identical to before.
 static void emit_atomic_part(uint32_t in, int mask, int is_mem) {
-    if (is_mem && guestbase_on() && ((in >> 5) & 31) != 31) {
+    if (is_mem && (guestbase_on() || jit_guest_soft_active()) &&
+        (jit_guest_soft_active() || ((in >> 5) & 31) != 31)) {
         if (jit_guest_bus_active()) emit_a64_bus_guard_instruction(in, g_emit_gpc);
         emit_fold_mem(in, 0);
     }
@@ -1656,7 +2207,7 @@ static void emit_lse_status_zero(int Ws) {
 
 // Returns bytes consumed (12 or 16) if a known atomic loop at gpc was rewritten, else 0.
 static int try_lse_atomic(uint64_t gpc) {
-    uint32_t i0 = *(uint32_t *)gpc;
+    uint32_t i0 = a64_fetch_instruction(gpc, NULL);
     // load-exclusive?
     if ((i0 & 0x3F400000u) != 0x08400000u) return 0;
     int sz = (i0 >> 30) & 3;
@@ -1665,13 +2216,13 @@ static int try_lse_atomic(uint64_t gpc) {
     // non-pair
     if (((i0 >> 16) & 0x1F) != 0x1F || ((i0 >> 10) & 0x1F) != 0x1F) return 0;
     int Wt = i0 & 31, Xn = (i0 >> 5) & 31;
-    uint32_t i1 = *(uint32_t *)(gpc + 4);
+    uint32_t i1 = a64_fetch_instruction(gpc + 4, NULL);
 
     // SWP:  ldxr Wt,[Xn]; stxr Ws,Wv,[Xn]; cbnz Ws,loop
     if ((i1 & 0x3F400000u) == 0x08000000u && ((i1 >> 30) & 3) == sz && ((i1 >> 10) & 0x1F) == 0x1F &&
         ((i1 >> 5) & 31) == Xn) {
         int Ws = (i1 >> 16) & 31, Wv = i1 & 31;
-        uint32_t i2 = *(uint32_t *)(gpc + 8);
+        uint32_t i2 = a64_fetch_instruction(gpc + 8, NULL);
         if ((i2 & 0xFF000000u) == 0x35000000u && (i2 & 31) == Ws &&
             (gpc + 8 + (uint64_t)(sext((i2 >> 5) & 0x7FFFF, 19) << 2)) == gpc) {
             // A bare `swpal` in place of this swap loop is a deterministic lost-wakeup for multithreaded
@@ -1715,7 +2266,7 @@ static int try_lse_atomic(uint64_t gpc) {
             else if (m == Wt)
                 Wm = n;
         }
-        uint32_t i2 = *(uint32_t *)(gpc + 8), i3 = *(uint32_t *)(gpc + 12);
+        uint32_t i2 = a64_fetch_instruction(gpc + 8, NULL), i3 = a64_fetch_instruction(gpc + 12, NULL);
         if (Wm >= 0 && (i2 & 0x3F400000u) == 0x08000000u && ((i2 >> 30) & 3) == sz && (i2 & 31) == Ws2 &&
             ((i2 >> 5) & 31) == Xn && ((i2 >> 10) & 0x1F) == 0x1F) {
             int Ws = (i2 >> 16) & 31;
@@ -1751,7 +2302,7 @@ static int try_lse_atomic(uint64_t gpc) {
     if ((i1 & 0xFFC00000u) == addib && ((i1 >> 5) & 31) == Wt) {
         int Ws2 = i1 & 31;
         unsigned imm = (i1 >> 10) & 0xFFF;
-        uint32_t i2 = *(uint32_t *)(gpc + 8), i3 = *(uint32_t *)(gpc + 12);
+        uint32_t i2 = a64_fetch_instruction(gpc + 8, NULL), i3 = a64_fetch_instruction(gpc + 12, NULL);
         if ((i2 & 0x3F400000u) == 0x08000000u && ((i2 >> 30) & 3) == sz && (i2 & 31) == Ws2 && ((i2 >> 5) & 31) == Xn &&
             ((i2 >> 10) & 0x1F) == 0x1F) {
             int Ws = (i2 >> 16) & 31;
@@ -1775,7 +2326,8 @@ static int try_lse_atomic(uint64_t gpc) {
     uint32_t subsb = sz == 3 ? 0xEB00001Fu : 0x6B00001Fu;
     if ((i1 & 0xFFE0FC1Fu) == subsb && ((i1 >> 5) & 31) == Wt) {
         int Wexp = (i1 >> 16) & 31;
-        uint32_t i2 = *(uint32_t *)(gpc + 8), i3 = *(uint32_t *)(gpc + 12), i4 = *(uint32_t *)(gpc + 16);
+        uint32_t i2 = a64_fetch_instruction(gpc + 8, NULL), i3 = a64_fetch_instruction(gpc + 12, NULL);
+        uint32_t i4 = a64_fetch_instruction(gpc + 16, NULL);
         // b.ne
         if ((i2 & 0xFF00001Fu) == 0x54000001u && (i3 & 0x3F400000u) == 0x08000000u && ((i3 >> 30) & 3) == sz &&
             ((i3 >> 10) & 0x1F) == 0x1F && ((i3 >> 5) & 31) == Xn && (i4 & 0xFF000000u) == 0x35000000u &&
@@ -1826,10 +2378,16 @@ static int try_lse_atomic(uint64_t gpc) {
 // PIE) and BUS inactive. Otherwise fall through to the normal call (the helper still runs correctly).
 // Returns 1 if it inlined (caller advances past the bl and keeps the block going), else 0.
 static int try_inline_outline_atomic(uint64_t gpc, uint64_t target) {
-    if (guestbase_on() || jit_guest_bus_active()) return 0;
-    uint32_t i0 = *(uint32_t *)target, i1 = *(uint32_t *)(target + 4);
-    uint32_t i2 = *(uint32_t *)(target + 8), i3 = *(uint32_t *)(target + 12);
-    uint32_t i4 = *(uint32_t *)(target + 16);
+    /*
+     * This optimization embeds an instruction read from an out-of-line helper
+     * in the caller translation.  The initial SMC prime removes all such
+     * pre-SMC callers; do not create new hidden source dependencies once map
+     * entries are individually invalidatable.
+     */
+    if (smc_seen() || guestbase_on() || jit_guest_bus_active()) return 0;
+    uint32_t i0 = a64_fetch_instruction(target, NULL), i1 = a64_fetch_instruction(target + 4, NULL);
+    uint32_t i2 = a64_fetch_instruction(target + 8, NULL), i3 = a64_fetch_instruction(target + 12, NULL);
+    uint32_t i4 = a64_fetch_instruction(target + 16, NULL);
     // adrp x16, #page
     if ((i0 & 0x9F00001Fu) != 0x90000010u) return 0;
     // ldrb w16, [x16, #imm12]
@@ -1947,6 +2505,14 @@ static uint64_t g_last_guest_start;
 static uint64_t g_last_guest_end;
 
 static void smc_queue_line(struct cpu *c, uint64_t address) {
+    /*
+     * ET_EXEC code is mapped at a high collision-avoidance bias while its
+     * architectural pointers remain link-time-low.  Translation-map source
+     * intervals use the real executable address, so normalize an ic-ivau
+     * operand exactly like instruction dispatch does before classifying it.
+     */
+    if (g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi)
+        address += g_nonpie_bias;
     uint64_t start = address & ~UINT64_C(63), end = start + 64;
     for (uint32_t i = 0; i < c->smc_range_count; i++) {
         if (end < c->smc_ranges[i][0] || start > c->smc_ranges[i][1]) continue;
@@ -1954,7 +2520,7 @@ static void smc_queue_line(struct cpu *c, uint64_t address) {
         if (end > c->smc_ranges[i][1]) c->smc_ranges[i][1] = end;
         return;
     }
-    if (c->smc_range_count == 8) {
+    if (c->smc_range_count == SMC_RANGE_CAP) {
         c->smc_range_overflow = 1;
         return;
     }
@@ -1963,20 +2529,219 @@ static void smc_queue_line(struct cpu *c, uint64_t address) {
     c->smc_range_count++;
 }
 
+/*
+ * Syscall copy-to-user writes bypass translated store sites.  Queue the
+ * guest-visible destination now; logical executable aliases are added by the
+ * immutable alias visitor when present, while architectural publication still
+ * occurs at the guest's ic-ivau/isb boundary.
+ */
+static void aarch64_smc_queue_range(uint64_t first, uint64_t last, void *opaque) {
+    struct cpu *c = opaque;
+    for (uint64_t line = first & ~UINT64_C(63); line < last;) {
+        smc_queue_line(c, line);
+        if (line > UINT64_MAX - 64) break;
+        line += 64;
+    }
+}
+
+static void aarch64_smc_copyout(uint64_t first, uint64_t last) {
+    if (last <= first) return;
+    struct cpu *c = pthread_getspecific(g_cpu_key);
+    if (c == NULL) return;
+    aarch64_smc_queue_range(first, last, c);
+    hl_logical_vma_visit_exec_aliases(first, last, aarch64_smc_queue_range, c);
+}
+
+/* Return 1 to retry the instruction, 0 for a guest protection fault. */
+static int aarch64_soft_tlb_miss(struct cpu *c) {
+    void *host = NULL;
+    size_t contiguous = 0;
+    uint32_t protection = HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_WRITE | HL_LOGICAL_VMA_EXEC;
+    int resolved = hl_logical_vma_resolve_data(c->soft_ea, 1, (uint32_t)c->soft_required,
+                                               &host, &contiguous);
+    if (resolved < 0) return 0;
+    uint64_t first, last;
+    if (resolved) {
+        hl_logical_vma_snapshot *snapshot =
+            atomic_load_explicit(hl_logical_vma_global_snapshot_source(), memory_order_acquire);
+        const hl_logical_vma_view *view = NULL;
+        if (snapshot != NULL)
+            for (size_t index = 0; index < snapshot->count; ++index)
+                if (c->soft_ea >= snapshot->views[index].guest_first &&
+                    c->soft_ea < snapshot->views[index].guest_last) {
+                    view = &snapshot->views[index];
+                    break;
+                }
+        if (view == NULL) return 0;
+        first = view->guest_first;
+        last = view->guest_last;
+        protection = view->protection;
+    } else {
+        if (!hl_host_range_mapped((uintptr_t)c->soft_ea, 1)) return 0;
+        first = c->soft_ea & ~UINT64_C(4095);
+        last = first + UINT64_C(4096);
+    }
+    if (c->soft_bytes == 0 || c->soft_bytes > last - first ||
+        c->soft_ea > last - c->soft_bytes) {
+        c->reason = R_SOFTSPAN;
+        return 1;
+    }
+    c->soft_page = first;
+    c->soft_limit = last;
+    c->soft_delta = resolved ? (uint64_t)(uintptr_t)host - c->soft_ea : 0;
+    c->soft_protection = protection;
+    c->reason = R_BRANCH;
+    return 1;
+}
+
+/*
+ * Return 1 when the complete cross-page access has one host delta and can be
+ * retried natively, 0 for a protection fault, and -1 when valid adjacent
+ * guest pages have discontinuous canonical storage (the architectural split
+ * slow path must handle that case).
+ */
+static int aarch64_soft_span_copy(struct cpu *c, int to_guest, int copy_bytes) {
+    uint64_t cursor = c->soft_ea;
+    size_t done = 0;
+    while (done < c->soft_bytes) {
+        void *host = NULL;
+        size_t contiguous = 0;
+        uint32_t required = to_guest ? HL_LOGICAL_VMA_WRITE : HL_LOGICAL_VMA_READ;
+        int resolved = hl_logical_vma_resolve_data(
+            cursor, 1, required, &host, &contiguous);
+        if (resolved < 0) return 0;
+        if (!resolved) {
+            size_t page_left = 4096u - (size_t)(cursor & 4095u);
+            if (!hl_host_range_mapped((uintptr_t)cursor, 1)) return 0;
+            host = (void *)(uintptr_t)cursor;
+            contiguous = page_left;
+        }
+        size_t take = (size_t)c->soft_bytes - done;
+        if (take > contiguous) take = contiguous;
+        if (!take) return 0;
+        if (copy_bytes) {
+            if (to_guest)
+                memcpy(host, c->soft_bounce + done, take);
+            else
+                memcpy(c->soft_bounce + done, host, take);
+        }
+        cursor += take;
+        done += take;
+    }
+    return 1;
+}
+
+static int aarch64_soft_prepare_bounce(struct cpu *c) {
+    int ok = 0;
+    uint32_t in = a64_fetch_instruction(c->soft_pc, &ok);
+    int single = (in & 0x3B000000u) == 0x39000000u ||
+                 (in & 0x3B200000u) == 0x38000000u;
+    int pair = (in & 0x3A000000u) == 0x28000000u;
+    int structure = is_advsimd_struct(in);
+    int literal = (in & 0xBF000000u) == 0x18000000u ||
+                  (in & 0xFF000000u) == 0x98000000u ||
+                  ((in & 0x3F000000u) == 0x1C000000u &&
+                   ((in >> 30) & 3) != 3);
+    int atomic = (in & 0x3B200C00u) == 0x38200000u ||
+                 (in & 0x3F000000u) == 0x08000000u || is_casp(in);
+    if (!ok || !(single || pair || structure || literal) || atomic || c->soft_bytes == 0 ||
+        c->soft_bytes > sizeof(c->soft_bounce))
+        return -1;
+    int write = (c->soft_required & HL_LOGICAL_VMA_WRITE) != 0;
+    if (!aarch64_soft_span_copy(c, write, 0)) return 0; /* validate every span first */
+    if (!write && !aarch64_soft_span_copy(c, 0, 1)) return 0;
+    /*
+     * No asynchronous signal may observe the architectural store after it
+     * changed the bounce but before scatter.  This is a cold discontinuous
+     * path: block host delivery across the single-instruction retry and
+     * restore the exact prior mask in R_SOFTCOMMIT.  Synchronous faults remain
+     * deliverable, but the validated aligned bounce access cannot fault.
+     */
+    sigset_t all;
+    sigfillset(&all);
+    _Static_assert(sizeof(sigset_t) <= sizeof(c->soft_bounce_host_mask),
+                   "soft bounce host-mask storage is too small");
+    if (pthread_sigmask(SIG_BLOCK, &all,
+                        (sigset_t *)(void *)c->soft_bounce_host_mask) != 0) return 0;
+    c->soft_bounce_write = (uint64_t)write;
+    c->soft_bounce_pending = 1;
+    c->soft_page = c->soft_ea;
+    c->soft_limit = c->soft_ea + c->soft_bytes;
+    c->soft_delta = (uint64_t)(uintptr_t)c->soft_bounce - c->soft_ea;
+    c->soft_protection = c->soft_required;
+    c->reason = R_BRANCH;
+    return 1;
+}
+
+static int aarch64_soft_bounce_commit(struct cpu *c) {
+    if (!c->soft_bounce_pending) return 1;
+    int ok = !c->soft_bounce_write || aarch64_soft_span_copy(c, 1, 1);
+    if (ok && c->soft_bounce_write)
+        aarch64_smc_copyout(c->soft_ea, c->soft_ea + c->soft_bytes);
+    c->soft_bounce_pending = 0;
+    c->soft_page = UINT64_MAX;
+    c->soft_protection = 0;
+    (void)pthread_sigmask(SIG_SETMASK,
+                          (const sigset_t *)(const void *)c->soft_bounce_host_mask, NULL);
+    return ok;
+}
+
+static int aarch64_soft_tlb_span(struct cpu *c) {
+    if (c->soft_bytes == 0 || c->soft_ea > UINT64_MAX - c->soft_bytes) return 0;
+    uint64_t cursor = c->soft_ea, last = cursor + c->soft_bytes, delta = 0;
+    int have_delta = 0;
+    while (cursor < last) {
+        void *host = NULL;
+        size_t contiguous = 0;
+        int resolved = hl_logical_vma_resolve_data(cursor, 1, (uint32_t)c->soft_required,
+                                                   &host, &contiguous);
+        if (resolved < 0) return 0;
+        uint64_t part_delta = resolved ? (uint64_t)(uintptr_t)host - cursor : 0;
+        if (have_delta && part_delta != delta)
+            return aarch64_soft_prepare_bounce(c);
+        delta = part_delta;
+        have_delta = 1;
+        uint64_t step = UINT64_C(4096) - (cursor & UINT64_C(4095));
+        if (resolved && contiguous < step) step = contiguous;
+        if (last - cursor < step) step = last - cursor;
+        if (step == 0) return 0;
+        cursor += step;
+    }
+    c->soft_page = c->soft_ea;
+    c->soft_limit = c->soft_ea + c->soft_bytes;
+    c->soft_delta = delta;
+    c->soft_protection = c->soft_required;
+    c->reason = R_BRANCH;
+    return 1;
+}
+
 static int smc_commit(struct cpu *c) {
+    pthread_mutex_lock(&g_jit_lock);
     txln_activate();                // arm eager line recording; may request a priming wholesale drop
     int force_whole = g_txln_prime; // first SMC after lazy activation: no lines recorded -> can't classify
     g_txln_prime = 0;
-    if (!force_whole && !c->smc_range_count && !c->smc_range_overflow) return 1;
-    g_smc_seen = 1;
+    if (!force_whole && !c->smc_range_count && !c->smc_range_overflow) {
+        pthread_mutex_unlock(&g_jit_lock);
+        return 1;
+    }
+    __atomic_store_n(&g_smc_seen, 1, __ATOMIC_RELEASE);
     if (!c->smc_range_overflow && !force_whole) {
-        pthread_mutex_lock(&g_jit_lock);
         uint32_t retained = 0;
         for (uint32_t i = 0; i < c->smc_range_count; i++) {
             uint64_t dirty_start = UINT64_MAX, dirty_end = 0;
             for (uint64_t line = c->smc_ranges[i][0]; line < c->smc_ranges[i][1]; line += 64) {
                 int classification = txln_flush_class(line);
-                if (classification == 1 || (classification == 0 && g_pcache_loaded && txpg_has(line))) {
+                int warm_source = 0;
+                if (classification == 0 && g_pcache_loaded) {
+                    for (uint32_t n = 0; n < g_live_map_count; n++) {
+                        uint32_t index = g_live_map_indices[n];
+                        if (map_live(index) && map_source_overlaps(index, line, line + 64)) {
+                            warm_source = 1;
+                            break;
+                        }
+                    }
+                }
+                if (classification == 1 || warm_source) {
                     if (dirty_start == UINT64_MAX) dirty_start = line;
                     dirty_end = line + 64;
                 }
@@ -1988,13 +2753,14 @@ static int smc_commit(struct cpu *c) {
             }
         }
         c->smc_range_count = retained;
-        pthread_mutex_unlock(&g_jit_lock);
         if (!retained) {
+            pthread_mutex_unlock(&g_jit_lock);
             c->smc_range_count = 0;
             c->smc_range_overflow = 0;
             return 1;
         }
     }
+    pthread_mutex_unlock(&g_jit_lock);
     /*
      * Do not rewrite live map entries in place here.  Besides leaving several
      * independent ingress paths to the old body (direct chains, shadow
@@ -2010,14 +2776,25 @@ static int smc_commit(struct cpu *c) {
      * modified guest bytes on demand.
      */
     stw_mapping_begin();
-    map_clear();
-    memset(g_ibtc, 0, sizeof g_ibtc);
+    uint32_t removed;
+    if (force_whole || c->smc_range_overflow) {
+        removed = g_live_map_count;
+        map_clear();
+        memset(g_ibtc, 0, sizeof g_ibtc);
+        txpg_clear();
+    } else {
+        removed = map_invalidate_source_ranges(
+            (const uint64_t (*)[2])c->smc_ranges, c->smc_range_count);
+    }
     pend_reset();
-    txpg_clear();
     for (int i = 0; i < STW_MAXTHREAD; i++)
         if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed) &&
             g_stw_threads[i].cpu)
             g_stw_threads[i].cpu->ssp = 0;
+    HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT,
+            "smc invalidate mode=%s ranges=%u removed=%u retained=%u",
+            (force_whole || c->smc_range_overflow) ? "whole" : "targeted",
+            c->smc_range_count, removed, g_live_map_count);
     g_smc_flushes++;
     stw_mapping_end();
     c->smc_range_count = 0;
@@ -2036,7 +2813,7 @@ static void smc_icflush(struct cpu *c, uint64_t va) {
     // The guest issued `ic ivau` -> it generates/patches code -> the per-site monomorphic IC stays disabled
     // (its literal lives in an unmodified caller block this flush can't reach). Latch this unconditionally,
     // even when the precise gate below skips, so a code-modifying guest never trusts the per-site IC.
-    g_smc_seen = 1;
+    __atomic_store_n(&g_smc_seen, 1, __ATOMIC_RELEASE);
     // PRECISE GATE: if the invalidated bytes were never translated, there is nothing stale to drop. A
     // code-generating guest flushes each freshly-written line as it grows its code space -> almost always
     // brand-new bytes -> this turns the catastrophic per-flush wholesale invalidation (which re-translated
@@ -2058,18 +2835,12 @@ static void smc_icflush(struct cpu *c, uint64_t va) {
     //   class 0 -> line never translated: nothing stale (fall back to the coarse pcache page gate below).
     //   class 2 -> translated but UNCHANGED: benign icache maintenance -> keep the valid translation, skip.
     //   class 1 -> translated AND (first flush | genuinely rewritten): take the real drop (soak_smc/V8 patch).
-    txln_activate(); // arm eager line recording (the priming wholesale drop is applied in smc_commit)
-    // First SMC after lazy activation: blocks translated before now have no recorded lines, so this flush
-    // cannot be classified from the line set. Queue the line unconditionally; smc_commit then forces the
-    // conservative wholesale drop (g_txln_prime) and re-translation re-records exact lines afterwards.
-    int cls = g_txln_prime ? 1 : txln_flush_class(va);
-    if (cls == 0) {
-        // pcache warm-load restores blocks with page info but no line info -> for a restored arena fall
-        // back to the coarse page gate (conservative: may over-drop, never misses stale restored code).
-        if (!(g_pcache_loaded && txpg_has(va))) return;
-    } else if (cls == 2) {
-        return; // unchanged translated line -> benign flush, no re-translation needed
-    }
+    /*
+     * Queue only.  smc_commit owns activation, membership/content
+     * classification and hash mutation under g_jit_lock.  Besides avoiding a
+     * race with translation, this ensures a changed line is classified once
+     * rather than immediately looking unchanged on a second observation.
+     */
     // ---- a GENUINE in-place modification of already-translated guest code (the line WAS a source line) ----
     // (BeamAsm SIGSEGV) coherence. smc_icflush runs from the dispatcher's post-run reason handler, which
     // has ALREADY released g_jit_lock (engine/dispatch.c: the unlock precedes G_DISPATCH_REASON), so a peer
@@ -2137,7 +2908,7 @@ static void emit_smc_queue(int va_register) {
 
     uint8_t *append = g_cp;
     e_ldr(16, CPUREG, OFF_SMC_RANGE_COUNT);
-    e_subi(17, 16, 8);
+    e_subi(17, 16, SMC_RANGE_CAP);
     uint32_t *overflow = (uint32_t *)g_cp;
     emit32(0); /* cbz x17,overflow */
     e_addlsl4(17, CPUREG, 16);
@@ -2444,11 +3215,11 @@ static uint64_t scan_tail_x30_carry(uint64_t pc) {
     // instruction following the restoring LDP.  Refuse to speculate across an
     // unmapped guest boundary.
     if (!hl_host_range_mapped((uintptr_t)pc, 10 * sizeof(uint32_t))) return 0;
-    if (*(uint32_t *)pc != 0xA9BF7BFDu) return 0;
+    if (a64_fetch_instruction(pc, NULL) != 0xA9BF7BFDu) return 0;
     for (int i = 1; i <= 8; i++) {
-        uint32_t in = *(uint32_t *)(pc + (uint64_t)i * 4);
+        uint32_t in = a64_fetch_instruction(pc + (uint64_t)i * 4, NULL);
         if (in == 0xA8C17BFDu) {
-            uint32_t tail = *(uint32_t *)(pc + (uint64_t)(i + 1) * 4);
+            uint32_t tail = a64_fetch_instruction(pc + (uint64_t)(i + 1) * 4, NULL);
             return (tail & 0xFC000000u) == 0x14000000u ? pc + (uint64_t)i * 4 : 0;
         }
         // No memory, control flow, system, SIMD, PC-relative operation, or
@@ -2476,6 +3247,9 @@ static void *translate_block(uint64_t gpc) {
     uint64_t start = gpc;
     chain_exit_dedup_reset();
     g_bus_stub_patch_count = 0;
+    g_soft_stub_patch_count = 0;
+    g_soft_legacy_stub_patch_count = 0;
+    g_soft_resolver_patch_count = 0;
     uint64_t guest_start = gpc;
     uint64_t guest_end = gpc + 4;
     uint64_t tail_carry_ldp = scan_tail_x30_carry(gpc);
@@ -2544,7 +3318,7 @@ static void *translate_block(uint64_t gpc) {
     // post-loop guard.
     uint64_t tx_last_line = ~UINT64_C(0);
 #define STITCH_OK                                                                                                      \
-    (g_stitch && !g_smc_seen && !in_excl && trace_blk < TRACE_MAX_BLK - 1 && ncond < STITCH_MAX_COND &&              \
+    (g_stitch && !smc_seen() && !in_excl && trace_blk < TRACE_MAX_BLK - 1 && ncond < STITCH_MAX_COND &&              \
      (g_cp - (uint8_t *)host) < TRACE_MAX_BYTES)
     for (;;) {
         // A basic block is not necessarily small: generated programs can contain tens of thousands of
@@ -2559,7 +3333,14 @@ static void *translate_block(uint64_t gpc) {
             emit_chain_exit(gpc);
             break;
         }
-        uint32_t in = *(uint32_t *)gpc;
+        int fetch_ok;
+        uint32_t in = a64_fetch_instruction(gpc, &fetch_ok);
+        if (!fetch_ok) {
+            e_movconst(9, gpc);
+            e_str(9, CPUREG, OFF_FAULT_ADDR);
+            emit_exit_const(gpc, R_FETCHFAULT);
+            break;
+        }
         if (stealfast_on() && !g_tier2_build && !in_excl && !guestbase_on() &&
             !jit_guest_bus_active() && !g_nonpie_lo) {
             int mask, read, write, fault;
@@ -2569,7 +3350,7 @@ static void *translate_block(uint64_t gpc) {
                 int count = 0, touches = 0, last_touch = -1;
                 int need16 = 0, need28 = 0;
                 for (; count < 12; count++) {
-                    uint32_t win = *(uint32_t *)(gpc + (uint64_t)count * 4);
+                    uint32_t win = a64_fetch_instruction(gpc + (uint64_t)count * 4, NULL);
                     int wm, wr, ww, wf;
                     if (!stolen_forward_classify(win, &wm, &wr, &ww, &wf))
                         break;
@@ -2593,7 +3374,7 @@ static void *translate_block(uint64_t gpc) {
                     if (need28) e_ldr(17, CPUREG, 28 * 8);
                     for (int i = 0; i < window; i++) {
                         uint64_t pc = gpc + (uint64_t)i * 4;
-                        uint32_t win = *(uint32_t *)pc;
+                        uint32_t win = a64_fetch_instruction(pc, NULL);
                         int wm, wr, ww, wf;
                         int ok = stolen_forward_classify(win, &wm, &wr, &ww, &wf);
                         assert(ok);
@@ -2628,7 +3409,7 @@ static void *translate_block(uint64_t gpc) {
                 x28_alu_window_field(in, read)) {
                 int count = 0, reads = 0, last_read = -1;
                 for (; count < 12; count++) {
-                    uint32_t win = *(uint32_t *)(gpc + (uint64_t)count * 4);
+                    uint32_t win = a64_fetch_instruction(gpc + (uint64_t)count * 4, NULL);
                     int wm, wr, ww;
                     if (!x28_alu_window_classify(win, &wm, &wr, &ww))
                         break;
@@ -2646,7 +3427,7 @@ static void *translate_block(uint64_t gpc) {
                     e_ldr(17, CPUREG, 28 * 8);
                     for (int i = 0; i < window; i++) {
                         uint64_t pc = gpc + (uint64_t)i * 4;
-                        uint32_t win = *(uint32_t *)pc;
+                        uint32_t win = a64_fetch_instruction(pc, NULL);
                         int wm, wr, ww;
                         int ok = x28_alu_window_classify(win, &wm, &wr, &ww);
                         assert(ok);
@@ -2801,11 +3582,12 @@ static void *translate_block(uint64_t gpc) {
             // Preserve every architectural effect and the real fault-capable GOT
             // load; only the extra translated-block hop and its entry poll vanish.
             uint64_t plt = gpc + off;
+            if (smc_seen()) goto no_bl_plt_fuse;
             if (!hl_host_range_mapped((uintptr_t)plt, 16)) goto no_bl_plt_fuse;
-            uint32_t p0 = *(uint32_t *)plt;
-            uint32_t p1 = *(uint32_t *)(plt + 4);
-            uint32_t p2 = *(uint32_t *)(plt + 8);
-            uint32_t p3 = *(uint32_t *)(plt + 12);
+            uint32_t p0 = a64_fetch_instruction(plt, NULL);
+            uint32_t p1 = a64_fetch_instruction(plt + 4, NULL);
+            uint32_t p2 = a64_fetch_instruction(plt + 8, NULL);
+            uint32_t p3 = a64_fetch_instruction(plt + 12, NULL);
             if (!guestbase_on() && !jit_guest_bus_active() &&
                 (p0 & 0x9F00001Fu) == 0x90000010u &&
                 (p1 & 0xFFC003FFu) == 0xF9400211u &&
@@ -2848,7 +3630,7 @@ no_bl_plt_fuse:
              * a call/return pair. Keep ordinary context cloning unchanged, but
              * use the normal RAS call path while BUS observation is active.
              */
-            if (!jit_guest_bus_active() && nctx < CTX_INLINE_DEPTH &&
+            if (!smc_seen() && !jit_guest_bus_active() && nctx < CTX_INLINE_DEPTH &&
                 context_clone_candidate(gpc + off, ancestors, nctx, &clone_ret, &clone_cost) &&
                 (g_cp - (uint8_t *)host) + clone_cost * 16 < TRACE_MAX_BYTES) {
                 emit_set_x30(pcrel_base(gpc) + 4);
@@ -2997,8 +3779,8 @@ no_bl_plt_fuse:
             // this deliberately narrow: both the instruction immediately before the branch and the
             // branch target must be scalar loads, so compute loops and ordinary backward branches remain
             // byte-for-byte unchanged.
-            uint32_t prev = gpc >= start + 4 ? *(uint32_t *)(gpc - 4) : 0;
-            uint32_t first = taken < gpc ? *(uint32_t *)taken : 0;
+            uint32_t prev = gpc >= start + 4 ? a64_fetch_instruction(gpc - 4, NULL) : 0;
+            uint32_t first = taken < gpc ? a64_fetch_instruction(taken, NULL) : 0;
             int prev_load = (prev & 0x0A000000u) == 0x08000000u && ((prev >> 22) & 1u);
             int first_load = (first & 0x0A000000u) == 0x08000000u && ((first >> 22) & 1u);
             if (taken < gpc && prev_load && first_load) emit32(0xD503203Fu); // yield
@@ -3228,9 +4010,12 @@ no_bl_plt_fuse:
                 e_movr(16, source);
             emit32(0x927AE610u); /* and x16,x16,#-64 */
             if (jit_guest_bus_active()) emit_a64_bus_guard(16, 64, gpc);
+            struct a64_soft_guard soft =
+                emit_a64_soft_guard_begin(16, 17, 18, 64, HL_LOGICAL_VMA_WRITE, gpc);
             for (unsigned offset = 0; offset < 64; offset += 16)
                 emit32(0xA9000000u | (((offset / 8) & 0x7Fu) << 15) |
                        (31u << 10) | (16u << 5) | 31u); /* stp xzr,xzr,[x16,#offset] */
+            emit_a64_soft_guard_end(&soft);
             gpc += 4;
             continue;
         }
@@ -3292,9 +4077,9 @@ no_bl_plt_fuse:
             // Exact canonical AArch64 PLT veneer:
             //   adrp x16,page; ldr x17,[x16,#got]; add x16,x16,#lo; br x17
             if (!hl_host_range_mapped((uintptr_t)gpc, 16)) goto no_adrp_plt_fuse;
-            uint32_t p1 = *(uint32_t *)(gpc + 4);
-            uint32_t p2 = *(uint32_t *)(gpc + 8);
-            uint32_t p3 = *(uint32_t *)(gpc + 12);
+            uint32_t p1 = a64_fetch_instruction(gpc + 4, NULL);
+            uint32_t p2 = a64_fetch_instruction(gpc + 8, NULL);
+            uint32_t p3 = a64_fetch_instruction(gpc + 12, NULL);
             if (!guestbase_on() && !jit_guest_bus_active() &&
                 (in & 0x9F00001Fu) == 0x90000010u &&
                 (p1 & 0xFFC003FFu) == 0xF9400211u &&
@@ -3338,32 +4123,30 @@ no_adrp_plt_fuse:
             int rt = in & 31, is64 = (in >> 30) & 1;
             int64_t off = sext((in >> 5) & 0x7FFFF, 19) << 2;
             if (is_stolen(rt)) {
-                if (stealfast_on()) {
-                    e_movconst(16, gpc + off);
-                    emit_a64_bus_guard(16, is64 ? 8 : 4, gpc);
-                    if (is64)
-                        e_ldr(16, 16, 0);
-                    else
-                        emit32(0xB9400000u | (16 << 5) | 16);
-                    e_str(16, CPUREG, rt * 8);
-                } else {
-                    x18_prolog();
-                    e_movconst(0, gpc + off);
-                    emit_a64_bus_guard(0, is64 ? 8 : 4, gpc);
-                    if (is64)
-                        e_ldr(0, 0, 0);
-                    else
-                        emit32(0xB9400000u | (0 << 5) | 0);
-                    e_str(0, 1, rt * 8);
-                    x18_epilog();
-                }
+                e_movconst(16, gpc + off);
+                emit_a64_bus_guard(16, is64 ? 8 : 4, gpc);
+                struct a64_soft_guard soft =
+                    emit_a64_soft_guard_begin(16, 17, 18, is64 ? 8 : 4,
+                                              HL_LOGICAL_VMA_READ, gpc);
+                if (is64)
+                    e_ldr(16, 16, 0);
+                else
+                    emit32(0xB9400000u | (16 << 5) | 16);
+                emit_a64_soft_guard_end(&soft);
+                e_str(16, CPUREG, rt * 8);
+                emit_a64_soft_bounce_commit(gpc + 4);
             } else {
                 e_movconst(rt, gpc + off);
                 emit_a64_bus_guard(rt, is64 ? 8 : 4, gpc);
+                struct a64_soft_guard soft =
+                    emit_a64_soft_guard_begin(rt, 16, 17, is64 ? 8 : 4,
+                                              HL_LOGICAL_VMA_READ, gpc);
                 if (is64)
                     e_ldr(rt, rt, 0);
                 else
                     emit32(0xB9400000u | (rt << 5) | rt);
+                emit_a64_soft_guard_end(&soft);
+                emit_a64_soft_bounce_commit(gpc + 4);
             }
             gpc += 4;
             continue;
@@ -3379,23 +4162,24 @@ no_adrp_plt_fuse:
             int rt = in & 31;
             int64_t off = sext((in >> 5) & 0x7FFFF, 19) << 2;
             if (is_stolen(rt)) {
-                if (stealfast_on()) {
-                    e_movconst(16, gpc + off);            // x16 = guest literal address
-                    emit_a64_bus_guard(16, 4, gpc);
-                    emit32(0xB9800000u | (16 << 5) | 16); // ldrsw x16, [x16]
-                    e_str(16, CPUREG, rt * 8);
-                } else {
-                    x18_prolog();
-                    e_movconst(0, gpc + off);
-                    emit_a64_bus_guard(0, 4, gpc);
-                    emit32(0xB9800000u | (0 << 5) | 0); // ldrsw x0, [x0]
-                    e_str(0, 1, rt * 8);
-                    x18_epilog();
-                }
+                e_movconst(16, gpc + off);            // x16 = guest literal address
+                emit_a64_bus_guard(16, 4, gpc);
+                struct a64_soft_guard soft =
+                    emit_a64_soft_guard_begin(16, 17, 18, 4,
+                                              HL_LOGICAL_VMA_READ, gpc);
+                emit32(0xB9800000u | (16 << 5) | 16); // ldrsw x16, [x16]
+                emit_a64_soft_guard_end(&soft);
+                e_str(16, CPUREG, rt * 8);
+                emit_a64_soft_bounce_commit(gpc + 4);
             } else {
                 e_movconst(rt, gpc + off);
                 emit_a64_bus_guard(rt, 4, gpc);
+                struct a64_soft_guard soft =
+                    emit_a64_soft_guard_begin(rt, 16, 17, 4,
+                                              HL_LOGICAL_VMA_READ, gpc);
                 emit32(0xB9800000u | (rt << 5) | rt); // ldrsw xt, [xt]
+                emit_a64_soft_guard_end(&soft);
+                emit_a64_soft_bounce_commit(gpc + 4);
             }
             gpc += 4;
             continue;
@@ -3412,18 +4196,14 @@ no_adrp_plt_fuse:
             int64_t off = sext((in >> 5) & 0x7FFFF, 19) << 2;
             // ldr (V), [Xn] unsigned-offset #0 base forms, Rn=x0: S=0xBD400000 D=0xFD400000 Q=0x3DC00000
             uint32_t ld = sz == 0 ? 0xBD400000u : (sz == 1 ? 0xFD400000u : 0x3DC00000u);
-            if (stealfast_on()) {
-                // stealfast: x16 is engine-dead -> no stash/restore around the address materialization
-                e_movconst(16, gpc + off);              // x16 = guest literal address
-                emit_a64_bus_guard(16, UINT64_C(4) << sz, gpc);
-                emit32(ld | (16u << 5) | (uint32_t)vt); // ldr St/Dt/Qt, [x16]
-            } else {
-                x18_prolog();                          // stash x0/x1 in the red zone; x0 becomes the address scratch
-                e_movconst(0, gpc + off);              // x0 = guest literal address (PIE: pcrel_base is identity)
-                emit_a64_bus_guard(0, UINT64_C(4) << sz, gpc);
-                emit32(ld | (0u << 5) | (uint32_t)vt); // ldr St/Dt/Qt, [x0]
-                x18_epilog();
-            }
+            e_movconst(16, gpc + off);              // x16 = guest literal address
+            emit_a64_bus_guard(16, UINT64_C(4) << sz, gpc);
+            struct a64_soft_guard soft =
+                emit_a64_soft_guard_begin(16, 17, 18, UINT64_C(4) << sz,
+                                          HL_LOGICAL_VMA_READ, gpc);
+            emit32(ld | (16u << 5) | (uint32_t)vt); // ldr St/Dt/Qt, [x16]
+            emit_a64_soft_guard_end(&soft);
+            emit_a64_soft_bounce_commit(gpc + 4);
             gpc += 4;
             continue;
         }
@@ -3435,6 +4215,15 @@ no_adrp_plt_fuse:
         // LDR-lit, 0x98 LDRSW-lit, 0x1C/0x5C/0x9C LDR-lit-SIMD, 0xD8 PRFM-lit) -- every form rewritten.
         if ((in & 0xFF000000u) == 0xD8000000u) {
             emit32(0xD503201Fu); // nop
+            gpc += 4;
+            continue;
+        }
+        /* Register/immediate PRFM is also an architecturally optional,
+           non-faulting hint.  Sending it through the ordinary fold would
+           incorrectly require WRITE permission and could synthesize a guest
+           fault.  Drop it exactly like PRFM-literal. */
+        if (is_prfm_register_or_immediate(in)) {
+            emit32(0xD503201Fu);
             gpc += 4;
             continue;
         }
@@ -3460,7 +4249,8 @@ no_adrp_plt_fuse:
         // clear the monitor) and only for a non-SP base (the stack is always high). The AdvSIMD load/store
         // structure family (ld1/st1.., ld1r) has no offset/index so is_foldable_mem omits it -- fold it via
         // its own emitter (else glibc's NEON strlen/memcpy trap once per access on the image). Inert for PIE.
-        if (guestbase_on() && !in_excl && ((in >> 5) & 31) != 31) {
+        if ((guestbase_on() || jit_guest_soft_active()) && !in_excl &&
+            (jit_guest_soft_active() || ((in >> 5) & 31) != 31)) {
             if (is_foldable_mem(in)) {
                 if (jit_guest_bus_active()) emit_a64_bus_guard_instruction(in, gpc);
                 emit_fold_mem(in, 0);
@@ -3500,12 +4290,18 @@ no_adrp_plt_fuse:
                 emit_a64_bus_guard_base((in >> 5) & 31, 0, bytes, gpc);
             }
         }
+        if (jit_guest_soft_active() &&
+            (((in & 0x3F000000u) == 0x08000000u) || is_casp(in))) {
+            emit_a64_soft_exclusive(in);
+            gpc += 4;
+            continue;
+        }
         // CASP paired compare-and-swap: the mangle machinery only substitutes NAMED register fields, so a
         // stolen pair partner (Xs+1 / Xt+1) would slip through verbatim. Relocate both pairs when any member
         // is stolen; otherwise (the common case) emit verbatim -- byte-identical to before.
         if (is_casp(in)) {
             if (casp_uses_stolen(in))
-                emit_casp_mangled(in);
+                emit_casp_mangled(in, -1);
             else
                 emit32(in);
             gpc += 4;
@@ -3574,6 +4370,14 @@ no_adrp_plt_fuse:
                 emit32(0xD503201Fu);
     }
     emit_a64_bus_stub();
+    emit_a64_soft_stub();
+    size_t emitted_bytes = (size_t)(g_cp - (uint8_t *)host);
+    if (emitted_bytes >= (1u << 20))
+        HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT,
+                "large block guest=%#llx source=%#llx-%#llx bytes=%zu bus_sites=%u soft_sites=%u",
+                (unsigned long long)start, (unsigned long long)guest_start,
+                (unsigned long long)guest_end, emitted_bytes, g_bus_stub_patch_count,
+                g_soft_stub_patch_count);
     // Only the REGION HEAD (start) is registered; intermediate inlined block-starts are left
     // unregistered so a later mid-region entry self-heals via re-translate + back-patch.
     // W4E tier-2: the promoter (g_tier2_build) recompiles in place and updates the EXISTING map entry
@@ -3604,7 +4408,13 @@ no_adrp_plt_fuse:
 // translate-lock discipline, so it's skipped once a guest thread exists (loop keeps running tier-1, still
 // correct). Caller is the dispatcher between block runs, so guest state is settled.
 static void tier2_promote(uint64_t gpc) {
-    if (g_threaded || g_notier2) return;
+    /*
+     * Promotion leaves predecessor bounces and a redirected tier-1 body.  The
+     * first SMC wholesale drop makes older promotions unreachable; do not
+     * create new cross-block ingress while translations are individually
+     * invalidatable.
+     */
+    if (g_threaded || g_notier2 || smc_seen()) return;
     // Promotion emits a fresh (folded) block at g_cp, but it runs from the dispatcher's post-run reason
     // handling -- OUTSIDE the cache-full check, which only fires on a translate MISS (dispatch.c). A run of
     // hot loops that all reach threshold between two misses promotes back-to-back with NO intervening

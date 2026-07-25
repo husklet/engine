@@ -15,7 +15,9 @@ int alu_kind_primary(uint8_t op);
 int byte_val(struct insn *insn, int register_number, int scratch);
 void byte_wb(struct insn *insn, int register_number, int value);
 int rm_load(struct insn *insn, uint64_t next, int width, int *memory);
+int rm_load_access(struct insn *insn, uint64_t next, int width, int *memory, uint32_t required);
 void rm_store(struct insn *insn, int width, int value);
+void rm_store_after_guard(struct insn *insn, int width, int value);
 int xaludirect_on(void);
 void do_alu(int kind, int destination, int left, int right, int width);
 int do_alu_imm12(int kind, int destination, int left, uint64_t immediate, int width);
@@ -23,6 +25,7 @@ void narrow_adcsbb(int adc, int destination, int left, int right, int width);
 int lock_rmw(int kind, int width, int source);
 void emit_rcl_rcr(struct insn *insn, uint64_t next, int width, int rotate_right, int count);
 void emit_exit_const(uint64_t rip, uint64_t reason);
+void hl_x86_emit_block_return(void);
 void hl_x86_emit_spill(void);
 void hl_x86_emit_reload(void);
 void hl_x86_emit_host_pointer(int destination, uint64_t pointer);
@@ -39,6 +42,14 @@ void emit_ea_core(struct insn *insn, uint64_t next, int bias);
 void emit_load_mem(struct insn *insn, uint64_t next, int width, int destination);
 int ea_imm_fold(struct insn *insn, int width, int *base, int *offset);
 void emit_bus_guard(int address_register, uint64_t size, uint64_t rip);
+
+enum { X86_SOFT_READ = 1u, X86_SOFT_WRITE = 2u };
+
+void emit_memory_guard(int address_register, uint64_t size, uint64_t rip, uint32_t required);
+int emit_soft_memory_active(void);
+void emit_soft_store_commit(uint64_t size);
+void emit_soft_store_observe(uint64_t size);
+void emit_soft_store_drain(void);
 
 void e_movz(int destination, uint32_t immediate, int shift);
 void e_movconst(int destination, uint64_t value);

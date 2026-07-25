@@ -128,6 +128,9 @@ hl_unit(fork_wire           LIBS ${_abi} ${_hostl} SINGLE LINK -pthread
                             INCLUDES ${CMAKE_SOURCE_DIR}/src/linux_abi
                                      ${CMAKE_SOURCE_DIR}/src/host)
 hl_unit(limits              LIBS ${_abi} SINGLE LINK -pthread)
+hl_unit(options_environment NO_LIBS
+                            SOURCES src/core/options.c src/core/environment.c
+                            FLAGS -UHL_ENABLE_LOGGING -DHL_ENABLE_LOGGING=1)
 
 # Cases compiled straight against a handful of .c files (no archive at all).
 hl_unit(resolve      SOURCES src/host/resolve.c)
@@ -152,15 +155,17 @@ hl_unit(system       SOURCES src/host/linux/system.c src/host/private.c)
 
 # --- the generic sweep (UNIT_NAMES) ----------------------------------------
 set(HL_UNIT_NAMES
-  a64_asm address affinity arena avx bus child cli clock codegen config cpuid
+  a64_asm address affinity arena avx bus child ckptinoq cli clock codegen config cpuid
   cmpxchg decoder device digest directory directory_services emit epoll eventfd
-  eventfd_fork fatal fdcache file flags fork_wire glue gmap host_services
+  environment eventfd_fork fatal fdcache file flags fork_wire glue gmap guest_fetch host_services
   identity image inotify ir key launch legacy lifecycle_identity linux_abi
-  linux_fork lower_alu lower_crypto lower_mov lower_repstr lower_shift
-  lower_sse4x lower_trace lower_x87 misc native open_plan operand owner persist
-  pidmap pipe pipe_linux placement ports private process range rep resolve
+  linux_fork logical_vma lower_alu lower_crypto lower_mov lower_repstr lower_shift
+  lower_sse4x lower_trace lower_x87 misc native open_plan operand options_environment owner persist
+  pidmap pipe pipe_linux placement ports private process provider_client provider_demux
+  provider_epoll_race provider_epoll_registry provider_files provider_handles provider_namespace
+  range rep resolve
   resolve_services rotate shared shm signal_aarch64 signal_x86_64 snapshot
-  system seccomp_vm stat engine errno limits log namespace number options parse
+  socket_identity system seccomp_vm stat engine errno limits log namespace number options parse
   profile readonly reloc target_bus watch window x87_stack x87math x87state
   xattr_cache)
 

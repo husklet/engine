@@ -10,6 +10,7 @@
 #include "../../core/provider/files.h"
 
 static int g_bound_sentinel = -1;
+
 static void bound_epoll_provider_ready(void *opaque, uint64_t token) {
     ep_provider_watch *watch = opaque;
     uint32_t ready;
@@ -65,6 +66,7 @@ static _Thread_local int g_bound_source_native;
 static int bound_source_is_native(void) {
     return g_bound_source_native;
 }
+
 static _Thread_local int g_bound_second_native;
 
 typedef struct bound_watch_source {
@@ -510,7 +512,8 @@ static void bound_virtualize_owner(const hl_linux_fd_snapshot *file, hl_linux_fi
         int uid, gid;
         path[named.value] = 0;
         struct stat native_status;
-        if (lstat(path, &native_status) == 0 && hl_owner_get(path, -1, &native_status, S_ISLNK(native_status.st_mode), &uid, &gid)) {
+        if (lstat(path, &native_status) == 0 &&
+            hl_owner_get(path, -1, &native_status, S_ISLNK(native_status.st_mode), &uid, &gid)) {
             if (uid >= 0) status->user = (uint32_t)uid;
             if (gid >= 0) status->group = (uint32_t)gid;
         }
@@ -870,12 +873,12 @@ static void bound_mapping_file_written(const hl_linux_fd_snapshot *file, uint64_
         hl_linux_file_event_publish(HL_LINUX_FILE_EVENT_RESIZE, metadata.stable_device, metadata.stable_object,
                                     old_size, metadata.size);
     if (have_metadata)
-        hl_linux_file_event_publish(HL_LINUX_FILE_EVENT_WRITE, metadata.stable_device, metadata.stable_object,
-                                    offset, size);
+        hl_linux_file_event_publish(HL_LINUX_FILE_EVENT_WRITE, metadata.stable_device, metadata.stable_object, offset,
+                                    size);
 }
 
-static void bound_mapping_journal_apply(void *opaque, uint32_t kind, uint64_t device, uint64_t inode,
-                                        uint64_t first, uint64_t second) {
+static void bound_mapping_journal_apply(void *opaque, uint32_t kind, uint64_t device, uint64_t inode, uint64_t first,
+                                        uint64_t second) {
     bound_mapping **head = bound_mapping_head();
     hl_host_file_metadata metadata = {.stable_device = device, .stable_object = inode};
     (void)opaque;
@@ -1134,8 +1137,8 @@ static int64_t bound_dup_at_least(hl_linux_fd source, int minimum, uint32_t desc
         hl_linux_fd_snapshot snapshot;
         hl_host_file_metadata metadata = {0};
         uint32_t kind = HL_HOST_FD_OTHER;
-        if (bound_snapshot((uint64_t)result, &snapshot) && g_host_services != NULL &&
-            g_host_services->file != NULL && g_host_services->file->metadata != NULL &&
+        if (bound_snapshot((uint64_t)result, &snapshot) && g_host_services != NULL && g_host_services->file != NULL &&
+            g_host_services->file->metadata != NULL &&
             g_host_services->file->metadata(g_host_services->context, snapshot.host_handle, &metadata).status ==
                 HL_STATUS_OK) {
             if (metadata.type == HL_HOST_FILE_TYPE_REGULAR || metadata.type == HL_HOST_FILE_TYPE_DIRECTORY ||
@@ -1206,8 +1209,7 @@ static int64_t bound_adopt_handle(bound_handle_slot *slot, hl_host_handle file, 
         bound_handle_cancel(slot);
     } else {
         slot->active = 0;
-        proc_fdvis_reservation_publish(&slot->fdvis, (int)result, kind, metadata.stable_device,
-                                       metadata.stable_object);
+        proc_fdvis_reservation_publish(&slot->fdvis, (int)result, kind, metadata.stable_device, metadata.stable_object);
     }
     return result;
 }
@@ -1326,8 +1328,7 @@ static int64_t bound_relocate_lowest(int64_t opened) {
             else if (metadata.type == HL_HOST_FILE_TYPE_SOCKET)
                 kind = HL_HOST_FD_SOCKET;
         }
-        proc_fdvis_reservation_publish(&fdvis, (int)duplicated, kind, metadata.stable_device,
-                                       metadata.stable_object);
+        proc_fdvis_reservation_publish(&fdvis, (int)duplicated, kind, metadata.stable_device, metadata.stable_object);
     }
     return duplicated;
 }
@@ -1337,9 +1338,7 @@ static int bound_path_copy(uint64_t address, char path[HL_LINUX_PATH_MAX + 1], s
     if (address == 0 || path == NULL || path_size == NULL) return -HL_LINUX_EFAULT;
     for (index = 0; index < HL_LINUX_PATH_MAX; ++index) {
         if (address > UINTPTR_MAX - index) return -HL_LINUX_EFAULT;
-        const char *byte = (const char *)(uintptr_t)(address + index);
-        if (!host_range_mapped((uintptr_t)byte, 1)) return -HL_LINUX_EFAULT;
-        path[index] = *byte;
+        if (guest_copy_from(path + index, address + index, 1) != 1) return -HL_LINUX_EFAULT;
         if (path[index] == 0) {
             if (index == 0) return -HL_LINUX_ENOENT;
             *path_size = index;
@@ -1356,30 +1355,111 @@ static int bound_vectors_copy(uint64_t address, uint64_t count, hl_host_iovec ve
     if (count == 0) return 0;
     if (address == 0 || count > SIZE_MAX / sizeof(*vectors)) return -HL_LINUX_EFAULT;
     array_size = (size_t)count * sizeof(*vectors);
-    if (address > UINTPTR_MAX || array_size > UINTPTR_MAX - (uintptr_t)address ||
-        !host_range_mapped((uintptr_t)address, array_size))
-        return -HL_LINUX_EFAULT;
-    memcpy(vectors, (const void *)(uintptr_t)address, array_size);
+    if (guest_copy_from(vectors, address, array_size) != (ssize_t)array_size) return -HL_LINUX_EFAULT;
     for (index = 0; index < count; ++index) {
         uint64_t base = vectors[index].address;
         uint64_t size = vectors[index].size;
-        if (size > SIZE_MAX || base > UINTPTR_MAX || (size != 0 && base == 0) || size > UINTPTR_MAX - (uintptr_t)base ||
-            (size != 0 && !host_range_mapped((uintptr_t)base, (size_t)size)))
+        if (size > SIZE_MAX || (size != 0 && base == 0))
             return -HL_LINUX_EFAULT;
     }
     return 0;
 }
 
+static int64_t bound_vector_io(const hl_linux_fd_snapshot *file, hl_host_iovec guest_vectors[HL_LINUX_IOV_MAX],
+                               uint32_t count, int output, int positioned, uint64_t offset) {
+    hl_host_iovec host_vectors[HL_LINUX_IOV_MAX] = {{0}};
+    void *buffers[HL_LINUX_IOV_MAX] = {0};
+    uint32_t usable = 0;
+    int64_t result;
+    if (count == 0)
+        return output ? (positioned ? hl_linux_preadv(g_linux_box, file->fd, host_vectors, 0, offset)
+                                    : hl_linux_readv(g_linux_box, file->fd, host_vectors, 0))
+                      : (positioned ? hl_linux_pwritev(g_linux_box, file->fd, host_vectors, 0, offset)
+                                    : hl_linux_writev(g_linux_box, file->fd, host_vectors, 0));
+    for (uint32_t index = 0; index < count; ++index) {
+        size_t size = (size_t)guest_vectors[index].size;
+        if (size == 0) {
+            host_vectors[usable++] = (hl_host_iovec){0, 0};
+            continue;
+        }
+        if (output) {
+            size_t prefix = guest_accessible_prefix(guest_vectors[index].address, size, HL_LOGICAL_VMA_WRITE);
+            if (prefix == 0) {
+                if (usable == 0) result = -EFAULT;
+                goto issue_or_fail;
+            }
+            size = prefix;
+        }
+        buffers[usable] = malloc(size);
+        if (buffers[usable] == NULL) {
+            result = -ENOMEM;
+            goto cleanup;
+        }
+        if (!output) {
+            ssize_t copied = guest_copy_from(buffers[usable], guest_vectors[index].address, size);
+            if (copied <= 0) {
+                if (usable == 0) {
+                    result = -EFAULT;
+                    goto cleanup;
+                }
+                goto issue_or_fail;
+            }
+            size = (size_t)copied;
+        }
+        host_vectors[usable] = (hl_host_iovec){(uint64_t)(uintptr_t)buffers[usable], size};
+        usable++;
+        if (size != guest_vectors[index].size) break;
+    }
+issue_or_fail:
+    if (usable == 0) goto cleanup;
+    if (output)
+        result = positioned ? hl_linux_preadv(g_linux_box, file->fd, host_vectors, usable, offset)
+                            : hl_linux_readv(g_linux_box, file->fd, host_vectors, usable);
+    else
+        result = positioned ? hl_linux_pwritev(g_linux_box, file->fd, host_vectors, usable, offset)
+                            : hl_linux_writev(g_linux_box, file->fd, host_vectors, usable);
+    if (output && result > 0) {
+        int64_t remaining = result, copied_total = 0;
+        for (uint32_t index = 0; index < usable && remaining > 0; ++index) {
+            size_t amount = (uint64_t)remaining < host_vectors[index].size ? (size_t)remaining
+                                                                          : (size_t)host_vectors[index].size;
+            ssize_t copied = guest_copy_to(guest_vectors[index].address, buffers[index], amount);
+            if (copied <= 0) {
+                result = copied_total != 0 ? copied_total : -EFAULT;
+                break;
+            }
+            copied_total += copied;
+            remaining -= copied;
+            if ((size_t)copied != amount) {
+                result = copied_total;
+                break;
+            }
+        }
+    }
+cleanup:
+    for (uint32_t index = 0; index < usable; ++index) free(buffers[index]);
+    return result;
+}
+
 static int bound_poll_references(uint64_t address, uint64_t count) {
-    struct pollfd *fds;
+    struct pollfd *fds = NULL;
     uint64_t index;
     hl_linux_fd_snapshot snapshot;
-    if (count > SIZE_MAX / sizeof(*fds) ||
-        (count != 0 && !host_range_mapped((uintptr_t)address, (size_t)count * sizeof(*fds))))
-        return 0;
-    fds = (struct pollfd *)(uintptr_t)address;
+    if (count > SIZE_MAX / sizeof(*fds)) return 0;
+    if (count != 0) {
+        size_t bytes = (size_t)count * sizeof(*fds);
+        fds = malloc(bytes);
+        if (fds == NULL || guest_copy_from(fds, address, bytes) != (ssize_t)bytes) {
+            free(fds);
+            return 0;
+        }
+    }
     for (index = 0; index < count; ++index)
-        if (fds[index].fd >= 0 && bound_snapshot((uint64_t)(unsigned)fds[index].fd, &snapshot)) return 1;
+        if (fds[index].fd >= 0 && bound_snapshot((uint64_t)(unsigned)fds[index].fd, &snapshot)) {
+            free(fds);
+            return 1;
+        }
+    free(fds);
     return 0;
 }
 
@@ -1389,18 +1469,25 @@ static int bound_fdsets_reference(uint64_t count, uint64_t read_set, uint64_t wr
     hl_linux_fd_snapshot snapshot;
     if (count > HL_LINUX_FD_LIMIT) count = HL_LINUX_FD_LIMIT;
     bytes = (size_t)((count + 7u) / 8u);
-    if ((read_set != 0 && !host_range_mapped((uintptr_t)read_set, bytes)) ||
-        (write_set != 0 && !host_range_mapped((uintptr_t)write_set, bytes)) ||
-        (except_set != 0 && !host_range_mapped((uintptr_t)except_set, bytes)))
+    uint8_t *sets = calloc(3, bytes == 0 ? 1 : bytes);
+    if (sets == NULL) return 0;
+    if ((read_set != 0 && guest_copy_from(sets, read_set, bytes) != (ssize_t)bytes) ||
+        (write_set != 0 && guest_copy_from(sets + bytes, write_set, bytes) != (ssize_t)bytes) ||
+        (except_set != 0 && guest_copy_from(sets + bytes * 2, except_set, bytes) != (ssize_t)bytes)) {
+        free(sets);
         return 0;
+    }
     for (fd = 0; fd < count; ++fd) {
         uint8_t mask = (uint8_t)(1u << (fd & 7u));
         size_t byte = (size_t)(fd >> 3);
-        if (((read_set != 0 && (((uint8_t *)(uintptr_t)read_set)[byte] & mask) != 0) ||
-             (write_set != 0 && (((uint8_t *)(uintptr_t)write_set)[byte] & mask) != 0) ||
-             (except_set != 0 && (((uint8_t *)(uintptr_t)except_set)[byte] & mask) != 0)) &&
-            bound_snapshot(fd, &snapshot))
+        if (((read_set != 0 && (sets[byte] & mask) != 0) ||
+             (write_set != 0 && (sets[bytes + byte] & mask) != 0) ||
+             (except_set != 0 && (sets[bytes * 2 + byte] & mask) != 0)) &&
+            bound_snapshot(fd, &snapshot)) {
+            free(sets);
             return 1;
+        }
+    free(sets);
     }
     return 0;
 }
@@ -1443,8 +1530,9 @@ static uint64_t bound_deadline(const struct timespec *timeout) {
 /* Poll native descriptors from a private copy: typed guest slots are never host descriptors. */
 static int64_t bound_ppoll(struct cpu *c, uint64_t address, uint64_t count, uint64_t timeout_address,
                            uint64_t mask_address) {
-    struct pollfd *guest = (struct pollfd *)(uintptr_t)address;
-    struct timespec *timeout = (struct timespec *)(uintptr_t)timeout_address;
+    struct pollfd *guest;
+    struct timespec timeout_value;
+    struct timespec *timeout = timeout_address ? &timeout_value : NULL;
     struct pollfd *native;
     hl_linux_poll_entry *objects;
     uint32_t *object_indices;
@@ -1452,15 +1540,31 @@ static int64_t bound_ppoll(struct cpu *c, uint64_t address, uint64_t count, uint
     uint64_t index;
     uint32_t object_count = 0;
     uint64_t saved = 0;
+    uint64_t mask = 0;
     int mask_on;
     int64_t result = 0;
     if (count > (uint64_t)guest_nofile_cur()) return -EINVAL;
-    if (count > SIZE_MAX / sizeof(*guest) || (count != 0 && guest_bad_ptr(address, (size_t)count * sizeof(*guest))) ||
-        (timeout != NULL && guest_bad_ptr(timeout_address, sizeof(*timeout))))
+    if (count > SIZE_MAX / sizeof(*guest)) return -EFAULT;
+    size_t guest_bytes = (size_t)count * sizeof(*guest);
+    guest = calloc(count != 0 ? (size_t)count : 1, sizeof(*guest));
+    if (!guest) return -ENOMEM;
+    if ((count != 0 && guest_copy_from(guest, address, guest_bytes) != (ssize_t)guest_bytes) ||
+        (timeout != NULL && guest_copy_from(timeout, timeout_address, sizeof(*timeout)) != sizeof(*timeout))) {
+        free(guest);
         return -EFAULT;
-    if (timeout != NULL && (timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L)) return -EINVAL;
-    if (mask_address != 0 && (size_t)G_A4(c) != 8) return -EINVAL;
-    if (mask_address != 0 && guest_bad_ptr(mask_address, 8)) return -EFAULT;
+    }
+    if (timeout != NULL && (timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L)) {
+        free(guest);
+        return -EINVAL;
+    }
+    if (mask_address != 0 && (size_t)G_A4(c) != 8) {
+        free(guest);
+        return -EINVAL;
+    }
+    if (mask_address != 0 && guest_copy_from(&mask, mask_address, sizeof(mask)) != sizeof(mask)) {
+        free(guest);
+        return -EFAULT;
+    }
     native = calloc(count != 0 ? (size_t)count : 1, sizeof(*native));
     objects = calloc(count != 0 ? (size_t)count : 1, sizeof(*objects));
     object_indices = calloc(count != 0 ? (size_t)count : 1, sizeof(*object_indices));
@@ -1468,6 +1572,7 @@ static int64_t bound_ppoll(struct cpu *c, uint64_t address, uint64_t count, uint
         free(native);
         free(objects);
         free(object_indices);
+        free(guest);
         return -ENOMEM;
     }
     memcpy(native, guest, (size_t)count * sizeof(*native));
@@ -1481,7 +1586,7 @@ static int64_t bound_ppoll(struct cpu *c, uint64_t address, uint64_t count, uint
         }
     }
     deadline = bound_deadline(timeout);
-    mask_on = poll_sigmask_enter(c, mask_address, &saved);
+    mask_on = poll_sigmask_enter(c, mask_address != 0, mask, &saved);
     for (;;) {
         int native_ready;
         int64_t object_ready = hl_linux_object_poll(g_linux_box, objects, object_count, 0);
@@ -1515,9 +1620,14 @@ static int64_t bound_ppoll(struct cpu *c, uint64_t address, uint64_t count, uint
         timeout->tv_sec = (time_t)(left / UINT64_C(1000000000));
         timeout->tv_nsec = (long)(left % UINT64_C(1000000000));
     }
+    if (result >= 0 &&
+        ((count != 0 && guest_copy_to(address, guest, guest_bytes) != (ssize_t)guest_bytes) ||
+         (timeout != NULL && guest_copy_to(timeout_address, timeout, sizeof(*timeout)) != sizeof(*timeout))))
+        result = -EFAULT;
     free(objects);
     free(object_indices);
     free(native);
+    free(guest);
     return result;
 }
 
@@ -1533,10 +1643,12 @@ static int64_t bound_pselect(struct cpu *c, uint64_t count_value, uint64_t read_
                              uint64_t except_address) {
     uint32_t count = count_value > HL_LINUX_FD_LIMIT ? HL_LINUX_FD_LIMIT : (uint32_t)count_value;
     size_t bytes = ((size_t)count + 7u) / 8u;
-    uint8_t *guest_read = (uint8_t *)(uintptr_t)read_address;
-    uint8_t *guest_write = (uint8_t *)(uintptr_t)write_address;
-    uint8_t *guest_except = (uint8_t *)(uintptr_t)except_address;
-    struct timespec *timeout = (struct timespec *)(uintptr_t)G_A4(c);
+    uint8_t *guest_read = NULL;
+    uint8_t *guest_write = NULL;
+    uint8_t *guest_except = NULL;
+    uint8_t *sets = NULL;
+    struct timespec timeout_value;
+    struct timespec *timeout = G_A4(c) ? &timeout_value : NULL;
     uint64_t mask_pair_address = G_A5(c);
     uint8_t *requested;
     struct pollfd *native;
@@ -1547,22 +1659,41 @@ static int64_t bound_pselect(struct cpu *c, uint64_t count_value, uint64_t read_
     uint64_t deadline;
     uint64_t mask_address = 0;
     uint64_t saved = 0;
+    uint64_t mask = 0;
     int mask_on;
     int64_t result = 0;
     if (count_value > INT_MAX) return -EINVAL;
-    if ((read_address != 0 && guest_bad_ptr(read_address, bytes)) ||
-        (write_address != 0 && guest_bad_ptr(write_address, bytes)) ||
-        (except_address != 0 && guest_bad_ptr(except_address, bytes)) ||
-        (timeout != NULL && guest_bad_ptr(G_A4(c), sizeof(*timeout))))
+    sets = calloc(bytes != 0 ? bytes * 3 : 1, 1);
+    if (!sets) return -ENOMEM;
+    if (read_address) guest_read = sets;
+    if (write_address) guest_write = sets + bytes;
+    if (except_address) guest_except = sets + bytes * 2;
+    if ((guest_read && guest_copy_from(guest_read, read_address, bytes) != (ssize_t)bytes) ||
+        (guest_write && guest_copy_from(guest_write, write_address, bytes) != (ssize_t)bytes) ||
+        (guest_except && guest_copy_from(guest_except, except_address, bytes) != (ssize_t)bytes) ||
+        (timeout && guest_copy_from(timeout, G_A4(c), sizeof(*timeout)) != sizeof(*timeout))) {
+        free(sets);
         return -EFAULT;
-    if (timeout != NULL && (timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L)) return -EINVAL;
+    }
+    if (timeout != NULL && (timeout->tv_nsec < 0 || timeout->tv_nsec >= 1000000000L)) {
+        free(sets);
+        return -EINVAL;
+    }
     if (mask_pair_address != 0) {
-        const uint64_t *pair;
-        if (guest_bad_ptr(mask_pair_address, 16)) return -EFAULT;
-        pair = (const uint64_t *)(uintptr_t)mask_pair_address;
+        uint64_t pair[2];
+        if (guest_copy_from(pair, mask_pair_address, sizeof(pair)) != sizeof(pair)) {
+            free(sets);
+            return -EFAULT;
+        }
         if (pair[0] != 0) {
-            if (pair[1] != 8) return -EINVAL;
-            if (guest_bad_ptr(pair[0], 8)) return -EFAULT;
+            if (pair[1] != 8) {
+                free(sets);
+                return -EINVAL;
+            }
+            if (guest_copy_from(&mask, pair[0], sizeof(mask)) != sizeof(mask)) {
+                free(sets);
+                return -EFAULT;
+            }
             mask_address = pair[0];
         }
     }
@@ -1591,7 +1722,7 @@ static int64_t bound_pselect(struct cpu *c, uint64_t count_value, uint64_t read_
         }
     }
     deadline = bound_deadline(timeout);
-    mask_on = poll_sigmask_enter(c, mask_address, &saved);
+    mask_on = poll_sigmask_enter(c, mask_address != 0, mask, &saved);
     for (;;) {
         int native_ready;
         int64_t object_ready = hl_linux_object_poll(g_linux_box, objects, object_count, 0);
@@ -1666,30 +1797,39 @@ waited:
         timeout->tv_nsec = (long)(left % UINT64_C(1000000000));
     }
 done:
+    if (result >= 0 && ((guest_read && guest_copy_to(read_address, guest_read, bytes) != (ssize_t)bytes) ||
+                        (guest_write && guest_copy_to(write_address, guest_write, bytes) != (ssize_t)bytes) ||
+                        (guest_except && guest_copy_to(except_address, guest_except, bytes) != (ssize_t)bytes) ||
+                        (timeout && guest_copy_to(G_A4(c), timeout, sizeof(*timeout)) != sizeof(*timeout))))
+        result = -EFAULT;
     free(object_indices);
     free(objects);
     free(native);
     free(requested);
+    free(sets);
     return result;
 }
 
 static int bound_rights_reference(uint64_t message_address) {
-    const uint8_t *message = (const uint8_t *)(uintptr_t)message_address;
-    const uint8_t *control;
+    uint8_t message[56];
+    uint8_t *control;
     uint64_t control_address;
     uint64_t control_size;
     uint64_t offset = 0;
     hl_linux_fd_snapshot snapshot;
-    if (!host_range_mapped((uintptr_t)message_address, 56)) return 0;
+    if (guest_copy_from(message, message_address, sizeof(message)) != (ssize_t)sizeof(message)) return 0;
     memcpy(&control_address, message + 32, sizeof(control_address));
     memcpy(&control_size, message + 40, sizeof(control_size));
 #if SIZE_MAX < UINT64_MAX
     if (control_size > SIZE_MAX) return 0;
 #endif
-    if (control_address == 0 || control_size < 16 ||
-        !host_range_mapped((uintptr_t)control_address, (size_t)control_size))
+    if (control_address == 0 || control_size < 16) return 0;
+    control = malloc((size_t)control_size);
+    if (control == NULL ||
+        guest_copy_from(control, control_address, (size_t)control_size) != (ssize_t)control_size) {
+        free(control);
         return 0;
-    control = (const uint8_t *)(uintptr_t)control_address;
+    }
     while (offset + 16 <= control_size) {
         uint64_t length;
         int32_t level;
@@ -1703,12 +1843,16 @@ static int bound_rights_reference(uint64_t message_address) {
             for (data = 16; data + sizeof(int32_t) <= length; data += sizeof(int32_t)) {
                 int32_t fd;
                 memcpy(&fd, control + offset + data, sizeof(fd));
-                if (fd >= 0 && bound_snapshot((uint64_t)(uint32_t)fd, &snapshot)) return 1;
+                if (fd >= 0 && bound_snapshot((uint64_t)(uint32_t)fd, &snapshot)) {
+                    free(control);
+                    return 1;
+                }
             }
         }
         if (length > UINT64_MAX - 7u) break;
         offset += (length + 7u) & ~UINT64_C(7);
     }
+    free(control);
     return 0;
 }
 
@@ -1764,6 +1908,41 @@ static int64_t bound_stream_write(const hl_linux_fd_snapshot *file, int native_f
     return count < 0 ? -errno : count;
 }
 
+static int64_t bound_guest_read(const hl_linux_fd_snapshot *file, uint64_t guest, size_t size, uint64_t offset,
+                                int positioned) {
+    if (size == 0) return positioned ? hl_linux_pread64(g_linux_box, file->fd, NULL, 0, offset)
+                                     : hl_linux_read(g_linux_box, file->fd, NULL, 0);
+    size_t accessible = guest_accessible_prefix(guest, size, HL_LOGICAL_VMA_WRITE);
+    if (accessible == 0) return -EFAULT;
+    void *buffer = malloc(accessible);
+    if (buffer == NULL) return -ENOMEM;
+    int64_t result = positioned ? hl_linux_pread64(g_linux_box, file->fd, buffer, accessible, offset)
+                                : hl_linux_read(g_linux_box, file->fd, buffer, accessible);
+    if (result > 0) {
+        ssize_t copied = guest_copy_to(guest, buffer, (size_t)result);
+        if (copied != result) result = copied > 0 ? copied : -EFAULT;
+    }
+    free(buffer);
+    return result;
+}
+
+static int64_t bound_guest_write(const hl_linux_fd_snapshot *file, uint64_t guest, size_t size, uint64_t offset,
+                                 int positioned) {
+    if (size == 0) return positioned ? hl_linux_pwrite64(g_linux_box, file->fd, NULL, 0, offset)
+                                     : hl_linux_write(g_linux_box, file->fd, NULL, 0);
+    void *buffer = malloc(size);
+    if (buffer == NULL) return -ENOMEM;
+    ssize_t copied = guest_copy_from(buffer, guest, size);
+    if (copied <= 0) {
+        free(buffer);
+        return -EFAULT;
+    }
+    int64_t result = positioned ? hl_linux_pwrite64(g_linux_box, file->fd, buffer, (size_t)copied, offset)
+                                : hl_linux_write(g_linux_box, file->fd, buffer, (size_t)copied);
+    free(buffer);
+    return result;
+}
+
 static int64_t bound_sendfile(const hl_linux_fd_snapshot *output, int output_fd, const hl_linux_fd_snapshot *input,
                               int input_fd, uint64_t offset_address, uint64_t count) {
     off_t supplied_offset = 0;
@@ -1783,8 +1962,9 @@ static int64_t bound_sendfile(const hl_linux_fd_snapshot *output, int output_fd,
         if (metadata.type != HL_HOST_FILE_TYPE_REGULAR) return -EINVAL;
     }
     if (offset_address != 0) {
-        if (!host_range_mapped((uintptr_t)offset_address, sizeof(off_t))) return -EFAULT;
-        supplied_offset = *(off_t *)(uintptr_t)offset_address;
+        if (guest_copy_from(&supplied_offset, offset_address, sizeof(supplied_offset)) !=
+            (ssize_t)sizeof(supplied_offset))
+            return -EFAULT;
         if (supplied_offset < 0) return -EINVAL;
         input_offset = &supplied_offset;
     }
@@ -1815,7 +1995,9 @@ static int64_t bound_sendfile(const hl_linux_fd_snapshot *output, int output_fd,
             break;
         }
     }
-    if (offset_address != 0) *(off_t *)(uintptr_t)offset_address = supplied_offset;
+    if (offset_address != 0 &&
+        guest_copy_to(offset_address, &supplied_offset, sizeof(supplied_offset)) != (ssize_t)sizeof(supplied_offset))
+        return done != 0 ? (int64_t)done : -EFAULT;
     return done != 0 ? (int64_t)done : error;
 }
 
@@ -1827,8 +2009,9 @@ static int bound_native_pipe(int fd) {
 static int64_t bound_splice(const hl_linux_fd_snapshot *input, int input_fd, uint64_t input_offset_address,
                             const hl_linux_fd_snapshot *output, int output_fd, uint64_t output_offset_address,
                             uint64_t size, uint64_t flags) {
-    off_t *input_offset = (off_t *)(uintptr_t)input_offset_address;
-    off_t *output_offset = (off_t *)(uintptr_t)output_offset_address;
+    off_t input_value = 0, output_value = 0;
+    off_t *input_offset = input_offset_address != 0 ? &input_value : NULL;
+    off_t *output_offset = output_offset_address != 0 ? &output_value : NULL;
     int input_pipe = input == NULL && bound_native_pipe(input_fd);
     int output_pipe = output == NULL && bound_native_pipe(output_fd);
     static _Thread_local char buffer[65536];
@@ -1837,8 +2020,11 @@ static int64_t bound_splice(const hl_linux_fd_snapshot *input, int input_fd, uin
     if (flags & ~UINT64_C(0xf)) return -EINVAL;
     if (!input_pipe && !output_pipe) return -EINVAL;
     if ((input_pipe && input_offset != NULL) || (output_pipe && output_offset != NULL)) return -ESPIPE;
-    if ((input_offset != NULL && !host_range_mapped((uintptr_t)input_offset, sizeof(*input_offset))) ||
-        (output_offset != NULL && !host_range_mapped((uintptr_t)output_offset, sizeof(*output_offset))))
+    if ((input_offset != NULL &&
+         guest_copy_from(input_offset, input_offset_address, sizeof(*input_offset)) != (ssize_t)sizeof(*input_offset)) ||
+        (output_offset != NULL &&
+         guest_copy_from(output_offset, output_offset_address, sizeof(*output_offset)) !=
+             (ssize_t)sizeof(*output_offset)))
         return -EFAULT;
     if (size > UINT64_C(0x7ffff000)) size = UINT64_C(0x7ffff000);
     if (size > sizeof(buffer)) size = sizeof(buffer);
@@ -1865,6 +2051,12 @@ static int64_t bound_splice(const hl_linux_fd_snapshot *input, int input_fd, uin
         bound_mapping_file_written(output, output_offset != NULL ? (uint64_t)*output_offset : output->offset,
                                    (uint64_t)write_count);
     if (output_offset != NULL) *output_offset += (off_t)write_count;
+    if ((input_offset != NULL &&
+         guest_copy_to(input_offset_address, input_offset, sizeof(*input_offset)) != (ssize_t)sizeof(*input_offset)) ||
+        (output_offset != NULL &&
+         guest_copy_to(output_offset_address, output_offset, sizeof(*output_offset)) !=
+             (ssize_t)sizeof(*output_offset)))
+        return -EFAULT;
     return write_count;
 }
 
@@ -1914,8 +2106,7 @@ static int64_t bound_rename_exchange(hl_host_handle old_dir, const char *old_pat
     return 0;
 }
 
-static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
-                       uint64_t a4) {
+static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
     hl_linux_fd_snapshot source;
     int64_t result;
     int source_bound = !g_bound_source_native && bound_snapshot(a0, &source);
@@ -1987,17 +2178,21 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     if (nr == 27 && source_bound) {
         char path[4200];
+        char guest_path[HL_LINUX_PATH_MAX + 1];
+        size_t guest_path_size;
         // EFAULT on an inaccessible path pointer BEFORE atpath dereferences it. inotify_add_watch(fd, NULL,
         // mask) and a wild/unmapped path return -EFAULT on Linux; without this guard atpath reads the
         // unmapped guest address and the engine child SIGSEGVs, killing the guest with signal 11 instead
         // (guest-triggerable crash). Mirrors the guarded sibling path syscalls (nr 78 below, fs.c openat).
-        if (!a1 || !host_range_mapped((uintptr_t)a1, 1)) {
+        if (bound_path_copy(a1, guest_path, &guest_path_size) != 0) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             return 1;
         }
-        const char *resolved = atpath(-100, (const char *)(uintptr_t)a1, path, sizeof(path), 0);
-        if (resolved == NULL) result = -errno;
-        else result = hl_linux_inotify_add(g_linux_box, source.fd, resolved, strlen(resolved), (uint32_t)a2);
+        const char *resolved = atpath(-100, guest_path, path, sizeof(path), 0);
+        if (resolved == NULL)
+            result = -errno;
+        else
+            result = hl_linux_inotify_add(g_linux_box, source.fd, resolved, strlen(resolved), (uint32_t)a2);
         G_RET(c) = (uint64_t)result;
         return 1;
     }
@@ -2005,16 +2200,21 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         G_RET(c) = (uint64_t)hl_linux_inotify_remove(g_linux_box, source.fd, (int32_t)a1);
         return 1;
     }
-    if (nr == 78 && a1 != 0 && a2 != 0 && (int64_t)a3 > 0 && host_range_mapped((uintptr_t)a1, 1) &&
-        host_range_mapped((uintptr_t)a2, (size_t)a3)) {
-        int guest_fd = procfd_num((const char *)(uintptr_t)a1);
+    if (nr == 78 && a1 != 0 && a2 != 0 && (int64_t)a3 > 0) {
+        char path[HL_LINUX_PATH_MAX + 1];
+        size_t path_size;
+        if (bound_path_copy(a1, path, &path_size) != 0) return 0;
+        int guest_fd = procfd_num(path);
         hl_linux_fd_snapshot target;
         if (guest_fd >= 0 && bound_snapshot((uint64_t)(uint32_t)guest_fd, &target)) {
             char target_path[4200];
             int length = proc_fd_link_pid((int)getpid(), guest_fd, target_path, sizeof target_path);
             if (length < 0) return 0;
             size_t copied = (size_t)length > (size_t)a3 ? (size_t)a3 : (size_t)length;
-            memcpy((void *)(uintptr_t)a2, target_path, copied);
+            if (guest_copy_to(a2, target_path, copied) != (ssize_t)copied) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                return 1;
+            }
             G_RET(c) = (uint64_t)copied;
             return 1;
         }
@@ -2062,8 +2262,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 return 1;
             }
             uint64_t operation_size = a1;
-            if (nr == 215 && offset == 0 && a1 == hl_gmap_find_guest_length(a0))
-                operation_size = mapping->size;
+            if (nr == 215 && offset == 0 && a1 == hl_gmap_find_guest_length(a0)) operation_size = mapping->size;
             if (nr == 215)
                 operation = g_host_services->memory->unmap_range(g_host_services->context, mapping->object->handle,
                                                                  mapping->object_offset + offset, operation_size);
@@ -2186,8 +2385,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 else if (result != 0) {
                     /* preserve earlier path-copy error */
                 } else if ((flags & UINT64_C(0x2)) != 0) {
-                    result = (int)bound_rename_exchange(source.host_handle, old_path, old_size,
-                                                        destination.host_handle, new_path, new_size);
+                    result = (int)bound_rename_exchange(source.host_handle, old_path, old_size, destination.host_handle,
+                                                        new_path, new_size);
                 } else if ((flags & UINT64_C(0x1)) != 0) {
                     hl_host_result probe = g_host_services->file->open_relative(
                         g_host_services->context, destination.host_handle, new_path, new_size,
@@ -2231,8 +2430,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 G_RET(c) = is_dup2 ? (uint64_t)(unsigned)target_fd : (uint64_t)(int64_t)-EINVAL;
                 return 1;
             }
-            if ((!is_dup2 && (flags & ~HL_LINUX_O_CLOEXEC) != 0) || target_fd < 0 ||
-                target_fd >= guest_nofile_cur()) {
+            if ((!is_dup2 && (flags & ~HL_LINUX_O_CLOEXEC) != 0) || target_fd < 0 || target_fd >= guest_nofile_cur()) {
                 G_RET(c) = (uint64_t)(int64_t)(target_fd < 0 || target_fd >= guest_nofile_cur() ? -EBADF : -EINVAL);
                 return 1;
             }
@@ -2258,21 +2456,29 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 hl_provider_files_is_handle(watched.host_handle)) {
                 int registry_ep = epoll_slot((int)a0);
                 uint32_t epoll_generation = g_ep_provider_generations[registry_ep];
-                ep_provider_watch *watch = ep_provider_find(g_ep_provider_watches, EP_PROVIDER_WATCH_LIMIT,
-                                                            registry_ep, epoll_generation, (int)a2,
-                                                            watched.descriptor_generation);
+                ep_provider_watch *watch = ep_provider_find(g_ep_provider_watches, EP_PROVIDER_WATCH_LIMIT, registry_ep,
+                                                            epoll_generation, (int)a2, watched.descriptor_generation);
                 if (a1 == HL_LINUX_EPOLL_DELETE) {
-                    if (watch == NULL) epoll_result = -ENOENT;
+                    if (watch == NULL)
+                        epoll_result = -ENOENT;
                     else {
                         ep_provider_retire(watch);
                         epoll_result = 0;
                     }
                 } else if ((a1 == HL_LINUX_EPOLL_ADD || a1 == HL_LINUX_EPOLL_MODIFY) && a3 != 0) {
-                    uint32_t events = *(uint32_t *)(uintptr_t)a3;
-                    uint64_t data;
-                    memcpy(&data, (const void *)((uintptr_t)a3 + G_EPEV_DOFF), sizeof(data));
-                    if (a1 == HL_LINUX_EPOLL_ADD && watch != NULL) epoll_result = -EEXIST;
-                    else if (a1 == HL_LINUX_EPOLL_MODIFY && watch == NULL) epoll_result = -ENOENT;
+                    uint8_t encoded[G_EPEV_DOFF + sizeof(uint64_t)];
+                    uint32_t events = 0;
+                    uint64_t data = 0;
+                    if (guest_copy_from(encoded, a3, sizeof(encoded)) != (ssize_t)sizeof(encoded)) {
+                        G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                        return 1;
+                    }
+                    memcpy(&events, encoded, sizeof(events));
+                    memcpy(&data, encoded + G_EPEV_DOFF, sizeof(data));
+                    if (a1 == HL_LINUX_EPOLL_ADD && watch != NULL)
+                        epoll_result = -EEXIST;
+                    else if (a1 == HL_LINUX_EPOLL_MODIFY && watch == NULL)
+                        epoll_result = -ENOENT;
                     else {
                         ep_provider_watch *previous = watch;
                         ep_provider_watch *replacement =
@@ -2282,18 +2488,24 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                             return 1;
                         }
                         uint32_t serial = g_ep_provider_serial = ep_provider_next(g_ep_provider_serial);
-                        uint32_t interests = ((events & 1u) ? HL_LINUX_READY_READ : 0u) |
-                                             ((events & 4u) ? HL_LINUX_READY_WRITE : 0u);
+                        uint32_t interests =
+                            ((events & 1u) ? HL_LINUX_READY_READ : 0u) | ((events & 4u) ? HL_LINUX_READY_WRITE : 0u);
                         ep_provider_activate(replacement, registry_ep, epoll_generation, (int)a2,
-                                             watched.descriptor_generation, serial, watched.host_handle,
-                                             events, interests, data);
+                                             watched.descriptor_generation, serial, watched.host_handle, events,
+                                             interests, data);
                         ep_wake_arm((int)a0);
                         epoll_result = hl_provider_files_subscribe(replacement->handle, replacement->interests,
-                            bound_epoll_provider_ready, replacement, atomic_load(&replacement->serial)) == 0 ? 0 : -EIO;
-                        if (epoll_result != 0) ep_provider_retire(replacement);
-                        else if (previous != NULL) ep_provider_retire(previous);
+                                                                   bound_epoll_provider_ready, replacement,
+                                                                   atomic_load(&replacement->serial)) == 0
+                                           ? 0
+                                           : -EIO;
+                        if (epoll_result != 0)
+                            ep_provider_retire(replacement);
+                        else if (previous != NULL)
+                            ep_provider_retire(previous);
                     }
-                } else epoll_result = -EINVAL;
+                } else
+                    epoll_result = -EINVAL;
                 G_RET(c) = (uint64_t)epoll_result;
                 return 1;
             }
@@ -2312,20 +2524,29 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 if (object_epollable) {
                     int registry_ep = epoll_slot((int)a0);
                     uint32_t epoll_generation = g_ep_provider_generations[registry_ep];
-                    ep_object_watch *watch = ep_object_find(registry_ep, epoll_generation, (int)a2,
-                                                            watched.descriptor_generation);
+                    ep_object_watch *watch =
+                        ep_object_find(registry_ep, epoll_generation, (int)a2, watched.descriptor_generation);
                     if (a1 == HL_LINUX_EPOLL_DELETE) {
-                        if (watch == NULL) epoll_result = -ENOENT;
+                        if (watch == NULL)
+                            epoll_result = -ENOENT;
                         else {
                             ep_object_free(watch);
                             epoll_result = 0;
                         }
                     } else if ((a1 == HL_LINUX_EPOLL_ADD || a1 == HL_LINUX_EPOLL_MODIFY) && a3 != 0) {
-                        uint32_t events = *(uint32_t *)(uintptr_t)a3;
-                        uint64_t data;
-                        memcpy(&data, (const void *)((uintptr_t)a3 + G_EPEV_DOFF), sizeof(data));
-                        if (a1 == HL_LINUX_EPOLL_ADD && watch != NULL) epoll_result = -EEXIST;
-                        else if (a1 == HL_LINUX_EPOLL_MODIFY && watch == NULL) epoll_result = -ENOENT;
+                        uint8_t encoded[G_EPEV_DOFF + sizeof(uint64_t)];
+                        uint32_t events = 0;
+                        uint64_t data = 0;
+                        if (guest_copy_from(encoded, a3, sizeof(encoded)) != (ssize_t)sizeof(encoded)) {
+                            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                            return 1;
+                        }
+                        memcpy(&events, encoded, sizeof(events));
+                        memcpy(&data, encoded + G_EPEV_DOFF, sizeof(data));
+                        if (a1 == HL_LINUX_EPOLL_ADD && watch != NULL)
+                            epoll_result = -EEXIST;
+                        else if (a1 == HL_LINUX_EPOLL_MODIFY && watch == NULL)
+                            epoll_result = -ENOENT;
                         else {
                             uint32_t interests = ((events & 0x1u) ? HL_LINUX_READY_READ : 0u) |
                                                  ((events & 0x4u) ? HL_LINUX_READY_WRITE : 0u);
@@ -2347,7 +2568,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                             ep_wake_arm((int)a0);
                             epoll_result = 0;
                         }
-                    } else epoll_result = -EINVAL;
+                    } else
+                        epoll_result = -EINVAL;
                     G_RET(c) = (uint64_t)epoll_result;
                     return 1;
                 }
@@ -2367,9 +2589,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     if (!source_bound) return 0;
     switch (nr) {
-    case 7:   /* fsetxattr */
-    case 10:  /* fgetxattr */
-    case 13:  /* flistxattr */
+    case 7:    /* fsetxattr */
+    case 10:   /* fgetxattr */
+    case 13:   /* flistxattr */
     case 16: { /* fremovexattr */
         char path[HL_LINUX_PATH_MAX + 1];
         hl_host_result named;
@@ -2446,10 +2668,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             break;
         }
         if ((a2 & UINT64_C(0x200)) != 0) {
-            result = bound_host_error(g_host_services->file
-                                          ->remove_directory(g_host_services->context, source.host_handle, path,
-                                                             path_size)
-                                          .status);
+            result = bound_host_error(
+                g_host_services->file->remove_directory(g_host_services->context, source.host_handle, path, path_size)
+                    .status);
         } else if (g_host_services->file->unlink_relative == NULL) {
             result = -ENOSYS;
         } else {
@@ -2469,16 +2690,17 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -EINVAL;
             break;
         }
+        char first_path_byte;
         if (nr == 452 && (flags & UINT64_C(0x1000)) != 0 && a1 != 0 &&
-            host_range_mapped((uintptr_t)a1, 1) && *(const char *)(uintptr_t)a1 == '\0') {
+            guest_copy_from(&first_path_byte, a1, 1) == 1 && first_path_byte == '\0') {
             if (g_host_services->file->set_permissions == NULL) {
                 result = -ENOSYS;
                 break;
             }
-            result = bound_host_error(g_host_services->file
-                                          ->set_permissions(g_host_services->context, source.host_handle,
-                                                            (uint32_t)a2 & 07777u)
-                                          .status);
+            result = bound_host_error(
+                g_host_services->file
+                    ->set_permissions(g_host_services->context, source.host_handle, (uint32_t)a2 & 07777u)
+                    .status);
             break;
         }
         result = bound_path_copy(a1, path, &path_size);
@@ -2544,7 +2766,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -EINVAL;
             break;
         }
-        if (!host_range_mapped((uintptr_t)a2, GUEST_LINUX_STAT_BYTES)) {
+        if (guest_accessible_prefix(a2, GUEST_LINUX_STAT_BYTES, HL_LOGICAL_VMA_WRITE) != GUEST_LINUX_STAT_BYTES) {
             result = -EFAULT;
             break;
         }
@@ -2566,8 +2788,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 if (measured <= 0) {
                     result = -ENOENT;
                 } else {
-                    fill_linux_stat((uint8_t *)(uintptr_t)a2, &status, NULL, -1);
-                    result = 0;
+                    result = guest_fill_linux_stat(a2, &status, NULL, -1);
                 }
                 break;
             }
@@ -2595,16 +2816,20 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             hl_linux_fd_snapshot target_snapshot = {.host_handle = target};
             bound_status_from_metadata(&status, &metadata);
             bound_virtualize_owner(&target_snapshot, &status);
-            fill_linux_bound_stat((uint8_t *)(uintptr_t)a2, &status);
-            result = 0;
+            uint8_t encoded[GUEST_LINUX_STAT_BYTES];
+            fill_linux_bound_stat(encoded, &status);
+            result = guest_copy_to(a2, encoded, sizeof encoded) == sizeof encoded ? 0 : -EFAULT;
         }
         if (close_target) (void)g_host_services->file->close(g_host_services->context, target);
         break;
     }
     case 78: {
         char path[HL_LINUX_PATH_MAX + 1];
+        char output[HL_LINUX_PATH_MAX];
         size_t path_size;
-        if (a3 == 0 || a3 > SIZE_MAX || !host_range_mapped((uintptr_t)a2, (size_t)a3)) {
+        size_t capacity = a3 < sizeof output ? (size_t)a3 : sizeof output;
+        if (a3 == 0 || a3 > SIZE_MAX ||
+            guest_accessible_prefix(a2, capacity, HL_LOGICAL_VMA_WRITE) != capacity) {
             result = a3 == 0 ? -EINVAL : -EFAULT;
             break;
         }
@@ -2619,8 +2844,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             break;
         }
         hl_host_result read = g_host_services->file->readlink(g_host_services->context, opened.value,
-                                                              (hl_host_bytes){(void *)(uintptr_t)a2, (size_t)a3});
+                                                              (hl_host_bytes){output, capacity});
         result = read.status == HL_STATUS_OK ? (int64_t)read.value : bound_host_error(read.status);
+        if (result > 0 && guest_copy_to(a2, output, (size_t)result) != result) result = -EFAULT;
         (void)g_host_services->file->close(g_host_services->context, opened.value);
         break;
     }
@@ -2682,8 +2908,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             hl_linux_fd_snapshot opened;
             hl_host_file_metadata metadata = {0};
             uint32_t kind = HL_HOST_FD_OTHER;
-            if (bound_snapshot((uint64_t)result, &opened) && g_host_services != NULL &&
-                g_host_services->file != NULL && g_host_services->file->metadata != NULL &&
+            if (bound_snapshot((uint64_t)result, &opened) && g_host_services != NULL && g_host_services->file != NULL &&
+                g_host_services->file->metadata != NULL &&
                 g_host_services->file->metadata(g_host_services->context, opened.host_handle, &metadata).status ==
                     HL_STATUS_OK) {
                 if (metadata.type == HL_HOST_FILE_TYPE_REGULAR || metadata.type == HL_HOST_FILE_TYPE_DIRECTORY ||
@@ -2694,8 +2920,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 else if (metadata.type == HL_HOST_FILE_TYPE_SOCKET)
                     kind = HL_HOST_FD_SOCKET;
             }
-            proc_fdvis_reservation_publish(&fdvis, (int)result, kind, metadata.stable_device,
-                                           metadata.stable_object);
+            proc_fdvis_reservation_publish(&fdvis, (int)result, kind, metadata.stable_device, metadata.stable_object);
         }
         break;
     }
@@ -2718,43 +2943,28 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         break;
     case 62: result = hl_linux_lseek(g_linux_box, source.fd, (int64_t)a1, (int32_t)a2); break;
     case 63:
-        if (a2 != 0 && !host_range_mapped((uintptr_t)a1, (size_t)a2))
-            result = -EFAULT;
-        else
-            result = hl_linux_read(g_linux_box, source.fd, (void *)(uintptr_t)a1, (size_t)a2);
+        result = bound_guest_read(&source, a1, (size_t)a2, 0, 0);
         break;
     case 64:
-        if (a2 != 0 && !host_range_mapped((uintptr_t)a1, (size_t)a2))
-            result = -EFAULT;
-        else {
+        {
             int64_t allowed = bound_fsize_gate(c, &source, source.offset, a2); // RLIMIT_FSIZE -> SIGXFSZ/EFBIG
-            result = allowed < 0 ? allowed
-                                 : hl_linux_write(g_linux_box, source.fd, (const void *)(uintptr_t)a1, (size_t)allowed);
+            result = allowed < 0 ? allowed : bound_guest_write(&source, a1, (size_t)allowed, 0, 0);
         }
         break;
     case 67:
-        if (a2 != 0 && !host_range_mapped((uintptr_t)a1, (size_t)a2))
-            result = -EFAULT;
-        else
-            result = hl_linux_pread64(g_linux_box, source.fd, (void *)(uintptr_t)a1, (size_t)a2, a3);
+        result = bound_guest_read(&source, a1, (size_t)a2, a3, 1);
         break;
     case 68:
-        if (a2 != 0 && !host_range_mapped((uintptr_t)a1, (size_t)a2))
-            result = -EFAULT;
-        else if (source.status_flags & HL_LINUX_O_APPEND) {
+        if (source.status_flags & HL_LINUX_O_APPEND) {
             // Linux quirk: pwrite() on an O_APPEND fd IGNORES the supplied offset and appends at EOF (the
             // append is atomic, driven by the file's O_APPEND status flag, not the position argument). The
             // typed path honored a3 and overwrote, so route an O_APPEND pwrite through the appending write.
             int64_t allowed = bound_fsize_gate(c, &source, source.offset, a2);
-            result = allowed < 0
-                         ? allowed
-                         : hl_linux_write(g_linux_box, source.fd, (const void *)(uintptr_t)a1, (size_t)allowed);
+            result = allowed < 0 ? allowed : bound_guest_write(&source, a1, (size_t)allowed, 0, 0);
             if (result > 0) bound_mapping_file_written(&source, source.offset, (uint64_t)result);
         } else {
             int64_t allowed = bound_fsize_gate(c, &source, a3, a2); // RLIMIT_FSIZE at the explicit pwrite offset
-            result = allowed < 0
-                         ? allowed
-                         : hl_linux_pwrite64(g_linux_box, source.fd, (const void *)(uintptr_t)a1, (size_t)allowed, a3);
+            result = allowed < 0 ? allowed : bound_guest_write(&source, a1, (size_t)allowed, a3, 1);
             if (result > 0) bound_mapping_file_written(&source, a3, (uint64_t)result);
         }
         break;
@@ -2765,14 +2975,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         static _Thread_local hl_host_iovec vectors[HL_LINUX_IOV_MAX];
         result = bound_vectors_copy(a1, a2, vectors);
         if (result != 0) break;
-        if (nr == 65)
-            result = hl_linux_readv(g_linux_box, source.fd, vectors, (uint32_t)a2);
-        else if (nr == 66)
-            result = hl_linux_writev(g_linux_box, source.fd, vectors, (uint32_t)a2);
-        else if (nr == 69)
-            result = hl_linux_preadv(g_linux_box, source.fd, vectors, (uint32_t)a2, a3);
-        else
-            result = hl_linux_pwritev(g_linux_box, source.fd, vectors, (uint32_t)a2, a3);
+        result = bound_vector_io(&source, vectors, (uint32_t)a2, nr == 65 || nr == 69, nr == 69 || nr == 70, a3);
         break;
     }
     case 213: {
@@ -2807,12 +3010,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -95; /* Linux EOPNOTSUPP; macOS's native value is 102. */
             break;
         }
-        if (vector_offset == UINT64_MAX)
-            result = nr == 286 ? hl_linux_readv(g_linux_box, source.fd, vectors, (uint32_t)a2)
-                               : hl_linux_writev(g_linux_box, source.fd, vectors, (uint32_t)a2);
-        else
-            result = nr == 286 ? hl_linux_preadv(g_linux_box, source.fd, vectors, (uint32_t)a2, vector_offset)
-                               : hl_linux_pwritev(g_linux_box, source.fd, vectors, (uint32_t)a2, vector_offset);
+        result = bound_vector_io(&source, vectors, (uint32_t)a2, nr == 286, vector_offset != UINT64_MAX,
+                                 vector_offset);
         if (nr == 287 && result > 0)
             bound_mapping_file_written(&source, vector_offset == UINT64_MAX ? source.offset : vector_offset,
                                        (uint64_t)result);
@@ -2853,8 +3052,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             bound_mapping_file_size_changed(&source, &metadata, 1, metadata.size, a1, NULL);
             pthread_mutex_unlock(&g_bound_mapping_lock);
             pthread_mutex_unlock(&g_bound_mapping_gate);
-            hl_linux_file_event_publish(HL_LINUX_FILE_EVENT_RESIZE, metadata.stable_device,
-                                        metadata.stable_object, metadata.size, a1);
+            hl_linux_file_event_publish(HL_LINUX_FILE_EVENT_RESIZE, metadata.stable_device, metadata.stable_object,
+                                        metadata.size, a1);
         }
         if (prepared) { gbus_prepare_release(); }
         break;
@@ -2865,8 +3064,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
            rejects the sync family through it with EBADF (fs/sync.c). */
         result = (source.status_flags & HL_LINUX_O_PATH) != 0
                      ? -EBADF
-                     : (nr == 82 ? hl_linux_fsync(g_linux_box, source.fd)
-                                 : hl_linux_fdatasync(g_linux_box, source.fd));
+                     : (nr == 82 ? hl_linux_fsync(g_linux_box, source.fd) : hl_linux_fdatasync(g_linux_box, source.fd));
         break;
     case 84:
         if ((G_A3(c) & ~(uint64_t)7u) != 0)
@@ -2878,27 +3076,33 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 80: {
         hl_linux_file_status status;
         result = hl_linux_fstat(g_linux_box, source.fd, &status);
-        if (result == 0 && !host_range_mapped((uintptr_t)a1, GUEST_LINUX_STAT_BYTES)) result = -EFAULT;
+        if (result == 0 &&
+            guest_accessible_prefix(a1, GUEST_LINUX_STAT_BYTES, HL_LOGICAL_VMA_WRITE) != GUEST_LINUX_STAT_BYTES)
+            result = -EFAULT;
         if (result == 0) bound_virtualize_owner(&source, &status);
-        if (result == 0) fill_linux_bound_stat((uint8_t *)(uintptr_t)a1, &status);
+        if (result == 0) {
+            uint8_t encoded[GUEST_LINUX_STAT_BYTES];
+            fill_linux_bound_stat(encoded, &status);
+            if (guest_copy_to(a1, encoded, sizeof encoded) != sizeof encoded) result = -EFAULT;
+        }
         break;
     }
     case 291: {
-        const char *path = (const char *)(uintptr_t)a1;
         uint64_t flags = a2;
         uint64_t mask = a3;
         uint64_t output = G_A4(c);
+        char path_byte;
         if ((flags & ~UINT64_C(0x7900)) != 0 || (flags & UINT64_C(0x6000)) == UINT64_C(0x6000) ||
             (mask & UINT64_C(0x80000000)) != 0) {
             result = -EINVAL;
             break;
         }
-        if (path == NULL || !host_range_mapped((uintptr_t)path, 1)) {
+        if (a1 == 0 || guest_copy_from(&path_byte, a1, 1) != 1) {
             result = -EFAULT;
             break;
         }
-        if (path[0] != 0 || (flags & UINT64_C(0x1000)) == 0) return 0;
-        if (!host_range_mapped((uintptr_t)output, 256)) {
+        if (path_byte != 0 || (flags & UINT64_C(0x1000)) == 0) return 0;
+        if (guest_accessible_prefix(output, 256, HL_LOGICAL_VMA_WRITE) != 256) {
             result = -EFAULT;
             break;
         }
@@ -2906,7 +3110,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         result = hl_linux_fstat(g_linux_box, source.fd, &status);
         if (result == 0) {
             bound_virtualize_owner(&source, &status);
-            bound_fill_statx((uint8_t *)(uintptr_t)output, &status);
+            uint8_t encoded[256];
+            bound_fill_statx(encoded, &status);
+            if (guest_copy_to(output, encoded, sizeof encoded) != sizeof encoded) result = -EFAULT;
         }
         break;
     }
@@ -2922,12 +3128,13 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = bound_host_error(status.status);
             break;
         }
-        if (!host_range_mapped((uintptr_t)a1, 120)) {
+        if (guest_accessible_prefix(a1, 120, HL_LOGICAL_VMA_WRITE) != 120) {
             result = -EFAULT;
             break;
         }
-        bound_fill_statfs((uint8_t *)(uintptr_t)a1, &metadata);
-        result = 0;
+        uint8_t encoded[120];
+        bound_fill_statfs(encoded, &metadata);
+        result = guest_copy_to(a1, encoded, sizeof encoded) == sizeof encoded ? 0 : -EFAULT;
         break;
     }
     case 47: {
@@ -3029,7 +3236,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     case 88: {
         hl_host_file_time times[2];
-        const struct timespec *guest = (const struct timespec *)(uintptr_t)a2;
+        struct timespec guest_times[2];
+        const struct timespec *guest = a2 ? guest_times : NULL;
         char relative[HL_LINUX_PATH_MAX + 1];
         size_t relative_size = 0;
         hl_host_handle target = source.host_handle;
@@ -3063,7 +3271,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -ENOSYS;
             goto bound_set_times_done;
         }
-        if (guest != NULL && !host_range_mapped((uintptr_t)guest, sizeof(struct timespec) * 2)) {
+        if (guest != NULL && guest_copy_from(guest_times, a2, sizeof guest_times) != sizeof guest_times) {
             result = -EFAULT;
             goto bound_set_times_done;
         }
@@ -3103,29 +3311,40 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     }
     case 29: {
         uint32_t request = (uint32_t)a1;
+        uint64_t guest_argument = a2;
+        uint8_t argument[44] = {0};
+        size_t argument_size = 0;
+        int argument_input = 0, argument_output = 0;
+        if (request == 0x5401u) argument_size = 36, argument_output = 1;
+        if (request >= 0x5402u && request <= 0x5404u) argument_size = 36, argument_input = 1;
+        if (request == 0x802c542au) argument_size = 44, argument_output = 1;
+        if (request >= 0x402c542bu && request <= 0x402c542du) argument_size = 44, argument_input = 1;
+        if (request == 0x5413u) argument_size = sizeof(struct winsize), argument_output = 1;
+        if (request == 0x5414u) argument_size = sizeof(struct winsize), argument_input = 1;
+        if (request == 0x5421u || request == 0x5410u) argument_size = sizeof(int), argument_input = 1;
+        if (request == 0x541bu || request == 0x540fu) argument_size = sizeof(int), argument_output = 1;
+        if (argument_input && guest_copy_from(argument, guest_argument, argument_size) != (ssize_t)argument_size) {
+            result = -EFAULT;
+            break;
+        }
+        if (argument_size) a2 = (uint64_t)(uintptr_t)argument;
         if (request == 0x5451u || request == 0x5450u) { /* FIOCLEX / FIONCLEX */
             result =
                 hl_linux_fcntl(g_linux_box, source.fd, HL_LINUX_F_SETFD, request == 0x5451u ? HL_LINUX_FD_CLOEXEC : 0);
         } else if (request == 0x5421u) { /* FIONBIO */
-            if (!host_range_mapped((uintptr_t)a2, sizeof(int))) {
-                result = -EFAULT;
-                break;
-            }
+            int enabled = 0;
+            memcpy(&enabled, argument, sizeof(enabled));
             int64_t flags = hl_linux_fcntl(g_linux_box, source.fd, HL_LINUX_F_GETFL, 0);
             if (flags < 0) {
                 result = flags;
                 break;
             }
-            if (*(const int *)(uintptr_t)a2)
+            if (enabled)
                 flags |= HL_LINUX_O_NONBLOCK;
             else
                 flags &= ~(int64_t)HL_LINUX_O_NONBLOCK;
             result = hl_linux_fcntl(g_linux_box, source.fd, HL_LINUX_F_SETFL, (uint64_t)flags);
         } else if (request == 0x541bu) { /* FIONREAD */
-            if (!host_range_mapped((uintptr_t)a2, sizeof(int))) {
-                result = -EFAULT;
-                break;
-            }
             hl_host_file_metadata metadata;
             hl_host_result status =
                 g_host_services->file->metadata(g_host_services->context, source.host_handle, &metadata);
@@ -3136,13 +3355,13 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 result = metadata.type != HL_HOST_FILE_TYPE_REGULAR ? -ENOTTY : offset;
             else {
                 uint64_t available = metadata.size > (uint64_t)offset ? metadata.size - (uint64_t)offset : 0;
-                *(int *)(uintptr_t)a2 = available > INT_MAX ? INT_MAX : (int)available;
+                int encoded = available > INT_MAX ? INT_MAX : (int)available;
+                memcpy(argument, &encoded, sizeof(encoded));
                 result = 0;
             }
-        } else if (request == 0x5401u || request == 0x5402u || request == 0x5403u ||
-                   request == 0x5404u || request == 0x5413u || request == 0x5414u ||
-                   request == 0x540fu || request == 0x5410u || request == 0x540eu ||
-                   request == 0x802c542au || request == 0x402c542bu || request == 0x402c542cu ||
+        } else if (request == 0x5401u || request == 0x5402u || request == 0x5403u || request == 0x5404u ||
+                   request == 0x5413u || request == 0x5414u || request == 0x540fu || request == 0x5410u ||
+                   request == 0x540eu || request == 0x802c542au || request == 0x402c542bu || request == 0x402c542cu ||
                    request == 0x402c542du) {
             int native_fd = -1;
             int borrowed = bound_attachment_borrow((int)source.fd, &native_fd);
@@ -3152,15 +3371,13 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             }
             if (request == 0x5401u) { /* TCGETS */
                 struct termios native;
-                if (!host_range_mapped((uintptr_t)a2, 36))
-                    result = -EFAULT;
-                else if (tcgetattr(native_fd, &native) != 0)
+                if (tcgetattr(native_fd, &native) != 0)
                     result = -errno;
                 else {
 #if defined(__linux__)
-                    memcpy((void *)(uintptr_t)a2, &native, 36);
+                    memcpy(argument, &native, 36);
 #else
-                    termios_m2l(&native, (uint8_t *)(uintptr_t)a2);
+                    termios_m2l(&native, argument);
 #endif
                     result = 0;
                 }
@@ -3169,79 +3386,69 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                  * byte-identical to the aarch64 guest ABI, so preserve the extended speed fields and
                  * forward the complete request. macOS has no termios2 request, so translate its native
                  * termios and explicitly populate the two Linux speed fields. */
-                if (!host_range_mapped((uintptr_t)a2, 44))
-                    result = -EFAULT;
 #if defined(__linux__)
-                else
-                    result = ioctl(native_fd, request, (void *)(uintptr_t)a2) == 0 ? 0 : -errno;
+                result = ioctl(native_fd, request, argument) == 0 ? 0 : -errno;
 #else
-                else {
+                {
                     struct termios native;
                     if (tcgetattr(native_fd, &native) != 0)
                         result = -errno;
                     else {
-                        termios_m2l(&native, (uint8_t *)(uintptr_t)a2);
-                        *(uint32_t *)((uint8_t *)(uintptr_t)a2 + 36) = (uint32_t)cfgetispeed(&native);
-                        *(uint32_t *)((uint8_t *)(uintptr_t)a2 + 40) = (uint32_t)cfgetospeed(&native);
+                        uint32_t input_speed = (uint32_t)cfgetispeed(&native);
+                        uint32_t output_speed = (uint32_t)cfgetospeed(&native);
+                        termios_m2l(&native, argument);
+                        memcpy(argument + 36, &input_speed, sizeof(input_speed));
+                        memcpy(argument + 40, &output_speed, sizeof(output_speed));
                         result = 0;
                     }
                 }
 #endif
             } else if (request >= 0x402c542bu && request <= 0x402c542du) { /* TCSETS2/W2/F2 */
-                if (!host_range_mapped((uintptr_t)a2, 44))
-                    result = -EFAULT;
 #if defined(__linux__)
-                else
-                    result = ioctl(native_fd, request, (void *)(uintptr_t)a2) == 0 ? 0 : -errno;
+                result = ioctl(native_fd, request, argument) == 0 ? 0 : -errno;
 #else
-                else {
+                {
                     struct termios native;
-                    termios_l2m((const uint8_t *)(uintptr_t)a2, &native);
-                    (void)cfsetispeed(&native, *(const uint32_t *)((const uint8_t *)(uintptr_t)a2 + 36));
-                    (void)cfsetospeed(&native, *(const uint32_t *)((const uint8_t *)(uintptr_t)a2 + 40));
-                    int action = request == 0x402c542bu ? TCSANOW
-                               : request == 0x402c542cu ? TCSADRAIN
-                                                        : TCSAFLUSH;
+                    uint32_t input_speed, output_speed;
+                    termios_l2m(argument, &native);
+                    memcpy(&input_speed, argument + 36, sizeof(input_speed));
+                    memcpy(&output_speed, argument + 40, sizeof(output_speed));
+                    (void)cfsetispeed(&native, input_speed);
+                    (void)cfsetospeed(&native, output_speed);
+                    int action = request == 0x402c542bu ? TCSANOW : request == 0x402c542cu ? TCSADRAIN : TCSAFLUSH;
                     result = tcsetattr(native_fd, action, &native) == 0 ? 0 : -errno;
                 }
 #endif
             } else if (request >= 0x5402u && request <= 0x5404u) { /* TCSETS{,W,F} */
                 struct termios native;
-                if (!host_range_mapped((uintptr_t)a2, 36))
-                    result = -EFAULT;
-                else {
+                {
 #if defined(__linux__)
                     memset(&native, 0, sizeof(native));
-                    memcpy(&native, (const void *)(uintptr_t)a2, 36);
+                    memcpy(&native, argument, 36);
 #else
-                    termios_l2m((const uint8_t *)(uintptr_t)a2, &native);
+                    termios_l2m(argument, &native);
 #endif
                     int action = request == 0x5402u ? TCSANOW : request == 0x5403u ? TCSADRAIN : TCSAFLUSH;
                     result = tcsetattr(native_fd, action, &native) == 0 ? 0 : -errno;
                 }
             } else if (request == 0x5413u || request == 0x5414u) { /* TIOCGWINSZ/TIOCSWINSZ */
-                if (!host_range_mapped((uintptr_t)a2, sizeof(struct winsize)))
-                    result = -EFAULT;
-                else
-                    result = ioctl(native_fd, request == 0x5413u ? TIOCGWINSZ : TIOCSWINSZ,
-                                   (void *)(uintptr_t)a2) == 0 ? 0 : -errno;
+                result = ioctl(native_fd, request == 0x5413u ? TIOCGWINSZ : TIOCSWINSZ, argument) == 0 ? 0 : -errno;
             } else if (request == 0x540fu) { /* TIOCGPGRP */
-                if (!host_range_mapped((uintptr_t)a2, sizeof(int)))
-                    result = -EFAULT;
-                else {
+                {
                     pid_t group = tcgetpgrp(native_fd);
                     if (group < 0)
                         result = -errno;
                     else {
-                        *(int *)(uintptr_t)a2 = group == g_init_hostpid ? 1 : (int)group;
+                        int encoded = group == g_init_hostpid ? 1 : (int)group;
+                        memcpy(argument, &encoded, sizeof(encoded));
                         result = 0;
                     }
                 }
             } else if (request == 0x5410u) { /* TIOCSPGRP */
-                if (!host_range_mapped((uintptr_t)a2, sizeof(int)))
-                    result = -EFAULT;
-                else {
-                    pid_t group = *(const int *)(uintptr_t)a2;
+                {
+                    int encoded;
+                    memcpy(&encoded, argument, sizeof(encoded));
+                    pid_t group = encoded;
                     if (group == 1 && g_init_hostpid) group = g_init_hostpid;
                     result = tcsetpgrp(native_fd, group) == 0 ? 0 : -errno;
                 }
@@ -3252,6 +3459,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         } else {
             result = -ENOTTY;
         }
+        if (result >= 0 && argument_output &&
+            guest_copy_to(guest_argument, argument, argument_size) != (ssize_t)argument_size)
+            result = -EFAULT;
         break;
     }
     case 61: {
@@ -3260,7 +3470,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -EINVAL;
             break;
         }
-        if (a1 == 0 || byte_capacity > SIZE_MAX || !host_range_mapped((uintptr_t)a1, (size_t)byte_capacity)) {
+        if (a1 == 0 || byte_capacity > SIZE_MAX ||
+            guest_accessible_prefix(a1, (size_t)byte_capacity, HL_LOGICAL_VMA_WRITE) != byte_capacity) {
             result = -EFAULT;
             break;
         }
@@ -3282,7 +3493,12 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             free(entries);
             break;
         }
-        uint8_t *output = (uint8_t *)(uintptr_t)a1;
+        uint8_t *output = calloc(1, (size_t)byte_capacity);
+        if (output == NULL) {
+            free(entries);
+            result = -ENOMEM;
+            break;
+        }
         size_t used = 0;
         result = 0;
         for (uint32_t index = 0; index < (uint32_t)read.value; ++index) {
@@ -3300,7 +3516,12 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             memcpy(record + 19, entries[index].name, entries[index].name_size);
             used += record_size;
         }
-        if (result == 0) result = (int64_t)used;
+        if (result == 0 &&
+            guest_copy_to(a1, output, used) != (ssize_t)used)
+            result = -EFAULT;
+        else if (result == 0)
+            result = (int64_t)used;
+        free(output);
         free(entries);
         break;
     }
@@ -3356,8 +3577,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                     else if (metadata.type == HL_HOST_FILE_TYPE_SOCKET)
                         kind = HL_HOST_FD_SOCKET;
                 }
-                proc_fdvis_reservation_publish(&fdvis, target, kind, metadata.stable_device,
-                                               metadata.stable_object);
+                proc_fdvis_reservation_publish(&fdvis, target, kind, metadata.stable_device, metadata.stable_object);
             }
         }
         break;
@@ -3370,16 +3590,17 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 result = bound_dup_at_least(source.fd, (int)a2,
                                             (int32_t)a1 == HL_LINUX_F_DUPFD_CLOEXEC ? HL_LINUX_FD_CLOEXEC : 0);
         } else if (a1 == 5 || a1 == 6 || a1 == 7) {
-            uint8_t *lock = (uint8_t *)(uintptr_t)a2;
+            uint8_t lock[32];
             hl_host_file_metadata metadata;
             hl_host_result status;
             int64_t current = 0;
             int lock_result = 0;
-            if (!host_range_mapped((uintptr_t)lock, 32)) {
+            if (guest_copy_from(lock, a2, sizeof(lock)) != (ssize_t)sizeof(lock)) {
                 result = -EFAULT;
                 break;
             }
-            short whence = *(short *)(lock + 2);
+            short whence;
+            memcpy(&whence, lock + 2, sizeof(whence));
             if (whence != SEEK_SET && whence != SEEK_CUR && whence != SEEK_END) {
                 result = -EINVAL;
                 break;
@@ -3427,6 +3648,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             /* poslk_apply is shared with the legacy Darwin syscall path and therefore reports native
              * errno numbers. This typed route bypasses svc_done(), so translate at this boundary. */
             result = lock_result < 0 ? -hl_linux_errno_from_macos(-lock_result) : lock_result;
+            if (result == 0 && a1 == 5 && guest_copy_to(a2, lock, sizeof(lock)) != (ssize_t)sizeof(lock))
+                result = -EFAULT;
         } else if ((int32_t)a1 == HL_LINUX_F_SETFL) {
             // O_DIRECT is a settable status flag whose bit is arch-specific (G_O_DIRECT: aarch64 0x10000 --
             // which aliases HL_LINUX_O_DIRECTORY -- vs x86-64 0x4000). Normalize the guest's arch bit to the
@@ -3462,8 +3685,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         break;
     case 285: {
         hl_linux_fd_snapshot output;
-        off_t *input_offset = (off_t *)(uintptr_t)a1;
-        off_t *output_offset = (off_t *)(uintptr_t)a3;
+        off_t input_value = 0, output_value = 0;
+        off_t *input_offset = a1 != 0 ? &input_value : NULL;
+        off_t *output_offset = a3 != 0 ? &output_value : NULL;
         size_t done = 0;
         char buffer[8192];
         result = 0;
@@ -3477,8 +3701,9 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -ENOSYS;
             break;
         }
-        if ((input_offset && !host_range_mapped((uintptr_t)input_offset, sizeof(*input_offset))) ||
-            (output_offset && !host_range_mapped((uintptr_t)output_offset, sizeof(*output_offset)))) {
+        if ((input_offset && guest_copy_from(input_offset, a1, sizeof(*input_offset)) != (ssize_t)sizeof(*input_offset)) ||
+            (output_offset &&
+             guest_copy_from(output_offset, a3, sizeof(*output_offset)) != (ssize_t)sizeof(*output_offset))) {
             result = -EFAULT;
             break;
         }
@@ -3505,6 +3730,11 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = (int64_t)done;
             if (nr_written < nr_read) break;
         }
+        if (result >= 0 &&
+            ((input_offset && guest_copy_to(a1, input_offset, sizeof(*input_offset)) != (ssize_t)sizeof(*input_offset)) ||
+             (output_offset &&
+              guest_copy_to(a3, output_offset, sizeof(*output_offset)) != (ssize_t)sizeof(*output_offset))))
+            result = done != 0 ? (int64_t)done : -EFAULT;
         break;
     }
     case 20: return 0; /* epoll_create1: a0 is flags, not an fd */

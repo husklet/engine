@@ -7,8 +7,9 @@
 #include "../../src/translator/guest/x86_64/lower/primitives.h"
 
 typedef struct calls {
-    int loads, stores, alus, narrows, locks, constants, inserts, bytes, writebacks;
+    int loads, stores, alus, narrows, locks, constants, inserts, bytes, writebacks, commits;
     int kind, destination, left, right, width, memory, value, constant_value;
+    uint32_t required;
 } calls;
 
 static calls seen;
@@ -50,11 +51,25 @@ int rm_load(struct insn *insn, uint64_t next, int width, int *is_memory) {
     return loaded;
 }
 
+int rm_load_access(struct insn *insn, uint64_t next, int width, int *is_memory, uint32_t required) {
+    seen.required = required;
+    return rm_load(insn, next, width, is_memory);
+}
+
 void rm_store(struct insn *insn, int width, int value) {
     (void)insn;
     seen.stores++;
     seen.width = width;
     seen.value = value;
+}
+
+void rm_store_after_guard(struct insn *insn, int width, int value) {
+    rm_store(insn, width, value);
+}
+
+void emit_soft_store_commit(uint64_t size) {
+    seen.commits++;
+    seen.width = (int)size;
 }
 
 int xaludirect_on(void) {
@@ -154,6 +169,8 @@ int main(void) {
     lock_succeeds = 1;
     HL_CHECK(hl_x86_lower_alu(&insn, 0x1000) == TX_NEXT);
     HL_CHECK(seen.locks == 1 && seen.alus == 0 && seen.stores == 0);
+    HL_CHECK(seen.required == (X86_SOFT_READ | X86_SOFT_WRITE));
+    HL_CHECK(seen.commits == 1 && seen.width == 8);
 
     /* Group-1 immediate forwards the exact immediate and stores a memory result. */
     reset();
@@ -165,6 +182,7 @@ int main(void) {
     HL_CHECK(hl_x86_lower_alu(&insn, 0x1000) == TX_NEXT);
     HL_CHECK(seen.constants == 1 && seen.constant_value == -7 && seen.kind == 6);
     HL_CHECK(seen.alus == 1 && seen.destination == 16 && seen.stores == 1);
+    HL_CHECK(seen.required == (X86_SOFT_READ | X86_SOFT_WRITE));
 
     /* TEST computes flags only. */
     reset();

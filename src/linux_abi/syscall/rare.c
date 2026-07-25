@@ -17,8 +17,8 @@
 static int mq_check_timeout(uint64_t p, struct timespec *dl, int *have_dl) {
     *have_dl = 0;
     if (!p) return 0;
-    if (gna_hit(p, 16)) return -EFAULT;
-    const long *ts = (const long *)(uintptr_t)p;
+    long ts[2];
+    if (guest_copy_from(ts, p, sizeof(ts)) != sizeof(ts)) return -EFAULT;
     long sec = ts[0], nsec = ts[1];
     if (nsec < 0 || nsec >= 1000000000L || sec < 0) return -EINVAL;
     dl->tv_sec = sec;
@@ -185,16 +185,14 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if (enumerated && open_count != 0) {
             size_t capacity = open_count;
             open_fds = calloc(capacity, sizeof *open_fds);
-            if (open_fds == NULL ||
-                !hl_host_process_fds((int64_t)getpid(), open_fds, capacity, &open_count)) {
+            if (open_fds == NULL || !hl_host_process_fds((int64_t)getpid(), open_fds, capacity, &open_count)) {
                 free(open_fds);
                 open_fds = NULL;
                 enumerated = 0;
             } else if (open_count > capacity) {
                 capacity = open_count;
                 hl_host_process_fd *larger = realloc(open_fds, capacity * sizeof *open_fds);
-                if (larger == NULL ||
-                    !hl_host_process_fds((int64_t)getpid(), larger, capacity, &open_count)) {
+                if (larger == NULL || !hl_host_process_fds((int64_t)getpid(), larger, capacity, &open_count)) {
                     free(larger == NULL ? open_fds : larger);
                     open_fds = NULL;
                     enumerated = 0;
@@ -349,13 +347,34 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // through the existing fd table and the kernel enforces access mode, RLIMIT_MSGQUEUE, geometry, and
         // the ENOENT/EEXIST/ENAMETOOLONG/EINVAL errno order natively — identical to the native oracle. The
         // #else in-process broker below backs the macOS build (Darwin has no POSIX mqueue kernel object).
-        long r = syscall(SYS_mq_open, (const char *)a0, (int)a1, (unsigned)a2, (const void *)a3);
+        char name[258];
+        int copied_name = guest_copy_string(name, sizeof(name), a0);
+        if (copied_name < 0) {
+            G_RET(c) = (uint64_t)(int64_t)copied_name;
+            break;
+        }
+        long attr[8], *attrp = NULL;
+        if (a3) {
+            if (guest_copy_from(attr, a3, sizeof(attr)) != (ssize_t)sizeof(attr)) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+            attrp = attr;
+        }
+        long r = syscall(SYS_mq_open, name, (int)a1, (unsigned)a2, attrp);
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : (uint64_t)r;
         break;
 #else
-        const char *name = (const char *)a0;
+        char name_storage[258];
+        int name_result = guest_copy_string(name_storage, sizeof(name_storage), a0);
+        if (name_result < 0) {
+            G_RET(c) = (uint64_t)(int64_t)name_result;
+            break;
+        }
+        const char *name = name_storage;
         int oflag = (int)a1;
-        const long *at = (const long *)a3; // struct mq_attr: {flags, maxmsg, msgsize, curmsgs, ...}
+        long attr_storage[4];
+        const long *at = NULL; // struct mq_attr: {flags, maxmsg, msgsize, curmsgs, ...}
         if (!name) {
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
@@ -373,6 +392,13 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             if (!(oflag & 0x40)) { // O_CREAT
                 G_RET(c) = (uint64_t)(int64_t)(-ENOENT);
                 break;
+            }
+            if (a3) {
+                if (guest_copy_from(attr_storage, a3, sizeof(attr_storage)) != sizeof(attr_storage)) {
+                    G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                    break;
+                }
+                at = attr_storage;
             }
             // When creating with an explicit attr, mq_maxmsg and mq_msgsize must both be > 0 else EINVAL
             // (Linux validates the attr only on the create path; an existing queue ignores it).
@@ -411,7 +437,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         g_mqq[qi].refs++;
         g_mqfd_amode[fd] = (uint8_t)(oflag & O_ACCMODE); // remember O_RDONLY/O_WRONLY/O_RDWR for send/recv EBADF
-        mq_fd_setnb(fd, (oflag & MQ_O_NONBLOCK) != 0); // O_NONBLOCK is a per-descriptor mq_flag
+        mq_fd_setnb(fd, (oflag & MQ_O_NONBLOCK) != 0);   // O_NONBLOCK is a per-descriptor mq_flag
         G_RET(c) = (uint64_t)fd;
         break;
 #endif
@@ -419,11 +445,23 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // mq_unlink(name): mark removed; freed once the last descriptor is gone.
     case 181: {
 #if defined(__linux__)
-        long r = syscall(SYS_mq_unlink, (const char *)a0); // host object: ENOENT enforced by the kernel
+        char name[258];
+        int copied_name = guest_copy_string(name, sizeof(name), a0);
+        if (copied_name < 0) {
+            G_RET(c) = (uint64_t)(int64_t)copied_name;
+            break;
+        }
+        long r = syscall(SYS_mq_unlink, name); // host object: ENOENT enforced by the kernel
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
         break;
 #else
-        int qi = mq_find((const char *)a0);
+        char name[258];
+        int name_result = guest_copy_string(name, sizeof(name), a0);
+        if (name_result < 0) {
+            G_RET(c) = (uint64_t)(int64_t)name_result;
+            break;
+        }
+        int qi = mq_find(name);
         if (qi < 0) {
             G_RET(c) = (uint64_t)(int64_t)(-ENOENT);
             break;
@@ -446,8 +484,39 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // msg-buffer EFAULT, then full-queue O_NONBLOCK->EAGAIN / block-until-space-or-abs_timeout
         // (ETIMEDOUT) / EINTR — the exact native semantics, and a blocked send now wakes when ANY process
         // sharing the named queue drains it (real cross-process blocking, not the single-process broker).
-        long r = syscall(SYS_mq_timedsend, (int)a0, (const char *)a1, (size_t)a2, (unsigned)a3,
-                         (const struct timespec *)a4);
+        struct timespec timeout, *timeoutp = NULL;
+        if (a4) {
+            if (guest_copy_from(&timeout, a4, sizeof(timeout)) != (ssize_t)sizeof(timeout)) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+            timeoutp = &timeout;
+        }
+        if ((unsigned)a3 >= 32768) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
+        long attr[8] = {0};
+        if (syscall(SYS_mq_getsetattr, (int)a0, NULL, attr) < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-errno);
+            break;
+        }
+        if (attr[2] >= 0 && a2 > (uint64_t)attr[2]) {
+            G_RET(c) = (uint64_t)(int64_t)(-EMSGSIZE);
+            break;
+        }
+        char *message = malloc(a2 ? (size_t)a2 : 1);
+        if (!message) {
+            G_RET(c) = (uint64_t)(int64_t)(-ENOMEM);
+            break;
+        }
+        if (a2 && guest_copy_from(message, a1, (size_t)a2) != (ssize_t)a2) {
+            free(message);
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
+        long r = syscall(SYS_mq_timedsend, (int)a0, message, (size_t)a2, (unsigned)a3, timeoutp);
+        free(message);
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
         break;
 #else
@@ -478,10 +547,6 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EMSGSIZE);
             break;
         }
-        if (len && gna_hit(a1, len)) { // the kernel copies the message in before enqueue (gna_hit: PIE-safe EFAULT)
-            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
-            break;
-        }
         int nb = mq_fd_nonblock((int)a0);
         int werr = 0;
         while (q->n >= q->maxmsg) { // full: block (unless O_NONBLOCK)
@@ -501,7 +566,11 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-ENOMEM);
             break;
         }
-        memcpy(buf, (const void *)a1, len);
+        if (len && guest_copy_from(buf, a1, len) != (ssize_t)len) {
+            free(buf);
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         int was_empty = (q->n == 0);
         int pos = q->n;
         while (pos > 0 && q->msg[pos - 1].prio < prio) {
@@ -539,8 +608,30 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // and enforces EBADF (fd + access mode), EMSGSIZE (buffer < mq_msgsize), then empty-queue
         // O_NONBLOCK->EAGAIN / block-until-message-or-abs_timeout (ETIMEDOUT) / EINTR. A blocked receive now
         // wakes when ANY process sharing the named queue sends (the cross-process fix).
-        long r = syscall(SYS_mq_timedreceive, (int)a0, (char *)a1, (size_t)a2, (unsigned *)a3,
-                         (const struct timespec *)a4);
+        struct timespec timeout, *timeoutp = NULL;
+        if (a4) {
+            if (guest_copy_from(&timeout, a4, sizeof(timeout)) != (ssize_t)sizeof(timeout)) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+            timeoutp = &timeout;
+        }
+        long attr[8] = {0};
+        size_t capacity = (size_t)a2;
+        if (syscall(SYS_mq_getsetattr, (int)a0, NULL, attr) == 0 && attr[2] >= 0 && capacity > (size_t)attr[2])
+            capacity = (size_t)attr[2];
+        char *message = malloc(capacity ? capacity : 1);
+        if (!message) {
+            G_RET(c) = (uint64_t)(int64_t)(-ENOMEM);
+            break;
+        }
+        unsigned priority = 0;
+        long r = syscall(SYS_mq_timedreceive, (int)a0, message, (size_t)a2, a3 ? &priority : NULL, timeoutp);
+        if (r >= 0 &&
+            ((r && guest_copy_to(a1, message, (size_t)r) != r) ||
+             (a3 && guest_copy_to(a3, &priority, sizeof(priority)) != (ssize_t)sizeof(priority))))
+            r = -1, errno = EFAULT;
+        free(message);
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : (uint64_t)r;
         break;
 #else
@@ -580,19 +671,22 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         struct mq_qmsg m = q->msg[0];
-        if (m.len && gna_hit(a1, m.len)) { // don't fault the engine on an unwritable dest; keep the msg
+        if (m.len && guest_accessible_prefix(a1, m.len, PROT_WRITE) != m.len) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        if (a3 && gna_hit(a3, sizeof(unsigned))) {
+        if (a3 && guest_accessible_prefix(a3, sizeof(unsigned), PROT_WRITE) != sizeof(unsigned)) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
         for (int j = 1; j < q->n; j++)
             q->msg[j - 1] = q->msg[j];
         q->n--;
-        memcpy((void *)a1, m.data, m.len);
-        if (a3) *(unsigned *)a3 = m.prio;
+        if ((m.len && guest_copy_to(a1, m.data, m.len) != (ssize_t)m.len) ||
+            (a3 && guest_copy_to(a3, &m.prio, sizeof(m.prio)) != sizeof(m.prio))) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         free(m.data);
         G_RET(c) = (uint64_t)m.len;
         break;
@@ -616,13 +710,19 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // delivery), so only its registration/EBUSY errno semantics are guaranteed here; the callback
         // thread's netlink plumbing is not separately driven (documented, matches the SIGEV_SIGNAL/NONE
         // fidelity the test asserts). Access-mode/EFAULT/EINVAL/EBADF/EBUSY are enforced by the kernel.
-        long r = syscall(SYS_mq_notify, (int)a0, (const void *)a1);
+        unsigned char event[64];
+        if (a1 && guest_copy_from(event, a1, sizeof event) != sizeof event) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
+        long r = syscall(SYS_mq_notify, (int)a0, a1 ? event : NULL);
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
         break;
 #else
-        const uint8_t *sev = (const uint8_t *)a1;
+        uint8_t event[16];
+        const uint8_t *sev = a1 ? event : NULL;
         if (sev) {
-            if (gna_hit(a1, 16)) { // struct sigevent: sigev_value[8], sigev_signo[4], sigev_notify[4] (PIE-safe)
+            if (guest_copy_from(event, a1, sizeof(event)) != sizeof(event)) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
@@ -674,11 +774,22 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // Host-passthrough: the kernel reports the current mq_flags(O_NONBLOCK)/maxmsg/msgsize/curmsgs into
         // oldattr and, if newattr is set, applies only the O_NONBLOCK bit (the mq analogue of F_SETFL) —
         // exact native geometry and EBADF/EFAULT semantics.
-        long r = syscall(SYS_mq_getsetattr, (int)a0, (const void *)a1, (void *)a2);
+        long new_attribute[4], old_attribute[4];
+        if (a1 && guest_copy_from(new_attribute, a1, sizeof new_attribute) != sizeof new_attribute) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
+        long r = syscall(SYS_mq_getsetattr, (int)a0, a1 ? new_attribute : NULL, a2 ? old_attribute : NULL);
+        if (r >= 0 && a2 && guest_copy_to(a2, old_attribute, sizeof old_attribute) != sizeof old_attribute) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
         break;
 #else
-        if ((a1 && gna_hit(a1, 32)) || (a2 && gna_hit(a2, 32))) {
+        long new_attribute[4], old_attribute[4];
+        if ((a1 && guest_copy_from(new_attribute, a1, sizeof(new_attribute)) != sizeof(new_attribute)) ||
+            (a2 && guest_accessible_prefix(a2, sizeof(old_attribute), PROT_WRITE) != sizeof(old_attribute))) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
@@ -689,15 +800,19 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         struct mq_queue *q = &g_mqq[qi];
         if (a2) { // oldattr: current flags/geometry (reported before applying newattr)
-            long *o = (long *)a2;
+            long *o = old_attribute;
             o[0] = mq_fd_nonblock((int)a0) ? MQ_O_NONBLOCK : 0;
             o[1] = q->maxmsg;
             o[2] = q->msgsize;
             o[3] = q->n;
         }
         if (a1) { // newattr: only mq_flags' O_NONBLOCK bit is honoured
-            long nf = ((const long *)a1)[0];
+            long nf = new_attribute[0];
             mq_fd_setnb((int)a0, (nf & MQ_O_NONBLOCK) != 0);
+        }
+        if (a2 && guest_copy_to(a2, old_attribute, sizeof(old_attribute)) != sizeof(old_attribute)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
         }
         G_RET(c) = 0;
         break;
@@ -713,19 +828,26 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     case 118:                      // sched_setparam
     case 119: G_RET(c) = 0; break; // sched_setscheduler -> ok (ignored)
     case 120: G_RET(c) = 0; break; // sched_getscheduler -> SCHED_OTHER(0)
-    case 121:
-        if (a1) *(int *)a1 = 0;
+    case 121: {
+        int priority = 0;
+        if (guest_copy_to(a1, &priority, sizeof priority) != sizeof priority) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
         G_RET(c) = 0;
-        break;                                                 // sched_getparam -> priority 0
+        break; // sched_getparam -> priority 0
+    }
     case 125: G_RET(c) = (a0 == 1 || a0 == 2) ? 99 : 0; break; // sched_get_priority_max: FIFO/RR=99 else 0
     case 126: G_RET(c) = (a0 == 1 || a0 == 2) ? 1 : 0; break;  // sched_get_priority_min: FIFO/RR=1 else 0
-    case 127:                                                  // sched_rr_get_interval -> a nominal 100ms slice
-        if (a1) {
-            ((struct timespec *)a1)->tv_sec = 0;
-            ((struct timespec *)a1)->tv_nsec = 100000000L;
+    case 127: { // sched_rr_get_interval -> a nominal 100ms slice
+        struct timespec interval = {.tv_nsec = 100000000L};
+        if (guest_copy_to(a1, &interval, sizeof interval) != sizeof interval) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
         }
         G_RET(c) = 0;
         break;
+    }
     // mlockall/munlockall. macOS has no mlockall(2), but it DOES have mlock(2), so we wire the pages for real
     // over the guest's tracked mappings instead of only tracking state: MCL_CURRENT host-mlocks every current
     // guest range (hl_gmap_lock_wire_current); MCL_FUTURE arms the registry so each fresh mmap (mem.c case 222) is
@@ -773,8 +895,6 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // one was given. Report node 0 for a mapped/present page, -ENOENT for one not present -- exactly Linux.
     case 239: {
         unsigned long count = (unsigned long)a1;
-        void **pages = (void **)a2;
-        int *status = (int *)a4;
         if (count == 0) {
             G_RET(c) = 0;
             break;
@@ -783,14 +903,39 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        if (!pages || !host_range_mapped((uintptr_t)pages, count * sizeof(void *)) ||
-            (status && !host_range_mapped((uintptr_t)status, count * sizeof(int)))) {
+        void **pages = malloc(count * sizeof *pages);
+        int *nodes = a3 ? malloc(count * sizeof *nodes) : NULL;
+        int *status = a4 ? malloc(count * sizeof *status) : NULL;
+        if (!pages || (a3 && !nodes) || (a4 && !status)) {
+            free(pages);
+            free(nodes);
+            free(status);
+            G_RET(c) = (uint64_t)(int64_t)(-ENOMEM);
+            break;
+        }
+        if (guest_copy_from(pages, a2, count * sizeof *pages) != (ssize_t)(count * sizeof *pages) ||
+            (nodes && guest_copy_from(nodes, a3, count * sizeof *nodes) != (ssize_t)(count * sizeof *nodes))) {
+            free(pages);
+            free(nodes);
+            free(status);
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
         if (status)
             for (unsigned long i = 0; i < count; i++)
-                status[i] = host_addr_mapped((uintptr_t)pages[i]) ? 0 : -ENOENT;
+                status[i] = guest_accessible_prefix((uint64_t)(uintptr_t)pages[i], 1, HL_LOGICAL_VMA_READ) == 1
+                                ? 0
+                                : -ENOENT;
+        if (status && guest_copy_to(a4, status, count * sizeof *status) != (ssize_t)(count * sizeof *status)) {
+            free(pages);
+            free(nodes);
+            free(status);
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
+        free(pages);
+        free(nodes);
+        free(status);
         G_RET(c) = 0;
         break;
     }
@@ -801,27 +946,46 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // passed a mode pointer, write MPOL_DEFAULT(0) -- but validate it first (host_addr_mapped, thread.c)
     // so a bad pointer returns -EFAULT to the guest rather than faulting the engine.
     case 236: {
-        int *mode = (int *)a0;
-        if (mode) {
+        if (a0) {
             // Validate the WHOLE 4-byte int, not just its first page: the store below is a full int write, so
             // a mode pointer straddling a page boundary into an unmapped page (host_addr_mapped only probes the
             // start) would fault the engine instead of returning -EFAULT. Mirror the sibling getcpu (case 168),
             // which range-checks its cpu/node out-pointers.
-            if (!host_range_mapped((uintptr_t)mode, sizeof(int))) {
+            int mode = 0;
+            if (guest_copy_to(a0, &mode, sizeof mode) != sizeof mode) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
-            *mode = 0; // MPOL_DEFAULT
         }
         G_RET(c) = 0;
         break;
     }
     // getitimer/setitimer: wrap the host (ITIMER_* + struct itimerval layouts match Linux<->macOS)
-    case 102: G_RET(c) = getitimer((int)a0, (struct itimerval *)a1) < 0 ? (uint64_t)(-errno) : 0; break;
-    case 103:
-        G_RET(c) =
-            setitimer((int)a0, (const struct itimerval *)a1, (struct itimerval *)a2) < 0 ? (uint64_t)(-errno) : 0;
+    case 102: {
+        struct itimerval value;
+        if (getitimer((int)a0, &value) < 0)
+            G_RET(c) = (uint64_t)(-errno);
+        else
+            G_RET(c) = guest_copy_to(a1, &value, sizeof value) == sizeof value
+                           ? 0
+                           : (uint64_t)(int64_t)-EFAULT;
         break;
+    }
+    case 103: {
+        struct itimerval value, old;
+        if (guest_copy_from(&value, a1, sizeof value) != sizeof value) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
+        int result = setitimer((int)a0, &value, a2 ? &old : NULL);
+        if (result < 0)
+            G_RET(c) = (uint64_t)(-errno);
+        else if (a2 && guest_copy_to(a2, &old, sizeof old) != sizeof old)
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+        else
+            G_RET(c) = 0;
+        break;
+    }
     // clock_settime: validate the clock id BEFORE the privilege check, as Linux does. An unknown or
     // non-settable clock id (e.g. CLOCK_MONOTONIC) is -EINVAL; only the settable wall clocks
     // CLOCK_REALTIME(0)/CLOCK_TAI(11) reach the CAP_SYS_TIME gate the container lacks -> -EPERM.
@@ -837,14 +1001,16 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // CPU and expects it back), node 0 (single NUMA node). A cpu/node pointer outside the address space
     // -> EFAULT (LTP getcpu02; guest_bad_ptr also catches a PROT_NONE tst_get_bad_addr page).
     case 168:
-        if ((a0 && guest_bad_ptr(a0, sizeof(unsigned))) || (a1 && guest_bad_ptr(a1, sizeof(unsigned)))) {
+        {
+        unsigned cpu = hl_linux_affinity_first(&g_affinity, linux_online_cpus()), node = 0;
+        if ((a0 && guest_copy_to(a0, &cpu, sizeof cpu) != sizeof cpu) ||
+            (a1 && guest_copy_to(a1, &node, sizeof node) != sizeof node)) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        if (a0) *(unsigned *)a0 = hl_linux_affinity_first(&g_affinity, linux_online_cpus());
-        if (a1) *(unsigned *)a1 = 0;
         G_RET(c) = 0;
         break;
+        }
     case 213: { // readahead: advisory, but Linux still validates the descriptor and offset
         if ((int)a0 < 0 || fcntl((int)a0, F_GETFD) < 0)
             G_RET(c) = (uint64_t)(int64_t)(-EBADF);
@@ -864,28 +1030,29 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        if (guest_bad_ptr(a1, sizeof(uint32_t))) {
+        unsigned char attr[48];
+        if (guest_copy_from(attr, a1, sizeof attr) != sizeof attr) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        uint32_t size = *(uint32_t *)a1;
-        if (size == 0) size = 48;    // 0 selects the VER0 struct size, as in the kernel
-        if (size < 48) {             // struct sched_attr is 48 bytes; a smaller one is malformed
+        uint32_t size;
+        memcpy(&size, attr, sizeof size);
+        if (size == 0) size = 48; // 0 selects the VER0 struct size, as in the kernel
+        if (size < 48) {          // struct sched_attr is 48 bytes; a smaller one is malformed
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        if (guest_bad_ptr(a1, 48)) {
-            G_RET(c) = (uint64_t)(-EFAULT);
-            break;
-        }
-        uint32_t policy = *(uint32_t *)(a1 + 4);
-        uint64_t sflags = *(uint64_t *)(a1 + 8);
+        uint32_t policy;
+        uint64_t sflags;
+        memcpy(&policy, attr + 4, sizeof policy);
+        memcpy(&sflags, attr + 8, sizeof sflags);
         int base = (int)policy & ~HL_SCHED_RESET_ON_FORK, lo, hi;
         if (sched_prio_band(base, &lo, &hi) < 0) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        int prio = *(int32_t *)(a1 + 20); // sched_priority
+        int32_t prio;
+        memcpy(&prio, attr + 20, sizeof prio);
         if (prio < lo || prio > hi) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
@@ -902,7 +1069,8 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // (proc.c case 140): the root container may lower niceness, so clamp to Linux [-20,19] without a
         // can_nice EPERM. This keeps sched_getattr's reported nice in sync with getpriority.
         if (!(sflags & 0x10)) {
-            int nice = *(int32_t *)(a1 + 16);
+            int32_t nice;
+            memcpy(&nice, attr + 16, sizeof nice);
             if (nice > 19)
                 nice = 19;
             else if (nice < -20)
@@ -922,19 +1090,15 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 G_RET(c) = (uint64_t)(int64_t)(-EOPNOTSUPP);
                 break;
             }
-            ssize_t r = memf_preadv(g_memf[(int)a0], (const struct iovec *)a1, (int)a2, (off_t)a3, 0);
-            G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
-            break;
+            memf_materialize((int)a0);
         }
-#if defined(__linux__)
-        ssize_t r = preadv2((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3, (int)a5);
-#else
+#if !defined(__linux__)
         if (a5) {
             G_RET(c) = (uint64_t)(int64_t)(-EOPNOTSUPP);
             break;
         }
-        ssize_t r = preadv((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
 #endif
+        ssize_t r = guest_fd_vector_flags((int)a0, a1, (size_t)a2, (off_t)a3, 1, 1, (int)a5);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -944,27 +1108,30 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         } // F_SEAL_WRITE
         if (memf_get((int)a0)) {
+            struct iovec imported[GUEST_IOV_STACK_MAX];
+            if (a2 > GUEST_IOV_STACK_MAX || guest_iov_import(a1, (size_t)a2, imported) < 0) {
+                G_RET(c) = (uint64_t)(int64_t)(a2 > GUEST_IOV_STACK_MAX ? -EINVAL : -EFAULT);
+                break;
+            }
+            uint64_t total = 0;
+            for (size_t i = 0; i < (size_t)a2; ++i) {
+                if (imported[i].iov_len > UINT64_MAX - total) {
+                    total = UINT64_MAX;
+                    break;
+                }
+                total += imported[i].iov_len;
+            }
+            if (memf_fsize_gate(c, (off_t)a3, total) < 0) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFBIG);
+                break;
+            }
             if (a5) {
                 G_RET(c) = (uint64_t)(int64_t)(-EOPNOTSUPP);
                 break;
             }
-            const struct iovec *iv = (const struct iovec *)a1;
-            off_t end = (off_t)a3;
-            for (int i = 0; i < (int)a2; i++)
-                end += iv[i].iov_len;
-            if (memf_fsize_gate(c, (off_t)a3, (uint64_t)(end - (off_t)a3)) < 0) { // RLIMIT_FSIZE -> SIGXFSZ/EFBIG
-                G_RET(c) = (uint64_t)(int64_t)(-EFBIG);
-                break;
-            }
-            if (memf_room_or_spill((int)a0, end)) {
-                ssize_t r = memf_pwritev(g_memf[(int)a0], iv, (int)a2, (off_t)a3, 0);
-                G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
-                break;
-            }
+            memf_materialize((int)a0);
         }
-#if defined(__linux__)
-        ssize_t r = pwritev2((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3, (int)a5);
-#else
+#if !defined(__linux__)
         // macOS lacks pwritev2. RWF_APPEND (0x10) is a semantic requirement: ignore the supplied offset
         // and land the write at end-of-file. Emulate it via fstat + pwritev at st_size; reject any other
         // RWF_* flag we cannot honor. (Linux keeps the native pwritev2 path above.)
@@ -983,7 +1150,9 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EOPNOTSUPP);
             break;
         }
-        ssize_t r = pwritev((int)a0, (const struct iovec *)a1, (int)a2, hl_off);
+        ssize_t r = guest_fd_vector_flags((int)a0, a1, (size_t)a2, hl_off, 1, 0, 0);
+#else
+        ssize_t r = guest_fd_vector_flags((int)a0, a1, (size_t)a2, (off_t)a3, 1, 0, (int)a5);
 #endif
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
@@ -1014,12 +1183,12 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
                 break;
             }
-            if (a2 && !host_range_mapped((uintptr_t)a2, 128)) {
+            if (a2 && guest_accessible_prefix(a2, 128, HL_LOGICAL_VMA_WRITE) != 128) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
             // Raw waitid(2) also copies out arg 5 (struct rusage *) when non-NULL; a bad pointer is EFAULT.
-            if (a4 && !host_range_mapped((uintptr_t)a4, 144)) {
+            if (a4 && guest_accessible_prefix(a4, 144, HL_LOGICAL_VMA_WRITE) != 144) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
@@ -1049,10 +1218,10 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
-        uint8_t *gi = (uint8_t *)a2;
-        if (gi) {
+        uint8_t linux_siginfo[128] = {0};
+        uint8_t *gi = linux_siginfo;
+        if (a2) {
             // Linux siginfo_t is 128 bytes; zero it (also the WNOHANG "no child" case -> si_pid stays 0)
-            memset(gi, 0, 128);
             if (si.si_pid != 0) {
                 int code = si.si_code, status = si.si_status;
                 int gsig, gcore;
@@ -1078,6 +1247,10 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 *(int *)(gi + 20) = (int)si.si_uid;
                 *(int *)(gi + 24) = status; // si_status
             }
+            if (guest_copy_to(a2, linux_siginfo, sizeof linux_siginfo) != sizeof linux_siginfo) {
+                G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+                break;
+            }
         }
         // guest-pid namespace: on an ACTUAL reap of a TERMINATED child (not a WNOWAIT peek, not a stop/
         // continue report), drop its container-registry record -- see wait4 (case 260) -- so a signal-killed
@@ -1091,10 +1264,12 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // buffer untouched exposed sentinel garbage (a wild ru_maxrss). Only on an actual reap (si_pid set).
         if (a4 && si.si_pid != 0) {
             struct rusage cru;
-            if (getrusage(RUSAGE_CHILDREN, &cru) == 0)
-                rusage_to_linux((uint8_t *)a4, &cru);
-            else
-                memset((void *)a4, 0, 144);
+            uint8_t linux_ru[144] = {0};
+            if (getrusage(RUSAGE_CHILDREN, &cru) == 0) rusage_to_linux(linux_ru, &cru);
+            if (guest_copy_to(a4, linux_ru, sizeof linux_ru) != sizeof linux_ru) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
         }
         G_RET(c) = 0;
         break;
@@ -1102,12 +1277,18 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // truncate(path, length): resolve the guest path through the overlay (same helper execve uses), then
     // truncate by host path. Evict the stat cache so the new size is observed.
     case 45: {
-        if (jail_ro_at(-100, (const char *)a0)) {
+        char guest_path[4200];
+        int imported = guest_copy_string(guest_path, sizeof guest_path, a0);
+        if (imported < 0) {
+            G_RET(c) = (uint64_t)(int64_t)imported;
+            break;
+        }
+        if (jail_ro_at(-100, guest_path)) {
             G_RET(c) = (uint64_t)(int64_t)(-EROFS);
             break;
         }
         char pb[4200];
-        const char *p = xresolve_overlay((const char *)a0, pb, sizeof pb);
+        const char *p = xresolve_overlay(guest_path, pb, sizeof pb);
         // RLIMIT_FSIZE: a truncate whose target length exceeds the soft file-size limit raises SIGXFSZ and
         // returns -EFBIG. Linux resolves the path FIRST (a missing file is ENOENT with no signal), so only
         // gate once the target is known to exist. No-op for an infinite limit (the common case).
@@ -1131,15 +1312,12 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     case 163:
         if ((int)a0 < 0 || (int)a0 >= HL_LIMIT_COUNT) {
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
-        } else if (!a1 || guest_bad_ptr((uintptr_t)a1, sizeof(uint64_t) * 2)) {
-            /* getrlimit copies a complete struct rlimit to userspace.  The
-             * kernel reports EFAULT for NULL, unmapped, wrapped, and
-             * PROT_NONE destinations; never dereference a guest pointer in
-             * the engine to discover that error. */
-            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
         } else {
-            svc_fill_rlimit((int)a0, (uint64_t *)a1);
-            G_RET(c) = 0;
+            uint64_t limits[2];
+            svc_fill_rlimit((int)a0, limits);
+            G_RET(c) = guest_copy_to(a1, limits, sizeof limits) == sizeof limits
+                           ? 0
+                           : (uint64_t)(int64_t)(-EFAULT);
         }
         break;
     case 164: {
@@ -1151,11 +1329,11 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        if (!a1 || guest_bad_ptr((uintptr_t)a1, sizeof(uint64_t) * 2)) {
+        uint64_t nl[2];
+        if (guest_copy_from(nl, a1, sizeof nl) != sizeof nl) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        const uint64_t *nl = (const uint64_t *)a1;
         if (nl[0] != ~UINT64_C(0) && nl[1] != ~UINT64_C(0) && nl[0] > nl[1]) {
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
@@ -1172,12 +1350,24 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        int r = svc_adjtimex((uint8_t *)a1);
+        uint8_t timex[96];
+        if (guest_copy_from(timex, a1, sizeof timex) != sizeof timex) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
+        int r = svc_adjtimex(timex);
+        if (r >= 0 && guest_copy_to(a1, timex, sizeof timex) != sizeof timex) r = -EFAULT;
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
         break;
     }
     case 171: { // adjtimex(timex)
-        int r = svc_adjtimex((uint8_t *)a0);
+        uint8_t timex[96];
+        if (guest_copy_from(timex, a0, sizeof timex) != sizeof timex) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
+        int r = svc_adjtimex(timex);
+        if (r >= 0 && guest_copy_to(a0, timex, sizeof timex) != sizeof timex) r = -EFAULT;
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
         break;
     }
@@ -1191,20 +1381,20 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             if (sz == 0 || sz > 48) sz = 48; // kernel struct sched_attr is 48+ bytes; cap to a sane size
             // The struct is written straight into the guest buffer below; a bad/unmapped attr pointer must
             // EFAULT like the kernel's copy_to_user, not fault the engine on the memset/field stores.
-            if (guest_bad_ptr((uintptr_t)a1, sz)) {
-                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
-                break;
-            }
-            memset((void *)a1, 0, sz);
-            if (sz >= 4) *(uint32_t *)(a1 + 0) = (uint32_t)sz;                  // sched_attr.size
-            if (sz >= 8) *(uint32_t *)(a1 + 4) = (uint32_t)g_sched_policy;      // sched_policy (live)
+            unsigned char attr[48] = {0};
+            if (sz >= 4) memcpy(attr, &(uint32_t){(uint32_t)sz}, 4);
+            if (sz >= 8) memcpy(attr + 4, &(uint32_t){(uint32_t)g_sched_policy}, 4);
             if (sz >= 20) {
                 errno = 0;
                 int nv = getpriority(PRIO_PROCESS, 0); // sched_nice = the live process nice value
                 if (nv == -1 && errno) nv = 0;
-                *(int32_t *)(a1 + 16) = nv;
+                memcpy(attr + 16, &nv, sizeof(int32_t));
             }
-            if (sz >= 24) *(uint32_t *)(a1 + 20) = (uint32_t)g_sched_prio; // sched_priority (recorded)
+            if (sz >= 24) memcpy(attr + 20, &(uint32_t){(uint32_t)g_sched_prio}, 4);
+            if (guest_copy_to(a1, attr, sz) != (ssize_t)sz) {
+                G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+                break;
+            }
         }
         G_RET(c) = 0;
         break;
@@ -1232,13 +1422,14 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         int sig = (int)a2;
         // The kernel copy_from_user()s the whole siginfo up front, so a bad (or NULL) user pointer is
         // -EFAULT, never a fault in the engine -- guard the direct deref below to match (as case 138 does).
-        if (!host_range_mapped((uintptr_t)a3, 128)) {
+        uint8_t siginfo[128];
+        if (guest_copy_from(siginfo, a3, sizeof siginfo) != sizeof siginfo) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
         if (sig >= 1 && sig <= 64 && a3) {
-            g_sigcode[sig] = *(int *)(a3 + 8);      // siginfo.si_code
-            g_sigval[sig] = *(uint64_t *)(a3 + 24); // siginfo.si_value (sival_int/ptr)
+            memcpy(&g_sigcode[sig], siginfo + 8, sizeof g_sigcode[sig]);
+            memcpy(&g_sigval[sig], siginfo + 24, sizeof g_sigval[sig]);
         }
         raise_guest_signal(c, sig);
         G_RET(c) = 0;
@@ -1252,7 +1443,11 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
 #ifdef CANON_X86ONLY
     case (CANON_X86ONLY | 201): { // time (x86-only nr 201; no aarch64 equivalent) -- redis hot clock path
         time_t t = time(NULL);
-        if (a0) *(int64_t *)a0 = (int64_t)t;
+        int64_t seconds = (int64_t)t;
+        if (a0 && guest_copy_to(a0, &seconds, sizeof seconds) != sizeof seconds) {
+            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
+            break;
+        }
         G_RET(c) = (uint64_t)(int64_t)t;
         break;
     }

@@ -285,6 +285,12 @@ static uint64_t call_return_pc(uint64_t pc) {
 
 // r/m operand: mem -> EA to x17, load value to x16 (returns 16); reg -> value reg.
 void emit_ea(struct insn *I, uint64_t next_rip);
+/*
+ * Architectural continuation of the instruction currently being emitted.
+ * Store helpers several layers below the decoder use this only when a
+ * completed store must leave the block for queued SMC service.  It is assigned
+ * immediately after successful decode, before any lowering helper runs.
+ */
 
 // 128-bit guest vector load/store of an r/m128 operand. The `base + index*scale` addressing mode x86
 // uses for array traversal (`movaps (%rcx,%rax,1),%xmm0`) is exactly ARM's register-offset form, so
@@ -293,6 +299,12 @@ void emit_ea(struct insn *I, uint64_t next_rip);
 // is byte-for-byte the emit_ea + g_ldr_q/g_str_q pair every call site used to write inline; the
 // x86-TSO barriers are the ones g_ldr_q/g_str_q emit, unchanged.
 static void g_ldr_q_ea(int t, struct insn *I, uint64_t next) {
+    if (emit_soft_memory_active()) {
+        emit_ea(I, next);
+        emit_memory_guard(17, 16, next - (uint64_t)I->len, X86_SOFT_READ);
+        g_ldr_q(t, 17, 0);
+        return;
+    }
     int rn, rm, sh;
     if (ea_reg_fold(I, 16, &rn, &rm, &sh)) {
         e_ldr_q_reg(t, rn, rm, sh);
@@ -303,7 +315,34 @@ static void g_ldr_q_ea(int t, struct insn *I, uint64_t next) {
     g_ldr_q(t, 17, 0);
 }
 
+static void g_ldr_d_ea(int t, struct insn *I, uint64_t next) {
+    emit_ea(I, next);
+    if (emit_soft_memory_active())
+        emit_memory_guard(17, 8, next - (uint64_t)I->len, X86_SOFT_READ);
+    g_ldr_d(t, 17);
+}
+
+static void g_str_d_ea(int t, struct insn *I, uint64_t next) {
+    emit_ea(I, next);
+    if (emit_soft_memory_active()) {
+        emit_memory_guard(17, 8, next - (uint64_t)I->len, X86_SOFT_WRITE);
+        e_dmb_ish();
+        e_str_d(t, 17);
+        emit_soft_store_commit(8);
+        return;
+    }
+    g_str_d(t, 17);
+}
+
 static void g_str_q_ea(int t, struct insn *I, uint64_t next) {
+    if (emit_soft_memory_active()) {
+        emit_ea(I, next);
+        emit_memory_guard(17, 16, next - (uint64_t)I->len, X86_SOFT_WRITE);
+        e_dmb_ish();
+        e_str_q(t, 17, 0);
+        emit_soft_store_commit(16);
+        return;
+    }
     int rn, rm, sh;
     if (ea_reg_fold(I, 16, &rn, &rm, &sh)) {
         e_dmb_ish();
@@ -313,6 +352,7 @@ static void g_str_q_ea(int t, struct insn *I, uint64_t next) {
     emit_ea(I, next);
     g_str_q(t, 17, 0);
 }
+
 // unimplemented-insn diagnostic (defined below translate_block); fwd-declared so the instruction-class
 // helpers in translate/<class>.c (#included above translate_block) can defer a rare unhandled form.
 static void report_unimpl(uint64_t pc, struct insn *I);
@@ -330,14 +370,27 @@ int rm_load(struct insn *I, uint64_t next, int w, int *mem) {
     return I->rm_reg;
 }
 
+int rm_load_access(struct insn *I, uint64_t next, int w, int *mem, uint32_t required) {
+    if (!I->is_mem || !emit_soft_memory_active()) return rm_load(I, next, w, mem);
+    emit_ea(I, next);
+    emit_memory_guard(17, (uint64_t)w, next - (uint64_t)I->len, required);
+    e_load(w, 16, 17);
+    *mem = 1;
+    return 16;
+}
+
 void rm_store(struct insn *I, int w, int val) { // val -> r/m (EA already in x17 if mem)
     if (I->is_mem) {
         if (val == 16) {
             e_mov_rr(19, 16, 1); /* host-call guard clobbers x16 */
             val = 19;
         }
-        emit_bus_guard(17, (uint64_t)w, g_emit_gpc);
+        if (emit_soft_memory_active())
+            emit_memory_guard(17, (uint64_t)w, g_emit_gpc, X86_SOFT_WRITE);
+        else
+            emit_bus_guard(17, (uint64_t)w, g_emit_gpc);
         e_store(w, val, 17);
+        if (emit_soft_memory_active()) emit_soft_store_commit((uint64_t)w);
         return;
     }
     if (w == 1) {
@@ -350,6 +403,19 @@ void rm_store(struct insn *I, int w, int val) { // val -> r/m (EA already in x17
         else
             e_bfi(I->rm_reg, val, 0, 8 * w, 1);
     }
+}
+
+void rm_store_after_guard(struct insn *I, int w, int val) {
+    if (!I->is_mem || !emit_soft_memory_active()) {
+        rm_store(I, w, val);
+        return;
+    }
+    if (val == 16) {
+        e_mov_rr(19, 16, 1);
+        val = 19;
+    }
+    e_store(w, val, 17);
+    emit_soft_store_commit((uint64_t)w);
 }
 
 // RCL/RCR (group2 /2,/3): rotate the r/m operand THROUGH the x86 carry flag by a CONSTANT count -- the
@@ -487,7 +553,9 @@ static int g_pfaf_dead;
 // time" (block entry, or after popfq) so the lowering loads cpu->df and picks the stride at runtime.
 static enum hl_x86_direction g_df; // block-static shadow; the runtime truth is cpu->df
 
-static int lazyflags_on(void) { return 1; }
+static int lazyflags_on(void) {
+    return 1;
+}
 
 // Direct-write ALU dst: when an ALU (or group1) instruction's r/m operand is a REGISTER (not memory)
 // at width>=4, compute the result straight into the guest reg's host home instead of into scratch x16
@@ -495,7 +563,9 @@ static int lazyflags_on(void) { return 1; }
 // as the dst==reg forms do) and computes PF/AF from the pristine a,b BEFORE overwriting `out`, so
 // out==a is byte-identical to out==x16 + rm_store — one fewer instruction on the dependent chain.
 // Gate NOXALUDIRECT=1 for A/B (elide-on default). Independent of the flag levers.
-int xaludirect_on(void) { return 1; }
+int xaludirect_on(void) {
+    return 1;
+}
 
 // Direct-write SHIFT dst (follow-on to the ALU residency above): when an IMMEDIATE/by-1
 // SHL/SHR/SAR's r/m operand is a REGISTER at width>=4, shift straight into the guest reg's host home
@@ -505,7 +575,9 @@ int xaludirect_on(void) { return 1; }
 // guest home. rm_store(...,rmreg) is already a no-op (val==I->rm_reg), so gate-OFF is byte-identical.
 // Memory / byte / word / CL-variable / rotate / RCL-RCR keep the x16+store-back path untouched.
 // Gate NOXSHIFTDIRECT=1 for A/B (elide-on default). Independent of the flag-elision lever.
-static int xshiftdirect_on(void) { return 1; }
+static int xshiftdirect_on(void) {
+    return 1;
+}
 
 // Spill the deferred flags to cpu->nzcv with the producer-correct finalizer (byte-identical to the
 // old inline finalizer) and clear the pending state. Every finalizer also msr's the corrected value
@@ -579,7 +651,9 @@ static int insn_is_carry_consumer(const struct insn *I) {
 
 // kill-switch: NOPFAFELIM=1 (any non-"0") disables PF/AF dead-flag elimination -> revert to the
 // always-eager PF/AF substrate (every ALU op materializes cpu->pf/cpu->af). Read once, cached.
-static int pfaf_elim_on(void) { return 1; }
+static int pfaf_elim_on(void) {
+    return 1;
+}
 
 // 1 iff I's handler EMITS the PF/AF substrate (so the translate loop knows a lookahead is worth
 // doing -- and, crucially, that I falls through to a real successor at `next`, making the lookahead
@@ -937,13 +1011,13 @@ static int emit_parity_jcc_cond(int lo) {
 // caller must not need v17 preserved. Used by the PCMP*STR* fast path below (movemask of the
 // pcmpeqb / cmeq-zero lanes) and mirrors the pmovmskb lowering.
 static void emit_pmovmask(int vm, int dst) {
-    e_vshr_imm(17, vm, 8, 7, 0);                        // ushr v17.16b, vm.16b, #7
-    emit32(0x6F001400u | (25u << 16) | (17 << 5) | 17); // usra v17.8h, v17.8h, #7
-    emit32(0x6F001400u | (50u << 16) | (17 << 5) | 17); // usra v17.4s, v17.4s, #14
+    e_vshr_imm(17, vm, 8, 7, 0);                         // ushr v17.16b, vm.16b, #7
+    emit32(0x6F001400u | (25u << 16) | (17 << 5) | 17);  // usra v17.8h, v17.8h, #7
+    emit32(0x6F001400u | (50u << 16) | (17 << 5) | 17);  // usra v17.4s, v17.4s, #14
     emit32(0x6F001400u | (100u << 16) | (17 << 5) | 17); // usra v17.2d, v17.2d, #28
     emit32(0x0E003C00u | (1u << 16) | (17 << 5) | 16);   // umov w16, v17.b[0]
-    emit32(0x0E003C00u | (17u << 16) | (17 << 5) | dst);  // umov wdst, v17.b[8]
-    e_rrr(A_ORR, dst, 16, dst, 0, 8);                     // orr wdst, w16, wdst, lsl #8
+    emit32(0x0E003C00u | (17u << 16) | (17 << 5) | dst); // umov wdst, v17.b[8]
+    e_rrr(A_ORR, dst, 16, dst, 0, 8);                    // orr wdst, w16, wdst, lsl #8
 }
 
 // PCMPISTRI (0F3A 63), implicit-length EQUAL-EACH byte form -- the exact idiom glibc's SSE4.2
@@ -966,7 +1040,7 @@ static void emit_pcmpistri_eqeach_byte(int av, int bv, int imm) {
     e_movz(16, 1, 1);               // x16 = 0x10000 (sentinel bit @16)
     e_rrr(A_ORR, 17, 21, 16, 0, 0); // w17 = op1nulls | 0x10000
     e_rbit(17, 17, 0);
-    e_clz(22, 17, 0); // la = ctz(...) -> w22
+    e_clz(22, 17, 0);               // la = ctz(...) -> w22
     e_rrr(A_ORR, 17, 24, 16, 0, 0); // w17 = op2nulls | 0x10000
     e_rbit(17, 17, 0);
     e_clz(23, 17, 0); // lb -> w23
@@ -993,8 +1067,8 @@ static void emit_pcmpistri_eqeach_byte(int av, int bv, int imm) {
         e_uxt(17, 17, 2); // uxth: mask IntRes2 to 16 bits
     }
     // index (imm[6]) -> guest RCX (host x1), zero-extended
-    if (!msb) {                       // least-significant set bit, else n(=16)
-        e_movz(16, 1, 1);             // x16 = 0x10000
+    if (!msb) {           // least-significant set bit, else n(=16)
+        e_movz(16, 1, 1); // x16 = 0x10000
         e_rrr(A_ORR, 16, 17, 16, 0, 0);
         e_rbit(16, 16, 0);
         e_clz(1, 16, 0); // RCX = ctz(IntRes2 | 0x10000) -> 16 when IntRes2==0
@@ -1021,7 +1095,7 @@ static void emit_pcmpistri_eqeach_byte(int av, int bv, int imm) {
     e_rrr(A_AND, 16, 17, 25, 0, 0);
     e_rrr(A_ORR, 20, 20, 16, 0, 28); // OF<<28 (IntRes2 bit0)
     e_str(20, 28, OFF_NZCV);
-    emit32(0xD51B4200u | 20);        // msr nzcv, x20
+    emit32(0xD51B4200u | 20); // msr nzcv, x20
     e_movz(16, 1, 0);
     e_str(16, 28, OFF_PF); // cpu->pf = 1  => x86 PF = 0 (matches sse42_flags)
     e_str(31, 28, OFF_AF); // cpu->af = 0
@@ -1061,7 +1135,10 @@ static void e_sse_var_shift(int vd, int vn, int vs, int esize, int left, int ari
 // keeps that input's sign on BOTH ISAs, so we must fix up ONLY generated default-NaNs, identified as
 // "result is NaN AND no input is NaN". Branchless: v20/v21 scratch, per-lane so scalar and packed share
 // one path (scalar upper lanes are 0.0 in the result -> never flagged). Set NOXFPDNAN to disable (A/B).
-static int fpdnan_on(void) { return 1; }
+static int fpdnan_on(void) {
+    return 1;
+}
+
 // PRE (emit BEFORE the arithmetic, while vd still holds src1): v20 <- per-lane PRESIGN mask =
 // (x86 indefinite sign bit) on lanes whose inputs are ALL non-NaN, else 0. Building the sign here
 // (off the arithmetic's result-dependency chain, overlapped with the long FP-op latency) shortens
@@ -1092,6 +1169,7 @@ static void emit_dnan_pre(int vd, int s, int two_in, int dbl) {
     }
     emit32(0x4F005400u | (immhb << 16) | (20 << 5) | 20); // v20 = PRESIGN (SHL v20.T, v20, #esize-1)
 }
+
 // POST (emit AFTER the arithmetic; vd = result): OR the x86 indefinite sign into lanes that are a
 // GENERATED default NaN (result is NaN AND no input was NaN). Payload already matches x86, so only the
 // sign bit must be set. Critical path from the result is just 2 ops: FCMEQ then BIC (the ORR is off the
@@ -1122,10 +1200,10 @@ static void emit_dnan_post(int vd, int dbl, int packed) {
     emit32(0xD53B4200u | 22);                                           // mrs x22, nzcv
     emit32((dbl ? 0x1E602000u : 0x1E202000u) | (vd << 16) | (vd << 5)); // FCMP dst,dst  (V=1 iff dst is NaN)
     uint32_t *p_bvc = (uint32_t *)g_cp;
-    emit32(0);                                 // b.vc Lok  (NOT NaN -> skip fixup; patched below)
-    emit32(EQ | (vd << 16) | (vd << 5) | 21);  // v21 = (res == res)  (all-ones where result NOT NaN)
-    e_v3(0x4E601C00u, 20, 20, 21);             // v20 = PRESIGN & ~res_notnan = sign on generated-NaN lanes
-    e_v3(0x4EA01C00u, vd, vd, 20);             // vd |= sign mask  (ORR.16b)
+    emit32(0);                                // b.vc Lok  (NOT NaN -> skip fixup; patched below)
+    emit32(EQ | (vd << 16) | (vd << 5) | 21); // v21 = (res == res)  (all-ones where result NOT NaN)
+    e_v3(0x4E601C00u, 20, 20, 21);            // v20 = PRESIGN & ~res_notnan = sign on generated-NaN lanes
+    e_v3(0x4EA01C00u, vd, vd, 20);            // vd |= sign mask  (ORR.16b)
     uint8_t *Lok = (uint8_t *)g_cp;
     *p_bvc = 0x54000000u | ((uint32_t)(((Lok - (uint8_t *)p_bvc) / 4) & 0x7FFFF) << 5) | 7; // b.vc (cond VC=7)
     emit32(0xD51B4200u | 22);                                                               // msr nzcv, x22
@@ -1162,21 +1240,23 @@ static void emit_nan_input_gate(int vd, int s, int dbl, uint64_t gpc) {
 // distinct from the sources. dbl: 1 -> .2d (pd), 0 -> .4s (ps).
 static void emit_fma_group(int rA, int rB, int rC, int acc, int mt1, int mt2, int neg, int fmls, int dbl) {
     int fixnan = fpdnan_on();
-    uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u;         // FCMEQ Vd.2d/.4s (all-ones per non-NaN lane)
+    uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u; // FCMEQ Vd.2d/.4s (all-ones per non-NaN lane)
     unsigned immhb = dbl ? (64u + 63u) : (32u + 31u);
-    if (fixnan) {                                           // mt1 = PRESIGN on lanes with all inputs non-NaN
-        emit32(EQ | (rA << 16) | (rA << 5) | mt1);         // mt1 = (A==A)
-        emit32(EQ | (rB << 16) | (rB << 5) | mt2);         // mt2 = (B==B)
-        e_v3(0x4E201C00u, mt1, mt1, mt2);                  // mt1 &= mt2  (AND.16b)
-        emit32(EQ | (rC << 16) | (rC << 5) | mt2);         // mt2 = (C==C)
-        e_v3(0x4E201C00u, mt1, mt1, mt2);                  // mt1 = all-inputs-notnan
+    if (fixnan) {                                               // mt1 = PRESIGN on lanes with all inputs non-NaN
+        emit32(EQ | (rA << 16) | (rA << 5) | mt1);              // mt1 = (A==A)
+        emit32(EQ | (rB << 16) | (rB << 5) | mt2);              // mt2 = (B==B)
+        e_v3(0x4E201C00u, mt1, mt1, mt2);                       // mt1 &= mt2  (AND.16b)
+        emit32(EQ | (rC << 16) | (rC << 5) | mt2);              // mt2 = (C==C)
+        e_v3(0x4E201C00u, mt1, mt1, mt2);                       // mt1 = all-inputs-notnan
         emit32(0x4F005400u | (immhb << 16) | (mt1 << 5) | mt1); // mt1 = SHL #(esize-1) -> sign bit per lane
     }
-    if (neg) emit32((dbl ? 0x6EE0F800u : 0x6EA0F800u) | (rC << 5) | acc); // FNEG acc.T, C  (exact)
-    else e_vmov(acc, rC);                                                  // acc = C
-    uint32_t fm = fmls ? (dbl ? 0x4EE0CC00u : 0x4EA0CC00u)                 // FMLS acc -= A*B
-                       : (dbl ? 0x4E60CC00u : 0x4E20CC00u);                // FMLA acc += A*B
-    e_v3(fm, acc, rA, rB);                                                 // fused multiply-add/sub
+    if (neg)
+        emit32((dbl ? 0x6EE0F800u : 0x6EA0F800u) | (rC << 5) | acc); // FNEG acc.T, C  (exact)
+    else
+        e_vmov(acc, rC);                                    // acc = C
+    uint32_t fm = fmls ? (dbl ? 0x4EE0CC00u : 0x4EA0CC00u)  // FMLS acc -= A*B
+                       : (dbl ? 0x4E60CC00u : 0x4E20CC00u); // FMLA acc += A*B
+    e_v3(fm, acc, rA, rB);                                  // fused multiply-add/sub
     if (fixnan) {
         emit32(EQ | (acc << 16) | (acc << 5) | mt2); // mt2 = (res==res) (all-ones where result NOT NaN)
         e_v3(0x4E601C00u, mt1, mt1, mt2);            // mt1 = PRESIGN & ~res_notnan (sign on generated-NaN)
@@ -1192,24 +1272,24 @@ static void emit_fma_group(int rA, int rB, int rC, int acc, int mt1, int mt2, in
 // (the gate falls back to do_avx) because x86 and ARM diverge on two-NaN-per-lane operand selection; that
 // path is left to the correctness-first do_avx. Scratch: v23 (presign), v24 (tmp).
 static void emit_vex_fp(int vd, int src1, int src2, int op, int dbl) {
-    uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u;              // FCMEQ Vd.2d/.4s (all-ones per non-NaN lane)
+    uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u; // FCMEQ Vd.2d/.4s (all-ones per non-NaN lane)
     unsigned immhb = dbl ? (64u + 63u) : (32u + 31u);
     uint32_t szb = dbl ? 0x00400000u : 0;
-    uint32_t base = op == 0x58   ? 0x4E20D400u   // FADD
-                    : op == 0x59 ? 0x6E20DC00u   // FMUL
-                    : op == 0x5C ? 0x4EA0D400u   // FSUB
-                                 : 0x6E20FC00u;  // FDIV (0x5E)
-    base |= szb;                                               // bit22 = sz: 0 -> .4s (ps), 1 -> .2d (pd)
+    uint32_t base = op == 0x58   ? 0x4E20D400u  // FADD
+                    : op == 0x59 ? 0x6E20DC00u  // FMUL
+                    : op == 0x5C ? 0x4EA0D400u  // FSUB
+                                 : 0x6E20FC00u; // FDIV (0x5E)
+    base |= szb;                                // bit22 = sz: 0 -> .4s (ps), 1 -> .2d (pd)
     // PRE: v23 = presign (x86 indefinite sign bit) on lanes whose BOTH inputs are non-NaN, else 0.
-    emit32(EQ | (src1 << 16) | (src1 << 5) | 23);              // v23 = (src1==src1)
-    emit32(EQ | (src2 << 16) | (src2 << 5) | 24);              // v24 = (src2==src2)
-    e_v3(0x4E201C00u, 23, 23, 24);                             // v23 = src1nn & src2nn  (AND.16b)
-    emit32(0x4F005400u | (immhb << 16) | (23 << 5) | 23);      // v23 = SHL #(esize-1) -> sign bit per lane
-    e_v3(base, vd, src1, src2);                                // vd = src1 OP src2  (Vn=src1, Vm=src2)
+    emit32(EQ | (src1 << 16) | (src1 << 5) | 23);         // v23 = (src1==src1)
+    emit32(EQ | (src2 << 16) | (src2 << 5) | 24);         // v24 = (src2==src2)
+    e_v3(0x4E201C00u, 23, 23, 24);                        // v23 = src1nn & src2nn  (AND.16b)
+    emit32(0x4F005400u | (immhb << 16) | (23 << 5) | 23); // v23 = SHL #(esize-1) -> sign bit per lane
+    e_v3(base, vd, src1, src2);                           // vd = src1 OP src2  (Vn=src1, Vm=src2)
     // POST: OR the x86 indefinite sign into lanes that are a GENERATED default NaN (result NaN, inputs not).
-    emit32(EQ | (vd << 16) | (vd << 5) | 24);                  // v24 = (vd==vd)
-    e_v3(0x4E601C00u, 23, 23, 24);                             // v23 = presign & ~res_notnan (BIC.16b)
-    e_v3(0x4EA01C00u, vd, vd, 23);                             // vd |= sign  (ORR.16b)
+    emit32(EQ | (vd << 16) | (vd << 5) | 24); // v24 = (vd==vd)
+    e_v3(0x4E601C00u, 23, 23, 24);            // v23 = presign & ~res_notnan (BIC.16b)
+    e_v3(0x4EA01C00u, vd, vd, 23);            // vd |= sign  (ORR.16b)
 }
 
 // Deliver a guest trap SIGNAL (int3 -> SIGTRAP, UD2 -> SIGILL) by EXITING the block to the dispatcher with
@@ -1234,6 +1314,7 @@ static void emit_guest_signal(uint64_t rip, int lsig, int code) {
 // just need to project them into MXCSR bits 0..5 (previously hard-zeroed), and ldmxcsr/fxrstor project a
 // loaded MXCSR back so a guest that CLEARS the sticky flags (feclearexcept) actually clears the host FPSR.
 static const int g_mxcsr_fpsr_bit[6] = {0, 7, 1, 2, 3, 4};
+
 static void emit_fpsr_to_mxcsr(int dst) { // OR the host FPSR sticky flags into `dst` at MXCSR bits 0..5
     emit32(0xD53B4420u | 22);             // mrs x22, fpsr
     e_movconst(21, 0);                    // accumulator
@@ -1245,6 +1326,7 @@ static void emit_fpsr_to_mxcsr(int dst) { // OR the host FPSR sticky flags into 
     }
     e_rrr(A_ORR, dst, dst, 21, 0, 0);
 }
+
 static void emit_mxcsr_to_fpsr(int src) { // set the host FPSR sticky flags from `src` (MXCSR) bits 0..5
     emit32(0xD53B4420u | 22);             // mrs x22, fpsr
     e_movconst(19, 0x9f);                 // ARM cumulative-flag mask: IOC|DZC|OFC|UFC|IXC|IDC (bits 0-4,7)
@@ -1264,6 +1346,7 @@ static void emit_mxcsr_to_fpsr(int src) { // set the host FPSR sticky flags from
 static void emit_ldmxcsr(struct insn *I, uint64_t next) {
     if (!I->is_mem) return;
     emit_ea(I, next);
+    emit_memory_guard(17, 4, next - (uint64_t)I->len, X86_SOFT_READ);
     e_load(4, 23, 17);      // x23 = MXCSR (full, kept for the sticky-flag projection)
     e_lsr_i(16, 23, 13, 0); // x16 = MXCSR >> 13
     e_movconst(19, 3);
@@ -1281,11 +1364,11 @@ static void emit_ldmxcsr(struct insn *I, uint64_t next) {
     // denormal inputs and outputs, so the common FTZ+DAZ pair maps exactly;
     // a lone FTZ/DAZ over-flushes the other direction (documented approximation)
     // -- strictly better than the prior behavior of never flushing at all.
-    e_lsr_i(16, 23, 15, 0);          // x16 = MXCSR>>15 (FTZ -> bit0)
-    e_lsr_i(20, 23, 6, 0);           // x20 = MXCSR>>6  (DAZ -> bit0)
-    e_rrr(A_ORR, 16, 16, 20, 0, 0);  // x16 = FTZ|DAZ (junk in high bits)
+    e_lsr_i(16, 23, 15, 0);         // x16 = MXCSR>>15 (FTZ -> bit0)
+    e_lsr_i(20, 23, 6, 0);          // x20 = MXCSR>>6  (DAZ -> bit0)
+    e_rrr(A_ORR, 16, 16, 20, 0, 0); // x16 = FTZ|DAZ (junk in high bits)
     e_movconst(20, 1);
-    e_rrr(A_AND, 16, 16, 20, 0, 0);  // x16 = (FTZ|DAZ)&1
+    e_rrr(A_AND, 16, 16, 20, 0, 0); // x16 = (FTZ|DAZ)&1
     e_movconst(20, 1u << 24);
     e_rrr(A_BIC, 19, 19, 20, 1, 0);  // clear FPCR.FZ
     e_rrr(A_ORR, 19, 19, 16, 1, 24); // FPCR.FZ = (FTZ|DAZ)
@@ -1298,6 +1381,7 @@ static void emit_ldmxcsr(struct insn *I, uint64_t next) {
 static void emit_stmxcsr(struct insn *I, uint64_t next) {
     if (!I->is_mem) return;
     emit_ea(I, next);
+    emit_memory_guard(17, 4, next - (uint64_t)I->len, X86_SOFT_WRITE);
     emit32(0xD53B4400u | 19); // mrs x19, fpcr
     e_lsr_i(19, 19, 22, 0);   // x19 = FPCR >> 22
     e_movconst(20, 3);
@@ -1311,13 +1395,14 @@ static void emit_stmxcsr(struct insn *I, uint64_t next) {
     emit_fpsr_to_mxcsr(16);          // + live sticky exception flags (IE/DE/ZE/OE/UE/PE)
     // reflect host FPCR.FZ(24) back to MXCSR FTZ(15)+DAZ(6) so a guest that
     // saves/restores the control word preserves flush-to-zero mode.
-    emit32(0xD53B4400u | 19);        // mrs x19, fpcr
-    e_lsr_i(19, 19, 24, 0);          // x19 = FPCR>>24 (FZ -> bit0)
+    emit32(0xD53B4400u | 19); // mrs x19, fpcr
+    e_lsr_i(19, 19, 24, 0);   // x19 = FPCR>>24 (FZ -> bit0)
     e_movconst(20, 1);
     e_rrr(A_AND, 19, 19, 20, 0, 0);  // x19 = FZ&1
     e_rrr(A_ORR, 16, 16, 19, 0, 15); // MXCSR |= FZ<<15 (FTZ)
     e_rrr(A_ORR, 16, 16, 19, 0, 6);  // MXCSR |= FZ<<6  (DAZ)
     e_store(4, 16, 17);
+    if (emit_soft_memory_active()) emit_soft_store_commit(4);
 }
 
 // x87 fist/fistp round ST0 (already in d16) to an integral double using the CURRENT x87 rounding control
@@ -1365,6 +1450,15 @@ static void jit86_drop_range_translations(uint64_t lo, uint64_t hi) {
         }
     }
     if (!hit) return; // no translated code in the range -> nothing to invalidate (the common data-munmap case)
+    map_clear();
+    memset(g_ibtc, 0, sizeof g_ibtc);
+    memset(g_xibtc, 0, sizeof g_xibtc);
+    pend_reset();
+}
+
+static void jit86_drop_all_smc_translations(void) {
+    if (!g_rwx_guest || g_smc_n == 0) return;
+    g_smc_n = 0;
     map_clear();
     memset(g_ibtc, 0, sizeof g_ibtc);
     memset(g_xibtc, 0, sizeof g_xibtc);
@@ -1518,20 +1612,24 @@ static void emit_irq_check(uint64_t rip) {
 static void avx_cpu_addr16(int off) { // x16 = x28 + off   (off < 4096)
     emit32(0x91000000u | ((unsigned)off << 10) | (28u << 5) | 16u);
 }
+
 static void avx_cpu_ldr_q(int t, int off) {
     avx_cpu_addr16(off);
     e_ldr_q(t, 16, 0);
 }
+
 static void avx_cpu_str_q(int t, int off) {
     avx_cpu_addr16(off);
     e_str_q(t, 16, 0);
 }
+
 static void avx_zero_upper(int d, int l256) { // zero destination bits above the written width
     if (!l256) {                              // VEX.128 wrote 128 -> also clear vhi (bits[255:128])
         e_str(31, 28, OFF_VHI + 16 * d);
         e_str(31, 28, OFF_VHI + 16 * d + 8);
     }
-    for (int k = 0; k < 4; k++) e_str(31, 28, OFF_VZ + 32 * d + 8 * k); // clear vz (bits[511:256])
+    for (int k = 0; k < 4; k++)
+        e_str(31, 28, OFF_VZ + 32 * d + 8 * k); // clear vz (bits[511:256])
 }
 
 // Emit ONE 128-bit lane of an AVX2 variable shift (VPSLLV/VPSRLV/VPSRAV). op: 0x47 sllv (logical left),
@@ -1551,33 +1649,33 @@ static void emit_avx_varshift_lane(int out, int val, int cnt, int op, int es) {
     uint32_t USHL = 0x6E204400u | (sz << 22);
     uint32_t SSHL = 0x4E204400u | (sz << 22);
     uint32_t NEG = 0x6E20B800u | (sz << 22);
-    if (op == 0x46) {                                              // arithmetic right (dword only)
+    if (op == 0x46) { // arithmetic right (dword only)
         e_movconst(16, 31);
-        emit32(0x4E040C00u | (16 << 5) | 24);                      // dup v24.4s, w16 (=31)
-        emit32((0x6EA06C00u) | (24 << 16) | (cnt << 5) | 24);      // umin v24.4s, cnt, 31
-        emit32(NEG | (24 << 5) | 24);                              // neg v24 -> -min(cnt,31)
-        emit32(SSHL | (24 << 16) | (val << 5) | out);              // sshl out, val, v24 (sign fill)
+        emit32(0x4E040C00u | (16 << 5) | 24);                 // dup v24.4s, w16 (=31)
+        emit32((0x6EA06C00u) | (24 << 16) | (cnt << 5) | 24); // umin v24.4s, cnt, 31
+        emit32(NEG | (24 << 5) | 24);                         // neg v24 -> -min(cnt,31)
+        emit32(SSHL | (24 << 16) | (val << 5) | out);         // sshl out, val, v24 (sign fill)
         return;
     }
-    if (es == 4) {                                                 // logical dword: clamp via UMIN.4s
+    if (es == 4) { // logical dword: clamp via UMIN.4s
         e_movconst(16, 32);
-        emit32(0x4E040C00u | (16 << 5) | 24);                      // dup v24.4s, w16 (=32)
-        emit32((0x6EA06C00u) | (24 << 16) | (cnt << 5) | 24);      // umin v24.4s = min(cnt,32)
-        if (op == 0x45) emit32(NEG | (24 << 5) | 24);              // right shift -> negate amount
-        emit32(USHL | (24 << 16) | (val << 5) | out);              // ushl out, val, v24
+        emit32(0x4E040C00u | (16 << 5) | 24);                 // dup v24.4s, w16 (=32)
+        emit32((0x6EA06C00u) | (24 << 16) | (cnt << 5) | 24); // umin v24.4s = min(cnt,32)
+        if (op == 0x45) emit32(NEG | (24 << 5) | 24);         // right shift -> negate amount
+        emit32(USHL | (24 << 16) | (val << 5) | out);         // ushl out, val, v24
         return;
     }
     // logical qword: mask lanes with count >= 64 to 0 (build mask first so out may alias cnt).
     e_movconst(16, 64);
-    emit32(0x4E080C00u | (16 << 5) | 24);                         // dup v24.2d, x16 (=64)
-    emit32((0x6EE03C00u) | (24 << 16) | (cnt << 5) | 25);         // cmhs v25.2d = (cnt u>= 64)
-    if (op == 0x45) {                                             // logical right
-        emit32(NEG | (cnt << 5) | 24);                           // v24 = -cnt
+    emit32(0x4E080C00u | (16 << 5) | 24);                 // dup v24.2d, x16 (=64)
+    emit32((0x6EE03C00u) | (24 << 16) | (cnt << 5) | 25); // cmhs v25.2d = (cnt u>= 64)
+    if (op == 0x45) {                                     // logical right
+        emit32(NEG | (cnt << 5) | 24);                    // v24 = -cnt
         emit32(USHL | (24 << 16) | (val << 5) | out);
-    } else {                                                     // logical left
+    } else { // logical left
         emit32(USHL | (cnt << 16) | (val << 5) | out);
     }
-    e_v3(0x4E601C00u, out, out, 25);                             // bic out, out, mask
+    e_v3(0x4E601C00u, out, out, 25); // bic out, out, mask
 }
 
 // Emit ONE 128-bit lane of a VCMPPS/VCMPPD packed FP compare (op 0xC2). a=src1, b=src2 (host V regs),
@@ -1593,31 +1691,63 @@ static void emit_vcmp_lane(int out, int a, int b, int p, int dbl) {
     const uint32_t AND = 0x4E201C00u, ORR = 0x4EA01C00u, EOR = 0x6E201C00u;
     uint32_t MVN = 0x6E205800u; // NOT vd.16b, vn.16b
     switch (p & 0x0F) {
-    case 0x0: e_v3(FCMEQ, out, a, b); break;                                  // EQ_OQ:  a==b (false on NaN)
-    case 0x1: e_v3(FCMGT, out, b, a); break;                                  // LT_OS:  a<b  = b>a
-    case 0x2: e_v3(FCMGE, out, b, a); break;                                  // LE_OS:  a<=b = b>=a
-    case 0x3: // UNORD_Q: either NaN  = NOT(ord)
-        e_v3(FCMEQ, 26, a, a); e_v3(FCMEQ, 27, b, b); e_v3(AND, out, 26, 27);
-        emit32(MVN | (out << 5) | out); break;
-    case 0x4: e_v3(FCMEQ, out, a, b); emit32(MVN | (out << 5) | out); break;  // NEQ_UQ: !(a==b) (true on NaN)
-    case 0x5: e_v3(FCMGT, out, b, a); emit32(MVN | (out << 5) | out); break;  // NLT_US: !(a<b)  (true on NaN)
-    case 0x6: e_v3(FCMGE, out, b, a); emit32(MVN | (out << 5) | out); break;  // NLE_US: !(a<=b) (true on NaN)
-    case 0x7: // ORD_Q: neither NaN
-        e_v3(FCMEQ, 26, a, a); e_v3(FCMEQ, 27, b, b); e_v3(AND, out, 26, 27); break;
+    case 0x0: e_v3(FCMEQ, out, a, b); break; // EQ_OQ:  a==b (false on NaN)
+    case 0x1: e_v3(FCMGT, out, b, a); break; // LT_OS:  a<b  = b>a
+    case 0x2: e_v3(FCMGE, out, b, a); break; // LE_OS:  a<=b = b>=a
+    case 0x3:                                // UNORD_Q: either NaN  = NOT(ord)
+        e_v3(FCMEQ, 26, a, a);
+        e_v3(FCMEQ, 27, b, b);
+        e_v3(AND, out, 26, 27);
+        emit32(MVN | (out << 5) | out);
+        break;
+    case 0x4:
+        e_v3(FCMEQ, out, a, b);
+        emit32(MVN | (out << 5) | out);
+        break; // NEQ_UQ: !(a==b) (true on NaN)
+    case 0x5:
+        e_v3(FCMGT, out, b, a);
+        emit32(MVN | (out << 5) | out);
+        break; // NLT_US: !(a<b)  (true on NaN)
+    case 0x6:
+        e_v3(FCMGE, out, b, a);
+        emit32(MVN | (out << 5) | out);
+        break; // NLE_US: !(a<=b) (true on NaN)
+    case 0x7:  // ORD_Q: neither NaN
+        e_v3(FCMEQ, 26, a, a);
+        e_v3(FCMEQ, 27, b, b);
+        e_v3(AND, out, 26, 27);
+        break;
     case 0x8: // EQ_UQ: a==b OR unordered
-        e_v3(FCMEQ, 26, a, a); e_v3(FCMEQ, 27, b, b); e_v3(AND, 26, 26, 27);
-        emit32(MVN | (26 << 5) | 26);                                        // v26 = unord
-        e_v3(FCMEQ, 27, a, b); e_v3(ORR, out, 26, 27); break;
-    case 0x9: e_v3(FCMGE, out, a, b); emit32(MVN | (out << 5) | out); break;  // NGE_US: !(a>=b) (true on NaN)
-    case 0xA: e_v3(FCMGT, out, a, b); emit32(MVN | (out << 5) | out); break;  // NGT_US: !(a>b)  (true on NaN)
-    case 0xB: e_v3(EOR, out, a, a); break;                                    // FALSE_OQ: all zero
-    case 0xC: // NEQ_OQ: a!=b AND ordered
-        e_v3(FCMEQ, 26, a, a); e_v3(FCMEQ, 27, b, b); e_v3(AND, 26, 26, 27); // ord
-        e_v3(FCMEQ, 27, a, b); emit32(MVN | (27 << 5) | 27);                 // !eq
-        e_v3(AND, out, 26, 27); break;
-    case 0xD: e_v3(FCMGE, out, a, b); break;                                  // GE_OS
-    case 0xE: e_v3(FCMGT, out, a, b); break;                                  // GT_OS
-    case 0xF: e_v3(EOR, out, a, a); emit32(MVN | (out << 5) | out); break;    // TRUE_UQ: all ones
+        e_v3(FCMEQ, 26, a, a);
+        e_v3(FCMEQ, 27, b, b);
+        e_v3(AND, 26, 26, 27);
+        emit32(MVN | (26 << 5) | 26); // v26 = unord
+        e_v3(FCMEQ, 27, a, b);
+        e_v3(ORR, out, 26, 27);
+        break;
+    case 0x9:
+        e_v3(FCMGE, out, a, b);
+        emit32(MVN | (out << 5) | out);
+        break; // NGE_US: !(a>=b) (true on NaN)
+    case 0xA:
+        e_v3(FCMGT, out, a, b);
+        emit32(MVN | (out << 5) | out);
+        break;                             // NGT_US: !(a>b)  (true on NaN)
+    case 0xB: e_v3(EOR, out, a, a); break; // FALSE_OQ: all zero
+    case 0xC:                              // NEQ_OQ: a!=b AND ordered
+        e_v3(FCMEQ, 26, a, a);
+        e_v3(FCMEQ, 27, b, b);
+        e_v3(AND, 26, 26, 27); // ord
+        e_v3(FCMEQ, 27, a, b);
+        emit32(MVN | (27 << 5) | 27); // !eq
+        e_v3(AND, out, 26, 27);
+        break;
+    case 0xD: e_v3(FCMGE, out, a, b); break; // GE_OS
+    case 0xE: e_v3(FCMGT, out, a, b); break; // GT_OS
+    case 0xF:
+        e_v3(EOR, out, a, a);
+        emit32(MVN | (out << 5) | out);
+        break; // TRUE_UQ: all ones
     }
 }
 
@@ -1655,17 +1785,24 @@ static void emit_pd2i32_pieces(int r, int m, int sd, int trunc, int c2p31d, int 
         emit32(0x6EE19800u | (sd << 5) | r); // FRINTI.2d r, sd
         emit32(0x4EE1B800u | (r << 5) | r);  // FCVTZS.2d r, r
     }
-    emit32(0x6E60E400u | (c2p31d << 16) | (sd << 5) | m);      // FCMGE.2d m, sd, 2^31       (f>=2^31)
-    emit32(0x6EE0E400u | (sd << 16) | (cneg2p31d << 5) | t1);  // FCMGT.2d t1, -2^31, sd     (-2^31 > f)
-    e_v3(0x4EA01C00u, m, m, t1);                               // ORR m |= (f < -2^31)
-    emit32(0x4E60E400u | (sd << 16) | (sd << 5) | t1);         // FCMEQ.2d t1, sd, sd        (NOT NaN)
-    emit32(0x6E205800u | (t1 << 5) | t1);                      // MVN t1                     (NaN)
-    e_v3(0x4EA01C00u, m, m, t1);                               // ORR m |= NaN
+    emit32(0x6E60E400u | (c2p31d << 16) | (sd << 5) | m);     // FCMGE.2d m, sd, 2^31       (f>=2^31)
+    emit32(0x6EE0E400u | (sd << 16) | (cneg2p31d << 5) | t1); // FCMGT.2d t1, -2^31, sd     (-2^31 > f)
+    e_v3(0x4EA01C00u, m, m, t1);                              // ORR m |= (f < -2^31)
+    emit32(0x4E60E400u | (sd << 16) | (sd << 5) | t1);        // FCMEQ.2d t1, sd, sd        (NOT NaN)
+    emit32(0x6E205800u | (t1 << 5) | t1);                     // MVN t1                     (NaN)
+    e_v3(0x4EA01C00u, m, m, t1);                              // ORR m |= NaN
 }
 
 // Returns 1 if the VEX insn was lowered inline (caller does gpc = next; continue), else 0 (fall through
 // to the R_AVX do_avx exit). Correctness-first: only a vetted, bit-exact-vs-qemu subset is claimed here.
 static int avx_lower(struct insn *I, uint64_t next) {
+    /*
+     * The C AVX/SSE emulator resolves logical mappings through the target
+     * memory callbacks.  Keep all memory-backed VEX/EVEX forms on that single
+     * audited path while soft mappings are active; register-only forms retain
+     * their inline fast path.
+     */
+    if (I->is_mem && emit_soft_memory_active()) return 0;
     if (!I->vex || I->evex || I->vex_l > 1) return 0; // 512-bit / EVEX (masks, zmm16..31): leave to do_avx
     int l256 = (I->vex_l == 1);
     int d = I->reg, s1 = I->vvvv, s2r = I->rm_reg, pp = I->vex_pp, map = I->vex_map, op = I->op;
@@ -1676,8 +1813,14 @@ static int avx_lower(struct insn *I, uint64_t next) {
     // the do_avx unimplemented path (which aborts the engine with exit 70). Memory operand, no vvvv. ----
     if (map == 1 && op == 0xAE && pp == 0 && !l256 && I->is_mem) {
         int sub = I->reg & 7;
-        if (sub == 2) { emit_ldmxcsr(I, next); return 1; }
-        if (sub == 3) { emit_stmxcsr(I, next); return 1; }
+        if (sub == 2) {
+            emit_ldmxcsr(I, next);
+            return 1;
+        }
+        if (sub == 3) {
+            emit_stmxcsr(I, next);
+            return 1;
+        }
     }
 
     // ---- vperm2i128 (46) / vperm2f128 (06) (VEX.256.66.0F3A.W0 /r ib): select each output 128-bit lane
@@ -1687,23 +1830,28 @@ static int avx_lower(struct insn *I, uint64_t next) {
     if (map == 3 && (op == 0x46 || op == 0x06) && pp == 1 && l256) {
         int imm = I->imm & 0xFF;
         mark_vdirty();
-        e_vmov(20, s1);                          // v20 = src1.lo (host xmm)
-        avx_cpu_ldr_q(21, OFF_VHI + 16 * s1);    // v21 = src1.hi
+        e_vmov(20, s1);                       // v20 = src1.lo (host xmm)
+        avx_cpu_ldr_q(21, OFF_VHI + 16 * s1); // v21 = src1.hi
         if (I->is_mem) {
             emit_ea(I, next);
-            g_ldr_q(22, 17, 0);                  // v22 = src2.lo (mem)
-            g_ldr_q(23, 17, 16);                 // v23 = src2.hi (mem+16)
+            g_ldr_q(22, 17, 0);  // v22 = src2.lo (mem)
+            g_ldr_q(23, 17, 16); // v23 = src2.hi (mem+16)
         } else {
-            e_vmov(22, s2r);                     // v22 = src2.lo (host xmm)
+            e_vmov(22, s2r);                       // v22 = src2.lo (host xmm)
             avx_cpu_ldr_q(23, OFF_VHI + 16 * s2r); // v23 = src2.hi
         }
         static const int srcreg[4] = {20, 21, 22, 23};
         // low output -> host v[d]
-        if (imm & 0x08) e_v3(0x6E201C00u, d, d, d);        // EOR d,d,d = zero
-        else e_vmov(d, srcreg[imm & 3]);
+        if (imm & 0x08)
+            e_v3(0x6E201C00u, d, d, d); // EOR d,d,d = zero
+        else
+            e_vmov(d, srcreg[imm & 3]);
         // high output -> cpu->vhi[d]
-        if (imm & 0x80) { e_v3(0x6E201C00u, 24, 24, 24); avx_cpu_str_q(24, OFF_VHI + 16 * d); }
-        else avx_cpu_str_q(srcreg[(imm >> 4) & 3], OFF_VHI + 16 * d);
+        if (imm & 0x80) {
+            e_v3(0x6E201C00u, 24, 24, 24);
+            avx_cpu_str_q(24, OFF_VHI + 16 * d);
+        } else
+            avx_cpu_str_q(srcreg[(imm >> 4) & 3], OFF_VHI + 16 * d);
         avx_zero_upper(d, l256);
         return 1;
     }
@@ -1714,15 +1862,15 @@ static int avx_lower(struct insn *I, uint64_t next) {
     // (L=0) or 32 bits (L=1) in the dest GPR, upper bits zeroed by the W-form (32-bit) ORR/UMOV. ----
     if (map == 1 && op == 0xD7 && pp == 1 && !I->is_mem) {
         e_vshr_imm(17, s2r, 8, 7, 0);                        // ushr v17.16b, src.16b, #7
-        emit32(0x6F001400u | (25u << 16) | (17 << 5) | 17); // usra v17.8h, v17.8h, #7
-        emit32(0x6F001400u | (50u << 16) | (17 << 5) | 17); // usra v17.4s, v17.4s, #14
-        emit32(0x6F001400u | (100u << 16) | (17 << 5) | 17);// usra v17.2d, v17.2d, #28
-        emit32(0x0E003C00u | (1u << 16) | (17 << 5) | 16);  // umov w16, v17.b[0]  (bytes 0..7)
-        emit32(0x0E003C00u | (17u << 16) | (17 << 5) | d);  // umov wD,  v17.b[8]  (bytes 8..15)
-        e_rrr(A_ORR, d, 16, d, 0, 8);                       // wD = w16 | (wD<<8)  -> bits[15:0]
+        emit32(0x6F001400u | (25u << 16) | (17 << 5) | 17);  // usra v17.8h, v17.8h, #7
+        emit32(0x6F001400u | (50u << 16) | (17 << 5) | 17);  // usra v17.4s, v17.4s, #14
+        emit32(0x6F001400u | (100u << 16) | (17 << 5) | 17); // usra v17.2d, v17.2d, #28
+        emit32(0x0E003C00u | (1u << 16) | (17 << 5) | 16);   // umov w16, v17.b[0]  (bytes 0..7)
+        emit32(0x0E003C00u | (17u << 16) | (17 << 5) | d);   // umov wD,  v17.b[8]  (bytes 8..15)
+        e_rrr(A_ORR, d, 16, d, 0, 8);                        // wD = w16 | (wD<<8)  -> bits[15:0]
         if (l256) {
-            avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);           // v20 = src.hi (bytes 16..31)
-            e_vshr_imm(18, 20, 8, 7, 0);                     // ushr v18.16b, v20.16b, #7
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // v20 = src.hi (bytes 16..31)
+            e_vshr_imm(18, 20, 8, 7, 0);           // ushr v18.16b, v20.16b, #7
             emit32(0x6F001400u | (25u << 16) | (18 << 5) | 18);
             emit32(0x6F001400u | (50u << 16) | (18 << 5) | 18);
             emit32(0x6F001400u | (100u << 16) | (18 << 5) | 18);
@@ -1740,23 +1888,42 @@ static int avx_lower(struct insn *I, uint64_t next) {
     // xmm -> GPR/mem. ----
     if (map == 1 && !l256 && (op == 0x6E || op == 0x7E)) {
         int w = I->vex_w;
-        if (op == 0x6E && pp == 1) {           // 66.0F.6E: (v)movd/q GPR|mem -> xmm, zero-extend to ymm width
+        if (op == 0x6E && pp == 1) { // 66.0F.6E: (v)movd/q GPR|mem -> xmm, zero-extend to ymm width
             mark_vdirty();
-            if (I->is_mem) { emit_ea(I, next); if (w) g_ldr_d(d, 17); else g_ldr_s(d, 17); }
-            else if (w) e_fmov_to_d(d, s2r); else e_fmov_to_s(d, s2r);
+            if (I->is_mem) {
+                emit_ea(I, next);
+                if (w)
+                    g_ldr_d(d, 17);
+                else
+                    g_ldr_s(d, 17);
+            } else if (w)
+                e_fmov_to_d(d, s2r);
+            else
+                e_fmov_to_s(d, s2r);
             avx_zero_upper(d, 0);
             return 1;
         }
-        if (op == 0x7E && pp == 2) {           // F3.0F.7E: vmovq xmm/m64 -> xmm (low 64, zero upper)
+        if (op == 0x7E && pp == 2) { // F3.0F.7E: vmovq xmm/m64 -> xmm (low 64, zero upper)
             mark_vdirty();
-            if (I->is_mem) { emit_ea(I, next); g_ldr_d(d, 17); }
-            else e_vmov8(d, s2r);
+            if (I->is_mem) {
+                emit_ea(I, next);
+                g_ldr_d(d, 17);
+            } else
+                e_vmov8(d, s2r);
             avx_zero_upper(d, 0);
             return 1;
         }
-        if (op == 0x7E && pp == 1) {           // 66.0F.7E: (v)movd/q xmm -> GPR|mem
-            if (I->is_mem) { emit_ea(I, next); if (w) g_str_d(d, 17); else g_str_s(d, 17); }
-            else if (w) e_fmov_from_d(s2r, d); else e_fmov_from_s(s2r, d);
+        if (op == 0x7E && pp == 1) { // 66.0F.7E: (v)movd/q xmm -> GPR|mem
+            if (I->is_mem) {
+                emit_ea(I, next);
+                if (w)
+                    g_str_d(d, 17);
+                else
+                    g_str_s(d, 17);
+            } else if (w)
+                e_fmov_from_d(s2r, d);
+            else
+                e_fmov_from_s(s2r, d);
             return 1;
         }
     }
@@ -1765,20 +1932,25 @@ static int avx_lower(struct insn *I, uint64_t next) {
     // bits[MAX:128] of all ymm0..15 (== avx_zero_upper for each: clears vhi + vz); vzeroall additionally
     // clears the low 128 (host v[n]). ----
     if (map == 1 && op == 0x77 && pp == 0) {
-        if (l256) {                                              // vzeroall: also zero the low 128 lanes
+        if (l256) { // vzeroall: also zero the low 128 lanes
             mark_vdirty();
-            for (int n = 0; n < 16; n++) e_v3(0x6E201C00u, n, n, n); // eor vn.16b -> 0
+            for (int n = 0; n < 16; n++)
+                e_v3(0x6E201C00u, n, n, n); // eor vn.16b -> 0
         }
-        for (int n = 0; n < 16; n++) avx_zero_upper(n, 0);       // clear vhi[n] and vz[n]
+        for (int n = 0; n < 16; n++)
+            avx_zero_upper(n, 0); // clear vhi[n] and vz[n]
         return 1;
     }
 
     // ---- moves (2-operand: no vvvv) ----
     int is_load = 0, is_store = 0;
     if (map == 1) {
-        if ((op == 0x6F && (pp == 1 || pp == 2)) || ((op == 0x10 || op == 0x28) && pp < 2)) is_load = 1;
-        else if ((op == 0x7F && (pp == 1 || pp == 2)) || ((op == 0x11 || op == 0x29) && pp < 2)) is_store = 1;
-        else if (op == 0xE7 && pp == 1 && I->is_mem) is_store = 1; // vmovntdq store xmm/ymm -> mem (plain STR)
+        if ((op == 0x6F && (pp == 1 || pp == 2)) || ((op == 0x10 || op == 0x28) && pp < 2))
+            is_load = 1;
+        else if ((op == 0x7F && (pp == 1 || pp == 2)) || ((op == 0x11 || op == 0x29) && pp < 2))
+            is_store = 1;
+        else if (op == 0xE7 && pp == 1 && I->is_mem)
+            is_store = 1; // vmovntdq store xmm/ymm -> mem (plain STR)
     }
     if (is_load) {
         mark_vdirty();
@@ -1803,11 +1975,20 @@ static int avx_lower(struct insn *I, uint64_t next) {
         mark_vdirty();
         if (I->is_mem) {
             emit_ea(I, next);
-            g_str_q(d, 17, 0);
+            if (emit_soft_memory_active()) {
+                emit_memory_guard(17, l256 ? 32u : 16u, next - (uint64_t)I->len, X86_SOFT_WRITE);
+                e_dmb_ish();
+                e_str_q(d, 17, 0);
+            } else
+                g_str_q(d, 17, 0);
             if (l256) {
                 avx_cpu_ldr_q(20, OFF_VHI + 16 * d);
-                g_str_q(20, 17, 16);
+                if (emit_soft_memory_active())
+                    e_str_q(20, 17, 16);
+                else
+                    g_str_q(20, 17, 16);
             }
+            if (emit_soft_memory_active()) emit_soft_store_commit(l256 ? 32u : 16u);
         } else {
             int dst = s2r; // r/m register is the destination
             if (dst != d) e_vmov(dst, d);
@@ -1826,25 +2007,41 @@ static int avx_lower(struct insn *I, uint64_t next) {
     if (map == 2 && pp == 1) {
         int role = 0, ok = 1;
         switch (op) {
-        case 0x98: case 0x9A: case 0x9C: case 0x9E: role = 132; break;
-        case 0xA8: case 0xAA: case 0xAC: case 0xAE: role = 213; break;
-        case 0xB8: case 0xBA: case 0xBC: case 0xBE: role = 231; break;
+        case 0x98:
+        case 0x9A:
+        case 0x9C:
+        case 0x9E: role = 132; break;
+        case 0xA8:
+        case 0xAA:
+        case 0xAC:
+        case 0xAE: role = 213; break;
+        case 0xB8:
+        case 0xBA:
+        case 0xBC:
+        case 0xBE: role = 231; break;
         default: ok = 0; break;
         }
         if (ok) {
-            int dbl = I->vex_w;      // W1 -> pd (.2d), W0 -> ps (.4s)
+            int dbl = I->vex_w; // W1 -> pd (.2d), W0 -> ps (.4s)
             int nib = op & 0x0F;
             int fmls = (nib == 0x0C || nib == 0x0E); // fnmadd/fnmsub: negate the product (FMLS)
             int neg = (nib == 0x0A || nib == 0x0E);  // fmsub/fnmsub: subtract C (FNEG the addend)
             mark_vdirty();
             int s2 = s2r;
-            if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; } // op3 low -> v16
+            if (I->is_mem) {
+                emit_ea(I, next);
+                g_ldr_q(16, 17, 0);
+                s2 = 16;
+            } // op3 low -> v16
             // High halves of the three inputs (256-bit) live in cpu->vhi (or mem+16). Load them once,
             // BEFORE the NaN gate, so both the gate predicate and the fast arithmetic reuse them.
             if (l256) {
-                avx_cpu_ldr_q(18, OFF_VHI + 16 * d);   // d.hi
-                avx_cpu_ldr_q(19, OFF_VHI + 16 * s1);  // s1.hi
-                if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // s2.hi
+                avx_cpu_ldr_q(18, OFF_VHI + 16 * d);  // d.hi
+                avx_cpu_ldr_q(19, OFF_VHI + 16 * s1); // s1.hi
+                if (I->is_mem)
+                    g_ldr_q(20, 17, 16);
+                else
+                    avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // s2.hi
             }
             // ---- NaN-input gate ----
             // Native FMLA/FMLS is bit-exact to x86 FMA for finite inputs and for GENERATED NaNs (fixed
@@ -1856,20 +2053,25 @@ static int avx_lower(struct insn *I, uint64_t next) {
             // float kernels, so the fast path carries the hot traffic. Predicate: v24 = AND over all
             // inputs of FCMEQ(x,x) (all-ones per non-NaN lane); any zero bit => some NaN => exit.
             uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u;
-            emit32(EQ | (d << 16) | (d << 5) | 24);         // v24 = (d==d)
-            emit32(EQ | (s1 << 16) | (s1 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= (s1==s1)
-            emit32(EQ | (s2 << 16) | (s2 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= (op3==op3)
+            emit32(EQ | (d << 16) | (d << 5) | 24); // v24 = (d==d)
+            emit32(EQ | (s1 << 16) | (s1 << 5) | 25);
+            e_v3(0x4E201C00u, 24, 24, 25); // &= (s1==s1)
+            emit32(EQ | (s2 << 16) | (s2 << 5) | 25);
+            e_v3(0x4E201C00u, 24, 24, 25); // &= (op3==op3)
             if (l256) {
-                emit32(EQ | (18 << 16) | (18 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= d.hi
-                emit32(EQ | (19 << 16) | (19 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= s1.hi
-                emit32(EQ | (20 << 16) | (20 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= op3.hi
+                emit32(EQ | (18 << 16) | (18 << 5) | 25);
+                e_v3(0x4E201C00u, 24, 24, 25); // &= d.hi
+                emit32(EQ | (19 << 16) | (19 << 5) | 25);
+                e_v3(0x4E201C00u, 24, 24, 25); // &= s1.hi
+                emit32(EQ | (20 << 16) | (20 << 5) | 25);
+                e_v3(0x4E201C00u, 24, 24, 25); // &= op3.hi
             }
-            e_ext(25, 24, 24, 8);              // v25.d[0] = v24.d[1] (fold the two 64-bit halves)
-            e_v3(0x4E201C00u, 24, 24, 25);     // v24.d[0] = lane0 & lane1
-            e_fmov_from_d(16, 24);             // x16 = combined mask (all-ones iff NO input NaN)
-            e_rrr(A_ORN, 16, 31, 16, 1, 0);    // x16 = ~x16 (0 iff clean; nonzero iff a NaN input)
+            e_ext(25, 24, 24, 8);           // v25.d[0] = v24.d[1] (fold the two 64-bit halves)
+            e_v3(0x4E201C00u, 24, 24, 25);  // v24.d[0] = lane0 & lane1
+            e_fmov_from_d(16, 24);          // x16 = combined mask (all-ones iff NO input NaN)
+            e_rrr(A_ORN, 16, 31, 16, 1, 0); // x16 = ~x16 (0 iff clean; nonzero iff a NaN input)
             uint32_t *p_cbz = (uint32_t *)g_cp;
-            emit32(0);                          // cbz x16, Lfast  (patched below)
+            emit32(0);                                       // cbz x16, Lfast  (patched below)
             emit_exit_const(next - (uint64_t)I->len, R_AVX); // NaN present -> emulate this insn in C (this insn's rip)
             uint8_t *Lfast = (uint8_t *)g_cp;
             *p_cbz = 0xB4000000u | ((uint32_t)(((Lfast - (uint8_t *)p_cbz) / 4) & 0x7FFFF) << 5) | 16;
@@ -1880,15 +2082,35 @@ static int avx_lower(struct insn *I, uint64_t next) {
             //   213: d = s1*d + op3   -> mul={s1,d},   C=op3
             //   231: d = s1*op3 + d   -> mul={s1,op3}, C=d
             int rA, rB, rC;
-            if (role == 132) { rA = d; rB = s2; rC = s1; }
-            else if (role == 213) { rA = s1; rB = d; rC = s2; }
-            else { rA = s1; rB = s2; rC = d; }
+            if (role == 132) {
+                rA = d;
+                rB = s2;
+                rC = s1;
+            } else if (role == 213) {
+                rA = s1;
+                rB = d;
+                rC = s2;
+            } else {
+                rA = s1;
+                rB = s2;
+                rC = d;
+            }
             emit_fma_group(rA, rB, rC, 23, 24, 25, neg, fmls, dbl); // low 128 -> v23
             if (l256) {                                             // high 128 (highs already in v18/19/20)
                 int hA, hB, hC;
-                if (role == 132) { hA = 18; hB = 20; hC = 19; }
-                else if (role == 213) { hA = 19; hB = 18; hC = 20; }
-                else { hA = 19; hB = 20; hC = 18; }
+                if (role == 132) {
+                    hA = 18;
+                    hB = 20;
+                    hC = 19;
+                } else if (role == 213) {
+                    hA = 19;
+                    hB = 18;
+                    hC = 20;
+                } else {
+                    hA = 19;
+                    hB = 20;
+                    hC = 18;
+                }
                 emit_fma_group(hA, hB, hC, 21, 22, 25, neg, fmls, dbl); // high 128 -> v21
                 e_vmov(d, 23);
                 avx_cpu_str_q(21, OFF_VHI + 16 * d);
@@ -1906,11 +2128,18 @@ static int avx_lower(struct insn *I, uint64_t next) {
         int dbl = (pp == 1); // 66 -> pd (.2d), none -> ps (.4s)
         mark_vdirty();
         int s2 = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; } // op2 low -> v16
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            s2 = 16;
+        } // op2 low -> v16
         // High halves (256-bit) loaded once, BEFORE the gate, so gate predicate + fast arith reuse them.
         if (l256) {
-            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);                        // s1.hi -> v20
-            if (I->is_mem) g_ldr_q(21, 17, 16); else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r); // s2.hi -> v21
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1); // s1.hi -> v20
+            if (I->is_mem)
+                g_ldr_q(21, 17, 16);
+            else
+                avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r); // s2.hi -> v21
         }
         // ---- NaN-input gate ----
         // NEON FADD/FMUL/FSUB/FDIV + emit_dnan is bit-exact to x86 for finite inputs and for GENERATED NaNs
@@ -1921,26 +2150,29 @@ static int avx_lower(struct insn *I, uint64_t next) {
         // some NaN input => exit to do_avx (correctness-first; == prior behavior). Real float kernels have no
         // NaN inputs, so the hot path is unaffected. Inputs are src1(s1)/src2(s2) only -- dest(d) is write-only.
         uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u;
-        emit32(EQ | (s1 << 16) | (s1 << 5) | 24);         // v24 = (s1==s1)
-        emit32(EQ | (s2 << 16) | (s2 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= (s2==s2)
+        emit32(EQ | (s1 << 16) | (s1 << 5) | 24); // v24 = (s1==s1)
+        emit32(EQ | (s2 << 16) | (s2 << 5) | 25);
+        e_v3(0x4E201C00u, 24, 24, 25); // &= (s2==s2)
         if (l256) {
-            emit32(EQ | (20 << 16) | (20 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= s1.hi
-            emit32(EQ | (21 << 16) | (21 << 5) | 25); e_v3(0x4E201C00u, 24, 24, 25); // &= s2.hi
+            emit32(EQ | (20 << 16) | (20 << 5) | 25);
+            e_v3(0x4E201C00u, 24, 24, 25); // &= s1.hi
+            emit32(EQ | (21 << 16) | (21 << 5) | 25);
+            e_v3(0x4E201C00u, 24, 24, 25); // &= s2.hi
         }
-        e_ext(25, 24, 24, 8);              // v25.d[0] = v24.d[1] (fold the two 64-bit halves)
-        e_v3(0x4E201C00u, 24, 24, 25);     // v24.d[0] = lane0 & lane1
-        e_fmov_from_d(16, 24);             // x16 = combined mask (all-ones iff NO input NaN)
-        e_rrr(A_ORN, 16, 31, 16, 1, 0);    // x16 = ~x16 (0 iff clean; nonzero iff a NaN input)
+        e_ext(25, 24, 24, 8);           // v25.d[0] = v24.d[1] (fold the two 64-bit halves)
+        e_v3(0x4E201C00u, 24, 24, 25);  // v24.d[0] = lane0 & lane1
+        e_fmov_from_d(16, 24);          // x16 = combined mask (all-ones iff NO input NaN)
+        e_rrr(A_ORN, 16, 31, 16, 1, 0); // x16 = ~x16 (0 iff clean; nonzero iff a NaN input)
         uint32_t *p_cbz = (uint32_t *)g_cp;
-        emit32(0);                          // cbz x16, Lfast  (patched below)
+        emit32(0);                                       // cbz x16, Lfast  (patched below)
         emit_exit_const(next - (uint64_t)I->len, R_AVX); // NaN present -> emulate this insn in C (this rip)
         uint8_t *Lfast = (uint8_t *)g_cp;
         *p_cbz = 0xB4000000u | ((uint32_t)(((Lfast - (uint8_t *)p_cbz) / 4) & 0x7FFFF) << 5) | 16;
 
         // ---- fast path: no input NaN ----
-        emit_vex_fp(d, s1, s2, op, dbl);                                  // low 128 -> host v[d]
+        emit_vex_fp(d, s1, s2, op, dbl); // low 128 -> host v[d]
         if (l256) {
-            emit_vex_fp(22, 20, 21, op, dbl);                            // high 128 -> v22 (highs in v20/v21)
+            emit_vex_fp(22, 20, 21, op, dbl); // high 128 -> v22 (highs in v20/v21)
             avx_cpu_str_q(22, OFF_VHI + 16 * d);
         }
         avx_zero_upper(d, l256);
@@ -1963,17 +2195,24 @@ static int avx_lower(struct insn *I, uint64_t next) {
         int msh = esz - 1;
         mark_vdirty();
         int s2 = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; } // src2 low -> v16
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            s2 = 16;
+        } // src2 low -> v16
         if (l256) { // load the three high halves BEFORE writing d.hi (d may alias src1/src2/mask)
-            avx_cpu_ldr_q(20, OFF_VHI + 16 * mreg);                                             // mask.hi
-            avx_cpu_ldr_q(21, OFF_VHI + 16 * s1);                                               // src1.hi
-            if (I->is_mem) g_ldr_q(22, 17, 16); else avx_cpu_ldr_q(22, OFF_VHI + 16 * s2r);     // src2.hi
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * mreg); // mask.hi
+            avx_cpu_ldr_q(21, OFF_VHI + 16 * s1);   // src1.hi
+            if (I->is_mem)
+                g_ldr_q(22, 17, 16);
+            else
+                avx_cpu_ldr_q(22, OFF_VHI + 16 * s2r); // src2.hi
         }
-        e_vshr_imm(18, mreg, esz, msh, 1);  // v18 = sshr mask, #esz-1 (lane all-ones where sign set)
-        e_v3(0x6E601C00u, 18, s2, s1);  // BSL v18.16b, src2.16b, src1.16b -> mask?src2:src1
+        e_vshr_imm(18, mreg, esz, msh, 1); // v18 = sshr mask, #esz-1 (lane all-ones where sign set)
+        e_v3(0x6E601C00u, 18, s2, s1);     // BSL v18.16b, src2.16b, src1.16b -> mask?src2:src1
         if (l256) {
-            e_vshr_imm(19, 20, esz, msh, 1);   // v19 = sshr mask.hi, #esz-1
-            e_v3(0x6E601C00u, 19, 22, 21);     // BSL v19.16b, src2.hi, src1.hi
+            e_vshr_imm(19, 20, esz, msh, 1); // v19 = sshr mask.hi, #esz-1
+            e_v3(0x6E601C00u, 19, 22, 21);   // BSL v19.16b, src2.hi, src1.hi
             e_vmov(d, 18);
             avx_cpu_str_q(19, OFF_VHI + 16 * d);
         } else {
@@ -1992,18 +2231,29 @@ static int avx_lower(struct insn *I, uint64_t next) {
         int imm = I->imm & 0xFF;
         mark_vdirty();
         int s2 = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; } // src2 low -> v16
-        if (l256) { // load highs before writing d (d may alias src1/src2)
-            avx_cpu_ldr_q(21, OFF_VHI + 16 * s1);                                             // src1.hi
-            if (I->is_mem) g_ldr_q(22, 17, 16); else avx_cpu_ldr_q(22, OFF_VHI + 16 * s2r);   // src2.hi
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            s2 = 16;
+        } // src2 low -> v16
+        if (l256) {                               // load highs before writing d (d may alias src1/src2)
+            avx_cpu_ldr_q(21, OFF_VHI + 16 * s1); // src1.hi
+            if (I->is_mem)
+                g_ldr_q(22, 17, 16);
+            else
+                avx_cpu_ldr_q(22, OFF_VHI + 16 * s2r); // src2.hi
         }
-        e_vmov(23, s1);                     // low  = src1
-        for (int i = 0; i < 8; i++) if (imm & (1 << i))
-            emit32(0x6E000400u | ((unsigned)(((i << 2) | 2)) << 16) | ((unsigned)(i << 1) << 11) | (s2 << 5) | 23); // INS v23.h[i], src2.h[i]
+        e_vmov(23, s1); // low  = src1
+        for (int i = 0; i < 8; i++)
+            if (imm & (1 << i))
+                emit32(0x6E000400u | ((unsigned)(((i << 2) | 2)) << 16) | ((unsigned)(i << 1) << 11) | (s2 << 5) |
+                       23); // INS v23.h[i], src2.h[i]
         if (l256) {
-            e_vmov(24, 21);                 // high = src1.hi
-            for (int i = 0; i < 8; i++) if (imm & (1 << i))
-                emit32(0x6E000400u | ((unsigned)(((i << 2) | 2)) << 16) | ((unsigned)(i << 1) << 11) | (22 << 5) | 24); // INS v24.h[i], src2.hi.h[i]
+            e_vmov(24, 21); // high = src1.hi
+            for (int i = 0; i < 8; i++)
+                if (imm & (1 << i))
+                    emit32(0x6E000400u | ((unsigned)(((i << 2) | 2)) << 16) | ((unsigned)(i << 1) << 11) | (22 << 5) |
+                           24); // INS v24.h[i], src2.hi.h[i]
             e_vmov(d, 23);
             avx_cpu_str_q(24, OFF_VHI + 16 * d);
         } else {
@@ -2024,12 +2274,19 @@ static int avx_lower(struct insn *I, uint64_t next) {
         int p = I->imm & 0x1F, dbl = (pp == 1);
         mark_vdirty();
         int s2 = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; } // src2 low -> v16
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            s2 = 16;
+        } // src2 low -> v16
         if (l256) {
-            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);                                             // a.hi
-            if (I->is_mem) g_ldr_q(21, 17, 16); else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);   // b.hi
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1); // a.hi
+            if (I->is_mem)
+                g_ldr_q(21, 17, 16);
+            else
+                avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r); // b.hi
         }
-        emit_vcmp_lane(d, s1, s2, p, dbl);  // low 128 -> host v[d]
+        emit_vcmp_lane(d, s1, s2, p, dbl); // low 128 -> host v[d]
         if (l256) {
             emit_vcmp_lane(22, 20, 21, p, dbl);
             avx_cpu_str_q(22, OFF_VHI + 16 * d);
@@ -2041,19 +2298,18 @@ static int avx_lower(struct insn *I, uint64_t next) {
     // ---- broadcasts (map 2, pp 1): DUP element 0 across the whole vector. reg source (xmm low element)
     // or a memory scalar. vpbroadcastb/w/d/q (0x78/0x79/0x58/0x59), vbroadcastss/sd (0x18/0x19). Both
     // 128-bit lanes of a 256-bit dst are identical, so the high half is just a copy of the low. ----
-    if (map == 2 && pp == 1 &&
-        (op == 0x78 || op == 0x79 || op == 0x58 || op == 0x59 || op == 0x18 || op == 0x19)) {
+    if (map == 2 && pp == 1 && (op == 0x78 || op == 0x79 || op == 0x58 || op == 0x59 || op == 0x18 || op == 0x19)) {
         int es = (op == 0x78) ? 1 : (op == 0x79) ? 2 : (op == 0x18 || op == 0x58) ? 4 : 8;
         int imm5 = es; // DUP element selector: b=1,h=2,s=4,d=8 (index 0)
         mark_vdirty();
         if (I->is_mem) {
             emit_ea(I, next);
-            e_load(es, 16, 17);                                  // x16 = zero-extended es-byte scalar
-            emit32(0x4E000C00u | (imm5 << 16) | (16 << 5) | d);  // dup d.T, w16/x16
+            e_load(es, 16, 17);                                 // x16 = zero-extended es-byte scalar
+            emit32(0x4E000C00u | (imm5 << 16) | (16 << 5) | d); // dup d.T, w16/x16
         } else {
             emit32(0x4E000400u | (imm5 << 16) | (s2r << 5) | d); // dup d.T, src.T[0]
         }
-        if (l256) avx_cpu_str_q(d, OFF_VHI + 16 * d);            // high lane == low lane
+        if (l256) avx_cpu_str_q(d, OFF_VHI + 16 * d); // high lane == low lane
         avx_zero_upper(d, l256);
         return 1;
     }
@@ -2066,10 +2322,17 @@ static int avx_lower(struct insn *I, uint64_t next) {
         if (op == 0x46 && es != 4) return 0; // vpsravq is AVX-512-only; leave to do_avx
         mark_vdirty();
         int s2 = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; } // count.lo -> v16
-        if (l256) {                                                       // load highs before writing d
-            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);                         // data.hi
-            if (I->is_mem) g_ldr_q(21, 17, 16); else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r); // count.hi
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            s2 = 16;
+        } // count.lo -> v16
+        if (l256) {                               // load highs before writing d
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1); // data.hi
+            if (I->is_mem)
+                g_ldr_q(21, 17, 16);
+            else
+                avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r); // count.hi
         }
         emit_avx_varshift_lane(d, s1, s2, op, es); // low -> v[d]
         if (l256) {
@@ -2087,12 +2350,21 @@ static int avx_lower(struct insn *I, uint64_t next) {
         int imm = I->imm & 0xFF;
         mark_vdirty();
         int src = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); src = 16; }
-        for (int j = 0; j < 4; j++) e_ins_s(23, j, src, (imm >> (2 * j)) & 3); // low -> v23
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            src = 16;
+        }
+        for (int j = 0; j < 4; j++)
+            e_ins_s(23, j, src, (imm >> (2 * j)) & 3); // low -> v23
         if (l256) {
             int srch = 20;
-            if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);
-            for (int j = 0; j < 4; j++) e_ins_s(24, j, srch, (imm >> (2 * j)) & 3); // high -> v24
+            if (I->is_mem)
+                g_ldr_q(20, 17, 16);
+            else
+                avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);
+            for (int j = 0; j < 4; j++)
+                e_ins_s(24, j, srch, (imm >> (2 * j)) & 3); // high -> v24
             e_vmov(d, 23);
             avx_cpu_str_q(24, OFF_VHI + 16 * d);
         } else {
@@ -2107,26 +2379,57 @@ static int avx_lower(struct insn *I, uint64_t next) {
     if (map == 1 && pp == 1) {
         int zip2 = -1, zsz = -1;
         switch (op) {
-        case 0x60: zsz = 0; zip2 = 0; break; // vpunpcklbw
-        case 0x61: zsz = 1; zip2 = 0; break; // vpunpcklwd
-        case 0x62: zsz = 2; zip2 = 0; break; // vpunpckldq
-        case 0x6C: zsz = 3; zip2 = 0; break; // vpunpcklqdq
-        case 0x68: zsz = 0; zip2 = 1; break; // vpunpckhbw
-        case 0x69: zsz = 1; zip2 = 1; break; // vpunpckhwd
-        case 0x6A: zsz = 2; zip2 = 1; break; // vpunpckhdq
-        case 0x6D: zsz = 3; zip2 = 1; break; // vpunpckhqdq
+        case 0x60:
+            zsz = 0;
+            zip2 = 0;
+            break; // vpunpcklbw
+        case 0x61:
+            zsz = 1;
+            zip2 = 0;
+            break; // vpunpcklwd
+        case 0x62:
+            zsz = 2;
+            zip2 = 0;
+            break; // vpunpckldq
+        case 0x6C:
+            zsz = 3;
+            zip2 = 0;
+            break; // vpunpcklqdq
+        case 0x68:
+            zsz = 0;
+            zip2 = 1;
+            break; // vpunpckhbw
+        case 0x69:
+            zsz = 1;
+            zip2 = 1;
+            break; // vpunpckhwd
+        case 0x6A:
+            zsz = 2;
+            zip2 = 1;
+            break; // vpunpckhdq
+        case 0x6D:
+            zsz = 3;
+            zip2 = 1;
+            break; // vpunpckhqdq
         default: break;
         }
         if (zsz >= 0) {
             uint32_t zbase = (zip2 ? 0x4E007800u : 0x4E003800u) | ((uint32_t)zsz << 22);
             mark_vdirty();
             int s2 = s2r;
-            if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; }
+            if (I->is_mem) {
+                emit_ea(I, next);
+                g_ldr_q(16, 17, 0);
+                s2 = 16;
+            }
             if (l256) {
-                if (I->is_mem) g_ldr_q(21, 17, 16); else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);
+                if (I->is_mem)
+                    g_ldr_q(21, 17, 16);
+                else
+                    avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);
                 avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);
-                e_v3(zbase, 22, 20, 21);              // high = zip(s1.hi, s2.hi)
-                e_v3(zbase, d, s1, s2);               // low
+                e_v3(zbase, 22, 20, 21); // high = zip(s1.hi, s2.hi)
+                e_v3(zbase, d, s1, s2);  // low
                 avx_cpu_str_q(22, OFF_VHI + 16 * d);
             } else {
                 e_v3(zbase, d, s1, s2);
@@ -2146,17 +2449,27 @@ static int avx_lower(struct insn *I, uint64_t next) {
     //   out  = TBL {data.lo,data.hi}, idx            -- gather. VEX.256 only (no 128-bit encoding). ----
     if (map == 2 && pp == 1 && (op == 0x36 || op == 0x16) && l256) {
         mark_vdirty();
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(20, 17, 0); g_ldr_q(21, 17, 16); } // table {lo,hi}
-        else { e_vmov(20, s2r); avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r); }
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(20, 17, 0);
+            g_ldr_q(21, 17, 16);
+        } // table {lo,hi}
+        else {
+            e_vmov(20, s2r);
+            avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);
+        }
         avx_cpu_ldr_q(25, OFF_VHI + 16 * s1); // ctrl.hi (ctrl.lo stays in v[s1])
-        e_movconst(16, 7);          emit32(0x4E040C00u | (16 << 5) | 26); // v26.4s = 7
-        e_movconst(16, 0x01010101); emit32(0x4E040C00u | (16 << 5) | 27); // v27.4s = 0x01010101
-        e_movconst(16, 0x03020100); emit32(0x4E040C00u | (16 << 5) | 28); // v28.4s = 0x03020100
+        e_movconst(16, 7);
+        emit32(0x4E040C00u | (16 << 5) | 26); // v26.4s = 7
+        e_movconst(16, 0x01010101);
+        emit32(0x4E040C00u | (16 << 5) | 27); // v27.4s = 0x01010101
+        e_movconst(16, 0x03020100);
+        emit32(0x4E040C00u | (16 << 5) | 28); // v28.4s = 0x03020100
         // low output dwords 0..3 (from ctrl.lo = v[s1]) -> v22
-        e_v3(0x4E201C00u, 24, s1, 26);                  // sel = ctrl.lo & 7
-        e_vshl_imm(24, 24, 32, 2);                      // base = sel*4
-        e_v3(0x4EA09C00u, 24, 24, 27);                  // rep  = base*0x01010101
-        e_v3(0x4E208400u, 24, 24, 28);                  // idx  = rep + {0,1,2,3}
+        e_v3(0x4E201C00u, 24, s1, 26);                     // sel = ctrl.lo & 7
+        e_vshl_imm(24, 24, 32, 2);                         // base = sel*4
+        e_v3(0x4EA09C00u, 24, 24, 27);                     // rep  = base*0x01010101
+        e_v3(0x4E208400u, 24, 24, 28);                     // idx  = rep + {0,1,2,3}
         emit32(0x4E002000u | (24 << 16) | (20 << 5) | 22); // tbl v22.16b, {v20,v21}, v24
         // high output dwords 4..7 (from ctrl.hi = v25) -> v23
         e_v3(0x4E201C00u, 24, 25, 26);
@@ -2179,13 +2492,20 @@ static int avx_lower(struct insn *I, uint64_t next) {
     if (map == 2 && pp == 1 && op == 0x2B) {
         mark_vdirty();
         int s2 = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; }
-        if (l256) {
-            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);                                             // src1.hi
-            if (I->is_mem) g_ldr_q(21, 17, 16); else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);   // src2.hi
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            s2 = 16;
         }
-        emit32(0x2E612800u | (s1 << 5) | 23);   // sqxtun  v23.4h, src1.4s  (low 4 words = sat(src1))
-        emit32(0x6E612800u | (s2 << 5) | 23);   // sqxtun2 v23.8h, src2.4s  (high 4 words = sat(src2))
+        if (l256) {
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1); // src1.hi
+            if (I->is_mem)
+                g_ldr_q(21, 17, 16);
+            else
+                avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r); // src2.hi
+        }
+        emit32(0x2E612800u | (s1 << 5) | 23); // sqxtun  v23.4h, src1.4s  (low 4 words = sat(src1))
+        emit32(0x6E612800u | (s2 << 5) | 23); // sqxtun2 v23.8h, src2.4s  (high 4 words = sat(src2))
         if (l256) {
             emit32(0x2E612800u | (20 << 5) | 24);
             emit32(0x6E612800u | (21 << 5) | 24);
@@ -2206,10 +2526,17 @@ static int avx_lower(struct insn *I, uint64_t next) {
     if (map == 2 && pp == 1 && op == 0x00) {
         mark_vdirty();
         int s2 = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; }
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            s2 = 16;
+        }
         if (l256) {
-            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);                                             // data.hi
-            if (I->is_mem) g_ldr_q(21, 17, 16); else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);   // idx.hi
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1); // data.hi
+            if (I->is_mem)
+                g_ldr_q(21, 17, 16);
+            else
+                avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r); // idx.hi
         }
         emit32(0x4F04E5E0u | 25);                          // movi v25.16b, #0x8f
         e_v3(0x4E201C00u, 18, s2, 25);                     // v18 = idx & 0x8f
@@ -2234,10 +2561,17 @@ static int avx_lower(struct insn *I, uint64_t next) {
     if (map == 1 && pp == 1 && op == 0xF6) {
         mark_vdirty();
         int s2 = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); s2 = 16; }
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            s2 = 16;
+        }
         if (l256) {
-            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);                                             // src1.hi
-            if (I->is_mem) g_ldr_q(21, 17, 16); else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);   // src2.hi
+            avx_cpu_ldr_q(20, OFF_VHI + 16 * s1); // src1.hi
+            if (I->is_mem)
+                g_ldr_q(21, 17, 16);
+            else
+                avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r); // src2.hi
         }
         emit32(0x6E207400u | (s2 << 16) | (s1 << 5) | 23); // uabd   v23.16b, src1.16b, src2.16b
         emit32(0x6E202800u | (23 << 5) | 23);              // uaddlp v23.8h, v23.16b
@@ -2265,15 +2599,26 @@ static int avx_lower(struct insn *I, uint64_t next) {
     if (map == 1 && op == 0x5B && pp <= 2) {
         mark_vdirty();
         int src = s2r, srch = 20;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); src = 16; }
-        if (l256) { if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); }
-        if (pp == 0) { // cvtdq2ps
-            emit32(0x4E21D800u | (src << 5) | 23);                  // SCVTF.4s v23, src
-            if (l256) emit32(0x4E21D800u | (srch << 5) | 24);      // SCVTF.4s v24, src.hi
-        } else {       // cvtps2dq(pp==1 round) / cvttps2dq(pp==2 trunc)
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            src = 16;
+        }
+        if (l256) {
+            if (I->is_mem)
+                g_ldr_q(20, 17, 16);
+            else
+                avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);
+        }
+        if (pp == 0) {                                        // cvtdq2ps
+            emit32(0x4E21D800u | (src << 5) | 23);            // SCVTF.4s v23, src
+            if (l256) emit32(0x4E21D800u | (srch << 5) | 24); // SCVTF.4s v24, src.hi
+        } else {                                              // cvtps2dq(pp==1 round) / cvttps2dq(pp==2 trunc)
             int trunc = (pp == 2);
-            e_movconst(16, 0x4F000000u); emit32(0x4E040C00u | (16 << 5) | 25); // v25.4s = 2^31 (f32)
-            e_movconst(16, 0x80000000u); emit32(0x4E040C00u | (16 << 5) | 26); // v26.4s = 0x80000000
+            e_movconst(16, 0x4F000000u);
+            emit32(0x4E040C00u | (16 << 5) | 25); // v25.4s = 2^31 (f32)
+            e_movconst(16, 0x80000000u);
+            emit32(0x4E040C00u | (16 << 5) | 26); // v26.4s = 0x80000000
             emit_ps2dq_128(23, src, trunc, 25, 26, 27, 28);
             if (l256) emit_ps2dq_128(24, srch, trunc, 25, 26, 27, 28);
         }
@@ -2290,17 +2635,24 @@ static int avx_lower(struct insn *I, uint64_t next) {
     if (map == 1 && op == 0x5A && pp < 2) {
         mark_vdirty();
         int src = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); src = 16; }
-        if (pp == 0) { // ps->pd: low 2 floats (and, for 256, high 2) widen to doubles
-            emit32(0x0E617800u | (src << 5) | 23);              // FCVTL.2d  v23, src.2s
-            if (l256) emit32(0x4E617800u | (src << 5) | 24);   // FCVTL2.2d v24, src.4s
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            src = 16;
+        }
+        if (pp == 0) {                             // ps->pd: low 2 floats (and, for 256, high 2) widen to doubles
+            emit32(0x0E617800u | (src << 5) | 23); // FCVTL.2d  v23, src.2s
+            if (l256) emit32(0x4E617800u | (src << 5) | 24); // FCVTL2.2d v24, src.4s
             e_vmov(d, 23);
             if (l256) avx_cpu_str_q(24, OFF_VHI + 16 * d);
-        } else {       // pd->ps: 2 (or 4 for 256) doubles narrow to floats, all landing in the low 128
-            emit32(0x0E616800u | (src << 5) | 23);             // FCVTN.2s v23, src.2d  (low 2 floats)
+        } else { // pd->ps: 2 (or 4 for 256) doubles narrow to floats, all landing in the low 128
+            emit32(0x0E616800u | (src << 5) | 23); // FCVTN.2s v23, src.2d  (low 2 floats)
             if (l256) {
-                if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // src.hi
-                emit32(0x4E616800u | (20 << 5) | 23);          // FCVTN2.4s v23, src.hi.2d (high 2 floats)
+                if (I->is_mem)
+                    g_ldr_q(20, 17, 16);
+                else
+                    avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // src.hi
+                emit32(0x4E616800u | (20 << 5) | 23);      // FCVTN2.4s v23, src.hi.2d (high 2 floats)
             }
             e_vmov(d, 23);
         }
@@ -2316,35 +2668,45 @@ static int avx_lower(struct insn *I, uint64_t next) {
     if (map == 1 && op == 0xE6 && pp >= 1) {
         mark_vdirty();
         int src = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); src = 16; }
-        if (pp == 2) { // cvtdq2pd: int32 -> double (exact widen)
-            emit32(0x0F20A400u | (src << 5) | 23);   // SXTL.2d  v23, src.2s
-            emit32(0x4E61D800u | (23 << 5) | 23);    // SCVTF.2d v23, v23
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            src = 16;
+        }
+        if (pp == 2) {                             // cvtdq2pd: int32 -> double (exact widen)
+            emit32(0x0F20A400u | (src << 5) | 23); // SXTL.2d  v23, src.2s
+            emit32(0x4E61D800u | (23 << 5) | 23);  // SCVTF.2d v23, v23
             if (l256) {
                 emit32(0x4F20A400u | (src << 5) | 24); // SXTL2.2d v24, src.4s (high 2 int32)
-                emit32(0x4E61D800u | (24 << 5) | 24); // SCVTF.2d v24, v24
+                emit32(0x4E61D800u | (24 << 5) | 24);  // SCVTF.2d v24, v24
             }
             e_vmov(d, 23);
             if (l256) avx_cpu_str_q(24, OFF_VHI + 16 * d);
         } else { // pd->dq: cvttpd2dq(pp==1 trunc) / cvtpd2dq(pp==3 round)
             int trunc = (pp == 1);
-            e_movconst(16, 0x41E0000000000000ull); emit32(0x4E080C00u | (16 << 5) | 25); // v25.2d = 2^31 (f64)
-            e_movconst(16, 0xC1E0000000000000ull); emit32(0x4E080C00u | (16 << 5) | 26); // v26.2d = -2^31
-            e_movconst(16, 0x80000000u);           emit32(0x4E040C00u | (16 << 5) | 27); // v27.4s = 0x80000000
+            e_movconst(16, 0x41E0000000000000ull);
+            emit32(0x4E080C00u | (16 << 5) | 25); // v25.2d = 2^31 (f64)
+            e_movconst(16, 0xC1E0000000000000ull);
+            emit32(0x4E080C00u | (16 << 5) | 26); // v26.2d = -2^31
+            e_movconst(16, 0x80000000u);
+            emit32(0x4E040C00u | (16 << 5) | 27); // v27.4s = 0x80000000
             // Compute the int64 results + per-64 fixup masks for BOTH halves first (they consume the +/-2^31
             // consts in v25/v26), THEN narrow -- the narrow step reuses v25 for the packed 32-bit mask.
             emit_pd2i32_pieces(22, 18, src, trunc, 25, 26, 28); // lo: r=v22, mask=v18
             if (l256) {
-                if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // src.hi
+                if (I->is_mem)
+                    g_ldr_q(20, 17, 16);
+                else
+                    avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);         // src.hi
                 emit_pd2i32_pieces(23, 19, 20, trunc, 25, 26, 28); // hi: r=v23, mask=v19
             }
-            emit32(0x0EA12800u | (22 << 5) | 24);   // XTN.2s  v24, v22  (low 2 int32)
-            emit32(0x0EA12800u | (18 << 5) | 25);   // XTN.2s  v25, v18  (low 2 mask lanes)
+            emit32(0x0EA12800u | (22 << 5) | 24); // XTN.2s  v24, v22  (low 2 int32)
+            emit32(0x0EA12800u | (18 << 5) | 25); // XTN.2s  v25, v18  (low 2 mask lanes)
             if (l256) {
                 emit32(0x4EA12800u | (23 << 5) | 24); // XTN2.4s v24, v23 (high 2 int32)
                 emit32(0x4EA12800u | (19 << 5) | 25); // XTN2.4s v25, v19 (high 2 mask lanes)
             }
-            e_v3(0x6E601C00u, 25, 27, 24);          // BSL v25 = mask ? 0x80000000 : result
+            e_v3(0x6E601C00u, 25, 27, 24); // BSL v25 = mask ? 0x80000000 : result
             e_vmov(d, 25);
         }
         avx_zero_upper(d, l256);
@@ -2358,11 +2720,20 @@ static int avx_lower(struct insn *I, uint64_t next) {
         int imm = I->imm & 0xFF;
         mark_vdirty();
         int src = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); src = 16; }
-        for (int j = 0; j < 4; j++) e_ins_s(23, j, src, (imm >> (2 * j)) & 3);
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            src = 16;
+        }
+        for (int j = 0; j < 4; j++)
+            e_ins_s(23, j, src, (imm >> (2 * j)) & 3);
         if (l256) {
-            if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);
-            for (int j = 0; j < 4; j++) e_ins_s(24, j, 20, (imm >> (2 * j)) & 3);
+            if (I->is_mem)
+                g_ldr_q(20, 17, 16);
+            else
+                avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);
+            for (int j = 0; j < 4; j++)
+                e_ins_s(24, j, 20, (imm >> (2 * j)) & 3);
             e_vmov(d, 23);
             avx_cpu_str_q(24, OFF_VHI + 16 * d);
         } else {
@@ -2378,11 +2749,18 @@ static int avx_lower(struct insn *I, uint64_t next) {
         int imm = I->imm & 0xFF;
         mark_vdirty();
         int src = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); src = 16; }
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            src = 16;
+        }
         e_ins_d(23, 0, src, imm & 1);
         e_ins_d(23, 1, src, (imm >> 1) & 1);
         if (l256) {
-            if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);
+            if (I->is_mem)
+                g_ldr_q(20, 17, 16);
+            else
+                avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);
             e_ins_d(24, 0, 20, (imm >> 2) & 1);
             e_ins_d(24, 1, 20, (imm >> 3) & 1);
             e_vmov(d, 23);
@@ -2400,18 +2778,28 @@ static int avx_lower(struct insn *I, uint64_t next) {
     if (map == 2 && pp == 1 && op == 0x0C) {
         mark_vdirty();
         int ctl = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); ctl = 16; }
-        e_movconst(16, 3);          emit32(0x4E040C00u | (16 << 5) | 25); // v25.4s = 3
-        e_movconst(16, 0x01010101); emit32(0x4E040C00u | (16 << 5) | 26); // v26.4s = 0x01010101
-        e_movconst(16, 0x03020100); emit32(0x4E040C00u | (16 << 5) | 27); // v27.4s = 0x03020100
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            ctl = 16;
+        }
+        e_movconst(16, 3);
+        emit32(0x4E040C00u | (16 << 5) | 25); // v25.4s = 3
+        e_movconst(16, 0x01010101);
+        emit32(0x4E040C00u | (16 << 5) | 26); // v26.4s = 0x01010101
+        e_movconst(16, 0x03020100);
+        emit32(0x4E040C00u | (16 << 5) | 27);              // v27.4s = 0x03020100
         e_v3(0x4E201C00u, 28, ctl, 25);                    // sel = ctrl & 3
         e_vshl_imm(28, 28, 32, 2);                         // base = sel*4
         e_v3(0x4EA09C00u, 28, 28, 26);                     // rep  = base*0x01010101
         e_v3(0x4E208400u, 28, 28, 27);                     // idx  = rep + {0,1,2,3}
         emit32(0x4E000000u | (28 << 16) | (s1 << 5) | 23); // TBL v23.16b, {data.lo}, idx
         if (l256) {
-            if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // ctrl.hi
-            avx_cpu_ldr_q(21, OFF_VHI + 16 * s1);          // data.hi
+            if (I->is_mem)
+                g_ldr_q(20, 17, 16);
+            else
+                avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // ctrl.hi
+            avx_cpu_ldr_q(21, OFF_VHI + 16 * s1);      // data.hi
             e_v3(0x4E201C00u, 28, 20, 25);
             e_vshl_imm(28, 28, 32, 2);
             e_v3(0x4EA09C00u, 28, 28, 26);
@@ -2432,16 +2820,23 @@ static int avx_lower(struct insn *I, uint64_t next) {
     if (map == 2 && pp == 1 && op == 0x0D) {
         mark_vdirty();
         int ctl = s2r;
-        if (I->is_mem) { emit_ea(I, next); g_ldr_q(16, 17, 0); ctl = 16; }
-        emit32(0x4E080400u | (s1 << 5) | 25);   // DUP v25.2d, data.d[0]  (A = both lanes = q0)
-        emit32(0x4E180400u | (s1 << 5) | 26);   // DUP v26.2d, data.d[1]  (B = both lanes = q1)
-        e_vshl_imm(28, ctl, 64, 62);            // bring ctrl bit1 to bit63 of each qword
-        e_vshr_imm(28, 28, 64, 63, 1);          // SSHR -> all-ones where bit1 set
-        e_v3(0x6E601C00u, 28, 26, 25);          // BSL v28 = mask ? B(q1) : A(q0)
+        if (I->is_mem) {
+            emit_ea(I, next);
+            g_ldr_q(16, 17, 0);
+            ctl = 16;
+        }
+        emit32(0x4E080400u | (s1 << 5) | 25); // DUP v25.2d, data.d[0]  (A = both lanes = q0)
+        emit32(0x4E180400u | (s1 << 5) | 26); // DUP v26.2d, data.d[1]  (B = both lanes = q1)
+        e_vshl_imm(28, ctl, 64, 62);          // bring ctrl bit1 to bit63 of each qword
+        e_vshr_imm(28, 28, 64, 63, 1);        // SSHR -> all-ones where bit1 set
+        e_v3(0x6E601C00u, 28, 26, 25);        // BSL v28 = mask ? B(q1) : A(q0)
         e_vmov(23, 28);
         if (l256) {
-            if (I->is_mem) g_ldr_q(20, 17, 16); else avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // ctrl.hi
-            avx_cpu_ldr_q(21, OFF_VHI + 16 * s1);   // data.hi
+            if (I->is_mem)
+                g_ldr_q(20, 17, 16);
+            else
+                avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r); // ctrl.hi
+            avx_cpu_ldr_q(21, OFF_VHI + 16 * s1);      // data.hi
             emit32(0x4E080400u | (21 << 5) | 25);
             emit32(0x4E180400u | (21 << 5) | 26);
             e_vshl_imm(28, 20, 64, 62);
@@ -2463,48 +2858,58 @@ static int avx_lower(struct insn *I, uint64_t next) {
     if (map == 1) {
         switch (op) {
         // bitwise (element-agnostic .16b); unique opcodes -> no pp gate needed
-        case 0xEF: case 0x57: base = 0x6E201C00u; break;                 // vpxor / vxorps,pd
-        case 0xDB: case 0x54: base = 0x4E201C00u; break;                 // vpand / vandps,pd
-        case 0xEB: case 0x56: base = 0x4EA01C00u; break;                 // vpor  / vorps,pd
-        case 0xDF: case 0x55: base = 0x4E601C00u; swap = 1; break;       // vpandn / vandnps,pd (BIC)
+        case 0xEF:
+        case 0x57: base = 0x6E201C00u; break; // vpxor / vxorps,pd
+        case 0xDB:
+        case 0x54: base = 0x4E201C00u; break; // vpand / vandps,pd
+        case 0xEB:
+        case 0x56: base = 0x4EA01C00u; break; // vpor  / vorps,pd
+        case 0xDF:
+        case 0x55:
+            base = 0x4E601C00u;
+            swap = 1;
+            break; // vpandn / vandnps,pd (BIC)
         default: break;
         }
-        if (!base && pp == 1) switch (op) { // 66-prefixed packed integer
-        case 0xFC: base = 0x4E208400u; break;                            // vpaddb
-        case 0xFD: base = 0x4E608400u; break;                            // vpaddw
-        case 0xFE: base = 0x4EA08400u; break;                            // vpaddd
-        case 0xD4: base = 0x4EE08400u; break;                            // vpaddq
-        case 0xF8: base = 0x6E208400u; break;                            // vpsubb
-        case 0xF9: base = 0x6E608400u; break;                            // vpsubw
-        case 0xFA: base = 0x6EA08400u; break;                            // vpsubd
-        case 0xFB: base = 0x6EE08400u; break;                            // vpsubq
-        case 0x74: base = 0x6E208C00u; break;                            // vpcmpeqb (CMEQ)
-        case 0x75: base = 0x6E608C00u; break;                            // vpcmpeqw
-        case 0x76: base = 0x6EA08C00u; break;                            // vpcmpeqd
-        case 0x64: base = 0x4E203400u; break;                            // vpcmpgtb (CMGT signed)
-        case 0x65: base = 0x4E603400u; break;                            // vpcmpgtw
-        case 0x66: base = 0x4EA03400u; break;                            // vpcmpgtd
-        // integer min/max (bit-exact: NEON SMIN/UMIN/SMAX/UMAX == x86, no NaN concerns). map1 legacy forms.
-        case 0xDA: base = 0x6E206C00u; break;                            // vpminub (UMIN.16b)
-        case 0xDE: base = 0x6E206400u; break;                            // vpmaxub (UMAX.16b)
-        case 0xEA: base = 0x4E606C00u; break;                            // vpminsw (SMIN.8h)
-        case 0xEE: base = 0x4E606400u; break;                            // vpmaxsw (SMAX.8h)
-        default: break;
-        }
+        if (!base && pp == 1) switch (op) {       // 66-prefixed packed integer
+            case 0xFC: base = 0x4E208400u; break; // vpaddb
+            case 0xFD: base = 0x4E608400u; break; // vpaddw
+            case 0xFE: base = 0x4EA08400u; break; // vpaddd
+            case 0xD4: base = 0x4EE08400u; break; // vpaddq
+            case 0xF8: base = 0x6E208400u; break; // vpsubb
+            case 0xF9: base = 0x6E608400u; break; // vpsubw
+            case 0xFA: base = 0x6EA08400u; break; // vpsubd
+            case 0xFB: base = 0x6EE08400u; break; // vpsubq
+            case 0x74: base = 0x6E208C00u; break; // vpcmpeqb (CMEQ)
+            case 0x75: base = 0x6E608C00u; break; // vpcmpeqw
+            case 0x76: base = 0x6EA08C00u; break; // vpcmpeqd
+            case 0x64: base = 0x4E203400u; break; // vpcmpgtb (CMGT signed)
+            case 0x65: base = 0x4E603400u; break; // vpcmpgtw
+            case 0x66:
+                base = 0x4EA03400u;
+                break; // vpcmpgtd
+            // integer min/max (bit-exact: NEON SMIN/UMIN/SMAX/UMAX == x86, no NaN concerns). map1 legacy forms.
+            case 0xDA: base = 0x6E206C00u; break; // vpminub (UMIN.16b)
+            case 0xDE: base = 0x6E206400u; break; // vpmaxub (UMAX.16b)
+            case 0xEA: base = 0x4E606C00u; break; // vpminsw (SMIN.8h)
+            case 0xEE: base = 0x4E606400u; break; // vpmaxsw (SMAX.8h)
+            default: break;
+            }
         // NOTE: packed FP add/sub/mul/div (0x58/0x59/0x5C/0x5E) are lowered above (emit_vex_fp), before
         // this generic base path, since they need the generated-NaN sign fixup the plain integer ops don't.
-    } else if (map == 2 && pp == 1) switch (op) { // 0F38 SSE4.1 integer min/max + multiply
-        case 0x40: base = 0x4EA09C00u; break;                            // vpmulld (MUL.4s)
-        case 0x38: base = 0x4E206C00u; break;                            // vpminsb (SMIN.16b)
-        case 0x39: base = 0x4EA06C00u; break;                            // vpminsd (SMIN.4s)
-        case 0x3A: base = 0x6E606C00u; break;                            // vpminuw (UMIN.8h)
-        case 0x3B: base = 0x6EA06C00u; break;                            // vpminud (UMIN.4s)
-        case 0x3C: base = 0x4E206400u; break;                            // vpmaxsb (SMAX.16b)
-        case 0x3D: base = 0x4EA06400u; break;                            // vpmaxsd (SMAX.4s)
-        case 0x3E: base = 0x6E606400u; break;                            // vpmaxuw (UMAX.8h)
-        case 0x3F: base = 0x6EA06400u; break;                            // vpmaxud (UMAX.4s)
+    } else if (map == 2 && pp == 1)
+        switch (op) {                         // 0F38 SSE4.1 integer min/max + multiply
+        case 0x40: base = 0x4EA09C00u; break; // vpmulld (MUL.4s)
+        case 0x38: base = 0x4E206C00u; break; // vpminsb (SMIN.16b)
+        case 0x39: base = 0x4EA06C00u; break; // vpminsd (SMIN.4s)
+        case 0x3A: base = 0x6E606C00u; break; // vpminuw (UMIN.8h)
+        case 0x3B: base = 0x6EA06C00u; break; // vpminud (UMIN.4s)
+        case 0x3C: base = 0x4E206400u; break; // vpmaxsb (SMAX.16b)
+        case 0x3D: base = 0x4EA06400u; break; // vpmaxsd (SMAX.4s)
+        case 0x3E: base = 0x6E606400u; break; // vpmaxuw (UMAX.8h)
+        case 0x3F: base = 0x6EA06400u; break; // vpmaxud (UMAX.4s)
         default: break;
-    }
+        }
     if (!base) return 0;
 
     mark_vdirty();
@@ -2514,12 +2919,20 @@ static int avx_lower(struct insn *I, uint64_t next) {
         g_ldr_q(16, 17, 0);
         s2 = 16;
     }
-    if (swap) e_v3(base, d, s2, s1); else e_v3(base, d, s1, s2); // low 128 -> host v[d]
-    if (l256) {                                                  // high 128 via cpu->vhi
-        if (I->is_mem) g_ldr_q(21, 17, 16);
-        else avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);
+    if (swap)
+        e_v3(base, d, s2, s1);
+    else
+        e_v3(base, d, s1, s2); // low 128 -> host v[d]
+    if (l256) {                // high 128 via cpu->vhi
+        if (I->is_mem)
+            g_ldr_q(21, 17, 16);
+        else
+            avx_cpu_ldr_q(21, OFF_VHI + 16 * s2r);
         avx_cpu_ldr_q(20, OFF_VHI + 16 * s1);
-        if (swap) e_v3(base, 22, 21, 20); else e_v3(base, 22, 20, 21);
+        if (swap)
+            e_v3(base, 22, 21, 20);
+        else
+            e_v3(base, 22, 20, 21);
         avx_cpu_str_q(22, OFF_VHI + 16 * d);
     }
     avx_zero_upper(d, l256);
@@ -2566,11 +2979,12 @@ static void *translate_block(uint64_t gpc) {
     // poll cpu->irq at the body entry so a caught async signal reaches a no-syscall guest loop.
     emit_irq_check(start);
     g_fl_pending = FL_NONE; // lazy flags: nothing deferred at block entry
-    crypto_state.zero_ready = crypto_state.mask_ready = 0;    // crypto constant hoist: no v26==0 / v27==0x8f claim survives a block entry
+    crypto_state.zero_ready = crypto_state.mask_ready =
+        0;                           // crypto constant hoist: no v26==0 / v27==0x8f claim survives a block entry
     g_df = HL_X86_DIRECTION_DYNAMIC; // a prior block's std/popfq may have left it set
-    hl_x86_x87_reset(); // x87: top unknown at block entry until a finit anchors it
-    g_vmark_done = 0; // fresh region -> first xmm write must re-mark cpu->vdirty
-    g_prof_xlate++;   // PROF (measurement-only): translate_block calls
+    hl_x86_x87_reset();              // x87: top unknown at block entry until a finit anchors it
+    g_vmark_done = 0;                // fresh region -> first xmm write must re-mark cpu->vdirty
+    g_prof_xlate++;                  // PROF (measurement-only): translate_block calls
     // W3-A superblock state: guest block-starts already laid in this region + region budget.
     uint64_t seen[HL_X86_TRACE_MAX_BLOCKS];
     int nseen = 0, trace_blk = 0;
@@ -2594,20 +3008,26 @@ static void *translate_block(uint64_t gpc) {
 #ifndef STITCH_MAX_COND
 #define STITCH_MAX_COND 3
 #endif
-#define STITCH_OK                                                                                                    \
-    (stitch && !g_nochain && !g_trace && !g_itrace && trace_blk < HL_X86_TRACE_MAX_BLOCKS - 1 &&                               \
+#define STITCH_OK                                                                                                      \
+    (stitch && !g_nochain && !g_trace && !g_itrace && trace_blk < HL_X86_TRACE_MAX_BLOCKS - 1 &&                       \
      ncond < STITCH_MAX_COND && (size_t)((uint8_t *)g_cp - (uint8_t *)host) < HL_X86_TRACE_MAX_BYTES)
     for (;;) {
         if (g_itrace && gpc != start) {
             if (g_fl_pending) flags_materialize(); // materialize before boundary
-            hl_x86_x87_drop();                             // x87: spill the shadow top before the boundary
+            hl_x86_x87_drop();                     // x87: spill the shadow top before the boundary
             emit_chain_exit(gpc);
             break;
         } // 1 insn/block: per-instruction register dump
         struct insn I;
         g_emit_gpc = gpc; // IRQSLIM: tag chain emission with the current branch's rip
-        hl_x86_decode(gpc, &I);
+        if (hl_x86_decode(gpc, &I) < 0) {
+            /* Logical execute permission/range failure is a guest instruction
+               fetch fault, not an engine-side dereference crash. */
+            emit_guest_signal(gpc, 11, 2); /* SIGSEGV, SEGV_ACCERR */
+            break;
+        }
         uint64_t next = gpc + I.len;
+        g_emit_next = next;
         if (prov_mem) jit_instruction_map_put(prov_host, (uint64_t)g_cp, prov_guest); // close previous insn
         prov_host = (uint64_t)g_cp;
         prov_guest = gpc;
@@ -2673,8 +3093,7 @@ static void *translate_block(uint64_t gpc) {
             if (I.map3 == 3 && I.op == 0x63 && !nosseopt() && (I.imm & 0x0D) == 0x08) {
                 int bv = 16;
                 if (I.is_mem) {
-                    emit_ea(&I, next);
-                    g_ldr_q(16, 17, 0); // op2 (r/m128) -> v16
+                    g_ldr_q_ea(16, &I, next); // op2 (r/m128) -> v16
                 } else
                     bv = I.rm_reg; // op2 = guest xmm (host v)
                 emit_pcmpistri_eqeach_byte(I.reg, bv, (int)I.imm);
@@ -2718,7 +3137,8 @@ static void *translate_block(uint64_t gpc) {
             // is provably overwritten before any read across the block (following unconditional jmps), it is
             // dead -- drop it, emitting NOTHING (same as the flagkill path; the live ARM NZCV need not be
             // canonicalized because no consumer observes it). PF/AF are handled independently below.
-            else if (lazy && trace_state.flag_elision && !(hl_x86_trace_flags_livein(&trace_state, gpc, gpc) & HL_X86_FLAG_NZCV))
+            else if (lazy && trace_state.flag_elision &&
+                     !(hl_x86_trace_flags_livein(&trace_state, gpc, gpc) & HL_X86_FLAG_NZCV))
                 g_fl_pending = FL_NONE;
             else
                 flags_materialize();
@@ -2735,17 +3155,19 @@ static void *translate_block(uint64_t gpc) {
         g_pfaf_dead = 0;
         if (pfaf_elim_on() && insn_writes_pfaf(&I)) {
             struct insn NI;
-            hl_x86_decode(next, &NI);
+            if (hl_x86_decode(next, &NI) < 0) memset(&NI, 0, sizeof NI);
             g_pfaf_dead = insn_kills_pfaf(&NI);
             // x86-xflags: the producer is the LAST flag op before a direct branch (cmp/test + jcc is
             // THE hot pattern) -> its PF/AF are still dead if EVERY successor entry provably
             // overwrites both before any read (guest-byte liveness scan, translate/trace.c).
-            if (!g_pfaf_dead && trace_state.flag_elision && NI.len > 0) g_pfaf_dead = hl_x86_trace_pfaf_dead(&trace_state, &NI, next, gpc);
+            if (!g_pfaf_dead && trace_state.flag_elision && NI.len > 0)
+                g_pfaf_dead = hl_x86_trace_pfaf_dead(&trace_state, &NI, next, gpc);
             // x86-xflags: generalize past the 1-insn / direct-branch cases -- in real integer chains the
             // next PF/AF writer sits a few value-only movs/immediate-shifts downstream. The same block
             // liveness scan proves both PF and AF overwritten-before-read from `next`; if so, drop the
             // whole PF/AF substrate for I (e_pf_save/e_af_save no-op on g_pfaf_dead).
-            if (!g_pfaf_dead && trace_state.flag_elision) g_pfaf_dead = !(hl_x86_trace_flags_livein(&trace_state, next, gpc) & (HL_X86_FLAG_PF | HL_X86_FLAG_AF));
+            if (!g_pfaf_dead && trace_state.flag_elision)
+                g_pfaf_dead = !(hl_x86_trace_flags_livein(&trace_state, next, gpc) & (HL_X86_FLAG_PF | HL_X86_FLAG_AF));
         }
 
         // x87 static-top tracking ends at any non-x87 instruction: spill the shadow top to
@@ -2758,8 +3180,7 @@ static void *translate_block(uint64_t gpc) {
             // Lowered in translate/mov.c translate_mov(); no EFLAGS interaction.
             {
                 const hl_x86_move_image image = {
-                    g_nonpie_lo, g_nonpie_hi, g_nonpie_bias, g_nonpie_types_lo, g_nonpie_types_hi,
-                    g_nonpie_blob_code,
+                    g_nonpie_lo, g_nonpie_hi, g_nonpie_bias, g_nonpie_types_lo, g_nonpie_types_hi, g_nonpie_blob_code,
                 };
                 int s = hl_x86_lower_mov(&I, next, &image);
                 if (s == TX_NEXT) {
@@ -2782,7 +3203,8 @@ static void *translate_block(uint64_t gpc) {
                 const hl_x86_shift_state shift_state = {
                     .parity_aux_dead = g_pfaf_dead,
                     .output_flags_dead =
-                        trace_state.flag_elision && !(hl_x86_trace_flags_livein(&trace_state, next, gpc) & (HL_X86_FLAG_ALL & ~HL_X86_FLAG_AF)),
+                        trace_state.flag_elision &&
+                        !(hl_x86_trace_flags_livein(&trace_state, next, gpc) & (HL_X86_FLAG_ALL & ~HL_X86_FLAG_AF)),
                     .direct_registers = 1,
                 };
                 int s = hl_x86_lower_shift(&I, next, &shift_state);
@@ -2989,8 +3411,9 @@ static void *translate_block(uint64_t gpc) {
             // ---- group4/5 (FE/FF): inc/dec, and FF: call/jmp/push (indirect) ----
             if (op == 0xFE || op == 0xFF) {
                 int k = I.reg & 7, w = op == 0xFE ? 1 : I.opsize, mem;
-                if (k == 0 || k == 1) {                   // inc / dec: set N/Z/V (OF correct), PRESERVE CF
-                    int rmv = rm_load(&I, next, w, &mem); // mem -> x16 (val), x17 (EA)
+                if (k == 0 || k == 1) { // inc / dec: set N/Z/V (OF correct), PRESERVE CF
+                    uint32_t access = X86_SOFT_READ | X86_SOFT_WRITE;
+                    int rmv = rm_load_access(&I, next, w, &mem, access); // mem -> x16 (val), x17 (EA)
                     if (I.lock && mem) {
                         // LOCK inc/dec [mem] -> atomic RMW (e.g. glibc's spinlock `lock decl`): a plain
                         // load-op-store races under contention and strands the lock with no owner -> hang.
@@ -3019,6 +3442,7 @@ static void *translate_block(uint64_t gpc) {
                             e_pf_save(21);
                             e_af_addsub(26, 21, 31, 19); // x86 AF = bit 4 of (old ^ result)
                         }
+                        if (emit_soft_memory_active()) emit_soft_store_commit((uint64_t)w);
                         gpc = next;
                         continue;
                     }
@@ -3032,7 +3456,7 @@ static void *translate_block(uint64_t gpc) {
                         e_nzcv_save_keepC();
                         e_pf_save(o);               // x86 PF source = result low byte
                         e_af_addsub(26, o, 31, 19); // x86 AF = bit 4 of (old ^ result)
-                        rm_store(&I, w, o);
+                        rm_store_after_guard(&I, w, o);
                     } else { // byte/word: flags from the high bits
                         int sh = 8 * (4 - w);
                         e_lsl_i(21, rmv, sh, 0);
@@ -3045,7 +3469,7 @@ static void *translate_block(uint64_t gpc) {
                         e_lsr_i(21, 21, sh, 0);
                         e_pf_save(21);                // x86 PF source = result low byte
                         e_af_addsub(rmv, 21, 31, 19); // x86 AF = bit 4 of (old ^ result)
-                        rm_store(&I, w, 21);
+                        rm_store_after_guard(&I, w, 21);
                     }
                     gpc = next;
                     continue;
@@ -3079,7 +3503,7 @@ static void *translate_block(uint64_t gpc) {
                 int w = (op & 1) ? I.opsize : 1, mem;
                 if (I.is_mem) {
                     emit_ea(&I, next);
-                    emit_bus_guard(17, (uint64_t)w, gpc);
+                    emit_memory_guard(17, (uint64_t)w, gpc, X86_SOFT_READ | X86_SOFT_WRITE);
                     int sv = (w == 1) ? byte_val(&I, I.reg, 19) : I.reg; // reg->mem: handle ah/bh/ch/dh
                     // xchg with memory is IMPLICITLY atomic on x86 (no LOCK needed) -> SWP, not load+store.
                     // glibc's mutex fast-path acquires the lock with xchg, so this must be a real atomic.
@@ -3090,6 +3514,7 @@ static void *translate_block(uint64_t gpc) {
                         byte_wb(&I, I.reg, 16);
                     else
                         e_bfi(I.reg, 16, 0, 8 * w, 1);
+                    if (emit_soft_memory_active()) emit_soft_store_commit((uint64_t)w);
                 } else if (w == 1) {
                     // byte xchg of two registers, either of which may be a high-byte (ah/bh/ch/dh) or even
                     // the SAME underlying register (xchg %ch,%cl): materialize BOTH bytes into independent
@@ -3148,7 +3573,8 @@ static void *translate_block(uint64_t gpc) {
                 int mem;
                 int rmv = rm_load(&I, next, I.opsize, &mem);
                 e_movconst(19, (uint64_t)I.imm);
-                int imm_co_live = !trace_state.flag_elision || (hl_x86_trace_flags_livein(&trace_state, next, gpc) & HL_X86_FLAG_NZCV);
+                int imm_co_live = !trace_state.flag_elision ||
+                                  (hl_x86_trace_flags_livein(&trace_state, next, gpc) & HL_X86_FLAG_NZCV);
                 e_imul2(I.reg, rmv, 19, I.opsize, imm_co_live); // dst = r/m * imm, sets x86 CF/OF on overflow
                 gpc = next;
                 continue;
@@ -3179,7 +3605,8 @@ static void *translate_block(uint64_t gpc) {
                 // (Without x86-xflags, g_fl_pending is FL_NONE here as before.) Skip if the target
                 // is the region head, already laid in this region, an already-registered block, or
                 // a dead trap arm.
-                if (STITCH_OK && tgt != start && !hl_x86_trace_seen(seen, nseen, tgt) && !map_body(tgt) && !hl_x86_trace_trap_head(tgt)) {
+                if (STITCH_OK && tgt != start && !hl_x86_trace_seen(seen, nseen, tgt) && !map_body(tgt) &&
+                    !hl_x86_trace_trap_head(tgt)) {
                     seen[nseen++] = tgt;
                     trace_blk++;
                     gpc = tgt;
@@ -3193,9 +3620,13 @@ static void *translate_block(uint64_t gpc) {
             }
             // ---- call rel32 (E8) ----
             if (op == 0xE8) {
-                e_subi(RSP, RSP, 8, 1); // flag-free push of the return address
+                if (emit_soft_memory_active()) {
+                    e_subi(17, RSP, 8, 1);
+                    emit_memory_guard(17, 8, gpc, X86_SOFT_WRITE);
+                }
+                e_subi(RSP, RSP, 8, 1); // commit only after a soft miss can no longer exit
                 e_movconst(16, call_return_pc(next));
-                e_store(8, 16, RSP);
+                e_store(8, 16, emit_soft_memory_active() ? 17 : RSP);
                 // x86-xflags: consult the CALLEE's flag live-in (function prologues kill flags fast).
                 hl_x86_trace_flags_edge(&trace_state, next + (uint64_t)I.imm, gpc);
                 emit_chain_exit(next + (uint64_t)I.imm);
@@ -3272,7 +3703,8 @@ static void *translate_block(uint64_t gpc) {
                 // hotness counter (tier-1) or the folded back-edge (tier-2). g_fl_pending is still pending
                 // here -- emit_selfloop_x86 does the flag handling itself. Parity already set the live Z
                 // (and spilled any pending producer) above, so it skips this purely-NZCV-flag path.
-                if (!parity && taken == start && !notier2x() && !hl_x86_trace_loop_hazard((uint64_t)body, (uint64_t)g_cp)) {
+                if (!parity && taken == start && !notier2x() &&
+                    !hl_x86_trace_loop_hazard((uint64_t)body, (uint64_t)g_cp)) {
                     int slot = g_tier2_build ? 0 : t2_slot(start);
                     if (g_tier2_build || slot >= 0) {
                         hl_x86_trace_self_loop(&trace_state, cc, start, next, body, slot);
@@ -3280,8 +3712,8 @@ static void *translate_block(uint64_t gpc) {
                     }
                 }
                 uint64_t fall = next;
-                int stitch_fall =
-                    (STITCH_OK && fall != start && !hl_x86_trace_seen(seen, nseen, fall) && !map_body(fall) && !hl_x86_trace_trap_head(fall));
+                int stitch_fall = (STITCH_OK && fall != start && !hl_x86_trace_seen(seen, nseen, fall) &&
+                                   !map_body(fall) && !hl_x86_trace_trap_head(fall));
                 int save_taken = 0, save_fall = 0;
                 if (parity) {
                     // live ARM Z already holds (PF==0) from emit_parity_jcc_cond; flags spilled there.
@@ -3303,9 +3735,10 @@ static void *translate_block(uint64_t gpc) {
                 if (stitch_fall) {
                     int inv = (cc ^ 1) & 0xF; // not-taken -> branch over the taken exit (x86cc_to_arm is 0..13)
                     uint32_t *patch = (uint32_t *)g_cp;
-                    emit32(0);                     // b.inv -> fall (inline)
-                    if (parity) e_nzcv_load();     // taken edge: restore canonical live NZCV
-                    emit_jcc_edge_spill(save_taken); // FL_SUB (e_nzcv_save) or FL_LOGIC (e_nzcv_save_c1) spill on the flag-live taken edge only
+                    emit32(0);                       // b.inv -> fall (inline)
+                    if (parity) e_nzcv_load();       // taken edge: restore canonical live NZCV
+                    emit_jcc_edge_spill(save_taken); // FL_SUB (e_nzcv_save) or FL_LOGIC (e_nzcv_save_c1) spill on the
+                                                     // flag-live taken edge only
                     emit_chain_exit(taken);
                     int64_t d = ((uint8_t *)g_cp - (uint8_t *)patch) / 4;
                     *patch = 0x54000000u | (((uint32_t)d & 0x7FFFF) << 5) | (uint32_t)inv;
@@ -3317,20 +3750,24 @@ static void *translate_block(uint64_t gpc) {
                     continue;
                 }
                 uint32_t *patch = (uint32_t *)g_cp;
-                emit32(0);                    // b.cond -> taken
-                if (parity) e_nzcv_load();    // fall edge: restore canonical live NZCV
+                emit32(0);                      // b.cond -> taken
+                if (parity) e_nzcv_load();      // fall edge: restore canonical live NZCV
                 emit_jcc_edge_spill(save_fall); // FL_SUB/FL_LOGIC spill for a flag-live fall successor
                 emit_chain_exit(next);
                 int64_t d = ((uint8_t *)g_cp - (uint8_t *)patch) / 4;
                 *patch = 0x54000000u | (((uint32_t)d & 0x7FFFF) << 5) | (cc & 0xF);
-                if (parity) e_nzcv_load();     // taken edge: restore canonical live NZCV
+                if (parity) e_nzcv_load();       // taken edge: restore canonical live NZCV
                 emit_jcc_edge_spill(save_taken); // FL_SUB/FL_LOGIC spill for a flag-live taken successor
                 emit_chain_exit(taken);
                 break;
             }
             // ---- ret (C3) / ret imm16 (C2) ----
             if (op == 0xC3 || op == 0xC2) {
-                e_load(8, 16, RSP);
+                if (emit_soft_memory_active()) {
+                    e_mov_rr(17, RSP, 1);
+                    emit_memory_guard(17, 8, gpc, X86_SOFT_READ);
+                }
+                e_load(8, 16, emit_soft_memory_active() ? 17 : RSP);
                 e_addi(RSP, RSP, 8, 1);
                 if (op == 0xC2) {
                     e_movconst(19, (uint64_t)(uint16_t)I.imm);
@@ -3343,8 +3780,12 @@ static void *translate_block(uint64_t gpc) {
             }
             // ---- leave (C9) ----
             if (op == 0xC9) {
+                if (emit_soft_memory_active()) {
+                    e_mov_rr(17, RBP, 1);
+                    emit_memory_guard(17, 8, gpc, X86_SOFT_READ);
+                }
                 e_mov_rr(RSP, RBP, 1);
-                e_load(8, RBP, RSP);
+                e_load(8, RBP, emit_soft_memory_active() ? 17 : RSP);
                 e_addi(RSP, RSP, 8, 1);
                 gpc = next;
                 continue;
@@ -3446,8 +3887,16 @@ static void *translate_block(uint64_t gpc) {
                 e_rrr(A_ORR, 17, 17, 18, 0, 4);                               // AF -> bit4
                 e_ldr(18, 28, OFF_ID);
                 e_rrr(A_ORR, 17, 17, 18, 0, 21); // ID(bit21) <- cpu->idflag (0/1) -- round-trips a CPUID probe
-                e_subi(RSP, RSP, 8, 1);
-                e_store(8, 17, RSP);
+                if (emit_soft_memory_active()) {
+                    e_mov_rr(20, 17, 1);
+                    e_subi(17, RSP, 8, 1);
+                    emit_memory_guard(17, 8, gpc, X86_SOFT_WRITE);
+                    e_subi(RSP, RSP, 8, 1);
+                    e_store(8, 20, 17);
+                } else {
+                    e_subi(RSP, RSP, 8, 1);
+                    e_store(8, 17, RSP);
+                }
                 gpc = next;
                 continue;
             }
@@ -3457,7 +3906,11 @@ static void *translate_block(uint64_t gpc) {
             // later-block `rep movs/stos/scas` copies BACKWARD correctly. g_df becomes dynamic because the
             // restored value is runtime (the string-op lowering will load cpu->df).
             if (op == 0x9D) {
-                e_load(8, 16, RSP); // x16 = popped RFLAGS
+                if (emit_soft_memory_active()) {
+                    e_mov_rr(17, RSP, 1);
+                    emit_memory_guard(17, 8, gpc, X86_SOFT_READ);
+                }
+                e_load(8, 16, emit_soft_memory_active() ? 17 : RSP); // x16 = popped RFLAGS
                 e_addi(RSP, RSP, 8, 1);
                 e_movconst(17, 0);
                 e_bit_move(17, 16, 6, 30, 18);                                // ZF(bit6) -> NZCV.Z(30)
@@ -3475,11 +3928,11 @@ static void *translate_block(uint64_t gpc) {
                 e_str(18, 28, OFF_PF);
                 e_af_save(16); // AF from popped RFLAGS bit4 (cpu->af consumer extracts bit 4)
                 emit32(0x53000000u | (21 << 16) | (21 << 10) | (16 << 5) | 18); // ubfx w18,w16,#21,#1 (ID)
-                e_str(18, 28, OFF_ID);  // stash RFLAGS.ID so a later pushfq observes the toggle (CPUID probe)
+                e_str(18, 28, OFF_ID); // stash RFLAGS.ID so a later pushfq observes the toggle (CPUID probe)
                 emit32(0x53000000u | (10 << 16) | (10 << 10) | (16 << 5) | 18); // ubfx w18,w16,#10,#1 (DF)
-                e_str(18, 28, OFF_DF);  // restore the runtime direction flag (was a documented M-gap)
+                e_str(18, 28, OFF_DF);           // restore the runtime direction flag (was a documented M-gap)
                 g_df = HL_X86_DIRECTION_DYNAMIC; // DF value is now runtime (popped)
-                g_fl_pending = FL_NONE; // flags now materialized directly into cpu->nzcv
+                g_fl_pending = FL_NONE;          // flags now materialized directly into cpu->nzcv
                 gpc = next;
                 continue;
             }
@@ -3512,7 +3965,23 @@ static void *translate_block(uint64_t gpc) {
                         x87_bytes = reg == 5 || reg == 7 ? 10 : 4;
                     else if (op == 0xDF)
                         x87_bytes = reg == 5 || reg == 7 ? 8 : 2;
-                    if (x87_bytes) emit_bus_guard(17, (uint64_t)x87_bytes, gpc);
+                    int x87_store = (op == 0xD9 && (reg == 2 || reg == 3 || reg == 6 || reg == 7)) ||
+                                    (op == 0xDD && (reg == 2 || reg == 3 || reg == 7)) ||
+                                    (op == 0xDB && (reg == 2 || reg == 3 || reg == 7)) ||
+                                    (op == 0xDF && (reg == 3 || reg == 7));
+                    if (x87_bytes)
+                        emit_memory_guard(17, (uint64_t)x87_bytes, gpc, x87_store ? X86_SOFT_WRITE : X86_SOFT_READ);
+                    /*
+                     * C-helper stores consume the translated host EA after
+                     * leaving the block.  Conservatively retire executable
+                     * aliases before either inline or helper stores; reload
+                     * the canonical EA because the callback spill restores
+                     * guest x17.
+                     */
+                    if (x87_store && emit_soft_memory_active()) {
+                        emit_soft_store_commit((uint64_t)x87_bytes);
+                        e_ldr(17, 28, OFF_BUS_EA);
+                    }
                     e_mov_rr(19, 17, 1); // x19 = EA (helpers clobber x17)
                     if (op == 0xD9) {    // f32 mem
                         if (reg == 0) {
@@ -3542,7 +4011,7 @@ static void *translate_block(uint64_t gpc) {
                             // x19 = EA. hl_x86_x87_status() materializes cpu->fptop and yields FSW in x16.
                             e_ldr(16, 28, OFF_FPCW);
                             emit32(0x79000000u | (0u << 10) | (19 << 5) | 16); // strh FCW, [x19,#0]
-                            hl_x86_x87_status();                              // x16 = FSW | (TOP<<11)
+                            hl_x86_x87_status();                               // x16 = FSW | (TOP<<11)
                             emit32(0x79000000u | (2u << 10) | (19 << 5) | 16); // strh FSW, [x19,#4]
                             e_movconst(16, 0xffff);
                             emit32(0x79000000u | (4u << 10) | (19 << 5) | 16); // strh FTW, [x19,#8]
@@ -3798,7 +4267,7 @@ static void *translate_block(uint64_t gpc) {
                     }
                 } else if (op == 0xD8 || op == 0xDC || op == 0xDE) { // arith ST0/ST(i) [+pop for DE]
                     hl_x86_x87_load(18, 0);
-                    hl_x86_x87_load(16, rm);                     // v18=ST0, v16=ST(rm)
+                    hl_x86_x87_load(16, rm);           // v18=ST0, v16=ST(rm)
                     int dst_i = (op == 0xD8) ? 0 : rm; // D8 -> ST0; DC/DE -> ST(i)
                     if (reg == 2 || reg == 3) {
                         e_fcom_setfpsw(18, 16);
@@ -3877,7 +4346,7 @@ static void *translate_block(uint64_t gpc) {
                         e_str(16, 28, OFF_FPCW);
                         hl_x86_x87_clear_exceptions();
                         if (hl_x86_x87_optimized()) { // anchor the translate-time shadow: top is now statically 0
-                            hl_x86_x87_anchor(0); // memory and shadow agree
+                            hl_x86_x87_anchor(0);     // memory and shadow agree
                         }
                     } // finit -> top=0
                     else if (reg == 4 && rm == 2) {
@@ -3985,8 +4454,8 @@ static void *translate_block(uint64_t gpc) {
                 if (sf)
                     e_asr_i(RDX, RAX, 63, 1); // cqo: rdx = rax>>63 (arith)
                 else if (I.p66) {
-                    e_sxt(19, RAX, 2);       // x19 = sext16(AX): bits 63:16 replicate AX bit 15
-                    e_asr_i(19, 19, 15, 0);  // w19 = all-ones if AX<0 else 0
+                    e_sxt(19, RAX, 2);        // x19 = sext16(AX): bits 63:16 replicate AX bit 15
+                    e_asr_i(19, 19, 15, 0);   // w19 = all-ones if AX<0 else 0
                     e_bfi(RDX, 19, 0, 16, 1); // DX = 0xFFFF/0x0000, preserve RDX 63:16
                 } // cwd: dx=sign(ax)
                 else
@@ -4008,9 +4477,9 @@ static void *translate_block(uint64_t gpc) {
                 base.rip_rel = 0;
                 base.disp = 0;
                 base.imm = 0;
-                emit_ea(&base, next);              // x17 = base address (seg base + bias + addr32 applied)
-                e_rrr(A_ADD, 17, 17, 19, 1, 0);    // x17 += zero-extended AL
-                if (I.addr32) e_uxt(17, 17, 4);    // 0x67: effective address wraps at 32 bits
+                emit_ea(&base, next);           // x17 = base address (seg base + bias + addr32 applied)
+                e_rrr(A_ADD, 17, 17, 19, 1, 0); // x17 += zero-extended AL
+                if (I.addr32) e_uxt(17, 17, 4); // 0x67: effective address wraps at 32 bits
                 emit_bus_guard(17, 1, next - (uint64_t)I.len);
                 e_load(1, 16, 17);
                 byte_wb(&I, RAX, 16); // AL = [table + AL]
@@ -4046,6 +4515,7 @@ static void *translate_block(uint64_t gpc) {
                 if (op == 0x6E) { // movd/movq xmm, r/m  (66)
                     if (I.is_mem) {
                         emit_ea(&I, next);
+                        emit_memory_guard(17, I.rexW ? 8u : 4u, gpc, X86_SOFT_READ);
                         if (I.rexW)
                             g_ldr_d(vd, 17);
                         else
@@ -4059,16 +4529,19 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0x7E && I.rep) { // F3 0F 7E: movq xmm, xmm/m64
                     if (I.is_mem) {
                         emit_ea(&I, next);
+                        emit_memory_guard(17, 8, gpc, X86_SOFT_READ);
                         g_ldr_d(vd, 17);
                     } else
                         e_vmov8(vd, vm);
                 } else if (op == 0x7E) { // 66 0F 7E: movd/movq r/m, xmm
                     if (I.is_mem) {
                         emit_ea(&I, next);
+                        emit_memory_guard(17, I.rexW ? 8u : 4u, gpc, X86_SOFT_WRITE);
                         if (I.rexW)
                             g_str_d(vd, 17);
                         else
                             g_str_s(vd, 17);
+                        if (emit_soft_memory_active()) emit_soft_store_commit(I.rexW ? 8u : 4u);
                     } else {
                         if (I.rexW)
                             e_fmov_from_d(I.rm_reg, vd);
@@ -4078,7 +4551,9 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0xD6) { // 66 0F D6: movq xmm/m64, xmm
                     if (I.is_mem) {
                         emit_ea(&I, next);
+                        emit_memory_guard(17, 8, gpc, X86_SOFT_WRITE);
                         g_str_d(vd, 17);
+                        if (emit_soft_memory_active()) emit_soft_store_commit(8);
                     } else
                         e_vmov8(vm, vd);
                 } else if (op == 0x6F && !I.p66 && !I.rep && !I.repne) { // MMX movq mm, mm/m64 (NO prefix): 64-bit
@@ -4087,13 +4562,16 @@ static void *translate_block(uint64_t gpc) {
                     // corrupted the adjacent 8 bytes of guest memory. Keep MMX at its architectural 64-bit width.
                     if (I.is_mem) {
                         emit_ea(&I, next);
+                        emit_memory_guard(17, 8, gpc, X86_SOFT_READ);
                         g_ldr_d(vd, 17);
                     } else
                         e_vmov8(vd, vm);
                 } else if (op == 0x7F && !I.p66 && !I.rep && !I.repne) { // MMX movq mm/m64, mm (NO prefix): 64-bit
                     if (I.is_mem) {
                         emit_ea(&I, next);
+                        emit_memory_guard(17, 8, gpc, X86_SOFT_WRITE);
                         g_str_d(vd, 17); // 64-bit store: must NOT clobber the 8 bytes after the MMX destination
+                        if (emit_soft_memory_active()) emit_soft_store_commit(8);
                     } else
                         e_vmov8(vm, vd);
                 } else if (op == 0x6F || op == 0x28 || (op == 0x10 && !I.rep && !I.repne)) { // load 128 -> xmm
@@ -4110,9 +4588,11 @@ static void *translate_block(uint64_t gpc) {
                     int st = (op == 0x11);
                     if (I.is_mem) {
                         emit_ea(&I, next);
-                        if (st)
+                        emit_memory_guard(17, 4, gpc, st ? X86_SOFT_WRITE : X86_SOFT_READ);
+                        if (st) {
                             g_str_s(vd, 17);
-                        else
+                            if (emit_soft_memory_active()) emit_soft_store_commit(4);
+                        } else
                             g_ldr_s(vd, 17);
                     } else {
                         if (st)
@@ -4124,9 +4604,11 @@ static void *translate_block(uint64_t gpc) {
                     int st = (op == 0x11);
                     if (I.is_mem) {
                         emit_ea(&I, next);
-                        if (st)
+                        emit_memory_guard(17, 8, gpc, st ? X86_SOFT_WRITE : X86_SOFT_READ);
+                        if (st) {
                             g_str_d(vd, 17);
-                        else
+                            if (emit_soft_memory_active()) emit_soft_store_commit(8);
+                        } else
                             g_ldr_d(vd, 17);
                     } else {
                         if (st)
@@ -4137,8 +4619,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0x7C || op == 0x7D) { // SSE3 haddps/hsubps (F2) or haddpd/hsubpd (66)
                     int s = vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                         s = 16;
                     }
                     uint32_t szb = I.p66 ? 0x00400000u : 0; // 66 -> double lanes (.2d), F2 -> single (.4s)
@@ -4179,8 +4660,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0xD0) { // SSE3 addsubps (F2) / addsubpd (66): even lanes sub, odd lanes add
                     int s = vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                         s = 16;
                     }
                     // Compute the sub and the add lanewise and SELECT, rather than flipping the
@@ -4209,27 +4689,24 @@ static void *translate_block(uint64_t gpc) {
                 } else if ((op == 0x12 || op == 0x16) && I.rep) { // SSE3 movsldup/movshdup: dup even/odd single lanes
                     int s = vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                         s = 16;
                     }
                     if (op == 0x12)
                         e_v3(0x4E802800u, vd, s, s); // movsldup: TRN1 vd.4s, s, s = [s0,s0,s2,s2]
                     else
                         e_v3(0x4E806800u, vd, s, s); // movshdup: TRN2 vd.4s, s, s = [s1,s1,s3,s3]
-                } else if (op == 0x12 && I.repne) { // movddup: dst[0]=dst[1]=src low 64-bit double
+                } else if (op == 0x12 && I.repne) {  // movddup: dst[0]=dst[1]=src low 64-bit double
                     int s = vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_d(16, 17); // low 64-bit -> v16.d[0]
+                        g_ldr_d_ea(16, &I, next); // low 64-bit -> v16.d[0]
                         s = 16;
                     }
                     emit32(0x4E080400u | (s << 5) | vd); // dup vd.2d, vs.d[0]  (broadcast low lane)
-                } else if (op == 0x12 || op == 0x16) { // movlps/movhps (load) or movhlps/movlhps (reg)
-                    int lane = (op == 0x16) ? 1 : 0;   // 12->low lane(d[0]), 16->high lane(d[1])
+                } else if (op == 0x12 || op == 0x16) {   // movlps/movhps (load) or movhlps/movlhps (reg)
+                    int lane = (op == 0x16) ? 1 : 0;     // 12->low lane(d[0]), 16->high lane(d[1])
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_d(16, 17);
+                        g_ldr_d_ea(16, &I, next);
                         e_ins_d(vd, lane, 16, 0);
                     } else {
                         int srclane = (op == 0x12) ? 1 : 0; // movhlps: d[0]<-src d[1]; movlhps: d[1]<-src d[0]
@@ -4237,15 +4714,13 @@ static void *translate_block(uint64_t gpc) {
                     }
                 } else if (op == 0x13 || op == 0x17) { // movlps/movhps store
                     int lane = (op == 0x17) ? 1 : 0;
-                    emit_ea(&I, next);
                     e_ins_d(16, 0, vd, lane);
-                    g_str_d(16, 17);
+                    g_str_d_ea(16, &I, next);
                 } else if (op == 0x54 || op == 0x55 || op == 0x56 ||
                            op == 0x57) { // andps/andnps/orps/xorps (FP bitwise)
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     if (op == 0x54)
                         e_v3(0x4E201C00u, vd, vd, s); // and
@@ -4258,8 +4733,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0xC6 && I.p66) {     // shufpd: 64-bit lanes (d[0]<-dst, d[1]<-src)
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     unsigned im = (unsigned)I.imm;
                     e_vmov(18, vd);
@@ -4269,8 +4743,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0xC6) { // shufps xmm,xmm/m,imm8 (lanes 0,1 from dst; 2,3 from src)
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     unsigned im = (unsigned)I.imm;
                     e_vmov(18, vd);
@@ -4295,7 +4768,8 @@ static void *translate_block(uint64_t gpc) {
                         if (sh > 15) {                               // x86: count > 15 -> result is all-zero
                             e_v3(0x6E201C00u, x, x, x);
                         } else if (sh) { // count 0 is the identity -> emit nothing
-                            if (!crypto_state.zero_ready || nosseopt()) e_v3(0x6E201C00u, 26, 26, 26); // hoisted zero (crypto.c claim)
+                            if (!crypto_state.zero_ready || nosseopt())
+                                e_v3(0x6E201C00u, 26, 26, 26); // hoisted zero (crypto.c claim)
                             crypto_state.zero_ready = 1;
                             if (sub == 3)
                                 e_ext(x, x, 26, sh); // psrldq
@@ -4309,8 +4783,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0x70 && I.p66) { // pshufd xmm, xmm/m, imm8
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     unsigned im = (unsigned)I.imm & 0xff;
                     // AES-endgame perf: single-insn forms for the shuffles crypto/ghash loops actually use.
@@ -4333,8 +4806,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0x70 && (I.rep || I.repne)) { // pshufhw(F3=high) / pshuflw(F2=low): shuffle 4 words
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     unsigned im = (unsigned)I.imm;
                     int hi = I.rep; // F3 shuffles the HIGH 4 words, F2 the LOW 4
@@ -4350,15 +4822,13 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0xEF) { // pxor
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     e_v3(0x6E201C00u, vd, vd, s);
                 } else if (op == 0xDB || op == 0xEB || op == 0xDF) { // pand / por / pandn
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     if (op == 0xDB)
                         e_v3(0x4E201C00u, vd, vd, s);
@@ -4369,24 +4839,21 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0x74 || op == 0x75 || op == 0x76) { // pcmpeqb/w/d
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     uint32_t b = op == 0x74 ? 0x6E208C00u : op == 0x75 ? 0x6E608C00u : 0x6EA08C00u;
                     e_v3(b, vd, vd, s);
                 } else if (op == 0x64 || op == 0x65 || op == 0x66) { // pcmpgtb/w/d -> CMGT (signed)
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     uint32_t b = op == 0x64 ? 0x4E203400u : op == 0x65 ? 0x4E603400u : 0x4EA03400u;
                     e_v3(b, vd, vd, s);
                 } else if (op == 0xDE || op == 0xDA || op == 0xEE || op == 0xEA) { // pmaxub/pminub/pmaxsw/pminsw
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     uint32_t b = op == 0xDE   ? 0x6E206400u  // pmaxub -> UMAX  .16B (lane-wise, NOT UMAXP)
                                  : op == 0xDA ? 0x6E206C00u  // pminub -> UMIN  .16B (lane-wise, NOT UMINP)
@@ -4396,8 +4863,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0xFC || op == 0xFD || op == 0xFE || op == 0xD4) { // paddb/w/d/q
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     uint32_t b = op == 0xFC   ? 0x4E208400u
                                  : op == 0xFD ? 0x4E608400u
@@ -4407,8 +4873,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0xF8 || op == 0xF9 || op == 0xFA || op == 0xFB) { // psubb/w/d/q
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     uint32_t b = op == 0xF8   ? 0x6E208400u
                                  : op == 0xF9 ? 0x6E608400u
@@ -4419,8 +4884,7 @@ static void *translate_block(uint64_t gpc) {
                            op == 0xE8 || op == 0xE9) { // saturating add/sub: paddus/padds/psubus/psubs b/w
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     uint32_t b = op == 0xDC   ? 0x6E200C00u  // paddusb -> UQADD .16b
                                  : op == 0xDD ? 0x6E600C00u  // paddusw -> UQADD .8h
@@ -4434,22 +4898,19 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0xE0 || op == 0xE3) { // pavgb/pavgw: unsigned rounding average -> URHADD
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     e_v3(op == 0xE0 ? 0x6E201400u : 0x6E601400u, vd, vd, s); // .16b : .8h
                 } else if (op == 0xD5) { // pmullw: packed signed 16x16 -> low 16 bits -> MUL .8h
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     e_v3(0x4E609C00u, vd, vd, s);
                 } else if (op == 0xE5 || op == 0xE4) { // pmulhw(signed)/pmulhuw(unsigned): 16x16 -> high 16 bits
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     // widen-multiply the low/high 4 lanes to 32-bit products, then UZP2 picks the high 16 of each.
                     uint32_t lo = op == 0xE5 ? 0x0E60C000u : 0x2E60C000u; // SMULL/UMULL  v18.4s, vd.4h, s.4h
@@ -4460,8 +4921,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0xF5) { // pmaddwd: signed 16x16, add adjacent pairs -> 32-bit lanes
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     emit32(0x0E60C000u | (s << 16) | (vd << 5) | 18);  // smull  v18.4s, vd.4h, s.4h
                     emit32(0x4E60C000u | (s << 16) | (vd << 5) | 19);  // smull2 v19.4s, vd.8h, s.8h
@@ -4470,8 +4930,7 @@ static void *translate_block(uint64_t gpc) {
                            op == 0xE1 || op == 0xE2) { // psll/psrl/psra w/d/q by xmm/m (variable count)
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     int left = (op == 0xF1 || op == 0xF2 || op == 0xF3);
                     int arith = (op == 0xE1 || op == 0xE2);
@@ -4482,8 +4941,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0x14 || op == 0x15) { // unpckl/hp{s,d}: interleave float lanes -> ZIP1/ZIP2
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     int hi = (op == 0x15);  // unpckh* -> ZIP2
                     int sz = I.p66 ? 3 : 2; // 66=pd (64-bit lanes, .2d); none=ps (32-bit lanes, .4s)
@@ -4492,8 +4950,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0xE6 && I.rep) { // cvtdq2pd (F3): low 2 packed s32 -> 2 packed f64
                     int s = vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_d(16, 17);
+                        g_ldr_d_ea(16, &I, next);
                         s = 16;
                     }
                     emit32(0x0F20A400u | (s << 5) | 16);  // SXTL v16.2d, vs.2s  (sign-extend the 2 int32)
@@ -4503,8 +4960,7 @@ static void *translate_block(uint64_t gpc) {
                     // s32 in the low 64 bits of dst; the high 64 bits are zeroed (SQXTN with Q=0).
                     int s = vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                         s = 16;
                     }
                     uint32_t cvt = I.p66 ? 0x4EE1B800u  // FCVTZS v16.2d, vs.2d (toward zero)
@@ -4515,9 +4971,9 @@ static void *translate_block(uint64_t gpc) {
                     // rounded s64 exceeds INT32_MAX (catches the round-up boundary too) OR the source is NaN. The
                     // NaN mask MUST be taken from the source doubles BEFORE the convert (which writes v16 and, for
                     // a memory operand where s==16, would otherwise clobber the doubles first).
-                    emit32(0x4E60E400u | (s << 16) | (s << 5) | 18);   // FCMEQ v18.2d, s, s  -> ordered (0 where NaN)
-                    emit32(0x6E205800u | (18 << 5) | 18);              // NOT  v18.16b       -> NaN mask
-                    emit32(cvt | (s << 5) | 16);                       // FCVT*S v16.2d = cvt(s)  (rounded s64/lane)
+                    emit32(0x4E60E400u | (s << 16) | (s << 5) | 18); // FCMEQ v18.2d, s, s  -> ordered (0 where NaN)
+                    emit32(0x6E205800u | (18 << 5) | 18);            // NOT  v18.16b       -> NaN mask
+                    emit32(cvt | (s << 5) | 16);                     // FCVT*S v16.2d = cvt(s)  (rounded s64/lane)
                     e_movconst(19, 0x7fffffffull);
                     emit32(0x4E080C00u | (19 << 5) | 19);              // DUP  v19.2d, x19   -> INT32_MAX threshold
                     emit32(0x4EE03400u | (19 << 16) | (16 << 5) | 17); // CMGT v17.2d, v16.2d, v19.2d -> overflow mask
@@ -4532,8 +4988,7 @@ static void *translate_block(uint64_t gpc) {
                            op == 0x6A || op == 0x6D) { // punpck l/h bw/wd/dq/qdq -> ZIP1/ZIP2
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     int hi = (op == 0x68 || op == 0x69 || op == 0x6A || op == 0x6D); // punpckh*; 0x6C(lqdq) is LOW
                     int sz = (op == 0x60 || op == 0x68)   ? 0
@@ -4547,8 +5002,7 @@ static void *translate_block(uint64_t gpc) {
                     // 0x6B PACKSSDW (32->s16). dst.low half from dst's lanes, dst.high half from src's.
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     uint32_t sz = (op == 0x6B) ? 1u : 0u;     // source element: 0x6B = 16-bit, else 8-bit dest
                     uint32_t lo = (op == 0x67) ? 0x2E212800u  // SQXTUN  (signed->unsigned narrow)
@@ -4590,6 +5044,8 @@ static void *translate_block(uint64_t gpc) {
                     int src;
                     if (I.is_mem) {
                         emit_ea(&I, next);
+                        if (emit_soft_memory_active())
+                            emit_memory_guard(17, I.rexW ? 8u : 4u, gpc, X86_SOFT_READ);
                         e_load(I.rexW ? 8 : 4, 16, 17);
                         src = 16;
                     } else
@@ -4606,6 +5062,8 @@ static void *translate_block(uint64_t gpc) {
                     int s = vm;
                     if (I.is_mem) {
                         emit_ea(&I, next);
+                        if (emit_soft_memory_active())
+                            emit_memory_guard(17, I.repne ? 8u : 4u, gpc, X86_SOFT_READ);
                         if (I.repne)
                             g_ldr_d(16, 17);
                         else
@@ -4629,8 +5087,8 @@ static void *translate_block(uint64_t gpc) {
                     // NZCV is free scratch, same as the ucomisd path.)
                     {
                         int sf = I.rexW ? 1 : 0; // dest is 64-bit signed int
-                        uint64_t thr = I.repne ? (sf ? 0x43E0000000000000ull : 0x41E0000000000000ull)  // dbl 2^63/2^31
-                                               : (sf ? 0x5F000000ull : 0x4F000000ull);                 // sgl 2^63/2^31
+                        uint64_t thr = I.repne ? (sf ? 0x43E0000000000000ull : 0x41E0000000000000ull) // dbl 2^63/2^31
+                                               : (sf ? 0x5F000000ull : 0x4F000000ull);                // sgl 2^63/2^31
                         e_movconst(20, thr);
                         if (I.repne)
                             e_fmov_to_d(19, 20);
@@ -4645,7 +5103,7 @@ static void *translate_block(uint64_t gpc) {
                         emit32((I.repne ? 0x1E602000u : 0x1E202000u) | (19 << 16) | (s << 5)); // FCMP s, v19
                         e_movconst(20, sf ? 0x8000000000000000ull : 0x80000000ull);            // integer indefinite
                         e_csel(I.reg, 20, I.reg, 2 /*CS: s>=thr or NaN*/, sf);
-                        emit32(0xD51B4200u | 21);                                              // msr nzcv, x21
+                        emit32(0xD51B4200u | 21); // msr nzcv, x21
                     }
                 } else if (op == 0x5D || op == 0x5F) { // H10: minps/maxps/minpd/maxpd + scalar minss/minsd/maxss/maxsd
                     // x86 MIN(a,b) = (a<b)?a:b ; MAX(a,b) = (a>b)?a:b -- and if either operand is NaN, or they
@@ -4660,6 +5118,8 @@ static void *translate_block(uint64_t gpc) {
                             g_ldr_q_ea(16, &I, next);
                         } else {
                             emit_ea(&I, next);
+                            if (emit_soft_memory_active())
+                                emit_memory_guard(17, I.repne ? 8u : 4u, gpc, X86_SOFT_READ);
                             if (I.repne)
                                 g_ldr_d(16, 17);
                             else
@@ -4696,6 +5156,8 @@ static void *translate_block(uint64_t gpc) {
                             g_ldr_q_ea(16, &I, next);
                         } else {
                             emit_ea(&I, next);
+                            if (emit_soft_memory_active())
+                                emit_memory_guard(17, I.repne ? 8u : 4u, gpc, X86_SOFT_READ);
                             if (I.repne)
                                 g_ldr_d(16, 17);
                             else
@@ -4746,76 +5208,76 @@ static void *translate_block(uint64_t gpc) {
                         emit32(0);                     // cbnz w16, Lfast (patched below)
                         emit_exit_const(gpc, R_SSE3B); // any NaN lane -> x86-exact C emulation
                         uint8_t *Lfast = (uint8_t *)g_cp;
-                        *p_cbnz =
-                            0x35000000u | ((uint32_t)(((Lfast - (uint8_t *)p_cbnz) / 4) & 0x7FFFF) << 5) | 16;
+                        *p_cbnz = 0x35000000u | ((uint32_t)(((Lfast - (uint8_t *)p_cbnz) / 4) & 0x7FFFF) << 5) | 16;
                         e_vmov(vd, 18);
                     } else {
-                    if (op != 0x51) {
-                        // ---- NaN-input gate ----
-                        // NEON FADD/FMUL/FSUB/FDIV + emit_dnan is bit-exact to x86 for finite inputs, for a
-                        // GENERATED NaN (fixed up below), and for a SINGLE NaN input (propagated + quieted,
-                        // sign preserved -- both ISAs agree). But when a lane has TWO NaN inputs, x86 selects
-                        // QNaN-priority-else-src2 while ARM selects SNaN-priority-else-src1 -- the exact
-                        // mirror, a silent wrong result. Rather than reproduce x86's per-lane priority inline
-                        // on the hot path, gate: if ANY checked input lane is a NaN, exit to the x86-exact C
-                        // softmulator (R_SSE3B -> hl_x86_sse_run). Real FP kernels have no NaN inputs, so the
-                        // fast path below is unaffected. src1 is still live in vd (arith not emitted yet),
-                        // src2 in s. Scalar ss/sd check ONLY the low lane; packed checks all lanes.
-                        uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u; // FCMEQ .2d/.4s (all-ones per non-NaN lane)
-                        emit32(EQ | (vd << 16) | (vd << 5) | 24);      // v24 = (src1==src1)
-                        emit32(EQ | (s << 16) | (s << 5) | 25);        // v25 = (src2==src2)
-                        e_v3(0x4E201C00u, 24, 24, 25);                 // v24 = src1nn & src2nn (AND.16b)
-                        if (packed) {                                  // fold both 64-bit halves -> low 64 = all lanes
-                            e_ext(25, 24, 24, 8);
-                            e_v3(0x4E201C00u, 24, 24, 25);
+                        if (op != 0x51) {
+                            // ---- NaN-input gate ----
+                            // NEON FADD/FMUL/FSUB/FDIV + emit_dnan is bit-exact to x86 for finite inputs, for a
+                            // GENERATED NaN (fixed up below), and for a SINGLE NaN input (propagated + quieted,
+                            // sign preserved -- both ISAs agree). But when a lane has TWO NaN inputs, x86 selects
+                            // QNaN-priority-else-src2 while ARM selects SNaN-priority-else-src1 -- the exact
+                            // mirror, a silent wrong result. Rather than reproduce x86's per-lane priority inline
+                            // on the hot path, gate: if ANY checked input lane is a NaN, exit to the x86-exact C
+                            // softmulator (R_SSE3B -> hl_x86_sse_run). Real FP kernels have no NaN inputs, so the
+                            // fast path below is unaffected. src1 is still live in vd (arith not emitted yet),
+                            // src2 in s. Scalar ss/sd check ONLY the low lane; packed checks all lanes.
+                            uint32_t EQ = dbl ? 0x4E60E400u : 0x4E20E400u; // FCMEQ .2d/.4s (all-ones per non-NaN lane)
+                            emit32(EQ | (vd << 16) | (vd << 5) | 24);      // v24 = (src1==src1)
+                            emit32(EQ | (s << 16) | (s << 5) | 25);        // v25 = (src2==src2)
+                            e_v3(0x4E201C00u, 24, 24, 25);                 // v24 = src1nn & src2nn (AND.16b)
+                            if (packed) { // fold both 64-bit halves -> low 64 = all lanes
+                                e_ext(25, 24, 24, 8);
+                                e_v3(0x4E201C00u, 24, 24, 25);
+                            }
+                            e_fmov_from_d(16, 24);          // x16 = lane mask (all-ones iff no NaN in checked lanes)
+                            e_rrr(A_ORN, 16, 31, 16, 1, 0); // x16 = ~mask (0 iff clean; nonzero iff a NaN input)
+                            uint32_t *p_cbz = (uint32_t *)g_cp;
+                            emit32(0);                     // cbz {w,x}16, Lfast (patched below)
+                            emit_exit_const(gpc, R_SSE3B); // NaN present -> x86-exact C emulation of this insn
+                            uint8_t *Lfast = (uint8_t *)g_cp;
+                            // scalar single checks only the low 32 bits (cbz w16); packed / scalar double check 64 (cbz
+                            // x16)
+                            uint32_t cbz = (!packed && !dbl) ? 0x34000000u : 0xB4000000u;
+                            *p_cbz = cbz | ((uint32_t)(((Lfast - (uint8_t *)p_cbz) / 4) & 0x7FFFF) << 5) | 16;
                         }
-                        e_fmov_from_d(16, 24);          // x16 = lane mask (all-ones iff no NaN in checked lanes)
-                        e_rrr(A_ORN, 16, 31, 16, 1, 0); // x16 = ~mask (0 iff clean; nonzero iff a NaN input)
-                        uint32_t *p_cbz = (uint32_t *)g_cp;
-                        emit32(0);                      // cbz {w,x}16, Lfast (patched below)
-                        emit_exit_const(gpc, R_SSE3B);  // NaN present -> x86-exact C emulation of this insn
-                        uint8_t *Lfast = (uint8_t *)g_cp;
-                        // scalar single checks only the low 32 bits (cbz w16); packed / scalar double check 64 (cbz x16)
-                        uint32_t cbz = (!packed && !dbl) ? 0x34000000u : 0xB4000000u;
-                        *p_cbz = cbz | ((uint32_t)(((Lfast - (uint8_t *)p_cbz) / 4) & 0x7FFFF) << 5) | 16;
-                    }
-                    int fixnan = fpdnan_on();
-                    if (fixnan) emit_dnan_pre(vd, s, op != 0x51, dbl); // capture "no input NaN" (uses v20/v21)
-                    if (packed) { // vector FP: 66 -> .2d (sz bit), none -> .4s
-                        uint32_t d = I.p66 ? 0x00400000u : 0;
-                        uint32_t b = op == 0x58   ? 0x4E20D400u  // FADD
-                                     : op == 0x59 ? 0x6E20DC00u  // FMUL
-                                     : op == 0x5C ? 0x4EA0D400u  // FSUB
-                                     : op == 0x5E ? 0x6E20FC00u  // FDIV
-                                                  : 0x6EA1F800u; // FSQRT (2-reg)  [min/max: see 0x5D/0x5F above]
-                        if (op == 0x51)
-                            emit32(b | d | (s << 5) | vd); // FSQRT vd.T, s.T
-                        else
-                            emit32(b | d | (s << 16) | (vd << 5) | vd); // op vd.T, vd.T, s.T
-                    } else {                                            // scalar FP: F2=double, F3=single
-                        uint32_t ty = I.repne ? 0x00400000u : 0;
-                        uint32_t b = op == 0x58   ? 0x1E202800u
-                                     : op == 0x59 ? 0x1E200800u
-                                     : op == 0x5C ? 0x1E203800u
-                                     : op == 0x5E ? 0x1E201800u
-                                                  : 0x1E21C000u; // FSQRT [min/max: see 0x5D/0x5F above]
-                        // ADDSS/SD, MULSS/SD, SUBSS/SD, DIVSS/SD and SQRTSS/SD write ONLY the low
-                        // element; the rest of the destination is architecturally PRESERVED. The ARM
-                        // scalar forms zero everything above the element, so land the result in
-                        // scratch v18 (which the default-NaN fixup then stamps) and INS it back.
-                        if (op == 0x51)
-                            emit32(b | ty | (s << 5) | 18); // FSQRT s18/d18, s
-                        else
-                            emit32(b | ty | (s << 16) | (vd << 5) | 18); // FADD/... s18/d18, vd, s
-                    }
-                    int res = packed ? vd : 18;
-                    if (fixnan) emit_dnan_post(res, dbl, packed); // stamp x86's negative default-NaN sign
-                    if (!packed) {
-                        if (dbl)
-                            e_ins_d(vd, 0, 18, 0);
-                        else
-                            e_ins_s(vd, 0, 18, 0);
-                    }
+                        int fixnan = fpdnan_on();
+                        if (fixnan) emit_dnan_pre(vd, s, op != 0x51, dbl); // capture "no input NaN" (uses v20/v21)
+                        if (packed) {                                      // vector FP: 66 -> .2d (sz bit), none -> .4s
+                            uint32_t d = I.p66 ? 0x00400000u : 0;
+                            uint32_t b = op == 0x58   ? 0x4E20D400u  // FADD
+                                         : op == 0x59 ? 0x6E20DC00u  // FMUL
+                                         : op == 0x5C ? 0x4EA0D400u  // FSUB
+                                         : op == 0x5E ? 0x6E20FC00u  // FDIV
+                                                      : 0x6EA1F800u; // FSQRT (2-reg)  [min/max: see 0x5D/0x5F above]
+                            if (op == 0x51)
+                                emit32(b | d | (s << 5) | vd); // FSQRT vd.T, s.T
+                            else
+                                emit32(b | d | (s << 16) | (vd << 5) | vd); // op vd.T, vd.T, s.T
+                        } else {                                            // scalar FP: F2=double, F3=single
+                            uint32_t ty = I.repne ? 0x00400000u : 0;
+                            uint32_t b = op == 0x58   ? 0x1E202800u
+                                         : op == 0x59 ? 0x1E200800u
+                                         : op == 0x5C ? 0x1E203800u
+                                         : op == 0x5E ? 0x1E201800u
+                                                      : 0x1E21C000u; // FSQRT [min/max: see 0x5D/0x5F above]
+                            // ADDSS/SD, MULSS/SD, SUBSS/SD, DIVSS/SD and SQRTSS/SD write ONLY the low
+                            // element; the rest of the destination is architecturally PRESERVED. The ARM
+                            // scalar forms zero everything above the element, so land the result in
+                            // scratch v18 (which the default-NaN fixup then stamps) and INS it back.
+                            if (op == 0x51)
+                                emit32(b | ty | (s << 5) | 18); // FSQRT s18/d18, s
+                            else
+                                emit32(b | ty | (s << 16) | (vd << 5) | 18); // FADD/... s18/d18, vd, s
+                        }
+                        int res = packed ? vd : 18;
+                        if (fixnan) emit_dnan_post(res, dbl, packed); // stamp x86's negative default-NaN sign
+                        if (!packed) {
+                            if (dbl)
+                                e_ins_d(vd, 0, 18, 0);
+                            else
+                                e_ins_s(vd, 0, 18, 0);
+                        }
                     }
                 } else if (op == 0x5A) {
                     // 0F 5A is FOUR instructions, selected by the mandatory prefix:
@@ -4827,6 +5289,9 @@ static void *translate_block(uint64_t gpc) {
                     int s = vm;
                     if (I.is_mem) {
                         emit_ea(&I, next);
+                        if (emit_soft_memory_active())
+                            emit_memory_guard(17, I.rep ? 4u : (packed && I.p66) ? 16u : 8u, gpc,
+                                              X86_SOFT_READ);
                         if (I.rep)
                             g_ldr_s(16, 17); // cvtss2sd: m32
                         else if (packed && I.p66)
@@ -4854,6 +5319,8 @@ static void *translate_block(uint64_t gpc) {
                     int src;
                     if (I.is_mem) {
                         emit_ea(&I, next);
+                        if (emit_soft_memory_active())
+                            emit_memory_guard(17, 2, gpc, X86_SOFT_READ);
                         e_load(2, 16, 17); // w16 = [addr] (16-bit)
                         src = 16;
                     } else {
@@ -4873,6 +5340,8 @@ static void *translate_block(uint64_t gpc) {
                             g_ldr_q_ea(16, &I, next);
                         } else {
                             emit_ea(&I, next);
+                            if (emit_soft_memory_active())
+                                emit_memory_guard(17, I.repne ? 8u : 4u, gpc, X86_SOFT_READ);
                             if (I.repne)
                                 g_ldr_d(16, 17);
                             else
@@ -4892,10 +5361,10 @@ static void *translate_block(uint64_t gpc) {
                     // destination, but the ARM scalar FCMxx/NOT forms zero everything above the
                     // element. So scalar results are built in v18 and inserted back into lane 0.
                     int res = packed ? vd : 18;
-                    if (pred == 3 || pred == 7) {                     // UNORD/ORD: ordered(a)&ordered(b)
-                        emit32(EQ | (vd << 16) | (vd << 5) | 17);     // v17 = a==a (ordered a)
-                        emit32(EQ | (s << 16) | (s << 5) | res);      // res = b==b (ordered b)
-                        emit32(ANDb | (17 << 16) | (res << 5) | res); // res = ORD
+                    if (pred == 3 || pred == 7) {                       // UNORD/ORD: ordered(a)&ordered(b)
+                        emit32(EQ | (vd << 16) | (vd << 5) | 17);       // v17 = a==a (ordered a)
+                        emit32(EQ | (s << 16) | (s << 5) | res);        // res = b==b (ordered b)
+                        emit32(ANDb | (17 << 16) | (res << 5) | res);   // res = ORD
                         if (pred == 3) emit32(NOTb | (res << 5) | res); // UNORD = ~ORD
                     } else {
                         // predicates handled here: 0 EQ, 1 LT, 2 LE, 4 NEQ, 5 NLT, 6 NLE.
@@ -4904,8 +5373,8 @@ static void *translate_block(uint64_t gpc) {
                         // an operand is NaN. ARM FCMGT/FCMGE give 0 on NaN, so inverting the ordered result (NOT)
                         // yields the correct NaN->true mask for NLT/NLE (H12) exactly as it already did for NEQ.
                         int lt_like = (pred == 1 || pred == 2 || pred == 5 || pred == 6);
-                        int use_ge = (pred == 2 || pred == 6);            // LE/NLE -> GE ; LT/NLT -> GT
-                        int neg = (pred == 4 || pred == 5 || pred == 6);  // NEQ/NLT/NLE invert (NaN -> true)
+                        int use_ge = (pred == 2 || pred == 6);           // LE/NLE -> GE ; LT/NLT -> GT
+                        int neg = (pred == 4 || pred == 5 || pred == 6); // NEQ/NLT/NLE invert (NaN -> true)
                         int n = lt_like ? s : vd, m = lt_like ? vd : s;
                         uint32_t fc = (pred == 0 || pred == 4) ? EQ : use_ge ? GE : GT;
                         emit32(fc | (m << 16) | (n << 5) | res);  // FCMxx res, n, m
@@ -4921,6 +5390,8 @@ static void *translate_block(uint64_t gpc) {
                     int s = vm;
                     if (I.is_mem) {
                         emit_ea(&I, next);
+                        if (emit_soft_memory_active())
+                            emit_memory_guard(17, I.p66 ? 8u : 4u, gpc, X86_SOFT_READ);
                         if (I.p66)
                             g_ldr_d(16, 17);
                         else
@@ -4931,8 +5402,8 @@ static void *translate_block(uint64_t gpc) {
                     // on ANY NaN operand, including qNaN. UCOMISS/UCOMISD (0x2E) is quiet: IE only for
                     // sNaN. Map 0x2F -> FCMPE (bit4 set) and 0x2E -> FCMP. EFLAGS result is identical
                     // for both (unordered -> N0 Z0 C1 V1), so the fixup below is unchanged.
-                    emit32((I.p66 ? 0x1E602000u : 0x1E202000u) | (op == 0x2F ? 0x10u : 0u) |
-                           (s << 16) | (vd << 5)); // FCMP/FCMPE Dvd, Ds  (Rd=0)
+                    emit32((I.p66 ? 0x1E602000u : 0x1E202000u) | (op == 0x2F ? 0x10u : 0u) | (s << 16) |
+                           (vd << 5));   // FCMP/FCMPE Dvd, Ds  (Rd=0)
                     e_nzcv_save_fcmp();  // unordered fixup: x86 ZF=PF=CF=1, SF=0 (ARM FCMP gives N0 Z0 C1 V1)
                 } else if (op == 0xF4) { // pmuludq: vd.u64[i] = (u32)vd.even32[i] * (u32)src.even32[i]
                     // W3b: was UNIMPL -> blocked glibc strchr/strrchr (byte-broadcast via pmuludq).
@@ -4940,8 +5411,7 @@ static void *translate_block(uint64_t gpc) {
                     // then widening multiply -> two 64-bit products. Bit-exact, 3 NEON insns.
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     emit32(0x4E801800u | (vd << 16) | (vd << 5) | 17); // uzp1 v17.4s, vd.4s, vd.4s -> [d0,d2,..]
                     emit32(0x4E801800u | (s << 16) | (s << 5) | 18);   // uzp1 v18.4s, s.4s,  s.4s  -> [s0,s2,..]
@@ -4963,8 +5433,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0x5B) { // cvtdq2ps(NP)/cvtps2dq(66)/cvttps2dq(F3): packed 4-lane int<->float
                     int s = vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                         s = 16;
                     }
                     if (I.rep || I.p66) {
@@ -4996,11 +5465,10 @@ static void *translate_block(uint64_t gpc) {
                     } else {
                         emit32(0x4E21D800u | (s << 5) | vd); // NP: cvtdq2ps -> SCVTF .4S (s32->f32)
                     }
-                } else if (op == 0xF6) {                     // psadbw (66): sum of abs byte diffs per 64-bit half
+                } else if (op == 0xF6) { // psadbw (66): sum of abs byte diffs per 64-bit half
                     int s = I.is_mem ? 16 : vm;
                     if (I.is_mem) {
-                        emit_ea(&I, next);
-                        g_ldr_q(16, 17, 0);
+                        g_ldr_q_ea(16, &I, next);
                     }
                     emit32(0x6E207400u | (s << 16) | (vd << 5) | 17); // uabd   v17.16b, vd.16b, s.16b
                     emit32(0x6E202800u | (17 << 5) | 17);             // uaddlp v17.8h,  v17.16b
@@ -5008,20 +5476,20 @@ static void *translate_block(uint64_t gpc) {
                     emit32(0x6EA02800u | (17 << 5) | 17);             // uaddlp v17.2d,  v17.4s
                     e_vmov(vd, 17);
                 } else if (op == 0xE7 && I.p66) { // movntdq (66): non-temporal store xmm -> m128
-                    emit_ea(&I, next);
-                    g_str_q(vd, 17, 0);
+                    g_str_q_ea(vd, &I, next);
                 } else if (op == 0xF7 && I.p66) { // maskmovdqu (66): per-byte masked store xmm(vd) -> [RDI],
                     // mask = xmm(vm); only each mask byte's MSB selects. Read-modify-write blend at [RDI]
                     // (the region is writable; unselected bytes keep their memory value == architecturally
                     // "not stored"). sel = sshr(mask,#7) -> 0xFF where store; BSL sel?src:mem; store back.
-                    e_vshr_imm(18, vm, 8, 7, 1);     // sshr v18.16b, vmask.16b, #7
-                    e_mov_rr(17, RDI, 1);            // x17 = RDI (guest addr == host addr, in-process)
-                    g_ldr_q(16, 17, 0);              // v16 = [RDI]
-                    e_v3(0x6E601C00u, 18, vd, 16);   // bsl v18.16b, vsrc.16b, v16.16b (sel?src:mem)
-                    g_str_q(18, 17, 0);              // [RDI] = blended
+                    e_vshr_imm(18, vm, 8, 7, 1); // sshr v18.16b, vmask.16b, #7
+                    e_mov_rr(17, RDI, 1);        // x17 = RDI (guest addr == host addr, in-process)
+                    emit_memory_guard(17, 16, gpc, X86_SOFT_READ | X86_SOFT_WRITE);
+                    g_ldr_q(16, 17, 0);            // v16 = [RDI]
+                    e_v3(0x6E601C00u, 18, vd, 16); // bsl v18.16b, vsrc.16b, v16.16b (sel?src:mem)
+                    g_str_q(18, 17, 0);            // [RDI] = blended
+                    if (emit_soft_memory_active()) emit_soft_store_commit(16);
                 } else if (op == 0x2B && I.is_mem) { // movntps (NP) / movntpd (66): non-temporal store xmm -> m128
-                    emit_ea(&I, next);               // (aligned, non-temporal -> a plain 128-bit store on ARM;)
-                    g_str_q(vd, 17, 0);
+                    g_str_q_ea(vd, &I, next);        // aligned, non-temporal -> a plain 128-bit store on ARM
                 } else
                     handled = 0;
                 if (handled) {
@@ -5060,12 +5528,14 @@ static void *translate_block(uint64_t gpc) {
             }
             if (op == 0xC3) { // movnti: non-temporal store r32/r64 -> m
                 emit_ea(&I, next);
-                emit_bus_guard(17, (uint64_t)I.opsize, gpc);
+                emit_memory_guard(17, (uint64_t)I.opsize, gpc, X86_SOFT_WRITE);
                 e_store(I.opsize, I.reg, 17);
+                if (emit_soft_memory_active()) emit_soft_store_commit((uint64_t)I.opsize);
                 gpc = next;
                 continue;
             }
-            if (op == 0xC7 && (I.reg & 7) == 1 && I.is_mem && I.opsize != 8) { // cmpxchg8b: 0F C7 /1 (64-bit compare+swap)
+            if (op == 0xC7 && (I.reg & 7) == 1 && I.is_mem &&
+                I.opsize != 8) { // cmpxchg8b: 0F C7 /1 (64-bit compare+swap)
                 // Compare EDX:EAX with the 64-bit memory operand. If equal, store ECX:EBX and set ZF;
                 // else load memory into EDX:EAX and clear ZF. A LOCK prefix makes it atomic; CASAL (a
                 // single 64-bit atomic compare-exchange) is replay-immune and correct for both.
@@ -5073,15 +5543,15 @@ static void *translate_block(uint64_t gpc) {
                 // edit ZF alone in the stored NZCV.
                 if (g_fl_pending) flags_materialize();
                 emit_ea(&I, next); // x17 = EA
-                emit_bus_guard(17, 8, gpc);
+                emit_memory_guard(17, 8, gpc, X86_SOFT_READ | X86_SOFT_WRITE);
                 e_uxt(19, RAX, 4);
                 e_bfi(19, RDX, 32, 32, 1); // x19 = EDX:EAX (expected)
                 e_uxt(20, RBX, 4);
-                e_bfi(20, RCX, 32, 32, 1); // x20 = ECX:EBX (new value)
-                e_mov_rr(22, 19, 1);       // x22 = expected (CASAL clobbers Rs with the old value)
-                e_cas(8, 19, 20, 17);      // x19 = old; if old==x22 then [m] = x20
-                e_uxt(24, 19, 4);          // old low 32  (EAX candidate, zero-extended)
-                e_lsr_i(25, 19, 32, 1);    // old high 32 (EDX candidate, zero-extended)
+                e_bfi(20, RCX, 32, 32, 1);       // x20 = ECX:EBX (new value)
+                e_mov_rr(22, 19, 1);             // x22 = expected (CASAL clobbers Rs with the old value)
+                e_cas(8, 19, 20, 17);            // x19 = old; if old==x22 then [m] = x20
+                e_uxt(24, 19, 4);                // old low 32  (EAX candidate, zero-extended)
+                e_lsr_i(25, 19, 32, 1);          // old high 32 (EDX candidate, zero-extended)
                 e_rrr(A_SUBS, 31, 19, 22, 1, 0); // host flags: Z = (old == expected)
                 e_csel(RAX, RAX, 24, 0, 1);      // mismatch -> EAX = old low  (equal keeps RAX)
                 e_csel(RDX, RDX, 25, 0, 1);      // mismatch -> EDX = old high (equal keeps RDX)
@@ -5093,6 +5563,7 @@ static void *translate_block(uint64_t gpc) {
                 e_rrr(A_ORR, 21, 21, 23, 1, 0); // set ZF from equality; other flags untouched
                 e_str(21, 28, OFF_NZCV);
                 emit32(0xD51B4200u | 21); // sync live ARM nzcv
+                if (emit_soft_memory_active()) emit_soft_store_commit(8);
                 gpc = next;
                 continue;
             }
@@ -5104,7 +5575,11 @@ static void *translate_block(uint64_t gpc) {
                 // cmpxchg16b affects ONLY ZF, so materialize any lazy flags first (the C helper edits ZF alone).
                 if (g_fl_pending) flags_materialize();
                 emit_ea(&I, next); // x17 = EA
-                emit_bus_guard(17, 16, gpc);
+                emit_memory_guard(17, 16, gpc, X86_SOFT_READ | X86_SOFT_WRITE);
+                if (emit_soft_memory_active()) {
+                    emit_soft_store_commit(16);
+                    e_ldr(17, 28, OFF_BUS_EA);
+                }
                 e_str(17, 28, OFF_X87EA);
                 emit_exit_const(next, R_CMPXCHG16);
                 break;
@@ -5227,8 +5702,8 @@ static void *translate_block(uint64_t gpc) {
                 }
                 e_shv(S_LSRV, 21, 22, 19, ssf);
                 e_movconst(19, 1);
-                e_rrr(A_AND, 21, 21, 19, 0, 0);  // x21 = x86 CF (0/1)
-                e_rrr(A_EOR, 21, 21, 19, 0, 0);  // x21 = NOT CF (stored borrow convention)
+                e_rrr(A_AND, 21, 21, 19, 0, 0); // x21 = x86 CF (0/1)
+                e_rrr(A_EOR, 21, 21, 19, 0, 0); // x21 = NOT CF (stored borrow convention)
                 e_movconst(19, 1u << 29);
                 e_rrr(A_BIC, 20, 20, 19, 1, 0);  // clear stored C (bit 29)
                 e_rrr(A_ORR, 20, 20, 21, 1, 29); // stored C = (NOT CF) << 29
@@ -5249,7 +5724,8 @@ static void *translate_block(uint64_t gpc) {
             if (op == 0xAF) {
                 int mem;
                 int rmv = rm_load(&I, next, I.opsize, &mem);
-                int af_co_live = !trace_state.flag_elision || (hl_x86_trace_flags_livein(&trace_state, next, gpc) & HL_X86_FLAG_NZCV);
+                int af_co_live = !trace_state.flag_elision ||
+                                 (hl_x86_trace_flags_livein(&trace_state, next, gpc) & HL_X86_FLAG_NZCV);
                 e_imul2(I.reg, I.reg, rmv, I.opsize, af_co_live); // reg *= r/m, sets x86 CF/OF on overflow
                 gpc = next;
                 continue;
@@ -5285,7 +5761,12 @@ static void *translate_block(uint64_t gpc) {
                 }
                 if ((sub == 0 || sub == 1) && I.is_mem) { // fxsave / fxrstor
                     emit_ea(&I, next);                    // x17 = base of the 512-byte FXSAVE area
-                    e_str(17, 28, OFF_X87EA);             // preserve EA across BUS guards and scratch lowering
+                    emit_memory_guard(17, 512, gpc, sub == 0 ? X86_SOFT_WRITE : X86_SOFT_READ);
+                    if (sub == 0 && emit_soft_memory_active()) {
+                        emit_soft_store_commit(512);
+                        e_ldr(17, 28, OFF_BUS_EA);
+                    }
+                    e_str(17, 28, OFF_X87EA); // preserve EA across BUS guards and scratch lowering
                     if (g_fl_pending) flags_materialize();
                     if (hl_x86_x87_known()) hl_x86_x87_drop();
                     emit_exit_const(next, sub == 0 ? R_FXSAVE : R_FXRSTOR);
@@ -5343,12 +5824,12 @@ static void *translate_block(uint64_t gpc) {
                 }
                 if (cnt) { // tzcnt/lzcnt: x86 CF = (src==0), ZF = (result==0)
                     e_rrr(A_SUBS, 31, src, 31, sf, 0);
-                    e_cset(19, 0 /*EQ*/, sf);               // x19 = (src==0) = x86 CF
+                    e_cset(19, 0 /*EQ*/, sf);             // x19 = (src==0) = x86 CF
                     e_rrr(A_ANDS, 31, dreg, dreg, sf, 0); // live N/Z from the result
-                    e_nzcv_save_setcf(19);                  // store N/Z, stored C = NOT(src==0)
-                } else {                                    // bsf/bsr: ZF = (src==0), dest UNCHANGED if src==0
-                    e_rrr(A_ANDS, 31, src, src, sf, 0);     // Z = (src == 0)
-                    e_csel(dreg, dreg, 22, 0 /*EQ*/, sf);   // src==0 -> keep dest, else the computed index
+                    e_nzcv_save_setcf(19);                // store N/Z, stored C = NOT(src==0)
+                } else {                                  // bsf/bsr: ZF = (src==0), dest UNCHANGED if src==0
+                    e_rrr(A_ANDS, 31, src, src, sf, 0);   // Z = (src == 0)
+                    e_csel(dreg, dreg, 22, 0 /*EQ*/, sf); // src==0 -> keep dest, else the computed index
                     e_nzcv_save();
                 }
                 if (w16) e_bfi(I.reg, dreg, 0, 16, 1);
@@ -5381,7 +5862,7 @@ static void *translate_block(uint64_t gpc) {
                     e_fmov_to_s(16, src);             // fmov s16, w[src] (zeroes bits[32:128])
                 emit32(0x0E205800u | (16 << 5) | 16); // cnt v16.8b, v16.8b  (per-byte popcount)
                 emit32(0x0E31B800u | (16 << 5) | 16); // addv b16, v16.8b    (sum the 8 byte counts -> 0..64)
-                e_fmov_from_s(w16 ? 21 : I.reg, 16); // dest = count; the W-write zero-extends
+                e_fmov_from_s(w16 ? 21 : I.reg, 16);  // dest = count; the W-write zero-extends
                 if (w16) e_bfi(I.reg, 21, 0, 16, 1);
                 e_rrr(A_ANDS, 31, src, src, sf, 0); // Z = (src == 0)
                 e_nzcv_save_popcnt();               // ZF from the source; SF/OF/AF/CF/PF all cleared
@@ -5413,12 +5894,14 @@ static void *translate_block(uint64_t gpc) {
                         e_sxt(20, I.reg, w);           // sxtw/sxth: index as a 64-bit signed value
                     e_asr_i(20, 20, logbits, 1);       // x20 = signed word offset = index >> log2(bits)
                     e_rrr(A_ADD, 17, 17, 20, 1, logw); // EA += wordoff * w
-                    emit_bus_guard(17, (uint64_t)w, gpc);
+                    uint32_t access = sub != 4 ? (X86_SOFT_READ | X86_SOFT_WRITE) : X86_SOFT_READ;
+                    emit_memory_guard(17, (uint64_t)w, gpc, access);
                     e_load(w, 16, 17);
                     val = 16;
                     mem = 1;
                 } else {
-                    val = rm_load(&I, next, w, &mem);
+                    uint32_t access = sub != 4 ? (X86_SOFT_READ | X86_SOFT_WRITE) : X86_SOFT_READ;
+                    val = rm_load_access(&I, next, w, &mem, access);
                 }
                 if (isimm)
                     e_movconst(19, (uint64_t)(((uint64_t)I.imm) & (bits - 1))); // idx -> x19
@@ -5446,6 +5929,7 @@ static void *translate_block(uint64_t gpc) {
                         e_rrr(A_AND, 24, 24, 25, sf, 0); // x24 = old tested bit
                         e_rrr(A_SUBS, 31, 31, 24, 1, 0);
                         e_nzcv_save(); // ARM C = !bit -> x86 CF, atomically consistent with the RMW above
+                        if (emit_soft_memory_active()) emit_soft_store_commit((uint64_t)w);
                     } else {
                         // A 16-bit register dest must preserve bits 63:16 (x86 word ops leave the upper
                         // 48 bits untouched), but a 32-bit ARM op writing the guest home zeroes 63:32.
@@ -5458,7 +5942,7 @@ static void *translate_block(uint64_t gpc) {
                             e_rrr(A_BIC, o, val, 22, sf, 0); // BTR
                         else
                             e_rrr(A_EOR, o, val, 22, sf, 0); // BTC
-                        rm_store(&I, w, o);
+                        rm_store_after_guard(&I, w, o);
                     }
                 }
                 gpc = next;
@@ -5469,7 +5953,7 @@ static void *translate_block(uint64_t gpc) {
                 int w = op == 0xB0 ? 1 : I.opsize, sf2 = (w == 8);
                 if (I.is_mem) {
                     emit_ea(&I, next);
-                    emit_bus_guard(17, (uint64_t)w, gpc);
+                    emit_memory_guard(17, (uint64_t)w, gpc, X86_SOFT_READ | X86_SOFT_WRITE);
                     e_mov_rr(19, RAX, sf2);    // expected
                     e_cas(w, 19, I.reg, 17);   // x19 = old; if old==expected [m]=reg
                     do_alu(7, -1, RAX, 19, w); // flags from (accumulator - dest), per the SDM
@@ -5477,6 +5961,7 @@ static void *translate_block(uint64_t gpc) {
                         e_mov_rr(RAX, 19, sf2);
                     else
                         e_bfi(RAX, 19, 0, 8 * w, 1); // rax = old
+                    if (emit_soft_memory_active()) emit_soft_store_commit((uint64_t)w);
                 } else if (w >= 4) {
                     e_mov_rr(19, I.rm_reg, sf2);
                     do_alu(7, -1, RAX, 19, w);           // flags from (accumulator - dest)
@@ -5508,13 +5993,14 @@ static void *translate_block(uint64_t gpc) {
                 int w = op == 0xC0 ? 1 : I.opsize, sf2 = (w == 8);
                 if (I.is_mem) {
                     emit_ea(&I, next);
-                    emit_bus_guard(17, (uint64_t)w, gpc);
+                    emit_memory_guard(17, (uint64_t)w, gpc, X86_SOFT_READ | X86_SOFT_WRITE);
                     e_lse(LSE_LDADD, w, I.reg, 19, 17); // x19 = old; [m] += reg
                     do_alu(0, -1, 19, I.reg, w);        // flags from old+reg
                     if (w >= 4)
                         e_mov_rr(I.reg, 19, sf2);
                     else
                         e_bfi(I.reg, 19, 0, 8 * w, 1); // reg = old
+                    if (emit_soft_memory_active()) emit_soft_store_commit((uint64_t)w);
                 } else if (w >= 4) {
                     e_mov_rr(19, I.rm_reg, sf2); // old
                     e_rrr(A_ADDS, I.rm_reg, I.rm_reg, I.reg, sf2, 0);
@@ -5556,7 +6042,8 @@ static void *translate_block(uint64_t gpc) {
                 }
                 uint64_t taken = next + (uint64_t)I.imm;
                 // W5B tier-2: single-block self-loop (taken back-edge == block start). See jcc rel8.
-                if (!parity && taken == start && !notier2x() && !hl_x86_trace_loop_hazard((uint64_t)body, (uint64_t)g_cp)) {
+                if (!parity && taken == start && !notier2x() &&
+                    !hl_x86_trace_loop_hazard((uint64_t)body, (uint64_t)g_cp)) {
                     int slot = g_tier2_build ? 0 : t2_slot(start);
                     if (g_tier2_build || slot >= 0) {
                         hl_x86_trace_self_loop(&trace_state, cc, start, next, body, slot);
@@ -5564,8 +6051,8 @@ static void *translate_block(uint64_t gpc) {
                     }
                 }
                 uint64_t fall = next;
-                int stitch_fall =
-                    (STITCH_OK && fall != start && !hl_x86_trace_seen(seen, nseen, fall) && !map_body(fall) && !hl_x86_trace_trap_head(fall));
+                int stitch_fall = (STITCH_OK && fall != start && !hl_x86_trace_seen(seen, nseen, fall) &&
+                                   !map_body(fall) && !hl_x86_trace_trap_head(fall));
                 int save_taken = 0, save_fall = 0;
                 if (parity) {
                     // live ARM Z already holds (PF==0) from emit_parity_jcc_cond; flags spilled there.
@@ -5578,9 +6065,10 @@ static void *translate_block(uint64_t gpc) {
                 if (stitch_fall) {
                     int inv = (cc ^ 1) & 0xF;
                     uint32_t *patch = (uint32_t *)g_cp;
-                    emit32(0);                     // b.inv -> fall (inline)
-                    if (parity) e_nzcv_load();     // taken edge: restore canonical live NZCV
-                    emit_jcc_edge_spill(save_taken); // FL_SUB (e_nzcv_save) or FL_LOGIC (e_nzcv_save_c1) spill on the flag-live taken edge only
+                    emit32(0);                       // b.inv -> fall (inline)
+                    if (parity) e_nzcv_load();       // taken edge: restore canonical live NZCV
+                    emit_jcc_edge_spill(save_taken); // FL_SUB (e_nzcv_save) or FL_LOGIC (e_nzcv_save_c1) spill on the
+                                                     // flag-live taken edge only
                     emit_chain_exit(taken);
                     int64_t d = ((uint8_t *)g_cp - (uint8_t *)patch) / 4;
                     *patch = 0x54000000u | (((uint32_t)d & 0x7FFFF) << 5) | (uint32_t)inv;
@@ -5593,12 +6081,12 @@ static void *translate_block(uint64_t gpc) {
                 }
                 uint32_t *patch = (uint32_t *)g_cp;
                 emit32(0);
-                if (parity) e_nzcv_load();    // fall edge: restore canonical live NZCV
+                if (parity) e_nzcv_load();      // fall edge: restore canonical live NZCV
                 emit_jcc_edge_spill(save_fall); // FL_SUB/FL_LOGIC spill for a flag-live fall successor
                 emit_chain_exit(next);
                 int64_t d = ((uint8_t *)g_cp - (uint8_t *)patch) / 4;
                 *patch = 0x54000000u | (((uint32_t)d & 0x7FFFF) << 5) | (cc & 0xF);
-                if (parity) e_nzcv_load();     // taken edge: restore canonical live NZCV
+                if (parity) e_nzcv_load();       // taken edge: restore canonical live NZCV
                 emit_jcc_edge_spill(save_taken); // FL_SUB/FL_LOGIC spill for a flag-live taken successor
                 emit_chain_exit(taken);
                 break;
@@ -5744,7 +6232,10 @@ static void tier2_promote(uint64_t gpc) {
     void *nb = g_last_body;
     g_tier2_build = 0;
     // make the tier-2 code coherent BEFORE anything can branch into it
-    if (!jit_publish_code(g_emit_start, (size_t)(g_cp - g_emit_start))) { (void)jit_wprot(1); return; }
+    if (!jit_publish_code(g_emit_start, (size_t)(g_cp - g_emit_start))) {
+        (void)jit_wprot(1);
+        return;
+    }
     // redirect the OLD tier-1 body to tier-2 (predecessor chains were resolved to the old body when they
     // were translated; patch_links_to only fixes still-PENDING edges) -- overwrite its first insn with
     // `b nb`. Costs one branch per loop ENTRY (negligible vs the loop body).
@@ -5757,7 +6248,10 @@ static void tier2_promote(uint64_t gpc) {
         int64_t bd8 = (((uint8_t *)nb + 8) - ((uint8_t *)old_body + 8)) / 4;
         ((uint32_t *)old_body)[2] = 0x14000000u | ((uint32_t)bd8 & 0x3FFFFFFu);
     }
-    if (!jit_publish_code(old_body, 4 + (g_fwdskip ? 8 : 0))) { (void)jit_wprot(1); return; }
+    if (!jit_publish_code(old_body, 4 + (g_fwdskip ? 8 : 0))) {
+        (void)jit_wprot(1);
+        return;
+    }
     // swap the live map entry: future dispatcher lookups + IBTC fills resolve to tier-2 directly
     g_map[mi].host = nh;
     g_map[mi].body = nb;
@@ -5795,27 +6289,26 @@ static void report_unimpl(uint64_t pc, struct insn *I) {
    callee-saved register image. */
 extern void run_block(struct cpu *cpu, void *code) __attribute__((visibility("hidden")));
 extern void block_return(void) __attribute__((visibility("hidden")));
-__asm__(
-    ".hidden run_block\n"
-    ".type run_block, %function\n"
-    "run_block:\n"
-    "str x19,[x0,#176]\n str x20,[x0,#184]\n str x21,[x0,#192]\n str x22,[x0,#200]\n"
-    "str x23,[x0,#208]\n str x24,[x0,#216]\n str x25,[x0,#224]\n str x26,[x0,#232]\n"
-    "str x27,[x0,#240]\n str x28,[x0,#248]\n str x29,[x0,#256]\n str x30,[x0,#264]\n"
-    "str q8,[x0,#272]\n str q9,[x0,#288]\n str q10,[x0,#304]\n str q11,[x0,#320]\n"
-    "str q12,[x0,#336]\n str q13,[x0,#352]\n str q14,[x0,#368]\n str q15,[x0,#384]\n"
-    "mov x9,sp\n str x9,[x0,#168]\n br x1\n"
-    ".size run_block, .-run_block\n"
-    ".hidden block_return\n"
-    ".type block_return, %function\n"
-    "block_return:\n"
-    "ldr x19,[x28,#176]\n ldr x20,[x28,#184]\n ldr x21,[x28,#192]\n ldr x22,[x28,#200]\n"
-    "ldr x23,[x28,#208]\n ldr x24,[x28,#216]\n ldr x25,[x28,#224]\n ldr x26,[x28,#232]\n"
-    "ldr x27,[x28,#240]\n ldr x29,[x28,#256]\n ldr x30,[x28,#264]\n"
-    "ldr q8,[x28,#272]\n ldr q9,[x28,#288]\n ldr q10,[x28,#304]\n ldr q11,[x28,#320]\n"
-    "ldr q12,[x28,#336]\n ldr q13,[x28,#352]\n ldr q14,[x28,#368]\n ldr q15,[x28,#384]\n"
-    "ldr x9,[x28,#168]\n mov sp,x9\n ldr x28,[x28,#248]\n ret\n"
-    ".size block_return, .-block_return\n");
+__asm__(".hidden run_block\n"
+        ".type run_block, %function\n"
+        "run_block:\n"
+        "str x19,[x0,#176]\n str x20,[x0,#184]\n str x21,[x0,#192]\n str x22,[x0,#200]\n"
+        "str x23,[x0,#208]\n str x24,[x0,#216]\n str x25,[x0,#224]\n str x26,[x0,#232]\n"
+        "str x27,[x0,#240]\n str x28,[x0,#248]\n str x29,[x0,#256]\n str x30,[x0,#264]\n"
+        "str q8,[x0,#272]\n str q9,[x0,#288]\n str q10,[x0,#304]\n str q11,[x0,#320]\n"
+        "str q12,[x0,#336]\n str q13,[x0,#352]\n str q14,[x0,#368]\n str q15,[x0,#384]\n"
+        "mov x9,sp\n str x9,[x0,#168]\n br x1\n"
+        ".size run_block, .-run_block\n"
+        ".hidden block_return\n"
+        ".type block_return, %function\n"
+        "block_return:\n"
+        "ldr x19,[x28,#176]\n ldr x20,[x28,#184]\n ldr x21,[x28,#192]\n ldr x22,[x28,#200]\n"
+        "ldr x23,[x28,#208]\n ldr x24,[x28,#216]\n ldr x25,[x28,#224]\n ldr x26,[x28,#232]\n"
+        "ldr x27,[x28,#240]\n ldr x29,[x28,#256]\n ldr x30,[x28,#264]\n"
+        "ldr q8,[x28,#272]\n ldr q9,[x28,#288]\n ldr q10,[x28,#304]\n ldr q11,[x28,#320]\n"
+        "ldr q12,[x28,#336]\n ldr q13,[x28,#352]\n ldr q14,[x28,#368]\n ldr q15,[x28,#384]\n"
+        "ldr x9,[x28,#168]\n mov sp,x9\n ldr x28,[x28,#248]\n ret\n"
+        ".size block_return, .-block_return\n");
 #else
 __attribute__((naked)) static void run_block(struct cpu *cpu, void *code) {
     __asm__ volatile( // x0=cpu, x1=code

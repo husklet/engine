@@ -1,6 +1,7 @@
 #ifndef HL_TRANSLATOR_X86_64_DECODER_H
 #define HL_TRANSLATOR_X86_64_DECODER_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct insn {
@@ -31,5 +32,7 @@ typedef struct insn {
 } hl_x86_insn;
 
 int hl_x86_decode(uint64_t pc, hl_x86_insn *insn);
+typedef int (*hl_x86_instruction_fetch_fn)(uint64_t, void *, size_t);
+void hl_x86_decode_set_instruction_fetch(hl_x86_instruction_fetch_fn);
 
 #endif

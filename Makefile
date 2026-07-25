@@ -104,7 +104,7 @@ PROVIDER_SOURCES := src/core/environment.c src/core/provider/client.c \
 	src/core/provider/namespace.c
 CORE_SOURCES := src/core/bus.c src/core/checkpoint_channel.c src/core/cli.c src/core/config.c src/core/engine.c src/core/fatal.c src/core/host_services.c src/core/launch.c src/core/log.c \
 	src/core/options.c src/core/target/bus.c src/core/target/native.c src/core/target/run.c src/core/target/services.c $(PROVIDER_SOURCES)
-IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/identity.c src/translator/persist.c src/translator/reloc.c \
+IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/guest_fetch.c src/translator/identity.c src/translator/persist.c src/translator/reloc.c \
 	src/translator/window.c src/translator/guest/x86_64/decode.c src/translator/guest/x86_64/address.c src/translator/host/aarch64/codegen.c \
 	src/translator/guest/x86_64/glue.c src/translator/guest/x86_64/avx.c \
 	src/translator/host/aarch64/asm.c \
@@ -129,7 +129,7 @@ IR_SOURCES := src/translator/arena.c src/translator/codegen.c src/translator/dig
 	src/translator/guest/x86_64/flags.c \
 	src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c \
 	src/translator/ir/ir.c
-LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/key.c src/linux_abi/container/pidmap.c src/linux_abi/container/ports.c src/linux_abi/container/snapshot.c src/linux_abi/container/vfs/gmap.c src/linux_abi/container/shm.c src/linux_abi/device.c src/linux_abi/dns.c src/linux_abi/image.c \
+LINUX_ABI_SOURCES := src/linux_abi/affinity.c src/linux_abi/container/key.c src/linux_abi/container/pidmap.c src/linux_abi/container/ports.c src/linux_abi/container/snapshot.c src/linux_abi/container/vfs/gmap.c src/linux_abi/container/shm.c src/linux_abi/device.c src/linux_abi/dns.c src/linux_abi/image.c src/linux_abi/logical_vma.c \
 	src/linux_abi/fdcache.c \
 	src/linux_abi/epoll.c src/linux_abi/eventfd.c src/linux_abi/fork_codec.c src/linux_abi/inotify.c src/linux_abi/pipe.c src/linux_abi/placement.c src/linux_abi/errno.c src/linux_abi/limits.c src/linux_abi/linux_abi.c src/linux_abi/number.c \
 	src/linux_abi/open_plan.c src/linux_abi/parse.c src/linux_abi/readonly.c src/linux_abi/seccomp_vm.c src/linux_abi/shared.c src/linux_abi/stat.c src/linux_abi/watch.c src/linux_abi/xattr.c \
@@ -222,7 +222,7 @@ DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJEC
 	$(LINUX_AARCH64_EMBEDDED_OBJECTS:.o=.d) \
 	$(wildcard $(BUILD)/mac/dual/*.d $(BUILD)/linux-aarch64/dual/*.d)
 
-UNIT_NAMES := a64_asm address affinity arena avx bus child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire glue gmap host_services identity image inotify ir key launch legacy lifecycle_identity linux_abi linux_fork lower_alu lower_crypto lower_mov lower_repstr lower_shift lower_sse4x lower_trace lower_x87 misc native open_plan operand owner persist pidmap pipe pipe_linux placement ports private process range rep resolve resolve_services rotate shared shm signal_aarch64 signal_x86_64 snapshot socket_identity system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc target_bus watch window x87_stack x87math x87state xattr_cache
+UNIT_NAMES := a64_asm address affinity arena avx bus child ckptinoq cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit environment epoll eventfd eventfd_fork fatal fdcache file flags fork_wire glue gmap guest_fetch host_services identity image inotify ir key launch legacy lifecycle_identity linux_abi linux_fork logical_vma lower_alu lower_crypto lower_mov lower_repstr lower_shift lower_sse4x lower_trace lower_x87 misc native open_plan operand options_environment owner persist pidmap pipe pipe_linux placement ports private process provider_client provider_demux provider_epoll_race provider_epoll_registry provider_files provider_handles provider_namespace range rep resolve resolve_services rotate shared shm signal_aarch64 signal_x86_64 snapshot socket_identity system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc target_bus watch window x87_stack x87math x87state xattr_cache
 
 $(BUILD)/tests/test_x87math: tests/unit/test_x87math.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
@@ -231,6 +231,13 @@ $(BUILD)/tests/test_x87math: tests/unit/test_x87math.c $(BUILD)/lib/libhl-engine
 		$(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a \
 		$(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a $(BUILD)/lib/libhl-linux-abi.a \
 		$(BUILD)/lib/libhl-host-fake.a -lm -o $@
+
+$(BUILD)/tests/test_options_environment: tests/unit/test_options_environment.c src/core/options.c \
+	src/core/options.h src/core/environment.c src/core/environment.h tests/unit/test.h
+	@mkdir -p $(@D)
+	$(CC) $(filter-out -DHL_ENABLE_LOGGING=%,$(CPPFLAGS)) -DHL_ENABLE_LOGGING=1 -Itests/unit \
+		$(ENGINE_CFLAGS) tests/unit/test_options_environment.c src/core/options.c src/core/environment.c -o $@
+
 UNIT_BINS := $(UNIT_NAMES:%=$(BUILD)/tests/test_%)
 UNIT_RUN_TARGETS := $(UNIT_NAMES:%=run-unit-%)
 

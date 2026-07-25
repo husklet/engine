@@ -8,6 +8,7 @@
 #include "../core/fatal.h"
 #include "arena.h"
 #include "emit.h"
+#include "guest_fetch.h"
 
 #define CACHE_SZ (64u << 20)
 /* A stitched AArch64 region may contain 4096 guest instructions.  When a
@@ -213,8 +214,26 @@ static _Alignas(64) hl_translation_index g_translation_index;
 // generation invalidates the whole table in O(1), while normal lookup still stops at the first slot that
 // is empty in the current generation.  A physical clear is needed only after the 32-bit epoch wraps.
 static uint32_t g_map_epoch = 1;
+static uint64_t g_cache_gen; /* generation of the current immutable code arena */
 static uint32_t g_live_map_indices[JIT_MAP_N];
 static uint32_t g_live_map_count;
+/*
+ * A live entry's decoded guest-source interval.  Keep this metadata parallel
+ * to the hot 32-byte hash entry: map lookup still touches one cache line, while
+ * the SMC slow path can retire only translations which consumed a rewritten
+ * cache line.
+ */
+static uint64_t g_map_guest_start[JIT_MAP_N];
+static uint64_t g_map_guest_end[JIT_MAP_N];
+/* Code-cache generation which owns each live entry's immutable host bytes. */
+static uint64_t g_map_cache_gen[JIT_MAP_N];
+/*
+ * Open-address deletion marker.  An invalidated slot cannot become an ordinary
+ * empty slot because a colliding live key may follow it in the probe cluster.
+ * Epoch-tagged tombstones preserve that lookup chain without clearing another
+ * multi-megabyte array on a wholesale generation change.
+ */
+static uint32_t g_map_tombstone_epoch[JIT_MAP_N];
 
 // Bounded instruction provenance shared by diagnostics and synchronous guest-fault delivery. Translation
 // records source boundaries; execution performs no checkpoint writes. Epoch publication makes signal-side
@@ -223,6 +242,10 @@ static uint32_t g_live_map_count;
 typedef struct { uint64_t host, end, guest; uint32_t epoch; } jit_instruction_map_entry;
 static jit_instruction_map_entry g_instruction_map[JIT_INSN_MAP_N];
 static uint32_t g_instruction_map_next;
+static int jit_host_to_rwpc(uint64_t host_pc, uint64_t *rwpc);
+static inline __attribute__((always_inline)) int
+jit_resolve_rw_code(void *rwcode, void **rxcode, uint64_t *generation);
+static void ibtc_drop_target(uint64_t target);
 
 static void jit_instruction_map_put(uint64_t host, uint64_t end, uint64_t guest) {
     if (host >= end) return;
@@ -249,12 +272,15 @@ static int jit_instruction_map_lookup(uint64_t rwpc, uint64_t *guest) {
 }
 
 static int jit_instruction_guest_pc(uint64_t host_pc, uint64_t *guest_pc) {
-    uint64_t rwpc = host_pc - g_rw2rx;
-    if (!g_cache || rwpc < (uint64_t)g_cache || rwpc >= (uint64_t)g_cache + CACHE_SZ) return 0;
+    uint64_t rwpc;
+    if (!jit_host_to_rwpc(host_pc, &rwpc)) return 0;
     return jit_instruction_map_lookup(rwpc, guest_pc);
 }
 
 static int map_live(uint32_t index) { return g_map[index].generation == g_map_epoch; }
+static int map_tombstone(uint32_t index) {
+    return !map_live(index) && g_map_tombstone_epoch[index] == g_map_epoch;
+}
 
 static void map_clear(void) {
     g_live_map_count = 0;
@@ -262,23 +288,20 @@ static void map_clear(void) {
     if (g_map_epoch == 0) {
         // Epoch wrapped (2^32 flushes -- effectively never): no valid entry may carry generation 0, so
         // clear every entry's generation before restarting at 1. Cold path; correctness over speed.
-        for (uint32_t i = 0; i < JIT_MAP_N; i++) g_map[i].generation = 0;
+        for (uint32_t i = 0; i < JIT_MAP_N; i++) {
+            g_map[i].generation = 0;
+            g_map_tombstone_epoch[i] = 0;
+        }
+        for (uint32_t i = 0; i < JIT_INSN_MAP_N; i++)
+            __atomic_store_n(&g_instruction_map[i].epoch, 0, __ATOMIC_RELAXED);
         g_map_epoch = 1;
     }
 }
 
 // Crash-only reverse lookup: map a host RX pc back to the nearest translated block start.
 int jit_hostpc_lookup(uint64_t hpc, uint64_t *gpc, uint64_t *off, uint32_t *insn) {
-    if (!g_cache) return 0;
-    uint64_t rxlo = (uint64_t)g_cache + g_rw2rx;
-    uint64_t rwlo = (uint64_t)g_cache;
-    uint64_t rwpc = 0;
-    if (hpc >= rxlo && hpc < rxlo + CACHE_SZ)
-        rwpc = hpc - g_rw2rx;
-    else if (hpc >= rwlo && hpc < rwlo + CACHE_SZ)
-        rwpc = hpc;
-    else
-        return 0;
+    uint64_t rwpc;
+    if (!jit_host_to_rwpc(hpc, &rwpc)) return 0;
     uint64_t best = 0;
     uint64_t bgpc = 0;
     for (uint32_t i = 0; i < JIT_MAP_N; i++) {
@@ -414,14 +437,16 @@ static void txln_clear(void) {
 // FNV-1a over the 64B guest line at `line_base` (64B-aligned). The line was just executed/flushed by the
 // guest, so it is in a mapped code page -> the 64-byte read never faults. Guest VA == host VA under the
 // JIT, so this reads the guest's own current bytes.
-static uint64_t line_hash64(uint64_t line_base) {
-    const uint8_t *p = (const uint8_t *)line_base;
+static int line_hash64(uint64_t line_base, uint64_t *hash) {
+    uint8_t bytes[64];
+    if (hl_guest_fetch_exec(line_base, bytes, sizeof bytes) != 0) return 0;
     uint64_t h = 1469598103934665603ull;
     for (int i = 0; i < 64; i++) {
-        h ^= p[i];
+        h ^= bytes[i];
         h *= 1099511628211ull;
     }
-    return h ? h : 1; // never 0 (0 sentinel == "unrecorded")
+    *hash = h ? h : 1; // never 0 (0 sentinel == "unrecorded")
+    return 1;
 }
 
 // Classify a guest `ic ivau` of the 64B line containing `addr`:
@@ -437,7 +462,9 @@ static int txln_flush_class(uint64_t addr) {
     for (uint32_t i = 0; i < TXLN_PROBE_CAP; i++) { // bounded probe: see TXLN_PROBE_CAP
         uint32_t j = (h + i) & (TXLN_N - 1);
         if (g_txln[j] == l) {
-            uint64_t cur = line_hash64(l << 6);
+            uint64_t cur;
+            // A disappearing/non-executable logical line is conservatively dirty.
+            if (!line_hash64(l << 6, &cur)) return 1;
             if (g_txlh[j] == 0) { // first flush: no pre-flush baseline -> drop
                 g_txlh[j] = cur;
                 return 1;
@@ -483,7 +510,10 @@ static int map_idx(uint64_t gpc) {
     uint32_t h = (uint32_t)((gpc >> G_GPC_HASH_SHIFT) * 2654435761u) & (JIT_MAP_N - 1);
     for (int i = 0; i < JIT_MAP_N; i++) {
         uint32_t j = (h + i) & (JIT_MAP_N - 1);
-        if (!map_live(j)) return -1;
+        if (!map_live(j)) {
+            if (map_tombstone(j)) continue;
+            return -1;
+        }
         if (g_map[j].gpc == gpc) return j;
     }
     return -1;
@@ -500,26 +530,105 @@ static void *map_body(uint64_t gpc) {
 }
 
 static void map_put(uint64_t gpc, uint64_t guest_start, uint64_t guest_end, void *host, void *body) {
-    // guest_start/guest_end are the block's guest SOURCE range. They are never read back from a live map
-    // entry on the hot path (map_idx/map_host/map_body key on gpc only) nor consumed by pcache restore (it
-    // serializes them but load discards them; the SMC page set is serialized independently). Keeping them
-    // in the entry only bloated it to 48B, so ~79% of entries straddled a 64B cache line -> the cold insert
-    // (and the cold lookup probe) paid ~1.8 line misses each into the 25MB sparse table. Dropping them makes
-    // the entry a cache-line-friendly 32B, so entries never straddle and the table shrinks to ~16.7MB.
-    (void)guest_start;
-    (void)guest_end;
     uint32_t h = (uint32_t)((gpc >> G_GPC_HASH_SHIFT) * 2654435761u) & (JIT_MAP_N - 1);
+    uint32_t first_tombstone = UINT32_MAX;
     for (int i = 0; i < JIT_MAP_N; i++) {
         uint32_t j = (h + i) & (JIT_MAP_N - 1);
         if (!map_live(j)) {
+            if (map_tombstone(j)) {
+                if (first_tombstone == UINT32_MAX) first_tombstone = j;
+                continue;
+            }
+            if (first_tombstone != UINT32_MAX) j = first_tombstone;
             g_map[j].gpc = gpc;
             g_map[j].host = host;
             g_map[j].body = body;
+            g_map_guest_start[j] = guest_start;
+            g_map_guest_end[j] = guest_end > guest_start
+                                     ? guest_end
+                                     : (guest_start == UINT64_MAX ? UINT64_MAX : guest_start + 1);
+            g_map_cache_gen[j] = g_cache_gen;
+            g_map_tombstone_epoch[j] = 0;
             g_map[j].generation = g_map_epoch;
             g_live_map_indices[g_live_map_count++] = j;
             return;
         }
     }
+    if (first_tombstone != UINT32_MAX) {
+        uint32_t j = first_tombstone;
+        g_map[j].gpc = gpc;
+        g_map[j].host = host;
+        g_map[j].body = body;
+        g_map_guest_start[j] = guest_start;
+        g_map_guest_end[j] = guest_end > guest_start
+                                 ? guest_end
+                                 : (guest_start == UINT64_MAX ? UINT64_MAX : guest_start + 1);
+        g_map_cache_gen[j] = g_cache_gen;
+        g_map_tombstone_epoch[j] = 0;
+        g_map[j].generation = g_map_epoch;
+        g_live_map_indices[g_live_map_count++] = j;
+    }
+}
+
+static int map_source_overlaps(uint32_t index, uint64_t lo, uint64_t hi) {
+    return g_map_guest_start[index] < hi && lo < g_map_guest_end[index];
+}
+
+/*
+ * Remove every live translation whose decoded source overlaps one of the
+ * dirty [lo,hi) ranges.  All callers hold a stop-the-world mapping boundary,
+ * so map readers cannot observe the mutation.  Host bytes remain immutable in
+ * the arena; only future ingress is removed.
+ */
+static uint32_t map_invalidate_source_ranges(const uint64_t ranges[][2], uint32_t count) {
+    uint32_t retained = 0, removed = 0;
+    for (uint32_t n = 0; n < g_live_map_count; n++) {
+        uint32_t index = g_live_map_indices[n];
+        if (!map_live(index)) continue;
+        int overlap = 0;
+        for (uint32_t r = 0; r < count; r++) {
+            if (map_source_overlaps(index, ranges[r][0], ranges[r][1])) {
+                overlap = 1;
+                break;
+            }
+        }
+        if (!overlap) {
+            g_live_map_indices[retained++] = index;
+            continue;
+        }
+        ibtc_drop_target(g_map[index].gpc);
+        g_map[index].generation = 0;
+        g_map_tombstone_epoch[index] = g_map_epoch;
+        removed++;
+    }
+    g_live_map_count = retained;
+    return removed;
+}
+
+static uint32_t map_invalidate_cache_generation(uint64_t generation) {
+    uint32_t retained = 0, removed = 0;
+    for (uint32_t n = 0; n < g_live_map_count; n++) {
+        uint32_t index = g_live_map_indices[n];
+        if (!map_live(index)) continue;
+        if (g_map_cache_gen[index] != generation) {
+            g_live_map_indices[retained++] = index;
+            continue;
+        }
+        ibtc_drop_target(g_map[index].gpc);
+        g_map[index].generation = 0;
+        g_map_tombstone_epoch[index] = g_map_epoch;
+        removed++;
+    }
+    g_live_map_count = retained;
+    return removed;
+}
+
+static int map_has_cache_generation(uint64_t generation) {
+    for (uint32_t n = 0; n < g_live_map_count; n++) {
+        uint32_t index = g_live_map_indices[n];
+        if (map_live(index) && g_map_cache_gen[index] == generation) return 1;
+    }
+    return 0;
 }
 
 // IBTC: a shared, direct-mapped hash table {guest target -> host body_ind} probed
@@ -565,6 +674,13 @@ static void ibtc_clear_lazy(void) {
     if (madvise(g_ibtc, sizeof g_ibtc, MADV_DONTNEED) == 0) return;
 #endif
     memset(g_ibtc, 0, sizeof g_ibtc);
+}
+
+static void ibtc_drop_target(uint64_t target) {
+    uint32_t index = (uint32_t)((target >> 2) & (IBTC_N - 1));
+    if (g_ibtc[index].target != target) return;
+    g_ibtc[index].target = 0;
+    g_ibtc[index].body = NULL;
 }
 
 // ---- W5C: race-free threaded IBTC fill ----
@@ -892,7 +1008,6 @@ static uint64_t g_stw_flushes;   // PROF: stop-the-world flushes performed
 // cache is reclaimed (unmapped) once no live thread's exec_gen still names its generation. This bounds
 // retained VA (no per-flush 64MB leak) AND removes the old unsafe reuse-in-place-on-alloc-failure path
 // that corrupted parked peers.
-static uint64_t g_cache_gen;                     // generation of the CURRENT cache (g_cache)
 static __thread _Atomic uint64_t *g_my_exec_gen; // this thread's exec_gen slot (NULL until registered)
 static __thread int g_my_stw_slot = -1;
 static _Atomic uint64_t g_dispatch_request;
@@ -909,6 +1024,60 @@ static struct {
 static int g_nretired;
 static int g_no_stw_reclaim;
 
+static int jit_host_to_rwpc(uint64_t host_pc, uint64_t *rwpc) {
+    if (!g_cache) return 0;
+    uint64_t lo = (uint64_t)g_cache + g_rw2rx;
+    if (host_pc >= lo && host_pc < lo + CACHE_SZ) {
+        *rwpc = host_pc - g_rw2rx;
+        return 1;
+    }
+    lo = (uint64_t)g_cache;
+    if (host_pc >= lo && host_pc < lo + CACHE_SZ) {
+        *rwpc = host_pc;
+        return 1;
+    }
+    for (int i = 0; i < g_nretired; i++) {
+        lo = (uint64_t)g_retired[i].rw + g_retired[i].rw2rx;
+        if (host_pc >= lo && host_pc < lo + CACHE_SZ) {
+            *rwpc = (uint64_t)((intptr_t)host_pc - g_retired[i].rw2rx);
+            return 1;
+        }
+        lo = (uint64_t)g_retired[i].rw;
+        if (host_pc >= lo && host_pc < lo + CACHE_SZ) {
+            *rwpc = host_pc;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Resolve a translation-map value (always an RW-alias address) through the
+ * arena which actually owns it.  Retained generations can have a different
+ * RX-RW delta from the current arena, and their generation must be published
+ * to STW before execution so reclamation cannot unmap them underneath a peer.
+ * Caller holds g_jit_lock whenever guest threads can race a rollover.
+ */
+static inline __attribute__((always_inline)) int
+jit_resolve_rw_code(void *rwcode, void **rxcode, uint64_t *generation) {
+    uintptr_t pc = (uintptr_t)rwcode;
+    uintptr_t lo = (uintptr_t)g_cache;
+    if (pc >= lo && pc < lo + CACHE_SZ) {
+        *rxcode = (void *)((intptr_t)pc + g_rw2rx);
+        *generation = g_cache_gen;
+        return 1;
+    }
+    for (int i = 0; i < g_nretired; i++) {
+        lo = (uintptr_t)g_retired[i].rw;
+        if (pc >= lo && pc < lo + CACHE_SZ) {
+            *rxcode = (void *)((intptr_t)pc + g_retired[i].rw2rx);
+            *generation = g_retired[i].gen;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 // Crash diagnostics: keep a bounded tombstone ring of retired caches we have unmapped. If a later crash PC
 // falls in one of these ranges, the process resumed through a stale cache pointer after reclamation.
 #define STW_FREED_MAX 4096
@@ -921,7 +1090,7 @@ static struct {
 
 static uint64_t g_nfreed_total;
 
-static int jit_flush_to_fresh(void);
+static int jit_flush_to_fresh(int retain_map_generations);
 
 int jit_pc_in_retained_cache(uint64_t pc) {
     if (!g_cache) return 0;
@@ -1026,6 +1195,9 @@ static void stw_register(struct cpu *cpu) {
                                   atomic_load_explicit(&g_dispatch_request, memory_order_relaxed),
                                   memory_order_relaxed);
             atomic_store_explicit(&g_stw_threads[i].in_translated, 0, memory_order_relaxed);
+#ifdef G_SOFT_TLB_REFRESH
+            G_SOFT_TLB_REFRESH(cpu);
+#endif
             g_my_exec_gen = &g_stw_threads[i].exec_gen;
             g_my_stw_slot = i;
             atomic_store_explicit(&g_stw_threads[i].used, 1, memory_order_release);
@@ -1125,7 +1297,9 @@ static int stw_force_dispatch_flush(void) {
         if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) && g_stw_threads[i].cpu)
             G_ACTIVATION_CLEAR_CPU(g_stw_threads[i].cpu);
     G_ACTIVATION_CLEAR_GLOBAL();
-    int ok = jit_flush_to_fresh();
+    /* BUS/mapping activation changes translation validity, not cache capacity:
+       never carry translations across this arena switch. */
+    int ok = jit_flush_to_fresh(0);
     atomic_store_explicit(&g_dispatch_gate, 0, memory_order_release);
     pthread_mutex_unlock(&g_stw_reg_lock);
     pthread_mutex_unlock(&g_jit_lock);
@@ -1162,9 +1336,27 @@ static void stw_mapping_begin(void) {
         if (!pending) break;
         jit_backoff_ns(UINT64_C(50000));
     }
+    /* Mapping publication may retire canonical soft-page backing as soon as
+       this quiescent section ends.  Invalidate every registered per-thread
+       translated-data TLB while the registry is pinned and no peer can run. */
+#ifdef G_SOFT_TLB_CLEAR
+    for (int i = 0; i < STW_MAXTHREAD; ++i)
+        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) &&
+            g_stw_threads[i].cpu != NULL)
+            G_SOFT_TLB_CLEAR(g_stw_threads[i].cpu);
+#endif
 }
 
 static void stw_mapping_end(void) {
+#ifdef G_SOFT_TLB_REFRESH
+    /* The logical snapshot is now committed while every peer remains behind
+       the mapping gate. Publish each CPU's conservative rejection hull before
+       translated execution resumes. */
+    for (int i = 0; i < STW_MAXTHREAD; ++i)
+        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) &&
+            g_stw_threads[i].cpu != NULL)
+            G_SOFT_TLB_REFRESH(g_stw_threads[i].cpu);
+#endif
     atomic_store_explicit(&g_dispatch_gate, 0, memory_order_release);
     pthread_mutex_unlock(&g_stw_reg_lock);
     pthread_mutex_unlock(&g_jit_lock);
@@ -1276,7 +1468,8 @@ static int gen_in_use(uint64_t gen) {
 static void reclaim_retired(void) {
     if (g_no_stw_reclaim) return;
     for (int i = 0; i < g_nretired;) {
-        if (!gen_in_use(g_retired[i].gen)) {
+        if (!gen_in_use(g_retired[i].gen) &&
+            !map_has_cache_generation(g_retired[i].gen)) {
             uint64_t gen = g_retired[i].gen;
             cache_unmap(g_retired[i].handle, g_retired[i].rw, g_retired[i].rw2rx);
             if (g_nfreed_total) g_freed[(g_nfreed_total - 1) % STW_FREED_MAX].gen = gen;
@@ -1314,8 +1507,31 @@ static int cache_oom_fail(void) {
 // peers and by baked-in chains/inline ICs); reclaim_retired() unmaps it once no thread is in its
 // generation, so retained VA stays bounded (no per-flush leak). MUST run with all peers quiesced
 // (stw_flush) and the dispatcher holding g_jit_lock.
-static int jit_flush_to_fresh(void) {
+static int jit_flush_to_fresh(int retain_map_generations) {
     hl_host_code_mapping mapping;
+    size_t old_used = (size_t)(g_cp - g_cache);
+    uint32_t old_blocks = g_live_map_count;
+#if G_GPC_HASH_SHIFT != 0
+    /*
+     * g_smc_seen is an AArch64 frontend latch.  x86 has different SMC
+     * bookkeeping and continues to use the established wholesale rollover.
+     */
+    int retain_generations = retain_map_generations && g_smc_seen;
+#else
+    int retain_generations = 0;
+#endif
+    /*
+     * After the first SMC prime, every constant inter-block edge probes the
+     * shared IBTC instead of baking an arena address.  Keep a bounded sliding
+     * window of four immutable 64 MiB arenas in the translation map: capacity
+     * rollover then evicts only the oldest quarter of the working set instead
+     * of throwing away all hot CoreCLR/runtime blocks.  Clearing the IBTC
+     * before reclaim removes the only post-SMC ingress not represented by the
+     * map.  Pre-SMC direct chains retain the historical wholesale policy.
+     */
+    uint32_t evicted = 0;
+    if (retain_generations && g_cache_gen >= 3)
+        evicted = map_invalidate_cache_generation(g_cache_gen - 3);
     reclaim_retired(); // free retired caches no peer is still in -> bound VA + free space for the new alloc
     if (code_mapping_reserve(&mapping, g_dualmap) != 0) return cache_oom_fail();
     if (!retire_current()) {
@@ -1323,11 +1539,14 @@ static int jit_flush_to_fresh(void) {
         return 0;
     }
     hl_arena_bind(&g_emit, &mapping);
-    HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT, "cache rotate generation=%llu rw=%p rx=%p",
-            (unsigned long long)(g_cache_gen + 1), (void *)g_cache, J_RX(g_cache));
+    HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT,
+            "cache rotate generation=%llu rw=%p rx=%p used=%zu blocks=%u evicted=%u retained=%u",
+            (unsigned long long)(g_cache_gen + 1), (void *)g_cache, J_RX(g_cache),
+            old_used, old_blocks, evicted, g_live_map_count);
     g_cache_gen++; // peers still on the just-retired generation pin it until they round-trip
-    map_clear();
-    memset(g_ibtc, 0, sizeof g_ibtc);
+    if (!retain_generations) map_clear();
+    if (!retain_generations)
+        memset(g_ibtc, 0, sizeof g_ibtc);
     pend_reset();
     return 1;
 }
@@ -1359,7 +1578,7 @@ static int stw_flush(void) {
     while (atomic_load_explicit(&g_stw_parked, memory_order_seq_cst) < target) {
         jit_backoff_ns(UINT64_C(50000));
     }
-    int ok = jit_flush_to_fresh();
+    int ok = jit_flush_to_fresh(1);
     atomic_store_explicit(&g_stw_active, 0, memory_order_seq_cst); // release the world
     // Wait for all peers to leave the handler so the counters are clean for the next flush.
     while (atomic_load_explicit(&g_stw_parked, memory_order_seq_cst) > 0) {

@@ -109,7 +109,24 @@ struct cpu {
     uint64_t bus_filter;
     uint64_t bus_force;
     uint64_t bus_scratch[3];
+    /* One-page translated-data TLB.  soft_snapshot is the immutable mapping
+       generation token; a pointer mismatch makes every field below stale. */
+    uint64_t soft_snapshot;
+    uint64_t soft_page;
+    uint64_t soft_last;
+    uint64_t soft_delta;
+    uint64_t soft_protection;
+    uint64_t soft_width;
+    uint64_t soft_required;
     volatile uint64_t in_service;
+    /*
+     * Direct shared-store SMC handoff.  Translated code only appends ranges
+     * and exits; executable-code mutation is deferred to the dispatcher.
+     */
+#define X86_SMC_RANGE_CAP 64
+    uint64_t smc_ranges[X86_SMC_RANGE_CAP][2];
+    uint64_t smc_range_count;
+    uint64_t smc_range_overflow;
 };
 
 #define OFF_FCPTR ((int)__builtin_offsetof(struct cpu, fastclk_ptr))
@@ -214,12 +231,28 @@ _Static_assert(__builtin_offsetof(struct cpu, mmscratch) == OFF_MM, "OFF_MM drif
 #define R_FXSAVE 15
 #define R_FXRSTOR 16
 #define R_BUS 17
-#define G_SMC_QUEUE_RESET(c) ((void)(c))
+#define R_SOFTMISS 18
+#define R_SOFTSPAN 19
+#define R_SMC 20
+#define OFF_SMC_RANGE_COUNT ((int)__builtin_offsetof(struct cpu, smc_range_count))
+#define G_SMC_QUEUE_RESET(c)                                                                                           \
+    do {                                                                                                               \
+        (c)->smc_range_count = 0;                                                                                      \
+        (c)->smc_range_overflow = 0;                                                                                   \
+    } while (0)
 #define OFF_FAULT_ADDR ((int)__builtin_offsetof(struct cpu, fault_addr))
 #define OFF_BUS_EA ((int)__builtin_offsetof(struct cpu, bus_ea))
 #define OFF_BUS_FILTER ((int)__builtin_offsetof(struct cpu, bus_filter))
 #define OFF_BUS_FORCE ((int)__builtin_offsetof(struct cpu, bus_force))
 #define OFF_BUS_SCRATCH ((int)__builtin_offsetof(struct cpu, bus_scratch))
+#define OFF_SOFT_SNAPSHOT ((int)__builtin_offsetof(struct cpu, soft_snapshot))
+#define OFF_SOFT_PAGE ((int)__builtin_offsetof(struct cpu, soft_page))
+#define OFF_SOFT_LAST ((int)__builtin_offsetof(struct cpu, soft_last))
+#define OFF_SOFT_DELTA ((int)__builtin_offsetof(struct cpu, soft_delta))
+#define OFF_SOFT_PROTECTION ((int)__builtin_offsetof(struct cpu, soft_protection))
+#define OFF_SOFT_WIDTH ((int)__builtin_offsetof(struct cpu, soft_width))
+#define OFF_SOFT_REQUIRED ((int)__builtin_offsetof(struct cpu, soft_required))
+#define G_SOFT_TLB_CLEAR(c) ((c)->soft_snapshot = 0)
 
 enum { X87_F2XM1, X87_FYL2X, X87_FPTAN, X87_FPATAN, X87_FYL2XP1, X87_FSINCOS, X87_FSIN, X87_FCOS };
 

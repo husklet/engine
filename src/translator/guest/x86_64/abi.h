@@ -36,6 +36,10 @@
 // / mremap paths. Inert unless a JIT guest is present (g_rwx_guest). See the "stale translation after
 // unmap/remap" bug. (aarch64 keeps its own smc_icflush model, so its seam is a no-op.)
 #define G_SMC_UNMAP(lo, hi) jit86_drop_range_translations((lo), (hi))
+/* Kernel copyout can modify bytes through a writable alias whose guest VA is
+   different from an executable alias. Until alias ranges are enumerated,
+   conservatively retire translated code whenever SMC tracking is armed. */
+#define G_SMC_COPYOUT(lo, hi) jit86_store_alias_changed((lo), (hi) - (lo))
 #define G_SHADOW_RESET(c) ((void)0) // no §B shadow stack on the x86 frontend
 /* x86 has no per-CPU shadow stack, but its second-level indirect target cache
    also contains host code pointers and must not survive an arena rotation. */

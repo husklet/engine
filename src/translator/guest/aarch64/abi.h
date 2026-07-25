@@ -46,12 +46,24 @@
 // x86 uses this to drop stale translations on munmap/MAP_FIXED/mremap of an executable VA. The aarch64
 // engine keeps its own guest-`ic ivau` (smc_icflush) coherence model, so the shared-path seam is a no-op.
 #define G_SMC_UNMAP(lo, hi) ((void)(lo), (void)(hi))
+static void aarch64_smc_copyout(uint64_t, uint64_t);
+#define G_SMC_COPYOUT(lo, hi) aarch64_smc_copyout((lo), (hi))
 #define G_SHADOW_RESET(c) ((c)->ssp = 0) // reset the §B shadow stack (fork/exec); no-op on engines without it
 /* A BUS-guard activation retires every pre-guard translation.  Clear cached
    host return PCs while all registered CPUs are at the dispatcher so none can
    return directly into a retired, unguarded arena. */
 #define G_ACTIVATION_CLEAR_CPU(c) ((c)->ssp = 0)
 #define G_ACTIVATION_CLEAR_GLOBAL() ((void)0)
+static void aarch64_soft_filter_refresh(struct cpu *);
+#define G_SOFT_TLB_REFRESH(c) aarch64_soft_filter_refresh(c)
+/* Mapping publication retires logical-VMA backing only after this STW clear. */
+#define G_SOFT_TLB_CLEAR(c)                                                                                           \
+    do {                                                                                                              \
+        (c)->soft_page = UINT64_MAX;                                                                                  \
+        (c)->soft_protection = 0;                                                                                     \
+        (c)->soft_span_bytes = 0;                                                                                     \
+        (c)->soft_span_protection = 0;                                                                                \
+    } while (0)
 
 // Child thread resume PC: aarch64 services a syscall with pc still at the SVC, so advance +4.
 #define G_THREAD_RESUME(child, parent) ((child)->pc = (parent)->pc + 4)

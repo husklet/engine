@@ -62,6 +62,11 @@ static hl_target_services g_target_services;
 #define g_jit_services (g_target_services.bound)
 static hl_status g_engine_result_status;
 static hl_linux_abi *g_linux_box;
+static int jit_guest_soft_activate(void);
+static void jit_guest_soft_restore_activate(void);
+static void jit_guest_soft_restore_deactivate(void);
+static void jit_guest_soft_deactivate(void);
+static int jit_guest_soft_active(void);
 
 hl_status hl_run_linux_guest_status(void) {
     return g_engine_result_status;
@@ -279,7 +284,11 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 static void ckpt_poll(struct cpu *c);
 #define G_CKPT_POLL(c) ckpt_poll(c)
 #define G_CKPT_ARCH 2
-#define G_CKPT_CPU_SANITIZE(c) ((c)->ic_site = 0)
+#define G_CKPT_CPU_SANITIZE(c)                                                                                        \
+    do {                                                                                                              \
+        (c)->ic_site = 0;                                                                                             \
+        G_SOFT_STATE_RESET(c);                                                                                        \
+    } while (0)
 // checkpoint.c's restore driver (included below) rebuilds the container from these, defined later in this TU.
 static int container_init(const char *rootfs);
 static int engine_global_init(void);
@@ -809,7 +818,12 @@ static int container_init(const char *rootfs) {
 // Returns 0 on success, nonzero exit code on failure. First call wins; later calls are no-ops
 // (g_engine_inited), so the resident fork-server parent pays this once and the standalone path runs it
 // exactly as before.
+static int guest_fetch_direct_valid(uint64_t address, size_t length) {
+    return host_range_mapped((uintptr_t)address, length);
+}
+
 static int engine_global_init(void) {
+    hl_guest_fetch_set_direct_validator(guest_fetch_direct_valid);
     if (hl_target_services_bind(&g_target_services) != 0) return 1;
     if (g_engine_inited) return 0;
     // Serve a non-PIE ET_EXEC's absolute data references at their biased host address. Faults not

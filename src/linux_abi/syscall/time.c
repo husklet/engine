@@ -280,11 +280,12 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // an out-of-range/negative timespec with EINVAL, matching Linux. Retry in place only on a
         // SPURIOUS/internal EINTR (nothing deliverable to the guest); surface a real EINTR so the
         // dispatcher runs the pending handler, exactly like poll/read. (LTP nanosleep02)
-        if (!host_range_mapped((uintptr_t)a0, sizeof(struct timespec))) {
+        struct timespec request;
+        if (guest_copy_from(&request, a0, sizeof request) != (ssize_t)sizeof request) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        const struct timespec *req = (const struct timespec *)a0;
+        const struct timespec *req = &request;
         if (req->tv_sec < 0 || req->tv_nsec < 0 || req->tv_nsec >= 1000000000L) {
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL); // out-of-range/negative timespec (LTP nanosleep02)
             break;
@@ -321,7 +322,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             if (r == 0) break;
             if (svc_poll_retry(c)) continue; // internal/spurious wakeup -> re-sleep the true remainder
             // A deliverable guest signal (or a real error): surface it, writing the remaining time to rem.
-            if (a1 && host_range_mapped((uintptr_t)a1, sizeof(struct timespec))) {
+            if (a1) {
                 struct timespec rem;
                 engine_clock_gettime(CLOCK_MONOTONIC, &now);
                 rem.tv_sec = deadline.tv_sec - now.tv_sec;
@@ -334,7 +335,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                     rem.tv_sec = 0;
                     rem.tv_nsec = 0;
                 }
-                *(struct timespec *)a1 = rem;
+                if (guest_copy_to(a1, &rem, sizeof rem) != (ssize_t)sizeof rem) r = -1, errno = EFAULT;
             }
             break;
         }
@@ -388,13 +389,11 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // rebased in dispatch.c (alongside clock_getres) so host_range_mapped classifies it correctly. Use
         // the same guest_bad_ptr the sibling copyout syscalls (gettimeofday/times/getrusage/newfstatat) use,
         // so a NULL *or* a wild/unmapped pointer faults EFAULT instead of crashing the engine mid-copyout.
-        if (guest_bad_ptr((uintptr_t)a1, 16)) {
+        uint64_t result[2] = {(uint64_t)ts.tv_sec, (uint64_t)ts.tv_nsec};
+        if (guest_copy_to(a1, result, sizeof result) != (ssize_t)sizeof result) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        uint64_t *g = (uint64_t *)a1;
-        g[0] = ts.tv_sec;
-        g[1] = ts.tv_nsec;
         G_RET(c) = 0;
         break;
     }
@@ -415,12 +414,11 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         if (a1) {
-            if (!host_range_mapped((uintptr_t)a1, 16)) {
+            uint64_t resolution[2] = {0, ((int)a0 == 5 || (int)a0 == 6) ? 1000000u : 1u};
+            if (guest_copy_to(a1, resolution, sizeof resolution) != (ssize_t)sizeof resolution) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
-            *(uint64_t *)a1 = 0;
-            *(uint64_t *)(a1 + 8) = ((int)a0 == 5 || (int)a0 == 6) ? 1000000 : 1;
         }
         G_RET(c) = 0;
         break;
@@ -431,7 +429,8 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // seconds and hang. Emulate ABSTIME by sleeping (deadline - now); relative falls back to nanosleep.
         int flags = (int)a1;
         int clk = (int)a0;
-        const struct timespec *req = (const struct timespec *)a2;
+        struct timespec request;
+        const struct timespec *req = &request;
         // validate the clockid before touching anything (LTP clock_nanosleep01). An unknown/negative
         // clock is -EINVAL; CLOCK_THREAD_CPUTIME_ID(3) has no kernel nsleep so the raw syscall returns
         // -EOPNOTSUPP (Linux errno 95 -- svc_time is NOT run through svc_done's m2l map, so hard-code the
@@ -455,7 +454,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // The request timespec is dereferenced by both paths below -> a bad pointer must EFAULT, not fault
         // the engine (glibc's nanosleep() lands here as clock_nanosleep(CLOCK_REALTIME,0,req,rem)).
         // guest_bad_ptr (not host_range_mapped) so a PROT_NONE guard page (LTP tst_get_bad_addr) faults too.
-        if (guest_bad_ptr((uintptr_t)a2, sizeof(struct timespec))) {
+        if (guest_copy_from(&request, a2, sizeof request) != (ssize_t)sizeof request) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
@@ -481,9 +480,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             // own relative remainder, so accumulated scheduling slop never shortens the sleep.
             for (;;) {
                 engine_clock_gettime(mc, &now);
-                if (req->tv_sec < now.tv_sec ||
-                    (req->tv_sec == now.tv_sec && req->tv_nsec <= now.tv_nsec))
-                    break;
+                if (req->tv_sec < now.tv_sec || (req->tv_sec == now.tv_sec && req->tv_nsec <= now.tv_nsec)) break;
                 if (engine_sleep_until(mc, req) == 0) break;
                 if (errno != EINTR) break;                                // genuine host error -> stop
                 if (__atomic_load_n(&c->exited, __ATOMIC_SEQ_CST)) break; // execve teardown: stop re-sleeping
@@ -505,7 +502,8 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // swallowed all of that and always returned 0. Retry only on a spurious/internal EINTR (nothing
         // deliverable to the guest); surface a real EINTR so the dispatcher runs the pending handler. (LTP
         // nanosleep02: an out-of-range tv_nsec / negative tv_sec is EINVAL, not a silent success.)
-        if (a3 && !host_range_mapped((uintptr_t)a3, sizeof(struct timespec))) {
+        if (a3 && guest_accessible_prefix(a3, sizeof(struct timespec), HL_LOGICAL_VMA_WRITE) !=
+                      sizeof(struct timespec)) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
@@ -556,7 +554,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                     rem.tv_sec = 0;
                     rem.tv_nsec = 0;
                 }
-                *(struct timespec *)a3 = rem;
+                if (guest_copy_to(a3, &rem, sizeof rem) != (ssize_t)sizeof rem) rr = -1, errno = EFAULT;
             }
             break;
         }
@@ -569,11 +567,10 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         struct tms tb;
         clock_t r = times(&tb);
         if (a0) {
-            if (!host_range_mapped((uintptr_t)a0, sizeof(struct tms))) {
+            if (guest_copy_to(a0, &tb, sizeof tb) != (ssize_t)sizeof tb) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
-            *(struct tms *)a0 = tb;
         }
         G_RET(c) = (uint64_t)r;
         break;
@@ -589,20 +586,18 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EIO);
             break;
         }
-        uint64_t *g = (uint64_t *)a0;
-        if (g) {
-            if (!host_range_mapped((uintptr_t)a0, 16)) {
+        if (a0) {
+            uint64_t timeval[2] = {(uint64_t)realtime.tv_sec, (uint64_t)realtime.tv_nsec / UINT64_C(1000)};
+            if (guest_copy_to(a0, timeval, sizeof timeval) != (ssize_t)sizeof timeval) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
-            g[0] = (uint64_t)realtime.tv_sec;
-            g[1] = (uint64_t)realtime.tv_nsec / UINT64_C(1000);
         }
         if (a1) { // struct timezone (deprecated). Validate for EFAULT like the kernel's copy_to_user, but do
                   // NOT write it: modern Linux fills it with zeros and no caller reads it, while writing a
                   // caller-supplied-but-read-only tz page would fault the engine (host_range_mapped only
                   // read-probes). Validation alone satisfies LTP gettimeofday01's bad-tz EFAULT case.
-            if (!host_range_mapped((uintptr_t)a1, 8)) {
+            if (guest_accessible_prefix(a1, 8, HL_LOGICAL_VMA_WRITE) != 8) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
@@ -625,7 +620,7 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             if (!g_gtimer[i].used) {
                 id = (int)i;
                 break;
-        }
+            }
         if (id < 0) {
             size_t first_new = g_gtimer_capacity;
             rc = gtimer_reserve_one();
@@ -654,13 +649,15 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // timerid out-pointer must be writable -- a bad address is -EFAULT, not an engine fault (LTP
         // timer_create02: bad sigevent / bad timer-id addr via tst_get_bad_addr). NULL sigevent is the POSIX
         // default (checked separately below); NULL timerid, however, has nowhere to store the id -> EFAULT.
-        if (a1 && guest_bad_ptr((uintptr_t)a1, 16)) {
+        unsigned char event[20] = {0};
+        size_t event_size = a1 ? 16 : 0;
+        if (a1 && guest_copy_from(event, a1, event_size) != (ssize_t)event_size) {
             t->used = 0;
             pthread_mutex_unlock(&g_gtimer_lk);
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        if (guest_bad_ptr((uintptr_t)a2, 4)) {
+        if (guest_accessible_prefix(a2, 4, HL_LOGICAL_VMA_WRITE) != 4) {
             t->used = 0;
             pthread_mutex_unlock(&g_gtimer_lk);
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
@@ -670,9 +667,9 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             // struct sigevent: sigev_value [0..8), sigev_signo [8..12), sigev_notify [12..16)
             uint64_t sigval;
             int signo, notify;
-            memcpy(&sigval, (void *)a1, 8);
-            memcpy(&signo, (void *)(a1 + 8), 4);
-            memcpy(&notify, (void *)(a1 + 12), 4);
+            memcpy(&sigval, event, 8);
+            memcpy(&signo, event + 8, 4);
+            memcpy(&notify, event + 12, 4);
             t->sigval = sigval;
             t->signo = signo;
             t->notify = notify;
@@ -682,8 +679,9 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             // the tid so gtimer_loop can deliver thread-directed (see below); a process-directed g_pending
             // raise would let the main thread's dispatcher discard the (handler-less, unblocked-there)
             // signal before the helper's rt_sigtimedwait poll claims it -- losing a one-shot expiry.
-            if (notify == 4 && !guest_bad_ptr((uintptr_t)(a1 + 16), 4))
-                memcpy(&t->target_tid, (void *)(a1 + 16), 4);
+            if (notify == 4) {
+                if (guest_copy_from(event + 16, a1 + 16, 4) == 4) memcpy(&t->target_tid, event + 16, 4);
+            }
         } else {
             // POSIX default: SIGEV_SIGNAL, SIGALRM(14), si_value = timer id
             t->notify = 0;
@@ -718,7 +716,10 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         pthread_mutex_unlock(&g_gtimer_lk);
-        if (a2) memcpy((void *)a2, &id, 4); // kernel writes the int timer id back
+        if (a2 && guest_copy_to(a2, &id, 4) != 4) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         G_RET(c) = 0;
         break;
     }
@@ -747,29 +748,38 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        if (guest_bad_ptr((uintptr_t)a2, 32)) {
+        unsigned char setting[32];
+        if (guest_copy_from(setting, a2, sizeof setting) != (ssize_t)sizeof setting) {
             pthread_mutex_unlock(&g_gtimer_lk);
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        if (a3 && guest_bad_ptr((uintptr_t)a3, 32)) {
+        if (a3 && guest_accessible_prefix(a3, 32, HL_LOGICAL_VMA_WRITE) != 32) {
             pthread_mutex_unlock(&g_gtimer_lk);
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
         // itimerspec: it_interval [0..16), it_value [16..32)
         uint64_t ivs = 0, ivn = 0, vls = 0, vln = 0;
-        memcpy(&ivs, (void *)a2, 8);
-        memcpy(&ivn, (void *)(a2 + 8), 8);
-        memcpy(&vls, (void *)(a2 + 16), 8);
-        memcpy(&vln, (void *)(a2 + 24), 8);
+        memcpy(&ivs, setting, 8);
+        memcpy(&ivn, setting + 8, 8);
+        memcpy(&vls, setting + 16, 8);
+        memcpy(&vln, setting + 24, 8);
         if (ivn >= 1000000000ull || vln >= 1000000000ull || (int64_t)ivs < 0 || (int64_t)vls < 0) {
             pthread_mutex_unlock(&g_gtimer_lk);
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        if (a3) gtimer_fill_curr(t, (void *)a3); // report the current setting before re-arming
-        if (vls == 0 && vln == 0) {              // it_value all-zero => disarm (regardless of it_interval)
+        if (a3) {
+            unsigned char old_setting[32];
+            gtimer_fill_curr(t, old_setting);
+            if (guest_copy_to(a3, old_setting, sizeof old_setting) != (ssize_t)sizeof old_setting) {
+                pthread_mutex_unlock(&g_gtimer_lk);
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+        }
+        if (vls == 0 && vln == 0) { // it_value all-zero => disarm (regardless of it_interval)
             gtimer_disarm(id);
             t->interval_ns = 0;
             pthread_mutex_unlock(&g_gtimer_lk);
@@ -822,12 +832,18 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // The kernel copy_to_user()s the itimerspec, so a NULL/bad curr pointer is -EFAULT (checked AFTER
         // the timerid EINVAL, matching LTP timer_gettime01: gettime(-1)->EINVAL, gettime(valid,NULL)->EFAULT).
         // guest_bad_ptr catches NULL and a PROT_NONE guard page; gtimer_fill_curr writes 32 bytes.
-        if (guest_bad_ptr((uintptr_t)a1, 32)) {
+        if (guest_accessible_prefix(a1, 32, HL_LOGICAL_VMA_WRITE) != 32) {
             pthread_mutex_unlock(&g_gtimer_lk);
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        gtimer_fill_curr(t, (void *)a1);
+        unsigned char current[32];
+        gtimer_fill_curr(t, current);
+        if (guest_copy_to(a1, current, sizeof current) != (ssize_t)sizeof current) {
+            pthread_mutex_unlock(&g_gtimer_lk);
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         pthread_mutex_unlock(&g_gtimer_lk);
         G_RET(c) = 0;
         break;

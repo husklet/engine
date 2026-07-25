@@ -31,11 +31,35 @@ int rm_load(struct insn *i, uint64_t n, int w, int *m) {
     return loaded;
 }
 
+int rm_load_access(struct insn *i, uint64_t n, int w, int *m, uint32_t required) {
+    (void)required;
+    return rm_load(i, n, w, m);
+}
+
 void rm_store(struct insn *i, int w, int v) {
     (void)i;
     seen.stores++;
     seen.width = w;
     seen.source = v;
+}
+
+void rm_store_after_guard(struct insn *i, int w, int v) {
+    rm_store(i, w, v);
+}
+
+void emit_memory_guard(int address, uint64_t size, uint64_t rip, uint32_t required) {
+    (void)address;
+    (void)size;
+    (void)rip;
+    (void)required;
+}
+
+int emit_soft_memory_active(void) {
+    return 0;
+}
+
+void emit_soft_store_commit(uint64_t size) {
+    (void)size;
 }
 
 void emit_rcl_rcr(struct insn *i, uint64_t n, int w, int r, int c) {

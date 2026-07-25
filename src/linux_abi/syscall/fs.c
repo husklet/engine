@@ -9,6 +9,13 @@
 #include <sys/syscall.h>
 #endif
 
+static int guest_fill_linux_stat(uint64_t destination, const struct stat *status, const char *host_path,
+                                 int descriptor) {
+    uint8_t encoded[GUEST_LINUX_STAT_BYTES];
+    fill_linux_stat(encoded, status, host_path, descriptor);
+    return guest_copy_to(destination, encoded, sizeof encoded) == sizeof encoded ? 0 : -EFAULT;
+}
+
 // statx(2) creation time. A plain Linux struct stat carries no birth time, so the engine must consult
 // a host statx to answer it -- AND to answer HONESTLY: a caller trusts stx_mask before reading
 // stx_btime, so STATX_BTIME must be advertised only when the backing filesystem actually reports it
@@ -519,14 +526,31 @@ static long guest_xattr_set(const char *host, const char *name, const void *val,
         if ((lflags & 1) && exists) return -EEXIST;   // XATTR_CREATE on an existing attr
         if ((lflags & 2) && !exists) return -ENOATTR; // XATTR_REPLACE on a missing attr -> ENODATA (m2l)
     }
-    return hl_native_setxattr(host, hn, val, sz, 0, opt) < 0 ? -errno : 0;
+    if (sz > 65536) return -E2BIG;
+    void *local = sz ? malloc(sz) : NULL;
+    if (sz && !local) return -ENOMEM;
+    if (sz && guest_copy_from(local, (uint64_t)(uintptr_t)val, sz) != (ssize_t)sz) {
+        free(local);
+        return -EFAULT;
+    }
+    long result = hl_native_setxattr(host, hn, local, sz, 0, opt) < 0 ? -errno : 0;
+    free(local);
+    return result;
 }
 
 static long guest_xattr_get(const char *host, const char *name, void *val, size_t sz, int opt) {
     char hn[512];
     snprintf(hn, sizeof hn, "%s%s", HL_GUEST_XATTR_PREFIX, name ? name : "");
-    ssize_t r = hl_native_getxattr(host, hn, val, sz, 0, opt);
-    return r < 0 ? -errno : r;
+    void *local = sz ? malloc(sz) : NULL;
+    if (sz && !local) return -ENOMEM;
+    ssize_t r = hl_native_getxattr(host, hn, local, sz, 0, opt);
+    int saved_error = errno;
+    if (r > 0 && guest_copy_to((uint64_t)(uintptr_t)val, local, (size_t)r) != r) {
+        free(local);
+        return -EFAULT;
+    }
+    free(local);
+    return r < 0 ? -saved_error : r;
 }
 
 static long guest_xattr_remove(const char *host, const char *name, int opt) {
@@ -538,6 +562,7 @@ static long guest_xattr_remove(const char *host, const char *name, int opt) {
 // List only guest-visible attrs, prefix stripped, into the guest buffer. sz==0 returns the required size.
 static long guest_xattr_list(const char *host, char *out, size_t sz, int opt) {
     char raw[65536];
+    char cooked[65536];
     ssize_t n = hl_native_listxattr(host, raw, sizeof raw, opt);
     if (n < 0) return -errno;
     size_t need = 0, pl = strlen(HL_GUEST_XATTR_PREFIX);
@@ -553,8 +578,8 @@ static long guest_xattr_list(const char *host, char *out, size_t sz, int opt) {
     }
     if (sz == 0) return (long)need;
     if (need > sz) return -ERANGE;
-    if (need && !host_range_mapped((uintptr_t)out, need)) return -EFAULT;
-    // Second pass: the destination is sized and fully mapped, so the copy cannot fault.
+    if (need && guest_accessible_prefix((uint64_t)(uintptr_t)out, need, HL_LOGICAL_VMA_WRITE) != need)
+        return -EFAULT;
     size_t off = 0;
     for (ssize_t i = 0; i < n;) {
         const char *nm = raw + i;
@@ -563,10 +588,11 @@ static long guest_xattr_list(const char *host, char *out, size_t sz, int opt) {
         if (l > pl && !strncmp(nm, HL_GUEST_XATTR_PREFIX, pl)) {
             const char *g = nm + pl;
             size_t gl = strlen(g) + 1;
-            memcpy(out + off, g, gl);
+            memcpy(cooked + off, g, gl);
             off += gl;
         }
     }
+    if (need && guest_copy_to((uint64_t)(uintptr_t)out, cooked, need) != (ssize_t)need) return -EFAULT;
     return (long)need;
 }
 
@@ -581,7 +607,20 @@ static long guest_xattr_list(const char *host, char *out, size_t sz, int opt) {
 static int64_t svc_mount(struct cpu *c, uint64_t a_src, uint64_t a_tgt, uint64_t a_fstype, uint64_t a_flags) {
     (void)c;
     if (!g_rootfs) return 0; // bare (no-jail) mode: nothing to alias into -> keep the legacy success
-    const char *src = (const char *)a_src, *tgtraw = (const char *)a_tgt, *fstype = (const char *)a_fstype;
+    char source_text[4200], target_text[4200], filesystem_text[64];
+    const char *src = NULL, *tgtraw = NULL, *fstype = NULL;
+    if (guest_copy_string(target_text, sizeof target_text, a_tgt) < 0) return -EFAULT;
+    tgtraw = target_text;
+    if (a_src) {
+        int imported = guest_copy_string(source_text, sizeof source_text, a_src);
+        if (imported < 0) return imported;
+        src = source_text;
+    }
+    if (a_fstype) {
+        int imported = guest_copy_string(filesystem_text, sizeof filesystem_text, a_fstype);
+        if (imported < 0) return imported;
+        fstype = filesystem_text;
+    }
     unsigned long fl = (unsigned long)a_flags;
     if (!tgtraw || guest_bad_ptr((uintptr_t)tgtraw, 1)) return -EFAULT;
     char tgt[4200];
@@ -754,6 +793,77 @@ static int procfd_follow_stat(const char *path, struct stat *status) {
 
 static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                   uint64_t a5) {
+    /*
+     * Path walkers expect ordinary host strings.  Import pathname operands first so a sparse logical VMA
+     * works exactly like an identity mapping and an unreadable string returns EFAULT instead of crashing
+     * inside strlen/atpath.  Keep this at the family boundary so every overlay/jail branch sees the same
+     * stable spelling.
+     */
+    char imported_path0[4200], imported_path1[4200];
+    uint64_t *path_arg0 = NULL, *path_arg1 = NULL;
+    switch (nr) {
+    case 5:
+    case 6:
+    case 8:
+    case 9:
+    case 14:
+    case 15:
+        path_arg0 = &a0;
+        path_arg1 = &a1; /* xattr name */
+        break;
+    case 7:
+    case 10:
+    case 16: path_arg0 = &a1; break; /* fd form: xattr name only */
+    case 11:
+    case 12:
+    case 39:
+    case 43:
+    case 49: path_arg0 = &a0; break;
+    case 33:
+    case 34:
+    case 35:
+    case 53:
+    case 54:
+    case 56:
+    case 78:
+    case 79:
+    case 88:
+    case 264:
+    case 291:
+    case 437:
+    case 439:
+    case 452:
+    case 48: path_arg0 = &a1; break;
+    case 36:
+        path_arg0 = &a0; /* symlink target */
+        path_arg1 = &a2; /* new link pathname */
+        break;
+    case 37:
+    case 38:
+    case 276:
+        path_arg0 = &a1;
+        path_arg1 = &a3;
+        break;
+    case 41:
+        path_arg0 = &a0;
+        path_arg1 = &a1;
+        break;
+    default: break;
+    }
+    int path_import_status;
+    if (path_arg0 &&
+        (path_import_status = guest_copy_string(imported_path0, sizeof imported_path0, *path_arg0)) < 0) {
+        G_RET(c) = (uint64_t)(int64_t)path_import_status;
+        return svc_done(c);
+    }
+    if (path_arg1 &&
+        (path_import_status = guest_copy_string(imported_path1, sizeof imported_path1, *path_arg1)) < 0) {
+        G_RET(c) = (uint64_t)(int64_t)path_import_status;
+        return svc_done(c);
+    }
+    if (path_arg0) *path_arg0 = (uint64_t)(uintptr_t)imported_path0;
+    if (path_arg1) *path_arg1 = (uint64_t)(uintptr_t)imported_path1;
+
     const char *operation = fs_operation_name(nr);
     if (operation != NULL)
         HL_LOGF(&g_jit_log, HL_LOG_TAG_FS, "%s nr=%llu a0=%#llx a1=%#llx a2=%#llx", operation, (unsigned long long)nr,
@@ -883,11 +993,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(-ERANGE);
             break;
         }
-        if (!a0 || !host_range_mapped((uintptr_t)a0, len)) {
+        if (!a0 || guest_copy_to(a0, cw, len) != (ssize_t)len) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        memcpy((void *)a0, cw, len);
         G_RET(c) = len;
         break;
     }
@@ -899,7 +1008,56 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // SIGN-EXTENDED as 0xffffffff80045430 and would miss its switch case -> ENOTTY (glibc zero-extends, so
         // it worked there). This makes both forms match, fixing musl tmux/script/openpty and any high-bit ioctl.
         unsigned long rq = (uint32_t)a1;
-        void *arg = (void *)a2;
+        uint8_t ioctl_argument[256] = {0};
+        uint8_t ioctl_nested[80] = {0};
+        uint64_t ioctl_nested_guest = 0;
+        size_t ioctl_nested_size = 0;
+        size_t ioctl_size = (rq >> 16) & 0x3fffu;
+        int ioctl_input = ((rq >> 30) & 1u) != 0;
+        int ioctl_output = ((rq >> 31) & 1u) != 0;
+        switch (rq) {
+        case 0x5401: ioctl_size = 36; ioctl_output = 1; break;
+        case 0x5402:
+        case 0x5403:
+        case 0x5404: ioctl_size = 36; ioctl_input = 1; break;
+        case 0x5413: ioctl_size = sizeof(struct winsize); ioctl_output = 1; break;
+        case 0x5414: ioctl_size = sizeof(struct winsize); ioctl_input = 1; break;
+        case 0x5421:
+        case 0x5410:
+        case 0x5420: ioctl_size = sizeof(int); ioctl_input = 1; break;
+        case 0x541b:
+        case 0x5411:
+        case 0x540f:
+        case 0x5429: ioctl_size = sizeof(int); ioctl_output = 1; break;
+        default:
+            if (rq >= 0x8900 && rq <= 0x89ff) ioctl_size = 40, ioctl_input = ioctl_output = 1;
+            break;
+        }
+        if (ioctl_size > sizeof ioctl_argument) {
+            G_RET(c) = (uint64_t)(int64_t)(-E2BIG);
+            break;
+        }
+        if (ioctl_input && ioctl_size &&
+            guest_copy_from(ioctl_argument, a2, ioctl_size) != (ssize_t)ioctl_size) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
+        if (rq == 0x8912 && ioctl_size >= 16) {
+            int32_t capacity;
+            memcpy(&capacity, ioctl_argument, sizeof capacity);
+            memcpy(&ioctl_nested_guest, ioctl_argument + 8, sizeof ioctl_nested_guest);
+            if (capacity > 0 && ioctl_nested_guest) {
+                ioctl_nested_size = (size_t)capacity < sizeof ioctl_nested ? (size_t)capacity : sizeof ioctl_nested;
+                if (guest_accessible_prefix(ioctl_nested_guest, ioctl_nested_size, HL_LOGICAL_VMA_WRITE) !=
+                    ioctl_nested_size) {
+                    G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                    break;
+                }
+                uint64_t local_nested = (uint64_t)(uintptr_t)ioctl_nested;
+                memcpy(ioctl_argument + 8, &local_nested, sizeof local_nested);
+            }
+        }
+        void *arg = ioctl_size ? ioctl_argument : (void *)a2;
         // macOS pty MASTERS reject every termios/winsize ioctl with ENOTTY -- unlike Linux, where the master
         // accepts them and they act on the shared line discipline (apt/dpkg's StartPtyMagic does TIOCSWINSZ +
         // tcsetattr(TCSANOW) on the master; that ENOTTY is apt's "Setting TIOCSWINSZ for master fd N failed"
@@ -1282,6 +1440,18 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         }
         if (pts_slave >= 0) close(pts_slave); // transient slave used to service a master's termios/winsize op
+        if ((int64_t)G_RET(c) >= 0 && rq == 0x8912 && ioctl_nested_guest) {
+            int32_t produced;
+            memcpy(&produced, ioctl_argument, sizeof produced);
+            size_t copied =
+                produced <= 0 ? 0 : (size_t)produced < ioctl_nested_size ? (size_t)produced : ioctl_nested_size;
+            if (copied && guest_copy_to(ioctl_nested_guest, ioctl_nested, copied) != (ssize_t)copied)
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            memcpy(ioctl_argument + 8, &ioctl_nested_guest, sizeof ioctl_nested_guest);
+        }
+        if ((int64_t)G_RET(c) >= 0 && ioctl_output && ioctl_size &&
+            guest_copy_to(a2, ioctl_argument, ioctl_size) != (ssize_t)ioctl_size)
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
         break;
     }
     // mknodat(dirfd, path, mode, dev)
@@ -1997,10 +2167,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
-        uint8_t *b = (uint8_t *)a1;
+        uint8_t encoded_statfs[HL_LINUX_STATFS_RECORD_SIZE];
+        uint8_t *b = encoded_statfs;
         // The result buffer must be writable -> EFAULT on a bad/unmapped/PROT_NONE pointer (LTP statfs02
         // "bad buf"; the engine fills this buffer itself, so guard before the writes below).
-        if (guest_bad_ptr((uintptr_t)a1, 120)) {
+        if (guest_accessible_prefix(a1, sizeof encoded_statfs, HL_LOGICAL_VMA_WRITE) != sizeof encoded_statfs) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
@@ -2050,6 +2221,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             .flags = (uint64_t)f_flags,
         };
         (void)hl_linux_statfs_encode(&record, b, HL_LINUX_STATFS_RECORD_SIZE);
+        if (guest_copy_to(a1, encoded_statfs, sizeof encoded_statfs) != sizeof encoded_statfs) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         G_RET(c) = 0;
         break;
     }
@@ -2604,7 +2779,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // rootfs jail already confines every resolution so the containment RESOLVE_* bits stay advisory.
     case 437: {
         uint64_t how_ptr = a2, usize = a3;
-        if (!how_ptr || guest_bad_ptr(how_ptr, 8)) {
+        if (!how_ptr) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
@@ -2616,11 +2791,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-E2BIG);
             break;
         }
-        if (guest_bad_ptr(how_ptr, usize)) {
+        uint8_t how_bytes[4096];
+        if (guest_copy_from(how_bytes, how_ptr, (size_t)usize) != (ssize_t)usize) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        const uint8_t *hb = (const uint8_t *)how_ptr;
+        const uint8_t *hb = how_bytes;
         int extbad = 0;
         for (uint64_t i = 24; i < usize; i++)
             if (hb[i]) {
@@ -2631,7 +2807,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-E2BIG);
             break;
         }
-        const uint64_t *how = (const uint64_t *)how_ptr;
+        const uint64_t *how = (const uint64_t *)how_bytes;
         uint64_t oflags = how[0], omode = how[1], resolve = how[2];
         // RESOLVE_* valid mask: NO_XDEV|NO_MAGICLINKS|NO_SYMLINKS|BENEATH|IN_ROOT|CACHED = 0x3f
         if ((resolve & ~0x3fULL) || (omode & ~07777ULL) ||
@@ -3334,7 +3510,6 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 g_ovldents[fd].pos = 0;
                 g_ovldents[fd].n = overlay_readdir(g_ovldir[fd], &g_ovldents[fd].nm, &g_ovldents[fd].ty);
             }
-            uint8_t *out = (uint8_t *)a1;
             size_t o = 0;
             int einval = 0;
             while (g_ovldents[fd].pos < g_ovldents[fd].n) {
@@ -3345,12 +3520,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     if (o == 0) einval = 1;
                     break;
                 }
-                uint8_t *ld = out + o;
+                uint8_t record[280] = {0};
+                uint8_t *ld = record;
                 // The guest result buffer is written directly; a straddling/unmapped destination must
                 // EFAULT like Linux copy_to_user, not fault the engine. Validate the exact destination
                 // sub-range before every entry: entries that fit in mapped memory are emitted, and the
                 // first faulting entry (nothing emitted yet) reports EFAULT.
-                if (!host_range_mapped((uintptr_t)ld, lr)) {
+                if (guest_accessible_prefix(a1 + o, lr, HL_LOGICAL_VMA_WRITE) != lr) {
                     if (o == 0) einval = -1; // sentinel: EFAULT rather than EINVAL
                     break;
                 }
@@ -3374,6 +3550,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 *(ld + 18) = g_ovldents[fd].ty[g_ovldents[fd].pos];
                 memcpy(ld + 19, nm, nl);
                 ld[19 + nl] = 0;
+                if (guest_copy_to(a1 + o, record, lr) != (ssize_t)lr) {
+                    if (o == 0) einval = -1;
+                    break;
+                }
                 o += lr;
                 g_ovldents[fd].pos++;
             }
@@ -3411,7 +3591,6 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 dir_cached = 1;
                 break;
             }
-        uint8_t *out = (uint8_t *)a1;
         size_t o = 0;
         struct dirent *de;
         long pos = telldir(dir);
@@ -3425,12 +3604,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 if (o == 0) einval = 1;
                 break;
             }
-            uint8_t *ld = out + o;
+            uint8_t record[280] = {0};
+            uint8_t *ld = record;
             // Guest buffer written directly: a straddling/unmapped destination must EFAULT like Linux
             // copy_to_user, not fault the engine. Validate the exact destination before writing; rewind
             // the stream so the un-emitted entry is not lost, and report EFAULT only when nothing was
             // emitted (matching the kernel's lastdirent behavior).
-            if (!host_range_mapped((uintptr_t)ld, lr)) {
+            if (guest_accessible_prefix(a1 + o, lr, HL_LOGICAL_VMA_WRITE) != lr) {
                 seekdir(dir, pos);
                 if (o == 0) einval = -1; // sentinel: EFAULT rather than EINVAL
                 break;
@@ -3441,6 +3621,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             *(ld + 18) = de->d_type;
             memcpy(ld + 19, de->d_name, nl);
             ld[19 + nl] = 0;
+            if (guest_copy_to(a1 + o, record, lr) != (ssize_t)lr) {
+                seekdir(dir, pos);
+                if (o == 0) einval = -1;
+                break;
+            }
             o += lr;
             pos = telldir(dir);
         }
@@ -3453,8 +3638,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // readlinkat(dirfd, path, buf, bufsiz)
     case 78: {
         const char *p = (const char *)a1;
-        char *buf = (char *)a2;
         size_t bs = (size_t)a3;
+        char local_result[4096];
+        char *buf = local_result;
         // Linux validates the buffer size FIRST: bufsiz <= 0 is EINVAL even for a nonexistent path.
         if ((int64_t)a3 <= 0) {
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
@@ -3465,11 +3651,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // is at most PATH_MAX bytes, so validating the first min(bufsiz, PATH_MAX) bytes bounds every write.
         {
             size_t chk = bs > 4096 ? 4096 : bs;
-            if (buf && !host_range_mapped((uintptr_t)buf, chk)) {
+            if (guest_accessible_prefix(a2, chk, HL_LOGICAL_VMA_WRITE) != chk) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
         }
+        if (bs > sizeof local_result) bs = sizeof local_result;
+        do {
         // AT_EMPTY_PATH form: readlinkat(dirfd, "", buf, sz) with an EMPTY pathname operates on the file the
         // DIRFD itself names -- an O_PATH|O_NOFOLLOW fd opened directly on a symlink. macOS has no
         // AT_EMPTY_PATH (and passing "" to host readlinkat yields ENOTDIR/ENOENT), so recover the fd's own
@@ -3758,6 +3946,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 hl_fdcache_readlink_store(rp, r < 0 ? -errno : (int)r, buf, r < 0 ? 0 : (int)r);
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         }
+        } while (0);
+        if ((int64_t)G_RET(c) > 0 &&
+            guest_copy_to(a2, local_result, (size_t)G_RET(c)) != (ssize_t)G_RET(c))
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
         break;
     }
     case 79: {
@@ -3795,7 +3987,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 hl_host_result opened;
                 hl_host_file_metadata metadata;
                 struct stat provider_stat;
-                if (!host_range_mapped((uintptr_t)a2, GUEST_LINUX_STAT_BYTES)) {
+                if (guest_accessible_prefix(a2, GUEST_LINUX_STAT_BYTES, HL_LOGICAL_VMA_WRITE) !=
+                    GUEST_LINUX_STAT_BYTES) {
                     G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                     break;
                 }
@@ -3819,7 +4012,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     provider_stat.st_rdev = (dev_t)hl_linux_device_make(service->major, service->minor);
                 provider_stat.st_size = (off_t)metadata.size;
                 provider_stat.st_nlink = 1;
-                fill_linux_stat((uint8_t *)a2, &provider_stat, NULL, -1);
+                (void)guest_fill_linux_stat(a2, &provider_stat, NULL, -1);
                 G_RET(c) = 0;
                 break;
             }
@@ -3853,7 +4046,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 struct stat es;
                 // The magic /proc/self/exe always "exists", so validate the guest stat buffer now (before
                 // the engine fills it directly) -> a bad pointer is -EFAULT, matching Linux's copyout.
-                if (!host_range_mapped((uintptr_t)a2, GUEST_LINUX_STAT_BYTES)) {
+                if (guest_accessible_prefix(a2, GUEST_LINUX_STAT_BYTES, HL_LOGICAL_VMA_WRITE) !=
+                    GUEST_LINUX_STAT_BYTES) {
                     G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                     break;
                 }
@@ -3862,7 +4056,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     es.st_mode = S_IFLNK | 0777;
                     es.st_size = 0;
                     es.st_nlink = 1;
-                    fill_linux_stat((uint8_t *)a2, &es, NULL, -1); // synth /proc/self/exe symlink
+                    (void)guest_fill_linux_stat(a2, &es, NULL, -1); // synth /proc/self/exe symlink
                     G_RET(c) = 0;
                     break;
                 }
@@ -3870,7 +4064,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 char hb[4200];
                 const char *hp = xresolve_overlay(ep, hb, sizeof hb);
                 if (stat(hp, &es) == 0) {
-                    fill_linux_stat((uint8_t *)a2, &es, hp, -1);
+                    (void)guest_fill_linux_stat(a2, &es, hp, -1);
                     G_RET(c) = 0;
                     break;
                 }
@@ -3882,7 +4076,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 if (sleaf && (!strcmp(sleaf, "root") || !strcmp(sleaf, "cwd"))) {
                     // Magic /proc/self/{root,cwd} always resolves; validate the guest stat buffer before the
                     // engine fills it -> a bad pointer is -EFAULT, matching Linux's copyout ordering.
-                    if (!host_range_mapped((uintptr_t)a2, GUEST_LINUX_STAT_BYTES)) {
+                    if (guest_accessible_prefix(a2, GUEST_LINUX_STAT_BYTES, HL_LOGICAL_VMA_WRITE) !=
+                        GUEST_LINUX_STAT_BYTES) {
                         G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                         break;
                     }
@@ -3902,14 +4097,14 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                         es.st_mode = S_IFLNK | 0777;
                         es.st_size = 0;
                         es.st_nlink = 1;
-                        fill_linux_stat((uint8_t *)a2, &es, NULL, -1);
+                        (void)guest_fill_linux_stat(a2, &es, NULL, -1);
                         G_RET(c) = 0;
                         break;
                     }
                     char hb[4200];
                     const char *hp = xresolve_overlay(tgt, hb, sizeof hb);
                     if (stat(hp, &es) == 0) {
-                        fill_linux_stat((uint8_t *)a2, &es, hp, -1);
+                        (void)guest_fill_linux_stat(a2, &es, hp, -1);
                         G_RET(c) = 0;
                         break;
                     }
@@ -3930,11 +4125,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     break;
                 }
                 if (procfd_status > 0 || synth_stat_raw(gp, &synth_s)) {
-                    if (!host_range_mapped((uintptr_t)a2, GUEST_LINUX_STAT_BYTES)) {
+                    if (guest_accessible_prefix(a2, GUEST_LINUX_STAT_BYTES, HL_LOGICAL_VMA_WRITE) !=
+                        GUEST_LINUX_STAT_BYTES) {
                         G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                         break;
                     }
-                    fill_linux_stat((uint8_t *)a2, &synth_s, NULL, -1);
+                    (void)guest_fill_linux_stat(a2, &synth_s, NULL, -1);
                     G_RET(c) = 0;
                     break;
                 }
@@ -3953,11 +4149,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // Validate the guest buffer only after a successful stat (copyout-last: a bad path still
             // reports its own errno first, matching Linux) -> a bad pointer is -EFAULT, not an engine fault.
             if (rc == 0) {
-                if (!host_range_mapped((uintptr_t)a2, GUEST_LINUX_STAT_BYTES)) {
+                if (guest_accessible_prefix(a2, GUEST_LINUX_STAT_BYTES, HL_LOGICAL_VMA_WRITE) !=
+                    GUEST_LINUX_STAT_BYTES) {
                     G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                     break;
                 }
-                fill_linux_stat((uint8_t *)a2, &s, p, -1);
+                (void)guest_fill_linux_stat(a2, &s, p, -1);
             }
             G_RET(c) = (uint64_t)(int64_t)rc;
             break;
@@ -3973,11 +4170,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         // guest-chown xattr lives on the host backing file: read via fd for AT_EMPTY_PATH, else by path.
         // The stat succeeded above, so validate the guest buffer here (copyout-last) -> bad ptr = -EFAULT.
-        if (!host_range_mapped((uintptr_t)a2, GUEST_LINUX_STAT_BYTES)) {
+        if (guest_accessible_prefix(a2, GUEST_LINUX_STAT_BYTES, HL_LOGICAL_VMA_WRITE) != GUEST_LINUX_STAT_BYTES) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        fill_linux_stat((uint8_t *)a2, &s, empty_self ? NULL : p, empty_self ? (int)a0 : -1);
+        (void)guest_fill_linux_stat(a2, &s, empty_self ? NULL : p, empty_self ? (int)a0 : -1);
         G_RET(c) = 0;
         break;
     }
@@ -3992,11 +4189,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // The guest stat buffer is filled DIRECTLY by the engine; validate it (after the fd/stat succeeds,
         // so a bad fd still reports EBADF first, matching Linux's copyout-last ordering) so a bad pointer
         // returns -EFAULT instead of faulting the engine (access_ok).
-        if (!host_range_mapped((uintptr_t)a1, GUEST_LINUX_STAT_BYTES)) {
+        if (guest_accessible_prefix(a1, GUEST_LINUX_STAT_BYTES, HL_LOGICAL_VMA_WRITE) != GUEST_LINUX_STAT_BYTES) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        fill_linux_stat((uint8_t *)a1, &s, NULL, (int)a0);
+        (void)guest_fill_linux_stat(a1, &s, NULL, (int)a0);
         G_RET(c) = 0;
         break;
     }
@@ -4031,12 +4228,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // field. Copy out to a local (never mutate guest memory) and translate both slots. a2==NULL stays
         // NULL (= set both to now). EFAULT a bad non-NULL times pointer (we now dereference it in-engine).
         if (a2) {
-            if (guest_bad_ptr((uintptr_t)a2, sizeof(struct timespec) * 2)) {
+            if (guest_copy_from(lts, a2, sizeof lts) != sizeof lts) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
-            lts[0] = ts[0];
-            lts[1] = ts[1];
             for (int i = 0; i < 2; i++) {
                 if (lts[i].tv_nsec == 0x3fffffff)
                     lts[i].tv_nsec = UTIME_NOW; // Linux UTIME_NOW  -> macOS
@@ -4124,7 +4319,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        if (!host_range_mapped((uintptr_t)a4, 256)) {
+        if (guest_accessible_prefix(a4, 256, HL_LOGICAL_VMA_WRITE) != 256) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
@@ -4201,7 +4396,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // the cache) so statx's uid/gid are byte-identical to fstat/newfstatat for the same file.
         uint32_t vuid, vgid;
         stat_virt_ids(&s, xpath, xfd, &vuid, &vgid);
-        uint8_t *d = (uint8_t *)a4;
+        uint8_t encoded_statx[256];
+        uint8_t *d = encoded_statx;
         // Birth time is mirrored from the host filesystem so the mask bit is honest per-fs (see
         // hl_statx_host_btime). Synthetic entries have no backing file (xpath==NULL && xfd<0) and so
         // never advertise btime -- matching native procfs/sysfs, which do not report it.
@@ -4250,6 +4446,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 *(uint32_t *)(d + 0) |= 0x1000u;
             }
         }
+        if (guest_copy_to(a4, encoded_statx, sizeof encoded_statx) != sizeof encoded_statx) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         G_RET(c) = 0;
         break;
     }
@@ -4258,8 +4458,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // { u32 handle_bytes; i32 handle_type; u8 f_handle[]; }; handle_bytes is the buffer size on input
     // and is rewritten to the produced size (-EOVERFLOW if the caller's buffer is too small).
     case 264: {
-        uint8_t *fh = (uint8_t *)a2;
-        if (!fh || !host_range_mapped((uintptr_t)a2, 4)) { // handle_bytes read/write below
+        uint32_t handle_capacity;
+        if (!a2 || guest_copy_from(&handle_capacity, a2, sizeof handle_capacity) != sizeof handle_capacity) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
@@ -4281,26 +4481,35 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         }
         const uint32_t need = 16; // dev(8) + ino(8)
-        if (*(uint32_t *)(fh + 0) < need) {
-            *(uint32_t *)(fh + 0) = need;
+        if (handle_capacity < need) {
+            if (guest_copy_to(a2, &need, sizeof need) != sizeof need) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
             G_RET(c) = (uint64_t)(int64_t)(-EOVERFLOW);
             break;
         }
-        if (!host_range_mapped((uintptr_t)a2, need + 8)) {
+        if (guest_accessible_prefix(a2, need + 8, HL_LOGICAL_VMA_WRITE) != need + 8) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
         uint64_t dev = (uint64_t)s.st_dev, ino = (uint64_t)s.st_ino;
-        *(uint32_t *)(fh + 0) = need; // handle_bytes
-        *(int32_t *)(fh + 4) = 1;     // handle_type (stable, arbitrary)
-        memcpy(fh + 8, &dev, 8);
-        memcpy(fh + 16, &ino, 8);
+        uint8_t handle[24] = {0};
+        memcpy(handle, &need, 4);
+        int32_t handle_type = 1;
+        memcpy(handle + 4, &handle_type, 4);
+        memcpy(handle + 8, &dev, 8);
+        memcpy(handle + 16, &ino, 8);
+        if (guest_copy_to(a2, handle, sizeof handle) != sizeof handle) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
         if (a3) {
-            if (!host_range_mapped((uintptr_t)a3, sizeof(int))) {
+            int mount_id = (int)s.st_dev;
+            if (guest_copy_to(a3, &mount_id, sizeof mount_id) != sizeof mount_id) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
-            *(int *)a3 = (int)s.st_dev; // mount_id
         }
         G_RET(c) = 0;
         break;

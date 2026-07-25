@@ -213,11 +213,13 @@ int main(int argc, char **argv) {
                                 !strcmp(argv[3], "io-repeat") || !strcmp(argv[3], "io-directory-change") ||
                                 !strcmp(argv[3], "io-missing-child-strict") || !strcmp(argv[3], "io-fifo-refusal") ||
                                 !strcmp(argv[3], "io-queued-device") || !strcmp(argv[3], "io-queued-missing"));
+    int backward_v2_case = argc == 5 && !strcmp(argv[3], "backward-v2");
+    const char *capture_engine = backward_v2_case ? argv[4] : argv[1];
     const char *guest_mode = io_case ? argv[3] + 3 : NULL;
     int io_capture_refusal = io_case && !strcmp(guest_mode, "fifo-refusal");
     int io_strict_restore = io_case && !strcmp(guest_mode, "missing-child-strict");
     if (io_case && !io_capture_refusal && !io_strict_restore) permissive_case = 1;
-    if ((argc != 3 && !pipe_case && !deleted_case && !threads_case && !memfd_case && !eventfd_case &&
+    if ((argc != 3 && !backward_v2_case && !pipe_case && !deleted_case && !threads_case && !memfd_case && !eventfd_case &&
          !timerfd_case && !inotify_case && !epoll_case && !socketpair_case && !socket_state_case &&
          !connected_socket_case && !signal_case && !connecting_refusal_case && !connecting_fallback_case && !corrupt_magic_case &&
          !corrupt_truncated_case && !corrupt_content_case && !corrupt_missing_case && !corrupt_extra_case &&
@@ -234,6 +236,7 @@ int main(int argc, char **argv) {
      * accumulated). Register one atexit hook that removes the whole tree. */
     snprintf(g_scratch_root, sizeof g_scratch_root, "%s", temporary);
     atexit(scratch_cleanup);
+    if (backward_v2_case && getenv("HL_KEEP_CHECKPOINT_FIXTURE")) g_scratch_root[0] = '\0';
     snprintf(checkpoint, sizeof checkpoint, "%s/image", temporary);
     snprintf(trigger, sizeof trigger, "%s.trigger", checkpoint);
     snprintf(manifest, sizeof manifest, "%s/MANIFEST", checkpoint);
@@ -241,7 +244,7 @@ int main(int argc, char **argv) {
     snprintf(release, sizeof release, "%s/release", temporary);
     snprintf(release_error, sizeof release_error, "%s.error", release);
 
-    child = launch(argv[1], argv[2], release, output, checkpoint, 0, permissive_case, guest_mode);
+    child = launch(capture_engine, argv[2], release, output, checkpoint, 0, permissive_case, guest_mode);
     if (child < 0) return 3;
     if (wait_for_ready(output, (deleted_case || threads_case || memfd_case || inotify_case || epoll_case ||
                                 signal_case || connecting_refusal_case || connecting_fallback_case || modified_external_case ||

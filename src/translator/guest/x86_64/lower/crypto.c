@@ -58,6 +58,7 @@ static uint32_t crypto_reg(int value) {
 static int crypto_rm_vec(struct insn *I, uint64_t next) {
     if (I->is_mem) {
         emit_ea(I, next);
+        emit_memory_guard(17, 16, next - (uint64_t)I->len, X86_SOFT_READ);
         hl_x86_emit_vector_load128(19, 17, 0);
         return 19;
     }
@@ -443,6 +444,7 @@ int hl_x86_lower_crypto(struct insn *I, uint64_t next, hl_x86_crypto_state *stat
             int s;
             if (I->is_mem) { // narrow source: load exactly src_bytes to avoid a 16B over-read past the page
                 emit_ea(I, next);
+                emit_memory_guard(17, (uint64_t)src_bytes, next - (uint64_t)I->len, X86_SOFT_READ);
                 s = 19;
                 if (src_bytes == 8)
                     hl_x86_emit_vector_load64(19, 17);

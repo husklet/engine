@@ -65,6 +65,7 @@ int hl_x86_lower_sse4x(struct insn *I, uint64_t next, const hl_x86_sse4x_state *
             int src;
             if (I->is_mem) {
                 emit_ea(I, next);
+                emit_memory_guard(17, (uint64_t)nb, next - (uint64_t)I->len, X86_SOFT_READ);
                 e_load(nb, 16, 17);
                 src = 16;
             } else {
@@ -84,6 +85,7 @@ int hl_x86_lower_sse4x(struct insn *I, uint64_t next, const hl_x86_sse4x_state *
         int nb = I->opsize;
         emit_ea(I, next);
         if (op == 0xF0) {
+            emit_memory_guard(17, (uint64_t)nb, next - (uint64_t)I->len, X86_SOFT_READ);
             e_load(nb, 16, 17); // zero-extending load
             if (nb == 2) {      // 16-bit dest merges into the low 16 bits of the guest reg
                 e4_rev(16, 16, 2);
@@ -92,8 +94,10 @@ int hl_x86_lower_sse4x(struct insn *I, uint64_t next, const hl_x86_sse4x_state *
                 e4_rev(D, 16, nb); // W write zero-extends (32-bit); X full (64-bit)
             }
         } else {
+            emit_memory_guard(17, (uint64_t)nb, next - (uint64_t)I->len, X86_SOFT_WRITE);
             e4_rev(16, D, nb); // rev16 leaves only the low halfword meaningful; the 2-byte store reads just that
             e_store(nb, 16, 17);
+            if (emit_soft_memory_active()) emit_soft_store_commit((uint64_t)nb);
         }
         return TX_NEXT;
     }
@@ -111,8 +115,10 @@ int hl_x86_lower_sse4x(struct insn *I, uint64_t next, const hl_x86_sse4x_state *
             int lane = imm & (16 / nb - 1);
             if (I->is_mem) {
                 emit_ea(I, next);
+                emit_memory_guard(17, (uint64_t)nb, next - (uint64_t)I->len, X86_SOFT_WRITE);
                 e4_umov(16, D, lane, nb);
                 e_store(nb, 16, 17);
+                if (emit_soft_memory_active()) emit_soft_store_commit((uint64_t)nb);
             } else {
                 e4_umov(I->rm_reg, D, lane, nb); // zero-extends into the full GPR (x86 r32 semantics)
             }
@@ -127,6 +133,7 @@ int hl_x86_lower_sse4x(struct insn *I, uint64_t next, const hl_x86_sse4x_state *
             int src;
             if (I->is_mem) {
                 emit_ea(I, next);
+                emit_memory_guard(17, (uint64_t)nb, next - (uint64_t)I->len, X86_SOFT_READ);
                 e_load(nb, 16, 17);
                 src = 16;
             } else {
@@ -141,6 +148,7 @@ int hl_x86_lower_sse4x(struct insn *I, uint64_t next, const hl_x86_sse4x_state *
             int countD = (imm >> 4) & 3, zmask = imm & 0xf;
             if (I->is_mem) {
                 emit_ea(I, next);
+                emit_memory_guard(17, 4, next - (uint64_t)I->len, X86_SOFT_READ);
                 hl_x86_emit_load_scalar32(19, 17); // m32 -> lane 0 of v19 (rest zeroed)
                 hl_x86_emit_insert_scalar32(D, countD, 19, 0);
             } else {

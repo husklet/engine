@@ -134,7 +134,6 @@ static void fd_carry_virt(int newfd, int oldfd, struct fdvis_reservation *reserv
 #define G_O_LARGEFILE 0x20000 // aarch64 / asm-generic
 #endif
 
-
 /* FUSE/shared host mounts may expose regular I/O but reject sparse seeking. Keep Linux guest semantics
  * available there by finding logical zero/data runs; native filesystem extents remain preferred. */
 static off_t sparse_seek_fallback(int fd, off_t offset, int guest_whence) {
@@ -373,6 +372,36 @@ static int64_t memf_fsize_gate(struct cpu *c, off_t pos, uint64_t count) {
     return count > room ? (int64_t)room : (int64_t)count;
 }
 
+static ssize_t io_guest_vector_gather(uint64_t address, size_t count, void *output, size_t capacity) {
+    struct iovec vectors[1024];
+    if (count > 1024 || guest_iov_import(address, count, vectors) < 0) return -EFAULT;
+    size_t done = 0;
+    for (size_t index = 0; index < count && done < capacity; ++index) {
+        size_t amount = vectors[index].iov_len;
+        if (amount > capacity - done) amount = capacity - done;
+        ssize_t copied = guest_copy_from((uint8_t *)output + done, (uint64_t)(uintptr_t)vectors[index].iov_base, amount);
+        if (copied <= 0 && amount != 0) return done != 0 ? (ssize_t)done : -EFAULT;
+        done += (size_t)copied;
+        if ((size_t)copied != amount) break;
+    }
+    return (ssize_t)done;
+}
+
+static ssize_t io_guest_vector_scatter(uint64_t address, size_t count, const void *input, size_t length) {
+    struct iovec vectors[1024];
+    if (count > 1024 || guest_iov_import(address, count, vectors) < 0) return -EFAULT;
+    size_t done = 0;
+    for (size_t index = 0; index < count && done < length; ++index) {
+        size_t amount = vectors[index].iov_len;
+        if (amount > length - done) amount = length - done;
+        ssize_t copied = guest_copy_to((uint64_t)(uintptr_t)vectors[index].iov_base, (const uint8_t *)input + done, amount);
+        if (copied <= 0 && amount != 0) return done != 0 ? (ssize_t)done : -EFAULT;
+        done += (size_t)copied;
+        if ((size_t)copied != amount) break;
+    }
+    return (ssize_t)done;
+}
+
 static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                   uint64_t a5) {
     // Scatter/gather iovcnt bound (readv/writev/preadv/pwritev). Linux (fs/read_write.c) rejects nr_segs
@@ -382,8 +411,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // arrives as a huge unsigned value) then sums wild lengths and mis-reports EFBIG/0 instead of EINVAL.
     // nr_segs is an unsigned long in the kernel, so the unsigned `a2 > 1024` test also captures negatives.
     // The kernel looks up the fd first, so a bad fd must still win with EBADF: gate on the fd being open.
-    if ((nr == 65 || nr == 66 || nr == 69 || nr == 70) && a2 > 1024 &&
-        (int)a0 >= 0 && fcntl((int)a0, F_GETFD) != -1) {
+    if ((nr == 65 || nr == 66 || nr == 69 || nr == 70) && a2 > 1024 && (int)a0 >= 0 && fcntl((int)a0, F_GETFD) != -1) {
         G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
         return svc_done(c);
     }
@@ -392,8 +420,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // and BSD/macOS readv/writev reject iovcnt 0 with EINVAL -- a host-passthrough divergence from the Linux
     // ABI. Emulate the Linux zero return directly once the fd is confirmed open (a bad fd must still win with
     // EBADF, which the host path below reports on either kernel).
-    if ((nr == 65 || nr == 66 || nr == 69 || nr == 70) && a2 == 0 &&
-        (int)a0 >= 0 && fcntl((int)a0, F_GETFD) != -1) {
+    if ((nr == 65 || nr == 66 || nr == 69 || nr == 70) && a2 == 0 && (int)a0 >= 0 && fcntl((int)a0, F_GETFD) != -1) {
         G_RET(c) = 0;
         return svc_done(c);
     }
@@ -404,12 +431,16 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // EINVAL for such a segment -- a host-passthrough divergence. Emulate the Linux access_ok rejection: any
     // segment whose base+len wraps or exceeds the 48-bit user ceiling can never name real guest memory, so it
     // is -EFAULT on every host. Real guest buffers live far below this ceiling, so valid I/O is untouched.
-    if ((nr == 65 || nr == 66 || nr == 69 || nr == 70) && a2 > 0 && a2 <= 1024 && a1 != 0 &&
-        (int)a0 >= 0 && fcntl((int)a0, F_GETFD) != -1) {
-        const struct iovec *iov = (const struct iovec *)a1;
+    if ((nr == 65 || nr == 66 || nr == 69 || nr == 70) && a2 > 0 && a2 <= 1024 && a1 != 0 && (int)a0 >= 0 &&
+        fcntl((int)a0, F_GETFD) != -1) {
+        struct iovec imported[1024];
+        if (guest_iov_import(a1, (size_t)a2, imported) < 0) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            return svc_done(c);
+        }
         for (int i = 0; i < (int)a2; i++) {
-            uintptr_t base = (uintptr_t)iov[i].iov_base;
-            uintptr_t len = (uintptr_t)iov[i].iov_len;
+            uintptr_t base = (uintptr_t)imported[i].iov_base;
+            uintptr_t len = (uintptr_t)imported[i].iov_len;
             if (len && (base + len < base || base + len > UINT64_C(0x0001000000000000))) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 return svc_done(c);
@@ -430,9 +461,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         case 69:
         case 70:
         case 82: /* fsync */
-        case 83: /* fdatasync */
-            G_RET(c) = (uint64_t)(int64_t)(-EBADF);
-            return svc_done(c);
+        case 83: /* fdatasync */ G_RET(c) = (uint64_t)(int64_t)(-EBADF); return svc_done(c);
         default: break;
         }
     }
@@ -572,25 +601,68 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         int rfd = (int)a0;
         // tee(2) pushback: bytes a prior tee() peeked out of this pipe are re-served here first, in order.
         if (rfd >= 0 && rfd < HL_NFD && g_fd_pb_len[rfd]) {
-            G_RET(c) = (uint64_t)pipe_pushback_take(rfd, (void *)a1, (size_t)a2);
+            size_t want = (size_t)a2;
+            size_t accessible = guest_accessible_prefix(a1, want, HL_LOGICAL_VMA_WRITE);
+            if (want != 0 && accessible == 0) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            want = accessible;
+            void *buffer = malloc(want == 0 ? 1 : want);
+            if (buffer == NULL) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            size_t taken = pipe_pushback_take(rfd, buffer, want);
+            ssize_t copied = guest_copy_to(a1, buffer, taken);
+            free(buffer);
+            G_RET(c) = copied == (ssize_t)taken ? taken : copied > 0 ? (uint64_t)copied : (uint64_t)(-EFAULT);
             break;
         }
         // AF_NETLINK socket read: busybox `ip` receives its RTNETLINK dump with read(2)/recvmsg;
         // drain our queued reply with the Linux MSG_PEEK/MSG_TRUNC semantics (see netns.c nl_recv).
         if (nl_is(rfd)) {
-            struct iovec iov = {(void *)a1, (size_t)a2};
-            G_RET(c) = (uint64_t)nl_recv(rfd, &iov, 1, 0, NULL);
+            size_t accessible = guest_accessible_prefix(a1, (size_t)a2, HL_LOGICAL_VMA_WRITE);
+            if (a2 && !accessible) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            uint8_t *buffer = malloc(accessible ? accessible : 1);
+            if (!buffer) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            struct iovec iov = {buffer, accessible};
+            int64_t result = nl_recv(rfd, &iov, 1, 0, NULL);
+            if (result > 0) {
+                size_t produced = (uint64_t)result < accessible ? (size_t)result : accessible;
+                ssize_t copied = guest_copy_to(a1, buffer, produced);
+                if (copied != (ssize_t)produced) result = copied > 0 ? copied : -EFAULT;
+            }
+            free(buffer);
+            G_RET(c) = (uint64_t)result;
             break;
         }
         // RAM-backed scratch file: serve the read from memory. Unlike a host-fd read (whose kernel copyout
         // faults a bad buffer to EFAULT), this copies straight into the guest buffer, so a bad/unmapped
         // pointer must be validated here or the engine memcpy faults (access_ok).
         if (memf_get(rfd)) {
-            if (a2 && !host_range_mapped((uintptr_t)a1, (size_t)a2)) {
+            size_t accessible = guest_accessible_prefix(a1, (size_t)a2, HL_LOGICAL_VMA_WRITE);
+            if (a2 != 0 && accessible == 0) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
-            ssize_t r = memf_read_pos(g_memf[rfd], (void *)a1, (size_t)a2);
+            void *buffer = malloc(accessible == 0 ? 1 : accessible);
+            if (buffer == NULL) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            ssize_t r = memf_read_pos(g_memf[rfd], buffer, accessible);
+            if (r > 0) {
+                ssize_t copied = guest_copy_to(a1, buffer, (size_t)r);
+                if (copied != r) r = copied > 0 ? copied : -EFAULT;
+            }
+            free(buffer);
             G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
             break;
         }
@@ -631,18 +703,22 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             if (a1 && a2 >= 128) {
                 // a1 is a raw guest buffer we write directly -> EFAULT a bad pointer instead of faulting the engine
-                if (!host_range_mapped((uintptr_t)a1, 128)) {
+                uint8_t info[128] = {0};
+                uint32_t signo = (uint32_t)sig, pid = (uint32_t)(popped ? ent.pid : g_sigpid[sig]);
+                uint32_t uid = (uint32_t)(popped ? ent.uid : g_siguid[sig]);
+                int32_t code = popped ? ent.code : g_sigcode[sig];
+                memcpy(info, &signo, sizeof(signo));
+                memcpy(info + 8, &code, sizeof(code));
+                memcpy(info + 12, &pid, sizeof(pid));
+                memcpy(info + 16, &uid, sizeof(uid));
+                uint64_t val = popped ? ent.value : g_sigval[sig];
+                int32_t integer = (int32_t)val;
+                memcpy(info + 44, &integer, sizeof(integer));
+                memcpy(info + 48, &val, sizeof(val));
+                if (guest_copy_to(a1, info, sizeof(info)) != (ssize_t)sizeof(info)) {
                     G_RET(c) = (uint64_t)(-EFAULT);
                     break;
                 }
-                memset((void *)a1, 0, 128);
-                *(uint32_t *)(a1 + 0) = (uint32_t)sig;                              // ssi_signo
-                *(int32_t *)(a1 + 8) = popped ? ent.code : g_sigcode[sig];          // ssi_code
-                *(uint32_t *)(a1 + 12) = (uint32_t)(popped ? ent.pid : g_sigpid[sig]); // ssi_pid
-                *(uint32_t *)(a1 + 16) = (uint32_t)(popped ? ent.uid : g_siguid[sig]); // ssi_uid
-                uint64_t val = popped ? ent.value : g_sigval[sig];
-                *(int32_t *)(a1 + 44) = (int32_t)val;  // ssi_int (sigqueue value)
-                *(uint64_t *)(a1 + 48) = val;          // ssi_ptr
                 if (!popped) {
                     g_sigcode[sig] = 0;
                     g_sigval[sig] = 0;
@@ -655,19 +731,21 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         // inotify read -> struct inotify_event[]
 #if defined(__linux__)
-        if (rfd >= 0 && rfd < HL_NFD && g_inotify[rfd] &&
-            g_inotify_raw_pos[rfd] < g_inotify_raw_len[rfd]) {
+        if (rfd >= 0 && rfd < HL_NFD && g_inotify[rfd] && g_inotify_raw_pos[rfd] < g_inotify_raw_len[rfd]) {
             if (a2 < 16) {
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
             }
-            if (!host_range_mapped((uintptr_t)a1, (size_t)a2)) {
+            if (guest_accessible_prefix(a1, (size_t)a2, HL_LOGICAL_VMA_WRITE) != (size_t)a2) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
             size_t available = g_inotify_raw_len[rfd] - g_inotify_raw_pos[rfd];
             size_t copied = available < (size_t)a2 ? available : (size_t)a2;
-            memcpy((void *)a1, g_inotify_raw[rfd] + g_inotify_raw_pos[rfd], copied);
+            if (guest_copy_to(a1, g_inotify_raw[rfd] + g_inotify_raw_pos[rfd], copied) != (ssize_t)copied) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
             g_inotify_raw_pos[rfd] += copied;
             if (g_inotify_raw_pos[rfd] == g_inotify_raw_len[rfd]) {
                 free(g_inotify_raw[rfd]);
@@ -687,11 +765,15 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             // The whole [a1, a1+a2) buffer is written directly by the engine below; validate it up front so a
             // bad/unmapped pointer returns -EFAULT (without consuming events) instead of faulting the engine.
-            if (!host_range_mapped((uintptr_t)a1, (size_t)a2)) {
+            if (guest_accessible_prefix(a1, (size_t)a2, HL_LOGICAL_VMA_WRITE) != (size_t)a2) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
-            uint8_t *out = (uint8_t *)a1;
+            uint8_t *out = malloc((size_t)a2);
+            if (!out) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
             size_t off = 0;
             // First drain any queued rename events (IN_MOVED_FROM/IN_MOVED_TO) for this instance; the
             // snapshot diff below can only synthesize IN_CREATE/IN_DELETE, not paired moves.
@@ -739,10 +821,13 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             int n = kevent(rfd, NULL, 0, kv, 32, (nb || off > 0) ? &zero : NULL);
             if (n <= 0) {
                 if (off > 0) {
-                    G_RET(c) = (uint64_t)off;
+                    ssize_t copied = guest_copy_to(a1, out, off);
+                    G_RET(c) = copied == (ssize_t)off ? (uint64_t)off : (uint64_t)(-EFAULT);
+                    free(out);
                     break;
                 } // return the moves we already have
                 G_RET(c) = (uint64_t)(int64_t)(n < 0 ? -errno : -EAGAIN);
+                free(out);
                 break;
             }
             for (int i = 0; i < n; i++) {
@@ -787,7 +872,9 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     off += 16;
                 }
             }
-            G_RET(c) = (uint64_t)off;
+            ssize_t copied = guest_copy_to(a1, out, off);
+            G_RET(c) = copied == (ssize_t)off ? (uint64_t)off : (uint64_t)(-EFAULT);
+            free(out);
             break;
         }
 #endif
@@ -830,7 +917,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 struct timespec zero = {0, 0};
                 (void)kevent(rfd, NULL, 0, &stale, 1, &zero);
                 if (expirations != 0) {
-                    if (!a1 || !host_range_mapped((uintptr_t)a1, 8)) {
+                    if (!a1 || guest_accessible_prefix(a1, 8, HL_LOGICAL_VMA_WRITE) != 8) {
                         G_RET(c) = (uint64_t)(-EFAULT);
                         break;
                     }
@@ -841,7 +928,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     }
                     g_tfd_deadline[tslot] = next;
                     g_tfd_interval[tslot] = interval;
-                    *(uint64_t *)a1 = expirations;
+                    if (guest_copy_to(a1, &expirations, sizeof(expirations)) != (ssize_t)sizeof(expirations)) {
+                        G_RET(c) = (uint64_t)(-EFAULT);
+                        break;
+                    }
                     G_RET(c) = 8;
                     break;
                 }
@@ -860,7 +950,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             if (g_tfd_pending[tslot] != 0) {
-                if (!a1 || !host_range_mapped((uintptr_t)a1, 8)) {
+                if (!a1 || guest_accessible_prefix(a1, 8, HL_LOGICAL_VMA_WRITE) != 8) {
                     G_RET(c) = (uint64_t)(-EFAULT);
                     break;
                 }
@@ -874,8 +964,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
                     int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
                     if (now_ns >= g_tfd_deadline[tslot]) {
-                        uint64_t elapsed = 1 + (uint64_t)((now_ns - g_tfd_deadline[tslot]) /
-                                                         g_tfd_interval[tslot]);
+                        uint64_t elapsed = 1 + (uint64_t)((now_ns - g_tfd_deadline[tslot]) / g_tfd_interval[tslot]);
                         expirations += elapsed;
                         g_tfd_deadline[tslot] += (int64_t)elapsed * g_tfd_interval[tslot];
                     }
@@ -886,7 +975,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     (void)kevent(rfd, &future, 1, NULL, 0, NULL);
                     g_tfd_first_oneshot[tslot] = 1;
                 }
-                *(uint64_t *)a1 = expirations;
+                if (guest_copy_to(a1, &expirations, sizeof(expirations)) != (ssize_t)sizeof(expirations)) {
+                    G_RET(c) = (uint64_t)(-EFAULT);
+                    break;
+                }
                 G_RET(c) = 8;
                 break;
             }
@@ -900,7 +992,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 // EAGAIN
             }
             if (a1 && a2 >= 8) {
-                if (!host_range_mapped((uintptr_t)a1, 8)) {
+                if (guest_accessible_prefix(a1, 8, HL_LOGICAL_VMA_WRITE) != 8) {
                     G_RET(c) = (uint64_t)(-EFAULT);
                     break;
                 }
@@ -923,7 +1015,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     if (now_ns >= g_tfd_deadline[tslot])
                         expirations = 1 + (uint64_t)((now_ns - g_tfd_deadline[tslot]) / g_tfd_interval[tslot]);
                 }
-                *(uint64_t *)a1 = expirations;
+                if (guest_copy_to(a1, &expirations, sizeof(expirations)) != (ssize_t)sizeof(expirations)) {
+                    G_RET(c) = (uint64_t)(-EFAULT);
+                    break;
+                }
             }
             // A periodic timerfd whose first expiry (it_value) differed from its interval was armed as a
             // one-shot for that first tick (event.c case 86). Now that the first tick has been consumed,
@@ -953,7 +1048,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // a1 (the result counter) is written directly below; reject a bad/NULL pointer here, before any
             // side effect (counter reset / pipe drain). Linux read(eventfd, NULL, 8) is EFAULT, not a
             // silent 8-byte success, so a null pointer must fault too (not just an out-of-range one).
-            if (!a1 || !host_range_mapped((uintptr_t)a1, 8)) {
+            if (!a1 || guest_accessible_prefix(a1, 8, HL_LOGICAL_VMA_WRITE) != 8) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
@@ -1002,7 +1097,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 if (write(g_eventfd_peer[rfd] - 1, &b, 1) < 0) {}
             }
             pthread_mutex_unlock(&g_eventfd_lock);
-            if (a1) *(uint64_t *)a1 = v;
+            if (guest_copy_to(a1, &v, sizeof(v)) != (ssize_t)sizeof(v)) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
             G_RET(c) = 8;
         eventfd_read_done:
             break;
@@ -1016,15 +1114,24 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = 0;
                 break;
             }
-            if (a1 && !host_range_mapped((uintptr_t)a1, want)) {
+            if (guest_accessible_prefix(a1, want, HL_LOGICAL_VMA_WRITE) != want) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
-            uint64_t *out = (uint64_t *)a1;
-            for (size_t i = 0; i < want / 8; i++)
-                out[i] = (1ULL << 63); // PM_PRESENT
+            uint64_t entries[512];
+            size_t done = 0;
+            for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); ++i) entries[i] = UINT64_C(1) << 63;
+            while (done < want) {
+                size_t chunk = want - done < sizeof(entries) ? want - done : sizeof(entries);
+                if (guest_copy_to(a1 + done, entries, chunk) != (ssize_t)chunk) {
+                    G_RET(c) = done != 0 ? done : (uint64_t)(-EFAULT);
+                    goto pagemap_done;
+                }
+                done += chunk;
+            }
             lseek(rfd, (off_t)want, SEEK_CUR);
             G_RET(c) = (uint64_t)want;
+        pagemap_done:
             break;
         }
         // SA_RESTART: a blocking read interrupted by a signal whose guest handler asked for restart is
@@ -1034,7 +1141,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         ssize_t r;
         ts_wait_enter(); // 'S' while a read may block (pipe/socket/tty; a ready/regular fd returns at once)
         do {
-            r = read(rfd, (void *)a1, (size_t)a2);
+            r = guest_fd_read(rfd, a1, (size_t)a2, 0, 0);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         ts_wait_leave();
         // /dev/tty (or /dev/console) tty semantics: a controlling terminal has no EOF-from-emptiness, so a
@@ -1071,11 +1178,11 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             // a1 is a raw guest pointer we read directly -> validate before the deref (covers NULL too)
-            if (!host_range_mapped((uintptr_t)a1, 8)) {
+            uint64_t add;
+            if (guest_copy_from(&add, a1, sizeof(add)) != (ssize_t)sizeof(add)) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
-            uint64_t add = *(uint64_t *)a1;
             if (add == 0xffffffffffffffffULL) {
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
@@ -1117,17 +1224,17 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // and update the synthetic file so reads through this open description
         // and through later opens agree.
         if (wfd >= 0 && wfd < HL_NFD && !strcmp(g_proc_text_desc[wfd], "self:oom_score_adj")) {
-            if (!a2 || a2 >= 32 || !host_range_mapped((uintptr_t)a1, (size_t)a2)) {
+            char value[32];
+            if (!a2 || a2 >= 32 || guest_copy_from(value, a1, (size_t)a2) != (ssize_t)a2) {
                 G_RET(c) = (uint64_t)(a2 ? -EFAULT : 0);
                 break;
             }
-            char value[32];
-            memcpy(value, (const void *)a1, (size_t)a2);
             value[a2] = 0;
             char *end = NULL;
             errno = 0;
             long parsed = strtol(value, &end, 10);
-            while (end && (*end == '\n' || *end == ' ' || *end == '\t')) end++;
+            while (end && (*end == '\n' || *end == ' ' || *end == '\t'))
+                end++;
             if (errno || !end || end == value || *end || parsed < -1000 || parsed > 1000) {
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
@@ -1150,13 +1257,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = 0;
                 break;
             }
-            if (!host_range_mapped((uintptr_t)a1, (size_t)a2)) {
+            char name[16];
+            size_t take = (size_t)a2 < sizeof name - 1 ? (size_t)a2 : sizeof name - 1;
+            if (guest_copy_from(name, a1, take) != (ssize_t)take) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
-            char name[16];
-            size_t take = (size_t)a2 < sizeof name - 1 ? (size_t)a2 : sizeof name - 1;
-            memcpy(name, (const void *)a1, take);
             name[take] = 0;
             char *nl = strchr(name, '\n');
             if (nl) *nl = 0;
@@ -1180,44 +1286,95 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // it, no dump was queued, and the follow-up recvmsg blocked forever ("container stuck Up").
         // Route it to nl_send so the dump is synthesized exactly as for the send* path.
         if (nl_is(wfd)) {
-            G_RET(c) = (uint64_t)nl_send(wfd, (const uint8_t *)a1, (size_t)a2);
+            uint8_t *buffer = malloc(a2 ? (size_t)a2 : 1);
+            if (!buffer) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            ssize_t copied = guest_copy_from(buffer, a1, (size_t)a2);
+            G_RET(c) = copied == (ssize_t)a2 ? (uint64_t)nl_send(wfd, buffer, (size_t)a2)
+                                             : (uint64_t)(copied > 0 ? copied : -EFAULT);
+            free(buffer);
             break;
         }
         // Container DNS: a query write(2)'d on a DNS socket (TCP DNS via write, or a connected-UDP write) is
         // parsed + answered by the host resolver (net.c/netns.c dns_send); nothing reaches the wire.
         if (wfd >= 0 && wfd < HL_NFD && g_dns_sock[wfd]) {
-            G_RET(c) = (uint64_t)dns_send(wfd, (const uint8_t *)a1, (size_t)a2, g_sock_stream[wfd]);
+            uint8_t *buffer = malloc(a2 ? (size_t)a2 : 1);
+            if (!buffer) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            ssize_t copied = guest_copy_from(buffer, a1, (size_t)a2);
+            G_RET(c) = copied == (ssize_t)a2
+                           ? (uint64_t)dns_send(wfd, buffer, (size_t)a2, g_sock_stream[wfd])
+                           : (uint64_t)(copied > 0 ? copied : -EFAULT);
+            free(buffer);
             break;
         }
         if (wfd >= 0 && wfd < HL_NFD && g_icmp_kind[wfd]) {
             int64_t result;
-            if (icmp_try_send(wfd, (const uint8_t *)a1, (size_t)a2, NULL, 0, &result)) {
+            uint8_t *buffer = malloc(a2 ? (size_t)a2 : 1);
+            if (!buffer) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            ssize_t copied = guest_copy_from(buffer, a1, (size_t)a2);
+            if (copied != (ssize_t)a2) {
+                free(buffer);
+                G_RET(c) = (uint64_t)(copied > 0 ? copied : -EFAULT);
+                break;
+            }
+            if (icmp_try_send(wfd, buffer, (size_t)a2, NULL, 0, &result)) {
+                free(buffer);
                 G_RET(c) = (uint64_t)result;
                 break;
             }
+            free(buffer);
         }
         {
-            struct iovec vector = {(void *)a1, (size_t)a2};
+            uint8_t *buffer = malloc(a2 ? (size_t)a2 : 1);
+            if (!buffer) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            ssize_t copied = guest_copy_from(buffer, a1, (size_t)a2);
+            if (copied != (ssize_t)a2) {
+                free(buffer);
+                G_RET(c) = (uint64_t)(copied > 0 ? copied : -EFAULT);
+                break;
+            }
+            struct iovec vector = {buffer, (size_t)a2};
             int64_t result;
             if (udp_switch_write(wfd, &vector, 1, &result)) {
+                free(buffer);
                 G_RET(c) = (uint64_t)result;
                 break;
             }
+            free(buffer);
         }
         // RAM-backed scratch file: serve the write from memory (spill to the host file past the cap).
         // Copies straight from the guest buffer, so validate it (a host-fd write's kernel copyin would fault
         // a bad pointer to EFAULT; this engine memcpy would instead crash) --, access_ok.
         if (memf_get(wfd) && memf_room_or_spill(wfd, (off_t)g_memf[wfd]->pos + (off_t)a2)) {
-            if (a2 && !host_range_mapped((uintptr_t)a1, (size_t)a2)) {
-                G_RET(c) = (uint64_t)(-EFAULT);
-                break;
-            }
             int64_t allowed = memf_fsize_gate(c, (off_t)g_memf[wfd]->pos, a2); // RLIMIT_FSIZE -> SIGXFSZ/EFBIG
             if (allowed < 0) {
                 G_RET(c) = (uint64_t)allowed;
                 break;
             }
-            ssize_t r = memf_write_pos(g_memf[wfd], (void *)a1, (size_t)allowed);
+            void *buffer = malloc(allowed == 0 ? 1 : (size_t)allowed);
+            if (buffer == NULL) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            ssize_t copied = guest_copy_from(buffer, a1, (size_t)allowed);
+            if (allowed != 0 && copied <= 0) {
+                free(buffer);
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            ssize_t r = memf_write_pos(g_memf[wfd], buffer, copied > 0 ? (size_t)copied : 0);
+            free(buffer);
             G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
             break;
         }
@@ -1231,7 +1388,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         ssize_t r; // SA_RESTART: restart a signal-interrupted blocking write in place (see case 63)
         do {
-            r = write(wfd, (void *)a1, (size_t)allowed);
+            r = guest_fd_write(wfd, a1, (size_t)allowed, 0, 0);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         svc_sigpipe_on_epipe(c, (int64_t)G_RET(c)); // write(2) to a broken pipe/socket -> guest SIGPIPE
@@ -1239,29 +1396,33 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     case 65: {
         if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_fd_pb_len[(int)a0]) { // tee(2) pushback served first
-            const struct iovec *iv = (const struct iovec *)a1;
-            size_t tot = 0;
-            for (int i = 0; i < (int)a2 && (int)a0 < HL_NFD && g_fd_pb_len[(int)a0]; i++) {
-                size_t k = pipe_pushback_take((int)a0, iv[i].iov_base, iv[i].iov_len);
-                tot += k;
-                if (k < iv[i].iov_len) break;
+            size_t available = g_fd_pb_len[(int)a0];
+            void *buffer = malloc(available == 0 ? 1 : available);
+            if (buffer == NULL) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
             }
-            G_RET(c) = (uint64_t)tot;
+            size_t taken = pipe_pushback_take((int)a0, buffer, available);
+            ssize_t copied = io_guest_vector_scatter(a1, (size_t)a2, buffer, taken);
+            free(buffer);
+            G_RET(c) = copied >= 0 ? (uint64_t)copied : (uint64_t)(int64_t)copied;
             break;
         }
         if (nl_is((int)a0)) { // netlink readv: drain the queued dump into the guest iov
-            G_RET(c) = (uint64_t)nl_recv((int)a0, (struct iovec *)a1, (int)a2, 0, NULL);
+            uint8_t buffer[65536];
+            struct iovec host = {buffer, sizeof(buffer)};
+            ssize_t received = nl_recv((int)a0, &host, 1, 0, NULL);
+            ssize_t copied = received > 0 ? io_guest_vector_scatter(a1, (size_t)a2, buffer, (size_t)received) : received;
+            G_RET(c) = (uint64_t)(int64_t)copied;
             break;
         }
         if (memf_get((int)a0)) {
-            ssize_t r = memf_preadv(g_memf[(int)a0], (const struct iovec *)a1, (int)a2, -1, 1);
-            G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
-            break;
+            memf_materialize((int)a0);
         }
         ssize_t r;       // SA_RESTART: restart a signal-interrupted blocking readv in place (see case 63)
         ts_wait_enter(); // 'S' while readv may block
         do {
-            r = readv((int)a0, (void *)a1, (int)a2);
+            r = guest_fd_vector((int)a0, a1, (size_t)a2, 0, 0, 1);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         ts_wait_leave();
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -1274,15 +1435,13 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         } // F_SEAL_WRITE
         if (nl_is((int)a0)) { // netlink writev: gather the request iov + queue the dump
-            const struct iovec *iv = (const struct iovec *)a1;
             uint8_t tmp[4096];
-            size_t tl = 0;
-            for (int i = 0; iv && i < (int)a2 && tl < sizeof tmp; i++) {
-                size_t n = iv[i].iov_len;
-                if (tl + n > sizeof tmp) n = sizeof tmp - tl;
-                memcpy(tmp + tl, iv[i].iov_base, n);
-                tl += n;
+            ssize_t gathered = io_guest_vector_gather(a1, (size_t)a2, tmp, sizeof(tmp));
+            if (gathered < 0) {
+                G_RET(c) = (uint64_t)(int64_t)gathered;
+                break;
             }
+            size_t tl = (size_t)gathered;
             nl_send((int)a0, tmp, tl);
             G_RET(c) = (uint64_t)tl;
             break;
@@ -1290,13 +1449,23 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // Container DNS: TCP DNS is commonly writev(len-prefix, query) (glibc send_vc). Gather + answer it.
         if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_dns_sock[(int)a0]) {
             uint8_t tmp[2048];
-            size_t tl = dns_gather((const struct iovec *)a1, (int)a2, tmp, sizeof tmp);
+            ssize_t gathered = io_guest_vector_gather(a1, (size_t)a2, tmp, sizeof(tmp));
+            if (gathered < 0) {
+                G_RET(c) = (uint64_t)(int64_t)gathered;
+                break;
+            }
+            size_t tl = (size_t)gathered;
             G_RET(c) = (uint64_t)dns_send((int)a0, tmp, tl, g_sock_stream[(int)a0]);
             break;
         }
         if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_icmp_kind[(int)a0]) {
             uint8_t tmp[2048];
-            size_t size = dns_gather((const struct iovec *)a1, (int)a2, tmp, sizeof tmp);
+            ssize_t gathered = io_guest_vector_gather(a1, (size_t)a2, tmp, sizeof(tmp));
+            if (gathered < 0) {
+                G_RET(c) = (uint64_t)(int64_t)gathered;
+                break;
+            }
+            size_t size = (size_t)gathered;
             int64_t result;
             if (icmp_try_send((int)a0, tmp, size, NULL, 0, &result)) {
                 G_RET(c) = (uint64_t)result;
@@ -1305,46 +1474,25 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         {
             int64_t result;
-            if (udp_switch_write((int)a0, (const struct iovec *)a1, (int)a2, &result)) {
+            uint8_t tmp[65536];
+            ssize_t gathered = io_guest_vector_gather(a1, (size_t)a2, tmp, sizeof(tmp));
+            struct iovec host = {tmp, gathered > 0 ? (size_t)gathered : 0};
+            if (gathered < 0) {
+                G_RET(c) = (uint64_t)(int64_t)gathered;
+                break;
+            }
+            if (udp_switch_write((int)a0, &host, 1, &result)) {
                 G_RET(c) = (uint64_t)result;
                 break;
             }
         }
         if (memf_get((int)a0)) {
-            // The iovec array a1 is read directly by the engine (the regular writev path lets the host
-            // syscall validate it, but the memf path dereferences it here) -> guard it before the loop.
-            int niov = (int)a2;
-            if (niov > 0 && !host_range_mapped((uintptr_t)a1, (size_t)niov * sizeof(struct iovec))) {
-                G_RET(c) = (uint64_t)(-EFAULT);
-                break;
-            }
-            const struct iovec *iv = (const struct iovec *)a1;
-            // memf_pwritev dereferences each iov_base directly (the host writev would fault -EFAULT on a bad
-            // buffer). Validate every segment up front so an unmapped iov_base yields -EFAULT like Linux
-            // rather than crashing the engine or copying garbage into the file.
-            for (int i = 0; i < (int)a2; i++)
-                if (iv[i].iov_len && !host_range_mapped((uintptr_t)iv[i].iov_base, iv[i].iov_len)) {
-                    G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
-                    return svc_done(c);
-                }
-            off_t start = g_memf[(int)a0]->pos;
-            off_t end = start;
-            for (int i = 0; i < (int)a2; i++)
-                end += iv[i].iov_len;
-            if (memf_fsize_gate(c, start, (uint64_t)(end - start)) < 0) { // RLIMIT_FSIZE at/beyond limit
-                G_RET(c) = (uint64_t)(int64_t)(-EFBIG);
-                break;
-            }
-            if (memf_room_or_spill((int)a0, end)) {
-                ssize_t r = memf_pwritev(g_memf[(int)a0], iv, (int)a2, -1, 1);
-                G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
-                break;
-            }
+            memf_materialize((int)a0);
         }
         hl_fdcache_fd_evict((int)a0);
         ssize_t r; // SA_RESTART: restart a signal-interrupted blocking writev in place (see case 63)
         do {
-            r = writev((int)a0, (void *)a1, (int)a2);
+            r = guest_fd_vector((int)a0, a1, (size_t)a2, 0, 0, 0);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         svc_sigpipe_on_epipe(c, (int64_t)G_RET(c)); // writev(2) to a broken pipe/socket -> guest SIGPIPE
@@ -1354,13 +1502,28 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     case 67: {
         // pread64
         if (memf_get((int)a0)) {
-            ssize_t r = memf_pread(g_memf[(int)a0], (void *)a1, (size_t)a2, (off_t)a3);
+            size_t accessible = guest_accessible_prefix(a1, (size_t)a2, HL_LOGICAL_VMA_WRITE);
+            if (a2 != 0 && accessible == 0) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            void *buffer = malloc(accessible == 0 ? 1 : accessible);
+            if (buffer == NULL) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            ssize_t r = memf_pread(g_memf[(int)a0], buffer, accessible, (off_t)a3);
+            if (r > 0) {
+                ssize_t copied = guest_copy_to(a1, buffer, (size_t)r);
+                if (copied != r) r = copied > 0 ? copied : -EFAULT;
+            }
+            free(buffer);
             G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
             break;
         }
         ssize_t r; // SA_RESTART: restart a signal-interrupted blocking pread in place (see case 63)
         do {
-            r = pread((int)a0, (void *)a1, (size_t)a2, (off_t)a3);
+            r = guest_fd_read((int)a0, a1, (size_t)a2, (off_t)a3, 1);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
@@ -1390,7 +1553,19 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = (uint64_t)allowed;
                 break;
             }
-            ssize_t r = memf_pwrite(g_memf[(int)a0], (void *)a1, (size_t)allowed, (off_t)a3);
+            void *buffer = malloc(allowed == 0 ? 1 : (size_t)allowed);
+            if (buffer == NULL) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            ssize_t copied = guest_copy_from(buffer, a1, (size_t)allowed);
+            if (allowed != 0 && copied <= 0) {
+                free(buffer);
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            ssize_t r = memf_pwrite(g_memf[(int)a0], buffer, copied > 0 ? (size_t)copied : 0, (off_t)a3);
+            free(buffer);
             G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
             break;
         }
@@ -1403,7 +1578,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         ssize_t r; // SA_RESTART: restart a signal-interrupted blocking pwrite in place (see case 63)
         do {
-            r = pwrite((int)a0, (void *)a1, (size_t)pw_allowed, (off_t)a3);
+            r = guest_fd_write((int)a0, a1, (size_t)pw_allowed, (off_t)a3, 1);
         } while (r < 0 && SVC_EINTR_RESTART(c));
         if (r > 0) filemap_written((int)a0, a3, (uint64_t)r);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -1414,7 +1589,8 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         int outfd = (int)a0, infd = (int)a1;
         memf_materialize(outfd); // sendfile reads/writes via the real fds -> flush RAM cache first
         memf_materialize(infd);
-        off_t *po = (off_t *)a2;
+        off_t offset_value = 0;
+        off_t *po = a2 != 0 ? &offset_value : NULL;
         size_t cnt = (size_t)a3;
         // Linux runs the count through rw_verify_area(), which rejects a count that is negative when read
         // as ssize_t with -EINVAL. The engine looped on the raw size_t, so sendfile(out, in, NULL, SIZE_MAX)
@@ -1425,7 +1601,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         // po (the in/out file offset) is read AND written directly -> validate before the copy loop so a bad
         // pointer returns -EFAULT instead of faulting the engine (and before any bytes move).
-        if (po && !host_range_mapped((uintptr_t)a2, sizeof(off_t))) {
+        if (po && guest_copy_from(po, a2, sizeof(*po)) != (ssize_t)sizeof(*po)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
@@ -1455,7 +1631,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         // Linux: once ANY bytes were transferred, sendfile returns that count (a later error surfaces on the
         // next call); an error before the first byte returns -errno.
-        if (po) *po = rpos;
+        if (po && guest_copy_to(a2, &rpos, sizeof(rpos)) != (ssize_t)sizeof(rpos)) {
+            G_RET(c) = tot != 0 ? (uint64_t)tot : (uint64_t)(-EFAULT);
+            break;
+        }
         G_RET(c) = rerr ? (uint64_t)(-rerr) : (uint64_t)tot;
         break;
     }
@@ -1463,7 +1642,6 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // bytes back into user memory (read end). Direction follows the pipe fd's access mode, matching Linux.
     case 75: {
         int vfd = (int)a0;
-        const struct iovec *iv = (const struct iovec *)a1;
         int niov = (int)a2;
         // SPLICE_F_MOVE(1)/NONBLOCK(2)/MORE(4)/GIFT(8) are the only defined bits; Linux rejects any other
         // bit with -EINVAL before touching the iovec. The engine ignored `flags` entirely.
@@ -1471,15 +1649,11 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        if (niov > 0 && !host_range_mapped((uintptr_t)a1, (size_t)niov * sizeof(struct iovec))) {
-            G_RET(c) = (uint64_t)(-EFAULT);
-            break;
-        }
         memf_materialize(vfd);
         int fl = fcntl(vfd, F_GETFL);
         int to_pipe = (fl < 0) || ((fl & O_ACCMODE) != O_RDONLY); // write end -> user pages into the pipe
         hl_fdcache_fd_evict(vfd);
-        ssize_t r = to_pipe ? writev(vfd, iv, niov) : readv(vfd, iv, niov);
+        ssize_t r = guest_fd_vector(vfd, a1, (size_t)niov, 0, 0, !to_pipe);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -1509,11 +1683,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         // splice reads/writes the optional off_in (a1) / off_out (a3) pointers directly; validate them
         // before moving any bytes so a bad pointer returns -EFAULT instead of faulting the engine.
-        if (a1 && !host_range_mapped((uintptr_t)a1, sizeof(off_t))) {
+        off_t input_offset = 0, output_offset = 0;
+        if (a1 && guest_copy_from(&input_offset, a1, sizeof(input_offset)) != (ssize_t)sizeof(input_offset)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        if (a3 && !host_range_mapped((uintptr_t)a3, sizeof(off_t))) {
+        if (a3 && guest_copy_from(&output_offset, a3, sizeof(output_offset)) != (ssize_t)sizeof(output_offset)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
@@ -1525,7 +1700,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         ssize_t n;
         hl_fdcache_fd_evict(fout);
         if (a1) {
-            n = pread(fin, sb, len, *(off_t *)a1);
+            n = pread(fin, sb, len, input_offset);
         } else {
             // a pipe source may carry tee()'d pushback -> serve that first (splice consumes it).
             size_t pb = pipe_pushback_take(fin, sb, len);
@@ -1535,13 +1710,18 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = n < 0 ? (uint64_t)(-errno) : 0;
             break;
         }
-        ssize_t w = a3 ? pwrite(fout, sb, n, *(off_t *)a3) : write(fout, sb, n);
+        ssize_t w = a3 ? pwrite(fout, sb, n, output_offset) : write(fout, sb, n);
         if (w < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
-        if (a1) *(off_t *)a1 += w;
-        if (a3) *(off_t *)a3 += w;
+        input_offset += w;
+        output_offset += w;
+        if ((a1 && guest_copy_to(a1, &input_offset, sizeof(input_offset)) != (ssize_t)sizeof(input_offset)) ||
+            (a3 && guest_copy_to(a3, &output_offset, sizeof(output_offset)) != (ssize_t)sizeof(output_offset))) {
+            G_RET(c) = (uint64_t)w;
+            break;
+        }
         G_RET(c) = (uint64_t)w;
         break;
     }
@@ -1557,8 +1737,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         {
             struct stat si, so;
-            if (!(fstat(fin, &si) == 0 && S_ISFIFO(si.st_mode)) ||
-                !(fstat(fout, &so) == 0 && S_ISFIFO(so.st_mode))) {
+            if (!(fstat(fin, &si) == 0 && S_ISFIFO(si.st_mode)) || !(fstat(fout, &so) == 0 && S_ISFIFO(so.st_mode))) {
                 G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
                 break;
             }
@@ -1778,7 +1957,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         if (lcmd == 5 || lcmd == 6 || lcmd == 7) {
             // macOS F_GETLK=7,SETLK=8,SETLKW=9
             int mc = lcmd == 5 ? F_GETLK : lcmd == 6 ? F_SETLK : F_SETLKW;
-            uint8_t *lf = (uint8_t *)a2;
+            uint8_t lf[32];
             // Linux order (SYSCALL_DEFINE3(fcntl) -> fcntl_getlk/setlk): the fd is validated (EBADF) BEFORE the
             // flock is copied in, so a bad fd wins over a bad pointer / bad l_whence. (LTP fcntl13: fcntl(-1,...).)
             if ((int)a0 < 0 || fcntl((int)a0, F_GETFD) < 0) {
@@ -1789,14 +1968,15 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // validate the 32-byte struct before any deref so a bad pointer returns -EFAULT, not a crash. A guest
             // PROT_NONE flock buffer (LTP fcntl13 uses one) is force-mapped host-writable by hl, but
             // host_range_mapped rejects it via its internal gna_hit check so it still EFAULTs like Linux.
-            if (!host_range_mapped((uintptr_t)a2, 32)) {
+            if (guest_copy_from(lf, a2, sizeof(lf)) != (ssize_t)sizeof(lf)) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
             // l_whence must be SEEK_SET/SEEK_CUR/SEEK_END; Linux rejects anything else with EINVAL in
             // flock_to_posix_lock -- BEFORE the fd type is consulted, so it applies to a pipe fd too. (LTP fcntl13)
             {
-                short whence = *(short *)(lf + 2);
+                short whence;
+                memcpy(&whence, lf + 2, sizeof(whence));
                 if (whence != 0 && whence != 1 && whence != 2) {
                     G_RET(c) = (uint64_t)(-EINVAL);
                     break;
@@ -1809,7 +1989,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             {
                 int pout = 0, claimed;
                 for (;;) {
-                    claimed = poslk_op((int)a0, lcmd, (uint8_t *)a2, &pout);
+                    claimed = poslk_op((int)a0, lcmd, lf, &pout);
                     if (!claimed) break; // not a regular file -> fall through to the host fcntl path
                     if (lcmd == 7 && pout == -EAGAIN) {
                         uint64_t p = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST) |
@@ -1836,21 +2016,28 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             struct flock fl;
             // Linux flock: type/whence/pad/start@8/len@16/pid@24
             memset(&fl, 0, sizeof fl);
-            short lt = *(short *)(lf + 0);
+            short lt;
+            memcpy(&lt, lf, sizeof(lt));
             // Linux RDLCK=0,WRLCK=1,UNLCK=2 -> macOS
             fl.l_type = lt == 0 ? F_RDLCK : lt == 1 ? F_WRLCK : F_UNLCK;
-            fl.l_whence = *(short *)(lf + 2);
-            fl.l_start = *(int64_t *)(lf + 8);
-            fl.l_len = *(int64_t *)(lf + 16);
-            fl.l_pid = *(int32_t *)(lf + 24);
+            memcpy(&fl.l_whence, lf + 2, sizeof(fl.l_whence));
+            memcpy(&fl.l_start, lf + 8, sizeof(fl.l_start));
+            memcpy(&fl.l_len, lf + 16, sizeof(fl.l_len));
+            memcpy(&fl.l_pid, lf + 24, sizeof(fl.l_pid));
             int r = fcntl((int)a0, mc, &fl), e = errno;
             // F_GETLK writes the conflicting lock back
             if (r >= 0 && lcmd == 5) {
-                *(short *)(lf + 0) = fl.l_type == F_RDLCK ? 0 : fl.l_type == F_WRLCK ? 1 : 2;
-                *(short *)(lf + 2) = fl.l_whence;
-                *(int64_t *)(lf + 8) = fl.l_start;
-                *(int64_t *)(lf + 16) = fl.l_len;
-                *(int32_t *)(lf + 24) = (int32_t)fl.l_pid;
+                short type = fl.l_type == F_RDLCK ? 0 : fl.l_type == F_WRLCK ? 1 : 2;
+                int32_t pid = (int32_t)fl.l_pid;
+                memcpy(lf, &type, sizeof(type));
+                memcpy(lf + 2, &fl.l_whence, sizeof(fl.l_whence));
+                memcpy(lf + 8, &fl.l_start, sizeof(fl.l_start));
+                memcpy(lf + 16, &fl.l_len, sizeof(fl.l_len));
+                memcpy(lf + 24, &pid, sizeof(pid));
+                if (guest_copy_to(a2, lf, sizeof(lf)) != (ssize_t)sizeof(lf)) {
+                    G_RET(c) = (uint64_t)(-EFAULT);
+                    break;
+                }
             }
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : (uint64_t)r;
             break;
@@ -1905,11 +2092,18 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // otherwise the do_fcntl default wrongly returns EINVAL where native returns the real hint. macOS
         // has no such command, so this stays Linux-only and the default switch keeps EINVAL there.
         if (lcmd >= 1035 && lcmd <= 1038) {
-            if (a2 && !host_range_mapped((uintptr_t)a2, sizeof(uint64_t))) {
+            uint64_t hint = 0;
+            int is_get = lcmd == 1035 || lcmd == 1037;
+            if (!a2 || (!is_get && guest_copy_from(&hint, a2, sizeof(hint)) != (ssize_t)sizeof(hint)) ||
+                (is_get && guest_accessible_prefix(a2, sizeof(hint), HL_LOGICAL_VMA_WRITE) != sizeof(hint))) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
             }
-            long r = fcntl((int)a0, lcmd, (unsigned long)a2);
+            long r = fcntl((int)a0, lcmd, &hint);
+            if (r >= 0 && is_get && guest_copy_to(a2, &hint, sizeof(hint)) != (ssize_t)sizeof(hint)) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
             G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)errno) : (uint64_t)(unsigned)r;
             break;
         }
@@ -2123,11 +2317,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // connection then hangs. Translate it to the O_ASYNC file-status flag (fcntl), exactly like Linux,
         // and defer every other request to svc_fs by returning "not handled".
         if (a1 != 0x5452) return 0; // not FIOASYNC -> let svc_fs handle it
-        if (a2 && !host_range_mapped((uintptr_t)a2, sizeof(int))) {
+        int on = 0;
+        if (!a2 || guest_copy_from(&on, a2, sizeof(on)) != (ssize_t)sizeof(on)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        int on = a2 ? *(int *)a2 : 0, fl = fcntl((int)a0, F_GETFL);
+        int fl = fcntl((int)a0, F_GETFL);
         if (fl < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;
@@ -2151,7 +2346,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         }
         // a0 receives the two result fds (8 bytes). Validate it BEFORE creating the pipe so a bad pointer
         // returns -EFAULT without leaking the freshly-opened fds (and without faulting the engine).
-        if (!host_range_mapped((uintptr_t)a0, 2 * sizeof(int))) {
+        if (guest_accessible_prefix(a0, 2 * sizeof(int), HL_LOGICAL_VMA_WRITE) != 2 * sizeof(int)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
@@ -2185,8 +2380,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(-EMFILE);
             break;
         }
-        ((int *)a0)[0] = fds[0];
-        ((int *)a0)[1] = fds[1];
+        if (guest_copy_to(a0, fds, sizeof(fds)) != (ssize_t)sizeof(fds)) {
+            close(fds[0]);
+            close(fds[1]);
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
         // An O_DIRECT pipe is backed by a DGRAM socketpair (above). Like a real pipe it must report EOF
         // when the write end closes, but macOS DGRAM sockets don't -- mark both ends so close() sends a
         // zero-length EOF datagram and read() coerces the peer-closed ECONNRESET to 0. (See netns.c.)
@@ -2231,14 +2430,15 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         memf_materialize(fdout);
         size_t len = (size_t)a4, done = 0;
         int err = 0;
-        off_t *poi = (off_t *)a1, *poo = (off_t *)a3;
+        off_t input_offset = 0, output_offset = 0;
+        off_t *poi = a1 != 0 ? &input_offset : NULL, *poo = a3 != 0 ? &output_offset : NULL;
         // off_in (a1) / off_out (a3) are read here and written back below -> validate before any deref so a
         // bad pointer returns -EFAULT instead of faulting the engine (and before any bytes are copied).
-        if (poi && !host_range_mapped((uintptr_t)a1, sizeof(off_t))) {
+        if (poi && guest_copy_from(poi, a1, sizeof(*poi)) != (ssize_t)sizeof(*poi)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        if (poo && !host_range_mapped((uintptr_t)a3, sizeof(off_t))) {
+        if (poo && guest_copy_from(poo, a3, sizeof(*poo)) != (ssize_t)sizeof(*poo)) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
@@ -2248,8 +2448,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // effective start offsets (explicit offset, else the current file position for a NULL offset).
         if (len > 0) {
             struct stat si, so;
-            if (fstat(fdin, &si) == 0 && fstat(fdout, &so) == 0 && si.st_dev == so.st_dev &&
-                si.st_ino == so.st_ino) {
+            if (fstat(fdin, &si) == 0 && fstat(fdout, &so) == 0 && si.st_dev == so.st_dev && si.st_ino == so.st_ino) {
                 off_t is = poi ? *poi : lseek(fdin, 0, SEEK_CUR);
                 off_t os = poo ? *poo : lseek(fdout, 0, SEEK_CUR);
                 if (is >= 0 && os >= 0 && is < os + (off_t)len && os < is + (off_t)len) {
@@ -2277,8 +2476,11 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (oo >= 0) oo += w;
             if (w < r) break;
         }
-        if (poi) *poi = oi;
-        if (poo) *poo = oo;
+        if ((poi && guest_copy_to(a1, &oi, sizeof(oi)) != (ssize_t)sizeof(oi)) ||
+            (poo && guest_copy_to(a3, &oo, sizeof(oo)) != (ssize_t)sizeof(oo))) {
+            G_RET(c) = done != 0 ? (uint64_t)done : (uint64_t)(-EFAULT);
+            break;
+        }
         hl_fdcache_fd_evict(fdout);
         G_RET(c) = (done == 0 && err) ? (uint64_t)(-(int64_t)err) : (uint64_t)done;
         break;
@@ -2286,11 +2488,9 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // preadv/pwritev: struct iovec layout is identical Linux<->macOS
     case 69: {
         if (memf_get((int)a0)) {
-            ssize_t r = memf_preadv(g_memf[(int)a0], (const struct iovec *)a1, (int)a2, (off_t)a3, 0);
-            G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
-            break;
+            memf_materialize((int)a0);
         }
-        ssize_t r = preadv((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
+        ssize_t r = guest_fd_vector((int)a0, a1, (size_t)a2, (off_t)a3, 1, 1);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
@@ -2300,28 +2500,9 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             break;
         } // F_SEAL_WRITE
         if (memf_get((int)a0)) {
-            // memf path dereferences the iovec array a1 directly (the host pwritev path validates its own) ->
-            // guard it before the loop so a bad array pointer returns -EFAULT instead of faulting the engine.
-            int niov = (int)a2;
-            if (niov > 0 && !host_range_mapped((uintptr_t)a1, (size_t)niov * sizeof(struct iovec))) {
-                G_RET(c) = (uint64_t)(-EFAULT);
-                break;
-            }
-            const struct iovec *iv = (const struct iovec *)a1;
-            off_t end = (off_t)a3;
-            for (int i = 0; i < (int)a2; i++)
-                end += iv[i].iov_len;
-            if (memf_fsize_gate(c, (off_t)a3, (uint64_t)(end - (off_t)a3)) < 0) { // RLIMIT_FSIZE at/beyond limit
-                G_RET(c) = (uint64_t)(int64_t)(-EFBIG);
-                break;
-            }
-            if (memf_room_or_spill((int)a0, end)) {
-                ssize_t r = memf_pwritev(g_memf[(int)a0], iv, (int)a2, (off_t)a3, 0);
-                G_RET(c) = r < 0 ? (uint64_t)(int64_t)r : (uint64_t)r;
-                break;
-            }
+            memf_materialize((int)a0);
         }
-        ssize_t r = pwritev((int)a0, (const struct iovec *)a1, (int)a2, (off_t)a3);
+        ssize_t r = guest_fd_vector((int)a0, a1, (size_t)a2, (off_t)a3, 1, 0);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }

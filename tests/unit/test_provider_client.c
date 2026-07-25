@@ -1,5 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
-#include "../../src/core/provider_client.h"
+#include "../../src/core/provider/client.h"
 #include "test.h"
 
 #include <errno.h>

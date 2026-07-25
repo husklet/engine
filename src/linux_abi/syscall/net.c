@@ -178,13 +178,214 @@ static int net_precheck(int fd, uintptr_t addr, socklen_t alen, int is_connect) 
             // The private UDP switch is family-neutral: dual-stack listeners and BusyBox clients may
             // select opposite INET families while still addressing the same loopback endpoint. Preserve
             // strict Linux family validation for every other socket, but allow that narrow datagram pair.
-            int private_udp_dual = fd >= 0 && fd < HL_NFD && g_sock_dgram[fd] && lo_on() &&
-                                   ((sfam == LX_AF_INET && lfam == LX_AF_INET6) ||
-                                    (sfam == LX_AF_INET6 && lfam == LX_AF_INET));
+            int private_udp_dual =
+                fd >= 0 && fd < HL_NFD && g_sock_dgram[fd] && lo_on() &&
+                ((sfam == LX_AF_INET && lfam == LX_AF_INET6) || (sfam == LX_AF_INET6 && lfam == LX_AF_INET));
             if (lfam != sfam && !private_udp_dual) return -EAFNOSUPPORT;
             if (alen < need) return -EINVAL;
         }
     }
+    return 0;
+}
+
+typedef struct net_sockaddr_copyout {
+    struct cpu *cpu;
+    uint64_t guest_address;
+    uint64_t guest_length;
+    socklen_t capacity;
+    socklen_t length;
+    uint8_t address[sizeof(struct sockaddr_storage)];
+    int active;
+} net_sockaddr_copyout;
+
+static int net_sockaddr_copyout_begin(net_sockaddr_copyout *copyout, struct cpu *cpu, uint64_t guest_address,
+                                      uint64_t guest_length) {
+    memset(copyout, 0, sizeof(*copyout));
+    copyout->cpu = cpu;
+    copyout->guest_address = guest_address;
+    copyout->guest_length = guest_length;
+    if (!guest_address) return 0;
+    if (!guest_length ||
+        guest_copy_from(&copyout->capacity, guest_length, sizeof(copyout->capacity)) != sizeof(copyout->capacity))
+        return -EFAULT;
+    size_t accessible = copyout->capacity;
+    if (accessible > sizeof(copyout->address)) accessible = sizeof(copyout->address);
+    if (accessible && guest_accessible_prefix(guest_address, accessible, PROT_WRITE) != accessible) return -EFAULT;
+    copyout->length = copyout->capacity;
+    copyout->active = 1;
+    return 0;
+}
+
+static void net_sockaddr_copyout_finish(void *opaque) {
+    net_sockaddr_copyout *copyout = opaque;
+    if (!copyout->active || (int64_t)G_RET(copyout->cpu) < 0) return;
+    size_t length = copyout->capacity < copyout->length ? copyout->capacity : copyout->length;
+    if (length > sizeof(copyout->address)) length = sizeof(copyout->address);
+    if ((length && guest_copy_to(copyout->guest_address, copyout->address, length) != (ssize_t)length) ||
+        guest_copy_to(copyout->guest_length, &copyout->length, sizeof(copyout->length)) != sizeof(copyout->length))
+        G_RET(copyout->cpu) = (uint64_t)(int64_t)(-EFAULT);
+}
+
+typedef struct net_option_copyout {
+    struct cpu *cpu;
+    uint64_t guest_value;
+    uint64_t guest_length;
+    socklen_t capacity;
+    socklen_t length;
+    void *value;
+    int active;
+} net_option_copyout;
+
+static int net_option_copyout_begin(net_option_copyout *copyout, struct cpu *cpu, uint64_t guest_value,
+                                    uint64_t guest_length) {
+    memset(copyout, 0, sizeof(*copyout));
+    copyout->cpu = cpu;
+    copyout->guest_value = guest_value;
+    copyout->guest_length = guest_length;
+    if (!guest_value) return 0;
+    if (!guest_length ||
+        guest_copy_from(&copyout->capacity, guest_length, sizeof(copyout->capacity)) != sizeof(copyout->capacity))
+        return -EFAULT;
+    if (copyout->capacity > 1024 * 1024) return -EINVAL;
+    if (copyout->capacity && guest_accessible_prefix(guest_value, copyout->capacity, PROT_WRITE) != copyout->capacity)
+        return -EFAULT;
+    copyout->value = calloc(copyout->capacity ? copyout->capacity : 1, 1);
+    if (!copyout->value) return -ENOMEM;
+    copyout->length = copyout->capacity;
+    copyout->active = 1;
+    return 0;
+}
+
+static void net_option_copyout_finish(void *opaque) {
+    net_option_copyout *copyout = opaque;
+    if (!copyout->active) return;
+    if ((int64_t)G_RET(copyout->cpu) >= 0) {
+        size_t length = copyout->capacity < copyout->length ? copyout->capacity : copyout->length;
+        if ((length && guest_copy_to(copyout->guest_value, copyout->value, length) != (ssize_t)length) ||
+            guest_copy_to(copyout->guest_length, &copyout->length, sizeof(copyout->length)) != sizeof(copyout->length))
+            G_RET(copyout->cpu) = (uint64_t)(int64_t)(-EFAULT);
+    }
+    free(copyout->value);
+}
+
+typedef struct net_message_bounce {
+    struct cpu *cpu;
+    uint64_t guest_header;
+    uint8_t header[56];
+    uint64_t count;
+    uint64_t guest_iov_address;
+    uint64_t raw_guest_iov_address;
+    struct iovec guest_iov[1024];
+    struct iovec host_iov[1024];
+    uint64_t guest_name;
+    uint64_t raw_guest_name;
+    uint32_t name_capacity;
+    void *name;
+    uint64_t guest_control;
+    uint64_t raw_guest_control;
+    size_t control_capacity;
+    void *control;
+    int receive;
+    int active;
+} net_message_bounce;
+
+static void net_message_bounce_finish(void *opaque) {
+    net_message_bounce *bounce = opaque;
+    if (bounce->active && bounce->receive && (int64_t)G_RET(bounce->cpu) >= 0) {
+        size_t remaining = (size_t)G_RET(bounce->cpu);
+        for (uint64_t i = 0; i < bounce->count && remaining; ++i) {
+            size_t length = bounce->host_iov[i].iov_len < remaining ? bounce->host_iov[i].iov_len : remaining;
+            if (length && guest_copy_to((uint64_t)(uintptr_t)bounce->guest_iov[i].iov_base,
+                                        bounce->host_iov[i].iov_base, length) != (ssize_t)length) {
+                G_RET(bounce->cpu) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+            remaining -= length;
+        }
+        uint32_t returned_name = 0;
+        memcpy(&returned_name, bounce->header + 8, sizeof(returned_name));
+        size_t name_length = bounce->name_capacity < returned_name ? bounce->name_capacity : returned_name;
+        uint64_t returned_control = 0;
+        memcpy(&returned_control, bounce->header + 40, sizeof(returned_control));
+        size_t control_length =
+            bounce->control_capacity < returned_control ? bounce->control_capacity : (size_t)returned_control;
+        if ((int64_t)G_RET(bounce->cpu) >= 0 &&
+            ((name_length && guest_copy_to(bounce->guest_name, bounce->name, name_length) != (ssize_t)name_length) ||
+             (control_length &&
+              guest_copy_to(bounce->guest_control, bounce->control, control_length) != (ssize_t)control_length) ||
+             0))
+            G_RET(bounce->cpu) = (uint64_t)(int64_t)(-EFAULT);
+        memcpy(bounce->header + 0, &bounce->raw_guest_name, sizeof(bounce->raw_guest_name));
+        memcpy(bounce->header + 16, &bounce->raw_guest_iov_address, sizeof(bounce->raw_guest_iov_address));
+        memcpy(bounce->header + 32, &bounce->raw_guest_control, sizeof(bounce->raw_guest_control));
+        if ((int64_t)G_RET(bounce->cpu) >= 0 &&
+            guest_copy_to(bounce->guest_header, bounce->header, sizeof(bounce->header)) != sizeof(bounce->header))
+            G_RET(bounce->cpu) = (uint64_t)(int64_t)(-EFAULT);
+    }
+    for (uint64_t i = 0; i < bounce->count; ++i)
+        free(bounce->host_iov[i].iov_base);
+    free(bounce->name);
+    free(bounce->control);
+}
+
+static int net_message_bounce_begin(net_message_bounce *bounce, struct cpu *cpu, uint64_t guest_header, int receive) {
+    memset(bounce, 0, sizeof(*bounce));
+    bounce->cpu = cpu;
+    bounce->guest_header = guest_header;
+    bounce->receive = receive;
+    if (guest_copy_from(bounce->header, guest_header, sizeof(bounce->header)) != sizeof(bounce->header)) return -EFAULT;
+    memcpy(&bounce->count, bounce->header + 24, sizeof(bounce->count));
+    if (bounce->count > 1024) {
+        bounce->count = 0;
+        return -EMSGSIZE;
+    }
+    memcpy(&bounce->raw_guest_iov_address, bounce->header + 16, sizeof(bounce->raw_guest_iov_address));
+    bounce->guest_iov_address = bounce->raw_guest_iov_address;
+    bounce->guest_iov_address = net_nonpie_p(bounce->guest_iov_address);
+    size_t iov_bytes = (size_t)bounce->count * sizeof(struct iovec);
+    if (iov_bytes && guest_copy_from(bounce->guest_iov, bounce->guest_iov_address, iov_bytes) != (ssize_t)iov_bytes)
+        return -EFAULT;
+    for (uint64_t i = 0; i < bounce->count; ++i) {
+        size_t length = bounce->guest_iov[i].iov_len;
+        bounce->host_iov[i].iov_len = length;
+        bounce->host_iov[i].iov_base = malloc(length ? length : 1);
+        if (!bounce->host_iov[i].iov_base) return -ENOMEM;
+        uint64_t guest = net_nonpie_p((uint64_t)(uintptr_t)bounce->guest_iov[i].iov_base);
+        bounce->guest_iov[i].iov_base = (void *)(uintptr_t)guest;
+        if (!receive && length && guest_copy_from(bounce->host_iov[i].iov_base, guest, length) != (ssize_t)length)
+            return -EFAULT;
+    }
+    memcpy(&bounce->raw_guest_name, bounce->header, sizeof(bounce->raw_guest_name));
+    bounce->guest_name = bounce->raw_guest_name;
+    bounce->guest_name = net_nonpie_p(bounce->guest_name);
+    memcpy(&bounce->name_capacity, bounce->header + 8, sizeof(bounce->name_capacity));
+    if (bounce->guest_name && bounce->name_capacity) {
+        if (bounce->name_capacity > 4096) return -EINVAL;
+        bounce->name = calloc(bounce->name_capacity, 1);
+        if (!bounce->name) return -ENOMEM;
+        if (!receive &&
+            guest_copy_from(bounce->name, bounce->guest_name, bounce->name_capacity) != bounce->name_capacity)
+            return -EFAULT;
+    }
+    memcpy(&bounce->raw_guest_control, bounce->header + 32, sizeof(bounce->raw_guest_control));
+    bounce->guest_control = bounce->raw_guest_control;
+    bounce->guest_control = net_nonpie_p(bounce->guest_control);
+    memcpy(&bounce->control_capacity, bounce->header + 40, sizeof(bounce->control_capacity));
+    if (bounce->guest_control && bounce->control_capacity) {
+        if (bounce->control_capacity > 1024 * 1024) return -ENOMEM;
+        bounce->control = calloc(bounce->control_capacity, 1);
+        if (!bounce->control) return -ENOMEM;
+        if (!receive && guest_copy_from(bounce->control, bounce->guest_control, bounce->control_capacity) !=
+                            (ssize_t)bounce->control_capacity)
+            return -EFAULT;
+    }
+    uint64_t host_iov_address = (uint64_t)(uintptr_t)bounce->host_iov;
+    uint64_t host_name_address = (uint64_t)(uintptr_t)bounce->name;
+    uint64_t host_control_address = (uint64_t)(uintptr_t)bounce->control;
+    memcpy(bounce->header + 16, &host_iov_address, sizeof(host_iov_address));
+    memcpy(bounce->header + 0, &host_name_address, sizeof(host_name_address));
+    memcpy(bounce->header + 32, &host_control_address, sizeof(host_control_address));
+    bounce->active = 1;
     return 0;
 }
 
@@ -201,16 +402,40 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = 0;
             return svc_done(c);
         case 204: // getsockname -> sockaddr_nl { family, pid=getpid() }
-            nl_getsockname((uint8_t *)a1, (socklen_t *)a2);
+        {
+            net_sockaddr_copyout address_copyout __attribute__((cleanup(net_sockaddr_copyout_finish)));
+            int error = net_sockaddr_copyout_begin(&address_copyout, c, a1, a2);
+            if (error < 0) {
+                G_RET(c) = (uint64_t)(int64_t)error;
+                return svc_done(c);
+            }
+            nl_getsockname(address_copyout.active ? address_copyout.address : NULL,
+                           address_copyout.active ? &address_copyout.length : NULL);
             G_RET(c) = 0;
             return svc_done(c);
+        }
         case 206: { // sendto/send: parse the RTNETLINK request, queue the dump
-            int64_t s = nl_send((int)a0, (const uint8_t *)a1, (size_t)a2);
+            void *payload __attribute__((cleanup(guest_free_bounce))) = malloc(a2 ? (size_t)a2 : 1);
+            if (!payload) {
+                G_RET(c) = (uint64_t)(int64_t)(-ENOMEM);
+                return svc_done(c);
+            }
+            if (a2 && guest_copy_from(payload, a1, (size_t)a2) != (ssize_t)a2) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                return svc_done(c);
+            }
+            int64_t s = nl_send((int)a0, payload, (size_t)a2);
             G_RET(c) = (uint64_t)s;
             return svc_done(c);
         }
         case 211: { // sendmsg: gather the iov into a scratch buffer, then queue the dump
-            uint8_t *g = (uint8_t *)a1;
+            net_message_bounce message_bounce __attribute__((cleanup(net_message_bounce_finish)));
+            int error = net_message_bounce_begin(&message_bounce, c, a1, 0);
+            if (error < 0) {
+                G_RET(c) = (uint64_t)(int64_t)error;
+                return svc_done(c);
+            }
+            uint8_t *g = message_bounce.header;
             struct iovec *iv = (struct iovec *)*(uint64_t *)(g + 16);
             int ivn = (int)*(uint64_t *)(g + 24);
             uint8_t tmp[4096];
@@ -226,17 +451,40 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             return svc_done(c);
         }
         case 207: { // recvfrom/recv: drain our queued dump (Linux MSG_PEEK/TRUNC); kernel (pid 0) source
-            struct iovec iov = {(void *)a1, (size_t)a2};
+            void *payload __attribute__((cleanup(guest_free_bounce))) = calloc(a2 ? (size_t)a2 : 1, 1);
+            if (!payload) {
+                G_RET(c) = (uint64_t)(int64_t)(-ENOMEM);
+                return svc_done(c);
+            }
+            struct iovec iov = {payload, (size_t)a2};
             int64_t r = nl_recv((int)a0, &iov, 1, (int)a3, NULL);
+            if (r >= 0) {
+                size_t copied = (size_t)r < (size_t)a2 ? (size_t)r : (size_t)a2;
+                if (copied && guest_copy_to(a1, payload, copied) != (ssize_t)copied) r = -EFAULT;
+            }
             if (r >= 0 && a4) {
-                nl_fill_src((uint8_t *)a4, a5 ? *(socklen_t *)a5 : 0);
-                if (a5) *(socklen_t *)a5 = 12;
+                net_sockaddr_copyout address_copyout __attribute__((cleanup(net_sockaddr_copyout_finish)));
+                int error = net_sockaddr_copyout_begin(&address_copyout, c, a4, a5);
+                if (error < 0) {
+                    G_RET(c) = (uint64_t)(int64_t)error;
+                    return svc_done(c);
+                }
+                nl_fill_src(address_copyout.address, address_copyout.capacity);
+                address_copyout.length = 12;
+                G_RET(c) = (uint64_t)r;
+                return svc_done(c);
             }
             G_RET(c) = (uint64_t)r; // nl_recv already returns -errno on failure
             return svc_done(c);
         }
         case 212: { // recvmsg: read into the guest iov (Linux MSG_PEEK/TRUNC); report a kernel source addr
-            uint8_t *g = (uint8_t *)a1;
+            net_message_bounce message_bounce __attribute__((cleanup(net_message_bounce_finish)));
+            int error = net_message_bounce_begin(&message_bounce, c, a1, 1);
+            if (error < 0) {
+                G_RET(c) = (uint64_t)(int64_t)error;
+                return svc_done(c);
+            }
+            uint8_t *g = message_bounce.header;
             struct iovec *iov = (struct iovec *)*(uint64_t *)(g + 16);
             int iovn = (int)*(uint64_t *)(g + 24);
             int mf = 0;
@@ -274,8 +522,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             break;
         }
         int icmp_ty = ty & 0xf;
-        int is_icmp = (int)a0 == AF_INET && (int)a2 == IPPROTO_ICMP &&
-                      ((icmp_ty == SOCK_DGRAM) || (icmp_ty == SOCK_RAW));
+        int is_icmp =
+            (int)a0 == AF_INET && (int)a2 == IPPROTO_ICMP && ((icmp_ty == SOCK_DGRAM) || (icmp_ty == SOCK_RAW));
         // The unprivileged ICMP *datagram* ping socket (`ping localhost` healthcheck) is synthesized from an
         // AF_UNIX socket and its loopback (127/8) echo reflected locally (see icmp_try_send). Gating only on
         // br_on() left the no-bridge / loopback-only case falling through to a real host
@@ -288,8 +536,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // socket (translate Linux domain -> macOS: AF_INET6 10->30, others unchanged). Gate the new fd
         // against the guest's soft RLIMIT_NOFILE -> EMFILE past the cap (the host table is far larger).
         // Bridge ICMP is synthesized below and must not depend on the host's privileged ping-socket policy.
-        int r = nofile_gate(virtual_icmp ? socket(AF_UNIX, SOCK_DGRAM, 0)
-                                        : socket(af_l2m((int)a0), ty & 0xf, (int)a2));
+        int r = nofile_gate(virtual_icmp ? socket(AF_UNIX, SOCK_DGRAM, 0) : socket(af_l2m((int)a0), ty & 0xf, (int)a2));
         if (r >= 0) {
             // SIGPIPE suppression: Linux delivers EPIPE (not a fatal signal) to a guest that has
             // SIG_IGN'd SIGPIPE or passes MSG_NOSIGNAL; macOS has no per-call MSG_NOSIGNAL, so make the
@@ -304,18 +551,17 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // AF_INET6 STREAM also gets loopback isolation (::/::1 -> private lo). a0 is the guest's
                 // Linux domain value, so test the Linux AF_INET6 (10), not the macOS one (30).
                 g_sock_stream[r] = ((ty & 0xf) == SOCK_STREAM && ((int)a0 == AF_INET || (int)a0 == LX_AF_INET6_FAM));
-                g_sock_dgram[r] = ((ty & 0xf) == SOCK_DGRAM &&
-                                   ((int)a0 == AF_INET || (int)a0 == LX_AF_INET6_FAM));
+                g_sock_dgram[r] = ((ty & 0xf) == SOCK_DGRAM && ((int)a0 == AF_INET || (int)a0 == LX_AF_INET6_FAM));
                 g_udp_local_port[r] = g_udp_peer_port[r] = 0;
                 g_udp_local_ip[r] = g_udp_peer_ip[r] = 0;
                 g_udp_local_interface[r] = g_udp_peer_interface[r] = 0;
                 g_udp_local_v6[r] = g_udp_peer_v6[r] = 0;
                 g_sock_seqpacket[r] = 0;
-                g_so_error[r] = 0;            // no pending async socket error on a fresh fd
-                g_so_reuseport[r] = 0;        // SO_REUSEPORT not yet set on a fresh fd
-                tcp_shadow_clear(r);          // no shadowed IPPROTO_TCP options on a fresh fd
-                ipopt_shadow_clear(r);        // ...nor shadowed IPPROTO_IP/IPV6 options
-                g_sock_conn[r] = 0;           // fresh socket: not yet connected (see g_sock_conn decl)
+                g_so_error[r] = 0;     // no pending async socket error on a fresh fd
+                g_so_reuseport[r] = 0; // SO_REUSEPORT not yet set on a fresh fd
+                tcp_shadow_clear(r);   // no shadowed IPPROTO_TCP options on a fresh fd
+                ipopt_shadow_clear(r); // ...nor shadowed IPPROTO_IP/IPV6 options
+                g_sock_conn[r] = 0;    // fresh socket: not yet connected (see g_sock_conn decl)
                 g_sock_connecting[r] = 0;
                 g_sock_host_backed[r] = 0;
                 g_sock_fam[r] = (uint16_t)a0; // guest address family, for connect/bind EAFNOSUPPORT check
@@ -328,10 +574,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_tcp_lport[r] = 0;
                 g_tcp_listen[r] = 0;
                 g_dns_sock[r] = 0;
-                g_icmp_kind[r] = ((int)a0 == AF_INET && (int)a2 == 1 &&
-                                  (((ty & 0xf) == SOCK_DGRAM) || ((ty & 0xf) == SOCK_RAW)))
-                                     ? (uint8_t)(((ty & 0xf) == SOCK_RAW) ? 2 : 1)
-                                     : 0;
+                g_icmp_kind[r] =
+                    ((int)a0 == AF_INET && (int)a2 == 1 && (((ty & 0xf) == SOCK_DGRAM) || ((ty & 0xf) == SOCK_RAW)))
+                        ? (uint8_t)(((ty & 0xf) == SOCK_RAW) ? 2 : 1)
+                        : 0;
                 g_icmp_sock[r] = 0;
                 g_icmp_ip[r] = 0;
                 g_sock_object[r] = sock_object_new();
@@ -384,14 +630,19 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             }
             // The fd pair is written straight into the guest array; a bad/unmapped destination must EFAULT
             // (and leak no fds) like Linux, not fault the engine writing the pair.
-            if (!host_range_mapped((uintptr_t)a3, 2 * sizeof(int))) {
+            if (guest_accessible_prefix(a3, 2 * sizeof(int), PROT_WRITE) != 2 * sizeof(int)) {
                 close(sv[0]);
                 close(sv[1]);
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
-            ((int *)a3)[0] = sv[0];
-            ((int *)a3)[1] = sv[1];
+            int guest_pair[2] = {sv[0], sv[1]};
+            if (guest_copy_to(a3, guest_pair, sizeof(guest_pair)) != (ssize_t)sizeof(guest_pair)) {
+                close(sv[0]);
+                close(sv[1]);
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
             if ((int)a0 == AF_UNIX) {
                 if (sv[0] >= 0 && sv[0] < HL_NFD) {
                     g_sock_fam[sv[0]] = AF_UNIX;
@@ -458,6 +709,27 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     }
     // bind -- port-map: bind the published host port
     case 200: {
+        int socket_type = 0;
+        socklen_t socket_type_length = sizeof(socket_type);
+        if (getsockopt((int)a0, SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_length) < 0) {
+            G_RET(c) = (uint64_t)(-errno);
+            break;
+        }
+        void *bind_address __attribute__((cleanup(guest_free_bounce))) = NULL;
+        if (a2 > sizeof(struct sockaddr_storage)) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        bind_address = malloc(a2 ? (size_t)a2 : 1);
+        if (!bind_address) {
+            G_RET(c) = (uint64_t)(-ENOMEM);
+            break;
+        }
+        if (a2 && guest_copy_from(bind_address, a1, (size_t)a2) != (ssize_t)a2) {
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
+        a1 = (uint64_t)(uintptr_t)bind_address;
         // Linux errno pre-screen (EBADF/ENOTSOCK/EFAULT/EINVAL/EAFNOSUPPORT) before any addr deref.
         {
             int pc = net_precheck((int)a0, a1, (socklen_t)a2, 0);
@@ -543,11 +815,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         int bridge_enabled = br_on();
         int bridge_interface = bridge_enabled ? br_bind_interface(sa, (socklen_t)a2) : -1;
         int bridge_v6_any = bridge_enabled && br6_any_is(sa, (socklen_t)a2);
-        int bridge_v4_any = bridge_enabled && sa && a2 >= 8 && *(uint16_t *)sa == AF_INET &&
-                            *(uint32_t *)(sa + 4) == 0;
+        int bridge_v4_any = bridge_enabled && sa && a2 >= 8 && *(uint16_t *)sa == AF_INET && *(uint32_t *)(sa + 4) == 0;
         if (bridge_v6_any) bridge_interface = 0;
-        if (bridge_enabled && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] &&
-            bridge_interface >= 0) {
+        if (bridge_enabled && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] && bridge_interface >= 0) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             if (p == 0) p = br_alloc_ephemeral(bridge_interface); // bind(:0) -> a real, round-trippable port
             int bridge_v6only = 0;
@@ -664,7 +934,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 overlay_copyup(gp, host, sizeof host); // guest path -> upper host path (+ materialize parent dirs)
             else
                 xlate(gp, host, sizeof host); // missing final socket name inside the bare bind volume
-            unlink(host);                          // clear a stale inode (else EADDRINUSE)
+            unlink(host);                     // clear a stale inode (else EADDRINUSE)
             // bind at the FULL upper path (via unix_sock_at, which fchdir-shortens paths past sun_path[104])
             // so the socket inode lands exactly where the guest's stat/chmod/connect resolves -- a plain bind
             // would truncate the long upper path and strand the inode where nothing can find it.
@@ -761,6 +1031,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             break;
         }
         int lfd = (int)a0;
+        uint64_t guest_peer = a1, guest_peer_length = a2;
+        uint8_t peer_address[sizeof(struct sockaddr_storage)] = {0};
+        socklen_t peer_length = 0, peer_capacity = 0;
         // accept / accept4
         int pl = (lfd >= 0 && lfd < HL_NFD) ? g_lo_port[lfd] : 0;
         int pl6 = (lfd >= 0 && lfd < HL_NFD) ? g_lo_v6[lfd] : 0; // listener is AF_INET6 -> report v6 peer
@@ -784,23 +1057,26 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // connection but not leaking its fd -- not fault the engine. Validate the addrlen cell then the
             // declared (clamped) sockaddr capacity before any writeback; close the accepted fd on failure.
             if (a1) {
-                int bad = (a2 && !host_range_mapped((uintptr_t)a2, sizeof(socklen_t)));
+                int bad = !a2 || guest_copy_from(&peer_length, a2, sizeof(peer_length)) != sizeof(peer_length);
                 if (!bad) {
-                    size_t alc = a2 ? (size_t)*(socklen_t *)a2 : 0;
+                    size_t alc = peer_length;
                     if (alc > sizeof(struct sockaddr_storage)) alc = sizeof(struct sockaddr_storage);
-                    if (alc && !host_range_mapped((uintptr_t)a1, alc)) bad = 1;
+                    if (alc && guest_accessible_prefix(a1, alc, PROT_WRITE) != alc) bad = 1;
                 }
                 if (bad) {
                     close(r);
                     G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                     break;
                 }
+                peer_capacity = peer_length;
+                a1 = (uint64_t)(uintptr_t)peer_address;
+                a2 = (uint64_t)(uintptr_t)&peer_length;
             }
             // Accepted connections are sockets too: make SIGPIPE suppression sticky on the new fd so a
             // write/send to a peer that closes returns EPIPE instead of killing the guest (see case 198).
             (void)hl_native_set_no_sigpipe(r);
             if (r >= 0 && r < HL_NFD) {
-                g_so_error[r] = 0;  // fresh accepted fd carries no pending async error
+                g_so_error[r] = 0; // fresh accepted fd carries no pending async error
                 g_so_reuseport[r] = 0;
                 tcp_shadow_clear(r); // no shadowed IPPROTO_TCP options on a fresh accepted fd
                 ipopt_shadow_clear(r);
@@ -850,6 +1126,16 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // peer reported as our virtual listen addr (cf. lo_* simplification)
                 fill_inet_br((uint8_t *)a1, (socklen_t *)a2, pbrip, pbr);
             }
+            if (guest_peer) {
+                size_t copy_length = peer_capacity < peer_length ? peer_capacity : peer_length;
+                if (copy_length > sizeof(peer_address)) copy_length = sizeof(peer_address);
+                if ((copy_length && guest_copy_to(guest_peer, peer_address, copy_length) != (ssize_t)copy_length) ||
+                    guest_copy_to(guest_peer_length, &peer_length, sizeof(peer_length)) != sizeof(peer_length)) {
+                    close(r);
+                    G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                    break;
+                }
+            }
             // peer = 127.0.0.1:lport
         }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -857,6 +1143,27 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     }
     // connect
     case 203: {
+        int socket_type = 0;
+        socklen_t socket_type_length = sizeof(socket_type);
+        if (getsockopt((int)a0, SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_length) < 0) {
+            G_RET(c) = (uint64_t)(-errno);
+            break;
+        }
+        void *connect_address __attribute__((cleanup(guest_free_bounce))) = NULL;
+        if (a2 > sizeof(struct sockaddr_storage)) {
+            G_RET(c) = (uint64_t)(-EINVAL);
+            break;
+        }
+        connect_address = malloc(a2 ? (size_t)a2 : 1);
+        if (!connect_address) {
+            G_RET(c) = (uint64_t)(-ENOMEM);
+            break;
+        }
+        if (a2 && guest_copy_from(connect_address, a1, (size_t)a2) != (ssize_t)a2) {
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
+        a1 = (uint64_t)(uintptr_t)connect_address;
         // Linux errno pre-screen (EBADF/ENOTSOCK/EFAULT/EINVAL/EISCONN/EAFNOSUPPORT) before any addr deref.
         {
             int pc = net_precheck((int)a0, a1, (socklen_t)a2, 1);
@@ -954,8 +1261,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // defers the refusal to the next poll/getsockopt(SO_ERROR). The AF_UNIX switch has no live
                 // INET peer to deliver that, so stash the error and report EINPROGRESS -- poll then wakes on
                 // the failed AF_UNIX socket and getsockopt(SO_ERROR) hands the ECONNREFUSED back once.
-                if (le == ECONNREFUSED && (int)a0 >= 0 && (int)a0 < HL_NFD &&
-                    (fcntl((int)a0, F_GETFL) & O_NONBLOCK)) {
+                if (le == ECONNREFUSED && (int)a0 >= 0 && (int)a0 < HL_NFD && (fcntl((int)a0, F_GETFL) & O_NONBLOCK)) {
                     g_so_error[(int)a0] = ECONNREFUSED;
                     G_RET(c) = (uint64_t)(-EINPROGRESS);
                 } else {
@@ -992,11 +1298,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = 0;
                 break;
             }
-            char udp_path[200]; int udp_interface; uint32_t udp_ip; uint16_t udp_port;
-            if (udp_switch_destination(sa, (socklen_t)a2, &udp_interface, &udp_ip, &udp_port,
-                                       udp_path, sizeof udp_path)) {
+            char udp_path[200];
+            int udp_interface;
+            uint32_t udp_ip;
+            uint16_t udp_port;
+            if (udp_switch_destination(sa, (socklen_t)a2, &udp_interface, &udp_ip, &udp_port, udp_path,
+                                       sizeof udp_path)) {
                 if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
-                    G_RET(c) = (uint64_t)(-errno); break;
+                    G_RET(c) = (uint64_t)(-errno);
+                    break;
                 }
                 g_udp_peer_port[(int)a0] = udp_port;
                 g_udp_peer_ip[(int)a0] = udp_ip;
@@ -1163,20 +1473,17 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 204: {
         // getsockname
         int fd = (int)a0;
+        net_sockaddr_copyout address_copyout __attribute__((cleanup(net_sockaddr_copyout_finish)));
         // The addrlen pointer (a2) is dereferenced and the sockaddr buffer (a1) written directly by every
         // branch below; a bad/unmapped pointer must EFAULT like Linux, not fault the engine. Validate the
         // addrlen cell first, then the declared (clamped) sockaddr capacity.
-        if (a2 && !host_range_mapped((uintptr_t)a2, sizeof(socklen_t))) {
+        if (net_sockaddr_copyout_begin(&address_copyout, c, a1, a2) < 0) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        if (a1) {
-            size_t alc = a2 ? (size_t)*(socklen_t *)a2 : 0;
-            if (alc > sizeof(struct sockaddr_storage)) alc = sizeof(struct sockaddr_storage);
-            if (alc && !host_range_mapped((uintptr_t)a1, alc)) {
-                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
-                break;
-            }
+        if (address_copyout.active) {
+            a1 = (uint64_t)(uintptr_t)address_copyout.address;
+            a2 = (uint64_t)(uintptr_t)&address_copyout.length;
         }
         // Abstract-namespace local name: echo the guest name, not the engine's HL_NETNS-keyed backing fs path.
         if (fd >= 0 && fd < HL_NFD && g_unix_bind[fd][0] == '@' && a1) {
@@ -1248,20 +1555,17 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 205: {
         // getpeername
         int fd = (int)a0;
+        net_sockaddr_copyout address_copyout __attribute__((cleanup(net_sockaddr_copyout_finish)));
         // The addrlen pointer (a2) is dereferenced and the sockaddr buffer (a1) written directly by every
         // branch below; a bad/unmapped pointer must EFAULT like Linux, not fault the engine. Validate the
         // addrlen cell first, then the declared (clamped) sockaddr capacity.
-        if (a2 && !host_range_mapped((uintptr_t)a2, sizeof(socklen_t))) {
+        if (net_sockaddr_copyout_begin(&address_copyout, c, a1, a2) < 0) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }
-        if (a1) {
-            size_t alc = a2 ? (size_t)*(socklen_t *)a2 : 0;
-            if (alc > sizeof(struct sockaddr_storage)) alc = sizeof(struct sockaddr_storage);
-            if (alc && !host_range_mapped((uintptr_t)a1, alc)) {
-                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
-                break;
-            }
+        if (address_copyout.active) {
+            a1 = (uint64_t)(uintptr_t)address_copyout.address;
+            a2 = (uint64_t)(uintptr_t)&address_copyout.length;
         }
         // Abstract-namespace peer name: echo the guest name recorded on connect, not the backing fs path.
         if (fd >= 0 && fd < HL_NFD && g_unix_peer[fd][0] == '@' && a1) {
@@ -1321,6 +1625,36 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         break;
     }
     case 206: {
+        void *send_payload __attribute__((cleanup(guest_free_bounce))) = NULL;
+        void *send_destination __attribute__((cleanup(guest_free_bounce))) = NULL;
+        if (a2) {
+            send_payload = malloc((size_t)a2);
+            if (!send_payload) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            if (guest_copy_from(send_payload, a1, (size_t)a2) != (ssize_t)a2) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            a1 = (uint64_t)(uintptr_t)send_payload;
+        }
+        if (a4) {
+            if (a5 > 4096) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
+            send_destination = calloc(a5 ? (size_t)a5 : 1, 1);
+            if (!send_destination) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            if (a5 && guest_copy_from(send_destination, a4, (size_t)a5) != (ssize_t)a5) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            a4 = (uint64_t)(uintptr_t)send_destination;
+        }
         // A bad DEST-address pointer -> EFAULT, not an engine fault: the DNS/AF_UNIX/INET classifiers
         // below deref a4 directly. (The data buffer a1 is validated by the host sendto itself.) The dest
         // is optional (NULL on a connected socket), so only validate when present. (LTP sendto02 EFAULT)
@@ -1349,17 +1683,14 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = (uint64_t)dret;
                 break;
             }
-            if (icmp_try_send((int)a0, (const uint8_t *)a1, (size_t)a2, (const uint8_t *)a4, (socklen_t)a5,
-                              &dret)) {
+            if (icmp_try_send((int)a0, (const uint8_t *)a1, (size_t)a2, (const uint8_t *)a4, (socklen_t)a5, &dret)) {
                 G_RET(c) = (uint64_t)dret;
                 break;
             }
         }
         // MSG_NOSIGNAL(0x4000) has no per-call equivalent on macOS; emulate it with the SO_NOSIGPIPE
         // socket option so the send returns EPIPE instead of raising a fatal SIGPIPE.
-        if ((int)a3 & 0x4000) {
-            (void)hl_native_set_no_sigpipe((int)a0);
-        }
+        if ((int)a3 & 0x4000) { (void)hl_native_set_no_sigpipe((int)a0); }
         // AF_UNIX pathname/abstract dest -> overlay/abstract-route it (syslog `logger` -> /dev/log).
         if (a4 && (socklen_t)a5 >= 2 && *(const uint16_t *)a4 == AF_UNIX) {
             char uhost[1200];
@@ -1378,19 +1709,24 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             }
         }
         if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0]) {
-            char udp_path[200]; int udp_interface; uint32_t udp_ip; uint16_t udp_port;
-            int udp_route = a4 ? udp_switch_destination((const uint8_t *)a4, (socklen_t)a5, &udp_interface,
-                                                        &udp_ip, &udp_port, udp_path, sizeof udp_path)
+            char udp_path[200];
+            int udp_interface;
+            uint32_t udp_ip;
+            uint16_t udp_port;
+            int udp_route = a4 ? udp_switch_destination((const uint8_t *)a4, (socklen_t)a5, &udp_interface, &udp_ip,
+                                                        &udp_port, udp_path, sizeof udp_path)
                                : udp_switch_peer_path((int)a0, udp_path, sizeof udp_path);
             if (udp_route) {
                 if (!a4) udp_interface = (int)g_udp_peer_interface[(int)a0] - 1;
                 if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
-                    G_RET(c) = (uint64_t)(-errno); break;
+                    G_RET(c) = (uint64_t)(-errno);
+                    break;
                 }
                 struct sockaddr_un un;
-                ssize_t ur = unix_addr_set(&un, udp_path) < 0 ? -1 :
-                    sendto((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3),
-                           (struct sockaddr *)&un, sizeof un);
+                ssize_t ur = unix_addr_set(&un, udp_path) < 0
+                                 ? -1
+                                 : sendto((int)a0, (void *)a1, (size_t)a2, msgflags_l2m((int)a3),
+                                          (struct sockaddr *)&un, sizeof un);
                 // Unconnected UDP send to a loopback port with no bound receiver: Linux drops the datagram
                 // and reports success (no ICMP error is delivered to an unconnected socket). The AF_UNIX
                 // switch backing instead surfaces ENOENT/ECONNREFUSED from the missing peer path -- coerce
@@ -1425,6 +1761,38 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         break;
     }
     case 207: {
+        uint64_t guest_buffer = a1, guest_source = a4, guest_source_length = a5;
+        socklen_t source_capacity = 0, source_length = 0;
+        void *receive_buffer __attribute__((cleanup(guest_free_bounce))) = NULL;
+        void *receive_source __attribute__((cleanup(guest_free_bounce))) = NULL;
+        if (a2) {
+            receive_buffer = malloc((size_t)a2);
+            if (!receive_buffer) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            a1 = (uint64_t)(uintptr_t)receive_buffer;
+        }
+        if (a4) {
+            if (!a5 || guest_copy_from(&source_capacity, a5, sizeof(source_capacity)) != sizeof(source_capacity)) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            size_t source_bytes =
+                source_capacity > sizeof(struct sockaddr_storage) ? source_capacity : sizeof(struct sockaddr_storage);
+            if (source_bytes > 4096) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
+            receive_source = calloc(source_bytes, 1);
+            if (!receive_source) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            source_length = source_capacity;
+            a4 = (uint64_t)(uintptr_t)receive_source;
+            a5 = (uint64_t)(uintptr_t)&source_length;
+        }
         // src addr: receive into host scratch (macOS layout) then translate back to Linux for the guest.
         struct sockaddr_storage hss;
         socklen_t hsl = sizeof hss;
@@ -1457,8 +1825,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         } else if (r >= 0 && want) {
             socklen_t gcap = a5 ? *(socklen_t *)a5 : 0;
             int ll = sa_m2l((struct sockaddr *)&hss, (uint8_t *)a4, gcap);
-            if (ll < 0)
-                ll = sa_un_m2l((struct sockaddr *)&hss, hsl, (uint8_t *)a4, gcap);
+            if (ll < 0) ll = sa_un_m2l((struct sockaddr *)&hss, hsl, (uint8_t *)a4, gcap);
             if (ll < 0) {
                 socklen_t n = hsl < gcap ? hsl : gcap;
                 if (gcap) memcpy((void *)a4, &hss, n);
@@ -1466,11 +1833,40 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             } else if (a5)
                 *(socklen_t *)a5 = (socklen_t)ll;
         }
+        if (r >= 0 && r > 0 && guest_copy_to(guest_buffer, receive_buffer, (size_t)r) != r) {
+            G_RET(c) = (uint64_t)(-EFAULT);
+            break;
+        }
+        if (r >= 0 && guest_source) {
+            size_t copy_length = source_capacity < source_length ? source_capacity : source_length;
+            if ((copy_length && guest_copy_to(guest_source, receive_source, copy_length) != (ssize_t)copy_length) ||
+                guest_copy_to(guest_source_length, &source_length, sizeof(source_length)) != sizeof(source_length)) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+        }
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
     }
     // setsockopt(fd, level, optname, val, len)
     case 208: {
+        void *option_value __attribute__((cleanup(guest_free_bounce))) = NULL;
+        if (a3 && a4) {
+            if (a4 > 1024 * 1024) {
+                G_RET(c) = (uint64_t)(-EINVAL);
+                break;
+            }
+            option_value = malloc((size_t)a4);
+            if (!option_value) {
+                G_RET(c) = (uint64_t)(-ENOMEM);
+                break;
+            }
+            if (guest_copy_from(option_value, a3, (size_t)a4) != (ssize_t)a4) {
+                G_RET(c) = (uint64_t)(-EFAULT);
+                break;
+            }
+            a3 = (uint64_t)(uintptr_t)option_value;
+        }
         int lvl = (int)a1, opt = (int)a2;
         // SO_REUSEPORT (Linux SOL_SOCKET/15): remember the guest's intent so getsockopt reports it even when
         // this INET socket is later backed by an AF_UNIX switch socket (which reads SO_REUSEPORT back as 0).
@@ -1615,6 +2011,16 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     }
     // getsockopt(fd, level, optname, val, len)
     case 209: {
+        net_option_copyout option_copyout __attribute__((cleanup(net_option_copyout_finish)));
+        int copyout_error = net_option_copyout_begin(&option_copyout, c, a3, a4);
+        if (copyout_error < 0) {
+            G_RET(c) = (uint64_t)(int64_t)copyout_error;
+            break;
+        }
+        if (option_copyout.active) {
+            a3 = (uint64_t)(uintptr_t)option_copyout.value;
+            a4 = (uint64_t)(uintptr_t)&option_copyout.length;
+        }
         int lvl = (int)a1, opt = (int)a2;
         int gfd = (int)a0;
         // A deferred asynchronous connect error (stashed for a non-blocking dial to a closed private-loopback
@@ -1877,15 +2283,17 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 211:
     // sendmsg/recvmsg -- translate Linux msghdr -> macOS
     case 212: {
-        uint8_t *g = (uint8_t *)a1;
+        net_message_bounce message_bounce __attribute__((cleanup(net_message_bounce_finish)));
+        int bounce_error = net_message_bounce_begin(&message_bounce, c, a1, nr == 212);
+        if (bounce_error < 0) {
+            G_RET(c) = (uint64_t)(int64_t)bounce_error;
+            break;
+        }
+        uint8_t *g = message_bounce.header;
         // The msghdr struct itself is read (iov ptr/count, name, control, flags) AND written back (recvmsg's
         // namelen/controllen/flags) directly through `g`; a NULL or unmapped msghdr pointer would fault the
         // engine on the very first field access below. Validate it up front so a bad pointer yields EFAULT
         // (like the kernel's copy_from_user), matching the sendmmsg/recvmmsg array guard. Linux msghdr is 56 B.
-        if (guest_bad_ptr((uintptr_t)a1, 56)) {
-            G_RET(c) = (uint64_t)(int64_t)-EFAULT;
-            break;
-        }
         uint64_t giov_count = *(uint64_t *)(g + 24);
         struct iovec rebased_iov[1024];
         struct iovec *guest_iov = (struct iovec *)net_nonpie_p(*(uint64_t *)(g + 16));
@@ -1914,7 +2322,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             size_t udp_cap = udp_dgram_maxlen((int)a0);
             if (udp_cap) {
                 size_t tot = 0;
-                for (uint64_t i = 0; i < giov_count; ++i) tot += rebased_iov[i].iov_len;
+                for (uint64_t i = 0; i < giov_count; ++i)
+                    tot += rebased_iov[i].iov_len;
                 if (tot > udp_cap) {
                     G_RET(c) = (uint64_t)(-EMSGSIZE);
                     break;
@@ -1962,17 +2371,18 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         char ud_host[1200];
         int ud_route = 0;                     // AF_UNIX pathname/abstract dgram dest -> overlay/abstract route on send
         if (nr == 211 && gname && gnamelen) { // sendmsg: guest -> host
-            int udp_interface; uint32_t udp_ip; uint16_t udp_port;
+            int udp_interface;
+            uint32_t udp_ip;
+            uint16_t udp_port;
             if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0] &&
-                udp_switch_destination(gname, gnamelen, &udp_interface, &udp_ip, &udp_port,
-                                       ud_host, sizeof ud_host)) {
+                udp_switch_destination(gname, gnamelen, &udp_interface, &udp_ip, &udp_port, ud_host, sizeof ud_host)) {
                 if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
                     G_RET(c) = (uint64_t)(-errno);
                     break;
                 }
                 ud_route = 1;
             } else if (gnamelen >= 2 && *(const uint16_t *)gname == AF_UNIX &&
-                unix_dgram_dest(gname, gnamelen, ud_host, sizeof ud_host)) {
+                       unix_dgram_dest(gname, gnamelen, ud_host, sizeof ud_host)) {
                 ud_route = 1; // sent via unix_dgram_sendmsg_at below (it owns msg_name)
             } else {
                 socklen_t hl = sa_l2m(gname, gnamelen, &nss);
@@ -1987,8 +2397,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     mh.msg_namelen = hl;
                 }
             }
-        } else if (nr == 211 && !gname && (int)a0 >= 0 && (int)a0 < HL_NFD &&
-                   g_sock_dgram[(int)a0] && udp_switch_peer_path((int)a0, ud_host, sizeof ud_host)) {
+        } else if (nr == 211 && !gname && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0] &&
+                   udp_switch_peer_path((int)a0, ud_host, sizeof ud_host)) {
             ud_route = 1;
         } else if (nr == 212 && gname && gnamelen) { // recvmsg: receive into host scratch
             mh.msg_name = &nss;
@@ -2036,9 +2446,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             mh.msg_controllen = (gc && gcl) ? (socklen_t)hcap : 0;
         }
         // MSG_NOSIGNAL(0x4000) -> SO_NOSIGPIPE (macOS has no per-call flag); EPIPE instead of SIGPIPE.
-        if (nr == 211 && ((int)a2 & 0x4000)) {
-            (void)hl_native_set_no_sigpipe((int)a0);
-        }
+        if (nr == 211 && ((int)a2 & 0x4000)) { (void)hl_native_set_no_sigpipe((int)a0); }
         // Zero-length address-peek idiom (recvmsg): if the guest wants the sender but supplies no receive
         // room, macOS returns 0 at once without filling msg_name (see dgram_addr_peek). Receive into a
         // 1-byte scratch iov so it blocks and reports the source; MSG_PEEK keeps the datagram queued.
@@ -2076,8 +2484,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // DNS socket: report the nameserver (127.0.0.11:53) as the source (see case 207).
                 dns_fill_ns(gname, NULL);
                 *(uint32_t *)(g + 8) = 16;
-            } else if (gname && gnamelen &&
-                       udp_switch_source(&nss, mh.msg_namelen, gname, (socklen_t *)(g + 8))) {
+            } else if (gname && gnamelen && udp_switch_source(&nss, mh.msg_namelen, gname, (socklen_t *)(g + 8))) {
                 // AF_UNIX switch sender restored to its Linux AF_INET identity.
             } else if (gname && gnamelen) { // translate received host sockaddr back to Linux layout
                 int ll = sa_m2l((struct sockaddr *)&nss, gname, gnamelen);
@@ -2127,8 +2534,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             int cmsg_trunc = 0;
             if (gc && gcl) ln = (size_t)cmsg_m2l(&mh, gc, gcl, ln, &cmsg_trunc);
             int host_mflags = (int)mh.msg_flags;
-            if (!cmsg_trunc && gc && gcl)
-                host_mflags &= ~MSG_CTRUNC; // host-side sideband expansion compressed cleanly
+            if (!cmsg_trunc && gc && gcl) host_mflags &= ~MSG_CTRUNC; // host-side sideband expansion compressed cleanly
             int mfl = msgflags_m2l(host_mflags);
             if (cred_trunc || (cmsg_trunc && !passcred_active)) mfl |= 0x8;          // MSG_CTRUNC
             if (((int)a2 & 0x40000000) && gc && ln) cmsg_lx_set_cloexec_fds(gc, ln); // MSG_CMSG_CLOEXEC
@@ -2150,6 +2556,43 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)-EINVAL;
             break;
         }
+        /*
+         * Drive each element through the already-audited single-message path.
+         * This preserves Linux's partial-success contract while sharing the
+         * canonical msghdr/iovec/name/control staging and ancillary-data
+         * translation with sendmsg/recvmsg.
+         */
+        size_t vector_bytes = (size_t)vlen * 64;
+        if (vector_bytes && (guest_accessible_prefix(a1, vector_bytes, PROT_READ) != vector_bytes ||
+                             guest_accessible_prefix(a1, vector_bytes, PROT_WRITE) != vector_bytes)) {
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+            break;
+        }
+        unsigned completed = 0;
+        for (; completed < vlen; ++completed) {
+            uint8_t message[64];
+            uint64_t message_address = a1 + (size_t)completed * sizeof(message);
+            if (guest_copy_from(message, message_address, sizeof(message)) != sizeof(message)) {
+                if (!completed) G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+            uint64_t nested_flags = a3;
+            if (nr == 243 && completed) nested_flags |= 0x40; /* MSG_DONTWAIT / WAITFORONE */
+            (void)svc_net(c, nr == 269 ? 211 : 212, a0, (uint64_t)(uintptr_t)message, nested_flags, 0, 0, 0);
+            int64_t result = (int64_t)G_RET(c);
+            if (result < 0) {
+                if (!completed) return 1; /* nested svc_done already translated the errno */
+                break;
+            }
+            uint32_t message_length = (uint32_t)result;
+            memcpy(message + 56, &message_length, sizeof(message_length));
+            if (guest_copy_to(message_address, message, sizeof(message)) != sizeof(message)) {
+                if (!completed) G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                break;
+            }
+        }
+        if (completed || vlen == 0) G_RET(c) = completed;
+        break;
         // The mmsghdr array itself is read AND written (msg_len/msg_namelen) per submessage; a straddling or
         // unmapped vec would fault the engine on the very first field access below. Validate the whole array up
         // front so a bad pointer yields EFAULT (like the kernel's copy_from_user) instead of a guest-crashes-engine
@@ -2170,7 +2613,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // nm0 is submessage 0's guest msg_name; dns_dest_is derefs it (8 B). A wild pointer must not fault
             // the engine here -- if unreadable, skip DNS classification and let the main loop below return
             // EFAULT for this submessage (its per-iter msg_name guard). See the sendmsg guard above.
-            if (nm0 && nml0 && guest_bad_ptr((uintptr_t)nm0, nml0)) { nm0 = NULL; nml0 = 0; }
+            if (nm0 && nml0 && guest_bad_ptr((uintptr_t)nm0, nml0)) {
+                nm0 = NULL;
+                nml0 = 0;
+            }
             if (!is_dns && dns_dest_is(nm0, nml0) &&
                 dns_swap(dfd, (dfd >= 0 && dfd < HL_NFD) ? g_sock_stream[dfd] : 0) == 0)
                 is_dns = 1;
@@ -2201,9 +2647,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         int done = 0, err = 0;
         // MSG_NOSIGNAL(0x4000) -> SO_NOSIGPIPE once before the fan-out (macOS has no per-call flag).
-        if (nr == 269 && ((int)a3 & 0x4000)) {
-            (void)hl_native_set_no_sigpipe((int)a0);
-        }
+        if (nr == 269 && ((int)a3 & 0x4000)) { (void)hl_native_set_no_sigpipe((int)a0); }
         for (unsigned i = 0; i < vlen; i++) {
             uint8_t *g = vec + (size_t)i * 64;
             struct msghdr mh;
@@ -2224,7 +2668,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 size_t udp_cap = udp_dgram_maxlen((int)a0);
                 if (udp_cap) {
                     size_t tot = 0;
-                    for (uint64_t j = 0; j < giov_count; ++j) tot += rebased_iov[j].iov_len;
+                    for (uint64_t j = 0; j < giov_count; ++j)
+                        tot += rebased_iov[j].iov_len;
                     if (tot > udp_cap) {
                         err = EMSGSIZE;
                         break;
@@ -2250,10 +2695,12 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             char ud_host[1200];
             int ud_route = 0; // AF_UNIX pathname/abstract dgram dest -> overlay/abstract route on send
             if (nr == 269 && gname && gnamelen) { // sendmmsg: guest -> host
-                int udp_interface; uint32_t udp_ip; uint16_t udp_port;
+                int udp_interface;
+                uint32_t udp_ip;
+                uint16_t udp_port;
                 if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0] &&
-                    udp_switch_destination(gname, gnamelen, &udp_interface, &udp_ip, &udp_port,
-                                           ud_host, sizeof ud_host)) {
+                    udp_switch_destination(gname, gnamelen, &udp_interface, &udp_ip, &udp_port, ud_host,
+                                           sizeof ud_host)) {
                     // AF_INET(6) dest over the private-loopback switch: resolve to the peer AF_UNIX path
                     // and send there (mirrors sendto/sendmsg cases 206/211).
                     if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
@@ -2262,7 +2709,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     }
                     ud_route = 1;
                 } else if (gnamelen >= 2 && *(const uint16_t *)gname == AF_UNIX &&
-                    unix_dgram_dest(gname, gnamelen, ud_host, sizeof ud_host)) {
+                           unix_dgram_dest(gname, gnamelen, ud_host, sizeof ud_host)) {
                     ud_route = 1; // sent via unix_dgram_sendmsg_at below (it owns msg_name)
                 } else {
                     socklen_t hl = sa_l2m(gname, gnamelen, &nss);
@@ -2271,8 +2718,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                         mh.msg_namelen = hl;
                     }
                 }
-            } else if (nr == 269 && !gname && (int)a0 >= 0 && (int)a0 < HL_NFD &&
-                       g_sock_dgram[(int)a0] && udp_switch_peer_path((int)a0, ud_host, sizeof ud_host)) {
+            } else if (nr == 269 && !gname && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0] &&
+                       udp_switch_peer_path((int)a0, ud_host, sizeof ud_host)) {
                 ud_route = 1; // connected UDP over the switch: send to the recorded peer AF_UNIX path
             } else if (nr == 243 && gname && gnamelen) { // recvmmsg: receive into host scratch
                 mh.msg_name = &nss;

@@ -32,6 +32,13 @@ void emit_ea(struct insn *insn, uint64_t next) {
     seen.addresses++;
 }
 
+void emit_memory_guard(int address, uint64_t size, uint64_t rip, uint32_t required) {
+    (void)address;
+    (void)size;
+    (void)rip;
+    (void)required;
+}
+
 void e_movconst(int destination, uint64_t value) {
     (void)destination;
     (void)value;

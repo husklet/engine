@@ -55,10 +55,12 @@
 #include "ckpt_sink_dir.h"    // the checkpoint writer emits every byte through the sink (docs/checkpoint-sink.md)
 #include "ckpt_sink_stream.h" // ... and that sink can be an embedder callback on the far side of a socket
 #include "ckpt_source.h"      // restore reads the image back through the symmetric source interface
+#include "logical_vma.h"
 
 #define CKPT_MAGIC UINT64_C(0x373054504b434c48)          // "HLCKPT07" (LE) -- per-process meta
 #define CKPT_MANIFEST_MAGIC UINT64_C(0x3730304e414d4c48) // "HLMAN007" (LE) -- workspace manifest
-#define CKPT_VERSION 2 // v2: streaming-compatible two-level image digest (docs/checkpoint-sink.md)
+#define CKPT_VERSION 1 // current checkpoint images are advertised and written as v1
+#define CKPT_RESTORE_VERSION_MAX 3
 #define CKPT_ARCH_X86_64 1
 #define CKPT_ARCH_AARCH64 2
 #define CKPT_CPU_MAGIC UINT64_C(0x31305550434c4848) // "HHLCPU01" (LE)
@@ -156,7 +158,53 @@ struct ckpt_region {
     uint64_t backing_offset;
     uint32_t backing_shared;
     uint32_t backing_emulated;
+    uint32_t format_version;
+    uint32_t logical;
 };
+
+#define CKPT_REGION_VERSION 1
+
+/* Published v2 pages files ended each region header at backing_emulated. */
+struct ckpt_region_v2 {
+    uint64_t addr, len, glen;
+    int32_t prot;
+    int32_t is_gna;
+    uint64_t npages;
+    uint64_t backing_object;
+    uint64_t backing_offset;
+    uint32_t backing_shared;
+    uint32_t backing_emulated;
+};
+
+static int ckpt_rd_all(FILE *f, void *buf, size_t n);
+
+static int ckpt_version_supported(uint64_t version) {
+    return version >= CKPT_VERSION && version <= CKPT_RESTORE_VERSION_MAX;
+}
+
+static int ckpt_read_region(FILE *file, uint64_t checkpoint_version, struct ckpt_region *region) {
+    memset(region, 0, sizeof *region);
+    if (checkpoint_version == 2) {
+        struct ckpt_region_v2 old;
+        if (ckpt_rd_all(file, &old, sizeof old) != 0) return -1;
+        region->addr = old.addr;
+        region->len = old.len;
+        region->glen = old.glen;
+        region->prot = old.prot;
+        region->is_gna = old.is_gna;
+        region->npages = old.npages;
+        region->backing_object = old.backing_object;
+        region->backing_offset = old.backing_offset;
+        region->backing_shared = old.backing_shared;
+        region->backing_emulated = old.backing_emulated;
+        region->format_version = CKPT_REGION_VERSION;
+        region->logical = 0;
+        return 0;
+    }
+    return (checkpoint_version == CKPT_VERSION || checkpoint_version == 3)
+               ? ckpt_rd_all(file, region, sizeof *region)
+               : -1;
+}
 
 struct ckpt_fd {
     int32_t gfd, kind, flags, descriptor_flags;
@@ -1790,11 +1838,57 @@ static int ckpt_region_prot(uint64_t addr, uint64_t glen) {
     return p >= 0 ? p : (PROT_READ | PROT_WRITE);
 }
 
+static int ckpt_logical_descriptor_compare(const void *left, const void *right) {
+    const hl_logical_vma_descriptor *a = left;
+    const hl_logical_vma_descriptor *b = right;
+    if (a->guest_first < b->guest_first) return -1;
+    if (a->guest_first > b->guest_first) return 1;
+    return 0;
+}
+
+static int ckpt_dump_region_bytes(struct ckpt_sink *sink, struct ckpt_sink_stream *f, size_t pagesz,
+                                  struct ckpt_region *reg) {
+    static uint8_t zero[65536];
+    uint8_t *logical_page = reg->logical ? malloc(pagesz) : NULL;
+    if (reg->logical && logical_page == NULL) return -1;
+    for (uint64_t off = 0; off < reg->len; off += pagesz) {
+        uint64_t va = reg->addr + off;
+        size_t n = (reg->len - off < pagesz) ? (size_t)(reg->len - off) : pagesz;
+        const void *bytes = (const void *)(uintptr_t)va;
+        if (reg->logical) {
+            if (hl_logical_vma_global_copy_out(va, logical_page, n) != 0) {
+                free(logical_page);
+                return -1;
+            }
+            bytes = logical_page;
+        } else if (!host_range_mapped((uintptr_t)va, n)) {
+            continue;
+        }
+        if (n <= sizeof zero && memcmp(bytes, zero, n) == 0) continue;
+        if (ckpt_sink_write(sink, f, &va, sizeof va) != 0 || ckpt_sink_write(sink, f, bytes, n) != 0) {
+            free(logical_page);
+            return -1;
+        }
+        reg->npages++;
+    }
+    free(logical_page);
+    return 0;
+}
+
+static int ckpt_write_region(struct ckpt_sink *sink, struct ckpt_sink_stream *stream,
+                             const struct ckpt_region *region) {
+    return ckpt_sink_write(sink, stream, region, sizeof *region);
+}
+
+static int ckpt_write_region_at(struct ckpt_sink *sink, struct ckpt_sink_stream *stream, uint64_t offset,
+                                const struct ckpt_region *region) {
+    return ckpt_sink_write_at(sink, stream, offset, region, sizeof *region);
+}
+
 // Sparse-dump every tracked guest mapping (image/interp/heap/stack/anon/file mmap). Non-zero HOST pages only.
 static int ckpt_dump_pages(struct ckpt_sink *sink, struct ckpt_sink_stream *f, size_t pagesz,
                            uint64_t *out_n) {
     uint64_t nreg = 0;
-    static uint8_t zero[65536];
     size_t mapping_count = hl_gmap_count();
     for (size_t i = 0; i < mapping_count; i++) {
         hl_gmap_entry mapping;
@@ -1803,6 +1897,7 @@ static int ckpt_dump_pages(struct ckpt_sink *sink, struct ckpt_sink_stream *f, s
         if (!addr || !len) continue;
         struct ckpt_region reg;
         memset(&reg, 0, sizeof reg);
+        reg.format_version = CKPT_REGION_VERSION;
         reg.addr = addr;
         reg.len = len;
         reg.glen = glen;
@@ -1819,21 +1914,58 @@ static int ckpt_dump_pages(struct ckpt_sink *sink, struct ckpt_sink_stream *f, s
             break;
         }
         pthread_mutex_unlock(&g_filemap_lock);
+        hl_logical_vma_descriptor logical;
+        int is_logical = hl_logical_vma_global_describe(addr, &logical);
+        if (is_logical < 0) return -1;
+        if (is_logical == 1) {
+            /*
+             * gmap tracks the original mmap while mprotect may split the
+             * logical ledger. Emit every descriptor in this gmap separately;
+             * the next outer entry (if any) skips descriptors it does not own.
+             */
+            size_t descriptor_count = hl_logical_vma_global_export(NULL, 0);
+            hl_logical_vma_descriptor *descriptors =
+                descriptor_count ? malloc(descriptor_count * sizeof(*descriptors)) : NULL;
+            if (descriptor_count && descriptors == NULL) return -1;
+            if (hl_logical_vma_global_export(descriptors, descriptor_count) != descriptor_count) {
+                free(descriptors);
+                errno = EAGAIN;
+                return -1;
+            }
+            qsort(descriptors, descriptor_count, sizeof(*descriptors), ckpt_logical_descriptor_compare);
+            for (size_t descriptor_index = 0; descriptor_index < descriptor_count; ++descriptor_index) {
+                const hl_logical_vma_descriptor *descriptor = &descriptors[descriptor_index];
+                if (descriptor->guest_first < addr || descriptor->guest_first >= addr + glen) continue;
+                struct ckpt_region logical_region = {0};
+                logical_region.addr = descriptor->guest_first;
+                logical_region.len = descriptor->length;
+                logical_region.glen = descriptor->length;
+                logical_region.prot = (int32_t)descriptor->protection;
+                logical_region.backing_object = ckpt_backing_values(descriptor->device, descriptor->inode);
+                logical_region.backing_offset = descriptor->backing_offset;
+                logical_region.backing_shared = 1;
+                logical_region.format_version = CKPT_REGION_VERSION;
+                logical_region.logical = 1;
+                int64_t logical_header = ckpt_sink_tell(sink, f);
+                if (logical_header < 0 ||
+                    ckpt_write_region(sink, f, &logical_region) != 0 ||
+                    ckpt_dump_region_bytes(sink, f, pagesz, &logical_region) != 0 ||
+                    ckpt_write_region_at(sink, f, (uint64_t)logical_header, &logical_region) != 0) {
+                    free(descriptors);
+                    return -1;
+                }
+                nreg++;
+            }
+            free(descriptors);
+            continue;
+        }
         int64_t header_offset = ckpt_sink_tell(sink, f);
         if (header_offset < 0) return -1;
-        if (ckpt_sink_write(sink, f, &reg, sizeof reg) != 0) return -1;
-        for (uint64_t off = 0; off < len; off += pagesz) {
-            uint64_t va = addr + off;
-            size_t n = (len - off < pagesz) ? (size_t)(len - off) : pagesz;
-            if (!host_range_mapped((uintptr_t)va, n)) continue;
-            if (memcmp((void *)va, zero, n) == 0) continue;
-            if (ckpt_sink_write(sink, f, &va, sizeof va) != 0) return -1;
-            if (ckpt_sink_write(sink, f, (void *)va, n) != 0) return -1;
-            reg.npages++;
-        }
+        if (ckpt_write_region(sink, f, &reg) != 0) return -1;
+        if (ckpt_dump_region_bytes(sink, f, pagesz, &reg) != 0) return -1;
         // Patch the region header in place now that npages is known (the streaming equivalent of the
         // old seek-back-and-rewrite).
-        if (ckpt_sink_write_at(sink, f, (uint64_t)header_offset, &reg, sizeof reg) != 0) return -1;
+        if (ckpt_write_region_at(sink, f, (uint64_t)header_offset, &reg) != 0) return -1;
         nreg++;
     }
     *out_n = nreg;
@@ -2152,7 +2284,7 @@ static int ckpt_read_manifest(const char *dir, struct ckpt_manifest *man) {
         fprintf(stderr, "[restore] %s: bad manifest magic\n", dir);
         return -1;
     }
-    if (man->version != CKPT_VERSION || man->arch != G_CKPT_ARCH) {
+    if (!ckpt_version_supported(man->version) || man->arch != G_CKPT_ARCH) {
         fprintf(stderr, "[restore] manifest version/arch mismatch\n");
         return -1;
     }
@@ -2181,14 +2313,24 @@ static int ckpt_read_meta_dir(const char *procdir, struct ckpt_meta *m) {
         fprintf(stderr, "[restore] %s is not a checkpoint (bad magic/short read)\n", procdir);
         return -1;
     }
-    if (m->version != CKPT_VERSION || m->arch != G_CKPT_ARCH) {
+    if (!ckpt_version_supported(m->version) || m->arch != G_CKPT_ARCH) {
         fprintf(stderr, "[restore] version/arch mismatch (file v%llu arch %llu)\n", (unsigned long long)m->version,
                 (unsigned long long)m->arch);
         return -1;
     }
-    if (m->cpu_sz != sizeof(struct cpu)) {
-        fprintf(stderr, "[restore] cpu-struct size mismatch (file %llu, engine %zu)\n", (unsigned long long)m->cpu_sz,
-                sizeof(struct cpu));
+    size_t expected_cpu_size = sizeof(struct cpu);
+    if (m->version == 2) {
+#if G_CKPT_ARCH == CKPT_ARCH_AARCH64
+        expected_cpu_size = 26512;
+#elif G_CKPT_ARCH == CKPT_ARCH_X86_64
+        expected_cpu_size = offsetof(struct cpu, soft_snapshot) + sizeof(uint64_t);
+#else
+#error "unsupported checkpoint architecture"
+#endif
+    }
+    if (m->cpu_sz != expected_cpu_size) {
+        fprintf(stderr, "[restore] cpu-struct size mismatch (file %llu, expected %zu for v%llu)\n",
+                (unsigned long long)m->cpu_sz, expected_cpu_size, (unsigned long long)m->version);
         return -1;
     }
     if (m->n_threads < 1 || m->n_threads > THREAD_REG_MAX) {
@@ -2198,9 +2340,57 @@ static int ckpt_read_meta_dir(const char *procdir, struct ckpt_meta *m) {
     return 0;
 }
 
+static size_t ckpt_cpu_payload_size(uint64_t version) {
+    if (version != 2) return sizeof(struct cpu);
+#if G_CKPT_ARCH == CKPT_ARCH_AARCH64
+    return 26512;
+#elif G_CKPT_ARCH == CKPT_ARCH_X86_64
+    return offsetof(struct cpu, soft_snapshot) + sizeof(uint64_t);
+#else
+#error "unsupported checkpoint architecture"
+#endif
+}
+
+static int ckpt_cpu_migrate_v2(struct cpu *current, const unsigned char *legacy, size_t legacy_size) {
+    memset(current, 0, sizeof *current);
+#if G_CKPT_ARCH == CKPT_ARCH_AARCH64
+    /*
+     * Published v2 had eight SMC ranges.  v3 enlarged that in-place to 64
+     * and inserted the logical-VMA soft state immediately before
+     * in_service.  Preserve the unchanged prefix and tail explicitly;
+     * copying the old object as a prefix would shift every field after the
+     * SMC queue by 896 bytes.
+     */
+    const size_t prefix = offsetof(struct cpu, smc_ranges);
+    const size_t old_ranges = 8 * 2 * sizeof(uint64_t);
+    const size_t new_ranges = sizeof current->smc_ranges;
+    const size_t old_tail = prefix + old_ranges;
+    const size_t new_tail = prefix + new_ranges;
+    const size_t stable_tail = offsetof(struct cpu, soft_page) - new_tail;
+    const size_t expected = old_tail + stable_tail + sizeof(uint64_t);
+    if (legacy_size != expected || expected != 26512) return -1;
+    memcpy(current, legacy, prefix);
+    memcpy(current->smc_ranges, legacy + prefix, old_ranges);
+    memcpy((unsigned char *)current + new_tail, legacy + old_tail, stable_tail);
+#elif G_CKPT_ARCH == CKPT_ARCH_X86_64
+    /*
+     * v3 inserted the software-TLB words immediately before in_service.
+     * Everything preceding them is byte-for-byte the published v2 layout.
+     */
+    const size_t stable = offsetof(struct cpu, soft_snapshot);
+    const size_t expected = stable + sizeof(uint64_t);
+    if (legacy_size != expected) return -1;
+    memcpy(current, legacy, stable);
+#else
+#error "unsupported checkpoint architecture"
+#endif
+    return 0;
+}
+
 struct ckpt_restore_backing {
     uint64_t object_id;
     int fd;
+    int expandable;
 };
 static struct ckpt_restore_backing *g_restore_backings;
 static int g_nrestore_backings;
@@ -2244,9 +2434,19 @@ static int ckpt_copy_fd_all(int source, int destination) {
     }
 }
 
-static int ckpt_restore_backing_seed(const char *procdir, uint64_t object_id) {
+static int ckpt_restore_backing_seed(const char *procdir, uint64_t object_id, uint64_t minimum_size) {
     for (int i = 0; i < g_nrestore_backings; i++)
-        if (g_restore_backings[i].object_id == object_id) return g_restore_backings[i].fd;
+        if (g_restore_backings[i].object_id == object_id) {
+            if (g_restore_backings[i].expandable) {
+                struct stat status;
+                if (minimum_size > (uint64_t)INT64_MAX ||
+                    fstat(g_restore_backings[i].fd, &status) != 0 ||
+                    ((uint64_t)status.st_size < minimum_size &&
+                     ftruncate(g_restore_backings[i].fd, (off_t)minimum_size) != 0))
+                    return -1;
+            }
+            return g_restore_backings[i].fd;
+        }
     if (ckpt_vector_reserve((void **)&g_restore_backings, &g_restore_backings_capacity,
                             sizeof *g_restore_backings, g_nrestore_backings + 1) != 0)
         return -1;
@@ -2256,6 +2456,7 @@ static int ckpt_restore_backing_seed(const char *procdir, uint64_t object_id) {
     if (!records) return -1;
     struct ckpt_fd record;
     int found = 0;
+    int expandable = 0;
     while (ckpt_rd_all(records, &record, sizeof record) == 0)
         if (record.object_id == object_id &&
             (record.kind == CKF_FILE || record.kind == CKF_BLOB || record.kind == CKF_MEMFD)) {
@@ -2263,9 +2464,25 @@ static int ckpt_restore_backing_seed(const char *procdir, uint64_t object_id) {
             break;
         }
     ckpt_source_fclose(records);
-    if (!found) return -1;
     int fd = -1;
-    if (record.kind == CKF_FILE) {
+    if (!found) {
+        /*
+         * mmap keeps a vnode alive after its guest descriptor is closed.
+         * Such a backing has no fd record, but the sparse page stream still
+         * contains every mapped byte needed for restoration.  Recreate a
+         * private anonymous seed now; later regions with the same object id
+         * reuse it and therefore recover alias topology.
+         */
+        char temporary[] = "/tmp/.hl-restore-mapXXXXXX";
+        fd = mkstemp(temporary);
+        if (fd >= 0) unlink(temporary);
+        if (fd < 0 || minimum_size > (uint64_t)INT64_MAX ||
+            ftruncate(fd, (off_t)minimum_size) != 0) {
+            if (fd >= 0) close(fd);
+            return -1;
+        }
+        expandable = 1;
+    } else if (record.kind == CKF_FILE) {
         fd = open(record.path, O_RDWR);
         if (fd < 0) fd = open(record.path, O_RDONLY);
     } else {
@@ -2288,7 +2505,7 @@ static int ckpt_restore_backing_seed(const char *procdir, uint64_t object_id) {
         return -1;
     }
     fd = private_fd;
-    g_restore_backings[g_nrestore_backings++] = (struct ckpt_restore_backing){object_id, fd};
+    g_restore_backings[g_nrestore_backings++] = (struct ckpt_restore_backing){object_id, fd, expandable};
     return fd;
 }
 
@@ -2315,6 +2532,7 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
     uint64_t *mapped_a;
     uint64_t *mapped_e;
     size_t nmapped = 0;
+    jit_guest_soft_restore_deactivate();
     char pf[1300];
     snprintf(pf, sizeof pf, "%s/pages", procdir);
     FILE *f = ckpt_source_fopen(pf);
@@ -2340,7 +2558,11 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
     mapped_e = mapped != NULL ? mapped + (size_t)m->n_regions : NULL;
     for (uint64_t i = 0; i < m->n_regions; i++) {
         struct ckpt_region reg;
-        if (ckpt_rd_all(f, &reg, sizeof reg) != 0) {
+        if (ckpt_read_region(f, m->version, &reg) != 0) {
+            goto fail;
+        }
+        if (reg.format_version != CKPT_REGION_VERSION || reg.logical > 1) {
+            fprintf(stderr, "[restore] invalid region format=%u logical=%u\n", reg.format_version, reg.logical);
             goto fail;
         }
         topology[i] = reg;
@@ -2351,12 +2573,31 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
                 contained = 1;
                 break;
         }
-        if (!contained) {
+        if (reg.logical) {
+            if (reg.backing_object == 0 || !reg.backing_shared || reg.backing_emulated) {
+                fprintf(stderr, "[restore] invalid logical backing metadata\n");
+                goto fail;
+            }
+            jit_guest_soft_restore_activate();
+            uint64_t seed_size = reg.backing_offset + reg.glen;
+            if (seed_size < reg.backing_offset) goto fail;
+            int seed = ckpt_restore_backing_seed(procdir, reg.backing_object, seed_size);
+            if (seed < 0 ||
+                hl_logical_vma_global_restore_shared(reg.addr, reg.glen, (uint32_t)reg.prot, seed,
+                                                     reg.backing_offset, (size_t)getpagesize()) != 0) {
+                fprintf(stderr, "[restore] cannot rebuild logical guest region %llx+%llx: %s\n",
+                        (unsigned long long)reg.addr, (unsigned long long)reg.glen, strerror(errno));
+                goto fail;
+            }
+            contained = 1;
+        } else if (!contained) {
             int map_flags = MAP_FIXED | MAP_ANON | MAP_PRIVATE;
             int map_fd = -1;
             off_t map_offset = 0;
             if (reg.backing_object != 0 && !reg.backing_emulated) {
-                map_fd = ckpt_restore_backing_seed(procdir, reg.backing_object);
+                if (reg.backing_offset > UINT64_MAX - reg.len) goto fail;
+                map_fd = ckpt_restore_backing_seed(procdir, reg.backing_object,
+                                                   reg.backing_offset + reg.len);
                 if (map_fd < 0) {
                     fprintf(stderr, "[restore] cannot prepare backing object %llx\n",
                             (unsigned long long)reg.backing_object);
@@ -2381,9 +2622,18 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
                 goto fail;
             }
             size_t n = (va - reg.addr + m->pagesz > reg.len) ? (size_t)(reg.len - (va - reg.addr)) : (size_t)m->pagesz;
-            if (ckpt_rd_all(f, (void *)va, n) != 0) {
+            if (reg.logical) {
+                void *page = malloc(n);
+                if (page == NULL || ckpt_rd_all(f, page, n) != 0 ||
+                    hl_logical_vma_global_copy_in(va, page, n) != 0) {
+                    fprintf(stderr, "[restore] cannot copy logical guest page %llx+%zx: %s\n",
+                            (unsigned long long)va, n, strerror(errno));
+                    free(page);
+                    goto fail;
+                }
+                free(page);
+            } else if (ckpt_rd_all(f, (void *)va, n) != 0)
                 goto fail;
-            }
         }
         hl_linux_snapshot_advance(&g_ckpt_snapshot, reg.addr + reg.len);
         hl_gmap_add(reg.addr, reg.len);
@@ -2397,7 +2647,13 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
     for (uint64_t i = 0; i < m->n_regions; i++) {
         struct ckpt_region *reg = &topology[i];
         if (reg->backing_object == 0) continue;
-        int seed = ckpt_restore_backing_seed(procdir, reg->backing_object);
+        if (reg->backing_offset > UINT64_MAX - reg->glen) {
+            free(mapped);
+            free(topology);
+            return -1;
+        }
+        int seed = ckpt_restore_backing_seed(procdir, reg->backing_object,
+                                             reg->backing_offset + reg->glen);
         if (seed < 0) {
             fprintf(stderr, "[restore] cannot rebuild backing object %llx\n",
                     (unsigned long long)reg->backing_object);
@@ -3425,16 +3681,20 @@ static int ckpt_restore_fds_dir(const char *procdir) {
 static int ckpt_restore_cpu_dir(const char *procdir, const struct ckpt_meta *m, struct cpu **out) {
     char pf[1300];
     snprintf(pf, sizeof pf, "%s/cpu", procdir);
+    size_t payload_size = ckpt_cpu_payload_size(m->version);
+    if (m->n_threads > SIZE_MAX / payload_size) return -1;
+    size_t payload_bytes = (size_t)m->n_threads * payload_size;
     size_t bytes = (size_t)m->n_threads * sizeof(struct cpu);
-    size_t file_bytes = sizeof(struct ckpt_cpu_header) + bytes;
+    if (payload_bytes > SIZE_MAX - sizeof(struct ckpt_cpu_header)) return -1;
+    size_t file_bytes = sizeof(struct ckpt_cpu_header) + payload_bytes;
     struct ckpt_cpu_header *cpu_file = malloc(file_bytes);
     if (!cpu_file || ckpt_source_load(pf, cpu_file, file_bytes) != 0) {
         free(cpu_file);
         fprintf(stderr, "[restore] cannot read cpu state\n");
         return -1;
     }
-    if (cpu_file->magic != CKPT_CPU_MAGIC || cpu_file->version != CKPT_VERSION || cpu_file->arch != G_CKPT_ARCH ||
-        cpu_file->count != m->n_threads || cpu_file->payload_size != sizeof(struct cpu)) {
+    if (cpu_file->magic != CKPT_CPU_MAGIC || cpu_file->version != m->version || cpu_file->arch != G_CKPT_ARCH ||
+        cpu_file->count != m->n_threads || cpu_file->payload_size != payload_size) {
         fprintf(stderr, "[restore] cpu image version/architecture/layout mismatch\n");
         free(cpu_file);
         return -1;
@@ -3444,7 +3704,18 @@ static int ckpt_restore_cpu_dir(const char *procdir, const struct ckpt_meta *m, 
         free(cpu_file);
         return -1;
     }
-    memcpy(images, cpu_file + 1, bytes);
+    if (m->version == 2) {
+        const unsigned char *legacy = (const unsigned char *)(cpu_file + 1);
+        for (uint64_t i = 0; i < m->n_threads; i++)
+            if (ckpt_cpu_migrate_v2(&images[i], legacy + (size_t)i * payload_size, payload_size) != 0) {
+                fprintf(stderr, "[restore] unsupported v2 cpu layout\n");
+                free(images);
+                free(cpu_file);
+                return -1;
+            }
+    } else {
+        memcpy(images, cpu_file + 1, bytes);
+    }
     free(cpu_file);
     // Zero host-transient fields (meaningful only WHILE a block runs; run_block re-populates them). The
     // architectural state (x[],sp,pc,tls,nzcv,v[],sigmask,tpending,alt_*,tid,ctid) + shadow stack are verbatim.
@@ -3512,6 +3783,7 @@ static void ckpt_reinstall_sigacts(const struct ckpt_meta *m) {
 // The process table read from the checkpoint (one entry per proc.<gpid>/meta), used to rebuild the tree.
 struct ckpt_proc {
     int gpid, ppid, pgid, sid;
+    uint64_t version;
     int viable;
     char reason[192];
 };
@@ -3543,6 +3815,7 @@ static int ckpt_scan_procs(const char *base) {
         g_rprocs[g_nrprocs].ppid = m.ppid_gpid;
         g_rprocs[g_nrprocs].pgid = m.pgid_gpid;
         g_rprocs[g_nrprocs].sid = m.sid_gpid;
+        g_rprocs[g_nrprocs].version = m.version;
         g_rprocs[g_nrprocs].viable = 1;
         g_rprocs[g_nrprocs].reason[0] = 0;
         g_nrprocs++;
@@ -3554,6 +3827,7 @@ static int ckpt_validate_proc_tree(const struct ckpt_manifest *man) {
     if ((uint64_t)g_nrprocs != man->n_procs) return -1;
     int roots = 0;
     for (int i = 0; i < g_nrprocs; i++) {
+        if (g_rprocs[i].version != man->version) return -1;
         if (g_rprocs[i].gpid == man->root_gpid) {
             if (g_rprocs[i].ppid != 0) return -1;
             roots++;
@@ -3763,9 +4037,16 @@ static int ckpt_validate_process_image(const char *base, const struct ckpt_proc 
     if (!pages) return -1;
     for (uint64_t index = 0; index < meta->n_regions; ++index) {
         struct ckpt_region region;
-        if (ckpt_rd_all(pages, &region, sizeof region) != 0 || region.addr == 0 || region.len == 0 ||
+        if (ckpt_read_region(pages, meta->version, &region) != 0 || region.addr == 0 || region.len == 0 ||
             region.addr > UINT64_MAX - region.len || region.glen > region.len ||
-            region.npages > (region.len - 1) / meta->pagesz + 1) {
+            region.npages > (region.len - 1) / meta->pagesz + 1 ||
+            region.format_version != CKPT_REGION_VERSION || region.logical > 1 ||
+            (region.backing_object != 0 &&
+             (region.backing_offset > UINT64_MAX - region.glen ||
+              region.backing_offset + region.glen > (uint64_t)INT64_MAX)) ||
+            (region.logical &&
+             (region.backing_object == 0 || !region.backing_shared || region.backing_emulated ||
+              region.glen != region.len))) {
             ckpt_source_fclose(pages);
             return -1;
         }
@@ -5162,6 +5443,7 @@ static void ckpt_restore_proc_run(const char *base, int gpid) {
      * host mapping ownership. Release those handles before forgetting the generic
      * map registry, otherwise every restored child leaks its parent's mappings. */
     bound_mapping_reset();
+    hl_logical_vma_global_reset_quiescent();
     hl_gmap_reset();
     g_nanonmap = 0;
     gna_reset();

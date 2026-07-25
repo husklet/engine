@@ -70,7 +70,7 @@
 // interpreter). Opt in via HL_PCACHE=1.
 
 #define PC_MAGIC 0x34414350544a4c48ull // "HLJTPCA4" (LE tag)
-#define PC_VERSION 8 // v8 persists exact fused-PLT GOT-load instruction provenance.
+#define PC_VERSION 9 // v9 persists each block's exact guest-source interval for targeted SMC invalidation.
 #define PC_VERSION_EFF PC_VERSION
 #define PC_IMG_BASE 0x0000040000000000ull    // 4 TB -- fixed guest image base (probed free on Apple silicon)
 #define PC_INTERP_BASE 0x0000048000000000ull // 4.5 TB -- fixed interp (ld.so) base
@@ -440,7 +440,8 @@ static int pcache_load(uint64_t entry_jump) {
         ok = pc_guest_adrp_ok(re[i], abuf, h.arena_rx_at);
     for (uint64_t i = 0; ok && i < h.n_mapent; i++)
         ok = hl_window_contains(h.arena_used, me[i].host_off, 1, 4) &&
-             hl_window_contains(h.arena_used, me[i].body_off, 1, 4);
+             hl_window_contains(h.arena_used, me[i].body_off, 1, 4) &&
+             me[i].guest_start < me[i].guest_end;
     for (uint64_t i = 0; ok && i < h.n_pend; i++) {
         ok = hl_window_contains(h.arena_used, pe[i].slot_off, 4, 4) &&
              pe[i].kind <= 2 && pe[i].fwd <= 1;
@@ -530,6 +531,13 @@ static int pcache_load(uint64_t entry_jump) {
     // page-fallback path for them by arming eager line recording for every block translated from now on,
     // matching the pre-lazy behaviour for a warm-loaded arena.
     g_txln_active = 1;
+    /*
+     * Restored blocks predate the live line-content table and can contain
+     * direct caller ingress.  The first warm-image SMC must therefore perform
+     * the normal activation prime before later events become precisely
+     * source-targeted.
+     */
+    g_txln_prime = 1;
     if (g_coldprof)
         fprintf(stderr, "[pcache] load %llu B arena, %llu blocks, %llu reloc in %.3f ms\n",
                 (unsigned long long)h.arena_used, (unsigned long long)h.n_mapent, (unsigned long long)h.n_reloc,
@@ -543,7 +551,7 @@ static int pcache_load(uint64_t entry_jump) {
 // taken under g_jit_lock so a live peer thread (threaded exit_group) can never tear it.
 static void pcache_save(void) {
     if (!g_pcache || !g_pc_binid || g_cp == g_cache) return;
-    if (g_pcache_poison || g_pcache_loaded || g_pcache_forked || g_force_base_failed || g_smc_seen) return;
+    if (g_pcache_poison || g_pcache_loaded || g_pcache_forked || g_force_base_failed || smc_seen()) return;
     uint64_t t0 = g_coldprof ? now_ns() : 0;
     char path[1024];
     if (!pcache_file(path, sizeof path)) return;
@@ -590,10 +598,9 @@ static void pcache_save(void) {
         w += (size_t)g_nreloc * sizeof(hl_reloc);
         for (uint32_t i = 0; i < JIT_MAP_N; i++) {
             if (!map_live(i)) continue;
-            // guest_start/guest_end are vestigial in the on-disk record (restore discards them; the SMC page
-            // set is serialized separately). The live map entry no longer stores them, so emit 0 placeholders
-            // and keep the pc_mapent layout + PC_VERSION unchanged.
-            struct pc_mapent e = {g_map[i].gpc, 0, 0,
+            // The hot map entry stays 32 bytes; cold source bounds live in parallel arrays and are persisted
+            // so a warm-loaded block remains individually invalidatable after guest code rewrites.
+            struct pc_mapent e = {g_map[i].gpc, g_map_guest_start[i], g_map_guest_end[i],
                                   (uint64_t)((uint8_t *)g_map[i].host - g_cache),
                                   (uint64_t)((uint8_t *)g_map[i].body - g_cache)};
             memcpy(w, &e, sizeof e);
