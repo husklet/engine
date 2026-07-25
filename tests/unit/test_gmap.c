@@ -97,7 +97,14 @@ int main(void) {
     HL_CHECK(hl_gmap_get(0, &first));
     HL_CHECK(hl_gmap_get(1, &second));
     HL_CHECK(first.address == 0x10000 && first.length == 0x2000 && first.guest_length == 0x2000);
-    HL_CHECK(second.address == 0x13000 && second.length == 0x2000 && second.guest_length == 0x2000);
+    HL_CHECK(second.address == 0x13000 && second.length == 0x2000 && second.guest_length == 0x1000);
+    {
+        uint64_t physical_address = 0, physical_length = 0;
+        HL_CHECK(hl_gmap_find_physical(0x10000, &physical_address, &physical_length));
+        HL_CHECK(physical_address == 0x10000 && physical_length == 0x2000);
+        HL_CHECK(hl_gmap_find_physical(0x13000, &physical_address, &physical_length));
+        HL_CHECK(physical_address == 0x13000 && physical_length == 0x2000);
+    }
     HL_CHECK(!hl_gmap_contains(0x12000, 1));
 
     hl_gmap_lock_add(0x10011, 100);
@@ -117,13 +124,29 @@ int main(void) {
 
     hl_gmap_lock_all(1);
     HL_CHECK(hl_gmap_lock_future());
-    HL_CHECK(hl_gmap_lock_total_bytes() == 0x4000);
+    HL_CHECK(hl_gmap_lock_total_bytes() == 0x3000);
     hl_gmap_lock_reset();
     HL_CHECK(!hl_gmap_lock_future() && hl_gmap_lock_total_bytes() == 0);
 
     hl_gmap_remove(0x10000);
     hl_gmap_remove(0x13000);
     HL_CHECK(hl_gmap_count() == 0);
+
+    hl_gmap_add_physical(0x9000, 0x4000, 0x8000, 0x6000);
+    hl_gmap_set_guest_length(0x9000, 0x3000);
+    hl_gmap_unmap_range(0xa000, 0xb000);
+    HL_CHECK(hl_gmap_count() == 2);
+    {
+        uint64_t physical_address = 0, physical_length = 0;
+        HL_CHECK(hl_gmap_find_physical(0x9000, &physical_address, &physical_length));
+        HL_CHECK(physical_address == 0x8000 && physical_length == 0x2000);
+        HL_CHECK(hl_gmap_find_physical(0xb000, &physical_address, &physical_length));
+        HL_CHECK(physical_address == 0xb000 && physical_length == 0x3000);
+        HL_CHECK(hl_gmap_find_guest_length(0x9000) == 0x1000);
+        HL_CHECK(hl_gmap_find_guest_length(0xb000) == 0x1000);
+    }
+    hl_gmap_remove(0x9000);
+    hl_gmap_remove(0xb000);
 
     {
         void *mapping = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

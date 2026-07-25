@@ -170,6 +170,10 @@ void hl_gmap_unmap_range(uint64_t start, uint64_t end) {
         hl_gmap_entry *entry = &g_gmap.mappings[index];
         uint64_t base = entry->address;
         uint64_t mapped_end = base + entry->length;
+        uint64_t guest_end =
+            base + (entry->guest_length < entry->length ? entry->guest_length : entry->length);
+        uint64_t physical_start = entry->physical_address;
+        uint64_t physical_end = physical_start + entry->physical_length;
         if (end <= base || start >= mapped_end) {
             index++;
             continue;
@@ -180,11 +184,29 @@ void hl_gmap_unmap_range(uint64_t start, uint64_t end) {
             *entry = g_gmap.mappings[--g_gmap.mapping_count];
             continue;
         }
-        if (keep_head)
-            entry->length = entry->guest_length = start - base;
-        else
-            entry->address = end, entry->length = entry->guest_length = mapped_end - end;
-        if (keep_head && keep_tail) hl_gmap_add(end, mapped_end - end);
+        if (keep_head) {
+            uint64_t head_length = start - base;
+            entry->length = head_length;
+            entry->guest_length = guest_end > base ? guest_end - base : 0;
+            if (entry->guest_length > head_length) entry->guest_length = head_length;
+            entry->physical_address = physical_start;
+            entry->physical_length = start - physical_start;
+        } else {
+            uint64_t tail_length = mapped_end - end;
+            entry->address = end;
+            entry->length = tail_length;
+            entry->guest_length = guest_end > end ? guest_end - end : 0;
+            if (entry->guest_length > tail_length) entry->guest_length = tail_length;
+            entry->physical_address = end;
+            entry->physical_length = physical_end - end;
+        }
+        if (keep_head && keep_tail) {
+            uint64_t tail_length = mapped_end - end;
+            uint64_t tail_guest_length = guest_end > end ? guest_end - end : 0;
+            if (tail_guest_length > tail_length) tail_guest_length = tail_length;
+            hl_gmap_add_physical(end, tail_length, end, physical_end - end);
+            hl_gmap_set_guest_length(end, tail_guest_length);
+        }
         index++;
     }
 }
