@@ -1204,6 +1204,15 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
+        // The engine can retain a host mapping after a guest-logical munmap (for example a subrange sharing
+        // a larger host page).  Host mincore would report that retained backing as resident even though Linux
+        // must reject a range containing any logically unmapped guest page with ENOMEM.  gmap is the complete
+        // guest mapping ledger (image, stack, brk, anonymous and file mappings), so validate against it before
+        // asking the host about residency.
+        if (len && !hl_gmap_contains(a0, (uint64_t)len)) {
+            G_RET(c) = (uint64_t)(int64_t)(-ENOMEM);
+            break;
+        }
         // Linux: `vec` must be a writable buffer of ceil(len/pagesize) bytes; a NULL or inaccessible vec is
         // EFAULT. Validate against GUEST protections up front (both paths), because hl force-maps guest
         // PROT_NONE pages host-writable -- so a raw host mincore would happily scribble a guest guard page
