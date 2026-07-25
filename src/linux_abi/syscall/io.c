@@ -483,24 +483,63 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         case 64:
         case 66:
         case 68:
-        case 70: G_RET(c) = (uint64_t)(int64_t)(-ENOSPC); return svc_done(c);
+        case 70:
+            // A description that is not open for writing loses first, as everywhere else in the family:
+            // write(fd_opened_O_RDONLY_on_/dev/full, buf, 1) is EBADF on Linux, not ENOSPC.
+            G_RET(c) = (uint64_t)(int64_t)(guest_fd_rejects((int)a0, 0) ? -EBADF : -ENOSPC);
+            return svc_done(c);
         default: break;
         }
     }
     // /dev/urandom + /dev/random: Linux accepts writes as entropy seeding and returns the byte count;
     // macOS EPERMs them. Swallow the write (count for write/pwrite; summed iov length for writev/pwritev).
     if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_devseed[(int)a0]) {
+        // The swallow must not skip the two checks the kernel makes ahead of the write itself: the
+        // description has to be open for writing (EBADF) and the source has to be readable (EFAULT).
         switch (nr) {
         case 64:
-        case 68: G_RET(c) = a2; return svc_done(c); // write / pwrite64: count = a2
+        case 66:
+        case 68:
+        case 70:
+            if (guest_fd_rejects((int)a0, 0)) {
+                G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+                return svc_done(c);
+            }
+            break;
+        default: break;
+        }
+        switch (nr) {
+        case 64:
+        case 68: // write / pwrite64: count = a2
+            if (a2 && guest_accessible_prefix(a1, (size_t)a2, HL_LOGICAL_VMA_READ) != (size_t)a2) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                return svc_done(c);
+            }
+            G_RET(c) = a2;
+            return svc_done(c);
         case 66:
         case 70: { // writev / pwritev: sum the iovec lengths
-            uint64_t tot = 0;
-            const struct iovec *iov = (const struct iovec *)a1;
-            if (iov)
-                for (int i = 0; i < (int)a2; i++)
-                    tot += iov[i].iov_len;
-            G_RET(c) = tot;
+            if (a2 > GUEST_IOV_STACK_MAX) {
+                G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+                return svc_done(c);
+            }
+            // The array itself lives in guest memory, so import it instead of dereferencing a1 directly.
+            struct iovec vectors[GUEST_IOV_STACK_MAX];
+            if (guest_iov_import(a1, (size_t)a2, vectors) < 0) {
+                G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                return svc_done(c);
+            }
+            uint64_t total = 0;
+            for (size_t index = 0; index < (size_t)a2; ++index) {
+                size_t length = vectors[index].iov_len;
+                uint64_t base = (uint64_t)(uintptr_t)vectors[index].iov_base;
+                if (length && guest_accessible_prefix(base, length, HL_LOGICAL_VMA_READ) != length) {
+                    G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
+                    return svc_done(c);
+                }
+                total += length;
+            }
+            G_RET(c) = total;
             return svc_done(c);
         }
         default: break;
@@ -1360,7 +1399,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             ssize_t copied = guest_copy_from(buffer, a1, (size_t)a2);
             if (copied != (ssize_t)a2) {
                 free(buffer);
-                G_RET(c) = (uint64_t)(copied > 0 ? copied : -EFAULT);
+                // This udp-switch probe bounces the source for EVERY write, ahead of any look at the fd, but
+                // Linux resolves the descriptor first (fdget_pos then FMODE_WRITE, both EBADF) -- so
+                // write(fd_opened_O_RDONLY, NULL, 1) must be EBADF, not the EFAULT this used to report.
+                G_RET(c) = (uint64_t)(copied > 0 ? copied : (guest_fd_rejects(wfd, 0) ? -EBADF : -EFAULT));
                 break;
             }
             struct iovec vector = {buffer, (size_t)a2};
@@ -1497,7 +1539,9 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             ssize_t gathered = io_guest_vector_gather(a1, (size_t)a2, tmp, sizeof(tmp));
             struct iovec host = {tmp, gathered > 0 ? (size_t)gathered : 0};
             if (gathered < 0) {
-                G_RET(c) = (uint64_t)(int64_t)gathered;
+                // Same ordering as case 64: this probe gathers before the fd is consulted, and do_writev
+                // resolves the descriptor ahead of import_iovec.
+                G_RET(c) = (uint64_t)(int64_t)(gathered == -EFAULT && guest_fd_rejects((int)a0, 0) ? -EBADF : gathered);
                 break;
             }
             if (udp_switch_write((int)a0, &host, 1, &result)) {

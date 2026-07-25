@@ -927,6 +927,16 @@ int main(int argc, char **argv) {
                 "[--repeat N] [CASE]\n");
         return 2;
     }
+    /*
+     * The guest maps /tmp to a fresh per-case scratch directory, so a binary root UNDER /tmp cannot resolve
+     * inside the guest: cases that canonicalize argv[0] then fail with a diagnostic that looks like an engine
+     * bug (BUILD=/tmp/...). Reject it up front instead.
+     */
+    if (strncmp(argv[3], "/tmp/", 5) == 0 || strncmp(argv[5], "/tmp/", 5) == 0) {
+        fprintf(stderr, "matrix-runner: binary root under /tmp is unusable -- the guest maps /tmp to its own "
+                        "scratch; use a build directory outside /tmp\n");
+        return 2;
+    }
     if (load_manifest(argv[6], cases, &count, &excluded, engine_is_macho(argv[2])) != 0) return 1;
     baseline = resource_measure();
     for (index = 0; index < count; ++index) {

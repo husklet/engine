@@ -188,6 +188,20 @@ static int guest_iov_import(uint64_t guest, size_t count, struct iovec *vectors)
 }
 
 /*
+ * Would Linux have rejected this descriptor before it ever looked at the user buffer?  ksys_read/ksys_write
+ * resolve the fd first (fdget_pos -> EBADF, then the FMODE_READ/FMODE_WRITE test, also EBADF) and only the
+ * file's ->read_iter/->write_iter reaches copy_{to,from}_user.  Our translation runs first -- that is what
+ * keeps the transfer zero-copy -- so a translation failure must ask whether the descriptor, not the buffer,
+ * was the real complaint.  `for_read` names the access mode the descriptor has to carry.
+ */
+static int guest_fd_rejects(int fd, int for_read) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0) return 1; // no such descriptor
+    int mode = flags & O_ACCMODE;
+    return for_read ? mode == O_WRONLY : mode == O_RDONLY;
+}
+
+/*
  * read/pread into a guest range.  One host syscall consumes all canonical and
  * direct spans, retaining atomic file-position advancement and kernel short
  * read/EINTR behavior.  A fault after a valid prefix exposes only that prefix
@@ -204,11 +218,13 @@ static ssize_t guest_fd_read(int fd, uint64_t guest, size_t length, off_t offset
         guest_iov_range(guest, length, HL_LOGICAL_VMA_WRITE, vectors, pins, guest_bases, GUEST_IOV_STACK_MAX, &covered);
     if (count < 0) {
         /*
-         * Linux resolves the descriptor before copy_to_user.  Preserve EBADF
-         * when both the descriptor and guest buffer are invalid instead of
-         * reporting the later EFAULT first.
+         * Linux resolves the descriptor before copy_to_user, so a missing fd -- or one that is not open for
+         * reading at all -- outranks the buffer complaint.
          */
-        if (fcntl(fd, F_GETFL) < 0 && errno == EBADF) return -1;
+        if (guest_fd_rejects(fd, 1)) {
+            errno = EBADF;
+            return -1;
+        }
         /*
          * A read at EOF succeeds without touching the destination. Probe at
          * the same file position without advancing it before classifying the
@@ -250,13 +266,9 @@ static ssize_t guest_fd_write(int fd, uint64_t guest, size_t length, off_t offse
     int count =
         guest_iov_range(guest, length, HL_LOGICAL_VMA_READ, vectors, pins, guest_bases, GUEST_IOV_STACK_MAX, &covered);
     if (count < 0) {
-        /*
-         * Linux resolves the descriptor before copy_from_user.  Preserve
-         * EBADF when both inputs are invalid; a valid descriptor still gets
-         * the expected EFAULT for an unreadable guest range.
-         */
-        if (fcntl(fd, F_GETFL) < 0 && errno == EBADF) return -1;
-        errno = EFAULT;
+        // A write always dereferences the source, so there is no EOF-shaped escape here: the descriptor
+        // (missing, or not open for writing) simply loses first.
+        errno = guest_fd_rejects(fd, 0) ? EBADF : EFAULT;
         return -1;
     }
     ssize_t result = positional ? pwritev(fd, vectors, count, offset) : writev(fd, vectors, count);
@@ -278,7 +290,8 @@ static ssize_t guest_fd_vector_flags(int fd, uint64_t guest_vectors, size_t gues
     }
     struct iovec guest_iov[GUEST_IOV_STACK_MAX];
     if (guest_iov_import(guest_vectors, guest_count, guest_iov) < 0) {
-        errno = EFAULT;
+        // do_readv/do_writev also reach the descriptor first: fdget_pos precedes import_iovec.
+        errno = guest_fd_rejects(fd, output) ? EBADF : EFAULT;
         return -1;
     }
     if (!guest_count) {
@@ -307,7 +320,7 @@ static ssize_t guest_fd_vector_flags(int fd, uint64_t guest_vectors, size_t gues
             pins + host_count, guest_bases + host_count, GUEST_IOV_STACK_MAX - host_count, &covered);
         if (count < 0) {
             if (!host_count) {
-                errno = EFAULT;
+                errno = guest_fd_rejects(fd, output) ? EBADF : EFAULT;
                 return -1;
             }
             break;
