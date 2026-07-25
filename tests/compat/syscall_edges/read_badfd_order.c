@@ -37,6 +37,16 @@ int main(void) {
     if (urandom < 0) return 1;
     errno = 0;
     show("read_goodfd_nullbuf", read(urandom, NULL, 1));
+    // A live descriptor opened the wrong way round is EBADF too: the FMODE_READ/FMODE_WRITE test sits beside
+    // fdget_pos, ahead of the buffer, so the access mode outranks a bad buffer as well.
+    errno = 0;
+    show("write_rdonly_nullbuf", write(urandom, NULL, 1));
     close(urandom);
+
+    int sink = open("/dev/null", O_WRONLY);
+    if (sink < 0) return 1;
+    errno = 0;
+    show("read_wronly_nullbuf", read(sink, NULL, 1));
+    close(sink);
     return 0;
 }
