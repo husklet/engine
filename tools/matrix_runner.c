@@ -841,15 +841,33 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
                    const char *suite_root, const char *isa, capture *result) {
     char guest[1024], expected_path[1024], binary[256], rootfs[1024] = {0};
     unsigned char *expected;
-    size_t expected_size, length = strlen(item->source), binary_length = length;
+    const char *source_name = strrchr(item->source, '/');
+    size_t expected_size, length, binary_length;
     int status;
+    /*
+     * Most suite binaries preserve source subdirectories, while imported corpus sources are flattened with
+     * $(notdir). Prefer the source-relative output and fall back to its basename so both Makefile layouts are
+     * addressable without encoding build-system paths into the manifest.
+     */
+    length = strlen(item->source);
+    binary_length = length;
     /* Source-built suites use foo.c; fixture suites may name the committed executable itself. */
     if (length >= 2 && strcmp(item->source + length - 2, ".c") == 0) binary_length -= 2;
     if (binary_length == 0 || binary_length >= sizeof(binary)) return 1;
     memcpy(binary, item->source, binary_length);
     binary[binary_length] = 0;
-    if (snprintf(guest, sizeof(guest), "%s/%s", binary_root, binary) >= (int)sizeof(guest) ||
-        snprintf(expected_path, sizeof(expected_path), "%s/%s", suite_root, item->expected) >=
+    if (snprintf(guest, sizeof(guest), "%s/%s", binary_root, binary) >= (int)sizeof(guest)) return 1;
+    if (access(guest, R_OK) != 0 && source_name != NULL) {
+        source_name++;
+        length = strlen(source_name);
+        binary_length = length;
+        if (length >= 2 && strcmp(source_name + length - 2, ".c") == 0) binary_length -= 2;
+        if (binary_length == 0 || binary_length >= sizeof(binary)) return 1;
+        memcpy(binary, source_name, binary_length);
+        binary[binary_length] = 0;
+        if (snprintf(guest, sizeof(guest), "%s/%s", binary_root, binary) >= (int)sizeof(guest)) return 1;
+    }
+    if (snprintf(expected_path, sizeof(expected_path), "%s/%s", suite_root, item->expected) >=
             (int)sizeof(expected_path) ||
         read_file(expected_path, &expected, &expected_size) != 0) {
         fprintf(stderr, "matrix-runner: %s input path/read failure\n", item->name);
