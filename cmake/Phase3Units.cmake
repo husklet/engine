@@ -108,6 +108,7 @@ set(_hostl hl-host-linux)
 # Manifest-only firewall audit: deliberately links NO engine archive so a mac
 # gate build never pulls GNU archives into a Darwin executable (Makefile 566).
 hl_unit(lifecycle_identity NO_LIBS)
+hl_unit(guest_naked NO_LIBS)
 
 hl_unit(linux_abi           LINK -pthread)
 hl_unit(watch               LIBS ${_abi} SINGLE LINK -pthread)
@@ -158,7 +159,7 @@ set(HL_UNIT_NAMES
   a64_asm address affinity arena avx bus child ckptinoq cli clock codegen config cpuid
   cmpxchg decoder device digest directory directory_services emit epoll eventfd
   environment eventfd_fork fatal fdcache file flags fork_wire glue gmap guest_fetch host_services
-  identity image inotify ir key launch legacy lifecycle_identity linux_abi
+  guest_naked identity image inotify ir key launch legacy lifecycle_identity linux_abi
   linux_fork logical_vma lower_alu lower_crypto lower_mov lower_repstr lower_shift
   lower_sse4x lower_trace lower_x87 misc native open_plan operand options_environment owner persist
   pidmap pipe pipe_linux placement ports private process provider_client provider_demux
