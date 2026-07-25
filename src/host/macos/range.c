@@ -16,10 +16,10 @@ int hl_host_address_mapped(uintptr_t address) {
     vm_region_basic_info_data_64_t info;
     mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
     mach_port_t object = MACH_PORT_NULL;
-    if (mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count,
-                       &object) != KERN_SUCCESS)
-        return 0;
-    return address >= (uintptr_t)region && address < (uintptr_t)region + (uintptr_t)size;
+    kern_return_t result = mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
+                                          (vm_region_info_t)&info, &count, &object);
+    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+    return result == KERN_SUCCESS && address >= (uintptr_t)region && address < (uintptr_t)region + (uintptr_t)size;
 }
 
 int hl_host_region_query(uintptr_t address, hl_host_region *region) {
@@ -29,11 +29,11 @@ int hl_host_region_query(uintptr_t address, hl_host_region *region) {
     mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
     mach_port_t object = MACH_PORT_NULL;
     uint32_t protection = 0;
-    if (region == NULL ||
-        mach_vm_region(mach_task_self(), &start, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count,
-                       &object) != KERN_SUCCESS ||
-        start > UINTPTR_MAX || size > SIZE_MAX)
-        return 0;
+    if (region == NULL) return 0;
+    kern_return_t result = mach_vm_region(mach_task_self(), &start, &size, VM_REGION_BASIC_INFO_64,
+                                          (vm_region_info_t)&info, &count, &object);
+    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+    if (result != KERN_SUCCESS || start > UINTPTR_MAX || size > SIZE_MAX) return 0;
     if ((info.protection & VM_PROT_READ) != 0) protection |= HL_HOST_REGION_READ;
     if ((info.protection & VM_PROT_WRITE) != 0) protection |= HL_HOST_REGION_WRITE;
     if ((info.protection & VM_PROT_EXECUTE) != 0) protection |= HL_HOST_REGION_EXECUTE;
