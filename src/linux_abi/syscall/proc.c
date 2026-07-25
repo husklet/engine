@@ -794,8 +794,17 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         // a3 is a timespec* for waits and a wake count for WAKE_OP; operation selects its interpretation.
         int is_private = ((int)a1 & 0x80) != 0;
-        const void *primary_key = is_private ? (const void *)(uintptr_t)a0 : primary;
-        const void *secondary_key = is_private ? (const void *)(uintptr_t)a4 : secondary;
+        /*
+         * futex_op's bucket/key helpers canonicalize addresses which belong to
+         * MAP_SHARED file mappings. FUTEX_PRIVATE_FLAG must instead remain
+         * keyed by this process's virtual address: two aliases of one memfd
+         * are distinct private futexes. Move private identity into the
+         * non-canonical host half so the shared-object registry cannot fold it
+         * back to (dev,inode,offset), while preserving a stable one-to-one key.
+         */
+        const uintptr_t private_tag = UINT64_C(0x8000000000000000);
+        const void *primary_key = is_private ? (const void *)(uintptr_t)(a0 ^ private_tag) : primary;
+        const void *secondary_key = is_private ? (const void *)(uintptr_t)(a4 ^ private_tag) : secondary;
         G_RET(c) = (uint64_t)futex_op(c, primary, primary_key, operation, is_private, (int)a2, timeout, (int)a3,
                                       secondary, secondary_key, (uint32_t)a5);
         hl_logical_vma_unpin(&timeout_pin);
