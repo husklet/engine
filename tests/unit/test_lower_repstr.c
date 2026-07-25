@@ -93,6 +93,13 @@ void emit_soft_store_commit(uint64_t size) {
     (void)size;
 }
 
+void emit_soft_store_observe(uint64_t size) {
+    (void)size;
+}
+
+void emit_soft_store_drain(void) {
+}
+
 void hl_x86_emit_host_pointer(int destination, uint64_t pointer) {
     (void)destination;
     (void)pointer;
