@@ -541,6 +541,16 @@ static long guest_xattr_set(const char *host, const char *name, const void *val,
 static long guest_xattr_get(const char *host, const char *name, void *val, size_t sz, int opt) {
     char hn[512];
     snprintf(hn, sizeof hn, "%s%s", HL_GUEST_XATTR_PREFIX, name ? name : "");
+    /*
+     * Linux getxattr(..., NULL, 0) returns the value length.  Darwin accepts
+     * that shape but reports zero, so perform a bounded host read for the
+     * guest's size probe. Guest xattrs are capped at 64 KiB by set above.
+     */
+    if (sz == 0) {
+        unsigned char probe[65536];
+        ssize_t length = hl_native_getxattr(host, hn, probe, sizeof probe, 0, opt);
+        return length < 0 ? -errno : length;
+    }
     void *local = sz ? malloc(sz) : NULL;
     if (sz && !local) return -ENOMEM;
     ssize_t r = hl_native_getxattr(host, hn, local, sz, 0, opt);
