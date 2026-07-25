@@ -1,3 +1,10 @@
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "hl/activation.h"
 #include "../host/fork_wire.h"
 #include "../host/system.h"
@@ -62,7 +69,7 @@ static void activation_host_destroy(hl_activation_host *host) {
 extern char **environ;
 void hl_activation_test_mode(uint32_t mode);
 
-enum { HL_ACTIVATION_FD = 198, HL_ACTIVATION_ABI = 2, HL_ACTIVATION_PATH_MAX = 4096 };
+enum { HL_ACTIVATION_FD = 3, HL_ACTIVATION_ABI = 2, HL_ACTIVATION_PATH_MAX = 4096 };
 /* Descriptor roles carried by one activation request, in ascending bit order. ABI 1 carried at most the
  * provider transport in an untagged single slot; ABI 2 tags them so the checkpoint broker can be attached
  * with or without a provider. */
@@ -178,6 +185,22 @@ static hl_provider_client activation_provider_client;
 static pthread_mutex_t activation_engine_lock = PTHREAD_MUTEX_INITIALIZER;
 static int activation_signal_pipe[2] = {-1, -1};
 static uint32_t activation_pending_signal;
+
+/*
+ * The activation constructor is the first engine code in the exec'd child.
+ * Make descriptor isolation an invariant here as well as a launcher policy:
+ * embedders may use a different spawn implementation, and platform spawn
+ * extensions must never decide what becomes guest-visible state.
+ */
+static void activation_close_unrelated_descriptors(void) {
+#if defined(__linux__)
+    closefrom(HL_ACTIVATION_FD + 1);
+#else
+    int limit = getdtablesize();
+    for (int fd = HL_ACTIVATION_FD + 1; fd < limit; ++fd)
+        (void)close(fd);
+#endif
+}
 
 static int activation_guest_signal(int host_signal) {
 #if defined(__linux__)
@@ -348,9 +371,13 @@ static void hl_activation_child(void) {
     if (environment < 0 || descriptor != HL_ACTIVATION_FD) _exit(125);
 #if defined(__APPLE__)
     /* Foundation's concrete string classes must finish initialization before
-     * activation creates its relay thread and the host backend forks a guest. */
+     * activation creates its relay thread and the host backend forks a guest.
+     * The warmup opens a com.apple.netsrc control socket, so descriptor
+     * isolation must run after it rather than letting that socket become guest
+     * state. */
     hl_linux_dns_prepare();
 #endif
+    activation_close_unrelated_descriptors();
     /* Embedded builds deliberately omit the native constructor.  Transport
      * adoption needs the private descriptor registry before the later backend
      * initialization boundary, otherwise every attached provider fails with
@@ -707,7 +734,7 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
     posix_spawnattr_t attributes;
     hl_activation_request request = {0};
     hl_activation_reply reply;
-    char activation[] = "HL_ACTIVATION_FD=198";
+    char activation[] = "HL_ACTIVATION_FD=3";
     char *child_argv[2];
     char **child_env;
     size_t env_count = 0;
@@ -772,6 +799,7 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
     child_argv[1] = NULL;
     if (terminal != NULL) {
         struct winsize size = {.ws_row = terminal->rows, .ws_col = terminal->columns};
+        int close_limit = getdtablesize();
         if (openpty(&master, &slave, NULL, NULL, &size) != 0 ||
             fcntl(master, F_SETFD, FD_CLOEXEC) != 0 || fcntl(slave, F_SETFD, FD_CLOEXEC) != 0) {
             if (master >= 0) close(master);
@@ -785,8 +813,20 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
             if (setsid() < 0 || ioctl(slave, TIOCSCTTY, 0) < 0 || dup2(slave, 0) < 0 || dup2(slave, 1) < 0 ||
                 dup2(slave, 2) < 0 || dup2(pair[1], HL_ACTIVATION_FD) < 0)
                 _exit(126);
-            if (slave > STDERR_FILENO) (void)close(slave);
-            if (pair[1] != HL_ACTIVATION_FD) (void)close(pair[1]);
+            /*
+             * execve preserves every descriptor without FD_CLOEXEC.  The
+             * embedder may be a large process with sockets and event queues
+             * that have nothing to do with this launch; none may become guest
+             * state.  Descriptor 3 is the sole activation capability and
+             * closefrom removes everything above it atomically with respect
+             * to this already-forked child.
+             */
+#if defined(__linux__)
+            closefrom(HL_ACTIVATION_FD + 1);
+#else
+            for (int fd = HL_ACTIVATION_FD + 1; fd < close_limit; ++fd)
+                (void)close(fd);
+#endif
             execve(executable, child_argv, child_env);
             _exit(127);
         }
@@ -804,7 +844,23 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
         posix_spawn_file_actions_destroy(&actions); close(pair[0]); close(pair[1]); free(child_env);
         return HL_STATUS_PLATFORM_FAILURE;
     }
-    if (posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP) != 0 ||
+    short spawn_flags = POSIX_SPAWN_SETPGROUP;
+#if defined(__APPLE__)
+    /*
+     * Darwin's CLOEXEC_DEFAULT is the race-free form of descriptor isolation:
+     * only descriptors named by file actions survive.  Explicitly inherit
+     * untouched standard streams; dup2 actions already name redirected ones.
+     */
+    spawn_flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
+    if (((stdio == NULL || stdio->input < 0) && posix_spawn_file_actions_addinherit_np(&actions, 0) != 0) ||
+        ((stdio == NULL || stdio->output < 0) && posix_spawn_file_actions_addinherit_np(&actions, 1) != 0) ||
+        ((stdio == NULL || stdio->error < 0) && posix_spawn_file_actions_addinherit_np(&actions, 2) != 0)) {
+        posix_spawnattr_destroy(&attributes); posix_spawn_file_actions_destroy(&actions);
+        close(pair[0]); close(pair[1]); free(child_env);
+        return HL_STATUS_PLATFORM_FAILURE;
+    }
+#endif
+    if (posix_spawnattr_setflags(&attributes, spawn_flags) != 0 ||
         posix_spawnattr_setpgroup(&attributes, 0) != 0) {
         posix_spawn_file_actions_destroy(&actions); close(pair[0]); close(pair[1]); free(child_env);
         return HL_STATUS_PLATFORM_FAILURE;
@@ -817,9 +873,19 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
         close(pair[0]); close(pair[1]); free(child_env);
         return HL_STATUS_PLATFORM_FAILURE;
     }
-    if (posix_spawn_file_actions_adddup2(&actions, pair[1], HL_ACTIVATION_FD) != 0 ||
-        posix_spawn_file_actions_addclose(&actions, pair[0]) != 0 ||
-        posix_spawn_file_actions_addclose(&actions, pair[1]) != 0) {
+    /*
+     * Close the parent endpoint before installing descriptor 3: pair[0] is
+     * commonly descriptor 3 itself.  On Linux, closefrom_np complements the
+     * Darwin default by closing every descriptor above the activation slot
+     * after all stdio/control dup2 actions have consumed their sources.
+     */
+    if (posix_spawn_file_actions_addclose(&actions, pair[0]) != 0 ||
+        posix_spawn_file_actions_adddup2(&actions, pair[1], HL_ACTIVATION_FD) != 0 ||
+        (pair[1] != HL_ACTIVATION_FD && posix_spawn_file_actions_addclose(&actions, pair[1]) != 0)
+#if defined(__linux__)
+        || posix_spawn_file_actions_addclosefrom_np(&actions, HL_ACTIVATION_FD + 1) != 0
+#endif
+    ) {
         posix_spawnattr_destroy(&attributes); posix_spawn_file_actions_destroy(&actions);
         close(pair[0]); close(pair[1]); free(child_env);
         return HL_STATUS_PLATFORM_FAILURE;
