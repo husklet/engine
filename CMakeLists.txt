@@ -159,6 +159,7 @@ if(HL_BUILD_TESTS)
   enable_testing()
   # Host-side unit tests need no guest cross compiler.
   include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Units.cmake)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3CiConfig.cmake)
   # Sets HL_HAVE_GUEST_CC and returns early when the Linux cross compilers are
   # absent (e.g. a plain `nix build`, whose sandbox exports no *_LINUX_CC).
   include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/GuestFixtures.cmake)
