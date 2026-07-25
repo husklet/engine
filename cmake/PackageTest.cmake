@@ -36,10 +36,20 @@ run(${CC} -I${STAGE}/include ${SOURCE_DIR}/tests/integration/package.c
 run(${BUILD_DIR}/package-consumer/package)
 
 if(HAVE_ACTIVATION AND EXISTS "${STAGE}/lib/libhl-engine-activation.a")
-  run(${CC} -I${STAGE}/include ${SOURCE_DIR}/tests/integration/activation_package.c
-      -Wl,--whole-archive ${STAGE}/lib/libhl-engine-activation.a -Wl,--no-whole-archive
-      -pthread -ldl -lm -latomic
-      -o ${BUILD_DIR}/package-consumer/activation-package)
+  if(IS_DARWIN)
+    run(${CC} -I${STAGE}/include
+        ${SOURCE_DIR}/tests/integration/activation_package.c
+        -Wl,-force_load,${STAGE}/lib/libhl-engine-activation.a
+        -o ${BUILD_DIR}/package-consumer/activation-package)
+    run(${CODESIGN} -s - --entitlements ${JIT_ENTITLEMENTS} -f
+        ${BUILD_DIR}/package-consumer/activation-package)
+  else()
+    run(${CC} -I${STAGE}/include
+        ${SOURCE_DIR}/tests/integration/activation_package.c
+        -Wl,--whole-archive ${STAGE}/lib/libhl-engine-activation.a
+        -Wl,--no-whole-archive -pthread -ldl -lm -latomic
+        -o ${BUILD_DIR}/package-consumer/activation-package)
+  endif()
   run(${BUILD_DIR}/package-consumer/activation-package)
 
   # The guest-execution leg needs the cross-built e2e guests. Skip cleanly when
@@ -59,6 +69,23 @@ if(HAVE_ACTIVATION AND EXISTS "${STAGE}/lib/libhl-engine-activation.a")
     run(${BUILD_DIR}/package-consumer/activation-package ${guests})
   else()
     message(STATUS "skip installed-activation guest-exec: e2e guests not built")
+  endif()
+
+  if(IS_DARWIN)
+    set(objc_consumer
+      "${BUILD_DIR}/package-consumer/activation-objc-package")
+    run(${CC} -I${STAGE}/include
+        ${SOURCE_DIR}/tests/integration/activation_objc_package.m
+        -Wl,-force_load,${STAGE}/lib/libhl-engine-activation.a
+        -framework Foundation -o ${objc_consumer})
+    run(${CODESIGN} -s - --entitlements ${JIT_ENTITLEMENTS} -f
+        ${objc_consumer})
+    if(EXISTS "${BUILD_DIR}/e2e/guest-exit-aarch64")
+      run(${objc_consumer} ${BUILD_DIR}/e2e/guest-exit-aarch64)
+    else()
+      message(STATUS
+        "skip installed Objective-C activation guest-exec: guest not built")
+    endif()
   endif()
 endif()
 

@@ -137,10 +137,36 @@ install(FILES ${HL_PUBLIC_HEADERS} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/hl)
 install(FILES ${HL_PC_DIR}/hl-engine.pc
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
-if(HL_HAVE_ACTIVATION AND TARGET hl-engine-activation)
+set(HL_ACTIVATION_TARGET "")
+if(TARGET hl-engine-activation)
+  set(HL_ACTIVATION_TARGET hl-engine-activation)
+elseif(TARGET hl-engine-dual)
+  set(HL_ACTIVATION_TARGET hl-engine-dual)
+endif()
+
+set(_HL_PACKAGE_TEST_DEPS hl-engine-runner ${HL_INSTALL_LIBS})
+foreach(_engine_arch aarch64 x86_64)
+  if(TARGET hl-engine-linux-${_engine_arch})
+    list(APPEND _HL_PACKAGE_TEST_DEPS hl-engine-linux-${_engine_arch})
+  endif()
+endforeach()
+if(HL_ACTIVATION_TARGET)
+  list(APPEND _HL_PACKAGE_TEST_DEPS ${HL_ACTIVATION_TARGET})
+endif()
+if(HL_HAVE_GUEST_CC)
+  list(APPEND _HL_PACKAGE_TEST_DEPS
+    ${CMAKE_BINARY_DIR}/e2e/guest-exit-aarch64
+    ${CMAKE_BINARY_DIR}/e2e/guest-descendant-aarch64
+    ${CMAKE_BINARY_DIR}/e2e/guest-external-term-aarch64
+    ${CMAKE_BINARY_DIR}/e2e/guest-domain-aarch64
+    ${CMAKE_BINARY_DIR}/e2e/guest-domain-x86_64)
+endif()
+add_custom_target(package-test-build DEPENDS ${_HL_PACKAGE_TEST_DEPS})
+
+if(HL_HAVE_ACTIVATION AND HL_ACTIVATION_TARGET)
   # Installed under the activation name; in the build tree it is the
   # package/<host>-aarch64/libhl-engine.a artefact (Makefile 481).
-  install(FILES $<TARGET_FILE:hl-engine-activation>
+  install(FILES $<TARGET_FILE:${HL_ACTIVATION_TARGET}>
           DESTINATION ${CMAKE_INSTALL_LIBDIR}
           RENAME libhl-engine-activation.a)
   install(FILES ${HL_PC_DIR}/hl-engine-activation.pc
@@ -151,7 +177,7 @@ endif()
 # The Makefile does this by re-invoking itself with DESTDIR; the CMake form
 # runs `cmake --install` into a staging prefix from a driver script so the
 # whole thing is one CTest case.
-if(HL_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(HL_BUILD_TESTS)
   set(HL_PKG_ROOT ${CMAKE_BINARY_DIR}/package-root)
 
   add_test(NAME package.consumer-link
@@ -162,13 +188,16 @@ if(HL_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
       -DCC=${CMAKE_C_COMPILER}
       -DPACKAGE_HOST=${HL_PACKAGE_HOST}
       -DHAVE_ACTIVATION=${HL_HAVE_ACTIVATION}
+      -DIS_DARWIN=$<BOOL:$<STREQUAL:${CMAKE_SYSTEM_NAME},Darwin>>
+      -DCODESIGN=${HL_CODESIGN}
+      -DJIT_ENTITLEMENTS=${HL_JIT_ENTITLEMENTS}
       -P ${CMAKE_SOURCE_DIR}/cmake/PackageTest.cmake)
   set_tests_properties(package.consumer-link PROPERTIES
     LABELS "package" RESOURCE_LOCK hl-package WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
   # package-activation: the installed activation library, self-test plus the
   # guest-execution leg (posix_spawn-self path).
-  if(HL_HAVE_ACTIVATION)
+  if(HL_HAVE_ACTIVATION AND HL_ACTIVATION_TARGET)
     set_tests_properties(package.consumer-link PROPERTIES
       LABELS "package;package-activation;package-embedded" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endif()
