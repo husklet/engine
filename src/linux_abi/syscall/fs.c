@@ -2670,6 +2670,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // normal read fd (O_RDONLY, +O_DIRECTORY for a dir) for the metadata ops and record the flag so the
         // I/O family (svc_io) returns EBADF. Marked on every open-success path below.
         int is_opath = (lf & 0x200000) != 0;
+        // openat/openat2 never give an empty pathname AT_EMPTY_PATH semantics,
+        // including for O_PATH. Resolving "" through atpath() instead folded the
+        // dirfd itself into the host path and opened it successfully.
+        if (a1 && !guest_bad_ptr(a1, 1) && !*(const char *)a1) {
+            G_RET(c) = (uint64_t)(int64_t)(-ENOENT);
+            break;
+        }
         // O_PATH|O_NOFOLLOW naming a SYMLINK: Linux opens the LINK ITSELF (so readlinkat(fd,"",..) and
         // fstatat(fd,"",AT_EMPTY_PATH) operate on the symlink --). macOS has no O_PATH, and a plain
         // follow-open would open the TARGET (F_GETPATH then names the target, breaking the empty-path
@@ -3771,6 +3778,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = (uint64_t)(int64_t)adc;
                 break;
             }
+        }
+        // Without AT_EMPTY_PATH, newfstatat("", ...) is ENOENT. atpath()
+        // otherwise resolves the empty spelling to the dirfd itself.
+        if (raw && !raw[0] && !(a3 & 0x1000)) {
+            G_RET(c) = (uint64_t)(int64_t)(-ENOENT);
+            break;
         }
         {
             char service_path[4200];
