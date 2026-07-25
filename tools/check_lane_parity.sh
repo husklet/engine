@@ -30,6 +30,7 @@ darwin=(
 	macos e2e-mac perf-macos compat-abi-corpus compat-core-abi
 	compat-core-syscall compat-core-regress compat-core-workload
 	compat-isa-x86-64 compat-isa-aarch64 compat-soak compat-extended
+	compat-direct
 )
 
 case "$host" in
@@ -67,4 +68,3 @@ if [ "$status" -ne 0 ]; then
 fi
 printf 'lane-parity: %d required labels are non-empty on %s\n' \
 	"${#labels[@]}" "$host"
-

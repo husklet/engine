@@ -254,6 +254,36 @@ set_tests_properties(e2e.bridge-jobserver PROPERTIES
   LABELS "e2e;e2e-mac" RESOURCE_LOCK hl-mac-bridge
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+# --- direct production/config launches formerly hidden in e2e-compat -------
+# These six checks are distinct from the embedding gates above: they launch
+# the signed production CLI itself and exercise both the argv and typed-config
+# entry points, including propagation of exit status 70.  Keep them under a
+# separate label so `e2e-mac` remains exactly the historical e2e-mac-gates
+# lane while the old e2e-compat coverage has a selectable replacement.
+foreach(_arch aarch64 x86_64)
+  add_test(NAME compat-launch.cli-exit42-${_arch}
+    COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/run_direct_launch.sh
+            cli $<TARGET_FILE:e2e-runner>
+            ${CMAKE_BINARY_DIR}/production/hl-engine-linux-${_arch}
+            ${_E2E}/guest-exit-${_arch} 42)
+  add_test(NAME compat-launch.config-exit42-${_arch}
+    COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/run_direct_launch.sh
+            config $<TARGET_FILE:config-e2e-runner>
+            ${CMAKE_BINARY_DIR}/production/hl-engine-linux-${_arch}
+            ${_E2E}/guest-exit-${_arch} 42)
+  add_test(NAME compat-launch.config-exit70-${_arch}
+    COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/run_direct_launch.sh
+            config $<TARGET_FILE:config-e2e-runner>
+            ${CMAKE_BINARY_DIR}/production/hl-engine-linux-${_arch}
+            ${_E2E}/guest-exit70-${_arch} 70)
+endforeach()
+set_tests_properties(
+  compat-launch.cli-exit42-aarch64 compat-launch.cli-exit42-x86_64
+  compat-launch.config-exit42-aarch64 compat-launch.config-exit42-x86_64
+  compat-launch.config-exit70-aarch64 compat-launch.config-exit70-x86_64
+  PROPERTIES LABELS "compat-direct" RESOURCE_LOCK hl-mac-bridge
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} TIMEOUT 1800)
+
 # ===========================================================================
 # perf-macos (Makefile 2579)
 # ===========================================================================
