@@ -203,6 +203,25 @@ static ssize_t guest_fd_read(int fd, uint64_t guest, size_t length, off_t offset
     int count =
         guest_iov_range(guest, length, HL_LOGICAL_VMA_WRITE, vectors, pins, guest_bases, GUEST_IOV_STACK_MAX, &covered);
     if (count < 0) {
+        /*
+         * Linux resolves the descriptor before copy_to_user.  Preserve EBADF
+         * when both the descriptor and guest buffer are invalid instead of
+         * reporting the later EFAULT first.
+         */
+        if (fcntl(fd, F_GETFL) < 0 && errno == EBADF) return -1;
+        /*
+         * A read at EOF succeeds without touching the destination. Probe at
+         * the same file position without advancing it before classifying the
+         * inaccessible guest range. This covers regular files and null-like
+         * seekable devices; non-seekable sources still correctly fault when
+         * data would have to be copied.
+         */
+        off_t probe_offset = positional ? offset : lseek(fd, 0, SEEK_CUR);
+        if (probe_offset >= 0) {
+            unsigned char probe;
+            ssize_t probed = pread(fd, &probe, 1, probe_offset);
+            if (probed <= 0) return probed;
+        }
         errno = EFAULT;
         return -1;
     }
@@ -231,6 +250,12 @@ static ssize_t guest_fd_write(int fd, uint64_t guest, size_t length, off_t offse
     int count =
         guest_iov_range(guest, length, HL_LOGICAL_VMA_READ, vectors, pins, guest_bases, GUEST_IOV_STACK_MAX, &covered);
     if (count < 0) {
+        /*
+         * Linux resolves the descriptor before copy_from_user.  Preserve
+         * EBADF when both inputs are invalid; a valid descriptor still gets
+         * the expected EFAULT for an unreadable guest range.
+         */
+        if (fcntl(fd, F_GETFL) < 0 && errno == EBADF) return -1;
         errno = EFAULT;
         return -1;
     }

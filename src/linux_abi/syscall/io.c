@@ -610,6 +610,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     case 63: {
         int rfd = (int)a0;
+        if (fcntl(rfd, F_GETFL) < 0 && errno == EBADF) {
+            G_RET(c) = (uint64_t)(-EBADF);
+            break;
+        }
         // tee(2) pushback: bytes a prior tee() peeked out of this pipe are re-served here first, in order.
         if (rfd >= 0 && rfd < HL_NFD && g_fd_pb_len[rfd]) {
             size_t want = (size_t)a2;
@@ -1174,6 +1178,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     case 64: {
         int wfd = (int)a0;
+        if (fcntl(wfd, F_GETFL) < 0 && errno == EBADF) {
+            G_RET(c) = (uint64_t)(-EBADF);
+            break;
+        }
         // eventfd write is hoisted to the very top of the write handler: an eventfd fd is disjoint from every
         // fd type the checks below probe (oom_score_adj text file, memfd, netlink, dns, icmp, udp, memf), so
         // routing it here changes no behavior -- but it skips the memfd_seals_fd() probe further down, which
