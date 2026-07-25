@@ -33,11 +33,9 @@ field() {
 	sed -n "s/^$1: //p" "$provenance" | head -1
 }
 
-fail() {
+remediation() {
 	printf '\n'
-	printf 'ERROR: %s\n' "$1"
 	cat <<'EOF'
-
 The crate at pkgs/rust/ ships PREBUILT static archives; it does not compile
 src/. They must be regenerated whenever any C source or header changes:
 
@@ -47,37 +45,55 @@ See DOCS.md ("Prebuilt crate archives") for the macOS half, which must be
 built on Apple silicon (from this checkout: `mac make ...`, /Users/x/dd is
 shared with the mac).
 EOF
-	exit 1
+}
+
+status=0
+report_error() {
+	printf '\nERROR: %s\n' "$1" >&2
+	status=1
 }
 
 recorded_manifest=$(field 'source-manifest')
-[ -n "$recorded_manifest" ] || fail "$provenance records no source-manifest hash"
+[ -n "$recorded_manifest" ] || report_error "$provenance records no source-manifest hash"
 
 actual_manifest=$(tools/crate_archive_manifest.sh)
 
 if [ "$recorded_manifest" != "$actual_manifest" ]; then
 	printf 'source manifest recorded: %s\n' "$recorded_manifest"
 	printf 'source manifest actual:   %s\n' "$actual_manifest"
-	fail 'C sources changed since the committed crate archives were built.'
+	report_error 'C sources changed since the committed crate archives were built.'
 fi
 
-status=0
 for target in aarch64-unknown-linux-gnu aarch64-apple-darwin; do
 	archive="pkgs/rust/assets/lib/$target/libhl-engine.a"
-	[ -f "$archive" ] || fail "missing archive $archive"
+	if [ ! -f "$archive" ]; then
+		report_error "missing archive $archive"
+		continue
+	fi
 	recorded=$(field "$target")
 	actual=$(sha256 "$archive" | cut -d' ' -f1)
+	if [ -z "$recorded" ]; then
+		report_error "$provenance records no SHA-256 for $target"
+		continue
+	fi
 	if [ "$recorded" != "$actual" ]; then
 		printf '%s recorded: %s\n' "$target" "$recorded"
 		printf '%s actual:   %s\n' "$target" "$actual"
-		status=1
+		report_error "committed $target archive does not match its recorded SHA-256."
 	fi
 done
-[ "$status" -eq 0 ] || fail 'a committed archive does not match its recorded SHA-256.'
 
-tools/validate_crate_archive.sh aarch64-unknown-linux-gnu \
-	pkgs/rust/assets/lib/aarch64-unknown-linux-gnu/libhl-engine.a
-tools/validate_crate_archive.sh aarch64-apple-darwin \
-	pkgs/rust/assets/lib/aarch64-apple-darwin/libhl-engine.a
+for target in aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+	archive="pkgs/rust/assets/lib/$target/libhl-engine.a"
+	if [ -f "$archive" ] &&
+		! tools/validate_crate_archive.sh "$target" "$archive"; then
+		report_error "$target archive failed structural/link validation."
+	fi
+done
+
+if [ "$status" -ne 0 ]; then
+	remediation
+	exit 1
+fi
 
 printf 'crate archives are current (source manifest %s)\n' "$actual_manifest"
