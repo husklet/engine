@@ -13,8 +13,7 @@ static hl_x86_rep_store_observation_active_fn g_rep_store_observation_active;
 static hl_x86_rep_access_fn g_rep_readable;
 static hl_x86_rep_access_fn g_rep_writable;
 
-void hl_x86_rep_set_store_commit(hl_x86_rep_store_commit_fn callback,
-                                 hl_x86_rep_store_observation_active_fn active) {
+void hl_x86_rep_set_store_commit(hl_x86_rep_store_commit_fn callback, hl_x86_rep_store_observation_active_fn active) {
     g_rep_store_commit = callback;
     g_rep_store_observation_active = active;
 }
@@ -53,8 +52,8 @@ static uint64_t rep_fault(struct cpu *cpu, uint64_t address, uint64_t width, uin
 // rip-relative lea into the type/rodata section); rebase it to the real high mapping so these bulk C string
 // helpers touch the mapped bytes (the single-access fault path nonpie_fixup cannot serve a libc memcpy).
 // Inert for PIE/static-PIE (the translator's non-PIE range is empty).
-uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes, int w, int df,
-                         struct cpu *cpu, uint64_t rip) {
+uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes, int w, int df, struct cpu *cpu,
+                         uint64_t rip) {
     uint8_t *dst = destination;
     const uint8_t *src = source;
     hl_x86_count_rep_movs();
@@ -88,8 +87,7 @@ uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes,
         }
         return n;
     }
-    if (g_rep_store_commit != NULL && g_rep_store_observation_active != NULL &&
-        g_rep_store_observation_active()) {
+    if (g_rep_store_commit != NULL && g_rep_store_observation_active != NULL && g_rep_store_observation_active()) {
         uint64_t n = nbytes / (unsigned)w;
         for (uint64_t i = 0; i < n; ++i) {
             uint64_t step = i * (uint64_t)w;
@@ -144,8 +142,7 @@ uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes,
 }
 
 // Host helper for `rep stos`: fill `n` elements of width `w` with `val` (AL/AX/EAX/RAX).
-uint64_t hl_x86_rep_stos(void *destination, uint64_t val, uint64_t n, int w, int df,
-                         struct cpu *cpu, uint64_t rip) {
+uint64_t hl_x86_rep_stos(void *destination, uint64_t val, uint64_t n, int w, int df, struct cpu *cpu, uint64_t rip) {
     uint8_t *dst = destination;
     hl_x86_count_rep_stos();
     dst = (uint8_t *)(uintptr_t)hl_x86_guest_pointer((uint64_t)(uintptr_t)dst);
@@ -166,8 +163,7 @@ uint64_t hl_x86_rep_stos(void *destination, uint64_t val, uint64_t n, int w, int
         }
         return n;
     }
-    if (g_rep_store_commit != NULL && g_rep_store_observation_active != NULL &&
-        g_rep_store_observation_active()) {
+    if (g_rep_store_commit != NULL && g_rep_store_observation_active != NULL && g_rep_store_observation_active()) {
         for (uint64_t i = 0; i < n; ++i) {
             uint64_t step = i * (uint64_t)w;
             uint8_t *element_dst = df ? dst - step : dst + step;
@@ -224,7 +220,7 @@ static void emit_rep_string(int movs, int w, int shift, enum hl_x86_direction df
     else
         e_movconst(4, (uint64_t)(df_static == HL_X86_DIRECTION_BACKWARD)); // x4 = statically-known direction
     e_mov_rr(5, 28, 1); // x5 = cpu, used to publish a precise soft-memory fault
-    e_movconst(6, rip);  // x6 = faulting guest instruction
+    e_movconst(6, rip); // x6 = faulting guest instruction
     if (movs) {
         if (shift) e_lsl_i(2, 2, shift, 1); // x2 = nbytes = count << shift
         hl_x86_emit_host_pointer(16, (uint64_t)(uintptr_t)&hl_x86_rep_movs);

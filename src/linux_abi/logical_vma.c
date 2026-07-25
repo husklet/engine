@@ -850,8 +850,7 @@ static int global_copy(uint64_t guest, void *buffer, size_t length, int into_bac
         uint64_t available64 = found->guest_last - address;
         size_t chunk = available64 > SIZE_MAX ? SIZE_MAX : (size_t)available64;
         if (chunk > length - done) chunk = length - done;
-        void *canonical = (char *)found->backing->mapping + found->backing_offset +
-                          (address - found->guest_first);
+        void *canonical = (char *)found->backing->mapping + found->backing_offset + (address - found->guest_first);
         if (into_backing)
             memcpy(canonical, (const char *)buffer + done, chunk);
         else

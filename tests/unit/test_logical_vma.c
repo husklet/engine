@@ -84,17 +84,15 @@ int main(void) {
     int directory_fd = open("/tmp", O_RDONLY);
     HL_CHECK(directory_fd >= 0);
     errno = 0;
-    HL_CHECK(hl_logical_vma_map_shared(&ledger, UINT64_C(0x500000054000), 4096,
-                                       HL_LOGICAL_VMA_READ, directory_fd, 0, 16384) == -1);
+    HL_CHECK(hl_logical_vma_map_shared(&ledger, UINT64_C(0x500000054000), 4096, HL_LOGICAL_VMA_READ, directory_fd, 0,
+                                       16384) == -1);
     close(directory_fd);
     HL_CHECK(hl_logical_vma_count(&ledger) == 2);
-    HL_CHECK(hl_logical_vma_resolve(&ledger, rw, 1, HL_LOGICAL_VMA_READ,
-                                    &alias_view) == 1);
+    HL_CHECK(hl_logical_vma_resolve(&ledger, rw, 1, HL_LOGICAL_VMA_READ, &alias_view) == 1);
 
     hl_logical_vma_pin overflow_pin;
     errno = 0;
-    HL_CHECK(hl_logical_vma_pin_data(UINT64_MAX - 3, 8, HL_LOGICAL_VMA_READ,
-                                     &overflow_pin) == -1);
+    HL_CHECK(hl_logical_vma_pin_data(UINT64_MAX - 3, 8, HL_LOGICAL_VMA_READ, &overflow_pin) == -1);
     HL_CHECK(errno == EINVAL);
 
     hl_logical_vma_resolution write_view, exec_view;
@@ -218,10 +216,10 @@ int main(void) {
      */
     const uint64_t checkpoint_rw = UINT64_C(0x600000104000);
     const uint64_t checkpoint_rx = UINT64_C(0x600000204000);
-    HL_CHECK(hl_logical_vma_global_restore_shared(
-                 checkpoint_rx, 8192, HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_EXEC, fd, 4096, 16384) == 0);
-    HL_CHECK(hl_logical_vma_global_restore_shared(
-                 checkpoint_rw, 8192, HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_WRITE, fd, 4096, 16384) == 0);
+    HL_CHECK(hl_logical_vma_global_restore_shared(checkpoint_rx, 8192, HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_EXEC, fd,
+                                                  4096, 16384) == 0);
+    HL_CHECK(hl_logical_vma_global_restore_shared(checkpoint_rw, 8192, HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_WRITE, fd,
+                                                  4096, 16384) == 0);
     hl_logical_vma_descriptor checkpoint_descriptors[2];
     HL_CHECK(hl_logical_vma_global_export(checkpoint_descriptors, 2) == 2);
     hl_logical_vma_descriptor checkpoint_descriptor;
@@ -232,11 +230,10 @@ int main(void) {
     static const unsigned char checkpoint_patch[16] = {
         0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x17, 0x28, 0x39, 0x4a, 0x5b, 0x6c, 0x7d, 0x8e, 0x9f, 0x10,
     };
-    HL_CHECK(hl_logical_vma_global_copy_in(checkpoint_rw + 4092, checkpoint_patch,
-                                           sizeof checkpoint_patch) == 0);
+    HL_CHECK(hl_logical_vma_global_copy_in(checkpoint_rw + 4092, checkpoint_patch, sizeof checkpoint_patch) == 0);
     unsigned char checkpoint_readback[sizeof checkpoint_patch];
-    HL_CHECK(hl_logical_vma_global_copy_out(checkpoint_rx + 4092, checkpoint_readback,
-                                            sizeof checkpoint_readback) == 0);
+    HL_CHECK(hl_logical_vma_global_copy_out(checkpoint_rx + 4092, checkpoint_readback, sizeof checkpoint_readback) ==
+             0);
     HL_CHECK(memcmp(checkpoint_readback, checkpoint_patch, sizeof checkpoint_patch) == 0);
     hl_logical_vma_pin checkpoint_pin;
     HL_CHECK(hl_logical_vma_pin_data(checkpoint_rx, 1, HL_LOGICAL_VMA_WRITE, &checkpoint_pin) == -1);

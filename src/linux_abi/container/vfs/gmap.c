@@ -170,8 +170,7 @@ void hl_gmap_unmap_range(uint64_t start, uint64_t end) {
         hl_gmap_entry *entry = &g_gmap.mappings[index];
         uint64_t base = entry->address;
         uint64_t mapped_end = base + entry->length;
-        uint64_t guest_end =
-            base + (entry->guest_length < entry->length ? entry->guest_length : entry->length);
+        uint64_t guest_end = base + (entry->guest_length < entry->length ? entry->guest_length : entry->length);
         uint64_t physical_start = entry->physical_address;
         uint64_t physical_end = physical_start + entry->physical_length;
         if (end <= base || start >= mapped_end) {

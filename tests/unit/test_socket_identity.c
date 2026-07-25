@@ -34,8 +34,7 @@ static void *connect_client(void *argument) {
     char path[HL_SOCKET_IDENTITY_PATH_SIZE];
     struct sockaddr_un local, listener;
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0 ||
-        hl_socket_identity_format(path, sizeof path, client->object, client->peer_object) != 0 ||
+    if (fd < 0 || hl_socket_identity_format(path, sizeof path, client->object, client->peer_object) != 0 ||
         unix_address(&local, path) != 0 || unix_address(&listener, client->listener_path) != 0) {
         client->result = 1;
         return NULL;
@@ -48,9 +47,8 @@ static void *connect_client(void *argument) {
     }
     unlink(path);
     unsigned char reply = 0;
-    if (connect(fd, (struct sockaddr *)&listener, sizeof listener) != 0 ||
-        send(fd, &client->payload, 1, 0) != 1 || recv(fd, &reply, 1, 0) != 1 ||
-        reply != client->payload)
+    if (connect(fd, (struct sockaddr *)&listener, sizeof listener) != 0 || send(fd, &client->payload, 1, 0) != 1 ||
+        recv(fd, &reply, 1, 0) != 1 || reply != client->payload)
         client->result = 1;
     close(fd);
     return NULL;
