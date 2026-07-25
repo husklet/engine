@@ -97,6 +97,9 @@ hl_guest_suite(SRC_DIR tests/compat/network OUT_DIR ${HL_COMPAT}/network
 
 hl_guest_suite(SRC_DIR tests/compat/procfs OUT_DIR ${HL_COMPAT}/procfs
   LINKAGE static FLAGS ${_gnu} -I${HL_TESTS}/compat/procfs LIBS ${_pt})
+hl_guest_named(${HL_COMPAT}/memory elf_rodata_write
+  ${HL_TESTS}/compat/memory/elf_rodata_write.c
+  LINKAGE static FLAGS ${_gnu} -Wl,-T,${HL_TESTS}/compat/memory/elf_rodata_write.ld LIBS ${_pt})
 hl_guest_suite(SRC_DIR tests/compat/memory OUT_DIR ${HL_COMPAT}/memory
   LINKAGE static FLAGS ${_gnu} -I${HL_TESTS}/compat/memory LIBS ${_pt})
 

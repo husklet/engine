@@ -1011,8 +1011,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
             }
-            if (a2 & ~(uint64_t)(PROT_READ | PROT_WRITE | PROT_EXEC |
-                                 0x01000000 /* PROT_GROWSDOWN */ |
+            if (a2 & ~(uint64_t)(PROT_READ | PROT_WRITE | PROT_EXEC | 0x01000000 /* PROT_GROWSDOWN */ |
                                  0x02000000 /* PROT_GROWSUP */)) {
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
@@ -1089,6 +1088,37 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             anon_update_prot(physical_a0 & ~(uint64_t)0xfff,
                              ((physical_a0 + a1 + 0xfff) & ~(uint64_t)0xfff) - (physical_a0 & ~(uint64_t)0xfff),
                              host_protection);
+#elif defined(__APPLE__)
+            // The ELF loader can physically narrow an independently aligned PT_LOAD segment to read-only.
+            // A later guest mprotect that adds WRITE must therefore reopen the backing host VM page; updating
+            // only GRO/GNA leaves CoreCLR's relocation target physically read-only and the first store dies in
+            // Darwin before the Linux permission model can see it. Guest pages are 4K while Apple-silicon host
+            // pages are 16K, so widen the host operation outwards. The adjacent guest subpages remain protected
+            // logically by GRO/GNA; translated guest bytes are data and never execute from this mapping.
+            if ((int)a2 & PROT_WRITE) {
+                size_t host_page = hl_host_page_size();
+                uint64_t host_lo = physical_a0;
+                uint64_t host_hi = physical_a0 + a1;
+                if (host_page != 0 && (host_page & (host_page - 1)) == 0) {
+                    host_lo &= ~((uint64_t)host_page - 1);
+                    host_hi = (host_hi + host_page - 1) & ~((uint64_t)host_page - 1);
+                }
+                if (host_page == 0 || host_hi < host_lo ||
+                    mprotect((void *)(uintptr_t)host_lo, (size_t)(host_hi - host_lo), PROT_READ | PROT_WRITE) != 0) {
+                    int saved = host_page == 0 ? EINVAL : errno;
+                    if (logical_protect_plan != NULL) {
+                        hl_logical_vma_abort_shared(logical_protect_plan);
+                        logical_protect_plan = NULL;
+                    }
+                    if (logical_protect_prepared) {
+                        hl_logical_vma_global_reclaim_quiescent();
+                        gbus_mapping_stw_end();
+                    }
+                    if (logical_protect_locked) gbus_mapping_transition_unlock();
+                    G_RET(c) = (uint64_t)(int64_t)-saved;
+                    break;
+                }
+            }
 #endif
             /* Publish guest-visible permission registries only after every
                fallible host operation succeeded.  Otherwise a failed

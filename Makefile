@@ -1025,6 +1025,14 @@ $(BUILD)/compat/procfs/x86_64/%: tests/compat/procfs/%.c tests/compat/procfs/pf.
 	@mkdir -p $(@D)
 	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 -Itests/compat/procfs $< -pthread -o $@
 
+$(BUILD)/compat/memory/aarch64/elf_rodata_write: tests/compat/memory/elf_rodata_write.c tests/compat/memory/elf_rodata_write.ld
+	@mkdir -p $(@D)
+	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -Wl,-T,tests/compat/memory/elf_rodata_write.ld -o $@
+
+$(BUILD)/compat/memory/x86_64/elf_rodata_write: tests/compat/memory/elf_rodata_write.c tests/compat/memory/elf_rodata_write.ld
+	@mkdir -p $(@D)
+	$(X86_64_LINUX_STATIC_CC) -O2 -static -std=gnu11 $< -pthread -Wl,-T,tests/compat/memory/elf_rodata_write.ld -o $@
+
 $(BUILD)/compat/memory/aarch64/%: tests/compat/memory/%.c tests/compat/memory/memrss.h
 	@mkdir -p $(@D)
 	$(AARCH64_LINUX_STATIC_CC) -O2 -static -std=gnu11 -Itests/compat/memory $< -pthread -o $@
