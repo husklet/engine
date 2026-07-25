@@ -321,14 +321,15 @@ set(_HL_MAC_UNAME --host-os ${CMAKE_HOST_SYSTEM_NAME}
 function(hl_perf_mac case arch warmups samples payload expect)
   list(GET PERF_MAC_LIMIT_${case} 0 _cold)
   list(GET PERF_MAC_LIMIT_${case} 1 _p99)
+  set(_guest /tmp/hl-perf-${case}-${arch})
   add_test(NAME perf.mac-${case}-${arch}
-    COMMAND $<TARGET_FILE:perf-runner> --label ${case}-${arch} ${_HL_MAC_UNAME}
-            --warmups ${warmups} --samples ${samples} --expect ${expect}
-            --max-cold-us ${_cold} --max-p99-us ${_p99} --
-            ${CMAKE_BINARY_DIR}/production/hl-engine-linux-${arch} ${payload})
+    COMMAND ${CMAKE_COMMAND}
+      "-DCMD0=${CMAKE_COMMAND} -E copy_if_different ${payload} ${_guest}"
+      "-DCMD1=$<TARGET_FILE:perf-runner> --label ${case}-${arch} --host-os ${CMAKE_HOST_SYSTEM_NAME} --host-release ${CMAKE_HOST_SYSTEM_VERSION} --host-arch ${CMAKE_HOST_SYSTEM_PROCESSOR} --warmups ${warmups} --samples ${samples} --expect ${expect} --max-cold-us ${_cold} --max-p99-us ${_p99} -- ${CMAKE_BINARY_DIR}/production/hl-engine-linux-${arch} ${_guest}"
+      -P ${CMAKE_SOURCE_DIR}/cmake/RunSequence.cmake)
   set_tests_properties(perf.mac-${case}-${arch} PROPERTIES
     LABELS "perf;perf-macos" RUN_SERIAL TRUE TIMEOUT 1800
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    WORKING_DIRECTORY /tmp)
 endfunction()
 
 set(_MC ${CMAKE_BINARY_DIR}/compat)
@@ -357,16 +358,19 @@ foreach(_arch aarch64 x86_64)
   list(GET PERF_MAC_LIMIT_warm-cache 1 _wc_p99)
   add_test(NAME perf.mac-warm-cache-${_arch}
     COMMAND ${CMAKE_COMMAND}
-      "-DCMD0=${CMAKE_COMMAND} -E rm -rf ${_MP}/cache-warm-mac-${_arch}"
-      "-DCMD1=$<TARGET_FILE:perf-runner> --label mac-warm-cache-${_arch} --host-os ${CMAKE_HOST_SYSTEM_NAME} --host-release ${CMAKE_HOST_SYSTEM_VERSION} --host-arch ${CMAKE_HOST_SYSTEM_PROCESSOR} --warmups ${HL_PERF_WARMUPS} --samples ${HL_PERF_SAMPLES} --max-cold-us ${_wc_cold} --max-p99-us ${_wc_p99} -- $<TARGET_FILE:config-e2e-runner> env ${CMAKE_BINARY_DIR}/production/hl-engine-linux-${_arch} ${_MP}/translate-${_arch} 0 1 ${_MP}/cache-warm-mac-${_arch}"
+      "-DCMD0=${CMAKE_COMMAND} -E copy_if_different ${_MP}/translate-${_arch} /tmp/hl-perf-warm-cache-${_arch}"
+      "-DCMD1=${CMAKE_COMMAND} -E rm -rf /tmp/hl-perf-cache-warm-mac-${_arch}"
+      "-DCMD2=$<TARGET_FILE:perf-runner> --label mac-warm-cache-${_arch} --host-os ${CMAKE_HOST_SYSTEM_NAME} --host-release ${CMAKE_HOST_SYSTEM_VERSION} --host-arch ${CMAKE_HOST_SYSTEM_PROCESSOR} --warmups ${HL_PERF_WARMUPS} --samples ${HL_PERF_SAMPLES} --max-cold-us ${_wc_cold} --max-p99-us ${_wc_p99} -- $<TARGET_FILE:config-e2e-runner> env ${CMAKE_BINARY_DIR}/production/hl-engine-linux-${_arch} /tmp/hl-perf-warm-cache-${_arch} 0 1 /tmp/hl-perf-cache-warm-mac-${_arch}"
       -P ${CMAKE_SOURCE_DIR}/cmake/RunSequence.cmake)
   set_tests_properties(perf.mac-warm-cache-${_arch} PROPERTIES
     LABELS "perf;perf-macos" RUN_SERIAL TRUE TIMEOUT 1800
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    WORKING_DIRECTORY /tmp)
 
   add_test(NAME perf.mac-resource-${_arch}
-    COMMAND ${CMAKE_BINARY_DIR}/production/hl-engine-linux-${_arch}
-            ${_MP}/resource-${_arch})
+    COMMAND ${CMAKE_COMMAND}
+      "-DCMD0=${CMAKE_COMMAND} -E copy_if_different ${_MP}/resource-${_arch} /tmp/hl-perf-resource-${_arch}"
+      "-DCMD1=${CMAKE_BINARY_DIR}/production/hl-engine-linux-${_arch} /tmp/hl-perf-resource-${_arch}"
+      -P ${CMAKE_SOURCE_DIR}/cmake/RunSequence.cmake)
   set_tests_properties(perf.mac-resource-${_arch} PROPERTIES
-    LABELS "perf;perf-macos" RUN_SERIAL TRUE WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    LABELS "perf;perf-macos" RUN_SERIAL TRUE WORKING_DIRECTORY /tmp)
 endforeach()

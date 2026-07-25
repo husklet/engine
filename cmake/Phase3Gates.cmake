@@ -464,14 +464,15 @@ set(HL_PERF_OP_SAMPLES 7  CACHE STRING "perf samples for OS-op cases")
 function(hl_perf_linux case arch warmups samples payload expect)
   list(GET PERF_LIMIT_${case} 0 _cold)
   list(GET PERF_LIMIT_${case} 1 _p99)
+  set(_guest /tmp/hl-perf-linux-${case}-${arch})
   add_test(NAME perf.linux-${case}-${arch}
-    COMMAND $<TARGET_FILE:perf-runner> --label linux-${case}-${arch}
-            --warmups ${warmups} --samples ${samples} --expect ${expect}
-            --max-cold-us ${_cold} --max-p99-us ${_p99} --
-            ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${arch} ${payload})
+    COMMAND ${CMAKE_COMMAND}
+      "-DCMD0=${CMAKE_COMMAND} -E copy_if_different ${payload} ${_guest}"
+      "-DCMD1=$<TARGET_FILE:perf-runner> --label linux-${case}-${arch} --warmups ${warmups} --samples ${samples} --expect ${expect} --max-cold-us ${_cold} --max-p99-us ${_p99} -- ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${arch} ${_guest}"
+      -P ${CMAKE_SOURCE_DIR}/cmake/RunSequence.cmake)
   # Timing measurements are meaningless when other tests contend for the CPU.
   set_tests_properties(perf.linux-${case}-${arch} PROPERTIES
-    LABELS "perf;perf-linux" RUN_SERIAL TRUE TIMEOUT 1800 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    LABELS "perf;perf-linux" RUN_SERIAL TRUE TIMEOUT 1800 WORKING_DIRECTORY /tmp)
 endfunction()
 
 foreach(_arch aarch64 x86_64)
@@ -499,18 +500,21 @@ foreach(_arch aarch64 x86_64)
   list(GET PERF_LIMIT_warm-cache 1 _wc_p99)
   add_test(NAME perf.linux-warm-cache-${_arch}
     COMMAND ${CMAKE_COMMAND}
-      "-DCMD0=${CMAKE_COMMAND} -E rm -rf ${CMAKE_BINARY_DIR}/perf/cache-warm-linux-${_arch}"
-      "-DCMD1=$<TARGET_FILE:perf-runner> --label linux-warm-cache-${_arch} --warmups ${HL_PERF_WARMUPS} --samples ${HL_PERF_SAMPLES} --max-cold-us ${_wc_cold} --max-p99-us ${_wc_p99} -- $<TARGET_FILE:config-e2e-runner> env ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${_arch} ${HL_PERF}/translate-${_arch} 0 1 ${CMAKE_BINARY_DIR}/perf/cache-warm-linux-${_arch}"
+      "-DCMD0=${CMAKE_COMMAND} -E copy_if_different ${HL_PERF}/translate-${_arch} /tmp/hl-perf-linux-warm-cache-${_arch}"
+      "-DCMD1=${CMAKE_COMMAND} -E rm -rf /tmp/hl-perf-cache-warm-linux-${_arch}"
+      "-DCMD2=$<TARGET_FILE:perf-runner> --label linux-warm-cache-${_arch} --warmups ${HL_PERF_WARMUPS} --samples ${HL_PERF_SAMPLES} --max-cold-us ${_wc_cold} --max-p99-us ${_wc_p99} -- $<TARGET_FILE:config-e2e-runner> env ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${_arch} /tmp/hl-perf-linux-warm-cache-${_arch} 0 1 /tmp/hl-perf-cache-warm-linux-${_arch}"
       -P ${CMAKE_SOURCE_DIR}/cmake/RunSequence.cmake)
   set_tests_properties(perf.linux-warm-cache-${_arch} PROPERTIES
     LABELS "perf;perf-linux" RUN_SERIAL TRUE TIMEOUT 1800
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    WORKING_DIRECTORY /tmp)
 
   add_test(NAME perf.linux-resource-${_arch}
-    COMMAND ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${_arch}
-            ${HL_PERF}/resource-${_arch})
+    COMMAND ${CMAKE_COMMAND}
+      "-DCMD0=${CMAKE_COMMAND} -E copy_if_different ${HL_PERF}/resource-${_arch} /tmp/hl-perf-linux-resource-${_arch}"
+      "-DCMD1=${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${_arch} /tmp/hl-perf-linux-resource-${_arch}"
+      -P ${CMAKE_SOURCE_DIR}/cmake/RunSequence.cmake)
   set_tests_properties(perf.linux-resource-${_arch} PROPERTIES
-    LABELS "perf;perf-linux" RUN_SERIAL TRUE WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    LABELS "perf;perf-linux" RUN_SERIAL TRUE WORKING_DIRECTORY /tmp)
 endforeach()
 
 # perf-native-aarch64: only meaningful when the host can run the AArch64 Linux
