@@ -404,6 +404,17 @@ static ssize_t io_guest_vector_scatter(uint64_t address, size_t count, const voi
 
 static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                   uint64_t a5) {
+    /*
+     * Linux resolves the descriptor before importing a scatter/gather vector.
+     * Keep that errno precedence before guest_iov_import(): otherwise a closed
+     * in-range descriptor can turn readv(fd, ...) into EFAULT even when the
+     * vector itself is valid. Guest descriptors are real host descriptors.
+     */
+    if ((nr == 65 || nr == 66 || nr == 69 || nr == 70) &&
+        ((int64_t)a0 < 0 || a0 >= HL_NFD || fcntl((int)a0, F_GETFD) == -1)) {
+        G_RET(c) = (uint64_t)(int64_t)(-EBADF);
+        return svc_done(c);
+    }
     // Scatter/gather iovcnt bound (readv/writev/preadv/pwritev). Linux (fs/read_write.c) rejects nr_segs
     // above UIO_MAXIOV(1024) with -EINVAL before touching the iovec array. The plain host path delegates
     // this check to the kernel, but the engine's RAM-backed-file (memf) and emulated-socket paths read the
