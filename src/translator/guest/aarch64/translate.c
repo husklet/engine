@@ -2841,7 +2841,14 @@ no_bl_plt_fuse:
             for (int i = 0; i < nctx; i++) ancestors[i] = ctx[i].target;
             uint64_t clone_ret;
             int clone_cost;
-            if (nctx < CTX_INLINE_DEPTH &&
+            /*
+             * A BUS-active generation expands every cloned memory operation
+             * with a runtime guard. Cloning then duplicates both hot guards
+             * and cold stubs, accelerating cache rotation while removing only
+             * a call/return pair. Keep ordinary context cloning unchanged, but
+             * use the normal RAS call path while BUS observation is active.
+             */
+            if (!jit_guest_bus_active() && nctx < CTX_INLINE_DEPTH &&
                 context_clone_candidate(gpc + off, ancestors, nctx, &clone_ret, &clone_cost) &&
                 (g_cp - (uint8_t *)host) + clone_cost * 16 < TRACE_MAX_BYTES) {
                 emit_set_x30(pcrel_base(gpc) + 4);
