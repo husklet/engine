@@ -2500,23 +2500,20 @@ static int proc_maps_fd(int smaps) {
 // /proc/[pid]/status -- the Name:/State:/VmRSS: key:value format (NOT the stat one-liner). VmRSS/VmSize
 // reflect the cgroup memory charge so a reader sees a plausible footprint.
 static unsigned long long self_rss_bytes(void); // defined after hl_get_procinfo (real engine resident floor)
-// One stable per-process footprint snapshot (resident + virtual, in bytes). /proc/self/{statm,status,stat}
-// all derive their VM figures from this single pair so ps/top -- which mix statm pages with status kB --
-// never see the two files disagree. Sampling live host RSS separately per file made statm and status drift
-// (and used different fallback margins). Cache the first sample so every reader gets identical numbers.
+// One current per-process footprint sample (resident + virtual, in bytes).
+// /proc is live state on Linux: values may legitimately move between separate
+// reads. Caching the first sample forever made statm claim that a faulted
+// 32 MiB mapping consumed zero pages and that munmap never released anything.
 static void self_vm_bytes(unsigned long long *rss, unsigned long long *vsize) {
-    static unsigned long long c_rss = 0, c_vsize = 0;
-    if (!c_rss) {
-        long pg = sysconf(_SC_PAGESIZE);
-        unsigned long long pgsz = pg > 0 ? (unsigned long long)pg : 4096;
-        unsigned long long r = (self_rss_bytes() / pgsz) * pgsz; // page-aligned resident floor
-        if (r < pgsz) r = pgsz;
-        c_rss = r;
-        c_vsize = g_mem_max ? (unsigned long long)g_mem_max : r + (4ull << 20); // rss + 4 MiB headroom
-        if (c_vsize < c_rss) c_vsize = c_rss;
-    }
-    if (rss) *rss = c_rss;
-    if (vsize) *vsize = c_vsize;
+    long pg = sysconf(_SC_PAGESIZE);
+    unsigned long long pgsz = pg > 0 ? (unsigned long long)pg : 4096;
+    unsigned long long r = (self_rss_bytes() / pgsz) * pgsz;
+    unsigned long long v;
+    if (r < pgsz) r = pgsz;
+    v = g_mem_max ? (unsigned long long)g_mem_max : r + (4ull << 20);
+    if (v < r) v = r;
+    if (rss) *rss = r;
+    if (vsize) *vsize = v;
 }
 
 // /proc/[pid]/status Cpus_allowed / Cpus_allowed_list. A default container is allowed to run on ALL of its
