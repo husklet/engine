@@ -247,13 +247,22 @@ jobs:
           # out after the runner's full 120s per-case budget having produced ZERO bytes of output
           # (mkfifoat, truncate-eof-bus). Building stays parallel; suites run one at a time.
           run_suites() {
-            local st=0 t=
+            local st=0 suite_st=0 t=
             : > "$1"
             for t in ${{ matrix.targets }}; do
+              suite_st=0
               run_bounded 2100 "$1.part" \
-                nix develop --command sh -c "make -s -j\"\$(nproc)\" CC=\"\$NATIVE_CC\" $t" || st=$?
+                nix develop --command sh -c "make -s -j\"\$(nproc)\" CC=\"\$NATIVE_CC\" $t" || suite_st=$?
               cat "$1.part" >> "$1"
-              [ "$st" -ne 0 ] && break
+              if [ "$suite_st" -ne 0 ]; then
+                # Preserve timeout as the most informative aggregate status,
+                # but continue so one broken suite cannot hide its siblings.
+                if [ "$suite_st" -eq 124 ]; then
+                  st=124
+                elif [ "$st" -eq 0 ]; then
+                  st="$suite_st"
+                fi
+              fi
             done
             tail -n 60 "$1"
             return $st
