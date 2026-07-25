@@ -17,13 +17,15 @@ concurrency:
 permissions:
   contents: read
 
-# NOTE: the Linux and macOS test workflows and the archive-verification steps are
-# intentionally NOT run here. This is a build -> publish only path, used to ship a
-# release whose testing was already done on the branch. Validation lives in
-# linux.yml / mac.yml on push; re-enable a `needs:` gate and verify steps to
-# restore the full gated release.
 jobs:
+  linux:
+    uses: ./.github/workflows/linux.yml
+
+  mac:
+    uses: ./.github/workflows/mac.yml
+
   publish:
+    needs: [linux, mac]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
@@ -43,9 +45,20 @@ jobs:
           fi
           test "$requested" = "$version"
 
-      # Build and publish only. cargo publish compiles (builds) the crate against
-      # the committed archive, then uploads. No separate test steps. Retries with
-      # backoff to ride out a transient crates.io upload outage.
+      # Recheck the exact tagged checkout in the publishing job. The reusable
+      # Linux/macOS jobs above provide the full host test signal; these two
+      # release-specific checks prevent a stale or ABI-incompatible prebuilt
+      # archive from reaching cargo publish even if those workflows later change.
+      - name: Verify crate archives are current
+        timeout-minutes: 15
+        run: nix develop --command make check-crate-archives
+
+      - name: Verify packaged archive launches a guest
+        timeout-minutes: 20
+        run: nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml --lib --test packaged_archive
+
+      # Upload retries only transient registry failures. The test jobs and both
+      # release-specific archive gates above must all pass before this can run.
       - name: Build and publish Rust crate
         timeout-minutes: 40
         env:
