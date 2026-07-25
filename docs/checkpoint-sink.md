@@ -150,11 +150,13 @@ not, once "walk the directory" stopped being available to impose an order.
 
 Consequences, taken deliberately:
 
-- the manifest digest changes value, so `CKPT_VERSION` is **2**. Images written by earlier builds are refused
-  rather than mis-authenticated. This codebase has already shipped one incident from a tolerated format skew;
 - the directory sink adopts the new algorithm too, so there is exactly one digest and no format flag. It
   still computes it by walking, because it can, and that keeps the on-disk format self-describing;
-- the digest is requested through `sink->digest` / `source->digest`, so neither side re-reads the store.
+- the digest is requested through `sink->digest` / `source->digest`, so neither side re-reads the store;
+- `MANIFEST` and the restore-side `RECOVERY.jsonl` are excluded from the fold, as before.
+
+Version numbers (`src/linux_abi/checkpoint.c`): capture writes `CKPT_VERSION` = 1, restore accepts 1 through
+`CKPT_RESTORE_VERSION_MAX` = 3, and version 2 selects the legacy `ckpt_region_v2` layout on read.
 
 ## Restore: the source
 
@@ -203,12 +205,11 @@ Zero image bytes are written raw: every byte now goes through the sink and there
 
 | Site | Calls | Why it is still raw |
 |---|---|---|
-| `ckpt_map_trigger` | `open`, `ftruncate`, `mmap` | The `<dir>.trigger` shared generation counter is a control channel, not image data, and is mapped `MAP_SHARED` by every engine process *and* written by the Rust caller. The host contract has shared memory by anonymous identity, not a named, externally-writable shared page. |
+| `ckpt_map_trigger` | `open`, `ftruncate`, `mmap` | The `<dir>.trigger` shared generation counter is a control channel, not image data, and is mapped `MAP_SHARED` by every engine process *and* written by the Rust caller. The host contract has shared memory by anonymous identity, not a named, externally-writable shared page. Only the fallback: when a trigger descriptor was inherited (`hl_ckpt_trigger_descriptor()`, the streaming path) it is mapped directly and no path is opened. |
 | `ckpt_image_digest` / `ckpt_hash_tree` | `opendir`, `readdir`, `closedir`, `lstat`, `open` | Re-reads the finished workspace to hash it into the manifest. This is image *enumeration and readback*, which the sink deliberately does not express. |
 | `ckpt_rmrf` | `opendir`, `readdir`, `closedir`, `rmdir`, `unlink` | Recursive removal of a stale staging directory. The host contract has `remove_directory` and `unlink_relative` but no recursive removal, and `read_directory` needs an open handle plus its own cursor management; converting it is a separate change with no correctness benefit here. Used only by the directory sink. |
-| `ckpt_coordinate_and_exit` | `mkdir`, `access`, `opendir`, `readdir`, `closedir` | The coordinator's peer rendezvous: it detects that a peer finished by the appearance of `proc.<gpid>` and counts published images by listing the workspace. This is synchronisation through the store, not image I/O. |
+| `ckpt_coordinate_and_exit` | `mkdir` | One idempotent `mkdir` of the workspace base, and only when the sink has a `root` — the requester prepared it before advancing the trigger, and a peer may already have dumped into it, so it must not be removed. The rendezvous itself is `ckpt_sink_group_present`, not `access`/`opendir`. |
 | fd scan (`ckpt_normalize_reopen_path` and the descriptor viability probes) | `access` | Probes **guest** paths, not the checkpoint image. |
 
-Counting textually over the writer region, raw filesystem calls went from **75 to 27**, and all 27 are in the
-five rows above. `ckpt_close_sync`/`ckpt_sync_dir` also survive in that text range but are now used only by the
-restore-side `RECOVERY.jsonl` writer, which this change did not touch.
+`ckpt_close_sync`/`ckpt_sync_dir` also survive in that text range but are used only by the restore-side
+`RECOVERY.jsonl` writer.

@@ -1,125 +1,91 @@
-# Engine Runtime Architecture (Current State, July 21, 2026)
+# Engine runtime map
 
-## 1) Core ownership map
+Where the layers DOCS.md section 3 defines actually live, at symbol level. DOCS.md is
+normative; this file is a navigation aid.
 
-The implementation is split by responsibility across these layers:
+## 1. Ownership
 
-- **Public API layer** (`include/hl`, `src/core/config.c`, `src/runner`)
-  - Defines ABI versions, config schema, and host-service contracts.
-  - Provides typed entrypoints (`hl_engine_create*`, `hl_engine_run`, `hl_engine_destroy`) and host-specific creation entrypoints (`hl_host_linux_create`, `hl_host_macos_create`).
+- **Public API** (`include/hl`, `src/core/config.c`, `src/runner/main.c`) — ABI versions,
+  config schema, host-service contracts; `hl_engine_create*`, `hl_engine_run`,
+  `hl_engine_destroy`, plus the host constructors `hl_host_linux_create` and
+  `hl_host_macos_create`.
+- **Core runtime** (`src/core/*.c`) — validation, lifecycle, process contract execution,
+  backend dispatch, engine state machine, result materialization.
+- **Target layer** (`src/core/target/{aarch64,x86_64,run,native,services,bus}.c`,
+  `src/core/target/dual.c`, `src/core/lifecycle.c`) — guest entry points
+  (`hl_run_linux_guest`), status publishing, run contracts, namespace init
+  (`src/core/target/namespace.h`), and constructor registration of the production backend.
+- **Linux ABI** (`src/linux_abi/*`) — the syscall and environment surface a Linux guest
+  image expects. Host-OS-neutral at the call site, Linux-semantic throughout.
+- **Host services** (`src/host/*`) — portable service interfaces mapped to OS primitives.
+  `src/host/linux` and `src/host/macos` are complete backends; `src/host/fake` is the
+  deterministic unit-test backend; `src/host/windows/` is README-only.
+- **Activation** (`src/core/activation.c`) — the config-file/embedded supervisor launch
+  path; initializes subsystems and delegates into the core runtime.
 
-- **Core runtime layer** (`src/core/*.c`)
-  - Owns validation, lifecycle, process contract execution, and backend dispatch.
-  - Maintains canonical engine state machine and result materialization.
+## 2. Entry paths
 
-- **Target layer** (`src/core/target/{aarch64,x86_64,lifecycle,run}.c`, `src/core/target/dual.c`, `src/core/target/native.*`)
-  - Owns guest entry points (`hl_run_linux_guest`, status publishing, run contracts), namespace initialization, and startup constructor registration.
+### Typed API (library)
 
-- **Linux ABI layer** (`src/linux_abi/*`)
-  - Owns syscalls/translation environment expected by Linux guest images.
-  - Independent of host OS choice at call-site level, but semantically Linux-centric.
+1. Build a host backend: `hl_host_macos_create` (`include/hl/macos.h`,
+   `src/host/macos/host.c`) or `hl_host_linux_create` (`include/hl/linux.h`,
+   `src/host/linux/host.c`). `hl_host_services` (`include/hl/host_services.h`) is the only
+   transport contract into the runtime.
+2. `hl_engine_create_with_options` (`src/core/engine.c`) validates ABI/size fields and
+   capabilities (`hl_host_services_validate`, `src/core/host_services.c`) and selects
+   `engine->backend = production_backends[config->guest_isa]`.
+3. `hl_engine_run` (`src/core/engine.c`) forwards to `backend->start_process`
+   (`hl_production_start_process`, `src/core/lifecycle.c`), waits via
+   `host->process->wait`, then calls `backend->finish_process` where present, publishes the
+   unified exit through `hl_engine_exit`, and tears down.
 
-- **Host service layer** (`src/host/*`)
-  - Maps portable host service interfaces to OS primitives.
-  - Linux and macOS backends are complete enough to build and register static libs.
-  - Windows backend directory exists as README-only placeholder.
+The production backend is one `hl_engine_backend` per translation unit:
+`src/core/lifecycle.c` is compiled once per ISA with `-DHL_PRODUCTION_GUEST_ISA`, and its
+`__attribute__((constructor))` calls `hl_target_register_backend()`.
 
-- **Activation path** (`src/core/activation.c`)
-  - Config-file/embedded supervisor launch path that initializes multiple subsystems then delegates into core runtime.
+### Native CLI
 
----
+`hl_native_engine_run` (`src/core/target/run.c`) creates a native host with
+`hl_native_host_create` (`src/core/target/native.c`), builds `hl_engine_config` with
+stdin/stdout/stderr as transferred file handles, delegates into
+`hl_engine_create_with_options`, and optionally writes `hl_launch_result` through
+`hl_native_result_store` using the same host `file` service.
 
-## 2) Core communication graph
+### Activation
 
-### 2.1 Typed API entry (library-style)
+`hl_activation_start` / `hl_activation_child` (`src/core/activation.c`):
 
-1. Host app builds a host backend
-   - macOS: `hl_host_macos_create` (`include/hl/macos.h`, `src/host/macos/*.c`)
-   - Linux: `hl_host_linux_create` (`include/hl/linux.h`, `src/host/linux/*.c`)
-   - `hl_host_services` is the single transport contract passed into runtime (`include/hl/host_services.h`).
+1. read the activation descriptor and request block from the supervisor channel;
+2. register both target backends (`hl_aarch64_target_register_backend`,
+   `hl_x86_64_target_register_backend`);
+3. run one-time init for the requested ISA (`hl_aarch64_target_runtime_init` /
+   `hl_x86_64_target_runtime_init`);
+4. construct services with the host-specific `activation_host_create`, then
+   `hl_engine_create_with_options` + `hl_engine_run`.
 
-2. Host app builds config and calls
-   - `hl_engine_create_with_options` (`src/core/engine.c`)
-   - validates ABI/size fields and `hl_host_services` capabilities (`src/core/host_services.c`)
-   - chooses backend from `engine->backend = production_backends[config->guest_isa]`.
+## 3. Where data moves
 
-3. Host app calls
-   - `hl_engine_run` (`src/core/engine.c`)
-   - forwards to `backend->start_process` (`src/core/target/lifecycle.c`/`src/core/target/*`) with config + options + host services.
-   - waits via `host->process->wait`, then forwards to `backend->finish_process` when available.
-   - publishes unified exit through `hl_engine_exit` and tears down resources.
+- **Config** (`src/core/engine.c`) — config strings, executable image, box config, fd
+  bindings and options are deep-copied into engine state; ABI and field checks precede any
+  host or process launch.
+- **Capabilities** (`src/core/host_services.c`) — `memory + clock + sync` is required for
+  every run; `executable`, `file` and process paths add further required bits.
+- **Execution** (`src/core/lifecycle.c`) — the parent maps a shared
+  `hl_engine_child_result`; the child runs `hl_run_linux_guest` and publishes status; the
+  parent reifies that record together with `wait()` detail.
+- **Linux ABI** (`src/linux_abi/`) — `hl_linux_abi_spawn` owns namespace/container setup,
+  translation-cache interaction, and fd-table wiring.
 
-4. Backend implementation currently available
-   - constructor-registered production backends in each ISA translation unit (`src/core/target/lifecycle.c`)
-   - dispatch index in `src/core/engine.c`.
-   - start/finish logic (`spawn_cloned` or `hl_linux_abi_spawn`, shared memory result record, wait/finish reconciliation).
+## 4. Seams that gate a new host platform
 
-### 2.2 Native CLI entry
-
-`hl_native_engine_run` (`src/core/target/run.c`) is the runner entry path for local CLI launches.
-
-1. It creates a native host via `hl_native_host_create` (`src/core/target/native.c`).
-2. It builds `hl_engine_config`, maps stdin/stdout/stderr as transferred file handles, and delegates into `hl_engine_create_with_options`.
-3. It runs engine and optionally writes `hl_launch_result` (`hl_native_result_store`) using the same host `file` service.
-
-### 2.3 Activation entry
-
-`hl_activation_start` / `hl_activation_child` in `src/core/activation.c` follow this sequence:
-
-1. Read activation descriptor and request block from process supervisor channel.
-2. Register both target backends:
-   - `hl_aarch64_target_register_backend`
-   - `hl_x86_64_target_register_backend`
-3. Run one-time target init for requested ISA:
-   - `hl_aarch64_target_runtime_init` or `hl_x86_64_target_runtime_init`
-4. Construct services with host-specific `activation_host_create` and run `hl_engine_create_with_options` + `hl_engine_run`.
-
----
-
-## 3) Data movement and where it happens
-
-- **Config validation (`src/core/engine.c`)**
-  - Copying and owning config strings, executable image, box config, fd bindings and options happens in engine state.
-  - ABI and field-level checks happen before host/process launch.
-
-- **Runtime services access (`src/core/engine.c` + `src/core/host_services.c`)**
-  - `hl_host_services_validate` gates required capabilities.
-  - Minimum required set for all runs is `memory + clock + sync`.
-  - `executable`, `file`, and process-related paths trigger additional required bits (`file`, `process`).
-
-- **Execution (`src/core/target/lifecycle.c`)**
-  - Parent creates a shared `hl_engine_child_result` mapping for child/parent agreement.
-  - Child runs `hl_run_linux_guest`, then publishes status.
-  - Parent reifies child status from shared record and `wait()` detail.
-
-- **Linux ABI context (`src/linux_abi/`)**
-  - `hl_linux_abi_spawn` and related helpers own namespace/container setup, translation cache interaction, and fd table wiring for Linux guest execution.
-
----
-
-## 4) What “currently supported” really means
-
-- Guest ISAs implemented at target layer: `AARCH64` and `X86_64` (`src/core/target/aarch64.c`, `src/core/target/x86_64.c`).
-- Host backends implemented and selectable by compile-time/compile-target path: Linux and macOS (`src/host/linux`, `src/host/macos`).
-- Windows is not yet a runnable host backend despite an empty placeholder directory.
-- A legacy compatibility shim exists:
-  - `src/core/target/dual.c` routes `hl_run_linux_guest` to `hl_aarch64_run_linux_guest`.
-
----
-
-## 5) Architecture seams that gate platform expansion
-
-1. **Host selection seam**
-   - `src/core/target/native.h` + `src/core/target/native.c` define `HL_NATIVE_HOST_NAME` as `macos|linux` only and error elsewhere.
-   - `src/core/activation.c` has matching `#error` and host typedef guards.
-
-2. **Host service implementation seam**
-   - `src/core/target/native.c` calls only `hl_host_macos_create` / `hl_host_linux_create`.
-   - No Windows implementations for `hl_host_process`, `hl_host_file`, and related interface tables.
-
-3. **Translation/compat seam**
-   - `src/host/native_context.h` and `src/host/native_compat.h` are Apple/Linux only with hard errors or platform-shared emulation assumptions.
-
-4. **Build and package seam**
-   - `Makefile` gates `HOST` to `linux|macos` and derives package host objects from that.
-   - `flake.nix` systems omit `x86_64-windows` and only builds/installs `linux` binaries and test matrix entries.
+1. **Host selection.** `src/core/target/native.h` defines `HL_NATIVE_HOST_NAME` only for
+   `__APPLE__`/`__linux__` and errors elsewhere; `src/core/target/native.c` dispatches only
+   to `hl_host_macos_create`/`hl_host_linux_create`; `src/core/activation.c` repeats the
+   same split with matching `#error` guards.
+2. **Compat shims.** `src/host/native_context.h` (signal-context extraction) and
+   `src/host/native_compat.h` (BSD/Linux primitive aliasing) are Apple/Linux only.
+3. **Legacy ISA routing.** `src/core/target/dual.c` routes `hl_run_linux_guest` to
+   `hl_aarch64_run_linux_guest`.
+4. **Build.** `flake.nix` carries `hostBackends` and `guestISAs` as data tables, so a new
+   host backend is an entry there plus source; the Makefile's `HOST` gate is `linux|macos`
+   (see docs/makefile-retirement.md).
