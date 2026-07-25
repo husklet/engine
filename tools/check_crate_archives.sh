@@ -39,7 +39,7 @@ remediation() {
 The crate at pkgs/rust/ ships PREBUILT static archives; it does not compile
 src/. They must be regenerated whenever any C source or header changes:
 
-    make refresh-crate-archives      # needs an aarch64 Linux host and the mac
+    cmake --build build --target refresh-crate-archives
 
 See DOCS.md ("Prebuilt crate archives") for the macOS half, which must be
 built on Apple silicon (from this checkout: `mac make ...`, /Users/x/dd is

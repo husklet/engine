@@ -61,5 +61,5 @@ golden-only pass and is surfaced here rather than hidden behind a weakened asser
 
 `src/linux_abi/syscall/io.c` was modified (iov iovcnt==0 / access_ok EFAULT, writev
 PROT_NONE EFAULT). The prebuilt crate archive under `pkgs/rust/assets/lib/` is now
-stale; the gated `make check-crate-archives` step will flag it. Refresh the archives
+stale; the gated `check-crate-archives` CMake target will flag it. Refresh the archives
 before release.

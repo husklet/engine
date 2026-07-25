@@ -551,7 +551,7 @@ with `launch config has an invalid prefix`.
 Regenerate both, and rewrite `pkgs/rust/assets/PROVENANCE.md`, with one command:
 
 ```text
-make refresh-crate-archives
+cmake --build build --target refresh-crate-archives
 ```
 
 It must run on an aarch64 Linux host, and it needs the mac for the darwin half: the macOS archive is compiled by
@@ -561,7 +561,7 @@ immediately rather than silently refreshing half the pair.
 
 Two CI gates protect this, on Linux and on `publish`:
 
-- `make check-crate-archives` recomputes the `source-manifest` hash in `PROVENANCE.md` — a digest over every C source
+- `cmake --build build --target check-crate-archives` recomputes the `source-manifest` hash in `PROVENANCE.md` — a digest over every C source
   and header the archives are built from (`make print-archive-sources`) — plus the SHA-256 of each committed archive,
   and fails with the regeneration command when the sources have moved on. This is the *currency* check, and it is pure
   hashing: seconds, no extra compilation.

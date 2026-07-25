@@ -207,5 +207,19 @@ if(HL_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     USES_TERMINAL)
 endif()
 
+add_custom_target(check-crate-archives
+  COMMAND ${HL_BASH_EXECUTABLE}
+          ${CMAKE_SOURCE_DIR}/tools/check_crate_archives.sh
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  USES_TERMINAL)
+
+add_custom_target(refresh-crate-archives
+  COMMAND ${CMAKE_COMMAND} -E env
+          BUILD=${CMAKE_BINARY_DIR}/crate-archives
+          ${HL_BASH_EXECUTABLE}
+          ${CMAKE_SOURCE_DIR}/tools/refresh_crate_archives.sh
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  USES_TERMINAL)
+
 # --- clang-format targets ---------------------------------------------------
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Format.cmake)
