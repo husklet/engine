@@ -673,7 +673,8 @@ Performance is part of correctness because an execution engine that is pathologi
 software reliably. Measurements use release builds and the C performance runner:
 
 ```text
-make BUILD=build-perf DEBUG=0 perf-compat
+ctest --test-dir <build-dir> -L perf-linux      # or -L perf-native, -L perf-macos
+make BUILD=build-perf DEBUG=0 perf-compat       # the Makefile equivalent
 ```
 
 Report at least:
