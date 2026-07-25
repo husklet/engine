@@ -1,5 +1,22 @@
 # hl-engine: system design and operating guide
 
+This file is normative: it defines the layering, the public contracts, the testing model and the
+completion roadmap. The rest of `docs/` is subordinate detail.
+
+| Document | Covers |
+|---|---|
+| `docs/arch.md` | Where each layer defined here lives, at symbol level. Read it before touching `src/core`. |
+| `docs/makefile-retirement.md` | What still blocks deleting the Makefile. |
+| `docs/ci-green.md` | Differential compat findings, `excluded-macos` justifications, runtime self-skips, open gaps. |
+| `docs/checkpoint-sink.md` | The `ckpt_sink`/`ckpt_source` interface and the embedder-supplied checkpoint store. |
+| `docs/checkpoint-restore-io.md` | Restore recovery policies and external-resource reconnection. |
+| `docs/perf-simd-findings.md` | Measured float/SIMD root causes: the shipped SSE NaN-gate fix, the open aarch64 back-edge poll. |
+| `docs/perf-sqlite-findings.md` | Why the sqlite phase runs at ~0.4x native, with the ruled-out hypotheses. |
+| `docs/compliance-ltp.md` | The manual LTP differential lane under `tests/compliance/ltp/`. |
+
+Per-suite fixture rules live in `tests/compat/<suite>/README.md`; `tools/bench/README.md` documents the
+benchmark harness.
+
 ## 1. Purpose
 
 `hl-engine` is a standalone execution engine for running Linux programs on supported host operating systems. Linux is
@@ -104,14 +121,16 @@ remains the launcher wire format, not the preferred embedding API; public caller
 internal `HL_*` option registry. Rootfs and scalar memory/pid/CPU limits live in `hl_engine_config`, arguments are
 supplied to `hl_engine_run`, and debug logging is deliberately a debug-build concern rather than box configuration.
 
-Checkpoint/restore is currently an AArch64, full-or-refuse operation. A successful capture freezes every live
-descendant at an engine safepoint, writes each process's guest memory, CPU state, signal dispositions, identity, and
-path-backed descriptors into a temporary process directory, syncs those files, atomically publishes each process,
-and syncs `MANIFEST` last. Restore rejects incomplete manifests and malformed process trees before resuming init.
-The current format supports single-threaded process trees with regular-file and terminal descriptors. Capture
-explicitly refuses multi-threaded processes, sentry/untrusted mode, and guest-owned sockets, pipes, epoll, eventfd,
-timerfd, inotify, and memfd descriptors. A process that daemonizes out of the init descendant tree is not yet captured.
-These cases are unsupported, not silently omitted from a successful image.
+Checkpoint/restore is a full-or-refuse operation, gated on both guest ISAs (`ctest -L checkpoint`, labels
+`checkpoint-aarch64` / `checkpoint-x86_64`). A successful capture freezes every live descendant at an engine
+safepoint, writes each process's guest memory, CPU state, signal dispositions, identity, and descriptors into a
+staged process group, then publishes the image and the `MANIFEST` last. Restore rejects incomplete manifests and
+malformed process trees before resuming init. Capture explicitly refuses sentry/untrusted mode, connected or
+in-progress sockets that would need connection-state transfer, descriptors with no recoverable path, and guest
+descriptor tables that exceed the checkpoint limit or change mid-capture. A process that daemonizes out of the init
+descendant tree is not captured. These cases are unsupported, not silently omitted from a successful image. Where
+the bytes go is an embedder decision: see docs/checkpoint-sink.md. Recovery policy and external-resource
+reconnection: docs/checkpoint-restore-io.md.
 
 ### 3.2 Engine core (`src/core`)
 
@@ -342,14 +361,17 @@ Logs are diagnostic evidence, never a synchronization mechanism or an API result
 
 ## 7. Build and run
 
-Two build systems are present while the project migrates to CMake. Neither requires Python or Bash test
-scripts.
+Two build systems are present while the project migrates to CMake. Neither requires Python.
 
 * **CMake (preferred, standard flow).** Covers the core libraries, the production engines and embedded
-  activation archive, the unit/compat/e2e matrix as CTest cases, codesigning, and `install`. This is the
-  path new work should use.
-* **Make (still authoritative).** The historical build; CI continues to gate on it until the CMake path has
-  soaked. Both are exercised on every push, so the two cannot silently diverge.
+  activation archive, the unit/compat/e2e matrix as CTest cases, codesigning, `install` and `uninstall`. This
+  is the path new work should use.
+* **Make.** The historical build. It is still what CI runs for the Linux compat shards and for the entire
+  macOS lane, so it cannot be deleted yet. `nix build`, `checks.package` and `checks.unit` are CMake, so the
+  two are exercised together on every push. Remaining conversion work: docs/makefile-retirement.md.
+
+A few CTest cases and build targets shell out to `bash` scripts under `tools/` (lane parity, direct launches,
+crate-archive currency, the remote-macOS lane). No test suite is implemented in a shell script.
 
 ### 7.0 CMake: the standard flow
 
@@ -358,7 +380,15 @@ cmake -G Ninja -B build-cmake
 ninja -C build-cmake
 ctest --test-dir build-cmake -L unit    # or -L compat-ipc, etc. -- one label per suite
 cmake --install build-cmake --prefix /usr/local
+cmake --build build-cmake --target uninstall     # exact install_manifest.txt consumer
 ```
+
+`ctest --test-dir build-cmake -N` and `--print-labels` enumerate the registry; a Linux `nix develop`
+configure registers 394 cases. Nothing is hand-maintained, so neither can drift.
+`gate.makefile-lane-parity` fails the build if any historical lane label selects zero tests — `ctest -L`
+on an unknown label exits 0, which would otherwise turn a mistyped CI step green.
+
+A second configure with `-DHL_SANITIZE=ON` is the ASan/UBSan build.
 
 No toolchain file is needed for a native build: inside the devShell `$CC` is the intended host compiler.
 (Use a build directory other than `build/`, which is the Makefile's output tree.)
@@ -494,14 +524,16 @@ compat-threads           compat-time
 compat-soak
 ```
 
-The complete production gate is seven independent top-level invocations: `e2e-compat` runs the full compatibility
-matrix; `e2e-lifecycle-signal`, `e2e-lifecycle-control`, and `e2e-lifecycle-hygiene` cover lifecycle behavior; and
-`e2e-embedding-fd`, `e2e-embedding-stdio`, and `e2e-embedding-dir` cover embedding for both guest ISAs. Run each with
-its own timeout. The host firewall scanner retains host-global identity state, so CI assigns every behavioral subgate
-its own fresh macOS runner. A checked manifest caps each subgate at four signed launches and ensures artifact identities
-are distinct within it. CI builds and signs only that subgate's artifacts in a preceding step; compilation never shares
-the execution process. Local shared-host runs must be serialized, verify no other `mac` workload is active, and allow a
-bounded settle interval between gates. There is deliberately no recursive umbrella and no firewall retry.
+The behavioral gate is six independent subgates, aggregated by `e2e-mac-gates`:
+`e2e-lifecycle-signal`, `e2e-lifecycle-control`, `e2e-lifecycle-hygiene`, `e2e-embedding-fd`,
+`e2e-embedding-stdio`, `e2e-embedding-dir`. Run each with its own timeout. The compatibility matrix is separate:
+`.github/workflows/mac.yml` shards `compat-*` across five parallel jobs and never runs the `e2e-compat` umbrella.
+The host firewall reliably admits at most four signed launches from one launching process, so a manifest-only
+firewall audit runs first in every gate (`cmake/RunSequence.cmake`, `cmake/Phase4Mac.cmake`) and keeps each subgate
+inside that budget with distinct artifact identities. CI builds and signs only that subgate's artifacts in a
+preceding step; compilation never shares the execution process. Local shared-host runs must be serialized, verify no
+other `mac` workload is active, and allow a bounded settle interval between gates. There is deliberately no
+recursive umbrella and no firewall retry.
 
 Remote execution is supervised. Cancellation, timeout, or bridge loss terminates the remote process group and reaps
 children. Validate the supervisor with:
@@ -551,7 +583,7 @@ with `launch config has an invalid prefix`.
 Regenerate both, and rewrite `pkgs/rust/assets/PROVENANCE.md`, with one command:
 
 ```text
-cmake --build build --target refresh-crate-archives
+cmake --build <build-dir> --target refresh-crate-archives
 ```
 
 It must run on an aarch64 Linux host, and it needs the mac for the darwin half: the macOS archive is compiled by
@@ -561,10 +593,12 @@ immediately rather than silently refreshing half the pair.
 
 Two CI gates protect this, on Linux and on `publish`:
 
-- `cmake --build build --target check-crate-archives` recomputes the `source-manifest` hash in `PROVENANCE.md` — a digest over every C source
+- `check-crate-archives` recomputes the `source-manifest` hash in `PROVENANCE.md` — a digest over every C source
   and header the archives are built from (`tools/crate_archive_manifest.sh`) — plus the SHA-256 of each committed archive,
   and fails with the regeneration command when the sources have moved on. This is the *currency* check, and it is pure
-  hashing: seconds, no extra compilation.
+  hashing: seconds, no extra compilation. Both workflows currently invoke it as
+  `make check-crate-archives`; the CMake target `check-crate-archives` runs the same
+  `tools/check_crate_archives.sh`.
 - `pkgs/rust/tests/packaged_archive.rs` launches a guest through the committed archive on both hosts. This is the
   *correctness* check.
 
@@ -725,13 +759,15 @@ layer immediately so completing macOS reduces, rather than increases, the later 
 - [x] Remove ambient mapping access from the remaining guest ELF paths. Persistent-cache storage is fully routed
       through a pinned typed File-service directory.
 - [x] Complete the Linux-host process, signal/fault, event, filesystem, and network production lanes. The permanent
-      `test-linux-production-typed` gate runs 656 active exact-golden cases across 16 manifests and both guest ISAs,
-      with zero exclusions.
+      `test-linux-production-typed` gate (`ctest -L compat`) runs 1148 active exact-golden cases across 16 manifests
+      and both guest ISAs, with no exclusions on the Linux lane. 64 cases carry `excluded-macos`, which runs them as
+      active on the Linux engine and skips them only on the macOS engine; each is a Linux-only kernel behaviour and
+      is justified case by case in docs/ci-green.md.
 
 ### Linux behavior
 
-- [x] Run every active compatibility manifest on macOS for both guest ISAs with no exclusions except explicitly
-      unsupported guest-ISA inputs.
+- [x] Run every active compatibility manifest on macOS for both guest ISAs. The only exclusions are explicitly
+      unsupported guest-ISA inputs and the `excluded-macos` cases above.
 - [x] Run the same exact-golden corpus through the production Linux host.
 - [x] Complete native Linux epoll, timerfd, eventfd, inotify, signal-mask, dup/fork, and rearm coverage.
 - [x] Complete typed directory, metadata, ownership, allocation, sparse-file, locking, and external-change coverage.
@@ -770,8 +806,8 @@ layer immediately so completing macOS reduces, rather than increases, the later 
       `perf-linux` exercise release fixtures, both production guest ISAs where applicable, and bounded resources.
 - [x] Enforce tracked cold and p99 thresholds for cold start, persistent-cache warm start, isolated translation,
       one-million-syscall execution, fork/exec stress, file/pipe/event IPC, and latency/throughput IPC on macOS and
-      Linux for both guest ISAs. Resource fixtures also bound retained JIT memory to 8 MiB and require mappings,
-      descriptors, and thread counts to return to their lifecycle baseline.
+      Linux for both guest ISAs. `tests/perf/resource.c` also bounds retained RSS growth to 2048 pages after
+      teardown and requires descriptor and thread counts to return to their baseline.
 - [x] Run extended synthetic and application-level workloads without leaks or unbounded growth. The synthetic soak
       repeats all 18 dual-ISA production cases ten times; the workload gate independently repeats all 18 supported
       compute, memory, code-cache, thread/fork churn, SMC, SQLite, and database-server cases ten times. Both require
