@@ -1001,6 +1001,16 @@ static void emit_soft_guard(int address_register, uint64_t size, uint64_t rip, u
 }
 
 void emit_memory_guard(int address_register, uint64_t size, uint64_t rip, uint32_t required) {
+    /*
+     * The post-store executable-alias observer consumes the original guest
+     * address from OFF_BUS_EA. A logical soft guard records it below, but a
+     * direct mapping has no soft guard and previously left the field at zero:
+     * scalar/SSE stores then invalidated guest address 0 instead of the RX
+     * alias of their MAP_SHARED backing object. Record only in the already
+     * armed executable-memory generation, before a soft guard can translate
+     * address_register to its host backing address.
+     */
+    if (!jit_guest_soft_active() && g_rwx_guest) e_str(address_register, 28, OFF_BUS_EA);
     emit_soft_guard(address_register, size, rip, required);
     if (!jit_guest_bus_active()) return;
     /* Sticky guarded translations become nearly inert after the final BUS

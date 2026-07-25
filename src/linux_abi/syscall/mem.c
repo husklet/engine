@@ -652,17 +652,22 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // Setting g_rwx_guest also arms the (otherwise inert) SMC write-fault invalidation in frontend/x86_64
         // so a guest that OVERWRITES already-translated code re-translates. NORWXFIX=1 disables the strip.
         if (prot & PROT_EXEC) {
+            /*
+             * A read-only executable mapping can alias a distinct writable
+             * MAP_SHARED view of the same object. The writable view must arm
+             * store observation even though this RX view itself is not
+             * writable (memfd JIT/code-cache layout).
+             */
+            g_rwx_guest = 1;
             if (a3 & 0x20) {
                 // Anon JIT arena: strip EXEC and map R+W so the guest can write its generated code.
                 prot = (prot & ~PROT_EXEC) | PROT_READ | PROT_WRITE;
-                g_rwx_guest = 1; // a JIT guest is present (informational + SMC gate)
             } else if (prot & PROT_WRITE) {
                 // File-backed WRITE+EXEC map: macOS W^X rejects it (EACCES) without MAP_JIT, but the JIT
                 // never executes guest pages, so EXEC is meaningless -- drop it, keeping the file map R+W.
                 // A file-backed READ+EXEC map (no write) is permitted by macOS -- that is how ld.so loads a
                 // .so's text -- so it is left untouched. (LTP mincore02 maps a file PROT_READ|WRITE|EXEC.)
                 prot &= ~PROT_EXEC;
-                g_rwx_guest = 1;
             }
         }
         size_t hp = (size_t)getpagesize();
