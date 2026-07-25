@@ -42,7 +42,7 @@ src/. They must be regenerated whenever any C source or header changes:
     cmake --build build --target refresh-crate-archives
 
 See DOCS.md ("Prebuilt crate archives") for the macOS half, which must be
-built on Apple silicon (from this checkout: `mac make ...`, /Users/x/dd is
+built on Apple silicon (from this shared checkout through `mac`, /Users/x/dd is
 shared with the mac).
 EOF
 }

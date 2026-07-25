@@ -562,7 +562,7 @@ immediately rather than silently refreshing half the pair.
 Two CI gates protect this, on Linux and on `publish`:
 
 - `cmake --build build --target check-crate-archives` recomputes the `source-manifest` hash in `PROVENANCE.md` — a digest over every C source
-  and header the archives are built from (`make print-archive-sources`) — plus the SHA-256 of each committed archive,
+  and header the archives are built from (`tools/crate_archive_manifest.sh`) — plus the SHA-256 of each committed archive,
   and fails with the regeneration command when the sources have moved on. This is the *currency* check, and it is pure
   hashing: seconds, no extra compilation.
 - `pkgs/rust/tests/packaged_archive.rs` launches a guest through the committed archive on both hosts. This is the

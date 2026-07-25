@@ -42,7 +42,7 @@ fn committed_archive_launches_a_guest_on_both_backends() {
                      {error}\n\
                      This usually means the archive is stale relative to \
                      include/hl/config.h. Rebuild it with \
-                     `make package-embedded-linux` (or `package-embedded-macos` on a mac), \
+                     the CMake `refresh-crate-archives` target, \
                      copy build/package/<arch>/libhl-engine.a into \
                      pkgs/rust/assets/lib/<target>/, and refresh \
                      pkgs/rust/assets/PROVENANCE.md."

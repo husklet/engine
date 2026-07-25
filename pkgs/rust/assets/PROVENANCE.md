@@ -22,8 +22,8 @@ aarch64-apple-darwin: 6401208882f801e17e5b31e163df088032cdc9df84397d3ec8257e902d
 <!-- END GENERATED ARCHIVE PROVENANCE -->
 
 `source-manifest` is a SHA-256 over the SHA-256 of every C source and header the
-archives are built from (the Makefile's `PRODUCTION_UNITY_DEPS`, printed by
-`make print-archive-sources`). It is what makes staleness detectable:
+archives are built from (the CMake archive source export consumed by
+`tools/crate_archive_manifest.sh`). It is what makes staleness detectable:
 `tools/check_crate_archives.sh` recomputes it and fails when the sources have
 moved on from the committed archives. A byte-for-byte rebuild comparison is not
 usable here — the build is deterministic for a fixed toolchain, but the compiler
