@@ -2469,6 +2469,16 @@ static void *translate_block(uint64_t gpc) {
     (g_stitch && !g_smc_seen && !in_excl && trace_blk < TRACE_MAX_BLK - 1 && ncond < STITCH_MAX_COND &&              \
      (g_cp - (uint8_t *)host) < TRACE_MAX_BYTES)
     for (;;) {
+        // A basic block is not necessarily small: generated programs can contain tens of thousands of
+        // straight-line instructions before their first control-flow edge.  File-backed BUS guards can
+        // expand each guest memory operation into hundreds of host bytes.  Bound normal regions by emitted
+        // size so the dispatcher's CACHE_EMIT_HEADROOM admission guarantee remains true.  Splitting at an
+        // arbitrary instruction boundary is equivalent to an ordinary chain exit; exclusive sequences are
+        // exempt because an injected dispatcher edge would clear the architectural monitor.
+        if (!in_excl && (size_t)(g_cp - (uint8_t *)host) >= CACHE_EMIT_HEADROOM / 2) {
+            emit_chain_exit(gpc);
+            break;
+        }
         uint32_t in = *(uint32_t *)gpc;
         if (stealfast_on() && !g_tier2_build && !in_excl && !guestbase_on() &&
             !jit_guest_bus_active() && !g_nonpie_lo) {
