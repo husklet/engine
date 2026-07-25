@@ -3,7 +3,7 @@
 //! API" is true: the image exists only as bytes this test held in memory.
 
 use hl_engine::{
-    CheckpointStore, Engine, Exit, Guest, MachineSpec, MemoryStore, ProcessIo, Stdio,
+    CheckpointStore, Engine, Exit, Guest, MachineSpec, MemoryStore, ProcessIo, Size, Stdio,
     StoreDirection, StoreError,
 };
 use std::{
@@ -107,6 +107,42 @@ fn a_three_process_tree_is_captured_into_memory_and_restored_from_it() {
         )
         .expect("restore launch");
     assert_eq!(restored.wait().expect("restore exit"), Exit::Code(0));
+
+    fs::remove_dir_all(root).expect("scratch cleanup");
+}
+
+#[test]
+fn a_terminal_launch_keeps_its_streaming_checkpoint_channels() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("checkpoint-terminal-{}", std::process::id()));
+    let release = root.join("release");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("scratch directory");
+
+    let store = Arc::new(MemoryStore::new());
+    let mut capture = MachineSpec::new(Guest::Aarch64, fixture("checkpoint-tree"));
+    capture.process.argv.push(release.clone().into_os_string());
+    capture.process.terminal = Some(Size::new(80, 24).expect("terminal size"));
+    capture.checkpoint.enabled = true;
+    let machine = Engine::new()
+        .spawn_with_store(
+            capture,
+            io(),
+            Arc::clone(&store) as Arc<dyn CheckpointStore>,
+            StoreDirection::Capture,
+        )
+        .expect("terminal capture launch");
+
+    wait_until_ready(&root.join("release.output"));
+    machine
+        .checkpoint_into_store(Duration::from_secs(20))
+        .expect("terminal capture into store");
+    assert_eq!(
+        machine.wait().expect("terminal capture exit"),
+        Exit::Code(0)
+    );
+    assert!(store.committed(), "terminal capture was never committed");
 
     fs::remove_dir_all(root).expect("scratch cleanup");
 }
