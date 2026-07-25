@@ -837,13 +837,16 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     case 56:
     case 78:
     case 79:
-    case 88:
     case 264:
     case 291:
     case 437:
     case 439:
     case 452:
     case 48: path_arg0 = &a1; break;
+    case 88:
+        /* utimensat(fd, NULL, times, 0) is futimens and has no pathname to import. */
+        if (a1) path_arg0 = &a1;
+        break;
     case 36:
         path_arg0 = &a0; /* symlink target */
         path_arg1 = &a2; /* new link pathname */
