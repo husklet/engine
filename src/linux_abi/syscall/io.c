@@ -1360,7 +1360,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             ssize_t copied = guest_copy_from(buffer, a1, (size_t)a2);
             if (copied != (ssize_t)a2) {
                 free(buffer);
-                G_RET(c) = (uint64_t)(copied > 0 ? copied : -EFAULT);
+                // This udp-switch probe bounces the source for EVERY write, ahead of any look at the fd, but
+                // Linux resolves the descriptor first (fdget_pos then FMODE_WRITE, both EBADF) -- so
+                // write(fd_opened_O_RDONLY, NULL, 1) must be EBADF, not the EFAULT this used to report.
+                G_RET(c) = (uint64_t)(copied > 0 ? copied : (guest_fd_rejects(wfd, 0) ? -EBADF : -EFAULT));
                 break;
             }
             struct iovec vector = {buffer, (size_t)a2};
@@ -1497,7 +1500,9 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             ssize_t gathered = io_guest_vector_gather(a1, (size_t)a2, tmp, sizeof(tmp));
             struct iovec host = {tmp, gathered > 0 ? (size_t)gathered : 0};
             if (gathered < 0) {
-                G_RET(c) = (uint64_t)(int64_t)gathered;
+                // Same ordering as case 64: this probe gathers before the fd is consulted, and do_writev
+                // resolves the descriptor ahead of import_iovec.
+                G_RET(c) = (uint64_t)(int64_t)(gathered == -EFAULT && guest_fd_rejects((int)a0, 0) ? -EBADF : gathered);
                 break;
             }
             if (udp_switch_write((int)a0, &host, 1, &result)) {
