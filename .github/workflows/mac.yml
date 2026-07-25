@@ -44,21 +44,21 @@ jobs:
 
       - name: Test C package
         timeout-minutes: 45
-        run: nix build --print-build-logs .#checks.aarch64-darwin.package
+        run: tools/ci_run.sh 2520 "Test C package" -- nix build --print-build-logs .#checks.aarch64-darwin.package
 
       # doCheck=false on darwin, so run the runtime suites unsandboxed here (they need "/",
       # "/tmp", JIT, localhost DNS). AR=ar forces the host archiver over the dev-shell cross-ar.
       - name: Test C unit suite
         timeout-minutes: 25
-        run: nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" AR=ar unit'
+        run: tools/ci_run.sh 1320 "Test C unit suite" -- nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" AR=ar unit'
 
       - name: Test C package integration
         timeout-minutes: 25
-        run: nix develop --command sh -c 'make -s CC="$NATIVE_CC" AR=ar CODESIGN=/usr/bin/codesign package-test'
+        run: tools/ci_run.sh 1320 "Test C package integration" -- nix develop --command sh -c 'make -s CC="$NATIVE_CC" AR=ar CODESIGN=/usr/bin/codesign package-test'
 
       - name: Test Rust package
         timeout-minutes: 25
-        run: nix build --print-build-logs .#checks.aarch64-darwin.rust
+        run: tools/ci_run.sh 1320 "Test Rust package" -- nix build --print-build-logs .#checks.aarch64-darwin.rust
 
       - name: Test macOS host services
         timeout-minutes: 30
@@ -88,21 +88,37 @@ jobs:
             done
             wait "$pid"
           }
+          # Two 22min attempts do not fit the 30min step timeout, and a step
+          # GitHub kills emits no ::error. Bound both attempts by one deadline.
+          deadline=$((SECONDS + 1680))
+          budget() {
+            local left=$((deadline - SECONDS - 60))
+            if [ "$left" -gt 0 ]; then echo "$left"; else echo 0; fi
+          }
           run_tm() {
-            local st=0
-            run_bounded 1320 "$1" \
+            local st=0 cap=
+            cap=$(budget)
+            if [ "$cap" -le 0 ]; then return 124; fi
+            if [ "$cap" -gt 1320 ]; then cap=1320; fi
+            run_bounded "$cap" "$1" \
               nix develop --command sh -c 'make -s -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" test-macos' || st=$?
             tail -n 60 "$1"
             return $st
           }
-          if ! run_tm tm.log; then
+          status=0
+          verdict='step budget exhausted before a retry'
+          run_tm tm.log || status=$?
+          if [ "$status" -ne 0 ] && [ "$(budget)" -ge 400 ]; then
+            verdict='both attempts'
             warn=$(tail -c 1500 tm.log); warn=${warn//'%'/'%25'}; warn=${warn//$'\n'/'%0A'}; warn=${warn//$'\r'/'%0D'}
             echo "::warning title=test-macos failed attempt 1 — retrying::$warn"
-            if ! run_tm tm.log; then
-              message=$(tail -c 1500 tm.log); message=${message//'%'/'%25'}; message=${message//$'\n'/'%0A'}; message=${message//$'\r'/'%0D'}
-              echo "::error title=test-macos failed (both attempts)::$message"
-              exit 1
-            fi
+            status=0
+            run_tm tm.log || status=$?
+          fi
+          if [ "$status" -ne 0 ]; then
+            message=$(tail -c 1500 tm.log); message=${message//'%'/'%25'}; message=${message//$'\n'/'%0A'}; message=${message//$'\r'/'%0D'}
+            echo "::error title=test-macos failed ($verdict)::$message"
+            exit 1
           fi
 
       - name: Run e2e gates
@@ -117,20 +133,57 @@ jobs:
         # intermittent stays visible rather than being silently greened.
         run: |
           set -o pipefail
-          run_gates() { nix develop --command sh -c 'make -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" e2e-mac-gates' 2>&1 | tee "$1"; }
-          if ! run_gates gates.log; then
+          # The gates spawn guests that outlive their parent, so output goes to a
+          # FILE: a `tee` reader can wait on an EOF that never comes. One
+          # deadline bounds both attempts, under the 30min step timeout, so a
+          # hang still produces the ::error tail instead of a silent step kill.
+          run_bounded() {
+            local secs="$1" log="$2"; shift 2
+            "$@" >"$log" 2>&1 </dev/null &
+            local pid=$! waited=0
+            while kill -0 "$pid" 2>/dev/null; do
+              if [ "$waited" -ge "$secs" ]; then
+                kill -TERM "$pid" 2>/dev/null; sleep 10; kill -KILL "$pid" 2>/dev/null
+                wait "$pid" 2>/dev/null; return 124
+              fi
+              sleep 5; waited=$((waited + 5))
+            done
+            wait "$pid"
+          }
+          deadline=$((SECONDS + 1680))
+          budget() {
+            local left=$((deadline - SECONDS - 60))
+            if [ "$left" -gt 0 ]; then echo "$left"; else echo 0; fi
+          }
+          run_gates() {
+            local st=0 cap=
+            cap=$(budget)
+            if [ "$cap" -le 0 ]; then return 124; fi
+            if [ "$cap" -gt 780 ]; then cap=780; fi
+            run_bounded "$cap" "$1" \
+              nix develop --command sh -c 'make -j"$(sysctl -n hw.ncpu)" CC="$NATIVE_CC" e2e-mac-gates' || st=$?
+            tail -n 60 "$1"
+            return $st
+          }
+          status=0
+          verdict='step budget exhausted before a retry'
+          run_gates gates.log || status=$?
+          if [ "$status" -ne 0 ] && [ "$(budget)" -ge 400 ]; then
+            verdict='both attempts'
             warn=$(tail -c 1200 gates.log); warn=${warn//'%'/'%25'}; warn=${warn//$'\n'/'%0A'}; warn=${warn//$'\r'/'%0D'}
             echo "::warning title=e2e-mac-gates failed attempt 1 — retrying::$warn"
-            if ! run_gates gates.log; then
-              message=$(tail -c 1500 gates.log); message=${message//'%'/'%25'}; message=${message//$'\n'/'%0A'}; message=${message//$'\r'/'%0D'}
-              echo "::error title=e2e-mac-gates failed (both attempts)::$message"
-              exit 1
-            fi
+            status=0
+            run_gates gates.log || status=$?
+          fi
+          if [ "$status" -ne 0 ]; then
+            message=$(tail -c 1500 gates.log); message=${message//'%'/'%25'}; message=${message//$'\n'/'%0A'}; message=${message//$'\r'/'%0D'}
+            echo "::error title=e2e-mac-gates failed ($verdict)::$message"
+            exit 1
           fi
 
       - name: Package Rust crate
         timeout-minutes: 20
-        run: nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
+        run: tools/ci_run.sh 1020 "Package Rust crate" -- nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
 
       # `cargo build` only proves the committed archive under pkgs/rust/assets/lib/
       # links. It is the artifact `cargo publish` ships, and an ABI mismatch
@@ -146,7 +199,7 @@ jobs:
       # runs the committed testdata fixtures on both guest backends.
       - name: Test Rust crate against the committed archive
         timeout-minutes: 25
-        run: nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml --test packaged_archive
+        run: tools/ci_run.sh 1320 "Test Rust crate against the committed archive" -- nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml --test packaged_archive
 
   # Runtime compatibility suites, split across parallel runners so wall-clock is the
   # slowest bucket (~20-25min) instead of the ~70min sequential `make e2e-compat`.
@@ -164,8 +217,11 @@ jobs:
         include:
           - name: abi-corpus
             targets: compat-abi-corpus
+          # compat-isa-aarch64 belongs here: the sharded buckets must cover
+          # every compat suite `make e2e-compat` runs, and it was the one
+          # omission -- the aarch64 ISA corpus went unrun on every push.
           - name: core
-            targets: compat-abi compat-core compat-isa-x86-64 compat-completeness
+            targets: compat-abi compat-core compat-isa-x86-64 compat-isa-aarch64 compat-completeness
           - name: net-ipc
             targets: compat-network compat-ipc compat-syscall compat-syscall-edges compat-libc
           - name: fs-proc
@@ -225,12 +281,24 @@ jobs:
           # the goals' recipes concurrently, so a bucket's suites competed with each other; the
           # symptom is a case timing out after the runner's full 120s per-case budget with ZERO
           # bytes of output. Building stays parallel; suites run one at a time.
+          # Bound the STEP, not just one suite: five suites plus the retry can
+          # outlast the 45min step timeout, and a step GitHub kills emits no
+          # ::error, so the failure lands with no diagnostic tail. Stop 60s short
+          # of the deadline so the reporting tail below always runs.
+          deadline=$((SECONDS + 2580))
+          budget() {
+            local left=$((deadline - SECONDS - 60))
+            if [ "$left" -gt 0 ]; then echo "$left"; else echo 0; fi
+          }
           run_bucket() {
-            local st=0 suite_st=0 t=
+            local st=0 suite_st=0 cap=0 t=
             : > "$1"
             for t in ${{ matrix.targets }}; do
               suite_st=0
-              run_bounded 2400 "$1.part" \
+              cap=$(budget)
+              if [ "$cap" -le 0 ]; then st=124; break; fi
+              if [ "$cap" -gt 2400 ]; then cap=2400; fi
+              run_bounded "$cap" "$1.part" \
                 nix develop --command sh -c "make -sk -j\"\$(sysctl -n hw.ncpu)\" CC=\"\$NATIVE_CC\" $t" || suite_st=$?
               cat "$1.part" >> "$1"
               if [ "$suite_st" -ne 0 ]; then
@@ -247,15 +315,26 @@ jobs:
             tail -n 60 "$1"
             return $st
           }
-          if ! run_bucket runtime.log; then
+          status=0
+          verdict='step budget exhausted before a retry'
+          run_bucket runtime.log || status=$?
+          # Retry only with enough budget left to finish and still report.
+          if [ "$status" -ne 0 ] && [ "$(budget)" -ge 600 ]; then
+            verdict='both attempts'
             warn=$(tail -c 1200 runtime.log); warn=${warn//'%'/'%25'}; warn=${warn//$'\n'/'%0A'}; warn=${warn//$'\r'/'%0D'}
             echo "::warning title=macOS compat (${{ matrix.name }}) failed attempt 1 — retrying::$warn"
-            if ! run_bucket runtime.log; then
-              message=$(tail -c 1500 runtime.log)
-              message=${message//'%'/'%25'}
-              message=${message//$'\n'/'%0A'}
-              message=${message//$'\r'/'%0D'}
-              echo "::error title=macOS compat (${{ matrix.name }}) failed (both attempts)::$message"
-              exit 1
+            status=0
+            run_bucket runtime.log || status=$?
+          fi
+          if [ "$status" -ne 0 ]; then
+            message=$(tail -c 1500 runtime.log)
+            message=${message//'%'/'%25'}
+            message=${message//$'\n'/'%0A'}
+            message=${message//$'\r'/'%0D'}
+            if [ "$status" -eq 124 ]; then
+              echo "::error title=macOS compat (${{ matrix.name }}) TIMED OUT ($verdict)::$message"
+            else
+              echo "::error title=macOS compat (${{ matrix.name }}) failed ($verdict)::$message"
             fi
+            exit 1
           fi

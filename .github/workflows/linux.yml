@@ -48,19 +48,19 @@ jobs:
       # the four checks `nix flake check` runs.
       - name: Check formatting
         timeout-minutes: 30
-        run: nix build --print-build-logs .#checks.aarch64-linux.format
+        run: tools/ci_run.sh 1620 "Check formatting" -- nix build --print-build-logs .#checks.aarch64-linux.format
 
       - name: Test C package
         timeout-minutes: 60
-        run: nix build --print-build-logs .#checks.aarch64-linux.package
+        run: tools/ci_run.sh 3420 "Test C package" -- nix build --print-build-logs .#checks.aarch64-linux.package
 
       - name: Test unit suite (CMake/CTest)
         timeout-minutes: 30
-        run: nix build --print-build-logs .#checks.aarch64-linux.unit
+        run: tools/ci_run.sh 1620 "Test unit suite (CMake/CTest)" -- nix build --print-build-logs .#checks.aarch64-linux.unit
 
       - name: Test Rust package
         timeout-minutes: 30
-        run: nix build --print-build-logs .#checks.aarch64-linux.rust
+        run: tools/ci_run.sh 1620 "Test Rust package" -- nix build --print-build-logs .#checks.aarch64-linux.rust
 
       # The CMake build is being brought up as the standard build path to replace
       # the hand-written Makefile. Gating it here keeps it honest: it must
@@ -71,7 +71,7 @@ jobs:
       - name: Test CMake build (configure, build, ctest, install)
         timeout-minutes: 30
         run: |
-          nix develop --command sh -c '
+          tools/ci_run.sh 1620 "Test CMake build" -- nix develop --command sh -c '
             set -e
             cmake -G Ninja -B build-ci
             ninja -C build-ci
@@ -92,7 +92,7 @@ jobs:
       - name: Compat coverage parity (make typed-* vs ctest labels)
         timeout-minutes: 15
         run: |
-          nix develop --command sh -c '
+          tools/ci_run.sh 720 "Compat coverage parity" -- nix develop --command sh -c '
             set -e
             missing=
             for s in filesystem isolation network procfs process memory syscall \
@@ -123,13 +123,13 @@ jobs:
       # but nothing enforced either, so both drifted red on main unnoticed.
       - name: Check Rust formatting
         timeout-minutes: 15
-        run: nix develop --command cargo fmt --manifest-path pkgs/rust/Cargo.toml --check
+        run: tools/ci_run.sh 720 "Check Rust formatting" -- nix develop --command cargo fmt --manifest-path pkgs/rust/Cargo.toml --check
 
       # -D warnings promotes the crate's `warn` lint levels to hard errors here
       # only: a local `cargo build` keeps showing them as warnings.
       - name: Lint Rust crate (clippy)
         timeout-minutes: 20
-        run: nix develop --command cargo clippy --manifest-path pkgs/rust/Cargo.toml --all-targets --locked -- -D warnings
+        run: tools/ci_run.sh 1020 "Lint Rust crate (clippy)" -- nix develop --command cargo clippy --manifest-path pkgs/rust/Cargo.toml --all-targets --locked -- -D warnings
 
       # --lib ONLY. The integration suites (spec, control, terminal, network,
       # e2e) link the frozen activation archive and need a built engine plus
@@ -139,11 +139,11 @@ jobs:
       # include/hl/config.h -- and are exactly what was silently failing on main.
       - name: Test Rust unit suite
         timeout-minutes: 20
-        run: nix develop --command cargo test --manifest-path pkgs/rust/Cargo.toml --locked --lib
+        run: tools/ci_run.sh 1020 "Test Rust unit suite" -- nix develop --command cargo test --manifest-path pkgs/rust/Cargo.toml --locked --lib
 
       - name: Package Rust crate
         timeout-minutes: 20
-        run: nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
+        run: tools/ci_run.sh 1020 "Package Rust crate" -- nix develop --command cargo build --release --locked --manifest-path pkgs/rust/Cargo.toml
 
       # `cargo build` only proves the committed archive under pkgs/rust/assets/lib/
       # links. It is the artifact `cargo publish` ships, and an ABI mismatch
@@ -162,7 +162,7 @@ jobs:
       # and cannot be flaked by the runner.
       - name: Gate — packaged archive launches a guest, and lib logic
         timeout-minutes: 15
-        run: nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml --lib --test packaged_archive
+        run: tools/ci_run.sh 720 "Gate — packaged archive launches a guest, and lib logic" -- nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml --lib --test packaged_archive
 
       # The full integration suite (spec, e2e, alpine, container, control, ...)
       # exercises deep host behaviour -- checkpoint capture, private fd bands,
@@ -179,7 +179,7 @@ jobs:
       # fails the job.
       - name: Full Rust integration suite
         timeout-minutes: 25
-        run: nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml
+        run: tools/ci_run.sh 1320 "Full Rust integration suite" -- nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml
 
       # The launch and integration tests above prove the committed archive
       # works. This final hard gate independently proves that it is current.
@@ -189,7 +189,7 @@ jobs:
       # stronger release and integration gates from reporting their results.
       - name: Check the committed crate archives match the C sources
         timeout-minutes: 15
-        run: nix develop --command make check-crate-archives
+        run: tools/ci_run.sh 720 "Check the committed crate archives match the C sources" -- nix develop --command make check-crate-archives
 
   # Runtime compatibility, sharded across parallel runners. This used to be one
   # step inside `linux` running `test-linux-production-typed`, i.e. every suite
@@ -260,12 +260,24 @@ jobs:
           # several of them contain load-sensitive stress gates, and the symptom was cases timing
           # out after the runner's full 120s per-case budget having produced ZERO bytes of output
           # (mkfifoat, truncate-eof-bus). Building stays parallel; suites run one at a time.
+          # Bound the STEP, not just one suite. Several suites plus the retry can
+          # outlast the 40min step timeout, and a step GitHub kills emits no
+          # ::error, so the failure lands with no diagnostic tail. Stop 60s short
+          # of the deadline so the reporting tail below always runs.
+          deadline=$((SECONDS + 2280))
+          budget() {
+            local left=$((deadline - SECONDS - 60))
+            if [ "$left" -gt 0 ]; then echo "$left"; else echo 0; fi
+          }
           run_suites() {
-            local st=0 suite_st=0 t=
+            local st=0 suite_st=0 cap=0 t=
             : > "$1"
             for t in ${{ matrix.targets }}; do
               suite_st=0
-              run_bounded 2100 "$1.part" \
+              cap=$(budget)
+              if [ "$cap" -le 0 ]; then st=124; break; fi
+              if [ "$cap" -gt 2100 ]; then cap=2100; fi
+              run_bounded "$cap" "$1.part" \
                 nix develop --command sh -c "make -s -j\"\$(nproc)\" CC=\"\$NATIVE_CC\" $t" || suite_st=$?
               cat "$1.part" >> "$1"
               if [ "$suite_st" -ne 0 ]; then
@@ -282,8 +294,11 @@ jobs:
             return $st
           }
           status=0
+          verdict='step budget exhausted before a retry'
           run_suites runtime.log || status=$?
-          if [ "$status" -ne 0 ]; then
+          # Retry only with enough budget left to finish and still report.
+          if [ "$status" -ne 0 ] && [ "$(budget)" -ge 600 ]; then
+            verdict='both attempts'
             warn=$(tail -c 1200 runtime.log)
             warn=${warn//'%'/'%25'}; warn=${warn//$'\n'/'%0A'}; warn=${warn//$'\r'/'%0D'}
             echo "::warning title=Linux compat (${{ matrix.name }}) failed attempt 1 — retrying::$warn"
@@ -297,9 +312,9 @@ jobs:
             message=${message//$'\n'/'%0A'}
             message=${message//$'\r'/'%0D'}
             if [ "$status" -eq 124 ]; then
-              echo "::error title=Linux compat (${{ matrix.name }}) TIMED OUT (both attempts)::$message"
+              echo "::error title=Linux compat (${{ matrix.name }}) TIMED OUT ($verdict)::$message"
             else
-              echo "::error title=Linux compat (${{ matrix.name }}) failed (both attempts)::$message"
+              echo "::error title=Linux compat (${{ matrix.name }}) failed ($verdict)::$message"
             fi
             exit 1
           fi

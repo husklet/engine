@@ -57,11 +57,11 @@ jobs:
       # archive from reaching cargo publish even if those workflows later change.
       - name: Verify crate archives are current
         timeout-minutes: 15
-        run: nix develop --command make check-crate-archives
+        run: tools/ci_run.sh 720 "Verify crate archives are current" -- nix develop --command make check-crate-archives
 
       - name: Verify packaged archive launches a guest
         timeout-minutes: 20
-        run: nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml --lib --test packaged_archive
+        run: tools/ci_run.sh 1020 "Verify packaged archive launches a guest" -- nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml --lib --test packaged_archive
 
       # Upload retries only transient registry failures. The test jobs and both
       # release-specific archive gates above must all pass before this can run.
@@ -82,4 +82,4 @@ jobs:
       - name: Dry-run Rust crate publication
         if: ${{ inputs.dry_run || startsWith(github.ref_name, 'verify-v') }}
         timeout-minutes: 40
-        run: nix develop --command cargo publish --dry-run --manifest-path pkgs/rust/Cargo.toml --locked
+        run: tools/ci_run.sh 2220 "Dry-run Rust crate publication" -- nix develop --command cargo publish --dry-run --manifest-path pkgs/rust/Cargo.toml --locked

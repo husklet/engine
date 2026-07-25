@@ -124,6 +124,18 @@ invariants)
 			if (step_runs[i] ~ /attempt 1/ &&
 			    (step_runs[i] !~ /both attempts/ || step_runs[i] !~ /exit 1/))
 				bad("I6 " step_files[i] " step `" step_names[i] "` does not check retry 2")
+			# A retried step must bound BOTH attempts against one deadline:
+			# a step the runner kills on its own timeout prints no ::error.
+			if (step_runs[i] ~ /attempt 1/ &&
+			    (step_runs[i] !~ /deadline=/ || step_runs[i] !~ /run_bounded/))
+				bad("I16 " step_files[i] " step `" step_names[i] "` retries without a step deadline")
+			# Every test-lane gate must name its own failure: the job-log
+			# endpoint needs admin rights, so a step that only exits
+			# non-zero is undiagnosable from the public check-run data.
+			if (step_runs[i] ~ /(nix build|nix develop|make |cargo )/ &&
+			    step_runs[i] !~ /ci_run\.sh/ && step_runs[i] !~ /::error/ &&
+			    step_runs[i] !~ /for attempt in/)
+				bad("I17 " step_files[i] " step `" step_names[i] "` reports no ::error on failure")
 		}
 		if (jobs < 7)
 			bad("I7 parsed only " jobs " jobs; expected at least 7")
@@ -140,7 +152,8 @@ invariants)
 		exit 1
 	fi
 
-	if grep -Eq 'actions/checkout@v[1-4]([^0-9]|$)|nix-installer-action@v([1-9]|1[0-9]|2[01])([^0-9]|$)|nix-installer-action@main' \
+	# checkout<=v4, nix-installer<=v21 and cache-nix-action<=v6 run on node20.
+	if grep -Eq 'actions/checkout@v[1-4]([^0-9]|$)|nix-installer-action@v([1-9]|1[0-9]|2[01])([^0-9]|$)|nix-installer-action@main|cache-nix-action@(v[1-6]([^0-9]|$)|main)' \
 		"$wfdir"/*.yml; then
 		printf '%s\n' 'VIOLATION: I9 a workflow action still targets the Node 20 generation' >&2
 		exit 1
@@ -158,6 +171,54 @@ invariants)
 			exit 1
 		fi
 	done
+
+	# I13-I15: the sharded compat matrices replaced whole-suite aggregates, so a
+	# suite the Makefile aggregate runs but no shard names is silently unrun.
+	logical_line() {
+		awk -v pat="$1" '
+		index($0, pat) == 1 { collecting = 1 }
+		collecting {
+			line = line " " $0
+			if ($0 !~ /\\$/) {
+				gsub(/\\/, " ", line)
+				print line
+				exit
+			}
+		}' Makefile
+	}
+	shard_targets() {
+		sed -n 's/^ *targets: *//p' "$1" | tr ' ' '\n' | sed '/^$/d'
+	}
+
+	shards=$(shard_targets "$wfdir/mac.yml")
+	for suite in $(logical_line 'e2e-compat:'); do
+		case "$suite" in
+		compat-engines) continue ;;
+		compat-*) ;;
+		*) continue ;;
+		esac
+		if ! printf '%s\n' "$shards" | grep -Fqx -- "$suite"; then
+			printf 'VIOLATION: I13 mac.yml runs no shard for `%s`\n' "$suite" >&2
+			exit 1
+		fi
+	done
+
+	shards=$(shard_targets "$wfdir/linux.yml")
+	typed_suites=$(logical_line 'TYPED_SUITES :=' | sed 's/.*TYPED_SUITES := *//')
+	for suite in $typed_suites; do
+		if ! printf '%s\n' "$shards" | grep -Fqx -- "typed-$suite"; then
+			printf 'VIOLATION: I14 linux.yml runs no shard for `typed-%s`\n' "$suite" >&2
+			exit 1
+		fi
+	done
+
+	parity=$(sed -n '/for s in /,/; do/p' "$wfdir/linux.yml" |
+		tr -d '\\' | sed 's/.*for s in //; s/; do.*//')
+	if [ "$(printf '%s\n' $typed_suites | LC_ALL=C sort)" != \
+		"$(printf '%s\n' $parity | LC_ALL=C sort)" ]; then
+		printf '%s\n' 'VIOLATION: I15 the CTest parity list is not TYPED_SUITES' >&2
+		exit 1
+	fi
 
 	full_line=$(grep -nF 'name: Full Rust integration suite' "$wfdir/linux.yml" |
 		cut -d: -f1)
