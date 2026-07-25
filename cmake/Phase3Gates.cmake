@@ -555,6 +555,36 @@ set(HL_ISA_FUZZ_ARM_REGRESS_SEEDS
   CACHE STRING "aarch64 differential ISA fuzz regression seeds")
 set(HL_ISA_FUZZ_ARM_ARGS "+i8mm +bf16 +dczva +fpcr"
   CACHE STRING "aarch64 ISA fuzz generator feature args")
+set(HL_ISA_FUZZ_SEEDS 200
+  CACHE STRING "fresh-seed count for the opt-in x86_64 fuzz campaign")
+set(HL_ISA_FUZZ_ARM_SEEDS 200
+  CACHE STRING "fresh-seed count for the opt-in aarch64 fuzz campaign")
+
+# Preserve the open-ended developer entry points as build targets.  They are
+# intentionally not CTest cases: a fresh-seed search is useful work, but not a
+# deterministic release verdict.
+add_custom_target(isa-fuzz
+  COMMAND ${HL_BASH_EXECUTABLE}
+          ${CMAKE_SOURCE_DIR}/tests/fuzz/isa/x86_64/run.sh
+          --engine ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-x86_64
+          --out ${CMAKE_BINARY_DIR}/isafuzz
+          --seeds ${HL_ISA_FUZZ_SEEDS} --ignore-mxcsr
+  DEPENDS hl-engine-linux-x86_64
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  USES_TERMINAL)
+
+if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+  add_custom_target(isa-fuzz-arm
+    COMMAND ${HL_BASH_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tests/fuzz/isa/aarch64/run.sh
+            --engine ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-aarch64
+            --out ${CMAKE_BINARY_DIR}/isafuzz-arm
+            --seeds ${HL_ISA_FUZZ_ARM_SEEDS}
+            --gen-args "${HL_ISA_FUZZ_ARM_ARGS}"
+    DEPENDS hl-engine-linux-aarch64
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    USES_TERMINAL)
+endif()
 
 # MXCSR is excluded from the x86_64 comparison: the engine mirrors the host
 # FPSR rather than modelling x86's sticky exception-status bits (Makefile 2345).
