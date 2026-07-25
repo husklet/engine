@@ -734,11 +734,20 @@ static int guest_fetch_direct_valid(uint64_t address, size_t length) {
     return host_range_mapped((uintptr_t)address, length);
 }
 
+static int guest_store_direct_valid(uint64_t address, size_t length) {
+    return !gro_hit(address, (uint64_t)length) && host_range_mapped((uintptr_t)address, length);
+}
+
+static int guest_rep_access_special(uint64_t address, size_t length, int write) {
+    return gna_hit(address, (uint64_t)length) || hl_linux_bus_hit(address, (uint64_t)length) ||
+           (write && gro_hit(address, (uint64_t)length));
+}
+
 static int engine_global_init(void) {
     hl_x86_decode_set_instruction_fetch(hl_guest_fetch_exec);
     hl_guest_fetch_set_direct_validator(guest_fetch_direct_valid);
     hl_x86_rep_set_store_commit(jit86_store_alias_changed, jit86_store_alias_observation_active);
-    hl_x86_rep_set_access_validators(guest_fetch_direct_valid, guest_fetch_direct_valid);
+    hl_x86_rep_set_access_validators(guest_fetch_direct_valid, guest_store_direct_valid, guest_rep_access_special);
     if (hl_target_services_bind(&g_target_services) != 0) return 1;
     if (g_engine_inited) return 0;
     if (pthread_key_create(&g_cpu_key, NULL) != 0) {

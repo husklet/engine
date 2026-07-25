@@ -12,15 +12,18 @@ static hl_x86_rep_store_commit_fn g_rep_store_commit;
 static hl_x86_rep_store_observation_active_fn g_rep_store_observation_active;
 static hl_x86_rep_access_fn g_rep_readable;
 static hl_x86_rep_access_fn g_rep_writable;
+static hl_x86_rep_access_special_fn g_rep_access_special;
 
 void hl_x86_rep_set_store_commit(hl_x86_rep_store_commit_fn callback, hl_x86_rep_store_observation_active_fn active) {
     g_rep_store_commit = callback;
     g_rep_store_observation_active = active;
 }
 
-void hl_x86_rep_set_access_validators(hl_x86_rep_access_fn readable, hl_x86_rep_access_fn writable) {
+void hl_x86_rep_set_access_validators(hl_x86_rep_access_fn readable, hl_x86_rep_access_fn writable,
+                                      hl_x86_rep_access_special_fn special) {
     g_rep_readable = readable;
     g_rep_writable = writable;
+    g_rep_access_special = special;
 }
 
 static uint64_t rep_fault(struct cpu *cpu, uint64_t address, uint64_t width, uint32_t required, uint64_t rip,
@@ -60,7 +63,12 @@ uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes,
     dst = (uint8_t *)(uintptr_t)hl_x86_guest_pointer((uint64_t)(uintptr_t)dst);
     src = (const uint8_t *)(uintptr_t)hl_x86_guest_pointer((uint64_t)(uintptr_t)src);
     if (nbytes == 0) return 0;
-    if (hl_logical_vma_global_active()) {
+    uint64_t span = nbytes - (uint64_t)w;
+    uint64_t dlo = (uint64_t)(uintptr_t)dst - (df ? span : 0);
+    uint64_t slo = (uint64_t)(uintptr_t)src - (df ? span : 0);
+    int special = g_rep_access_special != NULL &&
+                  (g_rep_access_special(slo, (size_t)nbytes, 0) || g_rep_access_special(dlo, (size_t)nbytes, 1));
+    if (hl_logical_vma_global_active() || special) {
         uint64_t n = nbytes / (unsigned)w;
         for (uint64_t i = 0; i < n; ++i) {
             uint64_t step = i * (uint64_t)w;
@@ -146,7 +154,12 @@ uint64_t hl_x86_rep_stos(void *destination, uint64_t val, uint64_t n, int w, int
     uint8_t *dst = destination;
     hl_x86_count_rep_stos();
     dst = (uint8_t *)(uintptr_t)hl_x86_guest_pointer((uint64_t)(uintptr_t)dst);
-    if (hl_logical_vma_global_active()) {
+    uint64_t bytes;
+    int overflow = __builtin_mul_overflow(n, (uint64_t)w, &bytes);
+    uint64_t span = !overflow && bytes != 0 ? bytes - (uint64_t)w : 0;
+    uint64_t dlo = (uint64_t)(uintptr_t)dst - (df ? span : 0);
+    int special = overflow || (g_rep_access_special != NULL && g_rep_access_special(dlo, (size_t)bytes, 1));
+    if (hl_logical_vma_global_active() || special) {
         for (uint64_t i = 0; i < n; ++i) {
             uint64_t step = i * (uint64_t)w;
             uint64_t dg = (uint64_t)(uintptr_t)(df ? dst - step : dst + step);
