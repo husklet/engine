@@ -118,8 +118,8 @@ invariants)
 			if (!job_timeouts[i] && !job_calls[i])
 				bad("I4 " job_files[i] " job `" job_names[i] "` has no timeout")
 		for (i = 1; i <= steps; i++) {
-			if (step_runs[i] !~ /(nix build|nix develop|make |cargo )/) continue
-			if (!step_timeouts[i])
+			if (step_runs[i] ~ /(nix build|nix develop|make |cargo )/ &&
+			    !step_timeouts[i])
 				bad("I5 " step_files[i] " step `" step_names[i] "` has no timeout")
 			if (step_runs[i] ~ /attempt 1/ &&
 			    (step_runs[i] !~ /both attempts/ || step_runs[i] !~ /exit 1/))
@@ -137,6 +137,16 @@ invariants)
 	if grep -Eq '\[[^]]*\$st[^]]*\][[:space:]]*&&[[:space:]]*break' \
 		"$wfdir/linux.yml" "$wfdir/mac.yml"; then
 		printf '%s\n' 'VIOLATION: I8 compatibility loops stop after the first failing suite' >&2
+		exit 1
+	fi
+
+	full_line=$(grep -nF 'name: Full Rust integration suite' "$wfdir/linux.yml" |
+		cut -d: -f1)
+	fresh_line=$(grep -nF 'name: Check the committed crate archives match the C sources' \
+		"$wfdir/linux.yml" | cut -d: -f1)
+	if [ -z "$full_line" ] || [ -z "$fresh_line" ] ||
+		[ "$fresh_line" -le "$full_line" ]; then
+		printf '%s\n' 'VIOLATION: I9 archive freshness masks the full integration gate' >&2
 		exit 1
 	fi
 	;;
