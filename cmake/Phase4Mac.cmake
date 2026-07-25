@@ -142,6 +142,7 @@ add_test(NAME dual-backend.mac-link
           ${CMAKE_BINARY_DIR}/e2e/guest-output-aarch64)
 set_tests_properties(dual-backend.mac-link PROPERTIES
   LABELS "embedding" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_custom_target(embedding-macos-build DEPENDS mac-dual-backend-link-test)
 
 # --- mac host-service unit tests -------------------------------------------
 # These open "/", "/tmp" and resolve localhost DNS, so they are NOT part of the
@@ -258,6 +259,27 @@ add_test(NAME e2e.bridge-jobserver
 set_tests_properties(e2e.bridge-jobserver PROPERTIES
   LABELS "e2e;e2e-mac" RESOURCE_LOCK hl-mac-bridge
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+set(_HL_E2E_MAC_DEPS
+  test_lifecycle_identity bridge-runner bridge-jobserver-test
+  lifecycle-exit-aarch64 lifecycle-exit-x86_64
+  lifecycle-signal-aarch64 lifecycle-signal-x86_64
+  lifecycle-clock-aarch64 lifecycle-clock-x86_64
+  lifecycle-force-aarch64 lifecycle-force-x86_64
+  binding-aarch64 binding-x86_64
+  stdio-aarch64 stdio-x86_64
+  dir-aarch64 dir-x86_64)
+foreach(_arch aarch64 x86_64)
+  list(APPEND _HL_E2E_MAC_DEPS
+    ${_E2E}/guest-exit139-${_arch}
+    ${_E2E}/guest-fault-${_arch}
+    ${_E2E}/clock-injected-${_arch}
+    ${_E2E}/guest-spin-${_arch}
+    ${_E2E}/fd-binding-${_arch}
+    ${_E2E}/stdio-binding-${_arch}
+    ${_E2E}/dir-binding-${_arch})
+endforeach()
+add_custom_target(e2e-macos-build DEPENDS ${_HL_E2E_MAC_DEPS})
 
 # --- direct production/config launches formerly hidden in e2e-compat -------
 # These six checks are distinct from the embedding gates above: they launch
