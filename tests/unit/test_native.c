@@ -170,6 +170,64 @@ int main(void) {
         HL_CHECK(rmdir(path) == 0); /* no temporary publication file leaked */
     }
     {
+        /*
+         * Scatter/gather iovcnt boundary of the native host file service. The Linux ABI above this
+         * layer must see Linux semantics on every host: a vector of 0..HL_HOST_FILE_IOV_MAX segments
+         * is accepted (and transfers the summed length, which is zero when every segment is empty),
+         * one segment past the ceiling is INVALID_ARGUMENT. Darwin's readv/writev family rejects
+         * iovcnt 0 with EINVAL where Linux returns 0, so the empty-vector rungs of this ladder are
+         * exactly where a host-passthrough backend diverges -- assert them here, host-agnostically.
+         */
+        static const uint32_t counts[] = {0, 1, 1023, HL_HOST_FILE_IOV_MAX};
+        static hl_host_iovec vectors[HL_HOST_FILE_IOV_MAX + 1];
+        static char payload[HL_HOST_FILE_IOV_MAX];
+        char path[] = "/tmp/hl-native-iov-XXXXXX";
+        int native = mkstemp(path);
+        hl_host_result file;
+        HL_CHECK(native >= 0 && close(native) == 0);
+        file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, path, strlen(path),
+                                            HL_HOST_FILE_READ | HL_HOST_FILE_WRITE, 0, 0);
+        HL_CHECK(file.status == HL_STATUS_OK);
+        for (uint32_t index = 0; index <= HL_HOST_FILE_IOV_MAX; index++)
+            vectors[index] = (hl_host_iovec){(uint64_t)(uintptr_t)&payload[0], 0};
+        for (size_t which = 0; which < sizeof counts / sizeof counts[0]; which++) {
+            uint32_t count = counts[which];
+            hl_host_result r = services.file->writev(services.context, file.value, vectors, count);
+            HL_CHECK(r.status == HL_STATUS_OK && r.value == 0);
+            r = services.file->readv(services.context, file.value, vectors, count);
+            HL_CHECK(r.status == HL_STATUS_OK && r.value == 0);
+            r = services.file->writev_at(services.context, file.value, vectors, count, 0);
+            HL_CHECK(r.status == HL_STATUS_OK && r.value == 0);
+            r = services.file->readv_at(services.context, file.value, vectors, count, 0);
+            HL_CHECK(r.status == HL_STATUS_OK && r.value == 0);
+        }
+        /* One past the ceiling is rejected before any byte moves, on either host. */
+        HL_CHECK(services.file->writev(services.context, file.value, vectors, HL_HOST_FILE_IOV_MAX + 1u).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.file->readv(services.context, file.value, vectors, HL_HOST_FILE_IOV_MAX + 1u).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.file->writev_at(services.context, file.value, vectors, HL_HOST_FILE_IOV_MAX + 1u, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.file->readv_at(services.context, file.value, vectors, HL_HOST_FILE_IOV_MAX + 1u, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        /* A full-ceiling vector carrying one byte per segment really transfers. */
+        memset(payload, 'z', sizeof payload);
+        for (uint32_t index = 0; index < HL_HOST_FILE_IOV_MAX; index++)
+            vectors[index] = (hl_host_iovec){(uint64_t)(uintptr_t)&payload[index], 1};
+        {
+            static char back[HL_HOST_FILE_IOV_MAX];
+            hl_host_result r = services.file->writev_at(services.context, file.value, vectors, HL_HOST_FILE_IOV_MAX, 0);
+            HL_CHECK(r.status == HL_STATUS_OK && r.value == HL_HOST_FILE_IOV_MAX);
+            for (uint32_t index = 0; index < HL_HOST_FILE_IOV_MAX; index++)
+                vectors[index] = (hl_host_iovec){(uint64_t)(uintptr_t)&back[index], 1};
+            r = services.file->readv_at(services.context, file.value, vectors, HL_HOST_FILE_IOV_MAX, 0);
+            HL_CHECK(r.status == HL_STATUS_OK && r.value == HL_HOST_FILE_IOV_MAX);
+            HL_CHECK(memcmp(back, payload, sizeof payload) == 0);
+        }
+        HL_CHECK(services.file->close(services.context, file.value).status == HL_STATUS_OK);
+        HL_CHECK(unlink(path) == 0);
+    }
+    {
         char path[] = "/tmp/hl-native-watch-XXXXXX", moved[128];
         int native = mkstemp(path);
         HL_CHECK(native >= 0 && close(native) == 0);

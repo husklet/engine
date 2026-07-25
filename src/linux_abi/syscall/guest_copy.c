@@ -316,6 +316,21 @@ static ssize_t guest_fd_vector_flags(int fd, uint64_t guest_vectors, size_t gues
         if (covered != guest_iov[index].iov_len) break;
     }
 
+    /*
+     * Every guest segment was zero-length, so the vector collapsed to nothing.  Linux transfers no
+     * bytes and returns 0 for such a call (fs/read_write.c: an iov_iter of count 0), but BSD/macOS
+     * reject iovcnt 0 outright with EINVAL, so forwarding the empty host vector would invent an
+     * error the guest must never see.  Hand the host one zero-length segment instead of zero
+     * segments: it is accepted on both kernels, moves nothing, and still performs the descriptor's
+     * access-mode check (a writev through an O_RDONLY fd must stay EBADF, which an early `return 0`
+     * here would swallow).
+     */
+    static char empty_segment;
+    if (!host_count) {
+        host_iov[0] = (struct iovec){&empty_segment, 0};
+        host_count = 1;
+    }
+
     ssize_t result;
 #if defined(__linux__)
     if (positional && flags)

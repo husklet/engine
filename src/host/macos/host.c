@@ -1920,6 +1920,18 @@ static hl_host_result hl_macos_file_vector(void *context, hl_host_handle file, c
         native[index].iov_base = (void *)(uintptr_t)vectors[index].address;
         native[index].iov_len = (size_t)vectors[index].size;
     }
+    /*
+     * An empty vector transfers nothing and succeeds on Linux, but Darwin's readv/writev family
+     * rejects iovcnt 0 outright with EINVAL. Present one zero-length segment instead of zero
+     * segments so the descriptor's access-mode check still runs and the caller observes the Linux
+     * result. The Linux backend needs no such adjustment.
+     */
+    if (count == 0) {
+        static char empty_segment;
+        native[0].iov_base = &empty_segment;
+        native[0].iov_len = 0;
+        count = 1;
+    }
     switch (operation) {
     case 0: transferred = readv(descriptor, native, (int)count); break;
     case 1: transferred = writev(descriptor, native, (int)count); break;
