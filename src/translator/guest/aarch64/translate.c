@@ -1283,9 +1283,25 @@ static int context_clone_candidate(uint64_t target, const uint64_t ancestors[], 
     for (int i = 0; i < depth; i++) anc[i] = ancestors[i];
     anc[depth] = target;
     int total = 0;
+    /*
+     * A candidate is decoded sequentially inside one VM region.  Query that
+     * containing region once instead of asking the host kernel about the same
+     * page before every instruction (mach_vm_region is especially costly).
+     * Retain the old boundary behavior by rejecting an instruction whose last
+     * byte is outside the containing readable region.
+     */
+    hl_host_region region;
+    if (!hl_host_region_query((uintptr_t)target, &region) ||
+        target < region.address || !(region.protection & HL_HOST_REGION_READ))
+        return 0;
+    uint64_t region_offset = target - region.address;
+    if (region_offset >= region.size) return 0;
+    uint64_t remaining = region.size - region_offset;
     for (int i = 0; i < CTX_INLINE_INSNS; i++) {
-        uint64_t pc = target + (uint64_t)i * 4;
-        if (!hl_host_range_mapped((uintptr_t)pc, 4)) return 0;
+        uint64_t offset = (uint64_t)i * 4;
+        if (offset > remaining || remaining - offset < 4 || offset > UINT64_MAX - target)
+            return 0;
+        uint64_t pc = target + offset;
         uint32_t in = *(uint32_t *)pc;
         total++;
         if ((in & 31u) == 30u &&
