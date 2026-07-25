@@ -365,7 +365,33 @@ set(HL_ENGINE_X86_64  ${HL_MATRIX_ENGINE_DIR}/hl-engine-linux-x86_64)
 #   Adds `compat.<label>` running the whole suite through matrix-runner, with
 #   LABELS <label> so `ctest -L compat-ipc` selects exactly that suite.
 function(hl_compat_suite label bindir suitedir)
-  cmake_parse_arguments(C "SERIAL" "" "LOCKS;ARGS" ${ARGN})
+  cmake_parse_arguments(C "SERIAL" "" "LOCKS;ARGS;FIXTURE_DIRS" ${ARGN})
+  if(NOT C_FIXTURE_DIRS)
+    set(C_FIXTURE_DIRS "${bindir}")
+  endif()
+
+  # A shard must be able to build only the guest corpus it executes. CTest
+  # does not build test dependencies, and the global guest-fixtures target is
+  # intentionally an ALL target for full builds, so expose an explicit narrow
+  # target for every suite label.
+  get_property(_guest_outputs GLOBAL PROPERTY HL_GUEST_ALL_OUTPUTS)
+  set(_suite_outputs "")
+  foreach(_output IN LISTS _guest_outputs)
+    foreach(_fixture_dir IN LISTS C_FIXTURE_DIRS)
+      string(FIND "${_output}" "${_fixture_dir}/" _prefix)
+      if(_prefix EQUAL 0)
+        list(APPEND _suite_outputs "${_output}")
+        break()
+      endif()
+    endforeach()
+  endforeach()
+  list(REMOVE_DUPLICATES _suite_outputs)
+  if(NOT _suite_outputs)
+    message(FATAL_ERROR
+      "compat-${label}-fixtures: no guest outputs under ${C_FIXTURE_DIRS}")
+  endif()
+  add_custom_target(compat-${label}-fixtures DEPENDS ${_suite_outputs})
+
   add_test(NAME compat.${label}
     COMMAND $<TARGET_FILE:matrix-runner> ${HL_MATRIX_BRIDGE}
             ${HL_ENGINE_AARCH64} ${bindir}/aarch64
@@ -401,8 +427,10 @@ hl_compat_suite(core-abi     ${HL_COMPAT}/core/abi     tests/compat/core/abi)
 hl_compat_suite(core-syscall ${HL_COMPAT}/core/syscall tests/compat/core/syscall)
 hl_compat_suite(core-regress ${HL_COMPAT}/core/regress tests/compat/core/regress)
 hl_compat_suite(core-workload ${HL_COMPAT}/core/workload tests/compat/core/workload)
-hl_compat_suite(isa-x86-64   ${HL_COMPAT}/isa          tests/compat/isa/x86_64)
-hl_compat_suite(isa-aarch64  ${HL_COMPAT}/isa          tests/compat/isa/aarch64)
+hl_compat_suite(isa-x86-64   ${HL_COMPAT}/isa          tests/compat/isa/x86_64
+                FIXTURE_DIRS ${HL_COMPAT}/isa/x86_64)
+hl_compat_suite(isa-aarch64  ${HL_COMPAT}/isa          tests/compat/isa/aarch64
+                FIXTURE_DIRS ${HL_COMPAT}/isa/aarch64)
 
 # --- suites with real, non-obvious concurrency constraints ------------------
 # The Makefile expresses these as prose + .NOTPARALLEL; CTest can express them
