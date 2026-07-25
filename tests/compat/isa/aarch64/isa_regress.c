@@ -154,6 +154,23 @@ static void report(const char *tag, uint64_t old, uint64_t status, uint64_t mem)
            (unsigned long long)status, (unsigned long long)mem);
 }
 
+/* BLR reads its target before writing the link register. This matters specifically
+ * for `blr x30`: stealing guest x30 must not turn the newly written return address
+ * into the branch target. */
+static __attribute__((noinline)) uint64_t blr_x30(void) {
+    uint64_t value;
+    __asm__ volatile("adr x30, 1f\n\t"
+                     "blr x30\n\t"
+                     "b 2f\n\t"
+                     "1: mov %[value], #0x30\n\t"
+                     "ret\n\t"
+                     "2:\n\t"
+                     : [value] "=r"(value)
+                     :
+                     : "x30");
+    return value;
+}
+
 int main(void) {
     uint64_t st, old;
 
@@ -191,5 +208,6 @@ int main(void) {
            (unsigned long long)hi, (unsigned long long)g_pair[0], (unsigned long long)g_pair[1]);
     printf("after-caspa  atomic_old=%016llx atomic_now=%016llx plain=%016llx\n", (unsigned long long)ao,
            (unsigned long long)g_after_atomic, (unsigned long long)pv);
+    printf("blr-x30      value=%016llx\n", (unsigned long long)blr_x30());
     return 0;
 }

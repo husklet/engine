@@ -1,6 +1,6 @@
 // translator/guest/aarch64 -- guest CPU state. The cpu struct is the guest register file +
 // engine scratch (shadow stack for §B return prediction, mangle scratch). Offsets are baked into
-// emitted code. x18/x28 are STOLEN by the engine (x28=cpu ptr, x18 is platform-reserved);
+// emitted code. x18/x28/x30 are STOLEN by the engine (x28=cpu ptr, x30=host link, x18=scratch);
 // guest values live in cpu->x[]. See docs/OPTIMIZATIONS.md.
 
 // ---------------- guest CPU state ----------------
@@ -193,11 +193,11 @@ static int guestbase_on(void) {
 
 // A1: x16/x17 engine-private (IBTC scratch); guest x16/x17 mangled like x18 so they never live in
 // the host reg -> the per-indirect-branch red-zone stash/restore of x16/x17 disappears.
-// x18 platform-reserved, x28=cpu. Guest x30 remains live in host x30 while shadow-RAS is disabled.
+// x18 volatile, x28=cpu, x30=host link (§B). NOSTEAL1617=1 reverts to the 3-reg stolen set at startup.
 static int g_steal1617 = 1;
 
 static int is_stolen(int r) {
-    return r == 18 || r == 28 || (g_steal1617 && (r == 16 || r == 17));
+    return r == 18 || r == 28 || r == 30 || (g_steal1617 && (r == 16 || r == 17));
 }
 
 #define R_BRANCH 0

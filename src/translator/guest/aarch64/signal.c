@@ -132,7 +132,7 @@ void hl_aarch64_signal_restore(struct cpu *c) {
 
 // Synchronous-fault delivery support (driven by os/linux/signal.c's deliver_guest_fault). In a translated
 // aarch64 block all NON-stolen guest GPRs live in the matching host x-register, and the guest SP/flags/V
-// state is the live host SP/NZCV/V state; the engine-stolen regs (x16/x17/x18/x28) are kept in cpu->x[]
+// state is the live host SP/NZCV/V state; the engine-stolen regs (x16/x17/x18/x28/x30) are kept in cpu->x[]
 // at every instruction boundary. So reconstruct the guest state by copying the host fault context back into
 // cpu, leaving the stolen regs untouched. block_return (jit/dispatch.c, included later) unwinds a block back
 // to the dispatcher: it restores the host callee-saved state run_block saved at block entry and returns to

@@ -347,6 +347,13 @@ static void emit_mangled_x18(uint32_t in, int mask) {
         } else if ((in & 0x1F800000u) == 0x13800000u) {
             read_mask = mask & (2 | 4); // EXTR
             write_mask = mask & 1;
+        } else if ((in & 0x1F800000u) == 0x13000000u) {
+            // SBFM/UBFM read Rn and overwrite Rd. BFM merges selected bits
+            // into the old Rd value, so it reads Rd as well as writing it.
+            read_mask = mask & 2;
+            if (((in >> 29) & 3) == 1)
+                read_mask |= mask & 1;
+            write_mask = mask & 1;
         } else {
             read_mask = mask & 2;
             write_mask = mask & 1;
@@ -1112,7 +1119,15 @@ static void emit_prof_bump(void *ctr) {
 // untouched -- its value lives only in cpu->x[16] under the steal. NOIBSLIM=1 restores the exact
 // legacy sequence for A/B.
 static void emit_set_x30(uint64_t val) {
-    e_movconst(30, val);
+    if (g_steal1617 && !g_noibslim) {
+        e_movconst(16, val);
+        e_str(16, CPUREG, 30 * 8);
+        return;
+    }
+    e_str(0, CPUREG, (int)OFF_MSCRATCH);
+    e_movconst(0, val);
+    e_str(0, CPUREG, 30 * 8);
+    e_ldr(0, CPUREG, (int)OFF_MSCRATCH);
 }
 
 // §B shadow push: cpu->x[30] = gpc+4; sstk[ssp&1023] = (gpc+4, &Lcont); ssp++. x0..x2 spilled to
@@ -1836,68 +1851,12 @@ static int seen_has(const uint64_t *seen, int n, uint64_t v) {
     return 0;
 }
 
-#define COND_DEFER_MAX 64
-static struct {
-    uint32_t *patch;
-    uint32_t orig;
-    uint64_t target;
-    uint64_t source_gpc;
-    int fwd;
-} g_cond_defer[COND_DEFER_MAX];
-static int g_cond_defer_n;
-
-static void cond_defer_reset(void) { g_cond_defer_n = 0; }
-static void cond_defer_finish(void) {
-    for (int i = 0; i < g_cond_defer_n; i++) {
-        uint8_t *stub = g_cp;
-        *g_cond_defer[i].patch =
-            recode_cond(g_cond_defer[i].orig,
-                        (stub - (uint8_t *)g_cond_defer[i].patch) / 4);
-        emit_chain_exit_from(g_cond_defer[i].target,
-                             g_cond_defer[i].source_gpc);
-        void *body = map_body(g_cond_defer[i].target);
-        if (body) {
-            uint8_t *entry = (uint8_t *)body +
-                             (g_cond_defer[i].fwd ? g_fwdskip : 0);
-            int64_t d = (entry - (uint8_t *)g_cond_defer[i].patch) / 4;
-            int tb = (g_cond_defer[i].orig & 0x7e000000u) == 0x36000000u;
-            int64_t lo = tb ? -(INT64_C(1) << 13) : -(INT64_C(1) << 18);
-            int64_t hi = tb ? ((INT64_C(1) << 13) - 1) : ((INT64_C(1) << 18) - 1);
-            if (d >= lo && d <= hi) {
-                *g_cond_defer[i].patch =
-                    recode_cond(g_cond_defer[i].orig, d);
-            }
-        } else {
-            add_pend_cond(g_cond_defer[i].patch,
-                          g_cond_defer[i].target,
-                          g_cond_defer[i].orig,
-                          g_cond_defer[i].source_gpc,
-                          g_cond_defer[i].fwd);
-        }
-    }
-}
-
 // Lay a conditional's fall-through inline: `inv` is the branch insn with its condition/op
 // already inverted, so when the guest would NOT take it we keep falling through. Emit the
 // inverted branch (skips the taken-side exit), the taken chain-exit, then patch the branch to
 // jump just past it. The patched offset is always tiny (the taken exit is ~1 insn if chained,
 // ~30 if it spills) -> in range even for tbz/tbnz's 14-bit field.
 static void stitch_cond(uint32_t inv, uint64_t taken) {
-    if (g_cond_defer_n < COND_DEFER_MAX) {
-        uint32_t orig = inv;
-        if ((orig & 0xff000010u) == 0x54000000u)
-            orig ^= 1u;
-        else
-            orig ^= 1u << 24;
-        int n = g_cond_defer_n++;
-        g_cond_defer[n].patch = (uint32_t *)g_cp;
-        g_cond_defer[n].orig = orig;
-        g_cond_defer[n].target = taken;
-        g_cond_defer[n].source_gpc = g_emit_gpc;
-        g_cond_defer[n].fwd = g_fwdskip && taken > g_emit_gpc;
-        emit32(0);
-        return;
-    }
     uint32_t *patch = (uint32_t *)g_cp;
     emit32(0);
     emit_chain_exit(taken);
@@ -2439,7 +2398,6 @@ static void *translate_block(uint64_t gpc) {
     // gpc is mutated by the decode loop; key the cache by START
     uint64_t start = gpc;
     chain_exit_dedup_reset();
-    cond_defer_reset();
     uint64_t guest_start = gpc;
     uint64_t guest_end = gpc + 4;
     uint64_t tail_carry_ldp = scan_tail_x30_carry(gpc);
@@ -2854,9 +2812,14 @@ no_bl_plt_fuse:
             // for non-PIE; the dispatcher re-biases on the ret. pcrel_base is identity for PIE.
             int blrn = (in >> 5) & 31;
             if (blrn == 30) {
-                e_movr(16, 30);
+                // BLR x30 reads the old guest x30 as its target, then writes
+                // the return address to x30. Preserve that ordering now that
+                // guest x30 is resident in cpu->x[30].
+                // emit_set_x30 uses x16 as its store scratch, so keep the
+                // branch target in the other engine-private IP register.
+                e_ldr(17, CPUREG, 30 * 8);
                 emit_set_x30(pcrel_base(gpc) + 4);
-                emit_ibranch(16);
+                emit_ibranch_ip2_ready(17, 1);
             } else {
                 emit_set_x30(pcrel_base(gpc) + 4);
                 emit_ibranch(blrn);
@@ -3488,7 +3451,6 @@ no_adrp_plt_fuse:
         *defer[i].patch = recode_cond(defer[i].in, d);
         emit_chain_exit(defer[i].target);
     }
-    cond_defer_finish();
     chain_exit_dedup_finish();
     // IRQSLIM: the out-of-line poll exit stub the body-entry cbnz targets (irq set -> exit to
     // the dispatcher at the block start, exactly like the legacy inline poll).

@@ -160,7 +160,8 @@ static void emit_exit_reg(int rn, uint64_t reason) {
 // monomorphic hit collapses to 5 instrs / 0 mem-ops:
 //   ldr x16,Lsite_tgt ; sub x16,x16,xT ; cbnz x16,Lhash ; ldr x16,Lsite_body ; br x16  (-> body)
 // The shared-hash miss tail uses x16/x17 freely (no guest values to preserve). For an indirect branch
-// A branch through stolen x16/x17 uses the compact two-IP probe below. Guest x30 remains live in host x30.
+// A branch through stolen x16/x17 uses the compact two-IP probe below. Guest x30 stays in cpu->x[30]
+// because host calls and returns use architectural x30 as their link register.
 
 static void emit_ibranch_ip2_ready(int rn, int ready) {
     int other = rn == 16 ? 17 : 16;
@@ -174,9 +175,12 @@ static void emit_ibranch_ip2_ready(int rn, int ready) {
     uint32_t *p_bhit = (uint32_t *)g_cp;
     emit32(0xD503201Fu);
     uint32_t *miss = (uint32_t *)g_cp;
+    if (ready) e_str(rn, CPUREG, OFF_PC);
     emit_spill();
-    e_ldr(9, CPUREG, rn * 8);
-    e_str(9, CPUREG, OFF_PC);
+    if (!ready) {
+        e_ldr(9, CPUREG, rn * 8);
+        e_str(9, CPUREG, OFF_PC);
+    }
     e_movconst(9, R_BRANCH);
     e_str(9, CPUREG, OFF_RSN);
     uint32_t *p_adr = (uint32_t *)g_cp;
@@ -210,6 +214,10 @@ static void emit_ibranch_steal(int rn) {
         return;
     }
     int treg = rn;
+    if (rn == 30) {
+        e_ldr(30, CPUREG, 30 * 8);
+        treg = 30;
+    }
     // --- per-site monomorphic cache ---
     uint32_t *p_ldrt = (uint32_t *)g_cp;
     // ldr x16, Lsite_tgt
