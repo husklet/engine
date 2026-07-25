@@ -663,10 +663,29 @@ static int64_t a64_fold_mem_offset(uint32_t in, int wb) {
     return 0; /* register-offset already materialized; atomics use [Xn] */
 }
 
-/* BUS-active generations instrument a native copied memory instruction before
-   it is emitted.  The exact guest EA is already materialized in `ea`; spill the
-   complete architectural file, query the generic core seam, and either return
-   to the dispatcher as R_BUS or reload byte-for-byte state and continue. */
+/*
+ * Every BUS-active memory site retains its compact force/page-filter fast
+ * path, but all sites in a translated block share one cold spill/query/reload
+ * stub. Large runtimes can keep BUS tracking active for their entire lifetime;
+ * duplicating that cold path at every memory operation needlessly exhausts the
+ * code cache even though almost every filter probe misses.
+ */
+#define BUS_STUB_PATCH_MAX 65536
+static uint32_t *g_bus_stub_patches[BUS_STUB_PATCH_MAX];
+static uint32_t g_bus_stub_patch_count;
+
+static void patch_adr(uint32_t *instruction, uint8_t *target, unsigned reg) {
+    int64_t displacement = target - (uint8_t *)instruction;
+    if (displacement < -(INT64_C(1) << 20) || displacement >= (INT64_C(1) << 20)) {
+        static const char message[] = "BUS metadata address out of range";
+        (void)jit_fail(HL_STATUS_OUT_OF_MEMORY, message, sizeof message - 1u);
+        _exit(70);
+    }
+    uint64_t immediate = (uint64_t)displacement & UINT64_C(0x1fffff);
+    *instruction = 0x10000000u | (uint32_t)((immediate & 3u) << 29) |
+                   (uint32_t)(((immediate >> 2) & 0x7ffffu) << 5) | reg;
+}
+
 static void emit_a64_bus_guard_saved(uint64_t bytes, uint64_t pc) {
     /* x16 carries the state loaded by the caller. */
     uint32_t *force_slow = (uint32_t *)g_cp;
@@ -688,15 +707,58 @@ static void emit_a64_bus_guard_saved(uint64_t bytes, uint64_t pc) {
     uint8_t *slow = g_cp;
     *force_slow = 0x37000000u | (1u << 19) |
                   (((uint32_t)((slow - (uint8_t *)force_slow) / 4) & 0x3FFFu) << 5) | 16u;
+    /*
+     * Carry only engine-reserved registers into the shared stub. emit_spill()
+     * deliberately preserves x16/x17, so an asynchronous signal cannot
+     * overwrite site metadata in per-thread mutable scratch.
+     */
+    e_ldr(16, CPUREG, OFF_BUS_EA);
+    uint32_t *metadata_address = (uint32_t *)g_cp;
+    emit32(0); /* adr x17,immutable_site_metadata */
+    if (g_bus_stub_patch_count >= BUS_STUB_PATCH_MAX) {
+        static const char message[] = "too many BUS guards in one translated block";
+        (void)jit_fail(HL_STATUS_OUT_OF_MEMORY, message, sizeof message - 1u);
+        _exit(70);
+    }
+    g_bus_stub_patches[g_bus_stub_patch_count++] = (uint32_t *)g_cp;
+    emit32(0); /* b shared_bus_stub */
+    uint8_t *metadata = g_cp;
+    patch_adr(metadata_address, metadata, 17);
+    memcpy(g_cp, &bytes, sizeof(bytes));
+    g_cp += sizeof(bytes);
+    memcpy(g_cp, &pc, sizeof(pc));
+    g_cp += sizeof(pc);
+    uint8_t *resume_slot = g_cp;
+    g_cp += sizeof(uint64_t);
+    uint8_t *resume_fast = g_cp;
+    uint64_t resume_rx = (uint64_t)J_RX(resume_fast);
+    memcpy(resume_slot, &resume_rx, sizeof(resume_rx));
+    *filter_miss = 0x36000000u |
+                   (((uint32_t)((resume_fast - (uint8_t *)filter_miss) / 4) & 0x3FFFu) << 5) | 16u;
+}
+
+static void emit_a64_bus_stub(void) {
+    if (!g_bus_stub_patch_count) return;
+    uint8_t *stub = g_cp;
+    for (uint32_t i = 0; i < g_bus_stub_patch_count; i++) {
+        int64_t displacement = (stub - (uint8_t *)g_bus_stub_patches[i]) / 4;
+        if (displacement < -(INT64_C(1) << 25) || displacement >= (INT64_C(1) << 25)) {
+            static const char message[] = "BUS stub branch out of range";
+            (void)jit_fail(HL_STATUS_OUT_OF_MEMORY, message, sizeof message - 1u);
+            _exit(70);
+        }
+        *g_bus_stub_patches[i] = 0x14000000u | ((uint32_t)displacement & 0x03ffffffu);
+    }
     emit_spill();
-    e_ldr(0, CPUREG, OFF_BUS_EA);
-    e_movconst(1, bytes);
+    e_movr(19, 17); /* callee-saved immutable metadata pointer across query */
+    e_movr(0, 16);
+    e_ldr(1, 19, 0);
     emit_busfaultptr(16);
     emit32(0xD63F0000u | (16u << 5)); /* blr x16 */
     uint32_t *clear = (uint32_t *)g_cp;
-    emit32(0); /* cbz x0, clear */
-    e_str(0, CPUREG, OFF_FAULT_ADDR); /* exact first invalid byte */
-    e_movconst(9, pc);
+    emit32(0); /* cbz x0,clear */
+    e_str(0, CPUREG, OFF_FAULT_ADDR);
+    e_ldr(9, 19, 8);
     e_str(9, CPUREG, OFF_PC);
     e_movconst(9, R_BUS);
     e_str(9, CPUREG, OFF_RSN);
@@ -704,7 +766,8 @@ static void emit_a64_bus_guard_saved(uint64_t bytes, uint64_t pc) {
     emit_blockret(9);
     e_br(9);
     uint8_t *resume = g_cp;
-    *clear = 0xB4000000u | (((uint32_t)((resume - (uint8_t *)clear) / 4) & 0x7FFFFu) << 5);
+    *clear = 0xB4000000u | (((uint32_t)((resume - (uint8_t *)clear) / 4) & 0x7ffffu) << 5);
+    e_ldr(16, 19, 16);
     e_ldr(9, CPUREG, OFF_SP);
     e_mov_sp_from(9);
     e_ldr(9, CPUREG, OFF_NZCV);
@@ -713,9 +776,7 @@ static void emit_a64_bus_guard_saved(uint64_t bytes, uint64_t pc) {
     for (int r = 1; r <= 30; r++)
         if (!is_stolen(r)) e_ldr(r, CPUREG, r * 8);
     e_ldr(0, CPUREG, 0);
-    uint8_t *resume_fast = g_cp;
-    *filter_miss = 0x36000000u |
-                   (((uint32_t)((resume_fast - (uint8_t *)filter_miss) / 4) & 0x3FFFu) << 5) | 16u;
+    e_br(16);
 }
 
 static void emit_a64_bus_guard(int ea, uint64_t bytes, uint64_t pc) {
@@ -2414,6 +2475,7 @@ static void *translate_block(uint64_t gpc) {
     // gpc is mutated by the decode loop; key the cache by START
     uint64_t start = gpc;
     chain_exit_dedup_reset();
+    g_bus_stub_patch_count = 0;
     uint64_t guest_start = gpc;
     uint64_t guest_end = gpc + 4;
     uint64_t tail_carry_ldp = scan_tail_x30_carry(gpc);
@@ -2491,7 +2553,9 @@ static void *translate_block(uint64_t gpc) {
         // size so the dispatcher's CACHE_EMIT_HEADROOM admission guarantee remains true.  Splitting at an
         // arbitrary instruction boundary is equivalent to an ordinary chain exit; exclusive sequences are
         // exempt because an injected dispatcher edge would clear the architectural monitor.
-        if (!in_excl && (size_t)(g_cp - (uint8_t *)host) >= CACHE_EMIT_HEADROOM / 2) {
+        if (!in_excl &&
+            ((size_t)(g_cp - (uint8_t *)host) >= CACHE_EMIT_HEADROOM / 2 ||
+             g_bus_stub_patch_count >= BUS_STUB_PATCH_MAX - 4)) {
             emit_chain_exit(gpc);
             break;
         }
@@ -3502,6 +3566,7 @@ no_adrp_plt_fuse:
             for (size_t off = 0; off < exit_bytes; off += 4)
                 emit32(0xD503201Fu);
     }
+    emit_a64_bus_stub();
     // Only the REGION HEAD (start) is registered; intermediate inlined block-starts are left
     // unregistered so a later mid-region entry self-heals via re-translate + back-patch.
     // W4E tier-2: the promoter (g_tier2_build) recompiles in place and updates the EXISTING map entry
