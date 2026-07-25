@@ -49,7 +49,7 @@ else
 	nm --print-armap "$archive" >"$scratch/armap"
 	grep -q '^Archive index:' "$scratch/armap"
 	nm -g --defined-only "$archive" >"$symbols"
-	: "${AARCH64_LINUX_CC:=aarch64-unknown-linux-gnu-cc}"
+	: "${AARCH64_LINUX_CC:=aarch64-linux-gnu-gcc}"
 	linker=("$AARCH64_LINUX_CC" -D_GNU_SOURCE -Iinclude -o "$scratch/link-test"
 		tools/dual_backend_e2e_runner.c -Wl,--whole-archive "$archive"
 		-Wl,--no-whole-archive -pthread -ldl -lm -latomic)
