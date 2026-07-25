@@ -2009,6 +2009,9 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                         continue;
                     }
                     G_RET(c) = (uint64_t)(int64_t)pout;
+                    if (lcmd == 5 && pout == 0 &&
+                        guest_copy_to(a2, lf, sizeof(lf)) != (ssize_t)sizeof(lf))
+                        G_RET(c) = (uint64_t)(-EFAULT);
                     break;
                 }
                 if (claimed) break; // handled in-engine (or interrupted); done
