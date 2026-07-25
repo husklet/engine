@@ -1700,11 +1700,17 @@ static long futex_lock_pi(struct cpu *c, int *uaddr, const void *key, int tryloc
         uint32_t owner = v & HL_FUTEX_TID_MASK;
         if (owner == 0) { // free (owner slot 0; FUTEX_OWNER_DIED may still be set on a robust mutex)
             int others = fbk_parked(b, futex_key(key)) - (parked ? 1 : 0); // waiters left behind
-            int nv = (int)((uint32_t)mytid | (others > 0 ? HL_FUTEX_WAITERS : 0));
+            int nv = (int)((uint32_t)mytid | (v & HL_FUTEX_OWNER_DIED) |
+                           (others > 0 ? HL_FUTEX_WAITERS : 0));
             // Acquire atomically vs a racing userspace fast-path locker (cmpxchg 0->tid): if the word moved
             // underfoot, retry from the re-read instead of clobbering the new owner (double-ownership bug).
             if (!__atomic_compare_exchange_n(uaddr, &expect, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) continue;
-            ret = (v & HL_FUTEX_OWNER_DIED) ? -EOWNERDEAD : 0;
+            /*
+             * PI owner death is reported in the futex word, not as a negative
+             * FUTEX_LOCK_PI syscall result. glibc consumes OWNER_DIED after a
+             * successful syscall and turns it into pthread EOWNERDEAD.
+             */
+            ret = 0;
             break;
         }
         if (owner == (uint32_t)mytid) {
