@@ -1488,49 +1488,17 @@ static int host_range_mapped(uintptr_t a, size_t len) {
     return ok;
 }
 
-/* Prove that every guest-page fragment in a range accepts stores without
-   changing its contents.  A Darwin file mapping can be readable while writes
-   to its EOF tail raise SIGBUS; VM-region protection alone cannot detect that
-   state.  The same guarded fault window used by host_range_mapped keeps this
-   suitable for reconciling Linux MAP_FIXED sub-host-page mappings. */
+/* Prove that every guest-page fragment in a range accepts stores without ever
+   storing into guest memory. Guest mappings and their read-only/PROT_NONE/EOF
+   intervals are tracked when they are created or protected; the guarded READ
+   probe catches unmapped and Darwin file-tail SIGBUS bytes. */
 static int host_range_writable(uintptr_t a, size_t len) {
     if (!len) return 1;
     uintptr_t end = a + len;
     if (end < a || gna_hit((uint64_t)a, (uint64_t)len) || gro_hit((uint64_t)a, (uint64_t)len) ||
         hl_linux_bus_hit((uint64_t)a, (uint64_t)len))
         return 0;
-    uintptr_t lo = a & ~(uintptr_t)0xfff;
-    volatile int ok = 1;
-    if (sigsetjmp(g_hrm_jb, 0)) {
-        ok = 0;
-    } else {
-        g_hrm_lo = lo;
-        g_hrm_hi = end;
-        for (uintptr_t p = lo; p < end; p += 0x1000) {
-            uintptr_t begin = p < a ? a : p;
-            uint8_t *first = (uint8_t *)begin;
-            uint8_t value = __atomic_load_n(first, __ATOMIC_RELAXED);
-            /*
-             * This is a write-intent fault probe, not a mutation.  A plain
-             * load followed by a same-byte store can resurrect the stale
-             * byte over a concurrent guest atomic update (PI futex owner
-             * words exposed this as 0x3ec -> 0x300).  A same-value CAS still
-             * faults on a non-writable mapping, but can only store if the
-             * byte has not changed since our load.
-             */
-            (void)__atomic_compare_exchange_n(first, &value, value, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
-            uintptr_t q = p + 0xfff;
-            if (q >= end) q = end - 1;
-            if (q != begin) {
-                uint8_t *last = (uint8_t *)q;
-                value = __atomic_load_n(last, __ATOMIC_RELAXED);
-                (void)__atomic_compare_exchange_n(last, &value, value, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
-            }
-        }
-    }
-    g_hrm_lo = 0;
-    g_hrm_hi = 0;
-    return ok;
+    return host_range_mapped(a, len);
 }
 
 static void abs_from_rel(struct timespec *abs, const struct timespec *ts) {

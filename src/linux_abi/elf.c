@@ -845,7 +845,13 @@ static void load_elf(const char *path, struct loaded *out) {
         uint64_t s = (v + bias) & ~0xFFFull, e = (v + bias + msz + 0xFFFull) & ~0xFFFull;
         uint32_t protection = HL_HOST_MEMORY_READ | ((fl & 2) ? HL_HOST_MEMORY_WRITE : 0) |
                               ((fl & 1) ? HL_HOST_MEMORY_EXECUTE : 0);
-        if (e > s) elf_mprotect_besteffort(&image_mapping, (void *)s, e - s, protection, "image segment");
+        if (e > s) {
+            elf_mprotect_besteffort(&image_mapping, (void *)s, e - s, protection, "image segment");
+            if (fl & 2)
+                gro_clear(s, e);
+            else
+                gro_add(s, e);
+        }
     }
     // for a non-PIE ET_EXEC the engine maps the image HIGH (+bias) but keeps every GUEST-VISIBLE
     // address at its LOW link value (baked absolute pointers, un-biased `bl` return vaddrs, the dispatcher

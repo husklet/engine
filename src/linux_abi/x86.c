@@ -395,6 +395,15 @@ static void load_elf(const char *path, struct loaded *out) {
         if (rd32(ph) != 1) continue;
         uint64_t off = rd64(ph + 8), v = rd64(ph + 16), fsz = rd64(ph + 32);
         memcpy((void *)(v + bias), f + off, fsz);
+        uint64_t msz = rd64(ph + 40);
+        uint64_t lo = (v + bias) & ~0xfffull;
+        uint64_t hi = (v + bias + msz + 0xfffull) & ~0xfffull;
+        if (hi > lo) {
+            if (rd32(ph + 4) & 2)
+                gro_clear(lo, hi);
+            else
+                gro_add(lo, hi);
+        }
     }
     // W6A item 1: for a biased non-PIE Go image, rebase firstmoduledata so the runtime's findfunc()
     // resolves the biased code PCs (otherwise runtime.pcdatavalue nil-derefs). Gated on g_nonpie_lo
