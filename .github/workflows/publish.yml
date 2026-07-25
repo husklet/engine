@@ -2,7 +2,7 @@ name: Publish
 
 on:
   push:
-    tags: ["v*.*.*"]
+    tags: ["v*.*.*", "verify-v*.*.*"]
   workflow_dispatch:
     inputs:
       version:
@@ -44,7 +44,8 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' pkgs/rust/Cargo.toml | head -1)
           if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-            requested=${GITHUB_REF_NAME#v}
+            requested=${GITHUB_REF_NAME#verify-}
+            requested=${requested#v}
           else
             requested='${{ inputs.version }}'
           fi
@@ -65,7 +66,7 @@ jobs:
       # Upload retries only transient registry failures. The test jobs and both
       # release-specific archive gates above must all pass before this can run.
       - name: Build and publish Rust crate
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && !startsWith(github.ref_name, 'verify-v') }}
         timeout-minutes: 40
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -79,6 +80,6 @@ jobs:
           done
 
       - name: Dry-run Rust crate publication
-        if: ${{ inputs.dry_run }}
+        if: ${{ inputs.dry_run || startsWith(github.ref_name, 'verify-v') }}
         timeout-minutes: 40
         run: nix develop --command cargo publish --dry-run --manifest-path pkgs/rust/Cargo.toml --locked
