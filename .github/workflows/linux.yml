@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: DeterminateSystems/nix-installer-action@v21
+      - uses: DeterminateSystems/nix-installer-action@v22
         with:
           # Disable the post-run install-diagnostic upload: it periodically hangs
           # for tens of minutes on the runner, stalling the whole job past its
@@ -216,7 +216,7 @@ jobs:
             targets: typed-memory typed-signals typed-threads
     steps:
       - uses: actions/checkout@v5
-      - uses: DeterminateSystems/nix-installer-action@v21
+      - uses: DeterminateSystems/nix-installer-action@v22
         with:
           diagnostic-endpoint: ""
       - uses: nix-community/cache-nix-action@v7

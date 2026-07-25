@@ -140,15 +140,21 @@ invariants)
 		exit 1
 	fi
 
+	if grep -Eq 'actions/checkout@v[1-4]([^0-9]|$)|nix-installer-action@v([1-9]|1[0-9]|2[01])([^0-9]|$)|nix-installer-action@main' \
+		"$wfdir"/*.yml; then
+		printf '%s\n' 'VIOLATION: I9 a workflow action still targets the Node 20 generation' >&2
+		exit 1
+	fi
+
 	for workflow in "$wfdir/linux.yml" "$wfdir/mac.yml"; do
 		if ! grep -Fq "cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}" \
 			"$workflow"; then
-			printf 'VIOLATION: I9 %s may cancel a main-branch verdict\n' "$workflow" >&2
+			printf 'VIOLATION: I10 %s may cancel a main-branch verdict\n' "$workflow" >&2
 			exit 1
 		fi
 		if ! grep -Fq "github.ref == 'refs/heads/main' && github.sha || github.ref" \
 			"$workflow"; then
-			printf 'VIOLATION: I10 %s supersedes queued main-branch verdicts\n' "$workflow" >&2
+			printf 'VIOLATION: I11 %s supersedes queued main-branch verdicts\n' "$workflow" >&2
 			exit 1
 		fi
 	done
@@ -159,7 +165,7 @@ invariants)
 		"$wfdir/linux.yml" | cut -d: -f1)
 	if [ -z "$full_line" ] || [ -z "$fresh_line" ] ||
 		[ "$fresh_line" -le "$full_line" ]; then
-		printf '%s\n' 'VIOLATION: I11 archive freshness masks the full integration gate' >&2
+		printf '%s\n' 'VIOLATION: I12 archive freshness masks the full integration gate' >&2
 		exit 1
 	fi
 	;;

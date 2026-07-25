@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
-      - uses: DeterminateSystems/nix-installer-action@v21
+      - uses: DeterminateSystems/nix-installer-action@v22
         with:
           # Disable the post-run install-diagnostic upload: it periodically hangs
           # for tens of minutes on the runner, stalling the whole job past its
@@ -174,7 +174,7 @@ jobs:
             targets: compat-isolation compat-posix compat-signals compat-soak compat-time
     steps:
       - uses: actions/checkout@v5
-      - uses: DeterminateSystems/nix-installer-action@v21
+      - uses: DeterminateSystems/nix-installer-action@v22
         with:
           # Disable the post-run install-diagnostic upload: it periodically hangs
           # for tens of minutes on the runner, stalling the whole job past its
