@@ -174,21 +174,16 @@ fn checkpoint_observability_and_debug_require_valid_bounded_policy() {
         hl_engine::spec::SpecErrorCategory::Invalid
     );
 
-    // x86_64 checkpoint is REFUSED, and the refusal is empirical rather than
-    // conservative. The image format is architecture independent and capture does
-    // succeed on x86_64, but restore brings the process back with its file
-    // descriptors pointing at the launcher's stdio instead of the captured ones:
-    // a guest that dup2'd fd 1 onto a file before capture writes to the console
-    // after restore, while registers and memory come back correctly. Until that is
-    // fixed the capability set advertises aarch64 only, and validation reads the
-    // capability set, so the two cannot disagree.
+    // x86_64 checkpoint is now ACCEPTED. The x86_64 fd-restore bug (a guest that
+    // dup2'd fd 1 onto a file wrote to the launcher's stdio after restore instead
+    // of the file) was fixed in the C backend: `x86_number()` now maps x86 dup2
+    // (33) onto canonical dup3 (24) so the shared fd-publish path registers a
+    // dup2'd descriptor and checkpoint captures it. Validation reads the
+    // capability set, which now advertises x86_64, so the launch is accepted.
     let mut value = MachineSpec::new(hl_engine::Guest::X86_64, "/bin/true");
     value.checkpoint.enabled = true;
     value.checkpoint.restore_directory = Some("/tmp/restore".into());
-    assert_eq!(
-        Engine::new().validate(&value).unwrap_err().category,
-        hl_engine::spec::SpecErrorCategory::Unsupported
-    );
+    Engine::new().validate(&value).unwrap();
 
     let mut value = spec();
     value.observability.trace = Some(TraceSpec {

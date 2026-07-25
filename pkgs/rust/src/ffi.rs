@@ -345,8 +345,13 @@ impl Drop for Trigger {
     }
 }
 
-/// Activation with either stdio or a terminal and any combination of activation channels.
-#[allow(clippy::too_many_arguments)]
+/// Activation with any combination of stdio streams OR a terminal size, a provider transport, a
+/// checkpoint broker and a trigger page — all forwarded together through the one combined C entry point.
+///
+/// Exactly one of `streams` / `size` describes the process I/O: pass `streams` for a plain (stdio)
+/// process, or `size` for a PTY. When `size` is set the engine returns the pty master, delivered here as
+/// the `Option<File>`. `transport`, `checkpoint` and `trigger` are each `-1` when not requested.
+#[allow(clippy::too_many_arguments)] // The one C entry that composes every activation channel.
 pub(crate) fn start_combined(
     executable: &std::ffi::CStr,
     guest: u32,
@@ -359,13 +364,15 @@ pub(crate) fn start_combined(
 ) -> Result<(Handle, Option<File>), i32> {
     let mut process = std::ptr::null_mut();
     let mut master = -1;
+    let size_ptr = size.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
+    let streams_ptr = streams.map_or(std::ptr::null(), std::ptr::from_ref);
     let status = unsafe {
         hl_activation_start_with_channels(
             executable.as_ptr(),
             guest,
             config.as_ptr(),
-            streams.map_or(std::ptr::null(), std::ptr::from_ref),
-            size.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+            streams_ptr,
+            size_ptr,
             transport,
             checkpoint,
             trigger,
@@ -376,11 +383,12 @@ pub(crate) fn start_combined(
     if status != 0 || process.is_null() {
         return Err(status);
     }
+    // The engine only fills the master when a terminal size was requested; a stdio process leaves it -1.
     let terminal = if size.is_some() {
         if master < 0 {
             return Err(status);
         }
-        // SAFETY: activation created this descriptor and transferred ownership to the caller.
+        // SAFETY: the descriptor was just created by the engine and is owned by this process.
         Some(unsafe { File::from_raw_fd(master) })
     } else {
         None

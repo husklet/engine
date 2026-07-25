@@ -114,6 +114,14 @@ where
         .map_err(|message| Error::Distribution(message.clone()))?;
     let config_path = CString::new(config.path().as_os_str().as_bytes())
         .map_err(|_| Error::InvalidConfig("config path contains NUL"))?;
+    // Compose rather than choose: gather whichever descriptors this launch requested — a provider
+    // transport, a checkpoint broker and its trigger — and hand them to the engine in ONE combined call
+    // alongside the process I/O (stdio or a PTY). Any subset may be present simultaneously.
+    //
+    // `_transport` keeps the provider-transport child socket alive across the activation call (its fd is
+    // duplicated into the engine via SCM_RIGHTS during the call). `_server` keeps the provider dispatch
+    // thread's join handle in scope for the whole function, exactly as `start_services` did: dropping the
+    // handle only detaches the thread, but keeping it named documents and preserves that lifetime.
     let (transport_socket, _server) = if let Some((services, authority)) = services {
         let (child, server) = prepare_services(services, &authority)?;
         (Some(child), Some(server))
