@@ -1487,8 +1487,8 @@ static int bound_fdsets_reference(uint64_t count, uint64_t read_set, uint64_t wr
             free(sets);
             return 1;
         }
-    free(sets);
     }
+    free(sets);
     return 0;
 }
 
