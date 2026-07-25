@@ -179,6 +179,7 @@ if(HL_BUILD_TESTS)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Gates.cmake)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase4Mac.cmake)
   endif()
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/LaneParity.cmake)
 endif()
 
 # --- Phase 4: install rules, pkg-config, packaging smoke tests -------------
