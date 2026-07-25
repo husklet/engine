@@ -6,7 +6,7 @@
   outputs = { self, nixpkgs }:
     let
       lib = nixpkgs.lib;
-      version = "0.1.28";
+      version = "0.1.30";
 
       systems = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
       forAllSystems = function:
