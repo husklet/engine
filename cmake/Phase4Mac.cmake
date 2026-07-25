@@ -89,6 +89,7 @@ foreach(_arch aarch64 x86_64)
                   SCENARIO ${_s})
   endforeach()
 endforeach()
+
 hl_mac_runner(pty-aarch64 tools/pty_binding_e2e_runner.c aarch64 NO_ISA)
 
 # --- mac dual-backend embedded archive -------------------------------------
@@ -374,3 +375,21 @@ foreach(_arch aarch64 x86_64)
   set_tests_properties(perf.mac-resource-${_arch} PROPERTIES
     LABELS "perf;perf-macos" RUN_SERIAL TRUE WORKING_DIRECTORY /tmp)
 endforeach()
+
+set(_HL_PERF_MAC_DEPS
+  perf-runner config-e2e-runner
+  hl-engine-linux-aarch64 hl-engine-linux-x86_64
+  ${_E2E}/guest-exit-aarch64 ${_E2E}/guest-exit-x86_64)
+foreach(_arch aarch64 x86_64)
+  list(APPEND _HL_PERF_MAC_DEPS
+    ${_MC}/core/workload/${_arch}/busyloop
+    ${_MC}/syscall/${_arch}/gettid
+    ${_MC}/process/${_arch}/forkstorm
+    ${_MP}/syscall-${_arch}
+    ${_MP}/translate-${_arch}
+    ${_MP}/resource-${_arch})
+  foreach(_op mmap file pipe event ipc-latency ipc-throughput)
+    list(APPEND _HL_PERF_MAC_DEPS ${_MP}/${_op}-${_arch})
+  endforeach()
+endforeach()
+add_custom_target(perf-macos-build DEPENDS ${_HL_PERF_MAC_DEPS})

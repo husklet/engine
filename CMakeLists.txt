@@ -193,5 +193,19 @@ if(HL_BUILD_TESTS AND HL_HAVE_GUEST_CC)
   include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/LaneParity.cmake)
 endif()
 
+# Preserve the Linux-to-macOS transport entry point.  The real Darwin build
+# and CTest registry remain authoritative; this target only drives them over
+# OrbStack's shared-checkout `mac` command.
+if(HL_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_custom_target(perf-macos-remote
+    COMMAND ${HL_BASH_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tools/run_remote_macos_ctest.sh
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/build-remote-macos
+            perf-macos
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    USES_TERMINAL)
+endif()
+
 # --- clang-format targets ---------------------------------------------------
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Format.cmake)
