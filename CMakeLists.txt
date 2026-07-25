@@ -130,6 +130,10 @@ set(LINUX_HOST_SOURCES
   src/host/linux/range.c src/host/linux/system.c src/host/clock.c src/host/file.c
   ${COMMON_HOST_SOURCES})
 
+set(MACOS_HOST_SOURCES
+  src/host/macos/directory.c src/host/macos/host.c src/host/macos/process.c
+  src/host/macos/range.c src/host/macos/system.c)
+
 # --- archives ---------------------------------------------------------------
 # CMake names a target `foo` as libfoo.a, matching the Makefile artifacts.
 # Each links the engine flag interface PRIVATE so the exact ENGINE_CFLAGS apply.
@@ -146,6 +150,11 @@ endforeach()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_library(hl-host-linux STATIC ${LINUX_HOST_SOURCES})
   target_link_libraries(hl-host-linux PRIVATE hl_engine_cflags)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  add_library(hl-host-macos STATIC
+    ${MACOS_HOST_SOURCES} ${COMMON_HOST_SOURCES}
+    src/host/clock.c src/host/file.c)
+  target_link_libraries(hl-host-macos PRIVATE hl_engine_cflags)
 endif()
 
 # --- Phase 2: Linux production engines + dual embedded activation archive ----

@@ -25,11 +25,10 @@
 # always agree here.
 # ---------------------------------------------------------------------------
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  return()
-endif()
-
 set(_HL_UNIT_DEFAULT_LIBS hl-engine hl-translator hl-linux-abi hl-host-fake)
+set(_HL_DARWIN_EXCLUDED_UNITS
+  directory directory_services eventfd_fork linux_fork native pipe_linux
+  private process range resolve_services system)
 
 # hl_unit(<name> [SOURCES extra.c ...] [LIBS <targets>] [DOUBLE]
 #         [FLAGS ...] [INCLUDES ...] [LINK ...] [NO_TEST])
@@ -39,6 +38,10 @@ set(_HL_UNIT_DEFAULT_LIBS hl-engine hl-translator hl-linux-abi hl-host-fake)
 function(hl_unit name)
   cmake_parse_arguments(U "NO_TEST;SINGLE;NO_LIBS" "BINARY;OUTNAME;SOURCE"
     "SOURCES;LIBS;FLAGS;INCLUDES;LINK" ${ARGN})
+  if(CMAKE_SYSTEM_NAME STREQUAL "Darwin"
+      AND name IN_LIST _HL_DARWIN_EXCLUDED_UNITS)
+    return()
+  endif()
   if(NOT U_BINARY)
     set(U_BINARY test_${name})
   endif()
@@ -74,8 +77,22 @@ function(hl_unit name)
     list(REMOVE_DUPLICATES U_LIBS)
     list(LENGTH U_LIBS _n)
     if(_n GREATER 1)
-      list(JOIN U_LIBS "," _grp)
-      target_link_libraries(${U_BINARY} PRIVATE "$<LINK_GROUP:RESCAN,${_grp}>")
+      if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        # Darwin's linker has no CMake RESCAN link-group feature. Match the
+        # Makefile's two archive passes literally and retain target build
+        # dependencies explicitly.
+        set(_archive_paths "")
+        foreach(_lib IN LISTS U_LIBS)
+          list(APPEND _archive_paths "$<TARGET_FILE:${_lib}>")
+          add_dependencies(${U_BINARY} ${_lib})
+        endforeach()
+        target_link_libraries(${U_BINARY} PRIVATE
+          ${_archive_paths} ${_archive_paths})
+      else()
+        list(JOIN U_LIBS "," _grp)
+        target_link_libraries(${U_BINARY} PRIVATE
+          "$<LINK_GROUP:RESCAN,${_grp}>")
+      endif()
     else()
       target_link_libraries(${U_BINARY} PRIVATE ${U_LIBS})
     endif()
@@ -98,12 +115,17 @@ function(hl_unit name)
     # working directory is part of the contract, not an implementation detail.
     set_tests_properties(unit.${name} PROPERTIES
       LABELS "unit" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_property(GLOBAL APPEND PROPERTY HL_UNIT_TARGETS ${U_BINARY})
   endif()
 endfunction()
 
 # --- explicit cases first (they replace the pattern rule) -------------------
 set(_abi   hl-linux-abi)
-set(_hostl hl-host-linux)
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  set(_hostl hl-host-macos)
+else()
+  set(_hostl hl-host-linux)
+endif()
 
 # Manifest-only firewall audit: deliberately links NO engine archive so a mac
 # gate build never pulls GNU archives into a Darwin executable (Makefile 566).
@@ -178,15 +200,19 @@ endforeach()
 
 # --- extra Linux-host binaries that `make unit` also builds/runs ------------
 # run-unit-linux + test-native-capacity (Makefile lines 2694-2700 / 615-620).
-hl_unit(linux BINARY tests_linux OUTNAME linux SOURCE tests/unit/linux.c
-        LIBS hl-engine ${_hostl} SINGLE LINK -pthread NO_TEST)
-add_test(NAME unit.linux COMMAND tests_linux)
-set_tests_properties(unit.linux PROPERTIES LABELS "unit" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  hl_unit(linux BINARY tests_linux OUTNAME linux SOURCE tests/unit/linux.c
+          LIBS hl-engine ${_hostl} SINGLE LINK -pthread NO_TEST)
+  add_test(NAME unit.linux COMMAND tests_linux)
+  set_tests_properties(unit.linux PROPERTIES LABELS "unit" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_property(GLOBAL APPEND PROPERTY HL_UNIT_TARGETS tests_linux)
 
-hl_unit(native_capacity BINARY native-capacity SOURCE tests/unit/test_native_capacity.c
-        LIBS hl-engine ${_hostl} SINGLE LINK -pthread NO_TEST)
-add_test(NAME unit.native-capacity COMMAND native-capacity)
-set_tests_properties(unit.native-capacity PROPERTIES LABELS "unit" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  hl_unit(native_capacity BINARY native-capacity SOURCE tests/unit/test_native_capacity.c
+          LIBS hl-engine ${_hostl} SINGLE LINK -pthread NO_TEST)
+  add_test(NAME unit.native-capacity COMMAND native-capacity)
+  set_tests_properties(unit.native-capacity PROPERTIES LABELS "unit" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_property(GLOBAL APPEND PROPERTY HL_UNIT_TARGETS native-capacity)
+endif()
 
 # Debug-logging variants: same TU with HL_ENABLE_LOGGING forced to 1.
 foreach(_d log fatal)
@@ -203,4 +229,8 @@ foreach(_d log fatal)
   hl_codesign(test-${_d}-debug)
   add_test(NAME unit.debug-${_d} COMMAND test-${_d}-debug)
   set_tests_properties(unit.debug-${_d} PROPERTIES LABELS "unit" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_property(GLOBAL APPEND PROPERTY HL_UNIT_TARGETS test-${_d}-debug)
 endforeach()
+
+get_property(_HL_UNIT_TARGETS GLOBAL PROPERTY HL_UNIT_TARGETS)
+add_custom_target(unit-tests DEPENDS ${_HL_UNIT_TARGETS})

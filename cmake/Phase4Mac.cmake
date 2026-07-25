@@ -25,14 +25,6 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   return()
 endif()
 
-# --- libhl-host-macos.a -----------------------------------------------------
-set(MACOS_HOST_SOURCES
-  src/host/macos/directory.c src/host/macos/host.c src/host/macos/process.c
-  src/host/macos/range.c src/host/macos/system.c)
-add_library(hl-host-macos STATIC
-  ${MACOS_HOST_SOURCES} ${COMMON_HOST_SOURCES} src/host/clock.c src/host/file.c)
-target_link_libraries(hl-host-macos PRIVATE hl_engine_cflags)
-
 set(HL_MAC_LIBS hl-engine hl-translator hl-linux-abi hl-host-macos)
 
 # --- production engines -----------------------------------------------------

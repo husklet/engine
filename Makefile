@@ -2788,9 +2788,9 @@ ifeq ($(HOST),macos)
 # (`make test-macos`), mirroring how Linux runs its compat suite outside the
 # build sandbox. Keeping them here would fail the package check on a sandboxed
 # runner for reasons unrelated to the code under test.
-unit: $(filter-out $(MAC_EXCLUDED_UNIT_TARGETS),$(UNIT_RUN_TARGETS)) check-ci-workflows
+unit: $(filter-out $(MAC_EXCLUDED_UNIT_TARGETS),$(UNIT_RUN_TARGETS)) test-debug-log test-debug-fatal check-ci-workflows
 else
-unit: $(UNIT_RUN_TARGETS) $(LINUX_HOST_TEST) test-native-capacity check-ci-workflows
+unit: $(UNIT_RUN_TARGETS) $(LINUX_HOST_TEST) test-native-capacity test-debug-log test-debug-fatal check-ci-workflows
 endif
 
 .PHONY: check-ci-workflows
