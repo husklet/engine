@@ -124,6 +124,11 @@ invariants)
 			if (step_runs[i] ~ /attempt 1/ &&
 			    (step_runs[i] !~ /both attempts/ || step_runs[i] !~ /exit 1/))
 				bad("I6 " step_files[i] " step `" step_names[i] "` does not check retry 2")
+			# A retried step must bound BOTH attempts against one deadline:
+			# a step the runner kills on its own timeout prints no ::error.
+			if (step_runs[i] ~ /attempt 1/ &&
+			    (step_runs[i] !~ /deadline=/ || step_runs[i] !~ /run_bounded/))
+				bad("I16 " step_files[i] " step `" step_names[i] "` retries without a step deadline")
 		}
 		if (jobs < 7)
 			bad("I7 parsed only " jobs " jobs; expected at least 7")

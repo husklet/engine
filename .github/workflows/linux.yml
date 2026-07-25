@@ -260,12 +260,24 @@ jobs:
           # several of them contain load-sensitive stress gates, and the symptom was cases timing
           # out after the runner's full 120s per-case budget having produced ZERO bytes of output
           # (mkfifoat, truncate-eof-bus). Building stays parallel; suites run one at a time.
+          # Bound the STEP, not just one suite. Several suites plus the retry can
+          # outlast the 40min step timeout, and a step GitHub kills emits no
+          # ::error, so the failure lands with no diagnostic tail. Stop 60s short
+          # of the deadline so the reporting tail below always runs.
+          deadline=$((SECONDS + 2280))
+          budget() {
+            local left=$((deadline - SECONDS - 60))
+            if [ "$left" -gt 0 ]; then echo "$left"; else echo 0; fi
+          }
           run_suites() {
-            local st=0 suite_st=0 t=
+            local st=0 suite_st=0 cap=0 t=
             : > "$1"
             for t in ${{ matrix.targets }}; do
               suite_st=0
-              run_bounded 2100 "$1.part" \
+              cap=$(budget)
+              if [ "$cap" -le 0 ]; then st=124; break; fi
+              if [ "$cap" -gt 2100 ]; then cap=2100; fi
+              run_bounded "$cap" "$1.part" \
                 nix develop --command sh -c "make -s -j\"\$(nproc)\" CC=\"\$NATIVE_CC\" $t" || suite_st=$?
               cat "$1.part" >> "$1"
               if [ "$suite_st" -ne 0 ]; then
@@ -282,8 +294,11 @@ jobs:
             return $st
           }
           status=0
+          verdict='step budget exhausted before a retry'
           run_suites runtime.log || status=$?
-          if [ "$status" -ne 0 ]; then
+          # Retry only with enough budget left to finish and still report.
+          if [ "$status" -ne 0 ] && [ "$(budget)" -ge 600 ]; then
+            verdict='both attempts'
             warn=$(tail -c 1200 runtime.log)
             warn=${warn//'%'/'%25'}; warn=${warn//$'\n'/'%0A'}; warn=${warn//$'\r'/'%0D'}
             echo "::warning title=Linux compat (${{ matrix.name }}) failed attempt 1 — retrying::$warn"
@@ -297,9 +312,9 @@ jobs:
             message=${message//$'\n'/'%0A'}
             message=${message//$'\r'/'%0D'}
             if [ "$status" -eq 124 ]; then
-              echo "::error title=Linux compat (${{ matrix.name }}) TIMED OUT (both attempts)::$message"
+              echo "::error title=Linux compat (${{ matrix.name }}) TIMED OUT ($verdict)::$message"
             else
-              echo "::error title=Linux compat (${{ matrix.name }}) failed (both attempts)::$message"
+              echo "::error title=Linux compat (${{ matrix.name }}) failed ($verdict)::$message"
             fi
             exit 1
           fi
