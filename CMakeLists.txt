@@ -25,6 +25,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(hl_engine_phase1 LANGUAGES C)
 
+find_program(HL_BASH_EXECUTABLE NAMES bash REQUIRED)
+
 # --- sanitizers -------------------------------------------------------------
 # The Makefile's `sanitize` target re-invokes make into a second BUILD dir with
 # ASan+UBSan CFLAGS and runs the unit suite. The CMake equivalent is a separate
@@ -179,11 +181,17 @@ if(HL_BUILD_TESTS)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Gates.cmake)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase4Mac.cmake)
   endif()
-  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/LaneParity.cmake)
 endif()
 
 # --- Phase 4: install rules, pkg-config, packaging smoke tests -------------
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase4Install.cmake)
+
+# Lane parity covers the complete registry, including Phase4Install's package
+# labels.  A host-unit-only configure intentionally has no guest cross
+# compilers and therefore no compat/production lanes to audit.
+if(HL_BUILD_TESTS AND HL_HAVE_GUEST_CC)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/LaneParity.cmake)
+endif()
 
 # --- clang-format targets ---------------------------------------------------
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Format.cmake)
