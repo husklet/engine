@@ -13,7 +13,7 @@ Makefile, CMake or CI — it is a manual investigation lane driven by three shel
 | `build.sh` | Fetch + cross-compile stage. |
 | `run.sh` | Run + score stage, one test at a time. |
 | `run-parallel.sh` | Same matrix in bounded per-category batches (`LTP_JOBS`, default 8), assembling one deterministic table. |
-| `config.h` | Hand-built `include/config.h` standing in for `./configure` on a modern glibc host. |
+| `config.h` | Hand-built stand-in for the `include/config.h` LTP's `./configure` would generate on a modern glibc host. |
 | `results-baseline-v0.9.25.tsv` | A recorded run (see below). |
 | `out/` | Working tree: `ltp-src/`, `bin/<arch>/<test>`, `logs/`, `results.tsv`. |
 
