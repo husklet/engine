@@ -900,6 +900,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
+            if (sock_internal_connect_prepare((int)a0) != 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
             int r = connect((int)a0, (struct sockaddr *)&un, sizeof un);
             if (r == 0 || errno == EINPROGRESS) {
                 g_sock_connecting[(int)a0] = r < 0;
@@ -916,6 +920,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 br_path(0, g_netif[0].ip, p, bp, sizeof bp);
                 struct sockaddr_un bu;
                 if (unix_addr_set(&bu, bp) < 0 || lo_swap((int)a0) < 0) {
+                    r = -1;
+                } else if (sock_internal_connect_prepare((int)a0) != 0) {
                     r = -1;
                 } else {
                     r = connect((int)a0, (struct sockaddr *)&bu, sizeof bu);
@@ -944,9 +950,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     G_RET(c) = (uint64_t)(-le);
                 }
             } else {
-                int identified = sock_internal_connect_identify((int)a0);
-                G_RET(c) = identified == 0 ? 0 : (uint64_t)(int64_t)(-errno);
-                if (identified == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD)
+                G_RET(c) = 0;
+                if ((int)a0 >= 0 && (int)a0 < HL_NFD)
                     g_sock_conn[(int)a0] = 1, g_sock_connecting[(int)a0] = 0; // sticky-connected
             }
             break;
@@ -1010,6 +1015,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     r = -1;
                     break;
                 }
+                if (sock_internal_connect_prepare((int)a0) != 0) {
+                    r = -1;
+                    break;
+                }
                 r = connect((int)a0, (struct sockaddr *)&un, sizeof un);
                 if (r == 0) {
                     // A blocking connect succeeded: verify it isn't a peer mid-exit (a `-w N` listener whose
@@ -1032,7 +1041,6 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 g_br_ip[(int)a0] = dip; // peer ip for getpeername
                 g_br_interface[(int)a0] = (uint8_t)(connect_interface + 1);
             }
-            if (r == 0 && sock_internal_connect_identify((int)a0) != 0) r = -1;
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
             if (r == 0 && (int)a0 >= 0 && (int)a0 < HL_NFD)
                 g_sock_conn[(int)a0] = 1, g_sock_connecting[(int)a0] = 0; // sticky-connected

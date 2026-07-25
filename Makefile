@@ -222,7 +222,7 @@ DEPENDENCY_FILES := $(NATIVE_OBJECTS:.o=.d) $(MAC_OBJECTS:.o=.d) $(MAC_AUX_OBJEC
 	$(LINUX_AARCH64_EMBEDDED_OBJECTS:.o=.d) \
 	$(wildcard $(BUILD)/mac/dual/*.d $(BUILD)/linux-aarch64/dual/*.d)
 
-UNIT_NAMES := a64_asm address affinity arena avx bus child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire glue gmap host_services identity image inotify ir key launch legacy lifecycle_identity linux_abi linux_fork lower_alu lower_crypto lower_mov lower_repstr lower_shift lower_sse4x lower_trace lower_x87 misc native open_plan operand owner persist pidmap pipe pipe_linux placement ports private process range rep resolve resolve_services rotate shared shm signal_aarch64 signal_x86_64 snapshot system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc target_bus watch window x87_stack x87math x87state xattr_cache
+UNIT_NAMES := a64_asm address affinity arena avx bus child cli clock codegen config cpuid cmpxchg decoder device digest directory directory_services emit epoll eventfd eventfd_fork fatal fdcache file flags fork_wire glue gmap host_services identity image inotify ir key launch legacy lifecycle_identity linux_abi linux_fork lower_alu lower_crypto lower_mov lower_repstr lower_shift lower_sse4x lower_trace lower_x87 misc native open_plan operand owner persist pidmap pipe pipe_linux placement ports private process range rep resolve resolve_services rotate shared shm signal_aarch64 signal_x86_64 snapshot socket_identity system seccomp_vm stat engine errno limits log namespace number options parse profile readonly reloc target_bus watch window x87_stack x87math x87state xattr_cache
 
 $(BUILD)/tests/test_x87math: tests/unit/test_x87math.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a
@@ -590,6 +590,11 @@ $(BUILD)/tests/test_lifecycle_identity: tests/unit/test_lifecycle_identity.c tes
 	tests/e2e/lifecycle.tsv tests/e2e/mac_gates.tsv
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< -o $@
+
+$(BUILD)/tests/test_socket_identity: tests/unit/test_socket_identity.c \
+	src/linux_abi/container/socket_identity.h tests/unit/test.h
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) -Itests/unit $(ENGINE_CFLAGS) $< -pthread -o $@
 
 $(BUILD)/tests/test_%: tests/unit/test_%.c $(BUILD)/lib/libhl-engine.a $(BUILD)/lib/libhl-translator.a \
 	$(BUILD)/lib/libhl-linux-abi.a $(BUILD)/lib/libhl-host-fake.a

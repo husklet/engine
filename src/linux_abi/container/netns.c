@@ -4,6 +4,7 @@
 
 #include "../shared.h"
 #include "../checkpoint.h"
+#include "socket_identity.h"
 
 // Build a pathname AF_UNIX address without ever accepting the silent truncation performed by snprintf.
 // Callers must do this before replacing a guest socket so ENAMETOOLONG leaves the original fd untouched.
@@ -1698,82 +1699,46 @@ static void sock_pair_identity_assign(int first, int second) {
     g_sock_peer_object[second] = first_object;
 }
 
-#define SOCK_INTERNAL_HELLO_MAGIC UINT64_C(0x484c434f4e4e3031)
-struct sock_internal_hello {
-    uint64_t magic;
-    uint64_t client_object;
-    uint64_t server_object;
-    uint64_t check;
-};
-
-/* Private loopback/bridge streams are AF_UNIX transports hidden behind guest INET sockets.  Give both
- * endpoints reciprocal identities on the wire before any guest payload can be sent.  The accepted side
- * consumes this engine-private header before exposing the fd, so it is invisible to the guest protocol. */
-static int sock_internal_connect_identify(int fd) {
+/* Private loopback/bridge streams are AF_UNIX transports hidden behind guest INET sockets. Encode their
+ * reciprocal object identities in the client's AF_UNIX bind name, so accept can recover them with
+ * getpeername() without placing engine-private bytes in the guest stream. */
+static int sock_internal_connect_prepare(int fd) {
     if (fd < 0 || fd >= HL_NFD || !g_sock_object[fd]) {
         errno = EINVAL;
         return -1;
     }
-    if (g_sock_peer_object[fd]) return 0;
-    uint64_t peer = sock_object_new();
-    struct sock_internal_hello hello = {
-        SOCK_INTERNAL_HELLO_MAGIC, g_sock_object[fd], peer,
-        SOCK_INTERNAL_HELLO_MAGIC ^ g_sock_object[fd] ^ peer,
-    };
-    int saved = fcntl(fd, F_GETFL);
-    if (saved < 0) return -1;
-    if ((saved & O_NONBLOCK) && fcntl(fd, F_SETFL, saved & ~O_NONBLOCK) != 0) return -1;
-    const unsigned char *bytes = (const unsigned char *)&hello;
-    size_t offset = 0;
-    while (offset < sizeof hello) {
-        ssize_t count = send(fd, bytes + offset, sizeof hello - offset, 0);
-        if (count > 0) {
-            offset += (size_t)count;
-            continue;
-        }
-        if (count < 0 && errno == EINTR) continue;
-        int error = count == 0 ? EPIPE : errno;
-        if (saved & O_NONBLOCK) (void)fcntl(fd, F_SETFL, saved);
-        errno = error;
+    // A failed AF_UNIX connect poisons its socket and the retry path replaces it with lo_swap(). Re-bind
+    // every replacement, while retaining the same logical peer object across attempts.
+    uint64_t peer = g_sock_peer_object[fd] ? g_sock_peer_object[fd] : sock_object_new();
+    char path[HL_SOCKET_IDENTITY_PATH_SIZE];
+    if (hl_socket_identity_format(path, sizeof path, g_sock_object[fd], peer) != 0) {
+        errno = EINVAL;
         return -1;
     }
-    if ((saved & O_NONBLOCK) && fcntl(fd, F_SETFL, saved) != 0) return -1;
+    struct sockaddr_un address;
+    if (unix_addr_set(&address, path) < 0) return -1;
+    unlink(path);
+    if (bind(fd, (struct sockaddr *)&address, sizeof address) != 0) return -1;
+    unlink(path);
     g_sock_peer_object[fd] = peer;
     return 0;
 }
 
 static int sock_internal_accept_identify(int fd) {
-    struct pollfd ready = {fd, POLLIN, 0};
-    int polled;
-    do {
-        polled = poll(&ready, 1, 20);
-    } while (polled < 0 && errno == EINTR);
-    if (polled <= 0 || !(ready.revents & POLLIN)) return 0; /* host-forwarded connection */
-    struct sock_internal_hello hello;
-    ssize_t peeked;
-    do {
-        peeked = recv(fd, &hello, sizeof hello, MSG_PEEK | MSG_DONTWAIT);
-    } while (peeked < 0 && errno == EINTR);
-    if (peeked < (ssize_t)sizeof hello || hello.magic != SOCK_INTERNAL_HELLO_MAGIC) return 0;
-    if (!hello.client_object || !hello.server_object || hello.client_object == hello.server_object ||
-        hello.check != (SOCK_INTERNAL_HELLO_MAGIC ^ hello.client_object ^ hello.server_object)) {
+    struct sockaddr_un peer = {0};
+    socklen_t length = sizeof peer;
+    if (getpeername(fd, (struct sockaddr *)&peer, &length) != 0) return -1;
+    peer.sun_path[sizeof peer.sun_path - 1] = '\0';
+    if (peer.sun_family != AF_UNIX ||
+        strncmp(peer.sun_path, HL_SOCKET_IDENTITY_PREFIX, sizeof(HL_SOCKET_IDENTITY_PREFIX) - 1) != 0)
+        return 0;
+    uint64_t client = 0, server = 0;
+    if (hl_socket_identity_parse(peer.sun_path, &client, &server) != 0) {
         errno = EPROTO;
         return -1;
     }
-    unsigned char *bytes = (unsigned char *)&hello;
-    size_t offset = 0;
-    while (offset < sizeof hello) {
-        ssize_t count = recv(fd, bytes + offset, sizeof hello - offset, 0);
-        if (count > 0) {
-            offset += (size_t)count;
-            continue;
-        }
-        if (count < 0 && errno == EINTR) continue;
-        errno = count == 0 ? ECONNRESET : errno;
-        return -1;
-    }
-    g_sock_object[fd] = hello.server_object;
-    g_sock_peer_object[fd] = hello.client_object;
+    g_sock_object[fd] = server;
+    g_sock_peer_object[fd] = client;
     return 1;
 }
 
