@@ -6,6 +6,10 @@ then reconnects external resources to their current host state.
 
 ## Recovery policies
 
+Selected by `HL_CHECKPOINT_POLICY` (`ckpt_recovery_policy`, `src/linux_abi/checkpoint.c`). `refuse` is the
+default. Under the two permissive policies a restore deliberately restores everything it can and stops what it
+cannot; a stopped subtree is the designed outcome, not a failure or a gap to be closed later.
+
 - `refuse`: any nonviable process or required resource refuses the whole restore.
 - `reconnect`: reconnect path-backed resources where possible and stop nonviable process subtrees.
 - `discard-optional`: reconnect reconstructible resources and stop nonviable process subtrees.
@@ -55,6 +59,9 @@ capture they restore as disconnected sockets with pending `ECONNRESET`, allowing
 
 ## Image durability
 
+Described here for the directory sink. A streaming sink expresses the same ordering through explicit group and
+commit calls — see docs/checkpoint-sink.md.
+
 - Each process image is published by temporary-directory rename after all files are synchronized.
 - `MANIFEST` is synchronized and published last.
 - The manifest authenticates the path, size, and content of every engine-owned image file.
@@ -68,7 +75,8 @@ capture they restore as disconnected sockets with pending `ECONNRESET`, allowing
 Run:
 
 ```sh
-make e2e-checkpoint-io-full
+ctest --test-dir <build-dir> -L checkpoint      # or -L checkpoint-io for the 16 IO/recovery scenarios
+make e2e-checkpoint-io-full                     # the Makefile equivalent
 ```
 
 The target is fail-fast and runs the IO/recovery matrix on AArch64 and x86_64 plus the existing process-tree,

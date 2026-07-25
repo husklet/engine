@@ -36,3 +36,21 @@ assert!(output.exit.success());
 ```
 
 Applied container closures contribute only mounts and environment edits; the engine remains device-neutral.
+
+## Documentation
+
+- [`DOCS.md`](DOCS.md) — normative design: layering, public contracts, build and test model, roadmap. Start here.
+  It indexes the rest of `docs/`.
+- [`docs/arch.md`](docs/arch.md) — where each layer lives in the source, at symbol level.
+- [`pkgs/rust/README.md`](pkgs/rust/README.md) — the Rust crate's own API surface.
+
+Build and test, from a `nix develop` shell:
+
+```sh
+cmake -G Ninja -B build-cmake
+ninja -C build-cmake
+ctest --test-dir build-cmake -L unit
+```
+
+`ctest --print-labels` lists every lane. A ~2900-line `Makefile` still exists and is what CI runs for the
+compatibility shards and the macOS lane; see [`docs/makefile-retirement.md`](docs/makefile-retirement.md).

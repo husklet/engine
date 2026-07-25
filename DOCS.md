@@ -121,16 +121,24 @@ remains the launcher wire format, not the preferred embedding API; public caller
 internal `HL_*` option registry. Rootfs and scalar memory/pid/CPU limits live in `hl_engine_config`, arguments are
 supplied to `hl_engine_run`, and debug logging is deliberately a debug-build concern rather than box configuration.
 
-Checkpoint/restore is a full-or-refuse operation, gated on both guest ISAs (`ctest -L checkpoint`, labels
-`checkpoint-aarch64` / `checkpoint-x86_64`). A successful capture freezes every live descendant at an engine
-safepoint, writes each process's guest memory, CPU state, signal dispositions, identity, and descriptors into a
-staged process group, then publishes the image and the `MANIFEST` last. Restore rejects incomplete manifests and
-malformed process trees before resuming init. Capture explicitly refuses sentry/untrusted mode, connected or
-in-progress sockets that would need connection-state transfer, descriptors with no recoverable path, and guest
-descriptor tables that exceed the checkpoint limit or change mid-capture. A process that daemonizes out of the init
-descendant tree is not captured. These cases are unsupported, not silently omitted from a successful image. Where
-the bytes go is an embedder decision: see docs/checkpoint-sink.md. Recovery policy and external-resource
-reconnection: docs/checkpoint-restore-io.md.
+Checkpoint/restore is gated on both guest ISAs (`ctest -L checkpoint`, labels `checkpoint-aarch64` /
+`checkpoint-x86_64`). Capture and restore have deliberately different contracts.
+
+**Capture is all-or-nothing.** A successful capture freezes every live descendant at an engine safepoint, writes
+each process's guest memory, CPU state, signal dispositions, identity, and descriptors into a staged process group,
+then publishes the image and the `MANIFEST` last. Any failed object aborts its process group and nothing is
+published (`src/linux_abi/checkpoint.c`, and docs/checkpoint-sink.md "Failure semantics"). Capture refuses
+sentry/untrusted mode, connected or in-progress sockets that would need connection-state transfer, descriptors with
+no recoverable path, and guest descriptor tables that exceed the checkpoint limit or change mid-capture. A process
+that daemonizes out of the init descendant tree is not captured. These cases are refused, not silently omitted from
+an otherwise successful image.
+
+**Restore is policy-driven, and the permissive policies restore what can be restored.** `HL_CHECKPOINT_POLICY`
+selects `refuse` (the default), `reconnect`, or `discard-optional`. Under the two permissive policies a process
+that cannot be reconstructed is stopped along with its descendants and the rest of the tree resumes; that is the
+intended contract, not a degraded mode. Container init is mandatory under every policy. Every restore records the
+per-process outcome in `RECOVERY.jsonl`. Detail: docs/checkpoint-restore-io.md. Where the bytes live is an
+embedder decision: docs/checkpoint-sink.md.
 
 ### 3.2 Engine core (`src/core`)
 
