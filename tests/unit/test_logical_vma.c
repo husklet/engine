@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct lookup_stress {
@@ -56,6 +57,15 @@ static void *pin_thread(void *opaque) {
         atomic_fetch_add_explicit(&stress->pins, 1, memory_order_relaxed);
     }
     return NULL;
+}
+
+static void await_first_iteration(_Atomic unsigned long *counter, _Atomic int *failed) {
+    for (unsigned attempt = 0; attempt < 5000; ++attempt) {
+        if (atomic_load_explicit(counter, memory_order_relaxed) != 0) return;
+        if (atomic_load_explicit(failed, memory_order_acquire)) return;
+        struct timespec nap = {0, 1000000};
+        nanosleep(&nap, NULL);
+    }
 }
 
 int main(void) {
@@ -177,6 +187,7 @@ int main(void) {
     pthread_t readers[4];
     for (size_t index = 0; index < 4; ++index)
         HL_CHECK(pthread_create(&readers[index], NULL, lookup_thread, &stress) == 0);
+    await_first_iteration(&stress.lookups, &stress.failed);
     for (unsigned iteration = 0; iteration < 2000; ++iteration) {
         uint64_t offset = (iteration & 1u) ? 16384u : 0u;
         HL_CHECK(hl_logical_vma_map_shared(&ledger, hot, 4096, HL_LOGICAL_VMA_READ, fd, offset, 16384) == 0);
@@ -198,6 +209,7 @@ int main(void) {
     pin_stress pstress = {.address = pinned};
     pthread_t pinner;
     HL_CHECK(pthread_create(&pinner, NULL, pin_thread, &pstress) == 0);
+    await_first_iteration(&pstress.pins, &pstress.failed);
     for (unsigned iteration = 0; iteration < 2000; ++iteration) {
         uint64_t offset = (iteration & 1u) ? 16384u : 0u;
         HL_CHECK(hl_logical_vma_global_map_shared(pinned, 4096, HL_LOGICAL_VMA_READ, fd, offset, 16384) == 0);
