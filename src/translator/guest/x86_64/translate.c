@@ -1573,6 +1573,34 @@ static void emit_sigill(uint64_t pc) {
     emit_guest_signal(pc, 4, 2); // ud2 -> SIGILL (si_code ILL_ILLOPN), rip = the faulting insn
 }
 
+// Restore the user-visible RFLAGS lanes from `src`.  POPFQ and IRETQ use the same architectural
+// distribution: arithmetic condition codes live in cpu->nzcv, PF/AF have dedicated lanes, and ID/DF
+// survive block boundaries in explicit cpu fields.  Keep this as one emitter so a context return
+// cannot silently restore a smaller flag set than POPFQ.
+static void emit_restore_rflags(int src) {
+    e_movconst(17, 0);
+    e_bit_move(17, src, 6, 30, 18);                                // ZF(bit6) -> NZCV.Z(30)
+    e_bit_move(17, src, 7, 31, 18);                                // SF(bit7) -> NZCV.N(31)
+    e_bit_move(17, src, 11, 28, 18);                               // OF(bit11) -> NZCV.V(28)
+    emit32(0x53000000u | (0 << 16) | (0 << 10) | (src << 5) | 18); // ubfx w18,wSrc,#0,#1 (CF)
+    e_movconst(19, 1);
+    e_rrr(A_EOR, 18, 18, 19, 0, 0);  // stored borrow-C = NOT x86 CF
+    e_rrr(A_ORR, 17, 17, 18, 0, 29); // -> NZCV.C(29)
+    e_str(17, 28, OFF_NZCV);
+    emit32(0xD51B4200u | 17);                                      // msr nzcv, x17
+    emit32(0x53000000u | (2 << 16) | (2 << 10) | (src << 5) | 18); // ubfx w18,wSrc,#2,#1 (PF)
+    e_movconst(19, 1);
+    e_rrr(A_EOR, 18, 18, 19, 0, 0); // PF source byte = NOT PF (consumer computes even parity)
+    e_str(18, 28, OFF_PF);
+    e_af_save(src);                                                  // cpu->af keeps the source's bit 4
+    emit32(0x53000000u | (21 << 16) | (21 << 10) | (src << 5) | 18); // ID
+    e_str(18, 28, OFF_ID);
+    emit32(0x53000000u | (10 << 16) | (10 << 10) | (src << 5) | 18); // DF
+    e_str(18, 28, OFF_DF);
+    g_df = HL_X86_DIRECTION_DYNAMIC;
+    g_fl_pending = FL_NONE;
+}
+
 // async-interrupt poll: emit a CHEAP flag-free check of cpu->irq at the block body entry (the target
 // of every fall-through, direct chain `b body`, self-loop fold, and IBTC hit). When irq is set (a caught
 // async guest signal became pending while the guest spins in-cache making no syscalls), exit to the
@@ -3912,29 +3940,30 @@ static void *translate_block(uint64_t gpc) {
                 }
                 e_load(8, 16, emit_soft_memory_active() ? 17 : RSP); // x16 = popped RFLAGS
                 e_addi(RSP, RSP, 8, 1);
-                e_movconst(17, 0);
-                e_bit_move(17, 16, 6, 30, 18);                                // ZF(bit6) -> NZCV.Z(30)
-                e_bit_move(17, 16, 7, 31, 18);                                // SF(bit7) -> NZCV.N(31)
-                e_bit_move(17, 16, 11, 28, 18);                               // OF(bit11) -> NZCV.V(28)
-                emit32(0x53000000u | (0 << 16) | (0 << 10) | (16 << 5) | 18); // ubfx w18,w16,#0,#1 (CF)
-                e_movconst(19, 1);
-                e_rrr(A_EOR, 18, 18, 19, 0, 0);  // stored borrow-C = NOT x86 CF
-                e_rrr(A_ORR, 17, 17, 18, 0, 29); // -> NZCV.C(29)
-                e_str(17, 28, OFF_NZCV);
-                emit32(0xD51B4200u | 17);                                     // msr nzcv, x17  (sync live ARM flags)
-                emit32(0x53000000u | (2 << 16) | (2 << 10) | (16 << 5) | 18); // ubfx w18,w16,#2,#1 (PF)
-                e_movconst(19, 1);
-                e_rrr(A_EOR, 18, 18, 19, 0, 0); // PF lane source byte = NOT PF (consumer takes even-parity)
-                e_str(18, 28, OFF_PF);
-                e_af_save(16); // AF from popped RFLAGS bit4 (cpu->af consumer extracts bit 4)
-                emit32(0x53000000u | (21 << 16) | (21 << 10) | (16 << 5) | 18); // ubfx w18,w16,#21,#1 (ID)
-                e_str(18, 28, OFF_ID); // stash RFLAGS.ID so a later pushfq observes the toggle (CPUID probe)
-                emit32(0x53000000u | (10 << 16) | (10 << 10) | (16 << 5) | 18); // ubfx w18,w16,#10,#1 (DF)
-                e_str(18, 28, OFF_DF);           // restore the runtime direction flag (was a documented M-gap)
-                g_df = HL_X86_DIRECTION_DYNAMIC; // DF value is now runtime (popped)
-                g_fl_pending = FL_NONE;          // flags now materialized directly into cpu->nzcv
+                emit_restore_rflags(16);
                 gpc = next;
                 continue;
+            }
+            // iretq (REX.W CF): CoreCLR's context-restore path provides the complete long-mode frame,
+            // in increasing addresses: RIP, CS, RFLAGS, RSP, SS.  CS/SS are fixed user selectors in this
+            // user-mode engine, but they are still consumed so RSP has architectural five-qword semantics.
+            if (op == 0xCF && I.rexW) {
+                int frame = RSP;
+                if (emit_soft_memory_active()) {
+                    e_mov_rr(17, RSP, 1);
+                    emit_memory_guard(17, 40, gpc, X86_SOFT_READ);
+                    frame = 17;
+                }
+                e_ldr(21, frame, 0);  // restored RIP; preserve across flag restoration
+                e_ldr(16, frame, 16); // restored RFLAGS
+                e_ldr(22, frame, 24); // restored RSP
+                emit_restore_rflags(16);
+                e_mov_rr(RSP, 22, 1);
+                e_mov_rr(16, 21, 1);
+                e_movconst(19, gpc);
+                e_str(19, 28, OFF_IBSRC);
+                emit_ibranch();
+                break;
             }
             // ===== x87 FPU (D8-DF): double-precision stack emulation =====
             if (op >= 0xD8 && op <= 0xDF) {

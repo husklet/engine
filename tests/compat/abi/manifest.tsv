@@ -61,6 +61,7 @@ atomic-builtins	atomics	atomics_builtins.c	atomics_builtins.c	aarch64,x86_64	-st
 cpuid-features	cpu	cpuid_features.c	cpuid_features.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/cpuid_features.out	linux-libc	active	exact source; deterministic checked registration
 lse-atomics	atomics	lse_atomics.c	lse_atomics.c	aarch64	-static-pie -O2 -pthread -lm -march=armv8.2-a+lse -mno-outline-atomics	-	-	0	expected/lse_atomics.out	linux-libc	active	exact source; LSE ISA build retained
 rflags-identity	cpu	rflags_id.c	rflags_id.c	x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/rflags_id.out	linux-libc	active	exact source; deterministic checked registration
+iretq-context	cpu	iretq_context.c	focused-production-regression	x86_64	-static-pie -O2 -std=gnu11	-	-	0	expected/iretq_context.out	linux-libc,iretq,rflags,stack	active	long-mode IRETQ restores the complete five-qword frame, arithmetic flags, ID, and DF before resuming at the restored RIP/RSP
 tls-basic	tls	tls.c	tls.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/tls.out	linux-libc	active	exact source; deterministic checked registration
 tls-models	tls	tlsmodels.c	tlsmodels.c	aarch64,x86_64	-static-pie -O2 -pthread -lm	-	-	0	expected/tlsmodels.out	linux-libc	active	exact source; deterministic checked registration
 tls-models-main	tls	tlsmodels_main.c	tlsmodels_main.c	aarch64,x86_64	-static -no-pie -O2 -pthread -lm	-	-	0	expected/tlsmodels_main.out	linux-libc	active	exact source; static non-PIE variant retained
