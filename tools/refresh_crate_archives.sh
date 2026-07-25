@@ -20,6 +20,7 @@ cd "$root"
 
 : "${MAKE:=make}"
 : "${BUILD:=build}"
+: "${MAC:=mac}"
 
 sha256() {
 	if command -v sha256sum >/dev/null 2>&1; then
@@ -29,7 +30,7 @@ sha256() {
 	fi
 }
 
-if [ "$(uname -s)" != "Darwin" ] && ! command -v mac >/dev/null 2>&1; then
+if [ "$(uname -s)" != "Darwin" ] && ! command -v "$MAC" >/dev/null 2>&1; then
 	printf 'refresh-crate-archives: the `mac` bridge is required to build the darwin archive\n' >&2
 	printf 'refresh-crate-archives: run this from a host that can reach the mac, or set MAC=<command>\n' >&2
 	exit 1
@@ -43,18 +44,34 @@ printf 'refresh-crate-archives: building the linux-gnu archive\n'
 printf 'refresh-crate-archives: building the darwin archive (via the mac host)\n'
 "$MAKE" -j"$jobs" BUILD="$BUILD" package-embedded-macos
 
-install -m 0644 "$BUILD/package/linux-aarch64/libhl-engine.a" \
-	pkgs/rust/assets/lib/aarch64-unknown-linux-gnu/libhl-engine.a
-install -m 0644 "$BUILD/package/macos-aarch64/libhl-engine.a" \
-	pkgs/rust/assets/lib/aarch64-apple-darwin/libhl-engine.a
+linux_asset=pkgs/rust/assets/lib/aarch64-unknown-linux-gnu/libhl-engine.a
+darwin_asset=pkgs/rust/assets/lib/aarch64-apple-darwin/libhl-engine.a
+linux_staging=$linux_asset.tmp
+darwin_staging=$darwin_asset.tmp
+
+# Publish and validate through a sibling file, then rename. Most importantly,
+# the Darwin copy, inspection, and rename all happen on the Mac: a Linux copy
+# from the shared mount can race the producer's libtool write and preserve a
+# truncated archive that still has the expected path and provenance.
+install -m 0644 "$BUILD/package/linux-aarch64/libhl-engine.a" "$linux_staging"
+tools/validate_crate_archive.sh aarch64-unknown-linux-gnu "$linux_staging"
+mv -f "$linux_staging" "$linux_asset"
+
+"$MAC" install -m 0644 "$BUILD/package/macos-aarch64/libhl-engine.a" "$darwin_staging"
+"$MAC" tools/validate_crate_archive.sh aarch64-apple-darwin "$darwin_staging"
+"$MAC" mv -f "$darwin_staging" "$darwin_asset"
+
+# Revalidate the exact final paths that cargo packages and build.rs links.
+tools/validate_crate_archive.sh aarch64-unknown-linux-gnu "$linux_asset"
+tools/validate_crate_archive.sh aarch64-apple-darwin "$darwin_asset"
 
 commit=$(git rev-parse HEAD)
 if ! git diff --quiet -- src include; then
 	commit="$commit (with uncommitted changes under src/ or include/)"
 fi
 manifest=$(tools/crate_archive_manifest.sh)
-linux_sha=$(sha256 pkgs/rust/assets/lib/aarch64-unknown-linux-gnu/libhl-engine.a | cut -d' ' -f1)
-darwin_sha=$(sha256 pkgs/rust/assets/lib/aarch64-apple-darwin/libhl-engine.a | cut -d' ' -f1)
+linux_sha=$(sha256 "$linux_asset" | cut -d' ' -f1)
+darwin_sha=$("$MAC" shasum -a 256 "$darwin_asset" | cut -d' ' -f1)
 abi=$(sed -n 's/^#define HL_CONFIG_ABI \([0-9]*\).*/\1/p' include/hl/config.h | head -1)
 
 provenance=pkgs/rust/assets/PROVENANCE.md

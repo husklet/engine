@@ -75,4 +75,9 @@ for target in aarch64-unknown-linux-gnu aarch64-apple-darwin; do
 done
 [ "$status" -eq 0 ] || fail 'a committed archive does not match its recorded SHA-256.'
 
+tools/validate_crate_archive.sh aarch64-unknown-linux-gnu \
+	pkgs/rust/assets/lib/aarch64-unknown-linux-gnu/libhl-engine.a
+tools/validate_crate_archive.sh aarch64-apple-darwin \
+	pkgs/rust/assets/lib/aarch64-apple-darwin/libhl-engine.a
+
 printf 'crate archives are current (source manifest %s)\n' "$actual_manifest"
