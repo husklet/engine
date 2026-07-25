@@ -30,13 +30,22 @@
 # deliberately defined ABOVE the Linux guard below: the macOS lane
 # (Phase4Mac.cmake) and the Linux-only gate sections both call hl_object(), so
 # leaving it inside the guard made it undefined on a Darwin configure.
-# Explicit dependency closure for the unity translation units (PRODUCTION_UNITY_DEPS).
-file(GLOB_RECURSE _HL_UNITY_DEPS CONFIGURE_DEPENDS
-  ${CMAKE_SOURCE_DIR}/src/core/*.c   ${CMAKE_SOURCE_DIR}/src/core/*.h
-  ${CMAKE_SOURCE_DIR}/src/host/*.c   ${CMAKE_SOURCE_DIR}/src/host/*.h
-  ${CMAKE_SOURCE_DIR}/src/linux_abi/*.c ${CMAKE_SOURCE_DIR}/src/linux_abi/*.h
-  ${CMAKE_SOURCE_DIR}/src/translator/*.c ${CMAKE_SOURCE_DIR}/src/translator/*.h
-  ${CMAKE_SOURCE_DIR}/include/hl/*.h)
+# Explicit dependency closure for the unity translation units
+# (PRODUCTION_UNITY_DEPS). The crate-archive freshness gate evaluates this same
+# CMake-owned list in script mode, so it cannot drift from the build graph.
+include(${CMAKE_SOURCE_DIR}/cmake/ArchiveSources.cmake)
+hl_collect_archive_sources(_HL_ARCHIVE_SOURCES "${CMAKE_SOURCE_DIR}")
+set(_HL_UNITY_DEPS "")
+foreach(_source IN LISTS _HL_ARCHIVE_SOURCES)
+  list(APPEND _HL_UNITY_DEPS "${CMAKE_SOURCE_DIR}/${_source}")
+endforeach()
+
+string(REPLACE ";" "\n" _HL_ARCHIVE_SOURCES_TEXT "${_HL_ARCHIVE_SOURCES}")
+file(WRITE "${CMAKE_BINARY_DIR}/archive-sources.txt"
+  "${_HL_ARCHIVE_SOURCES_TEXT}\n")
+add_custom_target(print-archive-sources
+  COMMAND ${CMAKE_COMMAND} -E cat "${CMAKE_BINARY_DIR}/archive-sources.txt"
+  VERBATIM)
 
 # Helper: one .c -> OBJECT library with an exact flag list (CPPFLAGS via the
 # hl_cpp_flags interface + the caller's FLAGS), optionally with the unity dep
