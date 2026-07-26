@@ -132,13 +132,22 @@ endforeach()
 
 hl_guest_finalize(guest-fixtures-gates)
 
+# ---------------------------------------------------------------------------
+# Everything from here on is the NATIVE LINUX lane: it consumes the
+# linux-production engines and the prod_* objects that Phase2Production.cmake
+# only defines on a Linux host, so it must be guarded or a Darwin configure
+# fails on missing targets. Sections 1-2 above build guest fixtures and are
+# host-agnostic. The macOS equivalents live in Phase4Mac.cmake.
+# ---------------------------------------------------------------------------
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+
 # ===========================================================================
 # 2b. native-oracle fixtures for the e2e-compat differential cases
 # ===========================================================================
-# `make run-e2e-compat-<case>` runs the cross-built guest under the engine and
-# diffs its output against the SAME source built and run natively on the host
-# (build/fixtures/<case>). Phase3Compat already builds the 13 `compat-native`
-# smoke fixtures; the E2E_CASES set is a superset, so fill in the rest here.
+# The cross-built guest runs under the engine and its output is diffed against
+# the SAME source built and run natively on the HOST (build/fixtures/<case>).
+# Host-native Linux syscall surface, so Linux-only. Phase3Compat already builds
+# the 13 `compat-native` smoke fixtures; E2E_CASES is a superset.
 foreach(_c ${HL_E2E_CASES})
   if(NOT TARGET fixture-${_c})
     add_executable(fixture-${_c} ${HL_TESTS}/compat/fixtures/${_c}.c)
@@ -148,15 +157,6 @@ foreach(_c ${HL_E2E_CASES})
       RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/fixtures OUTPUT_NAME ${_c})
   endif()
 endforeach()
-
-# ---------------------------------------------------------------------------
-# Everything from here on is the NATIVE LINUX lane: it consumes the
-# linux-production engines and the prod_* objects that Phase2Production.cmake
-# only defines on a Linux host, so it must be guarded or a Darwin configure
-# fails on missing targets. Sections 1-2 above build guest fixtures and are
-# host-agnostic. The macOS equivalents live in Phase4Mac.cmake.
-# ---------------------------------------------------------------------------
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
 # ===========================================================================
 # 3. lifecycle runners (native Linux)

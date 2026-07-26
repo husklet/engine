@@ -312,11 +312,16 @@ hl_tool(linux-production-remote-supervisor tools/remote_supervisor.c
         SUBDIR linux-production LINK -lc)
 set_target_properties(linux-production-remote-supervisor PROPERTIES
   OUTPUT_NAME hl-remote-supervisor)
-hl_tool(checkpoint-tree-runner tests/integration/checkpoint_tree_runner.c)
 hl_tool(bridge-jobserver-test  tests/integration/bridge_jobserver.c)
 hl_tool(forkserver-runner      tests/compat/process/integration/forkserver_runner.c)
-hl_tool(deny-icmp              tests/integration/deny_icmp.c SUBDIR tests)
 hl_tool(tests-remote-supervisor tests/integration/remote_supervisor.c SUBDIR tests)
+# Linux-host-only sources: checkpoint_tree_runner.c needs mkdtemp under the
+# strict c11 dialect, deny_icmp.c needs <linux/filter.h>. Their consumers (the
+# checkpoint gates, compat.network-icmp-bridge) are Linux-only too.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  hl_tool(checkpoint-tree-runner tests/integration/checkpoint_tree_runner.c)
+  hl_tool(deny-icmp              tests/integration/deny_icmp.c SUBDIR tests)
+endif()
 # -Werror + no -Wconversion, matching their Makefile recipes.
 hl_tool(linux-production-smoke tools/linux_production_smoke.c)
 hl_tool(linux-matrix           tools/linux_matrix.c)
@@ -334,20 +339,24 @@ hl_tool(matrix-runner tools/matrix_runner.c LINK -lc
         -DX86_64_DYNAMIC_LOADER="${HL_X86_64_DYNAMIC_LOADER}"
         -DX86_64_DYNAMIC_LIBC="${HL_X86_64_DYNAMIC_LIBC}")
 
-# Native (host-arch) smoke fixtures used by `make compat-native`.
-set(_native_smoke atomics clockelapsed epoll epoll_edge eventfd eventfd_sema
-  forkwait mmapanon mmapshared seccomp statx_agree sysv_ipc timerfd)
-set(_native_smoke_bins "")
-foreach(_c ${_native_smoke})
-  add_executable(fixture-${_c} tests/compat/fixtures/${_c}.c)
-  target_compile_options(fixture-${_c} PRIVATE -O2 -g -std=gnu11 -Wall -Wextra)
-  target_link_options(fixture-${_c} PRIVATE -pthread)
-  set_target_properties(fixture-${_c} PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/fixtures OUTPUT_NAME ${_c})
-  list(APPEND _native_smoke_bins $<TARGET_FILE:fixture-${_c}>)
-endforeach()
-add_test(NAME compat-native COMMAND compat-runner ${_native_smoke_bins})
-set_tests_properties(compat-native PROPERTIES LABELS "compat-native" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# Native (host-arch) smoke fixtures. Linux-only: they are the Linux syscall
+# surface (epoll/eventfd/timerfd/seccomp/statx) compiled for the HOST, so a
+# Darwin host cannot build them and never ran this lane.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(_native_smoke atomics clockelapsed epoll epoll_edge eventfd eventfd_sema
+    forkwait mmapanon mmapshared seccomp statx_agree sysv_ipc timerfd)
+  set(_native_smoke_bins "")
+  foreach(_c ${_native_smoke})
+    add_executable(fixture-${_c} tests/compat/fixtures/${_c}.c)
+    target_compile_options(fixture-${_c} PRIVATE -O2 -g -std=gnu11 -Wall -Wextra)
+    target_link_options(fixture-${_c} PRIVATE -pthread)
+    set_target_properties(fixture-${_c} PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/fixtures OUTPUT_NAME ${_c})
+    list(APPEND _native_smoke_bins $<TARGET_FILE:fixture-${_c}>)
+  endforeach()
+  add_test(NAME compat-native COMMAND compat-runner ${_native_smoke_bins})
+  set_tests_properties(compat-native PROPERTIES LABELS "compat-native" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
 
 # ===========================================================================
 # 11. the compat suites as CTest cases
@@ -498,10 +507,14 @@ endforeach()
 endif()
 
 # compat-network additionally runs the suite under an ICMP-denied bridge.
-add_test(NAME compat.network-icmp-bridge
-  COMMAND $<TARGET_FILE:deny-icmp> $<TARGET_FILE:matrix-runner> ${HL_MATRIX_BRIDGE}
-          ${HL_ENGINE_AARCH64} ${HL_COMPAT}/network/aarch64
-          ${HL_ENGINE_X86_64}  ${HL_COMPAT}/network/x86_64
-          ${HL_TESTS}/compat/network icmp-bridge)
-set_tests_properties(compat.network-icmp-bridge PROPERTIES
-  LABELS "compat;compat-network" RESOURCE_LOCK "hl-guest;hl-net" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# deny-icmp is a seccomp/BPF wrapper, so Linux-host only -- as `make
+# typed-network-icmp` always was.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_test(NAME compat.network-icmp-bridge
+    COMMAND $<TARGET_FILE:deny-icmp> $<TARGET_FILE:matrix-runner> ${HL_MATRIX_BRIDGE}
+            ${HL_ENGINE_AARCH64} ${HL_COMPAT}/network/aarch64
+            ${HL_ENGINE_X86_64}  ${HL_COMPAT}/network/x86_64
+            ${HL_TESTS}/compat/network icmp-bridge)
+  set_tests_properties(compat.network-icmp-bridge PROPERTIES
+    LABELS "compat;compat-network" RESOURCE_LOCK "hl-guest;hl-net" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
