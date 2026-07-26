@@ -65,9 +65,12 @@ int main(void) {
     if (first > 0) snprintf(first_name, sizeof first_name, "%s", ((struct linux_dirent64 *)buf)->name);
     long second = syscall(SYS_getdents64, alias, buf, sizeof buf);
     shared = first > 0 && second > 0 && strcmp(first_name, ((struct linux_dirent64 *)buf)->name) != 0;
-    if (lseek(alias, 0, SEEK_SET) == 0) {
+    // Contract: dup'd fds share one offset, so rewinding the alias restarts the shared
+    // stream. Assert "same first entry as the first read", NOT literally "." -- readdir
+    // order is filesystem-specific (ext4 htree hashes ./.. into the middle).
+    if (first > 0 && lseek(alias, 0, SEEK_SET) == 0) {
         long reset = syscall(SYS_getdents64, shared_fd, buf, sizeof buf);
-        alias_rewind = reset > 0 && !strcmp(((struct linux_dirent64 *)buf)->name, ".");
+        alias_rewind = reset > 0 && !strcmp(((struct linux_dirent64 *)buf)->name, first_name);
     }
     close(shared_fd);
     close(alias);
