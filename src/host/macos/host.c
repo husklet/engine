@@ -3886,8 +3886,12 @@ static int hl_macos_event_submit_timer(int descriptor, uint64_t token, uint64_t 
     struct kevent change;
     if (delay_ns == 0) delay_ns = 1;
     if (delay_ns > INT64_MAX) delay_ns = INT64_MAX;
-    EV_SET(&change, (uintptr_t)token, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS, (intptr_t)delay_ns,
-           (void *)(uintptr_t)token);
+    // NOTE_CRITICAL: opt out of macOS power-aware timer coalescing. These kqueue timers back guest
+    // timerfd/POSIX-timer/itimer expiries, which on Linux are hrtimers with no coalescing slop; the default
+    // leeway lets the kernel slide an expiry by tens of ms (much more under a background QoS band), which
+    // reorders or merges guest expiries that Linux keeps distinct.
+    EV_SET(&change, (uintptr_t)token, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS | NOTE_CRITICAL,
+           (intptr_t)delay_ns, (void *)(uintptr_t)token);
     return kevent(descriptor, &change, 1, NULL, 0, NULL);
 }
 
