@@ -12,6 +12,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef HL_BUILD_DIR
+#define HL_BUILD_DIR "." /* CMake passes the real binary dir; this only covers an ad-hoc compile */
+#endif
+
 struct result {
     char output[16384];
     size_t size;
@@ -164,8 +168,7 @@ static int shell_status(int status) {
 
 int main(int argc, char **argv) {
     char socket_path[256];
-    char socket_dir[200];
-    char cwd[192];
+    const char *socket_dir;
     struct result cold, served, warm1, warm2;
     pid_t server;
     int identity = 0, stdio = 0, exitcode = 0, fatal = 0, warm = 0;
@@ -175,15 +178,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: forkserver-runner BRIDGE ENGINE GUEST GOLDEN\n");
         return 2;
     }
-    /* `build/` is only the default build directory: with BUILD=<elsewhere> it need not exist, and the
-       server then fails to bind with no way to tell that from a real forkserver defect. */
-    if (getcwd(cwd, sizeof cwd) == NULL) {
-        fprintf(stderr, "forkserver-runner: cannot read the working directory (%s)\n", strerror(errno));
+    /* The socket lives in the build tree, which is named `build` only by convention: deriving it from
+       the working directory binds somewhere else entirely, and a bind failure is indistinguishable
+       from a real forkserver defect. */
+    socket_dir = getenv("HL_BUILD_DIR");
+    if (socket_dir == NULL || socket_dir[0] == '\0') socket_dir = HL_BUILD_DIR;
+    if (access(socket_dir, W_OK | X_OK) != 0) {
+        fprintf(stderr, "forkserver-runner: build directory %s is not writable (%s)\n", socket_dir,
+                strerror(errno));
         return 1;
     }
-    if (snprintf(socket_dir, sizeof socket_dir, "%s/build", cwd) >= (int)sizeof socket_dir ||
-        (mkdir(socket_dir, 0777) != 0 && errno != EEXIST))
-        snprintf(socket_dir, sizeof socket_dir, "%s", cwd);
     if (snprintf(socket_path, sizeof socket_path, "%s/hl-fsrv-%ld.sock", socket_dir, (long)getpid()) >=
         (int)sizeof socket_path) {
         fprintf(stderr, "forkserver-runner: socket path under %s does not fit\n", socket_dir);
