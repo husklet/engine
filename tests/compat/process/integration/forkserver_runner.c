@@ -117,6 +117,17 @@ static void stop_server(pid_t pid, const char *socket_path) {
     unlink(socket_path);
 }
 
+/* Every failure path must name itself: a gate that returns non-zero having printed nothing is
+   unattributable in CI. */
+static int run_leg(const char *phase, const char *leg, const char *bridge, const char *engine,
+                   const char *socket_path, const char *guest, const char *command, const char *argument,
+                   const char *input, struct result *result) {
+    if (run_guest(bridge, engine, socket_path, guest, command, argument, input, result) == 0) return 1;
+    fprintf(stderr, "forkserver-runner: %s %s leg did not complete (command=%s errno=%s)\n", phase, leg, command,
+            strerror(errno));
+    return 0;
+}
+
 static int same(const struct result *a, const struct result *b) {
     return a->status == b->status && a->size == b->size && memcmp(a->output, b->output, a->size) == 0;
 }
@@ -153,6 +164,7 @@ static int shell_status(int status) {
 
 int main(int argc, char **argv) {
     char socket_path[256];
+    char socket_dir[200];
     char cwd[192];
     struct result cold, served, warm1, warm2;
     pid_t server;
@@ -163,26 +175,41 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: forkserver-runner BRIDGE ENGINE GUEST GOLDEN\n");
         return 2;
     }
-    if (getcwd(cwd, sizeof cwd) == NULL ||
-        snprintf(socket_path, sizeof socket_path, "%s/build/hl-fsrv-%ld.sock", cwd, (long)getpid()) >=
-            (int)sizeof socket_path)
+    /* `build/` is only the default build directory: with BUILD=<elsewhere> it need not exist, and the
+       server then fails to bind with no way to tell that from a real forkserver defect. */
+    if (getcwd(cwd, sizeof cwd) == NULL) {
+        fprintf(stderr, "forkserver-runner: cannot read the working directory (%s)\n", strerror(errno));
         return 1;
+    }
+    if (snprintf(socket_dir, sizeof socket_dir, "%s/build", cwd) >= (int)sizeof socket_dir ||
+        (mkdir(socket_dir, 0777) != 0 && errno != EEXIST))
+        snprintf(socket_dir, sizeof socket_dir, "%s", cwd);
+    if (snprintf(socket_path, sizeof socket_path, "%s/hl-fsrv-%ld.sock", socket_dir, (long)getpid()) >=
+        (int)sizeof socket_path) {
+        fprintf(stderr, "forkserver-runner: socket path under %s does not fit\n", socket_dir);
+        return 1;
+    }
     server = start_server(argv[1], argv[2], socket_path, NULL);
-    if (server < 0) return 1;
-    if (run_guest(argv[1], argv[2], NULL, argv[3], "id", NULL, NULL, &cold) == 0 &&
-        run_guest(argv[1], argv[2], socket_path, argv[3], "id", NULL, NULL, &served) == 0)
+    if (server < 0) {
+        fprintf(stderr, "forkserver-runner: cold server never published %s (bridge=%s engine=%s)\n", socket_path,
+                argv[1], argv[2]);
+        return 1;
+    }
+    if (run_leg("identity", "cold", argv[1], argv[2], NULL, argv[3], "id", NULL, NULL, &cold) &&
+        run_leg("identity", "served", argv[1], argv[2], socket_path, argv[3], "id", NULL, NULL, &served))
         identity = same(&cold, &served) && WIFEXITED(cold.status) && WEXITSTATUS(cold.status) == 42;
     if (!identity) report_difference("identity", &cold, &served);
-    if (run_guest(argv[1], argv[2], NULL, argv[3], "stdin", NULL, "forkserver-stdin\n", &cold) == 0 &&
-        run_guest(argv[1], argv[2], socket_path, argv[3], "stdin", NULL, "forkserver-stdin\n", &served) == 0)
+    if (run_leg("stdio", "cold", argv[1], argv[2], NULL, argv[3], "stdin", NULL, "forkserver-stdin\n", &cold) &&
+        run_leg("stdio", "served", argv[1], argv[2], socket_path, argv[3], "stdin", NULL, "forkserver-stdin\n",
+                &served))
         stdio = same(&cold, &served) && WIFEXITED(cold.status) && WEXITSTATUS(cold.status) == 0;
     if (!stdio) report_difference("stdio", &cold, &served);
-    if (run_guest(argv[1], argv[2], NULL, argv[3], "exit", "17", NULL, &cold) == 0 &&
-        run_guest(argv[1], argv[2], socket_path, argv[3], "exit", "17", NULL, &served) == 0)
+    if (run_leg("exit", "cold", argv[1], argv[2], NULL, argv[3], "exit", "17", NULL, &cold) &&
+        run_leg("exit", "served", argv[1], argv[2], socket_path, argv[3], "exit", "17", NULL, &served))
         exitcode = same(&cold, &served) && WIFEXITED(cold.status) && WEXITSTATUS(cold.status) == 17;
     if (!exitcode) report_difference("exit", &cold, &served);
-    if (run_guest(argv[1], argv[2], NULL, argv[3], "segv", NULL, NULL, &cold) == 0 &&
-        run_guest(argv[1], argv[2], socket_path, argv[3], "segv", NULL, NULL, &served) == 0) {
+    if (run_leg("fatal", "cold", argv[1], argv[2], NULL, argv[3], "segv", NULL, NULL, &cold) &&
+        run_leg("fatal", "served", argv[1], argv[2], socket_path, argv[3], "segv", NULL, NULL, &served)) {
         int macho = engine_is_macho(argv[2]);
         int content_ok = macho ? cold.size == served.size
                                : (cold.size == served.size && memcmp(cold.output, served.output, cold.size) == 0);
@@ -193,9 +220,12 @@ int main(int argc, char **argv) {
     stop_server(server, socket_path);
 
     server = start_server(argv[1], argv[2], socket_path, argv[3]);
-    if (server < 0) return 1;
-    if (run_guest(argv[1], argv[2], socket_path, argv[3], "id", NULL, NULL, &warm1) == 0 &&
-        run_guest(argv[1], argv[2], socket_path, argv[3], "id", NULL, NULL, &warm2) == 0)
+    if (server < 0) {
+        fprintf(stderr, "forkserver-runner: prewarmed server never published %s (guest=%s)\n", socket_path, argv[3]);
+        return 1;
+    }
+    if (run_leg("warm", "first", argv[1], argv[2], socket_path, argv[3], "id", NULL, NULL, &warm1) &&
+        run_leg("warm", "second", argv[1], argv[2], socket_path, argv[3], "id", NULL, NULL, &warm2))
         warm = same(&warm1, &warm2) && WIFEXITED(warm1.status) && WEXITSTATUS(warm1.status) == 42;
     if (!warm) report_difference("warm", &warm1, &warm2);
     stop_server(server, socket_path);
@@ -203,8 +233,13 @@ int main(int argc, char **argv) {
              stdio, exitcode, fatal, warm);
     fputs(summary, stdout);
     golden = fopen(argv[4], "r");
-    if (golden == NULL || fgets(expected, sizeof expected, golden) == NULL || fclose(golden) != 0 ||
-        strcmp(summary, expected) != 0)
+    if (golden == NULL || fgets(expected, sizeof expected, golden) == NULL || fclose(golden) != 0) {
+        fprintf(stderr, "forkserver-runner: cannot read golden %s (%s)\n", argv[4], strerror(errno));
         return 1;
+    }
+    if (strcmp(summary, expected) != 0) {
+        fprintf(stderr, "forkserver-runner: summary mismatch\n  got:  %s  want: %s", summary, expected);
+        return 1;
+    }
     return identity && stdio && exitcode && fatal && warm ? 0 : 1;
 }
