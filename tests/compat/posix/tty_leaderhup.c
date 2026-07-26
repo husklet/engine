@@ -64,7 +64,7 @@ int main(void) {
         tcsetpgrp(s, w);                   // W is foreground
         char go='G'; if (write(rdy[1], &go, 1) != 1) _exit(6);
         usleep(30000);
-        _exit(0);                          // controlling-process death -> SIGHUP+SIGCONT to W
+        _exit(0);                          // controlling-process death -> SIGHUP to W's group
     }
     close(out[1]); close(rdy[0]); close(rdy[1]); close(ack[0]); close(ack[1]);
     unsigned char res = 0;
