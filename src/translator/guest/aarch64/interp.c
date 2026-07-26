@@ -1151,12 +1151,122 @@ static int interp_exec_branch_system(struct cpu *cpu, uint32_t insn) {
         return INTERP_END;
     }
 
-    // TODO(amd64-host): system register access. MRS/MSR (0xD51x/0xD53x) is the remaining hole that a real
-    // guest hits almost immediately -- TPIDR_EL0 is the thread pointer, and CTR_EL0/DCZID_EL0 must be
-    // answered from g_aarch64_cpu_model (cpu.h) rather than from the host, or the guest learns about host
-    // cache geometry and CPU features the engine never advertised. See translate.c's handling of each.
+    // ---- DC ZVA: zero the data cache block containing Xt ----
+    // The block size is the one the guest was TOLD about via DCZID_EL0, not the host's. The JIT lowers this to
+    // four explicit 16-byte stores for exactly that reason: copying the opcode verbatim would clear whatever
+    // the host CPU's block size happens to be, and a runtime that places live metadata immediately after a
+    // zeroed block then sees it corrupted. g_aarch64_cpu_model.dczid_el0 == 4 advertises 2^4 words = 64 bytes,
+    // so 64 bytes is what gets zeroed.
+    if ((insn & 0xFFFFFFE0u) == 0xD50B7420u) {
+        uint64_t address = interp_gpr(cpu, (int)(insn & 31)) & ~UINT64_C(63);
+        for (unsigned offset = 0; offset < 64u; offset += 8)
+            interp_store_bits(address + offset, 0, 8);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // ---- MSR (immediate): DAIFSet / DAIFClr and the other PSTATE fields ----
+    // Interrupt masking is an EL1 concept with no meaning for an emulated EL0 process, so these are no-ops --
+    // which is also what they effectively are for a Linux user-space program that executes them at all.
+    if ((insn & 0xFFF8F01Fu) == 0xD500401Fu) {
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // ---- MRS / MSR: system register access ----
+    // Every value handed to the guest here comes from g_aarch64_cpu_model (cpu.h) or from emulated state, never
+    // from the host CPU. That is a security property, not a convenience: this is an x86-64 host, so a host
+    // register read is not merely wrong but meaningless, and even on an AArch64 host forwarding an ID register
+    // leaks the real CPU and can make a guest JIT emit extensions the engine never advertised.
+    if ((insn & 0xFFD00000u) == 0xD5100000u) {
+        int rt = (int)(insn & 31);
+        uint32_t reg = insn & 0xFFFFFFE0u;
+        int is_read = (insn & 0x00200000u) != 0; // bit 21 is L: 1 = MRS, 0 = MSR
+
+        // The EL1 ID-register space (op0 == 3, op1 == 0). HWCAP_CPUID is deliberately absent from the model, so
+        // these are architecturally inaccessible at EL0; the JIT answers 0 rather than trapping, because a
+        // trap here is far more disruptive to a guest that probes optimistically than a zero is.
+        // Mask spelled exactly as translate.c's (0xFFFF0000 == 0xD5380000, i.e. op0 == 3 && op1 == 0 && CRn == 0)
+        // so the two backends deny precisely the same register set. A guest's ifunc resolver branches on these,
+        // so a broader or narrower gate here would make the same binary take a different path per backend.
+        if (is_read && (insn & 0xFFFF0000u) == 0xD5380000u && !g_aarch64_cpu_model.user_id_registers) {
+            interp_set_gpr(cpu, rt, 0);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        switch (reg) {
+        case 0xD53B0020u: // MRS CTR_EL0 -- cache type. IDC=1/DIC=0 describe THIS translator's coherence model:
+                          // no data-cache clean is needed before we re-read a guest's written bytes, but the
+                          // guest must keep issuing `ic ivau` because that is the engine's SMC interception
+                          // point. 64-byte I/D lines.
+            interp_set_gpr(cpu, rt, g_aarch64_cpu_model.ctr_el0);
+            break;
+        case 0xD53B00E0u: // MRS DCZID_EL0 -- the DC ZVA block size the guest may rely on (see DC ZVA above)
+            interp_set_gpr(cpu, rt, g_aarch64_cpu_model.dczid_el0);
+            break;
+        case 0xD53BD040u: // MRS TPIDR_EL0 -- the thread pointer, which the engine emulates in cpu->tls
+            interp_set_gpr(cpu, rt, cpu->tls);
+            break;
+        case 0xD51BD040u: // MSR TPIDR_EL0
+            cpu->tls = interp_gpr(cpu, rt);
+            break;
+        case 0xD53BD060u: // MRS TPIDRRO_EL0 -- read-only alias; the engine keeps one thread pointer
+            interp_set_gpr(cpu, rt, cpu->tls);
+            break;
+        case 0xD53B4200u: // MRS NZCV
+            interp_set_gpr(cpu, rt, cpu->nzcv & (INTERP_NZCV_N | INTERP_NZCV_Z | INTERP_NZCV_C | INTERP_NZCV_V));
+            break;
+        case 0xD51B4200u: // MSR NZCV -- only the four condition flags are writable
+            cpu->nzcv = interp_gpr(cpu, rt) & (INTERP_NZCV_N | INTERP_NZCV_Z | INTERP_NZCV_C | INTERP_NZCV_V);
+            break;
+        case 0xD53B4220u: // MRS DAIF -- no interrupts are masked from an emulated EL0's point of view
+            interp_set_gpr(cpu, rt, 0);
+            break;
+        case 0xD51B4220u: // MSR DAIF -- see the MSR-immediate note above
+            break;
+        case 0xD53B4400u: // MRS FPCR
+            interp_set_gpr(cpu, rt, g_interp_fpcr);
+            break;
+        case 0xD51B4400u: // MSR FPCR
+            // Stored so a read-modify-write round-trips (glibc's fesetround does exactly that), but it does not
+            // yet CHANGE anything: no floating-point arithmetic is implemented, so there is no rounding mode or
+            // exception trap for it to control. Whoever implements scalar FP must consume this.
+            g_interp_fpcr = interp_gpr(cpu, rt);
+            break;
+        case 0xD53B4420u: // MRS FPSR
+            interp_set_gpr(cpu, rt, g_interp_fpsr);
+            break;
+        case 0xD51B4420u: // MSR FPSR
+            g_interp_fpsr = interp_gpr(cpu, rt);
+            break;
+        case 0xD53BE000u: // MRS CNTFRQ_EL0 -- the counter frequency the guest should assume
+            // 1 GHz, chosen so that the counter below IS a nanosecond count. Any other frequency would force a
+            // scaling step whose rounding the guest could observe drifting against clock_gettime, which is
+            // served from the same host monotonic clock.
+            interp_set_gpr(cpu, rt, UINT64_C(1000000000));
+            break;
+        case 0xD53BE020u: // MRS CNTPCT_EL0 (physical counter)
+        case 0xD53BE040u: // MRS CNTVCT_EL0 (virtual counter)
+        case 0xD53BE0C0u: // MRS CNTVCTSS_EL0 (self-synchronising virtual counter)
+            // The same host monotonic clock the engine answers clock_gettime from, in nanoseconds, matching the
+            // 1 GHz frequency reported above. Sharing one source is what keeps a guest that cross-checks the
+            // counter against clock_gettime (every runtime with its own fast clock does) from seeing time move
+            // backwards between the two.
+            interp_set_gpr(cpu, rt, now_ns());
+            break;
+        default:
+            // An unmodelled register. Reporting rather than guessing is the right default here: silently
+            // answering 0 for a register the guest actually depends on produces a failure arbitrarily far from
+            // its cause, and the report names the exact encoding so the model can be extended deliberately.
+            return interp_undefined(cpu, insn, "system -- unmodelled system register (MRS/MSR)");
+        }
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // ---- The remaining SYS/SYSL cache and TLB maintenance space ----
     if ((insn & 0xFFC00000u) == 0xD5000000u)
-        return interp_undefined(cpu, insn, "system -- MRS/MSR/SYS register access");
+        return interp_undefined(cpu, insn, "system -- SYS/SYSL maintenance operation");
 
     return interp_undefined(cpu, insn, "branches, exception generating and system -- unallocated encoding");
 }
@@ -1354,6 +1464,15 @@ static __thread uint64_t g_interp_monitor_value2; // second register of an LDXP
 static void interp_monitor_clear(void) {
     g_interp_monitor_valid = 0;
 }
+
+// FPCR/FPSR. Per-thread, and deliberately NOT in struct cpu -- that layout is the checkpoint format and is
+// shared with the JIT, which does not model these fields either (it lets emitted code use the host's real
+// FPCR, which is only meaningful when the host is AArch64). Held here so a read-modify-write round-trips,
+// which is what glibc's fesetround/fegetround do, but NOT ACTED ON: no floating-point arithmetic is
+// implemented in this backend yet, so there is no rounding mode or exception trap for them to control.
+// Whoever implements scalar FP must start by consuming these rather than adding a second copy.
+static __thread uint64_t g_interp_fpcr;
+static __thread uint64_t g_interp_fpsr;
 
 // A guest data fault this backend detects itself, rather than by taking a host signal: a misaligned atomic,
 // which the architecture defines as an alignment fault. Routed through the same reason the JIT's inline
