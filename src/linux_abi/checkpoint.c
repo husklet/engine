@@ -5370,6 +5370,14 @@ static int ckpt_restore_tree(const char *rootfs) {
     char *pubargv[2] = {(char *)(exe[0] ? exe : "guest"), NULL};
     proc_reg_publish(g_exe_path, 1, pubargv);
 
+    // Re-create the init's OWN process group. Restore re-forks the init under the launcher, so it starts in
+    // the launcher's group, while at capture it led its own (an interactive shell's job-control setup does
+    // setpgid(0,1), which it never repeats after resume). Uncorrected, the guest pgid 1 -> g_init_hostpid
+    // translation names a group the shell is not in: its tcsetpgrp handoff after a foreground job puts the
+    // terminal's foreground on that empty group, its next read on the ctty is a background read, and with
+    // SIGTTIN blocked that read fails EIO -- readline reports EOF and the shell logs out after one line.
+    // Only the GROUP is re-created: the session belongs to the launcher, which owns the pty.
+    if (im.pgid_gpid == 1) (void)setpgid(0, 0);
     // Publish which guest group owned the tty foreground, so whichever re-forked process is that group's leader
     // claims the controlling terminal AFTER it re-creates its group (see ckpt_claim_tty_fg). Set before the fork
     // so every child inherits it. Without this the resumed tree's fg group defaults to the init's, and a tty
