@@ -2888,6 +2888,8 @@ void hl_x86_sse_run(const hl_x86_avx_state *state, struct cpu *c) {
                 uint64_t a = avx_ea(state, c, &I, next, nb);
                 v = 0;
                 (void)avx_memory_read(state, a, &v, (size_t)nb);
+            } else if (nb == 1 && !I.has_rex && I.rm_reg >= 4 && I.rm_reg <= 7) {
+                v = (c->r[I.rm_reg - 4] >> 8) & 0xff; // no REX: r/m8 4..7 is AH/CH/DH/BH, not SPL/BPL/SIL/DIL
             } else {
                 v = c->r[I.rm_reg];
             }

@@ -228,6 +228,20 @@ static uint64_t interp_lea_value(const struct cpu *cpu, const struct insn *insn,
     return interp_ea(cpu, insn, next);
 }
 
+// The one baked immediate hl rebases, and the opposite obligation to interp_lea_value above: V8's
+// embedded-builtins CODE base (v8_Default_embedded_blob_code_, recorded at load) is range-checked against
+// HIGH return addresses, so this constant alone must materialise HIGH. Exact-value match -> inert for every
+// other constant, every PIE image and every non-V8 image. Returns 1 when it fired, and then the write is
+// 64-bit whatever the operand size: the biased value does not fit the 32-bit form that usually carries it.
+// Register destinations only. Must stay byte-for-byte lower/mov.c's (findings 3.11).
+static int interp_mov_imm_rebase(const struct insn *insn, uint64_t *value) {
+    if (insn->opsize == 2 || !g_nonpie_blob_code) return 0;
+    uint64_t raw = insn->opsize == 8 ? *value : (uint64_t)(uint32_t)*value;
+    if (raw != g_nonpie_blob_code) return 0;
+    *value = raw + g_nonpie_bias;
+    return 1;
+}
+
 // ---- The flag substrate: x86 EFLAGS on ARM NZCV in cpu->nzcv plus side lanes, fixed by the checkpoint
 // format and signal.c's converters.
 //   bit 31 N = SF, bit 30 Z = ZF, bit 28 V = OF, bit 29 C = NOT x86 CF (ARM's borrow convention)
@@ -752,8 +766,28 @@ static int interp_divide(struct cpu *cpu, uint64_t divisor, int width, int is_si
         return interp_exit(cpu, pc, reason);
     }
     if (width == 8) {
+        // Quotient overflow is decided HERE, not by the dispatcher's own overflow arm, for two reasons.
+        // Linux reports FPE_INTDIV for the #DE trap whatever raised it -- verified against hardware, and
+        // it is already what every narrower width below produces -- while that arm queues FPE_INTOVF. And
+        // its signed check divides first, so RDX:RAX == INT128_MIN over -1 would trap the ENGINE's own
+        // idiv before it could rule. divop == 0 is the #DE marker; the fault reports the DIV's own pc.
+        int overflow;
+        if (!is_signed) {
+            overflow = cpu->r[RDX] >= divisor;
+        } else if ((int64_t)divisor == -1) {
+            __int128 numerator = ((__int128)(int64_t)cpu->r[RDX] << 64) | cpu->r[RAX];
+            overflow = numerator < -(__int128)INT64_MAX || numerator > -(__int128)INT64_MIN;
+        } else {
+            __int128 numerator = ((__int128)(int64_t)cpu->r[RDX] << 64) | cpu->r[RAX];
+            __int128 quotient = numerator / (int64_t)divisor;
+            overflow = (__int128)(int64_t)quotient != quotient;
+        }
+        if (overflow) {
+            cpu->divop = 0;
+            return interp_exit(cpu, pc, reason);
+        }
         cpu->divop = divisor;
-        return interp_exit(cpu, next, reason); // 128/64 in the dispatcher, quotient overflow included
+        return interp_exit(cpu, next, reason); // the 128/64 division itself stays in the dispatcher
     }
     unsigned bits = (unsigned)(8 * width);
     uint64_t m = interp_mask(width);
@@ -875,6 +909,13 @@ static int interp_step(struct cpu *cpu, struct insn *insn, uint64_t pc, uint64_t
 // safepoints) at block granularity.
 static void interp_execute(struct cpu *cpu) {
     for (;;) {
+        // Non-PIE fold, AGAIN. core/dispatch.c folds a low link-vaddr PC into the biased image once per
+        // iteration, but G_DISPATCH_DEBUG runs AFTER it and delivers a queued signal -- and the handler
+        // address the guest registered is a LOW vaddr, so that redirect lands here unfolded and the fetch
+        // faults the guest with a SIGSEGV it never earned. Rare (the window is a few instructions wide) and
+        // fatal: ~1 in 10^3 async deliveries under a 2 ms itimer. Folding at the point of execution is the
+        // one place no ordering can outrun.
+        if (g_nonpie_lo && cpu->rip >= g_nonpie_lo && cpu->rip < g_nonpie_hi) cpu->rip += g_nonpie_bias;
         uint64_t pc = cpu->rip; // a fault below reports precisely this PC
         struct insn insn;
         if (hl_x86_decode(pc, &insn) < 0) {
@@ -1371,10 +1412,13 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
     case 0xBC:
     case 0xBD:
     case 0xBE:
-    case 0xBF:
-        interp_reg_write(cpu, insn, (op & 7) | (insn->rexB << 3), insn->opsize, (uint64_t)insn->imm);
+    case 0xBF: {
+        uint64_t value = (uint64_t)insn->imm;
+        int width = interp_mov_imm_rebase(insn, &value) ? 8 : insn->opsize;
+        interp_reg_write(cpu, insn, (op & 7) | (insn->rexB << 3), width, value);
         cpu->rip = next;
         return STEP_NEXT;
+    }
 
     // Group 2: C0/C1 by imm8, D0/D1 by 1, D2/D3 by CL. /2 and /3 are RCL/RCR, reduced modulo width+1.
     case 0xC0:
@@ -1464,7 +1508,9 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
         if ((insn->reg & 7) != 0) return interp_undefined(cpu, insn, pc, "group 11 opcode other than MOV r/m,imm");
         int width = (op & 1) ? insn->opsize : 1;
         interp_operand operand = interp_rm(cpu, insn, next);
-        interp_rm_write(cpu, insn, &operand, width, (uint64_t)insn->imm);
+        uint64_t value = (uint64_t)insn->imm;
+        if (op == 0xC7 && !insn->is_mem && interp_mov_imm_rebase(insn, &value)) width = 8;
+        interp_rm_write(cpu, insn, &operand, width, value);
         cpu->rip = next;
         return STEP_NEXT;
     }
@@ -2007,6 +2053,10 @@ static unsigned interp_fp_source_bytes(uint8_t op, int prefix) {
     if (op == 0xE6 && prefix == SSE_F2) return 16; // CVTPD2DQ: PACKED despite the F2 prefix
     if (op == 0x5B) return 16;                     // CVTDQ2PS / CVTPS2DQ / CVTTPS2DQ: 4-lane
     if (op == 0x7C || op == 0x7D || op == 0xD0) return 16; // HADD/HSUB/ADDSUB: packed under 66 AND F2
+    // The MMX conversions (no F2/F3): CVTPI2PS/PD read mm/m64, CVTP{S,T}2PI read xmm/m64, and only the
+    // 66 forms of 2C/2D (CVT[T]PD2PI) read a full m128.
+    if (op == 0x2A && !interp_fp_is_scalar(prefix)) return 8;
+    if ((op == 0x2C || op == 0x2D) && prefix == SSE_NP) return 8;
     if (!interp_fp_is_scalar(prefix)) return 16;
     return interp_fp_is_double(prefix) ? 8u : 4u;
 }
@@ -2026,6 +2076,22 @@ static __m128d interp_fp_get_pd(const uint8_t image[16]) {
 static __m128i interp_fp_get_dq(const uint8_t image[16]) {
     __m128i value;
     memcpy(&value, image, 16);
+    return value;
+}
+
+// SPECULATION BARRIER. The host MXCSR is the guest MXCSR, so a host FP instruction the guest did not
+// execute is guest-visible: GCC if-converts `truncating ? _mm_cvttps_epi32(v) : _mm_cvtps_epi32(v)` into
+// BOTH instructions plus a select, and the not-taken one ORs its own #I/#P into the flags the guest is
+// about to read (observed: cvtpd2dq hoisted over the CVTPS2PI branch, reinterpreting two floats as one
+// double). Passing the operand through an asm volatile pins the conversion inside its arm. Only the
+// conversions need this -- an arm chosen by the PREFIX (0x5A/0x5B/0xE6) is a separate basic block already.
+static __m128 interp_fp_opaque_ps(__m128 value) {
+    __asm__ volatile("" : "+x"(value));
+    return value;
+}
+
+static __m128d interp_fp_opaque_pd(__m128d value) {
+    __asm__ volatile("" : "+x"(value));
     return value;
 }
 
@@ -2097,10 +2163,40 @@ static int interp_step_sse_fp(struct cpu *cpu, struct insn *insn, uint64_t pc, u
     unsigned source_bytes = interp_fp_source_bytes(op, prefix);
     uint8_t d[16], s[16];
 
-    // 0x2A/0x2C/0x2D name an MMX operand unless the prefix makes them scalar. The mm file exists (see
-    // interp_mm_get) but these are the only MMX forms that also need MXCSR-controlled conversion.
-    if ((op == 0x2A || op == 0x2C || op == 0x2D) && !scalar)
-        return interp_undefined(cpu, insn, pc, "TODO(amd64-host): MMX CVTPI2P* / CVTP*2PI");
+    // 0x2A/0x2C/0x2D name an MMX operand unless the prefix makes them scalar: CVTPI2PS/PD and
+    // CVT[T]PS2PI / CVT[T]PD2PI. Same host-intrinsic rule as the xmm conversions -- rounding is MXCSR.RC
+    // for 2D and truncation for 2C, and the out-of-range/NaN result is hardware's integer indefinite.
+    // The unused high lanes of the 4-wide intrinsics are fed ZEROES (interp_*_rm_get clears the tail), not
+    // the source's own upper half: a NaN parked there would raise #IE the guest instruction never raises.
+    if ((op == 0x2A || op == 0x2C || op == 0x2D) && !scalar) {
+        uint8_t result[16] = {0};
+        if (op == 0x2A) { // xmm := two int32 from mm/m64
+            interp_simd_rm_get(cpu, insn, 1 /*mmx*/, next, s);
+            interp_xmm_get(cpu, destination, d);
+            if (dbl) {
+                interp_fp_put_pd(d, _mm_cvtepi32_pd(interp_fp_get_dq(s))); // CVTPI2PD writes all 128 bits
+            } else {
+                interp_fp_put_ps(result, _mm_cvtepi32_ps(interp_fp_get_dq(s)));
+                memcpy(d, result, 8); // CVTPI2PS merges: upper 64 bits of the destination are preserved
+            }
+            interp_xmm_put(cpu, destination, d);
+        } else { // mm := two int32 from xmm/m64 (NP) or xmm/m128 (66)
+            // One arm per conversion, each with its own interp_fp_opaque_*: without the barrier the
+            // not-taken conversion runs too, into the guest's MXCSR.
+            interp_sse_rm_get(cpu, insn, next, source_bytes, s);
+            if (dbl && op == 0x2C)
+                interp_fp_put_dq(result, _mm_cvttpd_epi32(interp_fp_opaque_pd(interp_fp_get_pd(s))));
+            else if (dbl)
+                interp_fp_put_dq(result, _mm_cvtpd_epi32(interp_fp_opaque_pd(interp_fp_get_pd(s))));
+            else if (op == 0x2C)
+                interp_fp_put_dq(result, _mm_cvttps_epi32(interp_fp_opaque_ps(interp_fp_get_ps(s))));
+            else
+                interp_fp_put_dq(result, _mm_cvtps_epi32(interp_fp_opaque_ps(interp_fp_get_ps(s))));
+            interp_mm_put(cpu, destination, result);
+        }
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
     // RSQRT and RCP are single-precision only; there is no RSQRTPD/RCPSD encoding to reach.
     if ((op == 0x52 || op == 0x53) && dbl) return interp_undefined(cpu, insn, pc, "reserved (no RSQRTPD/RCPPD)");
 
@@ -2594,14 +2690,18 @@ static void interp_x87_remainder(struct cpu *cpu, int ieee) {
 }
 
 // FCW@0, FSW@4, FTW@8, pointers @12..24. No per-register tags: FTW all-empty, ignored on load.
+// FNSTENV writes ALL 28 bytes of the 32-bit protected-mode image, including the upper half of each of the
+// three 16-bit words, which hardware fills with 0xffff -- 2-byte stores left the guest's own prior bytes
+// there. Still unmodelled and therefore zero: FIP/FCS/FOP/FDP/FDS (no FPU instruction pointer here) and a
+// tag word that is always "all empty" (there is no tag word; see the FFREE arm).
 static void interp_x87_store_environment(struct cpu *cpu, uint64_t address) {
-    interp_store(address + 0, 2, cpu->fpcw & 0xffff);
-    interp_store(address + 4, 2, interp_x87_status_word(cpu));
-    interp_store(address + 8, 2, 0xffff);
+    interp_store(address + 0, 4, 0xffff0000u | (cpu->fpcw & 0xffff));
+    interp_store(address + 4, 4, 0xffff0000u | interp_x87_status_word(cpu));
+    interp_store(address + 8, 4, 0xffffffffu);
     interp_store(address + 12, 4, 0);
     interp_store(address + 16, 4, 0);
     interp_store(address + 20, 4, 0);
-    interp_store(address + 24, 4, 0);
+    interp_store(address + 24, 4, 0xffff0000u);
 }
 
 static void interp_x87_load_environment(struct cpu *cpu, uint64_t address) {
@@ -3366,9 +3466,26 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
         return STEP_NEXT;
     }
 
-    // MOVQ xmm/m64 store
+    // 0F D6: MOVQ xmm/m64, xmm (66) / MOVQ2DQ xmm, mm (F3) / MOVDQ2Q mm, xmm (F2). The prefix picks which
+    // REGISTER FILE each side names, so ignoring it wrote the right bytes to the wrong place. F3/F2 name a
+    // register-only operand (Nq / Uq) and NP 0F D6 has no encoding at all: both are #UD, verified native.
     case 0xD6: {
         uint8_t half[16] = {0};
+        if (prefix == SSE_NP || (insn->is_mem && prefix != SSE_66))
+            return interp_guest_trap(cpu, pc, 4 /*SIGILL*/, 2 /*ILL_ILLOPN*/);
+        if (prefix == SSE_F3) { // MOVQ2DQ: xmm := mm, upper 64 bits zeroed
+            interp_mm_get(cpu, insn->rm_reg, half);
+            interp_xmm_put(cpu, destination, half);
+            cpu->rip = next;
+            return STEP_NEXT;
+        }
+        if (prefix == SSE_F2) { // MOVDQ2Q: mm := xmm low 64
+            interp_xmm_get(cpu, insn->rm_reg, s);
+            memcpy(half, s, 8);
+            interp_mm_put(cpu, destination, half);
+            cpu->rip = next;
+            return STEP_NEXT;
+        }
         interp_xmm_get(cpu, destination, d);
         memcpy(half, d, 8);
         if (insn->is_mem) {
