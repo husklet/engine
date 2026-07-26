@@ -132,8 +132,9 @@ static int wait_child(pid_t pid, time_t deadline) {
     return 124;
 }
 
+/* `policy` is the --restore-policy argument, or NULL to leave the policy unset (the permissive default). */
 static pid_t launch(const char *engine, const char *guest, const char *release,
-                    const char *output, const char *checkpoint, int restore, int permissive,
+                    const char *output, const char *checkpoint, int restore, const char *policy,
                     const char *guest_mode) {
     pid_t pid = fork();
     if (pid != 0) return pid;
@@ -143,15 +144,15 @@ static pid_t launch(const char *engine, const char *guest, const char *release,
         if (fd < 0 || dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0) _exit(126);
         if (fd != STDOUT_FILENO) close(fd);
     }
-    if (restore && permissive)
-        execl(engine, engine, "--restore-policy", "discard-optional", "--restore", checkpoint, (char *)NULL);
+    if (restore && policy)
+        execl(engine, engine, "--restore-policy", policy, "--restore", checkpoint, (char *)NULL);
     else if (restore)
         execl(engine, engine, "--restore", checkpoint, (char *)NULL);
-    else if (permissive && guest_mode)
-        execl(engine, engine, "--restore-policy", "discard-optional", "--checkpoint", checkpoint, guest,
+    else if (policy && guest_mode)
+        execl(engine, engine, "--restore-policy", policy, "--checkpoint", checkpoint, guest,
               release, guest_mode, (char *)NULL);
-    else if (permissive)
-        execl(engine, engine, "--restore-policy", "discard-optional", "--checkpoint", checkpoint, guest,
+    else if (policy)
+        execl(engine, engine, "--restore-policy", policy, "--checkpoint", checkpoint, guest,
               release, (char *)NULL);
     else if (guest_mode)
         execl(engine, engine, "--checkpoint", checkpoint, guest, release, guest_mode, (char *)NULL);
@@ -211,14 +212,18 @@ int main(int argc, char **argv) {
                                 !strcmp(argv[3], "io-permission") || !strcmp(argv[3], "io-missing-root") ||
                                 !strcmp(argv[3], "io-append") || !strcmp(argv[3], "io-shortened") ||
                                 !strcmp(argv[3], "io-repeat") || !strcmp(argv[3], "io-directory-change") ||
-                                !strcmp(argv[3], "io-missing-child-strict") || !strcmp(argv[3], "io-fifo-refusal") ||
+                                !strcmp(argv[3], "io-missing-child-strict") ||
+                                !strcmp(argv[3], "io-missing-child-default") ||
+                                !strcmp(argv[3], "io-fifo-refusal") ||
                                 !strcmp(argv[3], "io-queued-device") || !strcmp(argv[3], "io-queued-missing"));
     int backward_v2_case = argc == 5 && !strcmp(argv[3], "backward-v2");
     const char *capture_engine = backward_v2_case ? argv[4] : argv[1];
     const char *guest_mode = io_case ? argv[3] + 3 : NULL;
     int io_capture_refusal = io_case && !strcmp(guest_mode, "fifo-refusal");
     int io_strict_restore = io_case && !strcmp(guest_mode, "missing-child-strict");
-    if (io_case && !io_capture_refusal && !io_strict_restore) permissive_case = 1;
+    /* Same image as the strict case, restored with no policy at all: the default must prune, not refuse. */
+    int io_default_restore = io_case && !strcmp(guest_mode, "missing-child-default");
+    if (io_case && !io_capture_refusal && !io_strict_restore && !io_default_restore) permissive_case = 1;
     if ((argc != 3 && !backward_v2_case && !pipe_case && !deleted_case && !threads_case && !memfd_case && !eventfd_case &&
          !timerfd_case && !inotify_case && !epoll_case && !socketpair_case && !socket_state_case &&
          !connected_socket_case && !signal_case && !connecting_refusal_case && !connecting_fallback_case && !corrupt_magic_case &&
@@ -244,14 +249,17 @@ int main(int argc, char **argv) {
     snprintf(release, sizeof release, "%s/release", temporary);
     snprintf(release_error, sizeof release_error, "%s.error", release);
 
-    child = launch(capture_engine, argv[2], release, output, checkpoint, 0, permissive_case, guest_mode);
+    child = launch(capture_engine, argv[2], release, output, checkpoint, 0,
+                   permissive_case ? "discard-optional" : NULL, guest_mode);
     if (child < 0) return 3;
     if (wait_for_ready(output, (deleted_case || threads_case || memfd_case || inotify_case || epoll_case ||
                                 signal_case || connecting_refusal_case || connecting_fallback_case || modified_external_case ||
                                 (io_case && strcmp(guest_mode, "type-change") && strcmp(guest_mode, "permission") &&
-                                 strcmp(guest_mode, "directory-change") && strcmp(guest_mode, "missing-child-strict"))) ? 1 :
+                                 strcmp(guest_mode, "directory-change") && strcmp(guest_mode, "missing-child-strict") &&
+                                 strcmp(guest_mode, "missing-child-default"))) ? 1 :
                                    (socketpair_case || connected_socket_case) ? 2 : socket_state_case ? 1 :
-                                   (pipe_case || eventfd_case || timerfd_case || permissive_case || io_strict_restore) ? 2 : 3,
+                                   (pipe_case || eventfd_case || timerfd_case || permissive_case || io_strict_restore ||
+                                    io_default_restore) ? 2 : 3,
                        time(NULL) + TIMEOUT_SECONDS) != 0) {
         fprintf(stderr, "checkpoint runner: readiness timeout one=%d two=%d three=%d\n",
                 output_has(output, "READY 1"), output_has(output, "READY 2"), output_has(output, "READY 3"));
@@ -326,7 +334,8 @@ int main(int argc, char **argv) {
             if (unlink(external) != 0) return 7;
         } else if (!strcmp(guest_mode, "queued-missing")) {
             if (unlink(external) != 0) return 7;
-        } else if (!strcmp(guest_mode, "missing-child-strict")) {
+        } else if (!strcmp(guest_mode, "missing-child-strict") ||
+                   !strcmp(guest_mode, "missing-child-default")) {
             if (unlink(external) != 0) return 7;
         } else if (!strcmp(guest_mode, "append")) {
             fd = open(external, O_WRONLY | O_APPEND);
@@ -378,9 +387,25 @@ int main(int argc, char **argv) {
         fd = open(extra, O_WRONLY | O_CREAT | O_EXCL, 0600);
         if (fd < 0 || write(fd, "unexpected", 10) != 10 || fsync(fd) != 0 || close(fd) != 0) return 7;
     }
-    child = launch(argv[1], argv[2], release, output, checkpoint, 1, permissive_case, NULL);
+    child = launch(argv[1], argv[2], release, output, checkpoint, 1,
+                   io_strict_restore ? "refuse" : permissive_case ? "discard-optional" : NULL, NULL);
     if (child < 0) return 8;
     result = wait_child(child, time(NULL) + TIMEOUT_SECONDS);
+    if (io_default_restore) {
+        char report[640];
+        snprintf(report, sizeof report, "%s/RECOVERY.jsonl", checkpoint);
+        if (result != 0 || wait_for_output(output, "IO-PARENT-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
+            output_has(output, "IO-CHILD-RESTORED") || !output_has(report, "\"outcome\":\"stopped\"") ||
+            !output_has(report, "required external")) {
+            fprintf(stderr,
+                    "checkpoint runner: default-policy partial restore result=%d parent=%d child=%d stopped=%d\n",
+                    result, output_has(output, "IO-PARENT-RESTORED"), output_has(output, "IO-CHILD-RESTORED"),
+                    output_has(report, "\"outcome\":\"stopped\""));
+            return 8;
+        }
+        printf("checkpoint io default-policy partial restore: ok\n");
+        return 0;
+    }
     if (io_case && (!strcmp(guest_mode, "missing-root") || !strcmp(guest_mode, "queued-missing"))) {
         char report[640];
         snprintf(report, sizeof report, "%s/RECOVERY.jsonl", checkpoint);
@@ -395,7 +420,7 @@ int main(int argc, char **argv) {
         char report[640];
         snprintf(report, sizeof report, "%s/RECOVERY.jsonl", checkpoint);
         if (result == 0 || result == 124 || !output_has(report, "required external")) return 8;
-        printf("checkpoint io strict missing-child refusal: ok\n");
+        printf("checkpoint io explicit-refuse missing-child refusal: ok\n");
         return 0;
     }
     if (corrupt_magic_case || corrupt_truncated_case || corrupt_content_case || corrupt_missing_case ||
@@ -434,7 +459,8 @@ int main(int argc, char **argv) {
                 return 9;
         }
         if (!strcmp(guest_mode, "repeat")) {
-            child = launch(argv[1], argv[2], release, output, checkpoint, 1, permissive_case, NULL);
+            child = launch(argv[1], argv[2], release, output, checkpoint, 1,
+                           permissive_case ? "discard-optional" : NULL, NULL);
             if (child < 0 || wait_child(child, time(NULL) + TIMEOUT_SECONDS) != 0 ||
                 wait_for_output_count(output, "IO-REPEAT-RESTORED", 2, time(NULL) + TIMEOUT_SECONDS) != 0)
                 return 9;

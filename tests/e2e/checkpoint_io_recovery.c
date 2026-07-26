@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
     }
 
     if (!strcmp(argv[2], "type-change") || !strcmp(argv[2], "permission") ||
-        !strcmp(argv[2], "missing-child-strict")) {
+        !strcmp(argv[2], "missing-child-strict") || !strcmp(argv[2], "missing-child-default")) {
         pid_t child = fork();
         if (child < 0) return 3;
         if (child == 0) {
