@@ -25,6 +25,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Host facts as a ::notice annotation. A gate that passes on a dev host and
+      # fails here differs by environment, and the job-log endpoint needs admin
+      # rights -- so the comparison has to travel through the annotations API.
+      - name: Runner environment
+        timeout-minutes: 5
+        run: tools/ci_env.sh ubuntu-24.04-arm
+
       - uses: DeterminateSystems/nix-installer-action@v22
         with:
           # Disable the post-run install-diagnostic upload: it periodically hangs
