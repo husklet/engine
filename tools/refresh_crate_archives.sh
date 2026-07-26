@@ -1,18 +1,29 @@
 #!/usr/bin/env bash
-# Regenerate BOTH prebuilt crate archives from the current tree and rewrite
+# Regenerate the prebuilt crate archives under pkgs/rust/assets/lib/ and rewrite
 # pkgs/rust/assets/PROVENANCE.md.
 #
 # The crate at pkgs/rust/ never compiles src/: build.rs links the committed
 # archives and `cargo publish` ships those bytes. Run this whenever a C source
 # or header changes, and commit the result together with the source change.
 #
-# Requirements:
-#   * an aarch64 Linux host for the linux-gnu archive;
-#   * an Apple silicon mac for the darwin archive. On a Linux workstation the
-#     mac is reached through the `mac` command bridge (MAC=mac, the default off
-#     Darwin) over the shared /Users/x/dd checkout. If `mac` is unavailable the
-#     compile fails immediately with "mac: command not found" -- there is no
-#     silent fallback and no way to refresh only half the pair.
+# The three halves are independently runnable so no single machine has to be
+# both an aarch64 Linux host and an Apple silicon mac:
+#
+#   --linux       build+install aarch64-unknown-linux-gnu (needs aarch64 Linux)
+#   --darwin      build+install aarch64-apple-darwin (needs Darwin, or the `mac`
+#                 bridge over a shared checkout)
+#   --emit PATH   with --darwin: write the built archive to PATH instead of
+#                 installing it, so it can be carried to another host
+#   --from PATH   with --darwin: install PATH's bytes instead of building
+#   --provenance  rewrite the generated block from the archives already in the
+#                 tree, then run the freshness check
+#
+# No flags means --linux --darwin --provenance, the original one-shot dual-host
+# behaviour.
+#
+# Split flow: on the mac, `--darwin --emit /somewhere/libhl-engine.a`; carry the
+# file over; on the Linux host, `--linux` then `--darwin --from <file>` then
+# `--provenance`.
 set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -23,6 +34,57 @@ cd "$root"
 : "${CMAKE:=cmake}"
 : "${NINJA:=ninja}"
 
+do_linux=0
+do_darwin=0
+do_provenance=0
+darwin_from=
+darwin_emit=
+allow_unvalidated=0
+
+while [ "$#" -gt 0 ]; do
+	case $1 in
+	--linux) do_linux=1 ;;
+	--darwin) do_darwin=1 ;;
+	--provenance) do_provenance=1 ;;
+	--all) do_linux=1 do_darwin=1 do_provenance=1 ;;
+	--from)
+		shift
+		darwin_from=${1:?--from needs a path}
+		;;
+	--emit)
+		shift
+		darwin_emit=${1:?--emit needs a path}
+		;;
+	# Records a darwin archive that this host cannot inspect. The gate in
+	# tools/check_crate_archives.sh still validates it wherever it can run.
+	--allow-unvalidated-darwin) allow_unvalidated=1 ;;
+	-h | --help)
+		sed -n '2,30p' "$0"
+		exit 0
+		;;
+	*)
+		printf 'refresh-crate-archives: unknown argument: %s\n' "$1" >&2
+		exit 2
+		;;
+	esac
+	shift
+done
+
+if [ "$do_linux$do_darwin$do_provenance" = "000" ]; then
+	do_linux=1
+	do_darwin=1
+	do_provenance=1
+fi
+
+if [ -n "$darwin_from" ] && [ -n "$darwin_emit" ]; then
+	printf 'refresh-crate-archives: --from and --emit are mutually exclusive\n' >&2
+	exit 2
+fi
+if [ "$do_darwin" = 0 ] && { [ -n "$darwin_from" ] || [ -n "$darwin_emit" ]; }; then
+	printf 'refresh-crate-archives: --from/--emit require --darwin\n' >&2
+	exit 2
+fi
+
 sha256() {
 	if command -v sha256sum >/dev/null 2>&1; then
 		sha256sum "$@"
@@ -31,79 +93,107 @@ sha256() {
 	fi
 }
 
-if [ "$(uname -s)" != "Darwin" ] && ! command -v "$MAC" >/dev/null 2>&1; then
-	printf 'refresh-crate-archives: the `mac` bridge is required to build the darwin archive\n' >&2
-	printf 'refresh-crate-archives: run this from a host that can reach the mac, or set MAC=<command>\n' >&2
-	exit 1
-fi
-
-linux_build=$BUILD/crate-archive-linux
-mac_build=$BUILD/crate-archive-macos
-
-printf 'refresh-crate-archives: building the linux-gnu archive\n'
-"$CMAKE" -S "$root" -B "$linux_build" -G Ninja -DHL_BUILD_TESTS=OFF
-"$NINJA" -C "$linux_build" hl-engine-activation
-
-printf 'refresh-crate-archives: building the darwin archive (via the mac host)\n'
-if [ "$(uname -s)" = "Darwin" ]; then
-	"$CMAKE" -S "$root" -B "$mac_build" -G Ninja -DHL_BUILD_TESTS=ON
-	"$NINJA" -C "$mac_build" hl-engine-dual
-else
-	"$MAC" zsh -lc '
-		root=$1
-		build=$2
-		cd "$root"
-		nix --extra-experimental-features "nix-command flakes" develop --command sh -c '"'"'
-			root=$1
-			build=$2
-			cmake -S "$root" -B "$build" -G Ninja -DHL_BUILD_TESTS=ON
-			ninja -C "$build" hl-engine-dual
-		'"'"' hl-refresh-inner "$root" "$build"
-	' hl-refresh "$root" "$mac_build"
-fi
+is_darwin() { [ "$(uname -s)" = Darwin ]; }
+have_mac() { command -v "$MAC" >/dev/null 2>&1; }
 
 linux_asset=pkgs/rust/assets/lib/aarch64-unknown-linux-gnu/libhl-engine.a
 darwin_asset=pkgs/rust/assets/lib/aarch64-apple-darwin/libhl-engine.a
-linux_staging=$linux_asset.tmp
-darwin_staging=$darwin_asset.tmp
+linux_build=$BUILD/crate-archive-linux
+mac_build=$BUILD/crate-archive-macos
 
-# Publish and validate through a sibling file, then rename. Most importantly,
-# the Darwin copy, inspection, and rename all happen on the Mac: a Linux copy
-# from the shared mount can race the producer's libtool write and preserve a
-# truncated archive that still has the expected path and provenance.
-install -m 0644 "$linux_build/package/linux-aarch64/libhl-engine.a" "$linux_staging"
-tools/validate_crate_archive.sh aarch64-unknown-linux-gnu "$linux_staging"
-mv -f "$linux_staging" "$linux_asset"
+# Publish through a sibling file, then rename. Most importantly, the Darwin
+# copy, inspection, and rename all happen on the Mac: a Linux copy from the
+# shared mount can race the producer's libtool write and preserve a truncated
+# archive that still has the expected path and provenance.
 
-if [ "$(uname -s)" = "Darwin" ]; then
-	install -m 0644 "$mac_build/package/macos-aarch64/libhl-engine.a" "$darwin_staging"
-	tools/validate_crate_archive.sh aarch64-apple-darwin "$darwin_staging"
-	mv -f "$darwin_staging" "$darwin_asset"
-else
-	"$MAC" install -m 0644 "$mac_build/package/macos-aarch64/libhl-engine.a" "$darwin_staging"
-	"$MAC" tools/validate_crate_archive.sh aarch64-apple-darwin "$darwin_staging"
-	"$MAC" mv -f "$darwin_staging" "$darwin_asset"
+if [ "$do_linux" = 1 ]; then
+	if is_darwin; then
+		printf 'refresh-crate-archives: --linux needs an aarch64 Linux host\n' >&2
+		exit 1
+	fi
+	printf 'refresh-crate-archives: building the linux-gnu archive\n'
+	"$CMAKE" -S "$root" -B "$linux_build" -G Ninja -DHL_BUILD_TESTS=OFF
+	"$NINJA" -C "$linux_build" hl-engine-activation
+	install -m 0644 "$linux_build/package/linux-aarch64/libhl-engine.a" "$linux_asset.tmp"
+	tools/validate_crate_archive.sh aarch64-unknown-linux-gnu "$linux_asset.tmp"
+	mv -f "$linux_asset.tmp" "$linux_asset"
+	tools/validate_crate_archive.sh aarch64-unknown-linux-gnu "$linux_asset"
 fi
 
-# Revalidate the exact final paths that cargo packages and build.rs links.
-tools/validate_crate_archive.sh aarch64-unknown-linux-gnu "$linux_asset"
-tools/validate_crate_archive.sh aarch64-apple-darwin "$darwin_asset"
-
-commit=$(git rev-parse HEAD)
-if ! git diff --quiet -- src include; then
-	commit="$commit (with uncommitted changes under src/ or include/)"
+if [ "$do_darwin" = 1 ] && [ -z "$darwin_from" ]; then
+	printf 'refresh-crate-archives: building the darwin archive\n'
+	if is_darwin; then
+		"$CMAKE" -S "$root" -B "$mac_build" -G Ninja -DHL_BUILD_TESTS=ON
+		"$NINJA" -C "$mac_build" hl-engine-dual
+	elif have_mac; then
+		"$MAC" zsh -lc '
+			root=$1
+			build=$2
+			cd "$root"
+			nix --extra-experimental-features "nix-command flakes" develop --command sh -c '"'"'
+				root=$1
+				build=$2
+				cmake -S "$root" -B "$build" -G Ninja -DHL_BUILD_TESTS=ON
+				ninja -C "$build" hl-engine-dual
+			'"'"' hl-refresh-inner "$root" "$build"
+		' hl-refresh "$root" "$mac_build"
+	else
+		printf 'refresh-crate-archives: --darwin needs Darwin, the `mac` bridge, or --from\n' >&2
+		exit 1
+	fi
+	built=$mac_build/package/macos-aarch64/libhl-engine.a
+	if [ -n "$darwin_emit" ]; then
+		if is_darwin; then
+			install -m 0644 "$built" "$darwin_emit"
+		else
+			"$MAC" install -m 0644 "$root/$built" "$darwin_emit"
+		fi
+		printf 'refresh-crate-archives: emitted %s\n' "$darwin_emit"
+	else
+		darwin_from=$built
+	fi
 fi
-manifest=$(tools/crate_archive_manifest.sh)
-linux_sha=$(sha256 "$linux_asset" | cut -d' ' -f1)
-if [ "$(uname -s)" = "Darwin" ]; then
-	darwin_sha=$(shasum -a 256 "$darwin_asset" | cut -d' ' -f1)
-else
-	darwin_sha=$("$MAC" shasum -a 256 "$darwin_asset" | cut -d' ' -f1)
-fi
-abi=$(sed -n 's/^#define HL_CONFIG_ABI \([0-9]*\).*/\1/p' include/hl/config.h | head -1)
 
-provenance=pkgs/rust/assets/PROVENANCE.md
-python3 - "$provenance" "$commit" "$manifest" "$linux_sha" "$darwin_sha" "$abi" <<'PY'
+if [ "$do_darwin" = 1 ] && [ -n "$darwin_from" ]; then
+	if is_darwin; then
+		install -m 0644 "$darwin_from" "$darwin_asset.tmp"
+		tools/validate_crate_archive.sh aarch64-apple-darwin "$darwin_asset.tmp"
+		mv -f "$darwin_asset.tmp" "$darwin_asset"
+	elif have_mac; then
+		"$MAC" install -m 0644 "$darwin_from" "$root/$darwin_asset.tmp"
+		"$MAC" tools/validate_crate_archive.sh aarch64-apple-darwin "$darwin_asset.tmp"
+		"$MAC" mv -f "$root/$darwin_asset.tmp" "$root/$darwin_asset"
+	elif [ "$allow_unvalidated" = 1 ]; then
+		install -m 0644 "$darwin_from" "$darwin_asset.tmp"
+		mv -f "$darwin_asset.tmp" "$darwin_asset"
+		printf 'refresh-crate-archives: WARNING recorded %s unvalidated; a Darwin\n' "$darwin_asset" >&2
+		printf 'refresh-crate-archives: WARNING host must still run check-crate-archives\n' >&2
+	else
+		printf 'refresh-crate-archives: cannot validate the darwin archive on this host\n' >&2
+		printf 'refresh-crate-archives: install the `mac` bridge, or pass --allow-unvalidated-darwin\n' >&2
+		exit 1
+	fi
+fi
+
+if [ "$do_provenance" = 1 ]; then
+	for asset in "$linux_asset" "$darwin_asset"; do
+		[ -s "$asset" ] || {
+			printf 'refresh-crate-archives: %s is missing; build it first\n' "$asset" >&2
+			exit 1
+		}
+	done
+
+	commit=$(git rev-parse HEAD)
+	if ! git diff --quiet -- src include; then
+		commit="$commit (with uncommitted changes under src/ or include/)"
+	fi
+	manifest=$(tools/crate_archive_manifest.sh)
+	linux_sha=$(sha256 "$linux_asset" | cut -d' ' -f1)
+	darwin_sha=$(sha256 "$darwin_asset" | cut -d' ' -f1)
+	abi=$(sed -n 's/^#define HL_CONFIG_ABI \([0-9]*\).*/\1/p' include/hl/config.h | head -1)
+
+	provenance=pkgs/rust/assets/PROVENANCE.md
+	python3 - "$provenance" "$commit" "$manifest" "$linux_sha" "$darwin_sha" "$abi" <<'PY'
 import sys
 
 path, commit, manifest, linux_sha, darwin_sha, abi = sys.argv[1:7]
@@ -132,5 +222,6 @@ _, _, tail = rest.partition(end)
 open(path, "w", encoding="utf-8").write(head + block + tail)
 PY
 
-printf 'refresh-crate-archives: updated %s\n' "$provenance"
-tools/check_crate_archives.sh
+	printf 'refresh-crate-archives: updated %s\n' "$provenance"
+	tools/check_crate_archives.sh
+fi
