@@ -10,13 +10,12 @@ permissions:
   contents: read
 
 concurrency:
-  # Pending members of one concurrency group are superseded even when
-  # cancel-in-progress is false. Give every main commit its own group so queued
-  # verdicts are preserved too; other refs retain normal ref-level coalescing.
-  group: mac-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
-  # Every commit on main must reach a verdict. Pull requests and other branch
-  # pushes may supersede an older run of the same ref.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  # Ref-level, unlike linux.yml. This lane is admission-bound: shards are 3-7 min
+  # of work but waited hours for a macos runner, so per-SHA groups superseded
+  # nothing and the backlog grew until no commit got a verdict at all. Coalescing
+  # gives up per-commit history for a timely verdict on the tip.
+  group: mac-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # Core build + host-service + gates. Fast (~30-40min); no compat corpus here.

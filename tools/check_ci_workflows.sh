@@ -181,18 +181,27 @@ invariants)
 		exit 1
 	fi
 
-	for workflow in "$wfdir/linux.yml" "$wfdir/mac.yml"; do
-		if ! grep -Fq "cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}" \
-			"$workflow"; then
-			printf 'VIOLATION: I10 %s may cancel a main-branch verdict\n' "$workflow" >&2
-			exit 1
-		fi
-		if ! grep -Fq "github.ref == 'refs/heads/main' && github.sha || github.ref" \
-			"$workflow"; then
-			printf 'VIOLATION: I11 %s supersedes queued main-branch verdicts\n' "$workflow" >&2
-			exit 1
-		fi
-	done
+	# I10/I11 apply to linux.yml only. Per-SHA groups preserve a verdict for every
+	# main commit, which is right when the lane can keep up. The macOS lane cannot:
+	# its shards are 3-7 min of work but wait hours for a runner, so per-SHA groups
+	# stopped superseding anything and the queue grew until NO commit got a verdict
+	# (measured: jobs waiting 9h). Coalescing there trades per-commit verdicts for
+	# a timely verdict on the tip, which is the only one anyone acts on.
+	if ! grep -Fq "cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}" \
+		"$wfdir/linux.yml"; then
+		printf 'VIOLATION: I10 %s may cancel a main-branch verdict\n' "$wfdir/linux.yml" >&2
+		exit 1
+	fi
+	if ! grep -Fq "github.ref == 'refs/heads/main' && github.sha || github.ref" \
+		"$wfdir/linux.yml"; then
+		printf 'VIOLATION: I11 %s supersedes queued main-branch verdicts\n' "$wfdir/linux.yml" >&2
+		exit 1
+	fi
+	# The macOS lane must still coalesce by ref rather than run unbounded copies.
+	if ! grep -Fq 'group: mac-${{ github.workflow }}-${{ github.ref }}' "$wfdir/mac.yml"; then
+		printf 'VIOLATION: I10b %s must coalesce macOS runs by ref\n' "$wfdir/mac.yml" >&2
+		exit 1
+	fi
 
 	# I13-I15: the sharded compat matrices are the only place a suite runs, so a
 	# lane cmake/CiLanes.cmake declares but no shard names is silently unrun.
