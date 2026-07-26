@@ -1050,12 +1050,14 @@ static int interp_exec_branch_system(struct cpu *cpu, uint32_t insn) {
         uint32_t reg = insn & 0xFFFFFFE0u;
         int is_read = (insn & 0x00200000u) != 0; // bit 21 is L: 1 = MRS, 0 = MSR
 
-        // EL1 ID-register space: absent from the model, so read 0 rather than trap. The mask matches
-        // translate.c's so both backends deny the same set -- guest ifunc resolvers branch on it.
+        // EL1 ID-register space. HWCAP_CPUID is clear, so EL0 has no ID-register emulation and the access is
+        // architecturally UNDEFINED -- a GUEST SIGILL, not an engine gap. translate.c emits a UDF word for the
+        // same mask, which faults into the same guest signal; answering 0 here made the two backends disagree
+        // and told a guest that had just been denied CPUID that its probe succeeded.
         if (is_read && (insn & 0xFFFF0000u) == 0xD5380000u && !g_aarch64_cpu_model.user_id_registers) {
-            interp_set_gpr(cpu, rt, 0);
-            cpu->pc = gpc + 4;
-            return INTERP_NEXT;
+            cpu->pc = gpc;
+            interp_raise_sync_signal(cpu, 4 /* SIGILL */, 1 /* ILL_ILLOPC */, pcrel_base(gpc));
+            return INTERP_END;
         }
         switch (reg) {
         case 0xD53B0020u: // MRS CTR_EL0. IDC=1/DIC=0: no clean needed before re-reading guest writes, but
@@ -1164,6 +1166,37 @@ static uint64_t interp_element_mask(unsigned size) {
 
 static uint64_t interp_element_sext(uint64_t element, unsigned size) {
     return (uint64_t)interp_sext(element, 8u << size);
+}
+
+// The byte dot product shared by FEAT_DotProd (SDOT/UDOT) and FEAT_I8MM (USDOT, SMMLA/UMMLA/USMMLA): four
+// byte products summed modulo 2^32, exactly as the ARM ARM writes them. MMLA calls it twice per lane for its
+// eight-element rows. Signedness is per SOURCE, which is what the mixed US/SU forms need.
+static uint32_t interp_dot4(const interp_vec *left, const interp_vec *right, unsigned left_base,
+                            unsigned right_base, int left_signed, int right_signed) {
+    uint32_t sum = 0;
+    for (unsigned i = 0; i < 4u; i++) {
+        uint8_t a = left->byte[left_base + i], b = right->byte[right_base + i];
+        int32_t x = left_signed ? (int32_t)(int8_t)a : (int32_t)a;
+        int32_t y = right_signed ? (int32_t)(int8_t)b : (int32_t)b;
+        sum += (uint32_t)(x * y);
+    }
+    return sum;
+}
+
+// Maps the three-same-extra opcode + U to how each source's bytes are read; 0 means "not a dot/MMLA form".
+// 0010/0100 are the same-signedness pairs (S with U=0, U with U=1); 0011/0101 are the mixed unsigned-by-signed
+// forms, for which U=1 is unallocated.
+static int interp_dot_signedness(unsigned opcode, unsigned u, int *left_signed, int *right_signed) {
+    if (opcode == 2u || opcode == 4u) {
+        *left_signed = *right_signed = !u;
+        return 1;
+    }
+    if ((opcode == 3u || opcode == 5u) && !u) {
+        *left_signed = 0;
+        *right_signed = 1;
+        return 1;
+    }
+    return 0;
 }
 
 // AdvSIMDExpandImm(), for MOVI/MVNI and immediate ORR/BIC. Returns 0 for a reserved cmode/op.
@@ -2994,8 +3027,42 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
         // FCVT names its DESTINATION in the low two opcode bits and its source in ptype, so split it first.
         if ((opcode & 0x3Cu) == 0x04u) {
             // Opcode 000110 shares this box but is BFCVT (FEAT_BF16), single -> BFloat16, not an FCVT.
-            if (opcode == 0x06u)
-                return interp_undefined(cpu, insn, "scalar FP -- BFCVT (BFloat16 conversion)");
+            if (opcode == 0x06u) {
+                // (ftype 01, opcode 000110) IS the encoding; the operand is V[n,32] anyway, so `fmt` above
+                // does not apply. ARM ARM FPConvertBF: bf16 is the TOP HALF of the binary32 encoding, so the
+                // whole conversion is a rounding of the discarded low 16 bits -- exact for normals,
+                // subnormals and the overflow-to-infinity carry alike. FPCR.RMode selects it; only the
+                // default tie-to-even is implemented, so the other three report rather than guess.
+                if (type != 1u) return interp_undefined(cpu, insn, "scalar FP -- BFCVT unallocated ptype");
+                if (INTERP_FPCR_RMODE(g_interp_fpcr) != 0u)
+                    return interp_undefined(cpu, insn, "scalar FP -- BFCVT with a non-default FPCR.RMode");
+                uint32_t bits = (uint32_t)interp_fp_flush_input(interp_fp_read(cpu, rn, INTERP_FP_S), INTERP_FP_S);
+                unsigned cls = interp_fp_class(bits, INTERP_FP_S);
+                uint64_t out;
+                if (cls >= INTERP_FPC_QNAN) {
+                    // A NaN whose whole payload sits below bit 16 truncates to the infinity pattern, so the
+                    // quiet bit must be set on the RESULT, not merely copied.
+                    if (cls == INTERP_FPC_SNAN) interp_fpsr_raise(INTERP_FPSR_IOC);
+                    out = INTERP_FPCR_DN(g_interp_fpcr) ? UINT64_C(0x7FC0) : ((bits >> 16) | 0x40u);
+                } else if (cls == INTERP_FPC_INF || cls == INTERP_FPC_ZERO) {
+                    out = bits >> 16;
+                } else {
+                    // Tie-to-even: add half an ulp, plus one more when the kept bit is already odd.
+                    uint32_t rounded = bits + 0x7FFFu + ((bits >> 16) & 1u);
+                    if (bits & 0xFFFFu) {
+                        unsigned raised = INTERP_FPSR_IXC;
+                        if ((rounded & 0x7F800000u) == 0x7F800000u) raised |= INTERP_FPSR_OFC;
+                        // bf16 shares binary32's exponent field, so the result is tiny exactly when the source
+                        // was -- tested BEFORE rounding, which is AArch64's tininess rule.
+                        if ((bits & 0x7F800000u) == 0) raised |= INTERP_FPSR_UFC;
+                        interp_fpsr_raise(raised);
+                    }
+                    out = rounded >> 16;
+                }
+                interp_fp_write(cpu, rd, INTERP_FP_H, out);
+                cpu->pc = gpc + 4;
+                return INTERP_NEXT;
+            }
             unsigned to;
             if (!interp_fp_type_fmt(opcode & 3u, &to) || to == fmt)
                 return interp_undefined(cpu, insn, "scalar FP -- unallocated FCVT destination");
@@ -4512,9 +4579,63 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
 
     // AdvSIMD three-same-EXTRA: FEAT_DotProd / FEAT_I8MM / FEAT_RDM / FCMLA-FCADD
     // Same mask as the copy group, separated only by bit15.
-    if ((decode & 0x9F208400u) == 0x0E008400u)
+    if ((decode & 0x9F208400u) == 0x0E008400u) {
+        unsigned opcode = (decode >> 11) & 0xFu, size = (decode >> 22) & 3u;
+        int n_signed, m_signed;
+        // !scalar: the normalisation above folds the scalar boxes into this spelling, and no dot/MMLA form has
+        // a scalar variant, so a scalar encoding here is some other instruction.
+        if (!scalar && size == 2u && interp_dot_signedness(opcode, u, &n_signed, &m_signed)) {
+            interp_vec left = interp_vec_read(cpu, rn), right = interp_vec_read(cpu, rm);
+            interp_vec result = interp_vec_read(cpu, rd);
+            if (opcode <= 3u) { // SDOT / UDOT / USDOT (vector): one 4-byte dot product per 32-bit lane
+                for (unsigned lane = 0; lane < (q ? 4u : 2u); lane++)
+                    interp_vec_set_element(&result, 2, lane,
+                                           (uint32_t)interp_vec_element(&result, 2, lane) +
+                                               interp_dot4(&left, &right, 4u * lane, 4u * lane, n_signed, m_signed));
+            } else { // SMMLA / UMMLA / USMMLA: 2x8 by 8x2, one eight-element dot product per lane
+                if (!q) return interp_undefined(cpu, insn, "AdvSIMD three-same-extra -- MMLA requires Q=1");
+                for (unsigned i = 0; i < 2u; i++)
+                    for (unsigned j = 0; j < 2u; j++) {
+                        uint32_t sum = (uint32_t)interp_vec_element(&result, 2, 2u * i + j);
+                        sum += interp_dot4(&left, &right, 8u * i, 8u * j, n_signed, m_signed);
+                        sum += interp_dot4(&left, &right, 8u * i + 4u, 8u * j + 4u, n_signed, m_signed);
+                        interp_vec_set_element(&result, 2, 2u * i + j, sum);
+                    }
+            }
+            interp_vec_write(cpu, rd, result, q);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        // SQRDMLAH/SQRDMLSH (FEAT_RDM), FCMLA/FCADD (FEAT_FCMA) and the BF16 forms share this box; none of
+        // the three is advertised in the CPU model, so they keep the honest gap report.
         return interp_undefined(cpu, insn,
-                               "AdvSIMD three-same-extra (SDOT/UDOT, SMMLA/USMMLA, SQRDMLAH, FCMLA/FCADD)");
+                               "AdvSIMD three-same-extra (SQRDMLAH, FCMLA/FCADD, BFDOT/BFMMLA)");
+    }
+
+    // AdvSIMD vector x indexed element. Only the FEAT_DotProd / FEAT_I8MM byte dot products are decoded here;
+    // the rest of the box (indexed FMLA/MLA/MUL/SQDMULL ...) is still a gap and reports as one.
+    if ((decode & 0x9F000400u) == 0x0F000000u) {
+        unsigned opcode = (decode >> 12) & 0xFu, size = (decode >> 22) & 3u;
+        // The by-element spelling shifts the vector opcodes one nibble up: 1110 is SDOT/UDOT, and 1111 is
+        // USDOT at size 10 / SUDOT at size 00 -- the same pair the vector box spells 0010 and 0011.
+        if (!scalar &&
+            ((opcode == 0xEu && size == 2u) || (opcode == 0xFu && !u && (size == 2u || size == 0u)))) {
+            int n_signed = opcode == 0xEu ? !u : (size == 0u), m_signed = opcode == 0xEu ? !u : !(size == 0u);
+            // Rm is M:Rm here, and H:L indexes the 32-bit group of Vm broadcast to every lane.
+            interp_vec left = interp_vec_read(cpu, rn);
+            interp_vec right = interp_vec_read(cpu, (int)(((decode >> 16) & 15u) | (((decode >> 20) & 1u) << 4)));
+            interp_vec result = interp_vec_read(cpu, rd);
+            unsigned index = (((decode >> 11) & 1u) << 1) | ((decode >> 21) & 1u);
+            for (unsigned lane = 0; lane < (q ? 4u : 2u); lane++)
+                interp_vec_set_element(&result, 2, lane,
+                                       (uint32_t)interp_vec_element(&result, 2, lane) +
+                                           interp_dot4(&left, &right, 4u * lane, 4u * index, n_signed, m_signed));
+            interp_vec_write(cpu, rd, result, q);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        return interp_undefined(cpu, insn, "AdvSIMD vector x indexed element");
+    }
 
     return interp_undefined(cpu, insn, "scalar floating-point and Advanced SIMD");
 }

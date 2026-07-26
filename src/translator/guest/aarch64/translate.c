@@ -145,6 +145,10 @@ static int uses_x18(uint32_t in, int mask) {
    ADDV therefore preserves the exact 32-bit modular accumulation semantics.
    USMMLA is U8*S8: reinterpret (u8 - 128) as s8, then add 128*sum(s8) for
    each right-hand row. */
+// FEAT_DotProd, by contrast, IS advertised (cpu.h, AT_HWCAP bit 20) and needs no probe or lowering here:
+// it is mandatory from Armv8.4-A, so SDOT/UDOT -- vector and by-element alike, neither of which touches a
+// stolen GPR -- reach the verbatim emit at the bottom of the loop and land on silicon that has them. That is
+// the same host assumption the already-advertised FEAT_LSE/AES/SHA2/CRC32 bits make.
 // FEAT_I8MM / FEAT_BF16 are OPTIONAL, and the engine's CPU model does not advertise them, so a guest that
 // uses them is already reaching past the contract. Where the HOST implements them the honest answer is the
 // architectural one: copy the instruction verbatim (same ISA, same silicon, bit-exact and faster). The
