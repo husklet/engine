@@ -1705,10 +1705,14 @@ static long futex_lock_pi(struct cpu *c, int *uaddr, const void *key, int tryloc
         int expect = __atomic_load_n(uaddr, __ATOMIC_SEQ_CST);
         uint32_t v = (uint32_t)expect;
         uint32_t owner = v & HL_FUTEX_TID_MASK;
-        if (owner == 0) { // free (owner slot 0; FUTEX_OWNER_DIED may still be set on a robust mutex)
-            int others = fbk_parked(b, futex_key(key)) - (parked ? 1 : 0); // waiters left behind
-            int nv = (int)((uint32_t)mytid | (v & HL_FUTEX_OWNER_DIED) |
-                           (others > 0 ? HL_FUTEX_WAITERS : 0));
+        int others = fbk_parked(b, futex_key(key)) - (parked ? 1 : 0); // waiters left behind
+        // A fresh arrival must not steal from a queued waiter: Linux hands the rt_mutex to the top waiter, so
+        // an unlocker that immediately re-locks queues behind it. Stealing starved waiters out to ETIMEDOUT.
+        // Only when the parked count is exact -- an overflowed bucket counts foreign addresses, and blocking
+        // on a phantom waiter would park us with nobody left to wake us.
+        int must_queue = !parked && others > 0 && !b->imprecise;
+        if (owner == 0 && !must_queue) { // free (FUTEX_OWNER_DIED may still be set on a robust mutex)
+            int nv = (int)((uint32_t)mytid | (v & HL_FUTEX_OWNER_DIED) | (others > 0 ? HL_FUTEX_WAITERS : 0));
             // Acquire atomically vs a racing userspace fast-path locker (cmpxchg 0->tid): if the word moved
             // underfoot, retry from the re-read instead of clobbering the new owner (double-ownership bug).
             if (!__atomic_compare_exchange_n(uaddr, &expect, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) continue;
