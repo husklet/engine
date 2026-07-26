@@ -491,6 +491,103 @@ static int cmsg_timerfd_marker(const struct hl_cmsg_timerfd_meta *m) {
     return fd;
 }
 
+// ---- SCM_RIGHTS in-flight retention (macOS only) -------------------------------------------------
+// Linux keeps a descriptor passed over an AF_UNIX socket alive for as long as the message carrying it
+// sits in the receiving socket, so "sendmsg(fd) then close(fd)" -- the canonical fd-handoff idiom every
+// broker/zygote uses -- is safe even if the peer has not called recvmsg yet. XNU does NOT: its unix-rights
+// garbage collector (unp_gc) treats a file whose ONLY remaining reference is an in-flight message as
+// unreachable and CLOSES it, and it runs asynchronously off any unix-socket close while rights are in
+// flight. So the sender's close(2) can race a GC pass that has not yet observed the receiver's
+// unp_externalize, and the passed socket is torn down under both peers: the receiver's read() reports EOF
+// and the sender's next write() gets EPIPE (default disposition: SIGPIPE kills it). It is a scheduling
+// accident, which is why it only shows up under load. Reproduced with a plain C program and no engine in
+// the picture: ~1 in 150 runs on an idle machine, ~1 in 60 pinned to the efficiency band.
+//
+// Fix: keep an engine-private duplicate of every descriptor put in flight, so the file always has a
+// reference that is NOT an in-flight message and can therefore never become GC-eligible. Every SCM_RIGHTS
+// record already carries one OFD marker file per passed fd, so that marker doubles as the delivery
+// receipt: the receiving engine stamps an ack byte past the metadata when it imports the trailer, and the
+// sender drops the duplicate on the next sweep. Nothing about the guest-visible message changes.
+#if defined(__linux__)
+#define cmsg_inflight_sweep() ((void)0)
+#define cmsg_inflight_hold(fd, marker) ((void)0)
+#define cmsg_inflight_mark() ((void)0)
+#define cmsg_inflight_finish(sent) ((void)(sent))
+#define cmsg_inflight_ack(marker) ((void)(marker))
+#define cmsg_inflight_is_retained(fd) (0)
+#else
+#define SCM_INFLIGHT_MAX 256
+#define SCM_INFLIGHT_ACK_OFFSET ((off_t)sizeof(struct hl_cmsg_ofd_meta))
+
+struct scm_inflight_hold {
+    int retained; // engine-private duplicate of the passed descriptor
+    int marker;   // engine-private duplicate of that fd's OFD marker file (the delivery receipt)
+};
+static struct scm_inflight_hold g_scm_hold[SCM_INFLIGHT_MAX];
+static int g_scm_hold_n;
+static int g_scm_hold_mark;
+
+static void cmsg_inflight_drop(int index) {
+    if (g_scm_hold[index].retained >= 0) close(g_scm_hold[index].retained);
+    if (g_scm_hold[index].marker >= 0) close(g_scm_hold[index].marker);
+    for (int i = index + 1; i < g_scm_hold_n; i++)
+        g_scm_hold[i - 1] = g_scm_hold[i]; // keep oldest-first order so the eviction below is FIFO
+    g_scm_hold_n--;
+    if (g_scm_hold_mark > g_scm_hold_n) g_scm_hold_mark = g_scm_hold_n;
+}
+
+// Release every hold whose receipt has been stamped by the receiving engine.
+static void cmsg_inflight_sweep(void) {
+    for (int i = g_scm_hold_n - 1; i >= 0; i--) {
+        uint8_t ack = 0;
+        if (pread(g_scm_hold[i].marker, &ack, 1, SCM_INFLIGHT_ACK_OFFSET) == 1 && ack != 0) cmsg_inflight_drop(i);
+    }
+}
+
+static void cmsg_inflight_hold(int fd, int marker) {
+    // Bounded: a peer that never reads the message must not cost the sender descriptors without limit.
+    // The oldest hold is the likeliest to have been consumed already, so evict that one.
+    if (g_scm_hold_n >= SCM_INFLIGHT_MAX) cmsg_inflight_drop(0);
+    int retained = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (retained < 0) return; // out of descriptors: degrade to bare XNU behaviour rather than fail the send
+    int receipt = fcntl(marker, F_DUPFD_CLOEXEC, 0);
+    if (receipt < 0) {
+        close(retained);
+        return;
+    }
+    g_scm_hold[g_scm_hold_n].retained = retained;
+    g_scm_hold[g_scm_hold_n].marker = receipt;
+    g_scm_hold_n++;
+}
+
+static void cmsg_inflight_mark(void) {
+    g_scm_hold_mark = g_scm_hold_n;
+}
+
+// A send that never left the building put nothing in flight, so its holds are released immediately.
+static void cmsg_inflight_finish(int sent) {
+    if (!sent)
+        while (g_scm_hold_n > g_scm_hold_mark)
+            cmsg_inflight_drop(g_scm_hold_n - 1);
+    g_scm_hold_mark = g_scm_hold_n;
+}
+
+// Receiver side: stamp the receipt so the sender can drop its duplicate.
+static void cmsg_inflight_ack(int marker) {
+    uint8_t ack = 1;
+    (void)pwrite(marker, &ack, 1, SCM_INFLIGHT_ACK_OFFSET);
+}
+
+// The retained duplicates back the engine's own lifetime guarantee, not the guest's fd table: the
+// emulated execve's close-on-exec sweep must leave them alone (Linux keeps an in-flight fd alive across
+// the sender's exec too).
+static int cmsg_inflight_is_retained(int fd) {
+    for (int i = 0; i < g_scm_hold_n; i++)
+        if (g_scm_hold[i].retained == fd || g_scm_hold[i].marker == fd) return 1;
+    return 0;
+}
+#endif
+
 static int cmsg_ofd_marker(const struct hl_cmsg_ofd_meta *m) {
     if (g_cmsg_ntmpfds >= (int)(sizeof g_cmsg_tmpfds / sizeof g_cmsg_tmpfds[0])) return -1;
     char name[] = "/tmp/.hl-ofdXXXXXX";
@@ -522,6 +619,7 @@ static int cmsg_import_ofd_trailer(int *fds, int nfds) {
         if (metadata.ordinal >= (uint32_t)(visible - 1) || !metadata.identity) break;
         int fd = fds[metadata.ordinal];
         if (fd >= 0 && fd < HL_NFD) g_ofd_id[fd] = metadata.identity;
+        cmsg_inflight_ack(marker); // the fd is installed in this process now: the sender may drop its hold
         close(marker);
         visible--;
     }
@@ -950,6 +1048,9 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
     cmsg_tmpfds_close();
     cmsg_seq_finish(0);
     cmsg_event_finish(0);
+    cmsg_inflight_finish(0);
+    cmsg_inflight_sweep();
+    cmsg_inflight_mark();
     size_t go = 0, ho = 0;
     while (go + LX_CMSGHDR <= glen) {
         uint64_t clen = *(const uint64_t *)(g + go); // Linux cmsg_len (8B)
@@ -1224,6 +1325,7 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                     return -1;
                 }
                 combo[combo_n++] = marker;
+                cmsg_inflight_hold(fds[i], marker);
             }
 cmsg_visible_only:
             dlen = (size_t)combo_n * sizeof(int);
@@ -1255,6 +1357,7 @@ cmsg_visible_only:
 // (<=cap; stops at the guest-buffer boundary, leaving the kernel's MSG_CTRUNC in mh->msg_flags to be
 // translated).
 static ssize_t cmsg_m2l(const struct msghdr *mh, uint8_t *g, size_t cap, size_t off, int *truncp) {
+    cmsg_inflight_sweep(); // cheap no-op unless this process has descriptors of its own still in flight
     if (truncp) *truncp = 0;
     size_t go = off;
     for (struct cmsghdr *c = CMSG_FIRSTHDR((struct msghdr *)mh); c; c = CMSG_NXTHDR((struct msghdr *)mh, c)) {
