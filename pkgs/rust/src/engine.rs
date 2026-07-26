@@ -123,7 +123,7 @@ impl Engine {
         let resources = lowering::allocate_memory(&spec, &authorities).map_err(SpawnError::Spec)?;
         let launch = lower(spec).map_err(SpawnError::Spec)?;
         launch::start(launch, io, authorities, resources)
-            .map(|child| Machine::new(child))
+            .map(Machine::new)
             .map_err(SpawnError::Engine)
     }
 
