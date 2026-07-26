@@ -284,6 +284,34 @@ static void interp_store(uint64_t guest_address, int width, uint64_t value) {
     if (jit86_store_alias_observation_active()) jit86_store_alias_changed(guest_address, (uint64_t)width);
 }
 
+// The same two accesses for an operand WIDER than a general register, i.e. the 8/16-byte halves and the full
+// 16 bytes of an xmm operand. Kept separate from interp_load/interp_store rather than generalising them,
+// because those return and take a uint64_t by value and the SSE paths work on a byte image: a 128-bit
+// operand has no scalar type here, and forcing one would mean two 64-bit halves and two fault windows where
+// the architecture has one access.
+//
+// The fault bracket is the ONE thing that must match interp_load/interp_store exactly. A single
+// interp_access_begin/end pair spans the whole transfer, so a fault anywhere inside a straddling 16-byte
+// access is still claimed by interp_signal_capture and still abandons the instruction with no architectural
+// change -- which is why every caller below reads its operands into locals FIRST and commits to cpu->v[] or
+// to guest memory only after the last access has returned.
+static void interp_load_bytes(uint64_t guest_address, void *destination, unsigned length) {
+    const void *host = (const void *)(uintptr_t)hl_x86_guest_pointer(guest_address);
+    interp_access_begin();
+    memcpy(destination, host, length); // unaligned-safe, and one window for the whole operand
+    interp_access_end();
+    interp_tso_fence();
+}
+
+static void interp_store_bytes(uint64_t guest_address, const void *source, unsigned length) {
+    void *host = (void *)(uintptr_t)hl_x86_guest_pointer(guest_address);
+    interp_tso_fence();
+    interp_access_begin();
+    memcpy(host, source, length);
+    interp_access_end();
+    if (jit86_store_alias_observation_active()) jit86_store_alias_changed(guest_address, (uint64_t)length);
+}
+
 // A biased ET_EXEC executes at link_pc+bias, but the address x86 CALL pushes is guest-visible architectural
 // state: DWARF FDE lookup, dladdr, backtrace and forced unwinding must see the LINK address, and the
 // dispatcher rebiases it again on the RET. Go and V8 are the deliberate exceptions -- linux_abi/x86.c
@@ -1832,11 +1860,888 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
 }
 
 // ---------------------------------------------------------------------------------------------------
+// LEGACY SSE / SSE2 (the 0F map).
+//
+// WHY THIS IS HERE AND NOT IN avx.c. The dispatcher already routes VEX/EVEX to hl_x86_avx_run and the
+// 0F38/0F3A escape maps to hl_x86_sse_run (R_AVX / R_SSE3B), so SSSE3/SSE4/AES/SHA/CRC32 come for free.
+// The base 0F map has no such emulator: the JIT lowered it instruction-by-instruction to NEON, which is
+// exactly the code that cannot exist on this host. So it is implemented here, in the interpreter, where the
+// register file is already plain memory.
+//
+// WHAT IS IMPLEMENTED, AND THE LINE THAT WAS DRAWN. Everything below is DATA MOVEMENT, BITWISE LOGIC, or
+// INTEGER SIMD -- operations whose result is a pure function of the input bits. Packed and scalar
+// FLOATING-POINT ARITHMETIC (ADDPS/MULPD/DIVSS/SQRTPD, the CVT* conversions, UCOMISS/COMISS/CMPPS) is
+// deliberately NOT implemented and routes to interp_undefined naming itself. That is not laziness: those
+// need MXCSR to be authoritative -- rounding mode, the denormals-are-zero and flush-to-zero controls, and
+// the six sticky exception flags -- and x87state.c already owns a real x86-64 MXCSR arm via
+// _mm_getcsr/_mm_setcsr. Emulating them with host C arithmetic would silently ignore the guest's rounding
+// mode and never accumulate an exception flag, which is the kind of wrong that passes every smoke test and
+// then produces a subtly different number a year later. The bit-movement and integer classes have no such
+// coupling, which is precisely why the boundary is where it is.
+//
+// THE UPPER-BITS RULE, which is the opposite of the AArch64 one and the easiest thing to get wrong here.
+// A legacy (non-VEX) SSE instruction writes the low 128 bits of the register and LEAVES BITS 128 AND ABOVE
+// UNTOUCHED. VEX-encoded instructions zero them. cpu->v[2r..2r+1] is xmm r; cpu->vhi[2r..]/vz[] carry the
+// AVX upper state, and avx.c honours the same split (see its "legacy SSE leaves the upper YMM bits intact"
+// comment). So interp_xmm_put writes ONLY v[] and never clears vhi -- a `pxor %xmm0,%xmm0` must not
+// silently truncate a ymm0 that a preceding VEX instruction filled, or a subsequent vpaddb would read
+// zeros the guest never wrote.
+//
+// cpu->vdirty is deliberately not touched. It exists so the JIT's slim R_SYSCALL exit knows whether guest
+// xmm is live in HOST v registers and needs spilling; here cpu->v[] IS the register file at every
+// instruction boundary, so there is nothing to spill and nothing to mark.
+// ---------------------------------------------------------------------------------------------------
+
+// xmm register file. The byte image is the natural representation: every operation below is defined on
+// lanes, the guest is little-endian, so is the host, and a byte array sidesteps both strict aliasing and
+// any question about lane order.
+static void interp_xmm_get(const struct cpu *cpu, int number, uint8_t out[16]) {
+    memcpy(out, &cpu->v[2 * number], 16);
+}
+
+static void interp_xmm_put(struct cpu *cpu, int number, const uint8_t in[16]) {
+    memcpy(&cpu->v[2 * number], in, 16); // low 128 bits only -- see the upper-bits rule above
+}
+
+// Lane accessors. memcpy rather than a cast so an odd lane offset (PINSRW into word 3, an unaligned m128)
+// stays defined behaviour.
+static uint16_t interp_lane16(const uint8_t *p, int index) {
+    uint16_t value;
+    memcpy(&value, p + 2 * index, 2);
+    return value;
+}
+
+static void interp_put16(uint8_t *p, int index, uint16_t value) {
+    memcpy(p + 2 * index, &value, 2);
+}
+
+static uint32_t interp_lane32(const uint8_t *p, int index) {
+    uint32_t value;
+    memcpy(&value, p + 4 * index, 4);
+    return value;
+}
+
+static void interp_put32(uint8_t *p, int index, uint32_t value) {
+    memcpy(p + 4 * index, &value, 4);
+}
+
+static uint64_t interp_lane64(const uint8_t *p, int index) {
+    uint64_t value;
+    memcpy(&value, p + 8 * index, 8);
+    return value;
+}
+
+static void interp_put64(uint8_t *p, int index, uint64_t value) {
+    memcpy(p + 8 * index, &value, 8);
+}
+
+// The mandatory prefix that selects an SSE opcode's variant. F2/F3 outrank 0x66 when a guest emits both,
+// matching the hardware precedence, so the tests are ordered rather than combined.
+enum { SSE_NP = 0, SSE_66 = 1, SSE_F3 = 2, SSE_F2 = 3 };
+
+static int interp_sse_prefix(const struct insn *insn) {
+    if (insn->rep) return SSE_F3;
+    if (insn->repne) return SSE_F2;
+    if (insn->p66) return SSE_66;
+    return SSE_NP;
+}
+
+// Read the r/m operand of an SSE instruction as `bytes` bytes of image: an xmm register (mod == 3) or
+// memory. `bytes` is 16 for the packed forms and 4/8 for the scalar and half-register ones; the untouched
+// tail of `out` is zeroed so a caller that merges only the low lanes still sees defined bytes.
+static void interp_sse_rm_get(struct cpu *cpu, const struct insn *insn, uint64_t next, unsigned bytes,
+                              uint8_t out[16]) {
+    memset(out, 0, 16);
+    if (insn->is_mem)
+        interp_load_bytes(interp_ea(cpu, insn, next), out, bytes);
+    else
+        memcpy(out, &cpu->v[2 * insn->rm_reg], bytes);
+}
+
+static void interp_sse_rm_put(struct cpu *cpu, const struct insn *insn, uint64_t next, unsigned bytes,
+                              const uint8_t in[16]) {
+    if (insn->is_mem)
+        interp_store_bytes(interp_ea(cpu, insn, next), in, bytes);
+    else
+        memcpy(&cpu->v[2 * insn->rm_reg], in, bytes); // register destination: merge, upper lanes preserved
+}
+
+// MOVDQA / MOVAPS / MOVAPD / MOVNTDQ / MOVNTPS require a 16-byte-aligned memory operand and raise #GP(0)
+// when it is not. That fault is honoured rather than quietly accepted: a guest can legitimately DEPEND on
+// it (a runtime probing alignment, or a bug it expects to crash on), and silently serving the access would
+// make this backend disagree with real hardware in the one direction nobody would ever notice until it
+// mattered. Linux reports #GP as SIGSEGV with si_code SI_KERNEL and si_addr 0, which is what the R_TRAP
+// path below produces for signal 11.
+static int interp_sse_unaligned(const struct cpu *cpu, const struct insn *insn, uint64_t next) {
+    return insn->is_mem && (interp_ea(cpu, insn, next) & 15u) != 0;
+}
+
+// ---- packed integer primitives -------------------------------------------------------------------
+// Each takes the destination image (operand 1, which x86 SSE always both reads and writes) and the source
+// image, and is defined on a lane width in bytes. Writing them as loops over a byte image rather than as
+// per-width duplicates keeps the arithmetic in one place, which is where the saturation rules can be
+// checked once instead of four times.
+
+static void interp_padd(uint8_t *d, const uint8_t *s, int lane) {
+    for (int i = 0; i < 16 / lane; i++) {
+        if (lane == 1)
+            d[i] = (uint8_t)(d[i] + s[i]);
+        else if (lane == 2)
+            interp_put16(d, i, (uint16_t)(interp_lane16(d, i) + interp_lane16(s, i)));
+        else if (lane == 4)
+            interp_put32(d, i, interp_lane32(d, i) + interp_lane32(s, i));
+        else
+            interp_put64(d, i, interp_lane64(d, i) + interp_lane64(s, i));
+    }
+}
+
+static void interp_psub(uint8_t *d, const uint8_t *s, int lane) {
+    for (int i = 0; i < 16 / lane; i++) {
+        if (lane == 1)
+            d[i] = (uint8_t)(d[i] - s[i]);
+        else if (lane == 2)
+            interp_put16(d, i, (uint16_t)(interp_lane16(d, i) - interp_lane16(s, i)));
+        else if (lane == 4)
+            interp_put32(d, i, interp_lane32(d, i) - interp_lane32(s, i));
+        else
+            interp_put64(d, i, interp_lane64(d, i) - interp_lane64(s, i));
+    }
+}
+
+static int32_t interp_sat_s8(int32_t v) {
+    return v < -128 ? -128 : v > 127 ? 127 : v;
+}
+
+static int32_t interp_sat_s16(int32_t v) {
+    return v < -32768 ? -32768 : v > 32767 ? 32767 : v;
+}
+
+static int32_t interp_sat_u8(int32_t v) {
+    return v < 0 ? 0 : v > 255 ? 255 : v;
+}
+
+static int32_t interp_sat_u16(int32_t v) {
+    return v < 0 ? 0 : v > 65535 ? 65535 : v;
+}
+
+// Saturating add/subtract. `subtract` picks the direction, `signed_form` the saturation domain.
+static void interp_padds(uint8_t *d, const uint8_t *s, int lane, int subtract, int signed_form) {
+    for (int i = 0; i < 16 / lane; i++) {
+        if (lane == 1) {
+            int32_t a = signed_form ? (int32_t)(int8_t)d[i] : (int32_t)d[i];
+            int32_t b = signed_form ? (int32_t)(int8_t)s[i] : (int32_t)s[i];
+            int32_t r = subtract ? a - b : a + b;
+            d[i] = (uint8_t)(signed_form ? interp_sat_s8(r) : interp_sat_u8(r));
+        } else {
+            int32_t a = signed_form ? (int32_t)(int16_t)interp_lane16(d, i) : (int32_t)interp_lane16(d, i);
+            int32_t b = signed_form ? (int32_t)(int16_t)interp_lane16(s, i) : (int32_t)interp_lane16(s, i);
+            int32_t r = subtract ? a - b : a + b;
+            interp_put16(d, i, (uint16_t)(signed_form ? interp_sat_s16(r) : interp_sat_u16(r)));
+        }
+    }
+}
+
+static void interp_pcmpeq(uint8_t *d, const uint8_t *s, int lane) {
+    for (int i = 0; i < 16 / lane; i++) {
+        if (lane == 1)
+            d[i] = d[i] == s[i] ? 0xff : 0x00;
+        else if (lane == 2)
+            interp_put16(d, i, interp_lane16(d, i) == interp_lane16(s, i) ? 0xffffu : 0);
+        else
+            interp_put32(d, i, interp_lane32(d, i) == interp_lane32(s, i) ? 0xffffffffu : 0);
+    }
+}
+
+// PCMPGT is SIGNED on every lane width -- the unsigned comparison has no SSE2 encoding, which is why
+// string code reaches for PMINUB/PCMPEQB instead.
+static void interp_pcmpgt(uint8_t *d, const uint8_t *s, int lane) {
+    for (int i = 0; i < 16 / lane; i++) {
+        if (lane == 1)
+            d[i] = (int8_t)d[i] > (int8_t)s[i] ? 0xff : 0x00;
+        else if (lane == 2)
+            interp_put16(d, i, (int16_t)interp_lane16(d, i) > (int16_t)interp_lane16(s, i) ? 0xffffu : 0);
+        else
+            interp_put32(d, i, (int32_t)interp_lane32(d, i) > (int32_t)interp_lane32(s, i) ? 0xffffffffu : 0);
+    }
+}
+
+// Per-lane shifts. A count at or beyond the lane width produces zero (or, for the arithmetic right shift,
+// a full sign fill) rather than being reduced modulo the width -- the x86 rule, and the opposite of what a
+// bare C shift by an over-wide amount would do (which is undefined behaviour).
+static void interp_pshift(uint8_t *d, int lane, unsigned count, int direction, int arithmetic) {
+    unsigned bits = (unsigned)lane * 8u;
+    for (int i = 0; i < 16 / lane; i++) {
+        uint64_t value = lane == 2 ? interp_lane16(d, i) : lane == 4 ? interp_lane32(d, i) : interp_lane64(d, i);
+        uint64_t result;
+        if (arithmetic) {
+            int64_t signed_value = lane == 2 ? (int64_t)(int16_t)value : (int64_t)(int32_t)value;
+            result = (uint64_t)(signed_value >> (count >= bits ? bits - 1 : count));
+        } else if (count >= bits) {
+            result = 0;
+        } else {
+            result = direction ? (value >> count) : (value << count);
+        }
+        if (lane == 2)
+            interp_put16(d, i, (uint16_t)result);
+        else if (lane == 4)
+            interp_put32(d, i, (uint32_t)result);
+        else
+            interp_put64(d, i, result);
+    }
+}
+
+// PSLLDQ / PSRLDQ: a shift of the WHOLE 128-bit register by a BYTE count, not a per-lane bit shift. The
+// byte-image representation makes this a memmove, which is the clearest statement of what it does.
+static void interp_pshift_bytes(uint8_t *d, unsigned count, int right) {
+    uint8_t out[16] = {0};
+    if (count < 16) {
+        if (right)
+            memcpy(out, d + count, 16 - count);
+        else
+            memcpy(out + count, d, 16 - count);
+    }
+    memcpy(d, out, 16);
+}
+
+// PUNPCK*: interleave lanes from the low (or high) half of destination and source. Destination lanes come
+// first in each pair, which is what makes PUNPCKLBW of a value with itself a byte-doubling broadcast.
+static void interp_punpck(uint8_t *d, const uint8_t *s, int lane, int high) {
+    uint8_t out[16];
+    int lanes = 16 / lane;
+    int base = high ? lanes / 2 : 0;
+    for (int i = 0; i < lanes / 2; i++) {
+        memcpy(out + (2 * i) * lane, d + (base + i) * lane, (size_t)lane);
+        memcpy(out + (2 * i + 1) * lane, s + (base + i) * lane, (size_t)lane);
+    }
+    memcpy(d, out, 16);
+}
+
+// PACKSSWB / PACKUSWB / PACKSSDW: narrow with saturation, destination lanes then source lanes.
+static void interp_pack(uint8_t *d, const uint8_t *s, int source_lane, int signed_result) {
+    uint8_t out[16];
+    int per = 8 / source_lane; // narrowed lanes contributed by each operand
+    for (int i = 0; i < per; i++) {
+        if (source_lane == 2) {
+            int32_t a = (int32_t)(int16_t)interp_lane16(d, i);
+            int32_t b = (int32_t)(int16_t)interp_lane16(s, i);
+            out[i] = (uint8_t)(signed_result ? interp_sat_s8(a) : interp_sat_u8(a));
+            out[per + i] = (uint8_t)(signed_result ? interp_sat_s8(b) : interp_sat_u8(b));
+        } else {
+            int32_t a = (int32_t)interp_lane32(d, i);
+            int32_t b = (int32_t)interp_lane32(s, i);
+            interp_put16(out, i, (uint16_t)interp_sat_s16(a));
+            interp_put16(out, per + i, (uint16_t)interp_sat_s16(b));
+        }
+    }
+    memcpy(d, out, 16);
+}
+
+// The 0F (two-byte) opcode map's SSE space. Returns STEP_NEXT/STEP_END when it owned the opcode, or
+// STEP_SSE_UNHANDLED so interp_step_two_byte can fall through to its own diagnostic.
+enum { STEP_SSE_UNHANDLED = -1 };
+
+// The floating-point arithmetic / conversion / compare space, named so the diagnostic says which decision
+// is missing rather than just quoting an opcode byte. See the boundary note at the top of this section.
+static int interp_sse_is_float_arithmetic(uint8_t op) {
+    if (op >= 0x58 && op <= 0x5F) return 1;                   // add/mul/cvt/sub/min/div/max ps/pd/ss/sd
+    if (op == 0x51 || op == 0x52 || op == 0x53) return 1;     // sqrt / rsqrt / rcp
+    if (op == 0x2A || (op >= 0x2C && op <= 0x2F)) return 1;   // cvtsi2s* / cvt*2si / ucomis* / comis*
+    if (op == 0x5A || op == 0x5B) return 1;                   // cvtps2pd / cvtdq2ps and friends
+    if (op == 0xC2) return 1;                                 // cmpps/cmppd/cmpss/cmpsd
+    if (op == 0xE6) return 1;                                 // cvtdq2pd / cvtpd2dq / cvttpd2dq
+    return 0;
+}
+
+static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint64_t next) {
+    uint8_t op = insn->op;
+    int prefix = interp_sse_prefix(insn);
+    int destination = insn->reg; // ModRM.reg names the xmm destination in almost every form here
+
+    // Floating-point arithmetic is out of scope by design; say so before anything else claims the opcode.
+    if (interp_sse_is_float_arithmetic(op))
+        return interp_undefined(cpu, insn, pc,
+                                "TODO(amd64-host): SSE floating-point arithmetic/conversion "
+                                "(needs authoritative MXCSR rounding + exception flags)");
+
+    // The integer SIMD opcodes exist in both an MMX (no mandatory prefix, mm0..7) and an SSE2 (0x66, xmm)
+    // encoding. This model has no MMX register file at all -- struct cpu carries no mm[] and the checkpoint
+    // format has no room for one -- so the MMX forms are reported rather than silently aliased onto xmm,
+    // which would corrupt whichever register the guest was really using.
+    int integer_simd = (op >= 0x60 && op <= 0x6D) || op == 0x6E || op == 0x6F || (op >= 0x71 && op <= 0x76) ||
+                       op == 0x7E || op == 0x7F || op == 0xD4 || op == 0xD5 || op == 0xD7 ||
+                       (op >= 0xD1 && op <= 0xD3) || (op >= 0xD8 && op <= 0xDF) || (op >= 0xE0 && op <= 0xE5) ||
+                       op == 0xE7 || (op >= 0xE8 && op <= 0xEF) || (op >= 0xF1 && op <= 0xFE) || op == 0x70 ||
+                       op == 0xC4 || op == 0xC5;
+    if (integer_simd && prefix == SSE_NP && op != 0x6F && op != 0x7E && op != 0x70)
+        return interp_undefined(cpu, insn, pc, "TODO(amd64-host): MMX form (no mm[] register file is modelled)");
+
+    uint8_t d[16], s[16];
+
+    switch (op) {
+    // ---- MOVUPS/MOVUPD/MOVSS/MOVSD, load direction (0F 10) ---------------------------------------
+    case 0x10:
+        if (prefix == SSE_F3) { // MOVSS: from memory the upper 96 bits are ZEROED, from a register kept
+            interp_sse_rm_get(cpu, insn, next, 4, s);
+            if (insn->is_mem) {
+                memset(d, 0, 16);
+                memcpy(d, s, 4);
+            } else {
+                interp_xmm_get(cpu, destination, d);
+                memcpy(d, s, 4);
+            }
+        } else if (prefix == SSE_F2) { // MOVSD: same rule at 64 bits
+            interp_sse_rm_get(cpu, insn, next, 8, s);
+            if (insn->is_mem) {
+                memset(d, 0, 16);
+                memcpy(d, s, 8);
+            } else {
+                interp_xmm_get(cpu, destination, d);
+                memcpy(d, s, 8);
+            }
+        } else {
+            interp_sse_rm_get(cpu, insn, next, 16, d); // MOVUPS/MOVUPD: unaligned is explicitly permitted
+        }
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- MOVUPS/MOVUPD/MOVSS/MOVSD, store direction (0F 11) --------------------------------------
+    case 0x11: {
+        unsigned bytes = prefix == SSE_F3 ? 4u : prefix == SSE_F2 ? 8u : 16u;
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_put(cpu, insn, next, bytes, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    // ---- MOVLPS/MOVLPD/MOVHLPS/MOVDDUP (0F 12) and MOVHPS/MOVHPD/MOVLHPS (0F 16) -----------------
+    case 0x12:
+    case 0x16: {
+        int high = (op == 0x16);
+        interp_xmm_get(cpu, destination, d);
+        if (prefix == SSE_F2 && op == 0x12) { // MOVDDUP: broadcast the low qword into both halves
+            interp_sse_rm_get(cpu, insn, next, 8, s);
+            memcpy(d + 0, s, 8);
+            memcpy(d + 8, s, 8);
+        } else if (insn->is_mem) { // MOVLPS/MOVLPD load low half, MOVHPS/MOVHPD load high half
+            interp_sse_rm_get(cpu, insn, next, 8, s);
+            memcpy(d + (high ? 8 : 0), s, 8);
+        } else if (high) { // MOVLHPS: destination high half := source LOW half
+            interp_xmm_get(cpu, insn->rm_reg, s);
+            memcpy(d + 8, s + 0, 8);
+        } else { // MOVHLPS: destination low half := source HIGH half
+            interp_xmm_get(cpu, insn->rm_reg, s);
+            memcpy(d + 0, s + 8, 8);
+        }
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    // ---- MOVLPS/MOVLPD (0F 13) and MOVHPS/MOVHPD (0F 17), store direction ------------------------
+    case 0x13:
+    case 0x17: {
+        uint8_t half[16] = {0};
+        interp_xmm_get(cpu, destination, d);
+        memcpy(half, d + (op == 0x17 ? 8 : 0), 8);
+        interp_sse_rm_put(cpu, insn, next, 8, half);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    // ---- UNPCKLPS/PD (0F 14) and UNPCKHPS/PD (0F 15) ---------------------------------------------
+    // Pure lane interleave, so these ARE the PUNPCK*DQ/QDQ operations under different names: the single-
+    // precision forms interleave dwords and the double-precision forms qwords. Sharing the primitive is
+    // not a shortcut, it is the architectural definition.
+    case 0x14:
+    case 0x15:
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_punpck(d, s, prefix == SSE_66 ? 8 : 4, op == 0x15);
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- MOVAPS/MOVAPD (0F 28/29) and the non-temporal stores (0F 2B) ----------------------------
+    case 0x28:
+        if (interp_sse_unaligned(cpu, insn, next)) return interp_guest_trap(cpu, pc, 11, 128);
+        interp_sse_rm_get(cpu, insn, next, 16, d);
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    case 0x29:
+    case 0x2B:
+        if (interp_sse_unaligned(cpu, insn, next)) return interp_guest_trap(cpu, pc, 11, 128);
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_put(cpu, insn, next, 16, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- MOVMSKPS / MOVMSKPD (0F 50) -------------------------------------------------------------
+    case 0x50: {
+        interp_xmm_get(cpu, insn->rm_reg, s);
+        uint64_t mask = 0;
+        if (prefix == SSE_66) {
+            for (int i = 0; i < 2; i++)
+                mask |= (uint64_t)((interp_lane64(s, i) >> 63) & 1) << i;
+        } else {
+            for (int i = 0; i < 4; i++)
+                mask |= (uint64_t)((interp_lane32(s, i) >> 31) & 1) << i;
+        }
+        interp_reg_write(cpu, insn, destination, 4, mask); // 32-bit destination: zero-extends
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    // ---- ANDPS/ANDNPS/ORPS/XORPS and their PD forms (0F 54..57) -----------------------------------
+    // Bitwise, so the single/double distinction carries no semantic difference at all -- which is exactly
+    // why these are in scope while the arithmetic beside them is not.
+    case 0x54:
+    case 0x55:
+    case 0x56:
+    case 0x57:
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        for (int i = 0; i < 16; i++)
+            d[i] = op == 0x54 ? (uint8_t)(d[i] & s[i])
+                   : op == 0x55 ? (uint8_t)(~d[i] & s[i]) // ANDNPS: NOT destination, then AND
+                   : op == 0x56 ? (uint8_t)(d[i] | s[i])
+                                : (uint8_t)(d[i] ^ s[i]);
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- PUNPCK* low (0F 60/61/62/6C) and high (0F 68/69/6A/6D) ----------------------------------
+    case 0x60:
+    case 0x61:
+    case 0x62:
+    case 0x6C:
+    case 0x68:
+    case 0x69:
+    case 0x6A:
+    case 0x6D: {
+        int lane = (op == 0x60 || op == 0x68) ? 1 : (op == 0x61 || op == 0x69) ? 2 : (op == 0x62 || op == 0x6A) ? 4 : 8;
+        // The low/high split is NOT a contiguous range: the byte/word/dword pairs sit at 0x60..0x62 (low)
+        // and 0x68..0x6A (high), but the QWORD pair was added later and landed at 0x6C (LOW) / 0x6D (HIGH),
+        // i.e. ABOVE the high group. A naive `op >= 0x68` therefore turns PUNPCKLQDQ into PUNPCKHQDQ --
+        // which is exactly the `movq`+`punpcklqdq` pointer-duplication idiom glibc's INIT_LIST_HEAD uses,
+        // so it corrupts a list head into garbage on the very first use.
+        int high = (op >= 0x68 && op <= 0x6A) || op == 0x6D;
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_punpck(d, s, lane, high);
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    // ---- PACKSSWB / PACKUSWB / PACKSSDW (0F 63/67/6B) --------------------------------------------
+    case 0x63:
+    case 0x67:
+    case 0x6B:
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_pack(d, s, op == 0x6B ? 4 : 2, op != 0x67);
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- PCMPGTB/W/D (0F 64/65/66) ---------------------------------------------------------------
+    case 0x64:
+    case 0x65:
+    case 0x66:
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_pcmpgt(d, s, op == 0x64 ? 1 : op == 0x65 ? 2 : 4);
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- MOVD / MOVQ, general register or memory INTO xmm (66 0F 6E) -----------------------------
+    // The r/m operand here is an INTEGER operand (a GPR or m32/m64), not an xmm, so it goes through the
+    // ordinary integer r/m path. REX.W selects the 64-bit form. The destination's upper bits are ZEROED:
+    // this is a move into the register, not a merge.
+    case 0x6E: {
+        interp_operand operand = interp_rm(cpu, insn, next);
+        int width = insn->rexW ? 8 : 4;
+        uint64_t value = interp_rm_read(cpu, insn, &operand, width);
+        memset(d, 0, 16);
+        memcpy(d, &value, (size_t)width);
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    // ---- MOVDQA (66) / MOVDQU (F3) load (0F 6F) --------------------------------------------------
+    case 0x6F:
+        if (prefix == SSE_NP)
+            return interp_undefined(cpu, insn, pc, "TODO(amd64-host): MMX MOVQ (no mm[] register file is modelled)");
+        if (prefix == SSE_66 && interp_sse_unaligned(cpu, insn, next)) return interp_guest_trap(cpu, pc, 11, 128);
+        interp_sse_rm_get(cpu, insn, next, 16, d);
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- MOVDQA (66) / MOVDQU (F3) store (0F 7F) -------------------------------------------------
+    case 0x7F:
+        if (prefix == SSE_NP)
+            return interp_undefined(cpu, insn, pc, "TODO(amd64-host): MMX MOVQ (no mm[] register file is modelled)");
+        if (prefix == SSE_66 && interp_sse_unaligned(cpu, insn, next)) return interp_guest_trap(cpu, pc, 11, 128);
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_put(cpu, insn, next, 16, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- MOVD/MOVQ xmm to r/m (66 0F 7E), and MOVQ xmm load (F3 0F 7E) ---------------------------
+    case 0x7E:
+        if (prefix == SSE_F3) { // MOVQ xmm, xmm/m64 -- a LOAD, upper 64 bits zeroed
+            interp_sse_rm_get(cpu, insn, next, 8, s);
+            memset(d, 0, 16);
+            memcpy(d, s, 8);
+            interp_xmm_put(cpu, destination, d);
+            cpu->rip = next;
+            return STEP_NEXT;
+        }
+        if (prefix == SSE_66) { // MOVD/MOVQ r/m32/64, xmm -- an integer destination
+            interp_operand operand = interp_rm(cpu, insn, next);
+            int width = insn->rexW ? 8 : 4;
+            uint64_t value = 0;
+            interp_xmm_get(cpu, destination, d);
+            memcpy(&value, d, (size_t)width);
+            interp_rm_write(cpu, insn, &operand, width, value);
+            cpu->rip = next;
+            return STEP_NEXT;
+        }
+        return interp_undefined(cpu, insn, pc, "TODO(amd64-host): MMX MOVQ (no mm[] register file is modelled)");
+
+    // ---- PSHUFD (66) / PSHUFHW (F3) / PSHUFLW (F2) (0F 70) ---------------------------------------
+    case 0x70: {
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        unsigned control = (unsigned)(insn->imm & 0xff);
+        memset(d, 0, 16);
+        if (prefix == SSE_66) {
+            for (int i = 0; i < 4; i++)
+                interp_put32(d, i, interp_lane32(s, (int)((control >> (2 * i)) & 3)));
+        } else if (prefix == SSE_F3) { // PSHUFHW: shuffle the HIGH four words, copy the low qword
+            memcpy(d, s, 8);
+            for (int i = 0; i < 4; i++)
+                interp_put16(d, 4 + i, interp_lane16(s, 4 + (int)((control >> (2 * i)) & 3)));
+        } else if (prefix == SSE_F2) { // PSHUFLW: shuffle the LOW four words, copy the high qword
+            memcpy(d + 8, s + 8, 8);
+            for (int i = 0; i < 4; i++)
+                interp_put16(d, i, interp_lane16(s, (int)((control >> (2 * i)) & 3)));
+        } else {
+            return interp_undefined(cpu, insn, pc, "TODO(amd64-host): MMX PSHUFW (no mm[] register file is modelled)");
+        }
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    // ---- the shift-by-immediate group (0F 71/72/73) ----------------------------------------------
+    // ModRM.reg is the sub-opcode, not a register, and the operand is always the xmm named by ModRM.rm.
+    case 0x71:
+    case 0x72:
+    case 0x73: {
+        int sub = insn->reg & 7;
+        unsigned count = (unsigned)(insn->imm & 0xff);
+        int lane = op == 0x71 ? 2 : op == 0x72 ? 4 : 8;
+        interp_xmm_get(cpu, insn->rm_reg, d);
+        if (op == 0x73 && (sub == 3 || sub == 7)) // PSRLDQ / PSLLDQ: whole-register BYTE shift
+            interp_pshift_bytes(d, count, sub == 3);
+        else if (sub == 2)
+            interp_pshift(d, lane, count, 1, 0); // PSRLW/D/Q
+        else if (sub == 4 && op != 0x73)
+            interp_pshift(d, lane, count, 1, 1); // PSRAW/D only: SSE2 has no PSRAQ, and 0F 73 /4 is an
+                                                 // AVX-512 encoding. Rejecting it below is deliberate --
+                                                 // computing a 64-bit arithmetic shift here would answer a
+                                                 // question the guest never legally asked.
+        else if (sub == 6)
+            interp_pshift(d, lane, count, 0, 0); // PSLLW/D/Q
+        else
+            return interp_undefined(cpu, insn, pc, "unallocated SSE shift-group sub-opcode");
+        interp_xmm_put(cpu, insn->rm_reg, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    // ---- PCMPEQB/W/D (0F 74/75/76) ---------------------------------------------------------------
+    case 0x74:
+    case 0x75:
+    case 0x76:
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_pcmpeq(d, s, op == 0x74 ? 1 : op == 0x75 ? 2 : 4);
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- PINSRW (66 0F C4) and PEXTRW (66 0F C5) -------------------------------------------------
+    case 0xC4: {
+        interp_operand operand = interp_rm(cpu, insn, next);
+        uint64_t value = interp_rm_read(cpu, insn, &operand, 2); // GPR low 16 bits, or m16
+        interp_xmm_get(cpu, destination, d);
+        interp_put16(d, (int)(insn->imm & 7), (uint16_t)value);
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    case 0xC5:
+        interp_xmm_get(cpu, insn->rm_reg, s); // the source is always an xmm register in this encoding
+        interp_reg_write(cpu, insn, destination, 4, interp_lane16(s, (int)(insn->imm & 7)));
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- SHUFPS / SHUFPD (0F C6) -----------------------------------------------------------------
+    case 0xC6: {
+        unsigned control = (unsigned)(insn->imm & 0xff);
+        uint8_t out[16];
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        if (prefix == SSE_66) { // SHUFPD: one bit per qword
+            interp_put64(out, 0, interp_lane64(d, (int)(control & 1)));
+            interp_put64(out, 1, interp_lane64(s, (int)((control >> 1) & 1)));
+        } else { // SHUFPS: low two dwords from the destination, high two from the source
+            interp_put32(out, 0, interp_lane32(d, (int)(control & 3)));
+            interp_put32(out, 1, interp_lane32(d, (int)((control >> 2) & 3)));
+            interp_put32(out, 2, interp_lane32(s, (int)((control >> 4) & 3)));
+            interp_put32(out, 3, interp_lane32(s, (int)((control >> 6) & 3)));
+        }
+        interp_xmm_put(cpu, destination, out);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    // ---- the shift-by-xmm forms (0F D1/D2/D3 right, E1/E2 arithmetic, F1/F2/F3 left) -------------
+    // The count is the FULL low 64 bits of the source, not its low 8 -- a source qword of 0x100 is a
+    // count of 256 and zeroes the register, so it must not be truncated into a count of 0.
+    case 0xD1:
+    case 0xD2:
+    case 0xD3:
+    case 0xE1:
+    case 0xE2:
+    case 0xF1:
+    case 0xF2:
+    case 0xF3: {
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        uint64_t raw = interp_lane64(s, 0);
+        unsigned count = raw > 255 ? 255u : (unsigned)raw;
+        int lane = (op == 0xD1 || op == 0xE1 || op == 0xF1) ? 2 : (op == 0xD2 || op == 0xE2 || op == 0xF2) ? 4 : 8;
+        int arithmetic = (op == 0xE1 || op == 0xE2);
+        int right = arithmetic || op == 0xD1 || op == 0xD2 || op == 0xD3;
+        interp_pshift(d, lane, count, right, arithmetic);
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    // ---- MOVQ xmm/m64 store (66 0F D6) -----------------------------------------------------------
+    case 0xD6: {
+        uint8_t half[16] = {0};
+        interp_xmm_get(cpu, destination, d);
+        memcpy(half, d, 8);
+        if (insn->is_mem) {
+            interp_store_bytes(interp_ea(cpu, insn, next), half, 8);
+        } else {
+            // Register destination: MOVQ zeroes the upper 64 bits rather than merging.
+            interp_xmm_put(cpu, insn->rm_reg, half);
+        }
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    // ---- PMOVMSKB (66 0F D7) ---------------------------------------------------------------------
+    // The reduction every strlen/memchr/strcmp ends with: gather the top bit of each of the sixteen bytes
+    // into a general register so ordinary integer code can branch on it.
+    case 0xD7: {
+        interp_xmm_get(cpu, insn->rm_reg, s);
+        uint64_t mask = 0;
+        for (int i = 0; i < 16; i++)
+            mask |= (uint64_t)((s[i] >> 7) & 1) << i;
+        interp_reg_write(cpu, insn, destination, 4, mask);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    // ---- MOVNTDQ (66 0F E7): an aligned store, the hint carries no architectural effect -----------
+    case 0xE7:
+        if (interp_sse_unaligned(cpu, insn, next)) return interp_guest_trap(cpu, pc, 11, 128);
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_put(cpu, insn, next, 16, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- the bitwise logical group (0F DB/DF/EB/EF) ----------------------------------------------
+    case 0xDB: // PAND
+    case 0xDF: // PANDN
+    case 0xEB: // POR
+    case 0xEF: // PXOR
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        for (int i = 0; i < 16; i++)
+            d[i] = op == 0xDB ? (uint8_t)(d[i] & s[i])
+                   : op == 0xDF ? (uint8_t)(~d[i] & s[i]) // PANDN: NOT destination, then AND
+                   : op == 0xEB ? (uint8_t)(d[i] | s[i])
+                                : (uint8_t)(d[i] ^ s[i]);
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- packed integer add/subtract, plain and saturating ---------------------------------------
+    case 0xFC: // PADDB
+    case 0xFD: // PADDW
+    case 0xFE: // PADDD
+    case 0xD4: // PADDQ
+    case 0xF8: // PSUBB
+    case 0xF9: // PSUBW
+    case 0xFA: // PSUBD
+    case 0xFB: // PSUBQ
+    case 0xEC: // PADDSB
+    case 0xED: // PADDSW
+    case 0xDC: // PADDUSB
+    case 0xDD: // PADDUSW
+    case 0xE8: // PSUBSB
+    case 0xE9: // PSUBSW
+    case 0xD8: // PSUBUSB
+    case 0xD9: // PSUBUSW
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        switch (op) {
+        case 0xFC: interp_padd(d, s, 1); break;
+        case 0xFD: interp_padd(d, s, 2); break;
+        case 0xFE: interp_padd(d, s, 4); break;
+        case 0xD4: interp_padd(d, s, 8); break;
+        case 0xF8: interp_psub(d, s, 1); break;
+        case 0xF9: interp_psub(d, s, 2); break;
+        case 0xFA: interp_psub(d, s, 4); break;
+        case 0xFB: interp_psub(d, s, 8); break;
+        case 0xEC: interp_padds(d, s, 1, 0, 1); break;
+        case 0xED: interp_padds(d, s, 2, 0, 1); break;
+        case 0xDC: interp_padds(d, s, 1, 0, 0); break;
+        case 0xDD: interp_padds(d, s, 2, 0, 0); break;
+        case 0xE8: interp_padds(d, s, 1, 1, 1); break;
+        case 0xE9: interp_padds(d, s, 2, 1, 1); break;
+        case 0xD8: interp_padds(d, s, 1, 1, 0); break;
+        default: interp_padds(d, s, 2, 1, 0); break; // 0xD9 PSUBUSW
+        }
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- unsigned/signed min and max (0F DA/DE/EA/EE) --------------------------------------------
+    case 0xDA: // PMINUB
+    case 0xDE: // PMAXUB
+    case 0xEA: // PMINSW
+    case 0xEE: // PMAXSW
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        if (op == 0xDA || op == 0xDE) {
+            for (int i = 0; i < 16; i++)
+                d[i] = (op == 0xDA) == (d[i] < s[i]) ? d[i] : s[i];
+        } else {
+            for (int i = 0; i < 8; i++) {
+                int16_t a = (int16_t)interp_lane16(d, i), b = (int16_t)interp_lane16(s, i);
+                interp_put16(d, i, (uint16_t)(((op == 0xEA) == (a < b)) ? a : b));
+            }
+        }
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- packed multiplies (0F D5/E4/E5/F4/F5) ---------------------------------------------------
+    case 0xD5: // PMULLW: low 16 bits of each 16x16 product
+    case 0xE4: // PMULHUW: high 16 bits, unsigned
+    case 0xE5: // PMULHW: high 16 bits, signed
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        for (int i = 0; i < 8; i++) {
+            uint32_t product;
+            if (op == 0xE5)
+                product = (uint32_t)(int32_t)((int16_t)interp_lane16(d, i) * (int32_t)(int16_t)interp_lane16(s, i));
+            else
+                product = (uint32_t)interp_lane16(d, i) * (uint32_t)interp_lane16(s, i);
+            interp_put16(d, i, (uint16_t)(op == 0xD5 ? (product & 0xffff) : (product >> 16)));
+        }
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    case 0xF4: { // PMULUDQ: unsigned 32x32 -> 64, from dwords 0 and 2
+        uint8_t out[16];
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_put64(out, 0, (uint64_t)interp_lane32(d, 0) * (uint64_t)interp_lane32(s, 0));
+        interp_put64(out, 1, (uint64_t)interp_lane32(d, 2) * (uint64_t)interp_lane32(s, 2));
+        interp_xmm_put(cpu, destination, out);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    case 0xF5: { // PMADDWD: signed 16x16 products summed in pairs into dwords
+        uint8_t out[16];
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        for (int i = 0; i < 4; i++) {
+            int32_t low = (int32_t)(int16_t)interp_lane16(d, 2 * i) * (int32_t)(int16_t)interp_lane16(s, 2 * i);
+            int32_t high =
+                (int32_t)(int16_t)interp_lane16(d, 2 * i + 1) * (int32_t)(int16_t)interp_lane16(s, 2 * i + 1);
+            interp_put32(out, i, (uint32_t)(low + high));
+        }
+        interp_xmm_put(cpu, destination, out);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    case 0xF6: { // PSADBW: sum of absolute byte differences, per 8-byte half, into words 0 and 4
+        uint8_t out[16] = {0};
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        for (int half = 0; half < 2; half++) {
+            uint32_t total = 0;
+            for (int i = 0; i < 8; i++) {
+                int index = 8 * half + i;
+                total += (uint32_t)(d[index] > s[index] ? d[index] - s[index] : s[index] - d[index]);
+            }
+            interp_put16(out, 4 * half, (uint16_t)total);
+        }
+        interp_xmm_put(cpu, destination, out);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
+    // ---- rounding averages (0F E0/E3) ------------------------------------------------------------
+    case 0xE0: // PAVGB
+    case 0xE3: // PAVGW
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        if (op == 0xE0) {
+            for (int i = 0; i < 16; i++)
+                d[i] = (uint8_t)(((uint32_t)d[i] + (uint32_t)s[i] + 1u) >> 1);
+        } else {
+            for (int i = 0; i < 8; i++) {
+                uint32_t sum = (uint32_t)interp_lane16(d, i) + (uint32_t)interp_lane16(s, i) + 1u;
+                interp_put16(d, i, (uint16_t)(sum >> 1));
+            }
+        }
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    default: break;
+    }
+    return STEP_SSE_UNHANDLED;
+}
+
+// ---------------------------------------------------------------------------------------------------
 // The 0F (two-byte) opcode map.
 // ---------------------------------------------------------------------------------------------------
 
-// Name the legacy-SSE region so the diagnostic says "implement SSE next" rather than "opcode 0x6F". The
-// list is the 0F-map SSE/SSE2 opcode space, i.e. everything not claimed by an integer arm below.
+// Name the legacy-SSE region so a residual gap reports as "SSE" rather than as a bare opcode byte. The
+// list is the 0F-map SSE/SSE2 opcode space, i.e. everything not claimed by an integer arm below;
+// interp_step_sse() above implements the data-movement, bitwise and integer-SIMD part of it.
 static int interp_is_legacy_sse(uint8_t op) {
     if (op >= 0x10 && op <= 0x17) return 1; // movups/movss/movlps/movhps/unpck*
     if (op >= 0x28 && op <= 0x2F) return 1; // movaps/movntps/cvt*/ucomiss/comiss
@@ -2295,11 +3200,15 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
     default: break;
     }
 
-    // Legacy SSE/SSE2 is the largest remaining gap: unlike VEX (R_AVX) and the 0F38/0F3A escape maps
-    // (R_SSE3B), the 0F map's SSE space has no C emulator to route to, so it needs real work rather than
-    // a reason code. Named explicitly so the diagnostic tells its reader which class to pick up.
-    if (interp_is_legacy_sse(op))
+    // Legacy SSE/SSE2. Unlike VEX (R_AVX) and the 0F38/0F3A escape maps (R_SSE3B) there is no shared C
+    // emulator to route to, so it is implemented in this file; interp_step_sse owns the data-movement,
+    // bitwise and integer-SIMD space and declines anything left (which is the floating-point arithmetic
+    // and the MMX encodings, each of which reports itself specifically).
+    if (interp_is_legacy_sse(op)) {
+        int handled = interp_step_sse(cpu, insn, pc, next);
+        if (handled != STEP_SSE_UNHANDLED) return handled;
         return interp_undefined(cpu, insn, pc, "TODO(amd64-host): legacy SSE/SSE2 (0F map)");
+    }
     if (op == 0x00 || op == 0x02 || op == 0x03 || op == 0x06 || op == 0x08 || op == 0x09 || op == 0x20 || op == 0x21 ||
         op == 0x22 || op == 0x23)
         return interp_undefined(cpu, insn, pc, "privileged system instruction (LGDT/LAR/MOV CRn/MOV DRn)");
