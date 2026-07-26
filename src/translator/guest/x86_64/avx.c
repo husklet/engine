@@ -5,6 +5,9 @@
 
 #include <fenv.h>
 #include <math.h>
+#if defined(HL_HOST_CPU_X86_64)
+#include <xmmintrin.h> // _mm_getcsr == STMXCSR: on this host the guest MXCSR IS the host MXCSR
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -426,6 +429,12 @@ static uint16_t avx_f32_to_f16_software(float f, unsigned mode) {
 }
 #endif
 
+#if defined(HL_HOST_CPU_X86_64)
+// The live MXCSR.RC, in the x86 ROUND*-immediate encoding (0 nearest-even, 1 down, 2 up, 3 truncate).
+// Defined with sse_round_d below, where the reason an x86-64 host must read it explicitly is set out.
+static int sse_host_rounding_control(void);
+#endif
+
 static uint16_t avx_f32_to_f16(float f, int imm) {
 #if defined(HL_HOST_CPU_AARCH64)
     _Float16 h;
@@ -445,17 +454,24 @@ static uint16_t avx_f32_to_f16(float f, int imm) {
     return o;
 #else
     // imm[2]=1 asks for the MXCSR-controlled mode. There is no host FPCR to read here, so take the host FP
-    // environment's rounding direction -- fegetround() is the portable spelling of the same thing the AArch64
-    // arm reads out of FPCR.RMode, and it is what LDMXCSR/FXRSTOR will have set once an x86-64 host back end
-    // routes the guest's MXCSR into the host. Falls back to nearest-even for any direction C does not name.
+    // environment's rounding direction -- the same thing the AArch64 arm reads out of FPCR.RMode, and what
+    // LDMXCSR/FXRSTOR will have put there once a host back end routes the guest's MXCSR into the host.
+    // Falls back to nearest-even for any direction the source does not name.
     unsigned mode = (unsigned)(imm & 3);
     if (imm & 4) {
+#if defined(HL_HOST_CPU_X86_64)
+        // NOT fegetround() on this host: glibc's x86-64 fegetround reads the **x87** control word, and the
+        // guest's MXCSR is a different register that LDMXCSR writes and FLDCW does not. Read MXCSR.RC, whose
+        // encoding is already this `mode` encoding (see sse_round_d).
+        mode = (unsigned)sse_host_rounding_control();
+#else
         switch (fegetround()) {
         case FE_DOWNWARD: mode = 1; break;
         case FE_UPWARD: mode = 2; break;
         case FE_TOWARDZERO: mode = 3; break;
         default: mode = 0; break;
         }
+#endif
     }
     return avx_f32_to_f16_software(f, mode);
 #endif
@@ -2610,7 +2626,36 @@ static uint32_t crc32c_step(uint32_t crc, uint64_t v, int nbytes) {
 // it here (fixes the "treated as nearest" gap). The explicit modes 0..3 must instead force that specific
 // direction regardless of MXCSR: floor/ceil/trunc already do, and explicit nearest is round-to-nearest-
 // EVEN independent of the current mode (__builtin_roundeven), not __builtin_rint (which would follow RC).
+//
+// ON AN x86-64 HOST __builtin_rint IS NOT USABLE FOR THAT, and the failure is silent. There is no ROUNDSD
+// to expand to without -msse4.1 (which the engine cannot assume of the host micro-architecture, exactly as
+// the F16C note below says), and gcc does not emit a libm call either: at -O2 it expands rint inline as
+// `|x| + 2^52 - 2^52` with the operand's sign re-applied afterwards, i.e. it rounds the MAGNITUDE. That is
+// valid only under round-to-nearest -- which -fno-rounding-math, the default, entitles gcc to assume -- and
+// the guest has just told us via LDMXCSR that the mode is something else. Under round-toward-negative-
+// infinity a negative operand's round-DOWN therefore became a round-toward-ZERO: `roundpd $4` of -2.5 gave
+// -2.0 where hardware gives -3.0 (compat/core/abi/fpedge, the `round cur` / `roundpd cur` lines).
+//
+// So on that host resolve MXCSR.RC into the explicit direction and fall through to the mode-independent
+// floor/ceil/trunc/roundeven below. The x86 RC encoding (0 nearest-even, 1 down, 2 up, 3 truncate) is
+// bit-for-bit the ROUND* imm[1:0] encoding, so it maps straight onto `mode`. MXCSR is read, never written,
+// so there is no LDMXCSR reserved-bit hazard here.
+//
+// AArch64 keeps __builtin_rint: it lowers to FRINTX, which really does read FPCR.RMode. Nothing about the
+// JIT is wrong -- this is a host-CPU-specific expansion hazard in a file that reads as host-neutral.
+#if defined(HL_HOST_CPU_X86_64)
+static int sse_host_rounding_control(void) {
+    return (int)((_mm_getcsr() >> 13) & 3u); // MXCSR bits 14:13 = RC
+}
+#endif
+
 static double sse_round_d(double x, int mode, int use_mxcsr) {
+#if defined(HL_HOST_CPU_X86_64)
+    if (use_mxcsr) {
+        mode = sse_host_rounding_control();
+        use_mxcsr = 0;
+    }
+#endif
     if (use_mxcsr) return __builtin_rint(x); // honor MXCSR.RC (mirrored into host FPCR by ldmxcsr)
     switch (mode & 3) {
     case 1: return __builtin_floor(x);
@@ -2621,6 +2666,12 @@ static double sse_round_d(double x, int mode, int use_mxcsr) {
 }
 
 static float sse_round_f(float x, int mode, int use_mxcsr) {
+#if defined(HL_HOST_CPU_X86_64)
+    if (use_mxcsr) {
+        mode = sse_host_rounding_control();
+        use_mxcsr = 0;
+    }
+#endif
     if (use_mxcsr) return __builtin_rintf(x);
     switch (mode & 3) {
     case 1: return __builtin_floorf(x);

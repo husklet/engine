@@ -1656,6 +1656,12 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
                 cpu->rip = next;
                 return STEP_NEXT;
             }
+            // The by-CL form goes to the shared helper, which reads its whole operand description out of
+            // cpu->divop (rotate.c's hl_x86_rotate_carry). Publishing it is not optional: without this
+            // store the helper decoded a STALE divop -- whatever the last R_DIV/R_TRAP/R_REPSTR left there
+            // -- and a width of 0 makes its `masked % (bits + 1)` reduce to 0, so `rclb %cl, %bl` retired
+            // without rotating anything and without touching CF.
+            cpu->divop = descriptor;
             return interp_exit(cpu, next, R_RCL);
         }
         unsigned count = (unsigned)(by_cl ? (cpu->r[RCX] & 0xff) : (by_one ? 1u : (unsigned)(insn->imm & 0xff)));
@@ -2128,9 +2134,16 @@ static void interp_punpck(uint8_t *d, const uint8_t *s, int lane, int high) {
 }
 
 // PACKSSWB / PACKUSWB / PACKSSDW: narrow with saturation, destination lanes then source lanes.
+//
+// `per` is 16/source_lane, NOT 8/source_lane: each 16-byte operand holds EIGHT words (or four dwords) and
+// contributes all of them, filling the whole 16-byte result between the two operands. With 8/source_lane it
+// was half that -- so PACKUSWB wrote only bytes 0..3 from the destination and 4..7 from the SOURCE (where
+// the source's belong at 8..15), and left out[8..15] UNINITIALISED, i.e. it stored stack garbage into a
+// guest register. gcc's vectoriser emits exactly this pack at the end of every byte-store loop it builds
+// out of wider arithmetic, so a plain `for (i) buf[i] = i * 7 + 3;` corrupted 12 of every 16 bytes.
 static void interp_pack(uint8_t *d, const uint8_t *s, int source_lane, int signed_result) {
     uint8_t out[16];
-    int per = 8 / source_lane; // narrowed lanes contributed by each operand
+    int per = 16 / source_lane; // narrowed lanes contributed by each operand
     for (int i = 0; i < per; i++) {
         if (source_lane == 2) {
             int32_t a = (int32_t)(int16_t)interp_lane16(d, i);
@@ -2156,12 +2169,14 @@ enum { STEP_SSE_UNHANDLED = -1 };
 // interp_step_sse_fp below -- and because the diagnostic on a host that cannot should say which CLASS is
 // missing rather than quote an opcode byte.
 static int interp_sse_is_float_arithmetic(uint8_t op) {
-    if (op >= 0x58 && op <= 0x5F) return 1;                   // add/mul/cvt/sub/min/div/max ps/pd/ss/sd
-    if (op == 0x51 || op == 0x52 || op == 0x53) return 1;     // sqrt / rsqrt / rcp
-    if (op == 0x2A || (op >= 0x2C && op <= 0x2F)) return 1;   // cvtsi2s* / cvt*2si / ucomis* / comis*
-    if (op == 0x5A || op == 0x5B) return 1;                   // cvtps2pd / cvtdq2ps and friends
-    if (op == 0xC2) return 1;                                 // cmpps/cmppd/cmpss/cmpsd
-    if (op == 0xE6) return 1;                                 // cvtdq2pd / cvtpd2dq / cvttpd2dq
+    if (op >= 0x58 && op <= 0x5F) return 1;                 // add/mul/cvt/sub/min/div/max ps/pd/ss/sd
+    if (op == 0x51 || op == 0x52 || op == 0x53) return 1;   // sqrt / rsqrt / rcp
+    if (op == 0x2A || (op >= 0x2C && op <= 0x2F)) return 1; // cvtsi2s* / cvt*2si / ucomis* / comis*
+    if (op == 0x5A || op == 0x5B) return 1;                 // cvtps2pd / cvtdq2ps and friends
+    if (op == 0xC2) return 1;                               // cmpps/cmppd/cmpss/cmpsd
+    if (op == 0xE6) return 1;                               // cvtdq2pd / cvtpd2dq / cvttpd2dq
+    if (op == 0x7C || op == 0x7D) return 1;                 // SSE3 haddps/haddpd / hsubps/hsubpd
+    if (op == 0xD0) return 1;                               // SSE3 addsubps / addsubpd
     return 0;
 }
 
@@ -2241,15 +2256,17 @@ static int interp_fp_is_scalar(int prefix) {
 // substitutes zeros for real source lanes.
 //
 // "F2/F3 means scalar" is the rule for the arithmetic block and it is NOT universal, which is the trap in
-// this space. Three opcodes carry a mandatory F2/F3 on a fully PACKED operation -- CVTPD2DQ is F2 0F E6,
-// CVTTPS2DQ is F3 0F 5B, CVTDQ2PD is F3 0F E6 -- and two more take an m64 while their packed sibling on the
-// same opcode byte takes an m128. So the exceptions are listed by (opcode, prefix) pair before the general
-// rule is applied, rather than being left to a predicate that is right for 0x58..0x5F and wrong here.
+// this space. Several opcodes carry a mandatory F2/F3 on a fully PACKED operation -- CVTPD2DQ is F2 0F E6,
+// CVTTPS2DQ is F3 0F 5B, CVTDQ2PD is F3 0F E6, and the whole SSE3 horizontal group spells PS with F2 (F2 0F
+// 7C is HADDPS) -- and two more take an m64 while their packed sibling on the same opcode byte takes an
+// m128. So the exceptions are listed by (opcode, prefix) pair before the general rule is applied, rather
+// than being left to a predicate that is right for 0x58..0x5F and wrong here.
 static unsigned interp_fp_source_bytes(uint8_t op, int prefix) {
     if (op == 0x5A && prefix == SSE_NP) return 8;  // CVTPS2PD: an m64 holding two floats
     if (op == 0xE6 && prefix == SSE_F3) return 8;  // CVTDQ2PD: an m64 holding two int32
     if (op == 0xE6 && prefix == SSE_F2) return 16; // CVTPD2DQ: PACKED despite the F2 prefix
     if (op == 0x5B) return 16;                     // CVTDQ2PS / CVTPS2DQ / CVTTPS2DQ: all 4-lane
+    if (op == 0x7C || op == 0x7D || op == 0xD0) return 16; // HADD/HSUB/ADDSUB: packed under 66 AND under F2
     if (!interp_fp_is_scalar(prefix)) return 16;
     return interp_fp_is_double(prefix) ? 8u : 4u;
 }
@@ -2338,11 +2355,11 @@ static void interp_fp_comis_flags(struct cpu *cpu, unsigned char zf, unsigned ch
 #define INTERP_FP_COMIS(cpu, mnemonic, left, right)                                                                    \
     do {                                                                                                               \
         unsigned char zf_, pf_, cf_;                                                                                   \
-        __asm__ volatile(mnemonic " %[b], %[a]\n\tsetz %[z]\n\tsetp %[p]\n\tsetc %[c]"                                  \
+        __asm__ volatile(mnemonic " %[b], %[a]\n\tsetz %[z]\n\tsetp %[p]\n\tsetc %[c]"                                 \
                          : [z] "=r"(zf_), [p] "=r"(pf_), [c] "=r"(cf_)                                                 \
                          : [a] "x"(left), [b] "x"(right)                                                               \
                          : "cc");                                                                                      \
-        interp_fp_comis_flags((cpu), zf_, pf_, cf_);                                                                    \
+        interp_fp_comis_flags((cpu), zf_, pf_, cf_);                                                                   \
     } while (0)
 
 static int interp_step_sse_fp(struct cpu *cpu, struct insn *insn, uint64_t pc, uint64_t next) {
@@ -2552,6 +2569,52 @@ static int interp_step_sse_fp(struct cpu *cpu, struct insn *insn, uint64_t pc, u
         return STEP_NEXT;
     }
 
+    // ---- SSE3 horizontal add/subtract (0F 7C / 0F 7D) and ADDSUBPS/PD (0F D0) ---------------------
+    // Built out of SSE2 shuffles plus one ADD or SUB rather than out of _mm_hadd_ps, deliberately: the SSE3
+    // intrinsics need -msse3, and the engine ships one binary per host OS/CPU pair rather than per
+    // micro-architecture, so an unconditional HADDPS would SIGILL on a pre-Prescott x86-64. avx.c refuses
+    // -mf16c for exactly this reason and says so. The composition is exact, not an approximation: each
+    // result lane of HADDPS is a single ADDPS-shaped addition of two source lanes, and gathering the
+    // even-indexed lanes into src1 and the odd ones into src2 preserves the operand ORDER, which is what
+    // decides NaN selection. ADDSUBPS likewise selects whole lanes bitwise from an ADDPS and a SUBPS, so
+    // every NaN payload and signed zero is the one the single instruction would have produced.
+    //
+    // Note the prefix mapping: 0x66 is the PD form and 0xF2 is the PS form -- F2 does NOT mean scalar here.
+    case 0x7C:
+    case 0x7D:
+    case 0xD0: {
+        int pd = prefix == SSE_66;
+        if (!pd && prefix != SSE_F2) return interp_undefined(cpu, insn, pc, "reserved (SSE3 0F 7C/7D/D0 prefix)");
+        interp_xmm_get(cpu, destination, d);
+        interp_sse_rm_get(cpu, insn, next, 16, s);
+        if (pd) {
+            __m128d a = interp_fp_get_pd(d), b = interp_fp_get_pd(s), r;
+            if (op == 0xD0) { // ADDSUBPD: lane0 subtracts, lane1 adds
+                __m128d mask = _mm_castsi128_pd(_mm_set_epi64x(0, -1));
+                r = _mm_or_pd(_mm_and_pd(mask, _mm_sub_pd(a, b)), _mm_andnot_pd(mask, _mm_add_pd(a, b)));
+            } else {
+                __m128d even = _mm_unpacklo_pd(a, b); // {a0, b0}
+                __m128d odd = _mm_unpackhi_pd(a, b);  // {a1, b1}
+                r = op == 0x7C ? _mm_add_pd(even, odd) : _mm_sub_pd(even, odd);
+            }
+            interp_fp_put_pd(d, r);
+        } else {
+            __m128 a = interp_fp_get_ps(d), b = interp_fp_get_ps(s), r;
+            if (op == 0xD0) { // ADDSUBPS: even lanes subtract, odd lanes add
+                __m128 mask = _mm_castsi128_ps(_mm_set_epi32(0, -1, 0, -1));
+                r = _mm_or_ps(_mm_and_ps(mask, _mm_sub_ps(a, b)), _mm_andnot_ps(mask, _mm_add_ps(a, b)));
+            } else {
+                __m128 even = _mm_shuffle_ps(a, b, 0x88); // {a0, a2, b0, b2}
+                __m128 odd = _mm_shuffle_ps(a, b, 0xdd);  // {a1, a3, b1, b3}
+                r = op == 0x7C ? _mm_add_ps(even, odd) : _mm_sub_ps(even, odd);
+            }
+            interp_fp_put_ps(d, r);
+        }
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
     // ---- CMPPS / CMPPD / CMPSS / CMPSD (0F C2 imm8) -----------------------------------------------
     case 0xC2: {
         unsigned predicate = (unsigned)insn->imm & 7u;
@@ -2650,6 +2713,45 @@ static void interp_x87_condition(struct cpu *cpu, unsigned c0, unsigned c1, unsi
     cpu->fpsw = status;
 }
 
+// C1 alone (FSW bit 9). Almost every x87 instruction WRITES C1 -- as the "result was rounded up"
+// indicator for the arithmetic and the stores, as the sign for FXAM, as quotient bit 0 for FPREM/FPREM1 --
+// and leaving a stale one behind is directly observable through FNSTSW/FNSTENV/FXSAVE, which is how the
+// divergence this exists to fix was found (glibc's fmod runs an FPREM loop, so a C1 left set by it showed
+// up in an unrelated FNSTENV hundreds of instructions later). So the ops that architecturally define C1
+// write it, and the ones that leave the rest of the condition codes alone write ONLY it.
+//
+// The residual gap, named because it is real: for the ARITHMETIC ops "rounded up" would need the exact
+// (unrounded) result to compare against, which double arithmetic cannot produce, so they write 0. That is
+// right whenever the operation was exact and wrong only for an inexact result that rounded away from
+// zero -- strictly better than a stale bit, and the AArch64 backend does not model C1 at all.
+static void interp_x87_c1(struct cpu *cpu, unsigned value) {
+    if (value)
+        cpu->fpsw |= UINT64_C(1) << 9;
+    else
+        cpu->fpsw &= ~(UINT64_C(1) << 9);
+}
+
+// "The result was rounded up", for the ops where both the rounded result and the original value are in
+// hand: the narrowing stores and the integral rounds. A NaN makes the comparison false, i.e. C1 = 0.
+static unsigned interp_x87_rounded_up(double result, double original) {
+    return (unsigned)(result > original);
+}
+
+// Round-half-to-EVEN, spelled out rather than delegated to rint/nearbyint because those follow the live
+// HOST rounding mode and this must not: it is x87's RC=00 (the default) and it is also FPREM1's quotient
+// rounding, which is round-to-nearest-even whatever RC says.
+static double interp_round_half_even(double value) {
+    double truncated;
+    double fraction;
+    double magnitude;
+    if (!isfinite(value)) return value;
+    truncated = trunc(value);
+    fraction = value - truncated; // exact: |value| >= 2^52 is already integral, so fraction is 0
+    magnitude = fabs(fraction);
+    if (magnitude > 0.5 || (magnitude == 0.5 && fmod(truncated, 2.0) != 0.0)) truncated += fraction > 0.0 ? 1.0 : -1.0;
+    return truncated;
+}
+
 // OR bits into the sticky exception flags the guest reads back through FNSTSW/FXSAVE. Only the paths that
 // raise an exception the HOST FP unit cannot raise for us need this -- today just the FIST/FISTP
 // out-of-range #IA, whose result is produced by a range test in C rather than by a host conversion.
@@ -2692,8 +2794,8 @@ static uint16_t interp_x87_status_word(const struct cpu *cpu) {
 // want it that way: FCOMI writes those bits directly, and the FSW condition codes are (C0,C2,C3) =
 // (CF,PF,ZF) -- greater 000, less 100, equal 001, unordered 111 -- which is not a coincidence but the
 // reason the SSE compare instructions chose that flag encoding.
-static void interp_x87_compare_flags(double left, double right, int signalling, unsigned char *zf,
-                                     unsigned char *pf, unsigned char *cf) {
+static void interp_x87_compare_flags(double left, double right, int signalling, unsigned char *zf, unsigned char *pf,
+                                     unsigned char *cf) {
 #if defined(HL_HOST_CPU_X86_64)
     __m128d a = _mm_set_sd(left);
     __m128d b = _mm_set_sd(right);
@@ -2735,6 +2837,7 @@ static void interp_x87_compare_eflags(struct cpu *cpu, double left, double right
     interp_flags_nzcv(cpu, 0, zf, cf, 0);
     cpu->pf = pf ? 0u : 1u; // a byte whose EVEN parity is x86 PF
     cpu->af = 0;
+    interp_x87_c1(cpu, 0); // the FSW condition codes are untouched by these, but C1 is defined as 0
 }
 
 // Round to an integral value under the x87 control word's RC field (FCW bits 11:10), independently of the
@@ -2745,18 +2848,10 @@ static double interp_x87_round_integral(const struct cpu *cpu, double value) {
     unsigned rc = (unsigned)((cpu->fpcw >> 10) & 3u);
     if (!isfinite(value)) return value;
     switch (rc) {
-    case 1: return floor(value); // toward -inf
-    case 2: return ceil(value);  // toward +inf
-    case 3: return trunc(value); // toward zero
-    default: break;
-    }
-    {
-        double truncated = trunc(value);
-        double fraction = value - truncated; // exact: |value| >= 2^52 is already integral, so fraction is 0
-        double magnitude = fabs(fraction);
-        if (magnitude > 0.5 || (magnitude == 0.5 && fmod(truncated, 2.0) != 0.0))
-            truncated += fraction > 0.0 ? 1.0 : -1.0;
-        return truncated;
+    case 1: return floor(value);                   // toward -inf
+    case 2: return ceil(value);                    // toward +inf
+    case 3: return trunc(value);                   // toward zero
+    default: return interp_round_half_even(value); // RC=00, the x87 default
     }
 }
 
@@ -2856,16 +2951,21 @@ static double interp_x87_scale(double value, double exponent) {
 // the IEEE-exact spellings of exactly those two, so they are used instead of reproducing the JIT's
 // divide-round-multiply-subtract sequence, which loses bits for a large ratio. The reduction is completed
 // in one step, so C2 <- 0 ("reduction complete"), which is what makes libc's `do { fprem } while (C2)`
-// loop terminate. FPREM also publishes |Q|'s low three bits as C1/C3/C0 (bit0/bit1/bit2); FPREM1 leaves
-// them clear -- matching qemu's helper_fprem and the JIT.
+// loop terminate.
+//
+// BOTH forms publish |Q|'s low three bits as C1/C3/C0 (bit 0/1/2). lower/x87.c and qemu's helper_fprem
+// leave them clear for FPREM1; real hardware does not, and a differential run against native catches it
+// immediately (FPREM1 of 17 by 5 gives Q=3, so C3 and C1 are set). The two differ only in how Q is
+// rounded, which is the same distinction that picks fmod over remainder.
 static void interp_x87_remainder(struct cpu *cpu, int ieee) {
     double st0 = interp_x87_get(cpu, 0);
     double st1 = interp_x87_get(cpu, 1);
     double result = ieee ? remainder(st0, st1) : fmod(st0, st1);
     unsigned c0 = 0, c1 = 0, c3 = 0;
     interp_x87_set(cpu, 0, result);
-    if (!ieee && isfinite(st0) && isfinite(st1) && st1 != 0.0) {
-        double quotient = trunc(st0 / st1);
+    if (isfinite(st0) && isfinite(st1) && st1 != 0.0) {
+        double ratio = st0 / st1;
+        double quotient = ieee ? interp_round_half_even(ratio) : trunc(ratio);
         if (fabs(quotient) < 9007199254740992.0) { // 2^53: beyond it the low bits are not represented
             uint64_t magnitude = (uint64_t)fabs(quotient);
             c1 = (unsigned)(magnitude & 1u);
@@ -2928,17 +3028,20 @@ static double interp_x87_load_f64(uint64_t address) {
     return value;
 }
 
-static void interp_x87_store_f32(uint64_t address, double value) {
+// Returns the C1 "rounded up" indicator: FST m32 is the one x87 store that can actually round, since the
+// carrier is already a double.
+static unsigned interp_x87_store_f32(uint64_t address, double value) {
     float narrowed = (float)value; // rounds per the live host mode -- see THE ONE APPROXIMATION above
     uint32_t bits;
     memcpy(&bits, &narrowed, sizeof bits);
     interp_store(address, 4, bits);
+    return interp_x87_rounded_up((double)narrowed, value);
 }
 
 static void interp_x87_store_f64(uint64_t address, double value) {
     uint64_t bits;
     memcpy(&bits, &value, sizeof bits);
-    interp_store(address, 8, bits);
+    interp_store(address, 8, bits); // always exact: the ST carrier IS a double
 }
 
 // The memory forms of the D8/DC (m32/m64 float) and DA/DE (m32/m16 SIGNED integer) arithmetic group. All
@@ -2954,6 +3057,7 @@ static int interp_x87_memory_arith(struct cpu *cpu, struct insn *insn, uint64_t 
     }
     (void)pc;
     interp_x87_set(cpu, 0, interp_x87_arith(kind, st0, source));
+    interp_x87_c1(cpu, 0); // arithmetic defines C1 as "rounded up", which this model cannot compute
     cpu->rip = next;
     return STEP_NEXT;
 }
@@ -2978,15 +3082,18 @@ static int interp_step_x87(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
         // ---- D9: m32 loads/stores and the control-word group -------------------------------------
         case 0xD9:
             switch (reg) {
-            case 0: interp_x87_push(cpu, interp_x87_load_f32(address)); break; // FLD m32
-            case 2:                                                            // FST m32
-            case 3:                                                            // FSTP m32
-                interp_x87_store_f32(address, interp_x87_get(cpu, 0));
+            case 0: // FLD m32 -- exact widening, so C1 (which FLD also writes) is 0
+                interp_x87_push(cpu, interp_x87_load_f32(address));
+                interp_x87_c1(cpu, 0);
+                break;
+            case 2: // FST m32
+            case 3: // FSTP m32
+                interp_x87_c1(cpu, interp_x87_store_f32(address, interp_x87_get(cpu, 0)));
                 if (reg == 3) interp_x87_pop(cpu);
                 break;
-            case 4: interp_x87_load_environment(cpu, address); break;  // FLDENV m28
-            case 5: cpu->fpcw = interp_load(address, 2); break;        // FLDCW m16
-            case 6: interp_x87_store_environment(cpu, address); break; // FNSTENV m28
+            case 4: interp_x87_load_environment(cpu, address); break;    // FLDENV m28
+            case 5: cpu->fpcw = interp_load(address, 2); break;          // FLDCW m16
+            case 6: interp_x87_store_environment(cpu, address); break;   // FNSTENV m28
             case 7: interp_store(address, 2, cpu->fpcw & 0xffff); break; // FNSTCW m16
             default: return interp_undefined(cpu, insn, pc, "x87 D9 memory form");
             }
@@ -2996,10 +3103,13 @@ static int interp_step_x87(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
         // ---- DB: m32 integer loads/stores, and the m80 pair ------------------------------------
         case 0xDB:
             switch (reg) {
-            case 0: interp_x87_push(cpu, (double)(int32_t)interp_load(address, 4)); break; // FILD m32
-            case 1:                                                                       // FISTTP m32
-            case 2:                                                                       // FIST m32
-            case 3: {                                                                     // FISTP m32
+            case 0: // FILD m32 -- exact for every int32, so C1 = 0
+                interp_x87_push(cpu, (double)(int32_t)interp_load(address, 4));
+                interp_x87_c1(cpu, 0);
+                break;
+            case 1:   // FISTTP m32
+            case 2:   // FIST m32
+            case 3: { // FISTP m32
                 int invalid = 0;
                 // FISTTP (SSE3) truncates unconditionally; FIST/FISTP round per the x87 control word.
                 double value = interp_x87_get(cpu, 0);
@@ -3007,19 +3117,24 @@ static int interp_step_x87(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
                 uint64_t stored = interp_x87_to_integer(rounded, 4, &invalid);
                 if (invalid) interp_fp_raise(1u /*IE*/);
                 interp_store(address, 4, stored);
+                interp_x87_c1(cpu, interp_x87_rounded_up(rounded, value));
                 if (reg != 2) interp_x87_pop(cpu);
                 break;
             }
             case 5: { // FLD m80 -- the 80-bit converter, shared with the JIT (x87state.c)
                 uint8_t image[10];
+                double value;
                 interp_load_bytes(address, image, sizeof image);
-                interp_x87_push(cpu, hl_x86_ext80_load(image));
+                value = hl_x86_ext80_load(image);
+                interp_x87_push(cpu, value);
+                interp_x87_c1(cpu, 0);
                 break;
             }
-            case 7: { // FSTP m80
+            case 7: { // FSTP m80 -- widening, so exact, so C1 = 0
                 uint8_t image[10];
                 hl_x86_ext80_store(interp_x87_get(cpu, 0), image);
                 interp_store_bytes(address, image, sizeof image);
+                interp_x87_c1(cpu, 0);
                 interp_x87_pop(cpu);
                 break;
             }
@@ -3031,18 +3146,25 @@ static int interp_step_x87(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
         // ---- DD: m64 loads/stores, and FNSTSW m16 ---------------------------------------------
         case 0xDD:
             switch (reg) {
-            case 0: interp_x87_push(cpu, interp_x87_load_f64(address)); break; // FLD m64
-            case 1: {                                                         // FISTTP m64
+            case 0: // FLD m64 -- the carrier IS a double, so exact
+                interp_x87_push(cpu, interp_x87_load_f64(address));
+                interp_x87_c1(cpu, 0);
+                break;
+            case 1: { // FISTTP m64
                 int invalid = 0;
-                uint64_t stored = interp_x87_to_integer(trunc(interp_x87_get(cpu, 0)), 8, &invalid);
+                double value = interp_x87_get(cpu, 0);
+                double rounded = trunc(value);
+                uint64_t stored = interp_x87_to_integer(rounded, 8, &invalid);
                 if (invalid) interp_fp_raise(1u);
                 interp_store(address, 8, stored);
+                interp_x87_c1(cpu, interp_x87_rounded_up(rounded, value));
                 interp_x87_pop(cpu);
                 break;
             }
             case 2: // FST m64
             case 3: // FSTP m64
                 interp_x87_store_f64(address, interp_x87_get(cpu, 0));
+                interp_x87_c1(cpu, 0);
                 if (reg == 3) interp_x87_pop(cpu);
                 break;
             case 7: interp_store(address, 2, interp_x87_status_word(cpu)); break; // FNSTSW m16
@@ -3059,26 +3181,39 @@ static int interp_step_x87(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
         // ---- DF: m16/m64 integer loads/stores ------------------------------------------------
         case 0xDF:
             switch (reg) {
-            case 0: interp_x87_push(cpu, (double)(int16_t)interp_load(address, 2)); break; // FILD m16
-            case 1:                                                                       // FISTTP m16
-            case 2:                                                                       // FIST m16
-            case 3: {                                                                     // FISTP m16
+            case 0: // FILD m16
+                interp_x87_push(cpu, (double)(int16_t)interp_load(address, 2));
+                interp_x87_c1(cpu, 0);
+                break;
+            case 1:   // FISTTP m16
+            case 2:   // FIST m16
+            case 3: { // FISTP m16
                 int invalid = 0;
                 double value = interp_x87_get(cpu, 0);
                 double rounded = reg == 1 ? trunc(value) : interp_x87_round_integral(cpu, value);
                 uint64_t stored = interp_x87_to_integer(rounded, 2, &invalid);
                 if (invalid) interp_fp_raise(1u);
                 interp_store(address, 2, stored);
+                interp_x87_c1(cpu, interp_x87_rounded_up(rounded, value));
                 if (reg != 2) interp_x87_pop(cpu);
                 break;
             }
-            case 5: interp_x87_push(cpu, (double)(int64_t)interp_load(address, 8)); break; // FILD m64
-            case 7: {                                                                     // FISTP m64
+            // FILD m64. The only x87 LOAD that can round in this model: a magnitude beyond 2^53 does not
+            // fit the double carrier, where a real 80-bit register would hold every int64 exactly. C1 is
+            // written 0 rather than reporting the direction of that rounding -- the same gap, for the same
+            // reason, as the arithmetic ops (see interp_x87_c1).
+            case 5:
+                interp_x87_push(cpu, (double)(int64_t)interp_load(address, 8));
+                interp_x87_c1(cpu, 0);
+                break;
+            case 7: { // FISTP m64
                 int invalid = 0;
-                uint64_t stored = interp_x87_to_integer(interp_x87_round_integral(cpu, interp_x87_get(cpu, 0)), 8,
-                                                        &invalid);
+                double value = interp_x87_get(cpu, 0);
+                double rounded = interp_x87_round_integral(cpu, value);
+                uint64_t stored = interp_x87_to_integer(rounded, 8, &invalid);
                 if (invalid) interp_fp_raise(1u);
                 interp_store(address, 8, stored);
+                interp_x87_c1(cpu, interp_x87_rounded_up(rounded, value));
                 interp_x87_pop(cpu);
                 break;
             }
@@ -3118,6 +3253,7 @@ static int interp_step_x87(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
             double source = op == 0xD8 ? interp_x87_get(cpu, rm) : interp_x87_get(cpu, 0);
             if (op != 0xD8 && (kind == 4 || kind == 5 || kind == 6 || kind == 7)) kind ^= 1;
             interp_x87_set(cpu, target, interp_x87_arith(kind, destination, source));
+            interp_x87_c1(cpu, 0);               // "rounded up" -- not computable here, see interp_x87_c1
             if (op == 0xDE) interp_x87_pop(cpu); // the DE forms pop after writing
         }
         cpu->rip = next;
@@ -3125,9 +3261,12 @@ static int interp_step_x87(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
 
     // ---- D9: the no-operand group ---------------------------------------------------------
     case 0xD9:
+        // Every arm below writes C1 (as 0), because every one of these instructions architecturally does;
+        // FXAM, FPREM and FPREM1 then overwrite it with the value they define.
+        interp_x87_c1(cpu, 0);
         switch (reg) {
         case 0: interp_x87_push(cpu, interp_x87_get(cpu, rm)); break; // FLD ST(i)
-        case 1: {                                                    // FXCH ST(i)
+        case 1: {                                                     // FXCH ST(i)
             double st0 = interp_x87_get(cpu, 0);
             interp_x87_set(cpu, 0, interp_x87_get(cpu, rm));
             interp_x87_set(cpu, rm, st0);
@@ -3174,18 +3313,25 @@ static int interp_step_x87(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
                 cpu->fptop = (cpu->fptop + 1) & 7; // FINCSTP
             break;
         case 7:
-            if (rm == 0)
-                interp_x87_remainder(cpu, 0); // FPREM
-            else if (rm == 1 || rm == 3 || rm == 6 || rm == 7) {
+            switch (rm) {
+            case 0: interp_x87_remainder(cpu, 0); break;                         // FPREM
+            case 2: interp_x87_set(cpu, 0, sqrt(interp_x87_get(cpu, 0))); break; // FSQRT
+            case 4: { // FRNDINT: rounds per the x87 control word, and reports the direction in C1
+                double value = interp_x87_get(cpu, 0);
+                double rounded = interp_x87_round_integral(cpu, value);
+                interp_x87_set(cpu, 0, rounded);
+                interp_x87_c1(cpu, interp_x87_rounded_up(rounded, value));
+                break;
+            }
+            case 5: // FSCALE
+                interp_x87_set(cpu, 0, interp_x87_scale(interp_x87_get(cpu, 0), interp_x87_get(cpu, 1)));
+                break;
+            default: { // F9 FYL2XP1, FB FSINCOS, FE FSIN, FF FCOS -- host libm, via x87math.c
                 static const int selector[8] = {0, X87_FYL2XP1, 0, X87_FSINCOS, 0, 0, X87_FSIN, X87_FCOS};
                 cpu->x87_ea = (uint64_t)selector[rm];
                 return interp_exit(cpu, next, R_X87FUNC);
-            } else if (rm == 2)
-                interp_x87_set(cpu, 0, sqrt(interp_x87_get(cpu, 0))); // FSQRT
-            else if (rm == 4)
-                interp_x87_set(cpu, 0, interp_x87_round_integral(cpu, interp_x87_get(cpu, 0))); // FRNDINT
-            else                                                                               // rm == 5
-                interp_x87_set(cpu, 0, interp_x87_scale(interp_x87_get(cpu, 0), interp_x87_get(cpu, 1))); // FSCALE
+            }
+            }
             break;
         default: return interp_undefined(cpu, insn, pc, "x87 D9 register form");
         }
@@ -3234,11 +3380,12 @@ static int interp_step_x87(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
     // ---- DD: FFREE, FST/FSTP ST(i), FUCOM/FUCOMP ---------------------------------------
     case 0xDD:
         switch (reg) {
-        case 0: break;                                                // FFREE: no tag word is modelled
-        case 2: interp_x87_set(cpu, rm, interp_x87_get(cpu, 0)); break; // FST ST(i)
-        case 3:                                                       // FSTP ST(i)
+        case 0: break; // FFREE: no tag word is modelled
+        case 2:        // FST ST(i) -- a register-to-register move, so exact, so C1 = 0
+        case 3:        // FSTP ST(i)
             interp_x87_set(cpu, rm, interp_x87_get(cpu, 0));
-            interp_x87_pop(cpu);
+            interp_x87_c1(cpu, 0);
+            if (reg == 3) interp_x87_pop(cpu);
             break;
         case 4: // FUCOM ST(i): quiet, so only a signalling NaN raises #IA
         case 5: // FUCOMP ST(i)
@@ -3327,12 +3474,22 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
         return STEP_NEXT;
     }
 
-    // ---- MOVLPS/MOVLPD/MOVHLPS/MOVDDUP (0F 12) and MOVHPS/MOVHPD/MOVLHPS (0F 16) -----------------
+    // ---- MOVLPS/MOVLPD/MOVHLPS/MOVDDUP/MOVSLDUP (0F 12) and MOVHPS/MOVHPD/MOVLHPS/MOVSHDUP (0F 16) --
     case 0x12:
     case 0x16: {
         int high = (op == 0x16);
         interp_xmm_get(cpu, destination, d);
-        if (prefix == SSE_F2 && op == 0x12) { // MOVDDUP: broadcast the low qword into both halves
+        if (prefix == SSE_F3) {
+            // SSE3 MOVSLDUP (F3 0F 12) / MOVSHDUP (F3 0F 16): duplicate the EVEN (resp. ODD) single-
+            // precision lanes across the whole register from a full m128 source. Pure lane duplication, so
+            // it belongs in this half rather than with the FP arithmetic. It is called out because the F3
+            // form previously fell into the MOVLPS/MOVHPS arm below, which reads only 8 bytes and merges
+            // them into one half -- silently wrong output rather than a reported gap, and the F3 prefix is
+            // the only thing distinguishing the two encodings.
+            interp_sse_rm_get(cpu, insn, next, 16, s);
+            for (int i = 0; i < 4; i++)
+                interp_put32(d, i, interp_lane32(s, (i & ~1) | (high ? 1 : 0)));
+        } else if (prefix == SSE_F2 && op == 0x12) { // MOVDDUP: broadcast the low qword into both halves
             interp_sse_rm_get(cpu, insn, next, 8, s);
             memcpy(d + 0, s, 8);
             memcpy(d + 8, s, 8);
@@ -3491,6 +3648,17 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
         if (prefix == SSE_NP)
             return interp_undefined(cpu, insn, pc, "TODO(amd64-host): MMX MOVQ (no mm[] register file is modelled)");
         if (prefix == SSE_66 && interp_sse_unaligned(cpu, insn, next)) return interp_guest_trap(cpu, pc, 11, 128);
+        interp_sse_rm_get(cpu, insn, next, 16, d);
+        interp_xmm_put(cpu, destination, d);
+        cpu->rip = next;
+        return STEP_NEXT;
+
+    // ---- LDDQU (F2 0F F0) ------------------------------------------------------------------------
+    // Architecturally identical to MOVDQU: an unaligned 16-byte load. The only difference is a
+    // micro-architectural hint (it may over-fetch and realign internally), which has no guest-visible
+    // effect, so sharing the MOVDQU path is the definition rather than a shortcut. Memory source only.
+    case 0xF0:
+        if (prefix != SSE_F2 || !insn->is_mem) return interp_undefined(cpu, insn, pc, "reserved (0F F0)");
         interp_sse_rm_get(cpu, insn, next, 16, d);
         interp_xmm_put(cpu, destination, d);
         cpu->rip = next;
@@ -4229,11 +4397,18 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
         if (operand.is_memory && insn->lock) {
             old = interp_locked_rmw(operand.address, width, RMW_ADD, source, 0);
             (void)interp_alu_add(cpu, old, source, 0, width);
+            interp_reg_write(cpu, insn, insn->reg, width, old); // the register receives the PRE-image
         } else {
+            uint64_t sum;
             old = interp_rm_read(cpu, insn, &operand, width);
-            interp_rm_write(cpu, insn, &operand, width, interp_alu_add(cpu, old, source, 0, width));
+            sum = interp_alu_add(cpu, old, source, 0, width);
+            // WRITE ORDER MATTERS, and only here. x86 defines XADD as `TEMP := SRC+DEST; SRC := DEST;
+            // DEST := TEMP`, i.e. the SUM lands last -- so `xadd %ax, %ax`, where SRC and DEST are the SAME
+            // register, must leave the SUM, not the pre-image. Writing the register first and the r/m second
+            // reproduces that and is indistinguishable from either order whenever the two operands differ.
+            interp_reg_write(cpu, insn, insn->reg, width, old);
+            interp_rm_write(cpu, insn, &operand, width, sum);
         }
-        interp_reg_write(cpu, insn, insn->reg, width, old); // the register receives the PRE-image
         cpu->rip = next;
         return STEP_NEXT;
     }
