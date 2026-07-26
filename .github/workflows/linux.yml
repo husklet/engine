@@ -303,6 +303,20 @@ jobs:
           # variable unset puts the scratch under the build tree, i.e. the
           # runner's ext4 -- the filesystem the goldens were captured against,
           # where the whole suite is 57/57.
+          # matrix-runner's per-case hang detector is 120s, which the endurance
+          # cases do not fit on a runner-sized machine: soak/reallocchurn is 124s
+          # (aarch64) and 112s (x86_64) pinned to four CPUs on an otherwise idle
+          # host, versus a fraction of that on a whole machine. It is real compute,
+          # not a hang -- the case produces its exact golden sum every time -- so
+          # give compat-soak a budget that matches its own CTest TIMEOUT instead of
+          # blunting the detector for the suites where 120s is generous.
+          env_for() {
+            scratch_for "$1"
+            case "$1" in
+            compat-soak) export HL_MATRIX_CASE_TIMEOUT_MS=600000 ;;
+            *) unset HL_MATRIX_CASE_TIMEOUT_MS ;;
+            esac
+          }
           scratch_for() {
             case "$1" in
             compat-core-syscall) unset HL_MATRIX_SCRATCH_DIR ;;
@@ -314,7 +328,7 @@ jobs:
             : > "$1"
             for t in ${{ matrix.targets }}; do
               suite_st=0
-              scratch_for "$t"
+              env_for "$t"
               cap=$(budget)
               if [ "$cap" -le 0 ]; then st=124; break; fi
               if [ "$cap" -gt 2100 ]; then cap=2100; fi

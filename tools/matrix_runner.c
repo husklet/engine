@@ -24,6 +24,24 @@
 
 enum { CASE_MAX = 256, FIELD_MAX = 512, OUTPUT_MAX = 1024 * 1024, ERROR_MAX = 64 * 1024, TIMEOUT_MS = 120000 };
 
+/* Per-case hang detector. 120s suits every suite whose cases are milliseconds of
+ * work, but the endurance cases are minutes of real compute: soak/reallocchurn
+ * measures 124s (aarch64) and 112s (x86_64) pinned to four CPUs, i.e. at or over
+ * the cap on a runner-sized machine, while finishing in a fraction of that on a
+ * whole host. Raising the constant for everyone would blunt the detector, so the
+ * budget is an explicit opt-in the caller sets for the suites that need it.
+ * Values outside [1s, 1h] are ignored rather than trusted. */
+static uint64_t case_timeout_ms(void) {
+    const char *value = getenv("HL_MATRIX_CASE_TIMEOUT_MS");
+    char *end = NULL;
+    unsigned long parsed;
+    if (value == NULL || *value == 0) return TIMEOUT_MS;
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != 0 || parsed < 1000 || parsed > 3600000) return TIMEOUT_MS;
+    return (uint64_t)parsed;
+}
+
 #ifndef AARCH64_DYNAMIC_LOADER
 #define AARCH64_DYNAMIC_LOADER ""
 #define AARCH64_DYNAMIC_LIBC ""
@@ -652,7 +670,7 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
         remove_tree(scratch);
         return 1;
     }
-    deadline = monotonic_ms() + TIMEOUT_MS;
+    deadline = monotonic_ms() + case_timeout_ms();
     while (!exited || !output_eof || !error_eof) {
         struct pollfd descriptors[2] = {{output_pipe[0], POLLIN | POLLHUP, 0}, {error_pipe[0], POLLIN | POLLHUP, 0}};
         pid_t waited;
