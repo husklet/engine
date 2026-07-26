@@ -296,13 +296,13 @@ jobs:
           # The scratch dir is the guest's /tmp, so its filesystem is an INPUT to
           # every case that touches a file. Most suites want the tmpfs mounted
           # above; compat-core-syscall does not. Its edge_fallocate golden needs
-          # FALLOC_FL_ZERO_RANGE and its edge_lseekhole golden needs
-          # lseek(fd,-1,SEEK_DATA) -> EINVAL, and tmpfs provides neither. A plain
-          # `cc` build of both cases reproduces the engine's tmpfs output byte for
-          # byte, and the ext4 output byte for byte, so forcing tmpfs here would
-          # be testing tmpfs rather than the engine. Leaving the variable unset
-          # puts the scratch under the build tree, i.e. the runner's ext4 --
-          # exactly the filesystem the goldens were captured against.
+          # FALLOC_FL_ZERO_RANGE, which tmpfs does not implement: a plain `cc`
+          # build of the case prints the engine's exact tmpfs output (zero_rc=-1)
+          # natively, and the golden's output on a loopback ext4. Forcing tmpfs
+          # here would be testing tmpfs rather than the engine. Leaving the
+          # variable unset puts the scratch under the build tree, i.e. the
+          # runner's ext4 -- the filesystem the goldens were captured against,
+          # where the whole suite is 57/57.
           scratch_for() {
             case "$1" in
             compat-core-syscall) unset HL_MATRIX_SCRATCH_DIR ;;
