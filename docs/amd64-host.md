@@ -100,6 +100,46 @@ the top of `run_block`, and a `siglongjmp` out of the host handler once the gues
 A same-ISA x86-64 transliterator is the obvious next step for performance and is a strictly additive
 third arm of the same fork. It is not a prerequisite for the host being supported.
 
+### 3.1 The register problem the ARM64 diagonal never had
+
+Worth settling before Stage 2 starts, because it is the one place where the x86-64 diagonal is not a
+mechanical mirror of the AArch64 one.
+
+`guest/aarch64` on an ARM64 host keeps all 31 guest GPRs in the matching host GPRs and *steals* a handful
+(x18/x28/x30, plus x16/x17) for the engine: `x28` holds the `struct cpu *`, `x30` the host link, `x18` is
+scratch. It can afford that because 31 registers is more than a guest ABI uses, and `is_stolen()` plus
+`emit_mangled_x18()` rewrite the rare instruction that names one.
+
+An x86-64 host has 16 GPRs and an x86-64 guest wants all 16. There is nothing to steal without cost. Three
+ways out:
+
+1. **Keep the guest register file in memory** and make every guest instruction load-operate-store against
+   `struct cpu`. Simple, and it throws away most of what same-ISA transliteration is for.
+2. **Steal a GPR** — say `%r15` — spill guest `r15` to `cpu->r[15]`, and mangle any instruction naming it.
+   This is the direct mirror of the x18 treatment and reuses a pattern already proven in this tree. It
+   costs on `r15`-using code, which is not rare in register-hungry compiled output.
+3. **Steal no GPR: reach `struct cpu` through a segment base.** x86-64 has `%fs` and `%gs` with
+   kernel-settable bases, and a Linux x86-64 guest's TLS lives in `%fs`. That leaves `%gs` for the engine,
+   so `mov %gs:0, %reg` recovers the cpu pointer at zero register cost.
+
+Option 3 is the right one, and note that it is not a new idea here — it is exactly what the ARM64 host
+already does. `hl_a64_load_cpu` (`src/translator/host/aarch64/asm.c`) emits `mrs xN, TPIDRRO_EL0` plus a
+masked load to read the pthread TSD from inside emitted code, for the same reason: recovering engine state
+without spending a guest-visible register. `%gs` is the x86-64 spelling of that same trick.
+
+The cost of option 3 is that the engine now owns the real `%gs`, so a guest that uses `%gs` itself must be
+virtualised. That is already largely paid for: `struct cpu` carries `gs_base` alongside `fs_base`, and the
+`arch_prctl` service already models both, so guest `%gs` accesses are rewritten against `cpu->gs_base`
+rather than executed. Guest `%gs` use is rare in practice; guest `%fs` use is ubiquitous and stays
+untouched.
+
+Scratch registers need no steal either. x86-64 addressing modes fold most of what the ARM64 side needed
+scratch for, and the sequences that genuinely need a temporary are the block-exit and chaining stubs, which
+run at block boundaries where all guest state is being spilled to `struct cpu` anyway. The one invariant to
+carry over from `stubs.c` is that a spill must never touch the guest red zone at `[sp-128, sp)` — on x86-64
+that zone is 128 bytes rather than AArch64's 16 and is used by far more compiled code, so it matters more
+here, not less.
+
 ## 4. Things that were wrong independently of this work
 
 Naming the host-CPU axis surfaced two defects that were latent on the existing hosts:
