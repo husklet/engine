@@ -92,10 +92,12 @@ struct ckpt_cpu_header {
 #define CKF_DEVICE 13 // path-backed character/block device; reconnect to current host device
 #define CKFA_DIRECTORY UINT64_C(1)
 
+// Wire values of HL_CHECKPOINT_POLICY (HL_CONFIG_CHECKPOINT_*). Zero means the caller asked for nothing.
 enum ckpt_recovery_policy {
-    CKPT_RECOVERY_REFUSE = 0,
+    CKPT_RECOVERY_DEFAULT = 0,
     CKPT_RECOVERY_RECONNECT = 1,
     CKPT_RECOVERY_DISCARD_OPTIONAL = 2,
+    CKPT_RECOVERY_REFUSE = 3,
 };
 
 struct ckpt_inotify_watch {
@@ -809,7 +811,7 @@ static int ckpt_socket_option_int(int fd, int option, int *value) {
     return getsockopt(fd, SOL_SOCKET, option, value, &size);
 }
 
-static int ckpt_recovery_policy(void);
+static int ckpt_recovery_permissive_requested(void);
 
 static int ckpt_capture_socket_state(int fd, uint64_t identity, int require_quiescent) {
     struct ckpt_sink *sink = ckpt_sink_current();
@@ -821,7 +823,7 @@ static int ckpt_capture_socket_state(int fd, uint64_t identity, int require_quie
     socklen_t peer_size = sizeof peer;
     int degraded_connection = require_quiescent && fd >= 0 && fd < HL_NFD &&
                               (g_sock_conn[fd] || g_sock_connecting[fd]) &&
-                              ckpt_recovery_policy() != CKPT_RECOVERY_REFUSE;
+                              ckpt_recovery_permissive_requested(); // capture stays strict unless asked
     if (require_quiescent && !degraded_connection && fd >= 0 && fd < HL_NFD &&
         (g_sock_conn[fd] || g_sock_connecting[fd])) {
         fprintf(stderr, "[ckpt] refuse: connected/in-progress socket fd %d requires connection-state transfer\n",
@@ -3854,17 +3856,31 @@ static int ckpt_validate_proc_tree(const struct ckpt_manifest *man) {
     return roots == 1 ? 0 : -1;
 }
 
-static int ckpt_recovery_policy(void) {
+// The requested policy, or -1 when the caller never asked for one (unset, or the DEFAULT wire value).
+static int ckpt_recovery_policy_requested(void) {
     const char *value = hl_option_get("HL_CHECKPOINT_POLICY");
-    if (value && value[0] >= '0' && value[0] <= '2' && value[1] == 0) return value[0] - '0';
-    return CKPT_RECOVERY_REFUSE;
+    if (value && value[0] > '0' && value[0] <= '3' && value[1] == 0) return value[0] - '0';
+    return -1;
+}
+
+// No policy asked for means "restore whatever can be restored", so the default is the most permissive one.
+static int ckpt_recovery_policy(void) {
+    int requested = ckpt_recovery_policy_requested();
+    return requested < 0 ? CKPT_RECOVERY_DISCARD_OPTIONAL : requested;
+}
+
+// Capture only relaxes for an explicitly permissive policy; the permissive restore default must not reach it.
+static int ckpt_recovery_permissive_requested(void) {
+    int requested = ckpt_recovery_policy_requested();
+    return requested == CKPT_RECOVERY_RECONNECT || requested == CKPT_RECOVERY_DISCARD_OPTIONAL;
 }
 
 static int ckpt_recovery_policy_set(const char *value) {
     const char *encoded = NULL;
-    if (!strcmp(value, "refuse")) encoded = "0";
+    if (!strcmp(value, "refuse")) encoded = "3";
     else if (!strcmp(value, "reconnect")) encoded = "1";
     else if (!strcmp(value, "discard-optional")) encoded = "2";
+    else if (!strcmp(value, "default")) encoded = "0";
     if (!encoded) return -1;
     return hl_option_set("HL_CHECKPOINT_POLICY", encoded, 1);
 }

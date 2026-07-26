@@ -333,7 +333,7 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
             HL_ENGINE_BOX_PUBLISH_EXTERNAL | HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED | HL_ENGINE_BOX_SENTRY_ONLY;
     if ((box->flags & ~known_flags) != 0 || box->reserved != 0 || box->uid < -1 || box->gid < -1 ||
         (has_checkpoint_policy &&
-         (box->checkpoint_policy > HL_CONFIG_CHECKPOINT_DISCARD_OPTIONAL || box->reserved_checkpoint != 0)))
+         (box->checkpoint_policy > HL_CONFIG_CHECKPOINT_REFUSE || box->reserved_checkpoint != 0)))
         return HL_STATUS_INVALID_ARGUMENT;
     if (box->working_directory != NULL && box->working_directory[0] != '/') return HL_STATUS_INVALID_ARGUMENT;
     if (!hl_engine_hostname_valid(box->hostname) || !hl_engine_environment_valid(box->environment))
