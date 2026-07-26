@@ -5,7 +5,7 @@ use std::sync::MutexGuard;
 use crate::{Machine, Terminal};
 
 pub use crate::api::control::{
-    AttachRequest, AttachmentKind, ExtensionHandle, ProcessInfo, ResourceUpdate, SignalTarget,
+    AttachRequest, AttachmentKind, ProcessInfo, ResourceUpdate, SignalTarget,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,21 +45,11 @@ pub enum ShutdownPolicy {
     Force,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NetworkUpdate {
-    pub replacement: crate::spec::NetworkSpec,
-}
-
 pub struct Attachment {
     pub stdin: Option<std::fs::File>,
     pub stdout: Option<std::fs::File>,
     pub stderr: Option<std::fs::File>,
     pub terminal: Option<Terminal>,
-}
-
-#[derive(Debug)]
-pub struct EventStream {
-    _private: (),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

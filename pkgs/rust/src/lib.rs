@@ -71,9 +71,8 @@ pub use terminal::{Size, Terminal};
 
 // --- Live control plane ---
 pub use control::{
-    AttachRequest, Attachment, AttachmentKind, ControlError, ControlErrorCategory, EventStream,
-    ExtensionHandle, NetworkUpdate, PauseGuard, ProcessInfo, ResourceUpdate, ShutdownPolicy,
-    Signal, SignalTarget,
+    AttachRequest, Attachment, AttachmentKind, ControlError, ControlErrorCategory, PauseGuard,
+    ProcessInfo, ResourceUpdate, ShutdownPolicy, Signal, SignalTarget,
 };
 
 // --- Extension provider authorities ---

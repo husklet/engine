@@ -1,7 +1,7 @@
 use crate::api::{
     extension::{
-        ExtensionCapability, ExtensionConfig, ExtensionLimits, ExtensionSelection, ExtensionSpec,
-        Feature, MemoryRequirement, NamespaceEntry, ProviderId, ServiceRegistration,
+        ExtensionConfig, ExtensionLimits, Feature, MemoryRequirement, NamespaceEntry, ProviderId,
+        ServiceRegistration,
     },
     Version,
 };
@@ -20,16 +20,6 @@ pub trait ExtensionProvider: Send + Sync {
         context: &PrepareContext,
         config: &ExtensionConfig,
     ) -> Result<PreparedExtension, ExtensionError>;
-}
-
-/// Negotiates versioned extension specifications before any provider is prepared.
-pub trait Extensions: Send + Sync {
-    fn capabilities(&self) -> Vec<ExtensionCapability>;
-    /// Selects one compatible contract version and feature set.
-    ///
-    /// # Errors
-    /// Returns a typed negotiation error when required contract elements cannot be selected.
-    fn negotiate(&self, spec: &ExtensionSpec) -> Result<ExtensionSelection, ExtensionError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

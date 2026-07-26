@@ -1,18 +1,4 @@
-use crate::provider::{ExtensionError, LinuxError, ProcessId, Readiness, ResourceId};
-
-pub trait Events: Send + Sync {
-    /// Publishes a bounded provider readiness or completion event.
-    ///
-    /// # Errors
-    /// Returns a Linux error when the queue is unavailable or full.
-    fn publish(&self, event: ProviderEvent) -> Result<(), LinuxError>;
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProviderEvent {
-    pub resource: Option<ResourceId>,
-    pub readiness: Option<Readiness>,
-    pub sequence: u64,
-}
+use crate::provider::{ExtensionError, ProcessId, ResourceId};
 
 pub trait Lifecycle: Send + Sync {
     /// Observes creation before the first guest instruction.

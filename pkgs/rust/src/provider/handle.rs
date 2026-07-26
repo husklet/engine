@@ -1,5 +1,5 @@
-use crate::api::extension::{Protections, ServiceId, Sharing};
-use crate::provider::{LinuxError, ResourceId};
+use crate::api::extension::ServiceId;
+use crate::provider::LinuxError;
 use std::{collections::BTreeSet, time::SystemTime};
 
 /// Opens provider resources. Guest descriptor numbers never cross this boundary.
@@ -65,28 +65,6 @@ pub trait OpenHandle: Send + Sync {
             context: "provider handle metadata is unsupported".into(),
         })
     }
-    /// Performs one bounded typed ioctl operation.
-    ///
-    /// # Errors
-    /// Returns a Linux I/O error on invalid or unsupported requests.
-    fn ioctl(&self, request: IoctlRequest) -> Result<IoctlReply, LinuxError> {
-        let _ = request;
-        Err(LinuxError {
-            errno: 25,
-            context: "provider handle does not support ioctl".into(),
-        })
-    }
-    /// Creates a provider-backed mapping description.
-    ///
-    /// # Errors
-    /// Returns a Linux error when the range or protections cannot be mapped.
-    fn map(&self, request: MapRequest) -> Result<Mapping, LinuxError> {
-        let _ = request;
-        Err(LinuxError {
-            errno: 19,
-            context: "provider handle does not expose mappable memory".into(),
-        })
-    }
     /// Samples readiness for an interest set.
     ///
     /// # Errors
@@ -129,31 +107,6 @@ pub struct HandleMetadata {
     pub uid: u32,
     pub gid: u32,
     pub size: u64,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IoctlRequest {
-    pub command: u64,
-    pub input: Vec<u8>,
-    pub output_capacity: u32,
-    pub deadline: SystemTime,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IoctlReply {
-    pub result: i64,
-    pub output: Vec<u8>,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MapRequest {
-    pub offset: u64,
-    pub length: u64,
-    pub protections: Protections,
-    pub sharing: Sharing,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Mapping {
-    pub resource: ResourceId,
-    pub offset: u64,
-    pub length: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Interest {
