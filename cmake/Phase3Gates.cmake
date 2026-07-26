@@ -624,7 +624,7 @@ foreach(_t ${_gate_tests})
   endif()
 endforeach()
 
-# `make bench` has no pass/fail semantics (it prints a comparison table), so it
+# The bench has no pass/fail semantics (it prints a comparison table), so it
 # stays a build target rather than a CTest case.
 add_custom_target(bench
   COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bench

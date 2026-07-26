@@ -1,29 +1,28 @@
 # ---------------------------------------------------------------------------
-# hl-engine — CMake build, PHASE 1 ONLY (core independent static libraries).
+# hl-engine — the build.
 #
-# This file is ADDITIVE and NON-GATING. It lives alongside the hand-written
-# Makefile, which remains the authoritative build. Nothing here modifies or
-# replaces a make target; `make` keeps working exactly as before. CMake writes
-# only into its own out-of-tree build directory.
+# This is the authoritative and only build system. The hand-written Makefile it
+# replaced is gone; CI invokes CTest labels and CMake targets exclusively, and
+# cmake/CiLanes.cmake + gate.ci-lane-parity are what keep a lane from being
+# silently dropped. CMake writes only into out-of-tree build directories.
 #
-# Scope (mirrors the Makefile SOURCES vars, see CORE_SOURCES / IR_SOURCES /
-# LINUX_ABI_SOURCES / FAKE_HOST_SOURCES / LINUX_HOST_SOURCES):
+# Layout:
 #     libhl-engine.a       <- CORE_SOURCES
 #     libhl-translator.a   <- IR_SOURCES        (incl. aarch64 host codegen)
 #     libhl-linux-abi.a    <- LINUX_ABI_SOURCES
 #     libhl-host-fake.a    <- FAKE_HOST_SOURCES
 #     libhl-host-linux.a   <- LINUX_HOST_SOURCES (Linux host only)
+#     libhl-host-macos.a   <- MACOS_HOST_SOURCES (Darwin host only)
+# Phase 2 adds the production engines, Phase 3 the test matrix, Phase 4 the
+# macOS lane, install rules and packaging.
 #
-# NOT in scope this phase: unity production engines, the test matrix,
-# codesigning, packaging, the Rust crate.
-#
-# Toolchain authority stays with nix: configure with one of the toolchain
-# files under cmake/toolchains/, which read the compiler path from the same environment
-# variables the flake devShell exports and the Makefile consumes
-# (AARCH64_LINUX_CC / X86_64_LINUX_CC). Do not hardcode compiler paths here.
+# Toolchain authority stays with nix: configure with one of the toolchain files
+# under cmake/toolchains/, which read the compiler path from the environment
+# variables the flake devShell exports (AARCH64_LINUX_CC / X86_64_LINUX_CC).
+# Do not hardcode compiler paths here.
 # ---------------------------------------------------------------------------
 cmake_minimum_required(VERSION 3.20)
-project(hl_engine_phase1 LANGUAGES C)
+project(hl_engine LANGUAGES C)
 
 find_program(HL_BASH_EXECUTABLE NAMES bash REQUIRED)
 
@@ -39,25 +38,18 @@ if(HL_LINT)
 endif()
 
 # --- sanitizers -------------------------------------------------------------
-# The Makefile's `sanitize` target re-invokes make into a second BUILD dir with
-# ASan+UBSan CFLAGS and runs the unit suite. The CMake equivalent is a separate
-# configure, which is the idiomatic form and avoids a recursive build:
+# A sanitized run is a separate configure, not a second build inside this one:
 #   cmake -G Ninja -B build-asan -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux.cmake -DHL_SANITIZE=ON
 #   ninja -C build-asan && ctest --test-dir build-asan -L unit
 option(HL_SANITIZE "build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
 if(HL_SANITIZE)
-  # Matches the Makefile's flags exactly (-O1 -g -fno-omit-frame-pointer).
   add_compile_options(-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined)
   add_link_options(-fsanitize=address,undefined)
 endif()
 
-# Mirror the Makefile's DEBUG knob (CPPFLAGS: -DHL_ENABLE_LOGGING=$(DEBUG)).
-set(HL_DEBUG_LOGGING "0" CACHE STRING "HL_ENABLE_LOGGING value (Makefile DEBUG)")
+set(HL_DEBUG_LOGGING "0" CACHE STRING "HL_ENABLE_LOGGING value")
 
 # --- flags in ONE place, as INTERFACE libraries (no directory-scope leakage) -
-# hl_cpp_flags  == Makefile CPPFLAGS      := -Iinclude -DHL_ENABLE_LOGGING=$(DEBUG)
-# hl_engine_cflags == CPPFLAGS + ENGINE_CFLAGS
-#                  := $(CPPFLAGS) $(CFLAGS) $(WARNINGS) -fvisibility=hidden
 # Interface libs are used instead of add_compile_options() so that Phase-2
 # production TUs (which need a DIFFERENT, minimal flag set) do not inherit the
 # engine warning/visibility flags. CMAKE_BUILD_TYPE stays empty so CMake injects
@@ -77,7 +69,7 @@ target_compile_options(hl_engine_cflags INTERFACE
   -Werror=implicit-function-declaration -Werror=implicit-int
   -fvisibility=hidden)
 
-# --- source lists (kept identical to the Makefile SOURCES variables) --------
+# --- source lists -----------------------------------------------------------
 set(PROVIDER_SOURCES
   src/core/environment.c src/core/provider/client.c
   src/core/provider/demux.c src/core/provider/files.c src/core/provider/handles.c
@@ -148,7 +140,6 @@ set(MACOS_HOST_SOURCES
   src/host/macos/range.c src/host/macos/system.c)
 
 # --- archives ---------------------------------------------------------------
-# CMake names a target `foo` as libfoo.a, matching the Makefile artifacts.
 # Each links the engine flag interface PRIVATE so the exact ENGINE_CFLAGS apply.
 add_library(hl-engine     STATIC ${CORE_SOURCES})
 add_library(hl-translator STATIC ${IR_SOURCES})
@@ -158,8 +149,8 @@ foreach(_lib hl-engine hl-translator hl-linux-abi hl-host-fake)
   target_link_libraries(${_lib} PRIVATE hl_engine_cflags)
 endforeach()
 
-# libhl-host-linux is Linux-host-specific (src/host/linux/*). On a macOS host
-# the Makefile builds libhl-host-macos instead; that host lib is a later phase.
+# libhl-host-linux is Linux-host-specific (src/host/linux/*); a macOS host
+# builds libhl-host-macos instead.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_library(hl-host-linux STATIC ${LINUX_HOST_SOURCES})
   target_link_libraries(hl-host-linux PRIVATE hl_engine_cflags)

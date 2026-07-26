@@ -3,7 +3,7 @@
 Investigation of the `sqlite` phase of `tests/perf/combined_bench.c`, which is the only
 phase of the combined benchmark that is far off parity.
 
-Reproduced baseline (`make bench BENCH_ENVS="native hl-engine" BENCH_ARCHES="arm64"
+Reproduced baseline (`ninja -C <build-dir> bench` with BENCH_ENVS="native hl-engine" BENCH_ARCHES="arm64"
 BENCH_REPEATS=2`, this machine):
 
 | phase   | hl-engine | native | ratio |

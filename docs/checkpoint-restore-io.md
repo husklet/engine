@@ -78,7 +78,6 @@ Run:
 
 ```sh
 ctest --test-dir <build-dir> -L checkpoint      # or -L checkpoint-io for the 17 IO/recovery scenarios
-make e2e-checkpoint-io-full                     # the Makefile equivalent
 ```
 
 The target is fail-fast and runs the IO/recovery matrix on AArch64 and x86_64 plus the existing process-tree,

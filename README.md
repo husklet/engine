@@ -49,8 +49,9 @@ Build and test, from a `nix develop` shell:
 ```sh
 cmake -G Ninja -B build-cmake
 ninja -C build-cmake
-ctest --test-dir build-cmake -L unit
+ctest --test-dir build-cmake -L unit --no-tests=error
 ```
 
-`ctest --print-labels` lists every lane. A ~2900-line `Makefile` still exists and is what CI runs for the
-compatibility shards and the macOS lane; see [`docs/makefile-retirement.md`](docs/makefile-retirement.md).
+CMake is the only build system. `ctest --print-labels` lists every lane; always pass
+`--no-tests=error`, because `ctest -L` on an unknown label exits 0. `cmake/CiLanes.cmake` declares
+which lanes CI runs and `gate.ci-lane-parity` fails the build if one of them selects no tests.

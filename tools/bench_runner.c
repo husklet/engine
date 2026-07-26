@@ -51,7 +51,7 @@
  * that env, then `report` merges them. On an OrbStack arm64 Linux machine:
  *
  *   # build the guests (both arches), engine (both arches), and this runner
- *   nix develop -c bash -c 'CC=cc make build/perf/combined-bench-aarch64 \
+ *   nix develop -c bash -c 'ninja -C <build-dir> perf/combined-bench-aarch64 \
  *       build/perf/combined-bench-x86_64 build/tools/bench-runner \
  *       build/linux-production/hl-engine-linux-aarch64 \
  *       build/linux-production/hl-engine-linux-x86_64'
@@ -73,7 +73,7 @@
  *   # (or --baseline native to read everything relative to native arm.)
  *
  * On an actual amd64 host, run the same with --arch amd64 and --env native to
- * fill the real native-amd64 baseline. `make bench` runs the locally-reachable
+ * fill the real native-amd64 baseline. The `bench` target runs the locally-reachable
  * cells for you.
  *
  * ============================================================================
