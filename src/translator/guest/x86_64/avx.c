@@ -334,6 +334,124 @@ static double fma_x86_f64(double a, double b, double c, int nmul, int nadd) {
     return r;
 }
 
+// Live guest rounding mode in the MXCSR.RC encoding {0=nearest,1=down,2=up,3=truncate}. The guest MXCSR IS
+// the host control register on both hosts: MXCSR itself here, FPCR.RMode on aarch64 -- where ldmxcsr swaps
+// the two directed modes on the way in, so this swaps them back.
+static int cvt_host_rc(void) {
+#if defined(HL_HOST_CPU_X86_64)
+    return (int)((_mm_getcsr() >> 13) & 3u);
+#elif defined(HL_HOST_CPU_AARCH64)
+    unsigned long fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    unsigned m = (unsigned)((fpcr >> 22) & 3u);
+    return m == 1 ? 2 : m == 2 ? 1 : (int)m;
+#else
+    switch (fegetround()) {
+    case FE_DOWNWARD: return 1;
+    case FE_UPWARD: return 2;
+    case FE_TOWARDZERO: return 3;
+    default: return 0;
+    }
+#endif
+}
+
+// Host sticky FP exception state, parked across the rounding step below. Volatile asm, not the _mm_*csr
+// intrinsics or fenv: the intrinsics are ordinary function-like and can be reordered around the FP they
+// are meant to bracket, and glibc's fesetexceptflag also writes the x87 status word, which is live guest
+// state here.
+static unsigned cvt_fp_flags(void) {
+#if defined(HL_HOST_CPU_X86_64)
+    unsigned v;
+    __asm__ volatile("stmxcsr %0" : "=m"(v));
+    return v & 0x3fu;
+#elif defined(HL_HOST_CPU_AARCH64)
+    unsigned long f;
+    __asm__ volatile("mrs %0, fpsr" : "=r"(f));
+    return (unsigned)(f & 0x9ful); // IOC/DZC/OFC/UFC/IXC + IDC(7)
+#else
+    fexcept_t f = 0;
+    fegetexceptflag(&f, FE_ALL_EXCEPT);
+    return (unsigned)f;
+#endif
+}
+
+static void cvt_fp_flags_set(unsigned keep) {
+#if defined(HL_HOST_CPU_X86_64)
+    unsigned v;
+    __asm__ volatile("stmxcsr %0" : "=m"(v));
+    v = (v & ~0x3fu) | keep;
+    __asm__ volatile("ldmxcsr %0" : : "m"(v));
+#elif defined(HL_HOST_CPU_AARCH64)
+    unsigned long f;
+    __asm__ volatile("mrs %0, fpsr" : "=r"(f));
+    f = (f & ~0x9ful) | keep;
+    __asm__ volatile("msr fpsr, %0" : : "r"(f));
+#else
+    fexcept_t f = (fexcept_t)keep;
+    fesetexceptflag(&f, FE_ALL_EXCEPT);
+#endif
+}
+
+// Round to integral in the live mode, contributing NO exception of its own -- the caller raises #I and #P
+// itself, and must be able to raise NEITHER. No rounding primitive here is trustworthy enough to do that
+// unaided: __builtin_rint on x86-64 with no ROUNDSD assumable becomes |x| + 2^52 - 2^52 with the sign
+// reapplied, which rounds the MAGNITUDE (RC=down returned -1 for -1.5); on aarch64 it is FRINTX, which
+// reports #P; and glibc's own trunc/floor resolve to a ROUNDSD that reports #P for an inexact source and
+// #D for a denormal one, neither of which an x86 convert raises. So park the sticky flags across it.
+#define CVT_ROUND(name, ty, sfx)                                                                                       \
+    static ty name(ty x, int trunc) {                                                                                  \
+        unsigned parked = cvt_fp_flags();                                                                              \
+        ty r;                                                                                                          \
+        switch (trunc ? 3 : cvt_host_rc()) {                                                                           \
+        case 1: r = __builtin_floor##sfx(x); break;                                                                    \
+        case 2: r = __builtin_ceil##sfx(x); break;                                                                     \
+        case 3: r = __builtin_trunc##sfx(x); break;                                                                    \
+        default: r = __builtin_roundeven##sfx(x); break;                                                               \
+        }                                                                                                              \
+        cvt_fp_flags_set(parked);                                                                                      \
+        return r;                                                                                                      \
+    }
+CVT_ROUND(cvt_round_d, double, )
+CVT_ROUND(cvt_round_f, float, f)
+
+static void cvt_raise_pe(void) {
+    volatile double a = 1.0, b = 3.0, q = a / b; // 1/3 is inexact in every mode and raises only #P
+    (void)q;
+}
+
+// x86 CVT[T]xx2{SI,DQ,PI}, the whole rule, for every convert the C emulator owns. Measured on Zen 4 over
+// the four RC modes and a kit whose out-of-range values include NON-INTEGERS -- the only ones that can
+// tell these three apart, and they exist only for an f64 source with a 32-bit destination:
+//   * out of range AFTER rounding, or NaN -> the integer indefinite and #I ALONE. Not #P, even from an
+//     inexact source; not #D, even from a denormal one. So no host FP op may run on that path.
+//   * in range -> #P iff the rounding changed the value, and nothing else.
+// The rounding itself is exception-free, so both flags are raised explicitly. Everything here used to be
+// absent: the VEX scalar forms raised no MXCSR bit at all on either host.
+// "Is it NaN" and "did the rounding change it" are decided on the BIT PATTERN, not with == : UCOMISD/
+// COMISD report #D for a denormal operand (SDM, and measured), and a convert must not. Bitwise inequality
+// is exactly inexactness here, because round-to-integral keeps the sign of a zero and NaN is already out.
+#define CVT_TO_INT(name, ty, uty, isnan, rnd)                                                                          \
+    static int64_t name(ty x, int trunc, int w64) {                                                                    \
+        ty lim = w64 ? (ty)9223372036854775808.0 : (ty)2147483648.0;                                                   \
+        int64_t indef = w64 ? (int64_t)0x8000000000000000ull : (int64_t)(int32_t)0x80000000u;                          \
+        uty xb, rb;                                                                                                    \
+        memcpy(&xb, &x, sizeof xb);                                                                                    \
+        if (isnan(xb)) {                                                                                               \
+            fma_raise_ie();                                                                                            \
+            return indef;                                                                                              \
+        }                                                                                                              \
+        ty r = rnd(x, trunc);                                                                                          \
+        if (r >= lim || r < -lim) { /* r is integral, never denormal, so these cannot report #D */              \
+            fma_raise_ie();                                                                                            \
+            return indef;                                                                                              \
+        }                                                                                                              \
+        memcpy(&rb, &r, sizeof rb);                                                                                    \
+        if (rb != xb) cvt_raise_pe();                                                                                  \
+        return (int64_t)r;                                                                                             \
+    }
+CVT_TO_INT(cvt_x86_d2i, double, uint64_t, nan64, cvt_round_d)
+CVT_TO_INT(cvt_x86_f2i, float, uint32_t, nan32, cvt_round_f)
+
 static float avx_fp_arith_f32(int op, float x, float y) {
     switch (op) {
     case 0x58: return avx_dnan_f32(x + y, x, y);
@@ -848,31 +966,17 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
         {
             int dbl = (pp == 3), es = dbl ? 8 : 4, trunc = (op == 0x2C), w64 = I.vex_w;
             avx_get_rm(state, c, &I, next, es, b);
-            // x86 float->int yields the "integer indefinite" (INT_MIN bit pattern) on NaN, infinity, or an
-            // out-of-range value; a raw C cast is undefined there (the legacy SSE path applies the same fixup,
-            // translate.c 0x2C/0x2D). Round in the float domain (0x2D honors MXCSR via the host FPCR rounding
-            // mode; 0x2C truncates toward zero), then range-check before narrowing.
-            int64_t res = 0;
-            int indef;
+            int64_t res;
             if (dbl) {
                 double x;
                 memcpy(&x, b, 8);
-                double r = trunc ? __builtin_trunc(x) : __builtin_rint(x);
-                indef = isnan(x) || (w64 ? (r >= 9223372036854775808.0 || r < -9223372036854775808.0)
-                                         : (r >= 2147483648.0 || r < -2147483648.0));
-                if (!indef) res = (int64_t)r;
+                res = cvt_x86_d2i(x, trunc, w64);
             } else {
                 float x;
                 memcpy(&x, b, 4);
-                float r = trunc ? __builtin_truncf(x) : __builtin_rintf(x);
-                indef = isnan(x) || (w64 ? (r >= 9223372036854775808.0f || r < -9223372036854775808.0f)
-                                         : (r >= 2147483648.0f || r < -2147483648.0f));
-                if (!indef) res = (int64_t)r;
+                res = cvt_x86_f2i(x, trunc, w64);
             }
-            if (indef)
-                c->r[rd] = w64 ? 0x8000000000000000ull : 0x80000000ull;
-            else
-                c->r[rd] = w64 ? (uint64_t)res : (uint32_t)res; // 32-bit dst zero-extends
+            c->r[rd] = w64 ? (uint64_t)res : (uint32_t)res; // 32-bit dst zero-extends
             goto done;
         }
         case 0x5A: {       // vcvtss2sd/sd2ss (scalar) or vcvtps2pd/pd2ps (packed) per pp
@@ -1441,15 +1545,10 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                     memcpy(&v, b + i, 4);
                     float f = (float)v;
                     memcpy(d + i, &f, 4);
-                } else { // cvtps2dq(66, round)/cvttps2dq(F3, truncate) -> int32; x86 indefinite on overflow/NaN
+                } else { // cvtps2dq(66, round)/cvttps2dq(F3, truncate) -> int32
                     float f;
                     memcpy(&f, b + i, 4);
-                    int32_t r;
-                    if (!(f == f) || f >= 2147483648.0f || f < -2147483648.0f)
-                        r = (int32_t)0x80000000; // integer indefinite
-                    else
-                        r = (int32_t)(pp == 2 ? __builtin_truncf(f)
-                                              : __builtin_rintf(f)); // F3(pp==2)=truncate, 66(pp==1)=round
+                    int32_t r = (int32_t)cvt_x86_f2i(f, pp == 2, 0); // F3(pp==2)=truncate, 66(pp==1)=round
                     memcpy(d + i, &r, 4);
                 }
             }
@@ -1473,11 +1572,7 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                 for (int i = 0; i < n; i++) {
                     double f;
                     memcpy(&f, b + 8 * i, 8);
-                    int32_t r;
-                    if (!(f == f) || f >= 2147483648.0 || f < -2147483648.0)
-                        r = (int32_t)0x80000000; // integer indefinite
-                    else
-                        r = (int32_t)(pp == 1 ? __builtin_trunc(f) : __builtin_rint(f));
+                    int32_t r = (int32_t)cvt_x86_d2i(f, pp == 1, 0); // 66(pp==1)=truncate, F2(pp==3)=round
                     memcpy(d + 4 * i, &r, 4);
                 }
                 avx_put(c, rd, d, W / 2);

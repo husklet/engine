@@ -1807,13 +1807,17 @@ static void emit_vcmp_lane(int out, int a, int b, int p, int dbl) {
 // overflow. -ovf already lands on INT_MIN==0x80000000 (matches), so only NaN and +ovf (f>=2^31) need
 // fixing. Compute the NEON result, then blend 0x80000000 into every lane where (f>=2^31 OR f is NaN).
 // `trunc`=1 truncates (FCVTZS direct); trunc=0 rounds under the current FPCR.RMode (== guest MXCSR.RC,
-// threaded by ldmxcsr) via FRINTI, then FCVTZS the now-integral value.
+// threaded by ldmxcsr) via FRINTX, then FCVTZS the now-integral value.
 //   c2p31 = 2^31 as f32 (0x4F000000) broadcast; cindef = 0x80000000 broadcast; t1,t2 scratch.
+// FRINTX, not FRINTI: x86 raises #P for an inexact conversion and only the X form reports Inexact. The
+// FRINTX trap that bites the f64 path (it also reports #P for an out-of-range inexact source, where x86
+// raises #I alone) CANNOT arise at this width -- every f32 at or above 2^31 is already an integer, and no
+// f32 below 2^31 can round up to it -- so here the X form is exactly x86 and needs no suppression.
 static void emit_ps2dq_128(int out, int sf, int trunc, int c2p31, int cindef, int t1, int t2) {
     if (trunc) {
         emit32(0x4EA1B800u | (sf << 5) | out); // FCVTZS.4s out, sf   (round toward zero)
     } else {
-        emit32(0x6EA19800u | (sf << 5) | out);  // FRINTI.4s out, sf  (round to integral, current mode)
+        emit32(0x6E219800u | (sf << 5) | out);  // FRINTX.4s out, sf  (round to integral, current mode)
         emit32(0x4EA1B800u | (out << 5) | out); // FCVTZS.4s out, out (integral value -> exact)
     }
     emit32(0x6E20E400u | (c2p31 << 16) | (sf << 5) | t1); // FCMGE.4s t1, sf, 2^31   (all-ones where f>=2^31)
@@ -1824,24 +1828,38 @@ static void emit_ps2dq_128(int out, int sf, int trunc, int c2p31, int cindef, in
     e_vmov(out, t1);
 }
 
-// ---- packed float64 (.2d) -> int32, one 128-bit source (2 doubles). Produces r = FCVTZS.2d int64 lanes
-// and m = per-64-bit fixup mask (all-ones where the x86 result must be 0x80000000: f>=2^31 OR f<-2^31 OR
-// NaN). Unlike the ps case BOTH overflow directions need the fixup, because the subsequent int64->int32
-// narrowing (XTN) would otherwise wrap a saturated INT64 bound to garbage. `trunc`=1 truncates, else
-// rounds under current FPCR.RMode. c2p31d/cneg2p31d = +/-2^31 as f64 broadcast; t1 scratch.
-static void emit_pd2i32_pieces(int r, int m, int sd, int trunc, int c2p31d, int cneg2p31d, int t1) {
-    if (trunc) {
-        emit32(0x4EE1B800u | (sd << 5) | r); // FCVTZS.2d r, sd
-    } else {
-        emit32(0x6EE19800u | (sd << 5) | r); // FRINTI.2d r, sd
-        emit32(0x4EE1B800u | (r << 5) | r);  // FCVTZS.2d r, r
-    }
-    emit32(0x6E60E400u | (c2p31d << 16) | (sd << 5) | m);     // FCMGE.2d m, sd, 2^31       (f>=2^31)
-    emit32(0x6EE0E400u | (sd << 16) | (cneg2p31d << 5) | t1); // FCMGT.2d t1, -2^31, sd     (-2^31 > f)
-    e_v3(0x4EA01C00u, m, m, t1);                              // ORR m |= (f < -2^31)
-    emit32(0x4E60E400u | (sd << 16) | (sd << 5) | t1);        // FCMEQ.2d t1, sd, sd        (NOT NaN)
-    emit32(0x6E205800u | (t1 << 5) | t1);                     // MVN t1                     (NaN)
-    e_v3(0x4EA01C00u, m, m, t1);                              // ORR m |= NaN
+// ---- packed float64 (.2d) -> int32, one 128-bit source (2 doubles). Produces r = int64 lanes and m =
+// per-64-bit fixup mask (all-ones where the x86 result must be 0x80000000). `trunc`=1 truncates, else
+// rounds under current FPCR.RMode. c2p31d/cneg2p31d = +/-2^31 as f64 broadcast; t1,t2 scratch.
+//
+// f64 -> int32 is the ONE width pair with out-of-range NON-integers (every f32 above 2^31, and every f64
+// above 2^63, is already integral), so it is the only place where x86's three flag rules can be told
+// apart, and all three were wrong here. Measured on Zen 4 across the four RC modes:
+//   * #I when the ROUNDED value leaves int32 -- so the mask must come from the rounded value, not the
+//     source: 2147483647.5 rounds to 2^31 under RC=near/up and is then out of range. A .2d convert
+//     targets int64 and cannot see that, so two scalar FCVTZS Wd,Dn over the (already integral) lanes
+//     raise it instead -- the same idiom CVT[T]PD2PI uses.
+//   * #P when the value stays in range and the rounding changed it -- so FRINTI, which reports nothing,
+//     under-reports it.
+//   * #P SUPPRESSED when the result is the indefinite, even from an inexact source -- so a bare FRINTX
+//     over-reports it, and the truncating FCVTZS.2d does too (it is an in-int64-range inexact convert).
+// Hence: round exception-free (FRINTZ/FRINTI), build the mask from the rounded value, take #I from the
+// scalar pair, and take #P from an FRINTX over the source with the out-of-range lanes replaced by +0.0
+// (exact, and it reports nothing). The result path itself is then flag-free.
+static void emit_pd2i32_pieces(int r, int m, int sd, int trunc, int c2p31d, int cneg2p31d, int t1, int t2) {
+    emit32((trunc ? 0x4EE19800u : 0x6EE19800u) | (sd << 5) | t2); // FRINTZ/FRINTI.2d t2, sd (no exception)
+    emit32(0x6E60E400u | (c2p31d << 16) | (t2 << 5) | m);         // FCMGE.2d m, t2, 2^31    (rounded >= 2^31)
+    emit32(0x6EE0E400u | (t2 << 16) | (cneg2p31d << 5) | t1);     // FCMGT.2d t1, -2^31, t2  (-2^31 > rounded)
+    e_v3(0x4EA01C00u, m, m, t1);                                  // ORR m |= (rounded < -2^31)
+    emit32(0x4E60E400u | (t2 << 16) | (t2 << 5) | t1);            // FCMEQ.2d t1, t2, t2     (NOT NaN)
+    emit32(0x6E205800u | (t1 << 5) | t1);                         // MVN t1                  (NaN)
+    e_v3(0x4EA01C00u, m, m, t1);                                  // ORR m |= NaN
+    emit32(0x1E780000u | (t2 << 5) | 16);                         // FCVTZS w16, d(t2)  lane 0 -> #I only
+    emit32(0x5E180400u | (t2 << 5) | t1);                         // DUP    d(t1), t2.d[1]
+    emit32(0x1E780000u | (t1 << 5) | 16);                         // FCVTZS w16, d(t1)  lane 1 -> #I only
+    e_v3(0x4E601C00u, t1, sd, m);                                 // BIC t1 = sd & ~m   (out-of-range -> +0.0)
+    emit32(0x6E619800u | (t1 << 5) | t1);                         // FRINTX.2d t1, t1   -> #P only
+    emit32(0x4EE1B800u | (t2 << 5) | r);                          // FCVTZS.2d r, t2    (integral -> exact)
 }
 
 // Returns 1 if the VEX insn was lowered inline (caller does gpc = next; continue), else 0 (fall through
@@ -2743,13 +2761,13 @@ static int avx_lower(struct insn *I, uint64_t next) {
             emit32(0x4E040C00u | (16 << 5) | 27); // v27.4s = 0x80000000
             // Compute the int64 results + per-64 fixup masks for BOTH halves first (they consume the +/-2^31
             // consts in v25/v26), THEN narrow -- the narrow step reuses v25 for the packed 32-bit mask.
-            emit_pd2i32_pieces(22, 18, src, trunc, 25, 26, 28); // lo: r=v22, mask=v18
+            emit_pd2i32_pieces(22, 18, src, trunc, 25, 26, 28, 21); // lo: r=v22, mask=v18
             if (l256) {
                 if (I->is_mem)
                     g_ldr_q(20, 17, 16);
                 else
-                    avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);         // src.hi
-                emit_pd2i32_pieces(23, 19, 20, trunc, 25, 26, 28); // hi: r=v23, mask=v19
+                    avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);             // src.hi
+                emit_pd2i32_pieces(23, 19, 20, trunc, 25, 26, 28, 21); // hi: r=v23, mask=v19
             }
             emit32(0x0EA12800u | (22 << 5) | 24); // XTN.2s  v24, v22  (low 2 int32)
             emit32(0x0EA12800u | (18 << 5) | 25); // XTN.2s  v25, v18  (low 2 mask lanes)
@@ -5013,34 +5031,28 @@ static void *translate_block(uint64_t gpc) {
                     emit32(0x0F20A400u | (s << 5) | 16);  // SXTL v16.2d, vs.2s  (sign-extend the 2 int32)
                     emit32(0x4E61D800u | (16 << 5) | vd); // SCVTF vd.2d, v16.2d (int64 -> double)
                 } else if (op == 0xE6 && (I.p66 || I.repne)) {
-                    // cvttpd2dq (66, truncate) / cvtpd2dq (F2, round-to-nearest): 2 packed f64 -> 2 packed
-                    // s32 in the low 64 bits of dst; the high 64 bits are zeroed (SQXTN with Q=0).
+                    // cvttpd2dq (66, truncate) / cvtpd2dq (F2, rounds by MXCSR.RC): 2 packed f64 -> 2 packed
+                    // s32 in the low 64 bits of dst; the high 64 bits are zeroed (the Q=0 XTN does that).
+                    // Shares emit_pd2i32_pieces with the VEX form, which is the point: this arm used to emit
+                    // FCVTNS unconditionally and so ignored MXCSR.RC while VEX honoured it -- legacy and VEX
+                    // disagreeing with each other, on top of both being wrong about #I and #P.
                     int s = vm;
                     if (I.is_mem) {
                         g_ldr_q_ea(16, &I, next);
                         s = 16;
                     }
-                    uint32_t cvt = I.p66 ? 0x4EE1B800u  // FCVTZS v16.2d, vs.2d (toward zero)
-                                         : 0x4E61A800u; // FCVTNS v16.2d, vs.2d (round to nearest even)
-                    // x86 CVT(T)PD2DQ yields the integer indefinite (0x80000000) on NaN or out-of-range input;
-                    // ARM FCVT*S saturates NaN->0 and SQXTN saturates positive overflow to INT32_MAX (negative
-                    // overflow already agrees at INT32_MIN == indefinite). Per lane force 0x80000000 where the
-                    // rounded s64 exceeds INT32_MAX (catches the round-up boundary too) OR the source is NaN. The
-                    // NaN mask MUST be taken from the source doubles BEFORE the convert (which writes v16 and, for
-                    // a memory operand where s==16, would otherwise clobber the doubles first).
-                    emit32(0x4E60E400u | (s << 16) | (s << 5) | 18); // FCMEQ v18.2d, s, s  -> ordered (0 where NaN)
-                    emit32(0x6E205800u | (18 << 5) | 18);            // NOT  v18.16b       -> NaN mask
-                    emit32(cvt | (s << 5) | 16);                     // FCVT*S v16.2d = cvt(s)  (rounded s64/lane)
-                    e_movconst(19, 0x7fffffffull);
-                    emit32(0x4E080C00u | (19 << 5) | 19);              // DUP  v19.2d, x19   -> INT32_MAX threshold
-                    emit32(0x4EE03400u | (19 << 16) | (16 << 5) | 17); // CMGT v17.2d, v16.2d, v19.2d -> overflow mask
-                    e_v3(0x4EA01C00u, 17, 17, 18);                     // ORR  v17.16b       -> make-indefinite mask
-                    emit32(0x0EA12800u | (17 << 5) | 17);              // XTN  v17.2s, v17.2d (mask -> low 2 lanes)
-                    emit32(0x0EA14800u | (16 << 5) | 20);              // SQXTN v20.2s, v16.2d (saturating result)
+                    int trunc = I.p66 != 0;
+                    e_movconst(19, 0x41E0000000000000ull);
+                    emit32(0x4E080C00u | (19 << 5) | 25); // v25.2d = 2^31 (f64)
+                    e_movconst(19, 0xC1E0000000000000ull);
+                    emit32(0x4E080C00u | (19 << 5) | 26); // v26.2d = -2^31
                     e_movconst(19, 0x80000000ull);
-                    emit32(0x0E040C00u | (19 << 5) | 18);              // DUP  v18.2s, w19   -> 0x80000000 per lane
-                    emit32(0x2E601C00u | (20 << 16) | (18 << 5) | 17); // BSL  v17.8b -> mask?indef:result (hi 64=0)
-                    e_vmov(vd, 17);
+                    emit32(0x0E040C00u | (19 << 5) | 27);                  // v27.2s = integer indefinite
+                    emit_pd2i32_pieces(22, 18, s, trunc, 25, 26, 28, 21);  // v22 = int64 lanes, v18 = fixup mask
+                    emit32(0x0EA12800u | (22 << 5) | 24);                  // XTN v24.2s, v22.2d (result)
+                    emit32(0x0EA12800u | (18 << 5) | 25);                  // XTN v25.2s, v18.2d (mask)
+                    emit32(0x2E601C00u | (24 << 16) | (27 << 5) | 25);     // BSL v25.8b -> mask?indef:result
+                    e_vmov(vd, 25);
                 } else if (op == 0x60 || op == 0x61 || op == 0x62 || op == 0x6C || op == 0x68 || op == 0x69 ||
                            op == 0x6A || op == 0x6D) { // punpck l/h bw/wd/dq/qdq -> ZIP1/ZIP2
                     int s = I.is_mem ? 16 : vm;
@@ -5153,26 +5165,16 @@ static void *translate_block(uint64_t gpc) {
                             g_ldr_q_ea(16, &I, next);
                             s = 16;
                         }
-                        int rs = s;
-                        if (!trunc) { // FRINTX, not FRINTI: only the X form reports the #P x86 raises here
-                            emit32(0x6E619800u | (s << 5) | 21); // FRINTX.2d v21, vs (current FPCR.RMode)
-                            rs = 21;
-                        }
-                        // The .2d convert below targets int64, so an int32 overflow raises nothing where x86
-                        // raises #I. Two scalar FCVTZS Wd,Dn over the same lanes raise exactly x86's #I (and,
-                        // for the truncating form, #P) -- results discarded, the value comes from the vector path.
-                        emit32(0x1E780000u | (rs << 5) | 16); // FCVTZS w16, d(rs)      lane 0
-                        emit32(0x5E180400u | (rs << 5) | 23); // DUP    d23, v(rs).d[1]
-                        emit32(0x1E780000u | (23 << 5) | 16); // FCVTZS w16, d23        lane 1
                         e_movconst(16, 0x41E0000000000000ull);
                         emit32(0x4E080C00u | (16 << 5) | 19); // v19.2d = 2^31 (f64)
                         e_movconst(16, 0xC1E0000000000000ull);
                         emit32(0x4E080C00u | (16 << 5) | 20); // v20.2d = -2^31
-                        // trunc=1: rs is already rounded, so the helper must not round again. Its `r` must
-                        // differ from `sd` -- it converts into r before reading sd for the masks.
-                        emit_pd2i32_pieces(24, 22, rs, 1, 19, 20, 23); // v24 = int64 lanes, v22 = fixup mask
-                        emit32(0x0EA12800u | (24 << 5) | 24);          // XTN v24.2s, v24.2d
-                        emit32(0x0EA12800u | (22 << 5) | 22);          // XTN v22.2s, v22.2d
+                        // The pre-rounding FRINTX that used to sit here reported #P for an out-of-range
+                        // inexact source, where x86 raises #I alone; emit_pd2i32_pieces now owns the whole
+                        // round-and-flag rule for this width.
+                        emit_pd2i32_pieces(24, 22, s, trunc, 19, 20, 23, 21); // v24 = int64 lanes, v22 = mask
+                        emit32(0x0EA12800u | (24 << 5) | 24);                 // XTN v24.2s, v24.2d
+                        emit32(0x0EA12800u | (22 << 5) | 22);                 // XTN v22.2s, v22.2d
                         e_movconst(16, 0x80000000ull);
                         emit32(0x0E040C00u | (16 << 5) | 18);              // v18.2s = 0x80000000 (integer indefinite)
                         emit32(0x2E601C00u | (24 << 16) | (18 << 5) | 22); // BSL v22.8b = mask ? indef : result
@@ -5230,6 +5232,7 @@ static void *translate_block(uint64_t gpc) {
                             g_ldr_s(16, 17);
                         s = 16;
                     }
+                    int s0 = s;       // the source, before 0x2D rounds it (the #P probe below needs it)
                     if (op == 0x2D) { // cvtsd2si: honor MXCSR.RC -> round to integral (FRINTI uses FPCR.RMode)...
                         uint32_t frinti = I.repne ? 0x1E67C000u : 0x1E27C000u; // double : single
                         emit32(frinti | (s << 5) | 18);                        // frinti d18, ds
@@ -5259,9 +5262,30 @@ static void *translate_block(uint64_t gpc) {
                         // restore it, so a later jcc/setcc/cmov/adc sees the integer flags it must.
                         // (The old comment claimed the top-of-loop had already flushed g_fl_pending
                         // here; a `cmp`; `cvttsd2si`; `js` sequence shows that it had not.)
-                        emit32(0xD53B4200u | 21);                                              // mrs x21, nzcv
-                        emit32((I.repne ? 0x1E602000u : 0x1E202000u) | (19 << 16) | (s << 5)); // FCMP s, v19
-                        e_movconst(20, sf ? 0x8000000000000000ull : 0x80000000ull);            // integer indefinite
+                        uint32_t fcmp = I.repne ? 0x1E602000u : 0x1E202000u;
+                        emit32(0xD53B4200u | 21);                     // mrs x21, nzcv
+                        emit32(fcmp | (19 << 16) | (s << 5));         // FCMP s, v19
+                        if (op == 0x2D) {
+                            // #P. FCVTZS above reports it for 0x2C (an in-range inexact truncation) but not
+                            // for 0x2D, whose FRINTI value is already integral -- and FRINTI itself reports
+                            // nothing. FRINTX would, but it also reports #P for an OUT-OF-RANGE inexact
+                            // source, where x86 raises #I alone; f64 -> int32 is the one width pair where
+                            // such a value exists, and 2147483648.25 is the case that proves it. So run
+                            // FRINTX over the source with the out-of-range case replaced by +0.0, which is
+                            // exact. Out of range is CS from the FCMP above (>= +thr, or NaN) or MI against
+                            // -thr; the result path only needs the former, because negative overflow lands
+                            // on FCVTZS's INT_MIN == the indefinite, but #P must be suppressed for both.
+                            emit32(0xDA9F33E0u | 22);                                       // csetm x22, cs
+                            emit32((I.repne ? 0x1E614000u : 0x1E214000u) | (19 << 5) | 20); // FNEG v20, v19 (-thr)
+                            emit32(fcmp | (20 << 16) | (s << 5));                           // FCMP s, -thr
+                            emit32(0xDA9F53E0u | 23);                                       // csetm x23, mi
+                            e_rrr(A_ORR, 22, 22, 23, 1, 0);                                 // x22 = out-of-range mask
+                            e_fmov_to_d(20, 22);
+                            e_v3(0x0E601C00u, 20, s0, 20);                                  // BIC v20 = src & ~mask
+                            emit32((I.repne ? 0x1E674000u : 0x1E274000u) | (20 << 5) | 20); // FRINTX v20 -> #P only
+                            emit32(fcmp | (19 << 16) | (s << 5)); // redo FCMP: the CSEL below reads its NZCV
+                        }
+                        e_movconst(20, sf ? 0x8000000000000000ull : 0x80000000ull); // integer indefinite
                         e_csel(I.reg, 20, I.reg, 2 /*CS: s>=thr or NaN*/, sf);
                         emit32(0xD51B4200u | 21); // msr nzcv, x21
                     }
@@ -5590,30 +5614,17 @@ static void *translate_block(uint64_t gpc) {
                         s = 16;
                     }
                     if (I.rep || I.p66) {
-                        // H13 (packed): x86 float->int32 gives the integer indefinite (0x80000000) per lane on
-                        // out-of-range or NaN; ARM saturates positive overflow to INT_MAX and NaN to 0 (negative
-                        // overflow already agrees at INT_MIN). Per lane, build the "make-indefinite" mask =
-                        //   (s >= 2^31)  OR  (s != s)   -- FCMGE against a 2^31 broadcast, ORed with ~FCMEQ(s,s)
-                        // and BSL 0x80000000 over the saturating result.
-                        // The mask MUST be built from the source floats BEFORE the convert: for the (common)
-                        // `cvttps2dq %xmm7,%xmm7` in-place form s == vd, so converting first would leave the
-                        // mask reading the INTEGER result reinterpreted as f32 -- an all-ones lane (-1) then
-                        // looks like a NaN and was wrongly forced to the indefinite, while a genuine
-                        // indefinite lane (0x80000000 == -0.0f) looked ordered and kept ARM's NaN->0. Same
-                        // hazard, and the same ordering, as the cvt(t)pd2dq lowering (0F E6) above.
-                        e_v3(0x4E20E400u, 17, s, s);          // FCMEQ v17.4s, s, s  -> ordered lanes (0 where NaN)
-                        emit32(0x6E205800u | (17 << 5) | 17); // NOT v17.16b       -> NaN mask
-                        e_movconst(19, 0x4F000000u);          // 2^31 as f32
-                        emit32(0x4E040C00u | (19 << 5) | 18); // DUP v18.4s, w19   -> threshold
-                        e_v3(0x6E20E400u, 18, s, 18);         // FCMGE v18.4s, s, thr -> s>=2^31 mask
-                        e_v3(0x4EA01C00u, 17, 17, 18);        // ORR v17.16b       -> combined make-indefinite mask
-                        if (I.rep)
-                            emit32(0x4EA1B800u | (s << 5) | vd); // F3: cvttps2dq -> FCVTZS .4S (truncate)
-                        else
-                            emit32(0x4E21A800u | (s << 5) | vd); // 66: cvtps2dq -> FCVTNS .4S (round to nearest)
+                        // Same emit as the VEX form: 66 cvtps2dq used to emit FCVTNS unconditionally and so
+                        // ignored MXCSR.RC, while vcvtps2dq honoured it. emit_ps2dq_128 builds the
+                        // "make-indefinite" mask from the SOURCE floats before converting, which the
+                        // in-place `cvttps2dq %xmm7,%xmm7` form requires: reading it back from the integer
+                        // result would see an all-ones lane (-1) as a NaN, and the indefinite (== -0.0f) as
+                        // ordered.
+                        e_movconst(19, 0x4F000000u);
+                        emit32(0x4E040C00u | (19 << 5) | 25); // v25.4s = 2^31 (f32)
                         e_movconst(19, 0x80000000u);
-                        emit32(0x4E040C00u | (19 << 5) | 18); // DUP v18.4s, w19   -> 0x80000000 per lane
-                        e_v3(0x6E601C00u, 17, 18, vd);        // BSL v17.16b, indef, result -> mask?indef:result
+                        emit32(0x4E040C00u | (19 << 5) | 26); // v26.4s = integer indefinite
+                        emit_ps2dq_128(17, s, I.rep != 0, 25, 26, 27, 28);
                         e_vmov(vd, 17);
                     } else {
                         emit32(0x4E21D800u | (s << 5) | vd); // NP: cvtdq2ps -> SCVTF .4S (s32->f32)
