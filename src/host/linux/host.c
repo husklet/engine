@@ -1442,6 +1442,21 @@ static hl_host_result hl_linux_file_set_times(void *context, hl_host_handle file
     do
         status = futimens(descriptor, native);
     while (status != 0 && errno == EINTR);
+    /* futimens(2) rejects an O_PATH descriptor with EBADF, and PATH_ONLY opens
+       are exactly O_PATH here -- utimensat(dirfd, RELATIVE) resolves its target
+       with PATH_ONLY, so every *at time-setter through a directory handle failed
+       (guest EIO). macOS models PATH_ONLY as a real O_RDONLY open, which is why
+       only the Linux engine broke, and why no lane caught it: compat-core-syscall
+       ran on macOS only. /proc/self/fd/<n> is the documented way to reach the
+       inode behind an O_PATH fd. No AT_SYMLINK_NOFOLLOW: the magic link must be
+       traversed to reach the target at all. */
+    if (status != 0 && errno == EBADF) {
+        char descriptor_path[64];
+        snprintf(descriptor_path, sizeof descriptor_path, "/proc/self/fd/%d", descriptor);
+        do
+            status = utimensat(AT_FDCWD, descriptor_path, native, 0);
+        while (status != 0 && errno == EINTR);
+    }
     return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 

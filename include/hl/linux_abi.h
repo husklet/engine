@@ -22,6 +22,7 @@ typedef enum hl_linux_errno {
     HL_LINUX_EIO = 5,
     HL_LINUX_EBADF = 9,
     HL_LINUX_EAGAIN = 11,
+    HL_LINUX_ENXIO = 6,
     HL_LINUX_ENOMEM = 12,
     HL_LINUX_EACCES = 13,
     HL_LINUX_EFAULT = 14,

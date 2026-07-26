@@ -29,7 +29,11 @@ int main(void) {
     off_t hole_eof = lseek(fd, end, SEEK_HOLE);
     int hole_eof_ok = hole_eof == -1;
     errno = 0;
-    int negative_ok = lseek(fd, -1, SEEK_DATA) == -1 && errno == EINVAL;
+    // A negative offset must be REJECTED; the errno is not portable and asserting one made this a
+    // host test rather than an engine test. Linux returns ENXIO (the SEEK_DATA/SEEK_HOLE range check
+    // in generic_file_llseek_size fires before the EINVAL path): verified on ext4 and tmpfs with a
+    // plain `cc` build, which the engine reproduces exactly. macOS/APFS returns EINVAL. Accept both.
+    int negative_ok = lseek(fd, -1, SEEK_DATA) == -1 && (errno == EINVAL || errno == ENXIO);
     int truncate_ok = ftruncate(fd, 8192) == 0 && lseek(fd, 4096, SEEK_DATA) == -1 &&
                       lseek(fd, 4096, SEEK_HOLE) == 4096;
     int extend_ok = ftruncate(fd, 16384) == 0 && lseek(fd, 8192, SEEK_HOLE) == 8192;
