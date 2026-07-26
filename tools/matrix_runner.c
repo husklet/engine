@@ -867,6 +867,12 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
         binary[binary_length] = 0;
         if (snprintf(guest, sizeof(guest), "%s/%s", binary_root, binary) >= (int)sizeof(guest)) return 1;
     }
+    /* An unbuilt guest otherwise surfaces as an opaque engine "execution failed status=6" with empty stdout;
+       name it so a missing build registration is not mistaken for a runtime abort. */
+    if (!item->needs_rootfs && access(guest, R_OK) != 0) {
+        fprintf(stderr, "matrix-runner: %s [%s] guest binary missing: %s\n", item->name, isa, guest);
+        return 1;
+    }
     if (snprintf(expected_path, sizeof(expected_path), "%s/%s", suite_root, item->expected) >=
             (int)sizeof(expected_path) ||
         read_file(expected_path, &expected, &expected_size) != 0) {
