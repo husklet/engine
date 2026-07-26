@@ -2,10 +2,22 @@
 #include <math.h>
 #include <stdint.h>
 #include "cpu.h"
+#include "x87state.h" // cpu->fptop's tag bits: a TOP move must preserve them and retag the slot
+
+// TOP +- delta, keeping the tag bits a plain `(fptop + d) & 7` would drop.
+static void top_add(struct cpu *cpu, int delta) {
+    cpu->fptop = (cpu->fptop & ~UINT64_C(7)) | ((cpu->fptop + (uint64_t)(int64_t)delta) & 7);
+}
 
 static void push(struct cpu *cpu, double value) {
-    cpu->fptop = (cpu->fptop - 1) & 7;
+    top_add(cpu, -1);
+    hl_x87_phys_mark(&cpu->fptop, (int)(cpu->fptop & 7), 0);
     cpu->st[cpu->fptop & 7] = value;
+}
+
+static void pop(struct cpu *cpu) {
+    hl_x87_phys_mark(&cpu->fptop, (int)(cpu->fptop & 7), 1);
+    top_add(cpu, 1);
 }
 
 void hl_x86_x87_math(struct cpu *cpu) {
@@ -17,21 +29,21 @@ void hl_x86_x87_math(struct cpu *cpu) {
     // already a NaN and fix the sign of the (single) result slot afterwards. Same rule, and the same
     // "result NaN AND no input NaN" test, as emit_x87_dnan_post / emit_dnan_post in translate.c.
     int clean_in = !isnan(st0) && !isnan(st1);
-    unsigned top_in = cpu->fptop;
+    unsigned top_in = (unsigned)(cpu->fptop & 7);
     cpu->fpsw &= ~UINT64_C(0x4700);
     switch (cpu->x87_ea) {
     case X87_F2XM1: cpu->st[cpu->fptop & 7] = exp2(st0) - 1.0; break;
     case X87_FYL2X:
         cpu->st[(cpu->fptop + 1) & 7] = st1 * log2(st0);
-        cpu->fptop = (cpu->fptop + 1) & 7;
+        pop(cpu);
         break;
     case X87_FPATAN:
         cpu->st[(cpu->fptop + 1) & 7] = atan2(st1, st0);
-        cpu->fptop = (cpu->fptop + 1) & 7;
+        pop(cpu);
         break;
     case X87_FYL2XP1:
         cpu->st[(cpu->fptop + 1) & 7] = st1 * log2(st0 + 1.0);
-        cpu->fptop = (cpu->fptop + 1) & 7;
+        pop(cpu);
         break;
     case X87_FPTAN:
         if (fabs(st0) >= 0x1p63) {

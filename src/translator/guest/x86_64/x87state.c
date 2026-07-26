@@ -69,14 +69,21 @@ void hl_x86_ext80_store(double value, uint8_t image[10]) {
     memcpy(image + 8, &sign_exponent, sizeof(sign_exponent));
 }
 
+// TOP moves must preserve cpu->fptop's tag bits (x87state.h), not just rewrite the low three.
+static void x87_top_add(struct cpu *cpu, int delta) {
+    cpu->fptop = (cpu->fptop & ~UINT64_C(7)) | (((cpu->fptop + (uint64_t)(int64_t)delta)) & 7);
+}
+
 void hl_x86_x87_load_ext80(struct cpu *cpu) {
-    cpu->fptop = (cpu->fptop - 1) & 7;
+    x87_top_add(cpu, -1);
+    hl_x87_phys_mark(&cpu->fptop, (int)(cpu->fptop & 7), 0);
     cpu->st[cpu->fptop & 7] = hl_x86_ext80_load((const uint8_t *)(uintptr_t)cpu->x87_ea);
 }
 
 void hl_x86_x87_store_ext80_pop(struct cpu *cpu) {
     double value = cpu->st[cpu->fptop & 7];
-    cpu->fptop = (cpu->fptop + 1) & 7;
+    hl_x87_phys_mark(&cpu->fptop, (int)(cpu->fptop & 7), 1);
+    x87_top_add(cpu, 1);
     hl_x86_ext80_store(value, (uint8_t *)(uintptr_t)cpu->x87_ea);
 }
 
@@ -116,13 +123,19 @@ void hl_x86_fxsave(struct cpu *cpu) {
 #endif
     memcpy(image, &cpu->fpcw, 2);
     {
-        uint16_t status = (uint16_t)((cpu->fpsw & 0x4700) | ((cpu->fptop & 7) << 11) | fsw_exc);
+        // 0x4740, not 0x4700: SF (bit 6) is a stack fault, not an MXCSR bit, so it lives in cpu->fpsw and
+        // must reach the image. Matches interp_x87_status_word; inert on the backend that never sets it.
+        uint16_t status = (uint16_t)((cpu->fpsw & 0x4740) | ((cpu->fptop & 7) << 11) | fsw_exc);
         memcpy(image + 2, &status, sizeof(status));
     }
-    image[4] = 0xff;
+    image[4] = hl_x87_abridged_tag(cpu->fptop);
     image[5] = 0;
+    // The register area is TOP-RELATIVE -- slot i is ST(i), NOT physical st[i] -- while the tag byte above
+    // is physical. Measured: with TOP=5 and 1,2,3 pushed, FXSAVE puts 3.0 (= ST(0)) at offset 32 and reports
+    // tag byte e0 (physical R5..R7 live). Writing st[index] there was wrong for every guest with TOP != 0,
+    // i.e. every guest that had pushed an odd number of values -- setjmp and signal handlers routinely do.
     for (int index = 0; index < 8; ++index)
-        hl_x86_ext80_store(cpu->st[index], image + 32 + index * 16);
+        hl_x86_ext80_store(cpu->st[(cpu->fptop + (unsigned)index) & 7], image + 32 + index * 16);
     memcpy(image + 24, &mxcsr, sizeof(mxcsr));
     memcpy(image + 160, cpu->v, 16 * 16);
 }
@@ -135,11 +148,16 @@ void hl_x86_fxrstor(struct cpu *cpu) {
     memcpy(&control, image, sizeof(control));
     memcpy(&status, image + 2, sizeof(status));
     memcpy(&mxcsr, image + 24, sizeof(mxcsr));
-    cpu->fpcw = control;
-    cpu->fpsw = status & 0x4700;
-    cpu->fptop = (status >> 11) & 7;
-    for (int index = 0; index < 8; ++index)
-        cpu->st[index] = hl_x86_ext80_load(image + 32 + index * 16);
+    cpu->fpcw = HL_X87_FCW(control);
+    cpu->fpsw = (cpu->fpsw & ~UINT64_C(0x4740)) | (status & 0x4740); // codes + SF
+    cpu->fptop = (cpu->fptop & HL_X87_STATE_BITS) | ((status >> 11) & 7);
+    if (hl_x87_tags_modelled()) {
+        cpu->fptop |= HL_X87_ARMED;
+        for (int slot = 0; slot < 8; ++slot)
+            hl_x87_phys_mark(&cpu->fptop, slot, !((image[4] >> slot) & 1));
+    }
+    for (int index = 0; index < 8; ++index) // TOP-relative, matching hl_x86_fxsave
+        cpu->st[(cpu->fptop + (unsigned)index) & 7] = hl_x86_ext80_load(image + 32 + index * 16);
     memcpy(cpu->v, image + 160, 16 * 16);
 #if defined(HL_HOST_CPU_AARCH64)
     {

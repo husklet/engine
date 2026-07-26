@@ -35,8 +35,15 @@ struct cpu {
     uint64_t ic_miss; // IBTC: set by an indirect-branch miss -> dispatcher fills g_ibtc for cpu->rip
     // x87 FPU: a register stack ST(0..7) emulated at DOUBLE precision (enough for printf %f of
     // doubles; loses the 80-bit long-double tail). st[fptop&7]=ST(0). Grows downward (push=--top).
-    double st[8];        // x87 stack slots
-    uint64_t fptop;      // top-of-stack index (only low 3 bits used)
+    double st[8]; // x87 stack slots
+    // Bits 2:0 = top-of-stack. Bits 15:8 + bit 16 carry the x87 TAG state (per-slot "empty" + an ARMED gate)
+    // so the tag word, #IS stack faults and FXAM's "empty" cost no change to sizeof(struct cpu) -- which is
+    // the checkpoint format. See x87state.h for the encoding. lower/x87.c's hl_x86_x87_materialize() stores
+    // TOP with a plain 64-bit str and so CLEARS them, which reads as DISARMED = today's tag-less behaviour;
+    // adopting the model on the JIT side means making that store a read-modify-write and retagging on
+    // push/pop/FFREE. Any other write to this field must preserve bits 63:3.
+    uint64_t fptop;
+
     uint64_t fpsw, fpcw; // status word (C0-C3 in bits 8/9/10/14), control word
     uint64_t x87_ea;     // m80 (80-bit long double) operand address -> handled in C via R_X87*
     uint64_t divop;      // 64-bit div/idiv divisor -> 128/64 division done in C (ARM has no 128/64 divide)
