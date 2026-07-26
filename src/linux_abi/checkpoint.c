@@ -1896,6 +1896,7 @@ static int ckpt_dump_self_locked(struct cpu *c, const char *group) {
     }
 
     // Open this process's image group. The sink stages it; nothing is visible until group_commit.
+    fprintf(stderr, "[ckpt] %s: begin (pid %d)\n", group, (int)getpid());
     if (ckpt_sink_group_begin(sink, group) != 0) {
         free(fdrecs);
         return -1;
@@ -1988,9 +1989,12 @@ done:
     if (ff) ckpt_sink_abort(sink, &ff);
     free(fdrecs);
     if (!ok) {
+        fprintf(stderr, "[ckpt] %s: ABORT -- see the refusal above; nothing from this process is published\n",
+                group);
         ckpt_sink_group_abort(sink, group);
         return -1;
     }
+    fprintf(stderr, "[ckpt] %s: commit\n", group);
     return ckpt_sink_group_commit(sink, group);
 }
 
@@ -2029,8 +2033,11 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
     // Freeze + dump every peer: the shared trigger generation is already advanced (the requester bumped it),
     // so KICK each peer with the guest-proof THREAD_INT_SIG to bounce it out of a blocked syscall / chained
     // in-cache loop to its safepoint, where ckpt_poll sees the new generation and dumps proc.<gpid> + _exit()s.
-    for (int i = 0; i < nfoll; i++)
-        (void)hl_host_process_interrupt(foll[i]);
+    for (int i = 0; i < nfoll; i++) {
+        int kicked = hl_host_process_interrupt(foll[i]);
+        fprintf(stderr, "[ckpt] participant %lld %s\n", (long long)foll[i].identity,
+                kicked ? "interrupted" : "NOT interrupted (it cannot reach a safepoint)");
+    }
     unsigned char *completed = calloc((size_t)(nfoll ? nfoll : 1), 1);
     if (completed == NULL) _exit(70);
     int ndone = 0;
@@ -2051,10 +2058,14 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
         if (ndone != nfoll) usleep(10000);
     }
     if (ndone != nfoll) {
+        // Name every participant still outstanding at the rendezvous deadline: "the group never committed"
+        // is otherwise indistinguishable from "nothing was ever asked to commit".
         for (int i = 0; i < nfoll; i++)
             if (!completed[i])
-                fprintf(stderr, "[ckpt] peer %lld did not checkpoint; refusing incomplete manifest\n",
-                        (long long)foll[i].identity);
+                fprintf(stderr,
+                        "[ckpt] participant %lld never committed proc.%lld (it did not reach a checkpoint "
+                        "safepoint, or its dump was refused); refusing incomplete manifest\n",
+                        (long long)foll[i].identity, (long long)foll[i].identity);
         _exit(70);
     }
 
