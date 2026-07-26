@@ -99,6 +99,70 @@ first time during this work, and passed.
 
 ---
 
+## 3.3 `lower/*.c` is a link-time landmine on any non-AArch64 host
+
+The highest-priority item in this document that is still **worked around rather than fixed**.
+
+The nine files under `src/translator/guest/x86_64/lower/` are compiled *independently* into
+`libhl-translator` via `IR_SOURCES` (`CMakeLists.txt`), **not** `#include`d into the unity TU. They are built
+on every host, and every one of them calls the ARM64 emitters (`e_ldr`, `e_rrr`, `emit_exit_const`,
+`hl_x86_emit_spill`, …) that only the AArch64 arm of `src/core/target/x86_64.c` defines.
+
+This is invisible on an AArch64 host because a linker pulls an archive member only on demand, and nothing
+demanded them. On an x86-64 host, `engine_global_init` unconditionally calls
+`hl_x86_rep_set_store_commit()` and `hl_x86_rep_set_access_validators()` — host-neutral *runtime*
+configuration hooks that happen to live in `lower/repstr.c`, the same object as its ARM64 emitter. That pulls
+the object in and fails the link on 21 undefined symbols.
+
+`guest/x86_64/interp.c` currently carries 21 aborting emitter stubs to unblock this. They are dead by
+construction — nothing calls the lowering entry points on this host — but they are debris.
+
+**Proper fix**, in preference order: split the host-neutral runtime halves (`hl_x86_rep_movs`,
+`hl_x86_rep_stos`, and the two setters) out of the lowering objects; or gate `lower/*.c` out of
+`IR_SOURCES` on a non-AArch64 host. Either deletes the stub section *and* lets the interpreter reuse the
+bulk `rep` helpers, a real speedup it currently has to decline.
+
+Note `src/translator/host/aarch64/{asm,codegen}.c` are in `IR_SOURCES` unconditionally too. They happen to
+link anywhere because they are pure byte-emission C with no inline asm — but the same
+on-demand-archive luck is load-bearing there, and it is luck.
+
+## 3.4 Cross-file invariants with nothing enforcing them
+
+Found while writing the interpreters. Each is a place where two files must agree and no mechanism makes
+them.
+
+- **`cpuid.c` and `xgetbv` must agree.** `cpuid.c` withholds AVX, so XCR0 must report x87+SSE only (3). If
+  they disagree, a guest takes a path neither backend implements.
+- **The JIT's address biasing and `hl_x86_guest_pointer` use different predicates.** `address.c`'s
+  `emit_bias` biases whenever the computed effective address has zero high 32 bits, with a special case for
+  disp-only absolutes outside `[nonpie_lo, nonpie_hi)`; `hl_x86_guest_pointer` does the precise range check.
+  For a biased ET_EXEC these are not the same predicate, so the two backends can differ on a non-PIE guest
+  whose EA is below 2^32 but outside the link range. The interpreter uses the precise one. Worth a decision.
+- **The interpreter's system-register values must match the JIT's.** `DCZID_EL0` and `CTR_EL0` in
+  particular: guests branch on them to choose between `DC ZVA` and byte-loop `memset`, so a different answer
+  sends the same guest down a different path on the two backends and would diverge the exact-golden
+  cross-ISA comparison for a reason nobody would find quickly.
+- **`G_DISPATCH_REASON` in `guest/x86_64/dispatch.h` has no `R_SOFTSPAN` arm**, though `soft_tlb_miss` can
+  set it; it falls through to the `R_BRANCH` default. Benign for the JIT (the block re-runs) but it is an
+  unhandled reason. The interpreter handles it explicitly.
+- **`R_TIER2` would spin forever on an interpreter** if left on the JIT's arm — `tier2_promote(); continue;`
+  with a promoter that cannot change anything. Normalised to `R_BRANCH` in `interp_dispatch.h`.
+
+## 3.5 Bugs the interpreters' own test guests caught
+
+Recorded because they show which parts of the ISA space are treacherous, and because hand-written
+freestanding test guests (no libc, one layer at a time) found all of them where re-reading did not.
+
+- **A non-contiguous opcode range.** `PUNPCKLQDQ` is `0F 6C` and sits *above* the high-unpack group, so a
+  `op >= 0x68` test silently swapped low for high. That is exactly the `movq`+`punpcklqdq` pointer-duplication
+  idiom glibc's `INIT_LIST_HEAD` uses: it zeroed `_dl_stack_user` and crashed in `__tls_init_tp` roughly 400
+  instructions later. Prefer explicit per-opcode cases over range tests.
+- **A wrong barrier constant.** `0xD5033000` instead of `0xD503301F` — the group pins `Rt=11111`. Every
+  `ISB`/`DMB`/`DSB` fell into the MRS/MSR catch-all, which silently broke the SMC commit point.
+- **`CASP` is discriminated by bit 31, not the size field**, so a `size < 2` test rejected every `CASP`.
+- **`SMAXP`/`SMINP` are opcode `0x14`/`0x15`**; `0x1A`/`0x1B` are the floating-point pair.
+- **A folded `CLS`** that computed `x ^ (x << 1)` without shifting down, returning 62 for all-ones.
+
 ## 4. Documentation that misleads
 
 These cost real time on this task and will cost it again.
