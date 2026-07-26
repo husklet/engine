@@ -163,47 +163,45 @@ static inline int smc_seen(void) {
         hl_x86_fxrstor(c);                                                                                             \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_DIV) { /* 128/64 unsigned div; divop==0 means #DE */                                           \
+    /* #DE si_code is FPE_INTDIV(1) for a quotient overflow too -- Linux classifies the trap, not its                  \
+     * cause (1328eac3, tests/compat/completeness/x86_64/div_overflow.c). interp_divide already rules on               \
+     * overflow and reports it as divop == 0, so the arms below are the defensive half; they are kept                  \
+     * exact, and they test before dividing so INT128_MIN over -1 is never evaluated (signed-overflow UB). */          \
+    if ((c)->reason == R_DIV) { /* 128/64 unsigned div; divop==0 means #DE */                                          \
         uint64_t d = (c)->divop;                                                                                       \
-        if (d == 0) {                                                                                                  \
+        if (d == 0 || (c)->r[RDX] >= d) { /* /0, or high half >= divisor: both are the same #DE */                     \
             if (raise_guest_de(c, 1 /*FPE_INTDIV*/)) {                                                                 \
                 maybe_deliver_signal(c);                                                                               \
                 continue;                                                                                              \
             }                                                                                                          \
             break; /* raise_guest_de set exited+exit_code */                                                           \
         }                                                                                                              \
-        if ((c)->r[RDX] >= d) { /* high half >= divisor: x86 #DE, as for /0 */                                          \
-            if (raise_guest_de(c, 2 /*FPE_INTOVF*/)) {                                                                 \
-                maybe_deliver_signal(c);                                                                               \
-                continue;                                                                                              \
-            }                                                                                                          \
-            break;                                                                                                     \
-        }                                                                                                              \
-        unsigned __int128 num = ((unsigned __int128)(c)->r[RDX] << 64) | (c)->r[RAX];                                   \
-        (c)->r[RAX] = (uint64_t)(num / d);                                                                              \
-        (c)->r[RDX] = (uint64_t)(num % d);                                                                              \
+        unsigned __int128 num = ((unsigned __int128)(c)->r[RDX] << 64) | (c)->r[RAX];                                  \
+        (c)->r[RAX] = (uint64_t)(num / d);                                                                             \
+        (c)->r[RDX] = (uint64_t)(num % d);                                                                             \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_IDIV) { /* 128/64 signed idiv */                                                               \
-        int64_t d = (int64_t)(c)->divop;                                                                                \
+    if ((c)->reason == R_IDIV) { /* 128/64 signed idiv */                                                              \
+        int64_t d = (int64_t)(c)->divop;                                                                               \
+        __int128 num = ((__int128)(int64_t)(c)->r[RDX] << 64) | (c)->r[RAX];                                           \
+        int de;                                                                                                        \
         if (d == 0) {                                                                                                  \
+            de = 1;                                                                                                    \
+        } else if (d == -1) { /* the only divisor whose quotient overflows __int128 too */                             \
+            de = num < -(__int128)INT64_MAX || num > -(__int128)INT64_MIN;                                             \
+        } else {                                                                                                       \
+            __int128 q0 = num / d;                                                                                     \
+            de = (__int128)(int64_t)q0 != q0;                                                                          \
+        }                                                                                                              \
+        if (de) {                                                                                                      \
             if (raise_guest_de(c, 1 /*FPE_INTDIV*/)) {                                                                 \
                 maybe_deliver_signal(c);                                                                               \
                 continue;                                                                                              \
             }                                                                                                          \
             break;                                                                                                     \
         }                                                                                                              \
-        __int128 num = ((__int128)(int64_t)(c)->r[RDX] << 64) | (c)->r[RAX];                                            \
-        __int128 q = num / d;                                                                                           \
-        if ((__int128)(int64_t)q != q) { /* incl. INT_MIN/-1: x86 #DE */                                                \
-            if (raise_guest_de(c, 2 /*FPE_INTOVF*/)) {                                                                 \
-                maybe_deliver_signal(c);                                                                               \
-                continue;                                                                                              \
-            }                                                                                                          \
-            break;                                                                                                     \
-        }                                                                                                              \
-        (c)->r[RAX] = (uint64_t)q;                                                                                      \
-        (c)->r[RDX] = (uint64_t)(num % d);                                                                              \
+        (c)->r[RAX] = (uint64_t)(num / d);                                                                             \
+        (c)->r[RDX] = (uint64_t)(num % d);                                                                             \
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_TRAP) { /* int3/UD2; cpu->divop = signo|code<<8 */                                             \

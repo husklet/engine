@@ -19,6 +19,7 @@
 #include "../../identity.h"
 #include "../../digest.h"
 #include "../../../host/host_cpu.h"
+#include "../../../host/native_context.h" // ucontext_t: the fault path restores uc_sigmask by hand
 #include "../../../host/range.h"
 #include "../../../linux_abi/logical_vma.h"
 
@@ -61,7 +62,7 @@ static uint64_t interp_guest_pointer(uint64_t address) {
 // The fault model. struct cpu is authoritative at every instruction boundary, so nothing needs reconstructing
 // as in the JIT; the handler only has to ABANDON the in-flight memcpy in the guest accessors, which would
 // otherwise re-execute and fault forever. A marker is armed around every guest access, run_block sigsetjmps
-// at its top (savemask = 1: the jump arrives from a handler with the signal blocked), the handler siglongjmps
+// at its top (savemask = 0; interp_restore_handler_mask below owns the mask), the handler siglongjmps
 // back. Sound because nothing in between holds a lock, and a load commits its destination only after the
 // marked memcpy returns while a store reads its sources into locals first: the abandoned instruction made no
 // partial architectural change and cpu->pc still names it.
@@ -89,6 +90,8 @@ static void interp_bus_ledger_check(uint64_t address, uint64_t bytes) {
     cpu->bus_ea = guest_fault;
     cpu->reason = R_BUS;
     g_interp_access_active = 0;
+    // The route into the pad that owes no mask restore: no signal was raised, so the host mask is already
+    // what run_block will resume on. (interp_signal_resume is the other route and it does owe one.)
     siglongjmp(g_interp_marker_jmp, 1);
 }
 
@@ -119,13 +122,51 @@ static int interp_signal_capture(struct cpu *c, void *ucontext) {
     return 1;
 }
 
-// Called (via sigframe_resume_dispatch) once the handler has set c->sync_signal/sync_code/tpending/reason.
-static void interp_signal_resume(struct cpu *c, void *ucontext) {
-    (void)ucontext;
-    if (!g_interp_marker_armed || g_interp_marker_cpu != c) {
-        // Unreachable via capture-then-resume; returning re-faults visibly, better than a stale-buffer jump.
+// WHY THIS EXISTS, AND WHY IT IS NOT sigsetjmp(pad, 1).
+//
+// Leaving a host handler by long jump instead of returning means the kernel never runs rt_sigreturn, so the
+// mask restore rt_sigreturn would have done is OWED BY US. Skip it and the fault signal stays blocked in this
+// guest thread forever: the SECOND guest SIGSEGV never arrives, and the failure is silent and looks like a
+// hang. The JIT backend has no such debt -- it rewrites the ucontext PC to block_return and RETURNS, so
+// sigreturn restores the mask for it. This function is the interpreter's hand-rolled sigreturn.
+//
+// The mask to install is exactly ucontext->uc_sigmask: the kernel wrote the pre-signal mask there, and it is
+// by definition the value sigreturn would restore. That is stronger than snapshotting the run loop's mask,
+// because it assumes NO invariance -- it stays correct across a nested guest signal, an SA_ONSTACK handler,
+// a guest rt_sigprocmask that mirrored SIGTSTP/SIGTTIN/SIGTTOU onto the real host mask (syscall/signal.c
+// case 135), a clone/fork child that inherited a different mask, and a host-service window that blocked
+// signals around a write (host/linux/host.c). Restoring BEFORE the jump matches glibc's own siglongjmp
+// ordering (mask first, __longjmp second).
+//
+// The savemask=1 this replaces cost an rt_sigprocmask syscall on EVERY guest basic block -- 271.7 ns, 44% of
+// compute CPU and 99.96% of the process's host syscalls (docs/amd64-host-performance.md 3, 4 and 7.1) -- to
+// save a mask that only this rare path ever reads.
+static void interp_restore_handler_mask(void *ucontext) {
+    if (ucontext != NULL) {
+        pthread_sigmask(SIG_SETMASK, &((ucontext_t *)ucontext)->uc_sigmask, NULL);
         return;
     }
+    // No context (no caller does this today: deliver_guest_fault_hint rejects a NULL ucontext up front).
+    // Unblock the classes the kernel could have auto-blocked at handler entry, so a repeat fault is still
+    // deliverable -- the failure mode this guards is exactly the silent one described above.
+    sigset_t fault;
+    sigemptyset(&fault);
+    sigaddset(&fault, SIGSEGV);
+    sigaddset(&fault, SIGBUS);
+    sigaddset(&fault, SIGILL);
+    sigaddset(&fault, SIGFPE);
+    sigaddset(&fault, SIGTRAP);
+    pthread_sigmask(SIG_UNBLOCK, &fault, NULL);
+}
+
+// Called (via sigframe_resume_dispatch) once the handler has set c->sync_signal/sync_code/tpending/reason.
+static void interp_signal_resume(struct cpu *c, void *ucontext) {
+    if (!g_interp_marker_armed || g_interp_marker_cpu != c) {
+        // Unreachable via capture-then-resume; returning re-faults visibly, better than a stale-buffer jump.
+        // Returning also hands the mask back to rt_sigreturn, so nothing is owed on this path.
+        return;
+    }
+    interp_restore_handler_mask(ucontext);
     siglongjmp(g_interp_marker_jmp, 1);
 }
 
@@ -4788,8 +4829,12 @@ static void run_block(struct cpu *cpu, void *code) {
         return;
     }
 
-    // savemask=1: the siglongjmp arrives from a signal handler, with the signal blocked.
-    if (sigsetjmp(g_interp_marker_jmp, 1) != 0) {
+    // savemask=0 -- this is the hottest line in the engine (once per guest block) and savemask=1 makes glibc
+    // issue a real rt_sigprocmask here. interp_restore_handler_mask does the restore on the fault path
+    // instead, where it is paid once per fault rather than once per block. sigsetjmp/siglongjmp and NOT
+    // setjmp/longjmp: on Darwin setjmp/longjmp are the mask-SAVING pair, so sigsetjmp(.,0) is the only
+    // portable way to say "this pad does not touch the mask" (same idiom as linux_abi/thread.c's probe pad).
+    if (sigsetjmp(g_interp_marker_jmp, 0) != 0) {
         // Both abandon paths already left cpu as the dispatcher needs it; no architectural state changed.
         g_interp_access_active = 0;
         g_interp_marker_armed = 0;

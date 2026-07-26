@@ -24,12 +24,8 @@
 #endif
 
 #include "../../identity.h"
+#include "../../../host/native_context.h" // ucontext_t: the fault path restores uc_sigmask by hand
 #include "decoder.h"
-
-// For the setter declarations engine_global_init needs; its hl_x86_rep_movs/stos stay unused. The string ops
-// run element-at-a-time below: those per-element pointer/counter updates are what make a fault mid-string
-// architecturally correct. Link fallout: docs/amd64-host-findings.md 3.3.
-#include "lower/repstr.h"
 
 // ---- The seam: names the JIT files own, which the rest of the TU needs.
 
@@ -87,8 +83,9 @@ void emit32(uint32_t instruction) {
 
 // ---- The fault model. *cpu is already authoritative, so capture is trivial; escaping is not -- the
 // faulting access is a memcpy several C frames deep and must be ABANDONED, not resumed past. run_block arms
-// a sigsetjmp pad (savemask=1: it is entered FROM a handler with that signal blocked) and marks every guest
-// access; claiming a fault only when marked is what keeps an engine-side null dereference reportable.
+// a sigsetjmp pad and marks every guest access; claiming a fault only when marked is what keeps an
+// engine-side null dereference reportable. The pad is armed with savemask=0 and the one route that enters it
+// from a signal handler restores the mask itself -- see interp_restore_handler_mask.
 
 static __thread sigjmp_buf g_interp_fault_pad;
 static __thread int g_interp_pad_armed;             // a run_block landing pad is live
@@ -114,6 +111,8 @@ static void interp_bus_ledger_check(uint64_t guest_address, uint64_t length) {
     cpu->bus_ea = guest_fault;
     cpu->reason = R_BUS;
     g_interp_guest_access = 0;
+    // The OTHER route into the pad, and the one that owes no mask restore: this runs on the ordinary
+    // interpretation path (no signal was raised), so the host mask is already what run_block will resume on.
     siglongjmp(g_interp_fault_pad, 1);
 }
 
@@ -138,11 +137,48 @@ int interp_signal_capture(struct cpu *cpu, void *native_context) {
     return 1;
 }
 
+// WHY THIS EXISTS, AND WHY IT IS NOT sigsetjmp(pad, 1).
+//
+// Leaving a host handler by long jump instead of returning means the kernel never runs rt_sigreturn, so the
+// mask restore rt_sigreturn would have done is OWED BY US. Skip it and the fault signal stays blocked in this
+// guest thread forever: the SECOND guest SIGSEGV never arrives, and the failure is silent and looks like a
+// hang. The JIT backend has no such debt -- it rewrites the ucontext PC to block_return and RETURNS, so
+// sigreturn restores the mask for it. This function is the interpreter's hand-rolled sigreturn.
+//
+// The mask to install is exactly ucontext->uc_sigmask: the kernel wrote the pre-signal mask there, and it is
+// by definition the value sigreturn would restore. That is stronger than snapshotting the run loop's mask,
+// because it assumes NO invariance -- it stays correct across a nested guest signal, an SA_ONSTACK handler,
+// a guest rt_sigprocmask that mirrored SIGTSTP/SIGTTIN/SIGTTOU onto the real host mask (syscall/signal.c
+// case 135), a clone/fork child that inherited a different mask, and a host-service window that blocked
+// signals around a write (host/linux/host.c). Restoring BEFORE the jump matches glibc's own siglongjmp
+// ordering (mask first, __longjmp second).
+//
+// The savemask=1 this replaces cost an rt_sigprocmask syscall on EVERY guest basic block -- 271.7 ns, 44% of
+// compute CPU and 99.96% of the process's host syscalls (docs/amd64-host-performance.md 3, 4 and 7.1) -- to
+// save a mask that only this rare path ever reads.
+static void interp_restore_handler_mask(void *native_context) {
+    if (native_context != NULL) {
+        pthread_sigmask(SIG_SETMASK, &((ucontext_t *)native_context)->uc_sigmask, NULL);
+        return;
+    }
+    // No context (no caller does this today: deliver_guest_fault_hint rejects a NULL ucontext up front).
+    // Unblock the classes the kernel could have auto-blocked at handler entry, so a repeat fault is still
+    // deliverable -- the failure mode this guards is exactly the silent one described above.
+    sigset_t fault;
+    sigemptyset(&fault);
+    sigaddset(&fault, SIGSEGV);
+    sigaddset(&fault, SIGBUS);
+    sigaddset(&fault, SIGILL);
+    sigaddset(&fault, SIGFPE);
+    sigaddset(&fault, SIGTRAP);
+    pthread_sigmask(SIG_UNBLOCK, &fault, NULL);
+}
+
 // The delivery path has already queued the signal and set R_BRANCH; just return from run_block.
 void interp_signal_resume(struct cpu *cpu, void *native_context) {
     (void)cpu;
-    (void)native_context;
-    if (!g_interp_pad_armed) return; // not ours; the caller re-raises
+    if (!g_interp_pad_armed) return; // not ours; the caller re-raises (and returns, so sigreturn restores)
+    interp_restore_handler_mask(native_context);
     siglongjmp(g_interp_fault_pad, 1);
 }
 
@@ -947,10 +983,15 @@ static void run_block(struct cpu *cpu, void *code) {
                 (unsigned long long)cpu->rip);
         abort();
     }
-    // Guest-fault landing pad. savemask=1: the jump arrives from a handler with the fault signal blocked.
+    // Guest-fault landing pad. savemask=0 -- this is the hottest line in the engine (once per guest block)
+    // and savemask=1 makes glibc issue a real rt_sigprocmask here. interp_restore_handler_mask does the
+    // restore on the fault path instead, where it is paid once per fault rather than once per block.
+    // sigsetjmp/siglongjmp and NOT setjmp/longjmp: on Darwin setjmp/longjmp are the mask-SAVING pair, so
+    // sigsetjmp(.,0) is the only portable way to say "this pad does not touch the mask" (same idiom as
+    // host_range_mapped's probe pad in linux_abi/thread.c).
     int previous = g_interp_pad_armed;
     struct cpu *previous_cpu = g_interp_pad_cpu;
-    if (sigsetjmp(g_interp_fault_pad, 1) != 0) {
+    if (sigsetjmp(g_interp_fault_pad, 0) != 0) {
         // A guest access was abandoned; both routes already set cpu->reason and left cpu->rip on it.
         g_interp_guest_access = 0;
         g_interp_pad_armed = previous;
@@ -4190,61 +4231,4 @@ static void pcache_note_fixed_img(uint64_t base, uint64_t span) {
     // Nothing is revivable here, so no spans to record.
     (void)base;
     (void)span;
-}
-
-// ARM64 emitter stubs: lower/*.c is in IR_SOURCES on every host and references emitters only the AArch64
-// arm of core/target/x86_64.c defines, and engine_global_init drags lower/repstr.c into the link here.
-// Dead by construction, so they abort. TODO(amd64-host): fix per docs/amd64-host-findings.md 3.3.
-
-static void interp_no_emitter(const char *name) {
-    fprintf(stderr,
-            "[hl] interp: ARM64 emitter %s() called on a " HL_HOST_CPU_NAME " host. This backend decodes and\n"
-            "     executes x86-64; it emits nothing, so a per-class lowering file under\n"
-            "     src/translator/guest/x86_64/lower/ was entered. Those are unreachable here by\n"
-            "     construction -- see the emitter-stub note in interp.c.\n",
-            name);
-    abort();
-}
-
-#define INTERP_EMITTER_STUB(name, signature, ...)                                                                      \
-    void name signature {                                                                                             \
-        __VA_ARGS__;                                                                                                  \
-        interp_no_emitter(#name);                                                                                     \
-    }
-
-INTERP_EMITTER_STUB(emit_exit_const, (uint64_t rip, uint64_t reason), (void)rip, (void)reason)
-INTERP_EMITTER_STUB(emit_memory_guard, (int address_register, uint64_t size, uint64_t rip, uint32_t required),
-                    (void)address_register, (void)size, (void)rip, (void)required)
-INTERP_EMITTER_STUB(emit_soft_store_observe, (uint64_t size), (void)size)
-INTERP_EMITTER_STUB(emit_soft_store_drain, (void), (void)0)
-INTERP_EMITTER_STUB(hl_x86_emit_block_return, (void), (void)0)
-INTERP_EMITTER_STUB(hl_x86_emit_spill, (void), (void)0)
-INTERP_EMITTER_STUB(hl_x86_emit_reload, (void), (void)0)
-INTERP_EMITTER_STUB(hl_x86_emit_vector_reset, (void), (void)0)
-INTERP_EMITTER_STUB(hl_x86_emit_host_pointer, (int destination, uint64_t pointer), (void)destination, (void)pointer)
-INTERP_EMITTER_STUB(e_movconst, (int destination, uint64_t value), (void)destination, (void)value)
-INTERP_EMITTER_STUB(e_load, (int width, int destination, int address), (void)width, (void)destination, (void)address)
-INTERP_EMITTER_STUB(e_store, (int width, int source, int address), (void)width, (void)source, (void)address)
-INTERP_EMITTER_STUB(e_mov_rr, (int destination, int source, int sixty_four_bit), (void)destination, (void)source,
-                    (void)sixty_four_bit)
-INTERP_EMITTER_STUB(e_addi, (int destination, int source, unsigned immediate, int sixty_four_bit), (void)destination,
-                    (void)source, (void)immediate, (void)sixty_four_bit)
-INTERP_EMITTER_STUB(e_subi, (int destination, int source, unsigned immediate, int sixty_four_bit), (void)destination,
-                    (void)source, (void)immediate, (void)sixty_four_bit)
-INTERP_EMITTER_STUB(e_str, (int source, int base, int offset), (void)source, (void)base, (void)offset)
-INTERP_EMITTER_STUB(e_ldr, (int destination, int base, int offset), (void)destination, (void)base, (void)offset)
-INTERP_EMITTER_STUB(e_rrr, (uint32_t instruction, int destination, int left, int right, int sixty_four_bit, int shift),
-                    (void)instruction, (void)destination, (void)left, (void)right, (void)sixty_four_bit, (void)shift)
-INTERP_EMITTER_STUB(e_lsl_i, (int destination, int source, int shift, int sixty_four_bit), (void)destination,
-                    (void)source, (void)shift, (void)sixty_four_bit)
-
-// These return a value, so no macro.
-int emit_soft_memory_active(void) {
-    // Nothing is emitted here, so no guards; answered rather than aborting for shared callers.
-    return 0;
-}
-
-uint32_t *hl_x86_emit_cursor(void) {
-    interp_no_emitter("hl_x86_emit_cursor");
-    return NULL;
 }
