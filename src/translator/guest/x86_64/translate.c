@@ -1,6 +1,7 @@
 // translator/guest/x86_64 -- the x86-64 -> arm64 translator (flag synthesis, SSE/x87 lowering, the
 // big translate_block) + host entry trampolines.
 
+#include "../../../host/host_cpu.h" // HL_HOST_CPU_*: the host entry trampolines at the end are AArch64-only
 #include "lower/primitives.h"
 #include "lower/alu.h"
 #include "lower/crypto.h"
@@ -6263,7 +6264,13 @@ static void report_unimpl(uint64_t pc, struct insn *I) {
 }
 
 // ---------------- host entry trampolines (adapted from jit.c, x86 reg set) ----------------
-#if defined(__GNUC__) && !defined(__clang__)
+// The arch test is as load-bearing as the compiler test: both arms below are AArch64 assembly, and the outer
+// guard used to select between them on the COMPILER alone, so an x86-64 build fed the ARM64 register names to
+// the host assembler. HL_HOST_CPU_AARCH64 (not a bare defined(__aarch64__)) is deliberately the same macro
+// core/dispatch.c gates its own copy of this construct on, so the two agree by spelling and not by luck --
+// dispatch.c only compiles ITS trampolines when the x86 frontend has not defined G_OWN_TRAMPOLINES, i.e. these
+// are the ones the x86 dispatcher actually enters, and the pair must never disagree about which host it is on.
+#if defined(__GNUC__) && !defined(__clang__) && defined(HL_HOST_CPU_AARCH64)
 /* GCC ignores naked on AArch64 functions.  Define the two ABI trampolines as
    assembler functions so no compiler-generated prologue can corrupt SP or the
    callee-saved register image. */
@@ -6289,7 +6296,7 @@ __asm__(".hidden run_block\n"
         "ldr q12,[x28,#336]\n ldr q13,[x28,#352]\n ldr q14,[x28,#368]\n ldr q15,[x28,#384]\n"
         "ldr x9,[x28,#168]\n mov sp,x9\n ldr x28,[x28,#248]\n ret\n"
         ".size block_return, .-block_return\n");
-#else
+#elif defined(HL_HOST_CPU_AARCH64)
 __attribute__((naked)) static void run_block(struct cpu *cpu, void *code) {
     __asm__ volatile( // x0=cpu, x1=code
         "str x19,[x0,#176]\n str x20,[x0,#184]\n str x21,[x0,#192]\n str x22,[x0,#200]\n"
@@ -6311,5 +6318,28 @@ __attribute__((naked)) static void block_return(void) {
         "ldr x9,[x28,#168]\n mov sp, x9\n" // host sp
         "ldr x28,[x28,#248]\n"             // restore host x28 LAST (was using it as base)
         "ret\n");
+}
+#else
+// Non-AArch64 host. Every emitter in this directory writes ARM64 machine code (emit.c's header says so), so
+// there is nothing for a trampoline to enter here and no host register file to spill into cpu -- an x86-64
+// host back end is a separate piece of work. These two definitions exist only so the rest of the engine still
+// compiles and links: block_return's ADDRESS is baked into emitted blocks (hl_x86_emit_block_return) and is
+// cache.c's image-slide anchor for the persistent code cache, and core/dispatch.c CALLS run_block, so both
+// must be real, address-taken function symbols -- they are `static` to match the forward declaration emit.c
+// makes on this same arm.
+//
+// Reaching either means the dispatcher tried to execute a translated block on a host whose ISA the emitters
+// cannot target, which is a build-configuration error and not a recoverable runtime state: say so on stderr
+// and abort rather than jumping into foreign machine code. Nothing on the AArch64 path changes.
+static void run_block(struct cpu *cpu, void *code) {
+    (void)cpu;
+    (void)code;
+    fprintf(stderr, "[hl] x86-64 guest: no host back end for " HL_HOST_CPU_NAME " (the emitters target arm64)\n");
+    abort();
+}
+
+static void block_return(void) {
+    fprintf(stderr, "[hl] x86-64 guest: no host back end for " HL_HOST_CPU_NAME " (the emitters target arm64)\n");
+    abort();
 }
 #endif

@@ -56,6 +56,20 @@ static int elf_interp(const char *path, char *out, size_t n) {
 // PC past the faulting instruction, and resumes. Inert unless a non-PIE image is loaded (g_nonpie_lo == 0
 // for PIE / static-PIE, the only state the test matrix ever sees). A form we cannot decode returns 0 so
 // the guard re-raises = a clean abort, never silent wrong data.
+
+// HOST-CPU GATE, covering the helpers below and all of nonpie_fixup. Read literally, the comment above says
+// what the gate is for: the fixup "decodes the native arm64 load/store the JIT emitted". It fetches the
+// 4-byte word at HL_HOST_UC_PC, matches it against A64 encodings (DC ZVA, LDP/STP, the exclusive-monitor
+// pair, the LSE atomics, CAS/CASP, the single load/store family), moves the data through the AArch64 register
+// file the kernel saved in the signal context (HL_HOST_UC_REGS / HL_HOST_UC_VREGS), applies A64 pre/post
+// writeback semantics, and advances the host PC by exactly 4. Only the AArch64-host JIT emits code that fits
+// any of that. On a host CPU whose emitted code is a different ISA, the word at the faulting host PC is not
+// an A64 instruction, its length is not 4, and its register operands are not in HL_HOST_UC_REGS -- so there
+// is nothing here to fix up and every match would be a coincidence acted on as fact. The #else arm declines
+// instead. A non-PIE ET_EXEC guest on such a host needs the equivalent decoder for that host's own ISA;
+// until it exists, the low absolute-data access is reported as the fault it is rather than mis-served.
+#if defined(HL_HOST_HAS_A64_CONTEXT)
+
 static int64_t nonpie_sext(uint64_t v, int bits) {
     uint64_t m = 1ull << (bits - 1);
     return (int64_t)((v ^ m) - m);
@@ -554,6 +568,22 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
     HL_HOST_UC_PC(uc) += 4;
     return 1;
 }
+
+#else
+
+// Not an AArch64 host: there is no emitted A64 access to decode, so decline every fault. 0 is the same
+// "not handled" answer the decoder above gives for a form it will not guess at, and it is what preserves the
+// crash path: nonpie_guard tests the return and, on 0, goes on to the writable-page representation repair,
+// deliver_guest_fault (a guest handler), deliver_guest_fatal_fault (a faithful WIFSIGNALED death), and
+// finally SIG_DFL + raise; core/target/aarch64.c's diagnostic handler consults it the same way and then falls
+// through to its own dump. Returning 1 would resume the very instruction that faulted, looping forever.
+static int nonpie_fixup(siginfo_t *si, void *ucv) {
+    (void)si;
+    (void)ucv;
+    return 0;
+}
+
+#endif
 
 // SIGSEGV/SIGBUS guard installed on the normal aarch64 run path. Serves a non-PIE absolute data access at
 // +bias (nonpie_fixup); anything else re-raises with the default action (a real crash). Inert for PIE.

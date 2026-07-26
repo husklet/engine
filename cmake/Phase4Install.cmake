@@ -23,9 +23,15 @@ else()
 endif()
 set(HL_PACKAGE_SYSTEM_LIBS "-pthread")
 
-# The embedded activation archive exists on aarch64 only; on other hosts the
-# activation header is not installed either, because nothing implements it.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+# Whether the embedded activation archive is installable.
+#
+# This used to test CMAKE_SYSTEM_PROCESSOR for aarch64, which disagreed with
+# Phase2Production.cmake: Phase 2 gates hl-engine-activation on the host OS
+# alone, so an x86_64 Linux host BUILT the archive and then Phase 4 refused to
+# install it or its header -- a build that produces an artifact it declares not
+# to exist. Ask the build graph instead of re-deriving the condition, so the two
+# phases cannot drift again.
+if(TARGET hl-engine-activation)
   set(HL_HAVE_ACTIVATION TRUE)
 else()
   set(HL_HAVE_ACTIVATION FALSE)

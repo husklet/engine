@@ -413,7 +413,7 @@ endforeach()
 # 6. dual-backend + dynamic rootfs
 # ===========================================================================
 add_test(NAME dual-backend.link
-  COMMAND ${CMAKE_BINARY_DIR}/package/linux-aarch64/dual-backend-link-test
+  COMMAND ${HL_PACKAGE_ARCH_DIR}/dual-backend-link-test
           ${HL_E2E}/guest-exit-aarch64 ${HL_E2E}/guest-exit-x86_64
           ${HL_E2E}/guest-exit70-aarch64 ${HL_E2E}/guest-exit70-x86_64
           ${HL_E2E}/guest-spin-aarch64 ${HL_E2E}/guest-output-aarch64)

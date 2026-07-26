@@ -966,11 +966,9 @@ static void sig_diag_fatal_fault(int sig, int hostsig, siginfo_t *si, struct cpu
         n = sig_diag_put_hex(b, n, " insn=", *(const uint32_t *)(uintptr_t)G_PC(c));
 #endif
     ucontext_t *u = (ucontext_t *)ucv;
-#if defined(__aarch64__)
+    /* HL_HOST_UC_PC is the host-neutral tier of native_context.h, so this needs
+     * no per-CPU branch -- it reads pc on AArch64 and rip on x86-64. */
     uint64_t hpc = u ? (uint64_t)HL_HOST_UC_PC(u) : 0;
-#else
-    uint64_t hpc = 0;
-#endif
     uint64_t hgpc = 0, hoff = 0;
     uint32_t hinsn = 0;
     extern int jit_hostpc_lookup(uint64_t hpc, uint64_t *gpc, uint64_t *off, uint32_t *insn);
@@ -986,13 +984,10 @@ static void sig_diag_fatal_fault(int sig, int hostsig, siginfo_t *si, struct cpu
 
 static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv) {
     ucontext_t *u = (ucontext_t *)ucv;
-#if defined(__aarch64__)
+    /* Was an open-coded Darwin-shaped `uc_mcontext->__ss.__rip` under a bare
+     * __x86_64__ guard, which does not compile against a Linux ucontext_t.
+     * HL_HOST_UC_PC resolves the OS and the CPU together. */
     uint64_t hpc = u ? (uint64_t)HL_HOST_UC_PC(u) : 0;
-#elif defined(__x86_64__)
-    uint64_t hpc = u ? (uint64_t)u->uc_mcontext->__ss.__rip : 0;
-#else
-    uint64_t hpc = 0;
-#endif
     uint64_t hgpc = 0, hoff = 0;
     uint32_t hinsn = 0;
     extern int jit_hostpc_lookup(uint64_t hpc, uint64_t *gpc, uint64_t *off, uint32_t *insn);

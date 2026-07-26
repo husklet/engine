@@ -95,8 +95,16 @@ static int jit_guest_soft_active(void);
 
 #include "../../translator/guest/x86_64/cpu.h"
 #include "../../translator/guest/x86_64/frame.h"
-#include "../../translator/guest/x86_64/abi.h"      // cpu-interface seam (G_* contract + sysmap + normalize)
+#include "../../translator/guest/x86_64/abi.h" // cpu-interface seam (G_* contract + sysmap + normalize)
+// The dispatch seam is per (guest ISA, HOST CPU), not per guest ISA alone -- see the comment on the
+// host-CPU fork further down. dispatch.h belongs to the x86-64 -> ARM64 translator and patches AArch64
+// branch encodings; every other host runs the interpreter backend and its interp_dispatch.h.
+#include "../../host/host_cpu.h"
+#if defined(HL_HOST_CPU_AARCH64)
 #include "../../translator/guest/x86_64/dispatch.h" // x86 dispatch seam for the SHARED engine/dispatch.c
+#else
+#include "../../translator/guest/x86_64/interp_dispatch.h"
+#endif
 #define HL_GUEST_STAT_SIZE HL_LINUX_STAT_X86_64_SIZE
 #define HL_GUEST_STAT_ENCODE hl_linux_stat_encode_x86_64
 #define HL_GUEST_BOUND_STAT hl_linux_stat_x86_64
@@ -170,6 +178,22 @@ static int jit86_avx_memory_write(uint64_t guest, const void *source, size_t len
     return 1;
 }
 
+// ---------------------------------------------------------------------------
+// The host-CPU fork.
+//
+// Everything from here to the matching #else is the x86-64 -> ARM64 translator: emit.c's "arm64 host
+// emitters", the address_* wrappers over them, translate.c's per-opcode ARM64 codegen, and a persistent
+// cache of the ARM64 code it produced. Its register model is stated at the top of this file -- guest
+// rax..r15 in host x0..x15, cpu pinned in host x28 -- so all of it presupposes an AArch64 host.
+//
+// On any other host CPU there is no ARM64 to emit. interp.c supplies the same seam by decoding and
+// executing x86-64 directly. Note that when the host CPU is itself x86-64 this is a same-ISA case and a
+// transliterator (the mirror of what guest/aarch64 does on an AArch64 host) would be far faster than an
+// interpreter; that is a deliberate later optimisation, not the correctness path.
+//
+// struct cpu is shared by both backends because it is the checkpoint format.
+// ---------------------------------------------------------------------------
+#if defined(HL_HOST_CPU_AARCH64)
 #include "../../translator/guest/x86_64/emit.c" // x86 engine: arm64 emitters + SSE + x87
 #include "../../translator/guest/x86_64/address.h"
 
@@ -299,7 +323,13 @@ void emit_load_mem(struct insn *insn, uint64_t next, int width, int rt) {
 
 #include "../../translator/guest/x86_64/translate.c" // x86-64 translate_block + trampolines
 #include "../../translator/guest/x86_64/cache.c"     // persistent translated-code cache (HL_PCACHE=1)
-#include "../../linux_abi/thread.c"                  // SHARED: clone->pthread, per-thread cpu, futex
+#else
+// The non-AArch64 host arm of the fork opened above: decode and execute x86-64 instead of emitting ARM64.
+// interp.c defines the same names emit.c/translate.c/cache.c do, which is what keeps everything below this
+// point -- linux_abi, the shared dispatcher, the ELF loader, checkpoint/restore -- identical on both hosts.
+#include "../../translator/guest/x86_64/interp.c"
+#endif
+#include "../../linux_abi/thread.c" // SHARED: clone->pthread, per-thread cpu, futex
 
 /*
  * Queue the bytes a store actually wrote into an emulated MAP_SHARED mapping,

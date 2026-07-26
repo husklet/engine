@@ -1,7 +1,21 @@
 #include "identity.h"
 
+#include "../host/host_cpu.h"
+
+#include <hl/codegen.h>
+
 #include <stddef.h>
 #include <string.h>
+
+/* hl_identity_configuration() takes the host ISA as a runtime hl_host_isa value, but every caller has to name
+ * it at PREPROCESSOR time (it is a property of the build, and the call sites sit inside emitters that cannot
+ * include the public codegen header). That is why src/host/host_cpu.h carries HL_HOST_CPU_ISA_* as literal
+ * macros alongside the enum. Two spellings of the same numbering is exactly the sort of duplication that
+ * drifts silently -- and the failure mode is not a compile error but a cache-identity hash that no longer
+ * distinguishes the host it was written on, i.e. one host loading and executing another host's machine code.
+ * Pin them together here, in the one file that legitimately sees both. */
+_Static_assert(HL_HOST_CPU_ISA_AARCH64 == HL_HOST_ISA_AARCH64, "host_cpu.h and hl_host_isa disagree on aarch64");
+_Static_assert(HL_HOST_CPU_ISA_X86_64 == HL_HOST_ISA_X86_64, "host_cpu.h and hl_host_isa disagree on x86_64");
 
 #define HL_IDENTITY_SEED 1469598103934665603ull
 #define HL_IDENTITY_PRIME 1099511628211ull

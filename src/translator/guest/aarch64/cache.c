@@ -124,7 +124,13 @@ static void pcache_record_provenance(uint64_t host, uint64_t end, uint64_t guest
         (struct pc_prov){host - (uint64_t)g_cache, guest, (uint32_t)(end - host), 0};
 }
 
-#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+// Same forward declaration of the dispatcher's block_return trampoline as stubs.c carries (this file is
+// #included first and the recorded emitters below bake its address), so it must select the SAME form: extern
+// global under GCC, which has no AArch64 naked function and therefore emits the trampoline from a file-scope
+// __asm__ block, static otherwise. Gated on HL_HOST_CPU_AARCH64 rather than __aarch64__ to stay in step with
+// core/dispatch.c, which decides which of the two it defines using that same host-CPU name.
+#include "../../../host/host_cpu.h"
+#if defined(__GNUC__) && !defined(__clang__) && defined(HL_HOST_CPU_AARCH64)
 extern void block_return(void) __attribute__((visibility("hidden")));
 #else
 static void block_return(void);
@@ -259,7 +265,7 @@ static uint64_t pcache_engine_id(void) {
                      ((uint64_t)(g_noibslim != 0) << 2) | ((uint64_t)(g_mtibtc != 0) << 3) |
                      ((uint64_t)(g_no_stw_reclaim != 0) << 4) | ((uint64_t)(g_prof != 0) << 5) |
                      ((uint64_t)(uint32_t)g_fwdskip << 32);
-    return hl_identity_configuration(build, 1, 1, modes);
+    return hl_identity_configuration(build, 1, HL_HOST_CPU_ISA, modes);
 }
 
 // Hash the BASENAME of argv[0]. A multicall binary (busybox, toolchain drivers) runs DIFFERENT code

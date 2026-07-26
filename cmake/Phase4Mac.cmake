@@ -122,7 +122,7 @@ add_library(hl-engine-dual STATIC
   $<TARGET_OBJECTS:macdual_dispatch>       $<TARGET_OBJECTS:macdual_activation>
   $<TARGET_OBJECTS:hl-mac-embedded-objs>)
 set_target_properties(hl-engine-dual PROPERTIES
-  ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/package/macos-aarch64
+  ARCHIVE_OUTPUT_DIRECTORY ${HL_PACKAGE_ARCH_DIR}
   OUTPUT_NAME hl-engine)   # -> build/package/macos-aarch64/libhl-engine.a
 
 add_executable(mac-dual-backend-link-test tools/dual_backend_e2e_runner.c)
@@ -131,7 +131,7 @@ target_link_options(mac-dual-backend-link-test PRIVATE
   -Wl,-force_load,$<TARGET_FILE:hl-engine-dual>)
 add_dependencies(mac-dual-backend-link-test hl-engine-dual)
 set_target_properties(mac-dual-backend-link-test PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/package/macos-aarch64)
+  RUNTIME_OUTPUT_DIRECTORY ${HL_PACKAGE_ARCH_DIR})
 hl_codesign(mac-dual-backend-link-test)
 
 # `make test-dual-backend` (Makefile 1708): one process force-loading the dual

@@ -52,6 +52,19 @@
         windows = { supported = false; };
       };
 
+      # Host CPUs, the OTHER half of the host platform. hostBackends above is keyed
+      # by host OS alone, which was indistinguishable from "the host platform" while
+      # aarch64 was the only answer. It is a separate axis and it composes with the
+      # first: an x86_64 Windows host reuses the x86_64 code generator with the
+      # windows backend. Modelling it as data here keeps this file free of the
+      # `system == "..."` branches the comment above warns about, and matches the
+      # same axis on the C side (src/host/host_cpu.h, HL_HOST_CPU_*) and in CMake
+      # (HL_HOST_ARCH).
+      hostCPUs = {
+        aarch64 = { supported = true; };
+        x86_64 = { supported = true; };
+      };
+
       # Everything host- and guest-dependent, derived once from `pkgs`.
       toolchainFor = pkgs:
         let
@@ -88,11 +101,22 @@
         rec {
           inherit host hostCpu nativeCC isNative pkgsFor;
           backend = hostBackends.${backendName};
-          # Can this host build guest fixtures at all?
-          canBuildGuests = backend.supported;
-          # Hosts that can execute a built engine, and therefore get the Rust
-          # package. A predicate, not an allowlist of system strings.
-          canRunGuests = backend.supported && hostCpu == "aarch64";
+          cpu = hostCPUs.${hostCpu} or { supported = false; };
+          # Can this host build guest fixtures at all? Both axes must be supported:
+          # a guest fixture is cross-compiled, but the engine that will run it is not.
+          canBuildGuests = backend.supported && cpu.supported;
+          # Hosts that get the publishable Rust crate.
+          #
+          # This used to be `canRunGuests`, spelled `hostCpu == "aarch64"`, and the
+          # two ideas were the same only by accident. The crate links a FROZEN
+          # prebuilt archive per host triple -- pkgs/rust/assets/lib/<triple>/
+          # libhl-engine.a -- and only the two aarch64 triples have one. Those
+          # archives are ~24 MB each against the 10 MB crates.io budget documented in
+          # pkgs/rust/Cargo.toml, so shipping a third is a deliberate publication
+          # decision, NOT an automatic consequence of a host becoming supported.
+          # Naming the predicate after the archive keeps a newly supported host from
+          # silently enabling a crate build that has nothing to link.
+          hasCrateArchive = backend.supported && hostCpu == "aarch64";
 
           crossCompilers = map ccPkgFor guestISAs;
 
@@ -177,7 +201,7 @@
               mainProgram = "hl-engine-runner";
             };
           };
-        } // lib.optionalAttrs tc.canRunGuests {
+        } // lib.optionalAttrs tc.hasCrateArchive {
           rust = pkgs.rustPlatform.buildRustPackage {
             pname = "hl-engine";
             inherit version;
@@ -254,7 +278,7 @@
             doCheck = true;
             installPhase = "touch $out";
           };
-        } // lib.optionalAttrs tc.canRunGuests {
+        } // lib.optionalAttrs tc.hasCrateArchive {
           rust = self.packages.${pkgs.stdenv.hostPlatform.system}.rust;
         });
 

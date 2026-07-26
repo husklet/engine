@@ -2,6 +2,7 @@
 // (ST(i) at double precision) + prologue/spill/exits.
 // ---------------- ARM64 instruction emitters ----------------
 #include "encoding.h"
+#include "../../../host/host_cpu.h" // HL_HOST_CPU_*: this back end's host-feature probes are AArch64-only
 // (the same-ISA-independent half: these emit HOST code, copied from jit.c +
 //  a few width-typed loads/stores the x86 front-end needs.)
 
@@ -12,8 +13,14 @@
 // runs, by a constructor. It is enabled ONLY on a Linux host: the LDAPR unaligned-crossing alignment-fault
 // fixup (ldapr_align_fixup) is wired solely into the Linux SIGBUS run path (jit86_lazyguard), so on any
 // other host the fast path stays OFF (== baseline behavior, no unhandled BUS_ADRALN).
+// It stays 0 on any host CPU that is not AArch64, and the probe is not even compiled there: AT_HWCAP is a
+// PER-ARCHITECTURE bit vector, so bit 15 is FEAT_LRCPC only on AArch64 -- on x86-64 Linux the same word
+// carries the legacy x86 capability flags, where bit 15 is unrelated and usually set. Probing it would flip
+// g_host_lrcpc on for a reason that has nothing to do with LDAPR. 0 selects the LDR + DMB ISHLD fallback in
+// every consumer (e_load / e_load_uoff / e_ldur here, and linux_abi/x86.c's ldapr_align_fixup, which is inert
+// unless an LDAPR was emitted), which is the byte-identical pre-LDAPR behavior.
 int g_host_lrcpc = 0;
-#if defined(__linux__)
+#if defined(__linux__) && defined(HL_HOST_CPU_AARCH64)
 #include <sys/auxv.h>
 #ifndef HWCAP_LRCPC
 #define HWCAP_LRCPC (1u << 15) // AArch64 AT_HWCAP bit 15
@@ -812,7 +819,9 @@ static int64_t sext(uint64_t v, int bits) {
     return (int64_t)((v ^ m) - m);
 }
 
-#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+// Must select the same arm translate.c's trampoline definitions do (HL_HOST_CPU_AARCH64, matching
+// core/dispatch.c) or this declaration and the definition disagree on linkage.
+#if defined(__GNUC__) && !defined(__clang__) && defined(HL_HOST_CPU_AARCH64)
 extern void block_return(void) __attribute__((visibility("hidden")));
 #else
 static void block_return(void);
@@ -1190,6 +1199,18 @@ static uint64_t g_sig_inline_count;   // # rt_sigprocmask served inline (written
 static uint64_t g_yield_inline_count; // # sched_yield served inline
 
 static void s1_calibrate(void) {
+#if !defined(HL_HOST_CPU_AARCH64)
+    // The inline time fast path is inseparable from the AArch64 generic timer: the calibration below reads
+    // CNTFRQ_EL0/CNTVCT_EL0, and the code emit_fast_syscall plants at the guest `syscall` site reads
+    // CNTVCT_EL0 again. Neither register exists on another host CPU, and there is no substitute a MOVe of a
+    // different clock could stand in for -- a wrong tick rate would not fail loudly, it would hand the guest
+    // a plausible but wrong CLOCK_REALTIME/MONOTONIC forever. So turn BOTH gates off, which is the same
+    // "safe fallback" state an AArch64 host with an unreadable counter frequency lands in: every
+    // clock_gettime/gettimeofday takes the real R_SYSCALL exit through service(), and g_fastsys == 0 also
+    // stops translate.c from emitting the W4F rt_sigprocmask/sched_yield arms.
+    g_fastsys = 0;
+    g_fastclk = 0;
+#else
     uint64_t freq;
     hl_host_result effective_frequency;
     const hl_host_services *host = effective_host_services();
@@ -1233,6 +1254,7 @@ static void s1_calibrate(void) {
     }
     g_cal_mono_ns = (uint64_t)tm.tv_sec * 1000000000ull + (uint64_t)tm.tv_nsec;
     g_cal_real_ns = (uint64_t)tr.tv_sec * 1000000000ull + (uint64_t)tr.tv_nsec;
+#endif
 }
 
 // Emitted at the guest `syscall` site. Guest GPRs are live in x0..x15 (rax=x0, rsi=x6, rdi=x7),

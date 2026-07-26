@@ -7,7 +7,7 @@
 #
 # The flavors the Makefile builds on a Linux host:
 #   build/linux-production/hl-engine-linux-{aarch64,x86_64}  <- native Linux
-#   build/package/linux-aarch64/libhl-engine.a              <- dual embedded
+#   build/package/linux-<host arch>/libhl-engine.a           <- dual embedded
 #   (the two build/production/* mac engines + mac dual .a are Phase 4)
 #
 # Key Makefile subtleties reproduced here:
@@ -101,7 +101,9 @@ hl_linux_production(aarch64 AARCH64 "-pthread;-lm;-ldl;-latomic")
 hl_linux_production(x86_64  X86_64  "-pthread;-lm")
 
 # ---- Linux dual-backend embedded activation archive -----------------------
-# libhl-engine-activation.a == build/package/linux-aarch64/libhl-engine.a.
+# libhl-engine-activation.a == ${HL_PACKAGE_ARCH_DIR}/libhl-engine.a, i.e.
+# build/package/linux-<host arch>/libhl-engine.a. The directory names the HOST
+# CPU, not a guest ISA -- both guest ISAs are members of this one archive.
 # Members: the namespaced dual TUs + activation/dispatch + a FULL embedded
 # rebuild of core/ir/abi/host with -DHL_EMBEDDED_BUILD.
 set(EMBEDDED_SOURCES ${CORE_SOURCES} ${IR_SOURCES} ${LINUX_ABI_SOURCES} ${LINUX_HOST_SOURCES})
@@ -138,7 +140,7 @@ add_library(hl-engine-activation STATIC
   $<TARGET_OBJECTS:dual_dispatch>       $<TARGET_OBJECTS:dual_activation>
   $<TARGET_OBJECTS:hl-embedded-objs>)
 set_target_properties(hl-engine-activation PROPERTIES
-  ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/package/linux-aarch64
+  ARCHIVE_OUTPUT_DIRECTORY ${HL_PACKAGE_ARCH_DIR}
   OUTPUT_NAME hl-engine)   # emits libhl-engine.a, matching the Makefile artifact
 
 # link-test: dual_backend_e2e_runner linked with --whole-archive (Makefile 1612).
@@ -150,4 +152,4 @@ target_link_options(dual-backend-link-test PRIVATE
   -pthread -ldl -lm -latomic)
 add_dependencies(dual-backend-link-test hl-engine-activation)
 set_target_properties(dual-backend-link-test PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/package/linux-aarch64)
+  RUNTIME_OUTPUT_DIRECTORY ${HL_PACKAGE_ARCH_DIR})

@@ -134,7 +134,13 @@ void hl_x86_signal_restore(struct cpu *c) {
 // host x0..x15 and xmm0..15 in host v0..v15, with cpu pinned in host x28. Reconstruct the guest GPR/xmm
 // state from the host fault context (the deferred-flag NZCV is left as last spilled). block_return
 // (frontend/x86_64/translate.c) unwinds the block back to the run_guest loop, which runs cpu->rip == handler.
+//
+// The reconstruction below is the ONE place in this file that is not host-neutral: the frame builders above
+// only write the guest's own rt_sigframe (guest ABI, no host registers involved), whereas this reads the
+// AArch64 host register file, so it lives behind HL_HOST_HAS_A64_CONTEXT and has a defined answer on every
+// other host CPU -- see the #else arm.
 int hl_x86_signal_capture(struct cpu *c, void *ucv, hl_x86_signal_cache_fn cache_contains, void *callback_context) {
+#if defined(HL_HOST_HAS_A64_CONTEXT)
     ucontext_t *uc = (ucontext_t *)ucv;
     uint64_t hpc = (uint64_t)HL_HOST_UC_PC(uc);
     if (!cache_contains(callback_context, hpc)) return 0; // host PC outside the code cache -> a genuine engine fault
@@ -145,13 +151,38 @@ int hl_x86_signal_capture(struct cpu *c, void *ucv, hl_x86_signal_cache_fn cache
         c->r[i] = X[i];           // rax..r15 == host x0..x15
     memcpy(c->v, V, sizeof c->v); // xmm0..15 == host v0..v15
     return 1;
+#else
+    // No AArch64 host register file to read the guest state out of, so nothing can be reconstructed. Return
+    // the SAME 0 the in-cache path returns for a host PC outside the code cache, because both callers treat
+    // 0 as "this fault is not a guest CPU fault taken inside a translated block": linux_abi/signal.c's
+    // deliver_guest_fault_hint falls through to re-raising it (or, inside a syscall, queues it as an ordinary
+    // async signal), and the fatal-fault path at signal.c:1068 returns 0 so the host guard re-raises. That is
+    // exactly what a genuine engine fault must do here -- reach the crash report -- and it is the only honest
+    // answer on a host CPU whose registers hold no guest state, since the emitters in this directory produce
+    // ARM64 code and no translated block can be running at all.
+    (void)c;
+    (void)ucv;
+    (void)cache_contains;
+    (void)callback_context;
+    return 0;
+#endif
 }
 
 void hl_x86_signal_resume(struct cpu *c, void *ucv, uintptr_t dispatcher_return) {
+#if defined(HL_HOST_HAS_A64_CONTEXT)
     ucontext_t *uc = (ucontext_t *)ucv;
     uint64_t cpu_address = (uint64_t)c;
     memcpy(HL_HOST_UC_REGS(uc) + 28, &cpu_address, sizeof(cpu_address));
     HL_HOST_UC_PC(uc) = (uint64_t)dispatcher_return;
+#else
+    // Unreachable on a non-AArch64 host: the only caller runs after hl_x86_signal_capture returned 1, which
+    // it never does above. The signature is kept so the shared delivery driver still links, and the body is
+    // empty rather than aborting -- an abort here would turn a diagnosable "unsupported host" into a second
+    // fault inside a signal handler.
+    (void)c;
+    (void)ucv;
+    (void)dispatcher_return;
+#endif
 }
 
 // recover a fast-clock GUARDED store fault (emit_fast_syscall's clock_gettime/gettimeofday inline
@@ -170,12 +201,21 @@ int hl_x86_signal_fast_clock_fault(struct cpu *c, uintptr_t va, void *ucv) {
     // offset instead: an in-window fault has (va - fastclk_ptr) in [0,16); every other value (including
     // va < fastclk_ptr, which underflows to a huge number) is >= 16. Correct for both bounds and wrap.
     if ((uint64_t)(va - c->fastclk_ptr) >= 16) return 0; // fault outside the guarded 16B window
+#if defined(HL_HOST_HAS_A64_CONTEXT)
     ucontext_t *uc = (ucontext_t *)ucv;
     uint64_t result = (uint64_t)(int64_t)(-EFAULT);
     memcpy(HL_HOST_UC_REGS(uc), &result, sizeof(result)); // guest rax = -EFAULT
     HL_HOST_UC_PC(uc) = c->fastclk_resume;                // resume at the in-block EFAULT tail
     c->fastclk_resume = 0;                                // window closed
     return 1;
+#else
+    // Dead code on a non-AArch64 host: cpu->fastclk_resume is written ONLY by the emitted ARM64 fast-clock
+    // arm (emit_fast_syscall), which s1_calibrate leaves permanently disabled there, so the window test above
+    // already returned 0. Report "not handled" so the run-path guard continues to the ordinary fault handling
+    // instead of pretending an EFAULT the guest never asked for.
+    (void)ucv;
+    return 0;
+#endif
 }
 
 // Integer divide-by-zero (#DE) reaches the dispatcher as R_DIV/R_IDIV with divop==0. The host cannot

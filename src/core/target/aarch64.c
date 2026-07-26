@@ -108,6 +108,26 @@ static void emit_crash_diagnostic(const char *message, size_t size) {
         host->log->emit(host->context, HL_LOG_TAG_SIGNAL, message, size);
 }
 
+// ---------------------------------------------------------------------------
+// The host-CPU fork.
+//
+// Everything from here to the matching #else is the same-ISA transliterating JIT: an AArch64 assembler,
+// the block-ABI stubs built on it, and a translate_block that copies most guest instruction words
+// verbatim into the code arena. All of it presupposes that the host CPU executes AArch64, so it is
+// selectable only on an AArch64 host.
+//
+// On any other host CPU the guest's ISA is not the host's, and there is nothing to transliterate INTO.
+// interp.c supplies the same seam -- translate_block, run_block/block_return, the pcache entry points,
+// the SMC and soft-TLB hooks -- by decoding and executing AArch64 rather than emitting it. See its header
+// comment for why that substitution is possible at all: core/dispatch.c's whole contract with a backend is
+// `translate_block` then `run_block`, and nothing in it requires the result to be machine code.
+//
+// struct cpu is shared by both, deliberately: it is the checkpoint format (sizeof(struct cpu) is written
+// into the image and validated on restore), so keeping one layout is what lets the two backends read each
+// other's guest state.
+// ---------------------------------------------------------------------------
+#include "../../host/host_cpu.h"
+#if defined(HL_HOST_CPU_AARCH64)
 // Keep the unity consumers' compact encoder vocabulary while the assembler itself is an independently
 // compiled, explicitly-stateful translator component.
 #include "../../translator/host/aarch64/asm.h"
@@ -141,6 +161,12 @@ static void e_ldp_q(int rt, int rt2, int rn, int off) { hl_a64_ldp_q(&g_emit, rt
 #include "../../translator/guest/aarch64/stubs.c"
 // transliterate + mangle + §B + LSE + depth-gate
 #include "../../translator/guest/aarch64/translate.c"
+#else
+// The non-AArch64 host arm of the fork opened above: decode and execute AArch64 instead of emitting it.
+// interp.c defines the same names the three JIT files above do, which is what keeps everything below this
+// point -- linux_abi, the shared dispatcher, the ELF loader, checkpoint/restore -- identical on both hosts.
+#include "../../translator/guest/aarch64/interp.c"
+#endif
 // clone/futex/threads (declares run_guest)
 #include "../../linux_abi/thread.c"
 // signal delivery
@@ -340,7 +366,17 @@ static void diag_crash(int s, siginfo_t *si, void *uc) {
     if (deliver_guest_fault(s, si, uc)) return;
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
     ucontext_t *u = (ucontext_t *)uc;
+#if defined(HL_HOST_HAS_A64_CONTEXT)
+    // The fields this report goes on to print -- x16/x17/x30 and x0/x1/x9/x10 -- are the engine's own
+    // scratch and link registers under the same-ISA JIT's register model, so on an AArch64 host they are
+    // the single most useful thing in a crash dump: they say which trampoline was mid-flight. That model
+    // is what makes them meaningful, and it does not exist on any other host CPU, where guest state lives
+    // in struct cpu rather than in the host register file. Leave the report's fixed column layout intact
+    // and let those columns read zero rather than print seven host registers under AArch64 names.
     uint64_t *regs = u ? HL_HOST_UC_REGS(u) : NULL;
+#else
+    uint64_t *regs = NULL;
+#endif
     uint64_t hpc = u ? (uint64_t)HL_HOST_UC_PC(u) : 0;
     uint64_t hx0 = regs ? regs[0] : 0;
     uint64_t hx1 = regs ? regs[1] : 0;

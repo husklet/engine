@@ -154,7 +154,19 @@ static int uses_x18(uint32_t in, int mask) {
 // reproduce (the differential ISA fuzzer, tests/fuzz/isa/aarch64, showed 1-ulp results, wrong NaN payloads
 // and a spurious FPSR.UFC). Probed once, before any translation runs.
 static int g_host_i8mm, g_host_bf16;
-#if defined(__linux__)
+// Both probes below ask the HOST CPU whether it implements the extension, so both are gated on an AArch64
+// host. The Linux one especially: getauxval(AT_HWCAP2) exists on every Linux architecture and returns a bit
+// vector whose meaning is entirely architecture-defined, so on an x86_64 host bit 13 is not HWCAP2_I8MM but
+// whatever x86's own AT_HWCAP2 assigns (the FSRM/tsx-abort family) -- the flags would be set from unrelated
+// data and the translator would then copy I8MM/BF16 opcodes verbatim on the strength of it. Leave both at 0
+// on any non-AArch64 host: 0 selects the baseline-AdvSIMD lowerings, which is the correct answer for a host
+// that does not implement the extension, and it is the answer this transliterator would want anyway (it can
+// only ever execute on an AArch64 host, so a non-AArch64 host reaches these flags only at compile time).
+// Include the host-CPU header here rather than relying on the unity TU having pulled it in already: the
+// failure mode of an undefined HL_HOST_CPU_AARCH64 is silent and one-directional -- it would drop the probe on
+// a REAL AArch64 host and demote every I8MM/BF16 guest instruction to the slower lowering.
+#include "../../../host/host_cpu.h"
+#if defined(__linux__) && defined(HL_HOST_CPU_AARCH64)
 #include <sys/auxv.h>
 #ifndef HWCAP2_I8MM
 #define HWCAP2_I8MM (1u << 13)
@@ -167,7 +179,7 @@ __attribute__((constructor)) static void hl_detect_host_matrix_ext(void) {
     g_host_i8mm = (h2 & HWCAP2_I8MM) ? 1 : 0;
     g_host_bf16 = (h2 & HWCAP2_BF16) ? 1 : 0;
 }
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && defined(HL_HOST_CPU_AARCH64)
 #include <sys/sysctl.h>
 static int hl_sysctl_flag(const char *name) {
     int v = 0;

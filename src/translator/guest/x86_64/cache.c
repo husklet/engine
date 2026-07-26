@@ -160,7 +160,7 @@ static uint64_t pcache_engine_id(void) {
     h *= 1099511628211ull;
     modes = (uint64_t)(g_fastsys != 0) | ((uint64_t)(g_fastclk != 0) << 1) |
             ((uint64_t)(g_siginline != 0) << 2) | ((uint64_t)(slimsys_on() != 0) << 3);
-    return hl_identity_configuration(h, 2, 1, modes);
+    return hl_identity_configuration(h, 2, HL_HOST_CPU_ISA, modes);
 }
 
 // hash the BASENAME of argv[0]. A multicall binary (busybox, toolchain drivers) runs a DIFFERENT

@@ -27,6 +27,42 @@ project(hl_engine LANGUAGES C)
 find_program(HL_BASH_EXECUTABLE NAMES bash REQUIRED)
 
 # ---------------------------------------------------------------------------
+# The host-CPU axis.
+#
+# DOCS.md section 1 names guest OS, guest ISA and host platform as the three
+# independent axes. "Host platform" is really two axes -- host OS and host CPU
+# -- and only the first ever had a name in this build: CMAKE_SYSTEM_NAME, and
+# src/host/<os>/ beside it. Everything that actually depended on the host CPU
+# either spelled `aarch64` inline as a path literal or did not test for it at
+# all, because until now there was only ever one answer.
+#
+# Name it once, here, and normalise the spelling: Darwin says arm64 where Linux
+# says aarch64, and amd64 and x86_64 are the same CPU. The values match
+# HL_HOST_CPU_* in src/host/host_cpu.h, which is the same axis on the C side.
+# ---------------------------------------------------------------------------
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+  set(HL_HOST_ARCH aarch64)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+  set(HL_HOST_ARCH x86_64)
+else()
+  message(FATAL_ERROR
+    "hl-engine has no host-CPU support for CMAKE_SYSTEM_PROCESSOR='${CMAKE_SYSTEM_PROCESSOR}'. "
+    "Supported host CPUs are aarch64 and x86_64.")
+endif()
+
+# Where the packaged host archives land. This directory name encodes the HOST
+# platform, not a guest ISA, and it used to be the literal `package/linux-aarch64`
+# in three .cmake files and two shell scripts -- so an x86_64 host would have
+# overwritten the aarch64 artifact under its name, and
+# tools/refresh_crate_archives.sh would have published it as the aarch64 crate
+# asset. Derive it once so the two host CPUs can never collide.
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  set(HL_PACKAGE_ARCH_DIR ${CMAKE_BINARY_DIR}/package/macos-${HL_HOST_ARCH})
+else()
+  set(HL_PACKAGE_ARCH_DIR ${CMAKE_BINARY_DIR}/package/linux-${HL_HOST_ARCH})
+endif()
+
+# ---------------------------------------------------------------------------
 # Static-analysis target family (lint, format checks, CI-quality gates).
 # ---------------------------------------------------------------------------
 option(HL_LINT "Run the C lint pipeline (clang-format, clang-tidy, cppcheck, custom C heuristics)" OFF)

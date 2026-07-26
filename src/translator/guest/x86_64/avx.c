@@ -1,7 +1,9 @@
 #include "avx.h"
 #include "cpu.h"
 #include "decoder.h"
+#include "../../../host/host_cpu.h" // HL_HOST_CPU_*: the half-precision converter has a per-host-CPU arm
 
+#include <fenv.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -361,7 +363,71 @@ static int avx_cmp_pred(double x, double y, int pred) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 
+#if !defined(HL_HOST_CPU_AARCH64)
+// Portable single->half conversion for every host CPU that is not AArch64. Deliberately NOT the F16C
+// intrinsic (_cvtss_sh / VCVTPS2PH): that would need -mf16c, which this build cannot assume of the host --
+// the engine ships one binary per host OS/CPU pair, not per micro-architecture -- and an unconditional
+// VCVTPS2PH would SIGILL on a pre-Ivy-Bridge x86-64. Software instead, which needs no -m flag, is the same
+// answer for a future Windows host, and is the only way to honour a DIRECTED rounding mode exactly (a
+// _Float16 cast is round-to-nearest-even whatever the FP environment says, and may be a libcall the compiler
+// is free to hoist across an fesetround).
+//
+// `mode` is the x86 rounding control already normalised to imm[1:0]: 0=nearest-even, 1=down(-inf),
+// 2=up(+inf), 3=truncate(toward zero). The IEEE 754 binary32 -> binary16 cases this must get right, all of
+// which the ISA fuzz lane compares against real hardware:
+//   * NaN     -- payload is the source's mantissa[22:13] and the result is QUIET even for a signalling
+//                source, which is what VCVTPS2PH does (and forcing the quiet bit also stops a payload that
+//                truncates to zero from becoming an Infinity).
+//   * subnormal result -- the exponent floor is 2^-24 (the smallest half subnormal), so the round point
+//                moves with the exponent rather than sitting at a fixed 13 bits.
+//   * overflow -- an out-of-range magnitude becomes an Infinity only when the active mode rounds AWAY from
+//                zero at that sign, and the largest finite half (0x7bff) otherwise. Round-to-nearest crosses
+//                to Infinity at 65520 (the midpoint between 65504 and 65536), which falls out of the same
+//                guard/sticky arithmetic rather than needing its own threshold.
+static uint16_t avx_f32_to_f16_software(float f, unsigned mode) {
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    uint32_t sign = bits >> 31;
+    uint32_t biased_exponent = (bits >> 23) & 0xffu;
+    uint32_t mantissa = bits & 0x7fffffu;
+    uint16_t sign16 = (uint16_t)(sign << 15);
+    // Direction the mode takes a value it cannot represent exactly. Nearest-even decides per value (below);
+    // the three directed modes decide by sign alone, and that same predicate is what IEEE 754 uses to choose
+    // between Infinity and the largest finite on overflow.
+    uint32_t away = ((mode == 1 && sign != 0) || (mode == 2 && sign == 0)) ? 1u : 0u;
+    if (biased_exponent == 0xffu)
+        return mantissa == 0 ? (uint16_t)(sign16 | 0x7c00u) : (uint16_t)(sign16 | 0x7e00u | (uint16_t)(mantissa >> 13));
+    if (biased_exponent == 0 && mantissa == 0) return sign16; // +-0 converts exactly, sign preserved
+    // Treat the source as significand * 2^(exponent-23) with the implicit integer bit made explicit (a
+    // binary32 subnormal has no implicit bit and a fixed exponent of -126, i.e. the biased 1 case).
+    uint32_t significand = biased_exponent == 0 ? mantissa : (mantissa | 0x800000u);
+    int32_t exponent = (int32_t)(biased_exponent == 0 ? 1u : biased_exponent) - 127;
+    // Bits to drop to land on the half's ulp: 13 for a normal result (24-bit significand -> 11), more when
+    // the result is subnormal and the ulp is pinned at 2^-24. Clamped at 25 because beyond that the dropped
+    // field already covers the whole significand, so the round bit is 0 and sticky is "significand != 0" --
+    // identical to what an unclamped (and undefined) wider shift would compute.
+    int32_t shift = exponent >= -14 ? 13 : -1 - exponent;
+    if (shift > 25) shift = 25;
+    uint32_t half = significand >> shift;
+    uint32_t round_bit = (significand >> (shift - 1)) & 1u;
+    uint32_t sticky = (significand & ((1u << (shift - 1)) - 1u)) != 0 ? 1u : 0u;
+    if (mode == 0)
+        half += round_bit & (sticky | (half & 1u)); // nearest-even: up on >half, or on exactly-half to even
+    else
+        half += away & (round_bit | sticky);
+    if (exponent < -14) return (uint16_t)(sign16 | half); // subnormal; a carry out lands on 0x0400 exactly
+    int32_t exponent16 = exponent + 15;
+    if (half >> 11) { // the increment carried into the next binade: 1.111..1 -> 1.000..0 * 2^(exponent+1)
+        half >>= 1;
+        exponent16++;
+    }
+    if (exponent16 >= 0x1f) return (uint16_t)(sign16 | (away != 0 || mode == 0 ? 0x7c00u : 0x7bffu));
+    return (uint16_t)(sign16 | ((uint32_t)exponent16 << 10) | (half & 0x3ffu)); // implicit bit 0x400 drops out
+}
+#endif
+
 static uint16_t avx_f32_to_f16(float f, int imm) {
+#if defined(HL_HOST_CPU_AARCH64)
     _Float16 h;
     uint16_t o;
     if (imm & 4) { // imm[2]=1: MXCSR-controlled (current host FPCR mirrors guest MXCSR rounding)
@@ -377,6 +443,22 @@ static uint16_t avx_f32_to_f16(float f, int imm) {
     __asm__ volatile("msr fpcr, %0\n\tisb" ::"r"(fpcr_orig));
     memcpy(&o, &h, 2);
     return o;
+#else
+    // imm[2]=1 asks for the MXCSR-controlled mode. There is no host FPCR to read here, so take the host FP
+    // environment's rounding direction -- fegetround() is the portable spelling of the same thing the AArch64
+    // arm reads out of FPCR.RMode, and it is what LDMXCSR/FXRSTOR will have set once an x86-64 host back end
+    // routes the guest's MXCSR into the host. Falls back to nearest-even for any direction C does not name.
+    unsigned mode = (unsigned)(imm & 3);
+    if (imm & 4) {
+        switch (fegetround()) {
+        case FE_DOWNWARD: mode = 1; break;
+        case FE_UPWARD: mode = 2; break;
+        case FE_TOWARDZERO: mode = 3; break;
+        default: mode = 0; break;
+        }
+    }
+    return avx_f32_to_f16_software(f, mode);
+#endif
 }
 
 static float avx_f16_to_f32(uint16_t bits) {
