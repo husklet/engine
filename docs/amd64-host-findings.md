@@ -352,8 +352,8 @@ engine crash outranks a wrong answer.
 | 2 | **The x86-64 interpreter SIGSEGVs on repeated async signal delivery** — `sigaction` + a 2 ms repeating `setitimer` + a long arithmetic loop, 10 lines, no inline asm, `wait=0x8b00`, deterministic 3/3. A guest-triggerable engine kill. | x86-64 | 1 |
 | 3 | **Non-PIE `mov r64,imm32` materialisation is not rebased** — `same_half=0`. The exact sibling of §3.11's `LEA` obligation in the opposite direction: `LEA` must un-bias DOWN, this must stay HIGH. The JIT does it in `lower/mov.c`; the interpreter does not. §3.11 predicted this class would recur, and it did. | x86-64 | 1 |
 | 4 | **`CRC32` with a high-byte source** — `crc32 %ah, %r32` gives `968c7e88`, hardware `86d2b9e7`. Every other line of a 14 kB output matches, so it is the `%ah/%ch/%dh/%bh` decode, not CRC32. | x86-64 | 1 |
-| 5 | **`MRS` of an inaccessible ID register does not trap** — HWCAP bit 11 (CPUID emulation) is clear, so `mrs x, id_aa64isar0_el1` must SIGILL; the interpreter returns a value. The same contradiction as §3.13 from the other side: the engine says it does not emulate ID reads, then services one. | aarch64 | 1 |
-| 6 | **BF16 / DotProd / I8MM unimplemented** while advertised — see §3.13. | aarch64 | 3 |
+| 5 | **`MRS` of an inaccessible ID register does not trap** — HWCAP bit 11 (CPUID emulation) is clear, so `mrs x, id_aa64isar0_el1` must SIGILL; the interpreter returned a value. **Fixed** (`23afa33e`): raises a guest `SIGILL`/`ILL_ILLOPC` with the PC on the instruction, as an architectural trap rather than through `interp_undefined`. | aarch64 | 1 |
+| 6 | **BF16 / DotProd / I8MM unimplemented** — **fixed** (`23afa33e`), and my description of the cause was wrong; see §3.13. | aarch64 | 3 |
 
 Two failures are **environmental, not engine defects**, and are now documented in `docs/ci-green.md` under
 "Host-environment preconditions the harness does not enforce":
@@ -366,21 +366,56 @@ Two failures are **environmental, not engine defects**, and are now documented i
 - `syscall/memfd-seals` needs `HL_MATRIX_SCRATCH_DIR` on tmpfs, which only the workflow sets. Re-verified
   both ways.
 
-### 3.13 The engine advertises three aarch64 features it does not implement
+### 3.13 The feature-advertisement contradiction, and how I mis-stated it
 
-`src/linux_abi/elf.c` puts `AT_HWCAP = 0x1fb` on the guest stack, and emits **no `AT_HWCAP2` at all** —
-which on aarch64 is where `HWCAP2_BF16` and `HWCAP2_I8MM` live. Meanwhile `tests/compat/completeness/`
-carries `active` rows for `bf16`, `dotprod` and `i8mm`, and all three execute the instructions
-**unconditionally, with no HWCAP guard**.
+**Corrected.** I wrote here that the engine advertised three aarch64 features it did not implement. It did
+not. `AT_HWCAP = 0x1fb` is bits 0,1,3-8 — FP, ASIMD, AES, PMULL, SHA1, SHA2, CRC32, ATOMICS — and contains
+no `HWCAP_ASIMDDP`; `AT_HWCAP2`, where `HWCAP2_I8MM` and `HWCAP2_BF16` live, was absent entirely. `elf.c`
+was telling the truth. The outlier was `tests/compat/completeness/manifest.tsv`, which carried three
+`active` rows with hardware-derived goldens for instructions the interpreter aborted on. The real defect was
+smaller than I claimed and in a different file.
 
-The failure mode is the bad one: a guest reads `AT_HWCAP`, sees a bit, dispatches to its optimised path and
-hits an unimplemented-instruction abort. glibc's and musl's ifunc selectors do precisely this.
+One genuine ABI defect did fall out of it: **an absent `AT_HWCAP2` is a shape no kernel produces.** arm64's
+`create_elf_tables` emits it unconditionally. Now emitted explicitly with value 0.
 
-They pass on an aarch64 **host** only because the transliterator copies the guest instruction word to a host
-CPU that happens to have the features — which is coverage that would be silently deleted by marking the rows
-excluded, because `tests/matrix/matrix_runner.c` understands only `excluded-macos`, keyed on the engine being
-Mach-O. **There is no host-CPU-keyed disposition.** Either the three get implemented, or the bits get
-cleared *and* the harness gains that key first.
+The rule now recorded in `guest/aarch64/cpu.h` is the durable part: **a HWCAP bit is set only when both
+backends implement the whole feature exactly.** Applied per feature, it gives three different answers —
+DotProd advertised (mandatory from Armv8.4-A, so the transliterator always lands on silicon that has it, the
+same assumption the already-advertised LSE/AES/SHA2 bits make); I8MM implemented but not advertised (Apple
+Silicon before M4 lacks it, so the JIT falls to a baseline lowering covering 3 of 6 forms); BF16 with BFCVT
+implemented and **BFDOT left an honest gap**, because with `FPCR.EBF=0` `BFDotAdd` computes in
+**round-to-odd**, the soft-FP has no such mode, and RNE would be subtly wrong. That last one independently
+confirms `translate.c`'s own note that its BFDOT lowering is not bit-exact.
+
+No host-CPU-keyed harness disposition was needed in the end, because implementing all three made the rows
+pass on both hosts. §3.12's entry 6 is closed.
+
+### 3.14 The whole AdvSIMD vector × indexed-element box was unimplemented
+
+Found in passing, and **far bigger than the three named features**. The aarch64 interpreter implemented none
+of the "AdvSIMD vector x indexed element" encoding group — indexed `FMLA`, `MLA`, `MUL`, `SQDMULL`,
+`SQRDMULH` and the rest. Confirmed with a hand-built binary: `0x4f9e8bff` aborts.
+
+This is **baseline Armv8.0** that any compiled NEON code uses constantly. The 3012-run scan missed it
+because no fixture in the corpus reaches it — which is the sharpest available illustration of what that scan
+does and does not prove: it measures the corpus, not the ISA. The box is now open for the dot products only;
+everything else in it still reports honestly.
+
+### 3.15 x86-64 guest auxv defects, found during the aarch64 audit
+
+`src/linux_abi/x86.c`:
+
+- **`AT_HWCAP` is hardcoded 0**, where a real kernel puts `CPUID.1:EDX`. Masked in practice because glibc
+  special-cases `getauxval(AT_HWCAP)` to return `GLRO(dl_hwcap)` from CPUID directly — which is why the
+  `auxval` fixture still reads `hwcap_nz=1`. Anything parsing `/proc/self/auxv` sees 0.
+- **`AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID` are hardcoded 0** while the aarch64 path uses `cuid()`/`cgid()`.
+  Live divergence: on this host an aarch64 guest sees 1000 and an x86-64 guest sees 0. The x86 side carries
+  a "container root" comment, so it reads as deliberate rather than a slip — but it is guest-visible and the
+  two guest ISAs disagree.
+
+And in `src/linux_abi/container/vfs.c:4998`: **`/proc/cpuinfo` reports `Features: fp asimd` only**, not
+derived from the CPU model, so it omits the aes/pmull/sha1/sha2/crc32/atomics the engine *does* advertise in
+`AT_HWCAP`. That contradicts `cpu.h`'s claim that every discovery surface derives from one model.
 
 ## 4. Documentation that misleads
 
