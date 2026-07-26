@@ -122,8 +122,21 @@ set(HL_CI_SHARDED_HOST_ONLY
 )
 
 # --- lanes each host's main job runs directly (not sharded) -----------------
+#
+# nested-engine is the engine-in-engine gate (cmake/Phase3Gates.cmake section 9).
+# It is non-empty on both Linux host CPUs without a cross build tree -- the two
+# host-ISA cells always run -- so it needs no HL_CI_HOST_CPU_ONLY entry. The three
+# foreign-ISA cells SKIP (SKIP_RETURN_CODE 77) where that tree is absent, which on
+# Linux-x86_64 it is not: the workflow builds build-arm-check one step earlier.
+#
+# Only linux-x86_64.yml runs it today. That is the host where all five cells run
+# and where every cell has been executed by hand; the aarch64 host's own two cells
+# have not, and adding an unrun gate to the lane that SHIPS is a decision for
+# someone with the hardware, not an assumption. No invariant is involved -- I13/I14
+# see sharded lanes only -- so this list, not a guard, is where it is recorded.
 set(HL_CI_DIRECT_LINUX
   unit
+  nested-engine
 )
 set(HL_CI_DIRECT_DARWIN
   unit

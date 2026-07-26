@@ -468,10 +468,20 @@ set(HL_PERF_HEAVY_SAMPLES 7 CACHE STRING "perf samples for heavy cases")
 set(HL_PERF_OP_SAMPLES 7  CACHE STRING "perf samples for OS-op cases")
 
 # --- whether the thresholds above are ENFORCED, as a function of the host CPU -
-# Every PERF_LIMIT_ pair above describes a JIT host, which an x86_64 host is not;
-# OFF records the measurement without a verdict (docs/ci-green.md, "Why the perf
-# thresholds are recorded rather than re-set or skipped"). Record-only cases are
-# RENAMED so a green line cannot read as a threshold met; --label is not.
+# Every PERF_LIMIT_ pair above describes a JIT host, which an x86_64 host is not; OFF records
+# the measurement without a verdict. Record-only cases are RENAMED so a green line cannot read
+# as a threshold met; --label is not.
+#
+# The reason is NOT that the thresholds are all unreachable here. Measured
+# (docs/amd64-host-performance.md section 2): five of the thirteen x86_64 cases PASS the JIT
+# thresholds unchanged and four more are within 3x, so docs/ci-green.md's "all thirteen cases
+# fail" is false and must be corrected there too. What rules the five out is MARGIN against
+# this host's measured load spread of ~1.9x (compute: 348s/run loaded vs 184s median):
+# translation clears p99 by 5.6%, fork-stress by 9.5%, startup by 39%, ipc-throughput by 38% --
+# enforcing them buys flaky red, not signal. warm-cache is the only one with real margin and it
+# measures a tautology here: warm and cold agree to 0.2% because an interpreter emits no host
+# code for the persistent cache to hold. So: record all thirteen, and revisit per case when
+# Stage 2 moves the numbers rather than when someone rereads this comment.
 if(HL_HOST_ARCH STREQUAL "x86_64")
   set(_hl_perf_enforce_default OFF)
 else()
@@ -480,6 +490,21 @@ endif()
 option(HL_PERF_ENFORCE
   "enforce the tracked cold/p99 perf thresholds (OFF records the measurement without a verdict)"
   ${_hl_perf_enforce_default})
+
+# --- per-(case, arch) CTest budgets where the shared 1800s is not one ---------
+# perf-runner does 1 cold + warmups + samples RUNS, so the budget is runs x per-run cost, not a
+# per-run number. compute is 11 x 184.0s = 2024s on this host and could never have finished
+# inside its own TIMEOUT 1800 -- it would have failed as a timeout and read as a performance
+# regression rather than as a budget nobody checked against an interpreter. Derived per leg as
+# runs x measured median x 1.9 (this host's measured load spread) x 1.25 headroom:
+#   x86_64  11 x 184.0s x 1.9 x 1.25 = 4807 -> 4800
+#   aarch64 11 x 135.6s x 1.9 x 1.25 = 3542 -> 3600   (1492s unloaded: 17% margin, i.e. flaky)
+# Numbers from docs/amd64-host-performance.md section 2. Interpreting host only: on a JIT host
+# the case is ~1s and 1800s stays the tighter hang bound.
+if(HL_HOST_ARCH STREQUAL "x86_64")
+  set(PERF_TIMEOUT_compute_x86_64  4800)
+  set(PERF_TIMEOUT_compute_aarch64 3600)
+endif()
 
 # hl_perf_linux(<case> <arch> <warmups> <samples> <payload> <expect-status>)
 function(hl_perf_linux case arch warmups samples payload expect)
@@ -503,9 +528,13 @@ function(hl_perf_linux case arch warmups samples payload expect)
       "-DCMD1=$<TARGET_FILE:perf-runner> --label linux-${case}-${arch} --warmups ${warmups} --samples ${samples} --expect ${expect} ${_limits} -- ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${arch} ${_guest}"
       ${_record}
       -P ${CMAKE_SOURCE_DIR}/cmake/RunSequence.cmake)
+  set(_budget 1800)
+  if(DEFINED PERF_TIMEOUT_${case}_${arch})
+    set(_budget ${PERF_TIMEOUT_${case}_${arch}})
+  endif()
   # Timing measurements are meaningless when other tests contend for the CPU.
   set_tests_properties(${_name} PROPERTIES
-    LABELS "perf;perf-linux" RUN_SERIAL TRUE TIMEOUT 1800 WORKING_DIRECTORY /tmp)
+    LABELS "perf;perf-linux" RUN_SERIAL TRUE TIMEOUT ${_budget} WORKING_DIRECTORY /tmp)
 endfunction()
 
 foreach(_arch aarch64 x86_64)
@@ -685,7 +714,109 @@ add_custom_target(bench
   COMMENT "fair combined self-timing bench (see tools/bench/README.md)")
 
 # ===========================================================================
-# 9. the host-backend timeout scale, for the lanes not driven by matrix-runner
+# 9. engine in engine
+# ===========================================================================
+# `<engine> <engine> [<engine>] <guest>`: the outer engine's guest is ANOTHER engine, which
+# runs a guest of its own. This is the branch's acceptance criterion ("engine in engine, like
+# docker in docker") and it was verified only by hand, i.e. not verified.
+#
+# It is the only test in the tree that runs one host backend as a GUEST of the other. On an
+# x86_64 host the outer engine is the INTERPRETER and the cross-built inner engine is the
+# ARM64 JIT, so the interpreter executes the JIT's own emitted-code arena, its W^X flips and
+# its signal handling -- paths nothing else here reaches, because on this host they are never
+# compiled in. It is also the only place the inner engine allocates guest descriptors and W^X
+# mappings INSIDE another engine's guest: the constraint that forced
+# hl_host_process_fd_private_floor() (src/host/private.c) to anchor the private band on the
+# reserve rather than on HL_HOST_GUEST_DESCRIPTOR_MINIMUM, since the inner guest sees
+# RLIMIT_NOFILE 20480. Verified: an inner engine built with that fix reverted exits 70
+# (HL_STATUS_RESOURCE_LIMIT) in every cell, while the SAME binary run at one level passes.
+#
+# Case names are the guest-ISA chain, OUTERMOST FIRST; the last element is also the ISA of the
+# `hello` fixture at the bottom. An engine binary's ELF arch is the host it was built for, so
+# the outer engine's guest ISA must equal the inner engine's ELF arch -- which is what decides
+# where each inner engine can come from:
+#   ${HL_HOST_ARCH} inner  -> this build tree, always present  (2 cells, never skip)
+#   foreign inner          -> HL_NESTED_FOREIGN_TREE           (3 cells, skip if absent)
+if(HL_HOST_ARCH STREQUAL "aarch64")
+  set(_nest_foreign x86_64)
+else()
+  set(_nest_foreign aarch64)
+endif()
+set(_nest_short arm)
+if(_nest_foreign STREQUAL "x86_64")
+  set(_nest_short x86)
+endif()
+set(HL_NESTED_FOREIGN_TREE ${CMAKE_SOURCE_DIR}/build-${_nest_short}-check CACHE PATH
+    "cross build tree supplying the ${_nest_foreign}-host engines the nested gate runs as guests")
+
+# NOT a declared dependency of the default build, deliberately. It is a second toolchain and a
+# second configure; linux-x86_64.yml already budgets 25 min for exactly this tree, and
+# GuestFixtures.cmake already refuses to make a cross compiler mandatory (a plain `nix build`
+# sandbox exports none, and CTest does not build test dependencies, so "declared" would have to
+# mean ALL -- taxing every build). So it stays ONE named command, which the skip path prints.
+# Run the lane with `-V`: CTest prints nothing at all for a SKIPPED test, so without it the
+# message naming the missing tree and that command never reaches anyone.
+set(_nest_cross_dir ${HL_NESTED_FOREIGN_TREE}/linux-production)
+set(_nest_fix "cmake --build ${CMAKE_BINARY_DIR} --target nested-foreign-engines")
+add_custom_target(nested-foreign-engines
+  COMMAND ${CMAKE_COMMAND} -G Ninja -S ${CMAKE_SOURCE_DIR} -B ${HL_NESTED_FOREIGN_TREE}
+          -DHL_BUILD_TESTS=OFF
+          -DCMAKE_TOOLCHAIN_FILE=${CMAKE_SOURCE_DIR}/cmake/toolchains/${_nest_foreign}-linux.cmake
+  COMMAND ${CMAKE_COMMAND} --build ${HL_NESTED_FOREIGN_TREE}
+          --target hl-engine-linux-aarch64 hl-engine-linux-x86_64
+  COMMENT "cross-building the ${_nest_foreign}-host engines the nested gate runs as guests"
+  USES_TERMINAL)
+
+# hl_nested_case(<name> CROSS <dir|-> BUDGET <s> CHAIN <link>...)
+#   BUDGET is the JIT-host budget; section 10 multiplies it by HL_MATRIX_TIMEOUT_SCALE.
+set(_nest_hello_out ${CMAKE_SOURCE_DIR}/tests/compat/core/abi/expected/hello.out)
+function(hl_nested_case name)
+  cmake_parse_arguments(N "" "CROSS;BUDGET" "CHAIN" ${ARGN})
+  add_test(NAME nested.${name}
+    COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/nested_engine_gate.sh
+            ${N_CROSS} "${_nest_fix}" ${_nest_hello_out} 42 -- ${N_CHAIN})
+  set_tests_properties(nested.${name} PROPERTIES
+    LABELS "nested-engine" SKIP_RETURN_CODE 77 RESOURCE_LOCK hl-guest
+    TIMEOUT ${N_BUDGET} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endfunction()
+
+# Budgets, derived not picked. Measured on this x86_64 host at HL_MATRIX_TIMEOUT_SCALE=30:
+# 4.1-5.2s for the two-engine cells, 107s for the three-engine one -- the cost is one whole
+# ENGINE start-up interpreted by another engine, not the 3-byte guest at the bottom. The
+# numbers below are the JIT-host budgets that section 10 scales, giving 900s (~170x measured)
+# and 3600s (~34x measured) here.
+set(_nest_budget2 30)
+set(_nest_budget3 120)
+set(_nest_native ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux)
+set(_nest_cross  ${_nest_cross_dir}/hl-engine-linux)
+set(_nest_hello  ${HL_COMPAT}/core/abi)
+
+# The two host-ISA cells: inner engine comes from this tree, so they can never skip and they
+# keep the lane non-empty on every host (gate.ci-lane-parity). On an aarch64 host the second
+# of them IS the acceptance criterion, natively.
+hl_nested_case(${HL_HOST_ARCH}-${HL_HOST_ARCH} CROSS - BUDGET ${_nest_budget2}
+  CHAIN ${_nest_native}-${HL_HOST_ARCH} ${_nest_native}-${HL_HOST_ARCH}
+        ${_nest_hello}/${HL_HOST_ARCH}/hello)
+hl_nested_case(${HL_HOST_ARCH}-${_nest_foreign} CROSS - BUDGET ${_nest_budget2}
+  CHAIN ${_nest_native}-${HL_HOST_ARCH} ${_nest_native}-${_nest_foreign}
+        ${_nest_hello}/${_nest_foreign}/hello)
+
+# The three foreign-ISA cells. On an x86_64 host `nested.aarch64-x86_64` is the hand-verified
+# claim; the three-engine cell is the INVERSE gate, in the sense linux-x86_64.yml already uses
+# -- an aarch64 host running engine-in-engine, reproduced here with no aarch64 hardware.
+hl_nested_case(${_nest_foreign}-${_nest_foreign} CROSS ${_nest_cross_dir} BUDGET ${_nest_budget2}
+  CHAIN ${_nest_native}-${_nest_foreign} ${_nest_cross}-${_nest_foreign}
+        ${_nest_hello}/${_nest_foreign}/hello)
+hl_nested_case(${_nest_foreign}-${HL_HOST_ARCH} CROSS ${_nest_cross_dir} BUDGET ${_nest_budget2}
+  CHAIN ${_nest_native}-${_nest_foreign} ${_nest_cross}-${HL_HOST_ARCH}
+        ${_nest_hello}/${HL_HOST_ARCH}/hello)
+hl_nested_case(${_nest_foreign}-${_nest_foreign}-${HL_HOST_ARCH}
+  CROSS ${_nest_cross_dir} BUDGET ${_nest_budget3}
+  CHAIN ${_nest_native}-${_nest_foreign} ${_nest_cross}-${_nest_foreign}
+        ${_nest_cross}-${HL_HOST_ARCH} ${_nest_hello}/${HL_HOST_ARCH}/hello)
+
+# ===========================================================================
+# 10. the host-backend timeout scale, for the lanes not driven by matrix-runner
 # ===========================================================================
 # hl_matrix_timeout_scale() (cmake/Phase3Compat.cmake) covers the compat suites
 # and the production-full lanes; the four runners registered ABOVE carry per-case
@@ -698,6 +829,7 @@ set(_hl_scaled_patterns
   "^production\\.config-"
   "^perf\\.linux-warm-cache-"
   "^dynamic-e2e\\."
+  "^nested\\."
   "^checkpoint\\.")
 get_property(_hl_lane_tests DIRECTORY PROPERTY TESTS)
 foreach(_pattern IN LISTS _hl_scaled_patterns)

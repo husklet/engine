@@ -70,6 +70,11 @@ jobs:
       # matters is amd64 work breaking the aarch64 host that ships. Building the
       # HL_HOST_CPU_AARCH64 arms here catches it with no aarch64 hardware, and
       # -DHL_BUILD_TESTS=OFF must stay off because only compilation is the point.
+      #
+      # It is no longer only compilation: the `nested-engine` gate in the next step
+      # RUNS these two binaries as guests of this host's engines, so build-arm-check
+      # must exist before it. Move or rename this tree and that gate reports SKIPPED
+      # rather than passing.
       - name: Cross-compile the aarch64 host arms
         timeout-minutes: 25
         run: |
@@ -87,6 +92,13 @@ jobs:
       # gate.ci-lane-parity runs HERE and nowhere else on this host CPU, asserting
       # every lane cmake/CiLanes.cmake declares is non-empty on (Linux, x86_64).
       # --no-tests=error because `ctest -L <missing>` exits 0 (I15).
+      #
+      # `nested-engine` is the branch's acceptance criterion, engine in engine. All
+      # five cells run here, because this is the only host where BOTH engine ELF
+      # arches exist: build-arm-check above supplies the aarch64 ones. ~130s.
+      # -V, not --output-on-failure: CTest prints nothing for a SKIPPED test, and a
+      # skip here means build-arm-check went missing -- whose whole point is to say
+      # so and name the fix.
       - name: Test CMake build (configure, build, ctest, install)
         timeout-minutes: 75
         run: |
@@ -95,6 +107,7 @@ jobs:
             cmake -G Ninja -B build-ci
             ninja -C build-ci
             ctest --test-dir build-ci -L unit --no-tests=error --output-on-failure
+            ctest --test-dir build-ci -L nested-engine --no-tests=error -V
             cmake --install build-ci --prefix "$PWD/build-ci-sdk"
             test -f build-ci-sdk/lib/libhl-engine.a
             test -f build-ci-sdk/lib/pkgconfig/hl-engine.pc
