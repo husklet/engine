@@ -31,25 +31,31 @@
 // other's guest state. Its host_save[12]/host_v[16] fields are AArch64 callee-saved spill slots for
 // run_block/block_return; this backend simply never touches them (it has no host register file to spill).
 //
-// WHAT IS AND IS NOT IMPLEMENTED YET, AND HOW TO EXTEND IT
-// -------------------------------------------------------
-// This file is the framework plus the INTEGER CORE. Implemented: data-processing immediate (add/sub imm,
-// logical imm, MOVZ/MOVN/MOVK, ADR/ADRP, bitfield, EXTR); data-processing register (add/sub shifted and
-// extended, ADC/SBC, the logical group, variable shifts, mul/div, the 1-source bit ops, CCMP/CCMN, the
-// conditional-select group); every branch form; the hint/barrier space; SVC; and the `ic ivau`/ISB
-// self-modifying-code interception. NOT yet implemented, and each routed to interp_undefined() with a
-// TODO(amd64-host) marker naming its class: loads and stores, FP/AdvSIMD, atomics and load/store-exclusive,
-// and system-register access (MRS/MSR, including TPIDR_EL0).
+// WHAT IS AND IS NOT IMPLEMENTED, AND HOW TO EXTEND IT
+// ----------------------------------------------------
+// Implemented: the whole integer core (data-processing immediate and register, every branch form, the
+// hint/barrier space, SVC, and the `ic ivau`/ISB self-modifying-code interception); the full load/store space
+// including the exclusives with a monitor, the LSE atomics, LDAPR, and the AdvSIMD single- and
+// multi-structure forms with their de-interleaving and replicating variants; the system registers this engine
+// models (MRS/MSR, including TPIDR_EL0, FPCR and FPSR); scalar floating point with FPCR/FPSR honoured (see the
+// "Floating point" section for the projection onto the host FP unit and where it does not apply); and the
+// AdvSIMD integer and floating-point subsets the corpus reaches, plus CRC32.
+//
+// Still routed to interp_undefined() with a TODO(amd64-host) marker naming the class, because nothing in the
+// corpus has asked for them: SVE and SME; the crypto block (AES/SHA/SM3/SM4); BFloat16 (BFCVT and friends);
+// the reciprocal-estimate family (FRECPE/FRECPS/FRSQRTE/FRSQRTS/FMULX/URECPE/URSQRTE), deliberately reported
+// rather than approximated because an almost-right reciprocal iteration is worse than an honest refusal; the
+// saturating-doubling multiplies (SQDMULL/SQDMLAL/SQDMLSL) and SUQADD/USQADD; the by-element (indexed) AdvSIMD
+// forms; pointer authentication; and memory tagging.
 //
 // The extension points, in the order a follow-up will want them:
 //   * interp_step() is the single top-level decoder. It switches on op0 = insn[28:25] exactly as the ARM ARM
 //     top-level table does, and hands each group to one interp_exec_<group>() function. Adding a group means
 //     filling in that one function; nothing else moves.
-//   * interp_read_guest() / interp_write_guest() are the guest memory accessors the load/store group needs.
-//     They are already written, already carry the non-PIE rebias, already use memcpy (never a cast-and-
-//     deref, so an unaligned guest access cannot fault or be reordered by the host compiler), and are
-//     already bracketed by the fault marker described below. A load/store implementation calls them and
-//     needs no new fault plumbing.
+//   * interp_read_guest() / interp_write_guest() are the guest memory accessors every load/store goes through.
+//     They carry the non-PIE rebias, use memcpy (never a cast-and-deref, so an unaligned guest access cannot
+//     fault or be reordered by the host compiler), and are bracketed by the fault marker described below. A
+//     new memory-touching instruction calls them and needs no new fault plumbing.
 //   * interp_block_ends() is the pre-scan's view of where a block stops. It must stay in agreement with the
 //     set of instructions interp_step() answers INTERP_END for; see translate_block() for why a disagreement
 //     is safe but wasteful.
@@ -1680,6 +1686,92 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
+    // ---- AdvSIMD load/store SINGLE structure, and the LD1R/LD2R/LD3R/LD4R replicating loads ----
+    //   0 Q 0011 010 L R 00000 opcode S size Rn Rt   (no offset)
+    //   0 Q 0011 011 L R Rm    opcode S size Rn Rt   (post-index; Rm == 11111 selects the implicit immediate)
+    // A different box from the multi-structure forms above (bits[29:24] is 001101 rather than 001100), and it
+    // transfers ONE element per register rather than a whole vector. Two things make its decode unusual:
+    //
+    //   * The number of registers is (R ? 2 : 1) + (opcode<0> ? 2 : 0), so the four counts are spread across
+    //     two disjoint fields -- R is not a count and opcode<0> is not a size.
+    //   * The lane INDEX is assembled from Q, S and size, and how many of those bits participate depends on the
+    //     element width: an 8-bit access indexes with Q:S:size (16 lanes), a 16-bit one with Q:S:size<1>, a
+    //     32-bit one with Q:S, and a 64-bit one with Q alone. Reading `size` as a lane count here (as every
+    //     other AdvSIMD group would) produces an out-of-range lane and a silently wrong address.
+    //
+    // The replicate forms (opcode<2:1> == 11, load only) instead read ONE element and broadcast it across the
+    // whole destination -- that is what a vectorising compiler emits to get a scalar into every lane, so it is
+    // much more common in real code than its corner of the encoding space suggests.
+    // bits[29:24] == 001101 identifies the box on its own; bit23 is the post-index selector and bit21 is R,
+    // so neither may be part of the mask (an earlier version tested bit21 and silently rejected every LD2R/LD4R).
+    if ((insn & 0xBF000000u) == 0x0D000000u) {
+        unsigned load = (insn >> 22) & 1u, replicate_group = (insn >> 21) & 1u;
+        unsigned opcode = (insn >> 13) & 7u, selector = (insn >> 12) & 1u, size_field = (insn >> 10) & 3u;
+        int post_index = (insn & 0x00800000u) != 0;
+        unsigned registers = (replicate_group ? 2u : 1u) + ((opcode & 1u) ? 2u : 0u);
+        uint64_t base = interp_gpr_sp(cpu, rn), address = base;
+        unsigned element_size, index;
+        if ((opcode >> 1) == 3u) { // LD1R / LD2R / LD3R / LD4R
+            if (!load || selector) return interp_undefined(cpu, insn, "AdvSIMD load single -- unallocated replicate");
+            element_size = size_field;
+            unsigned bytes = 1u << element_size;
+            for (unsigned entry = 0; entry < registers; entry++) {
+                uint64_t element = interp_load_bits(address, bytes);
+                interp_vec value;
+                memset(value.byte, 0, sizeof value.byte);
+                for (unsigned lane = 0; lane < interp_vec_lanes(element_size, q); lane++)
+                    interp_vec_set_element(&value, element_size, lane, element);
+                interp_vec_write(cpu, (rt + (int)entry) % 32, value, q);
+                address += bytes;
+            }
+        } else {
+            switch (opcode >> 1) {
+            case 0: // 8-bit: the index uses every one of Q, S and both size bits
+                element_size = 0;
+                index = (q << 3) | (selector << 2) | size_field;
+                break;
+            case 1: // 16-bit: size<0> is RES0 and does not participate
+                if (size_field & 1u) return interp_undefined(cpu, insn, "AdvSIMD load single -- 16-bit size<0> set");
+                element_size = 1;
+                index = (q << 2) | (selector << 1) | (size_field >> 1);
+                break;
+            default: // 32-bit when size == 00, 64-bit when size == 01 (and then S must be 0)
+                if (size_field == 0) {
+                    element_size = 2;
+                    index = (q << 1) | selector;
+                } else if (size_field == 1 && selector == 0) {
+                    element_size = 3;
+                    index = q;
+                } else {
+                    return interp_undefined(cpu, insn, "AdvSIMD load single -- unallocated 32/64-bit form");
+                }
+                break;
+            }
+            unsigned bytes = 1u << element_size;
+            for (unsigned entry = 0; entry < registers; entry++) {
+                int reg = (rt + (int)entry) % 32;
+                if (load) {
+                    uint64_t element = interp_load_bits(address, bytes);
+                    // A single-lane LOAD leaves every other lane of the destination unchanged, including the
+                    // upper 64 bits -- unlike the multi-structure forms, Q here only widens the index range.
+                    interp_vec value = interp_vec_read(cpu, reg);
+                    interp_vec_set_element(&value, element_size, index, element);
+                    interp_vec_write(cpu, reg, value, 1);
+                } else {
+                    interp_vec value = interp_vec_read(cpu, reg);
+                    interp_store_bits(address, interp_vec_element(&value, element_size, index), bytes);
+                }
+                address += bytes;
+            }
+        }
+        if (post_index) {
+            uint64_t increment = rm == 31 ? (address - base) : interp_gpr(cpu, rm);
+            interp_set_gpr_sp(cpu, rn, base + increment);
+        }
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
     // ---- Load register (literal): LDR/LDRSW/PRFM, PC-relative ----
     if ((insn & 0x3B000000u) == 0x18000000u) {
         unsigned opc = (insn >> 30) & 3;
@@ -1995,6 +2087,25 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         // failed STXR to leave no armed monitor, or a retry loop could succeed without re-reading.
         interp_monitor_clear();
         interp_set_gpr32(cpu, rs, failed);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // ---- LDAPR (FEAT_LRCPC): an acquire load with RCpc rather than RCsc ordering ----
+    //   size 111000 0 0 1 11111 1100 00 Rn Rt
+    // It sits inside the LSE atomic box below (Rs == 11111, opc == 100, o3 == 1 would decode as an atomic), so
+    // it has to be recognised BEFORE that decode arms the atomic path. For this backend an RCpc acquire and an
+    // RCsc acquire come out the same: the guest's loads are ordinary C accesses that the host compiler and CPU
+    // may reorder, so any guest acquire has to become a real host barrier, and sequential consistency is
+    // stronger than either ordering. (Weakening it would be an optimisation, not a correctness fix.)
+    if ((insn & 0x3FFFFC00u) == 0x38BFC000u && !vector) {
+        unsigned bytes = 1u << ((insn >> 30) & 3);
+        uint64_t value = interp_load_bits(interp_gpr_sp(cpu, rn), bytes);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (bytes == 8)
+            interp_set_gpr(cpu, rt, value);
+        else
+            interp_set_gpr32(cpu, rt, (uint32_t)value);
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
@@ -3331,6 +3442,11 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
         // FCVT names its DESTINATION in the low two bits of the opcode and its source in ptype, so it has to
         // be split out before the single-format cases below.
         if ((opcode & 0x3Cu) == 0x04u) {
+            // Opcode 000110 shares this box with the three FCVT destinations but is not one: it is BFCVT
+            // (FEAT_BF16), single -> BFloat16. Say so, rather than reporting it as an FCVT with a destination
+            // type the architecture does not allocate -- which is true of the bits and useless to the reader.
+            if (opcode == 0x06u)
+                return interp_undefined(cpu, insn, "scalar FP -- BFCVT (BFloat16 conversion)");
             unsigned to;
             if (!interp_fp_type_fmt(opcode & 3u, &to) || to == fmt)
                 return interp_undefined(cpu, insn, "scalar FP -- unallocated FCVT destination");
@@ -3400,14 +3516,28 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
 // what is implemented, and it was chosen by running the guest and reading interp_undefined's report rather
 // than by working down the ARM ARM.
 //
-// Deliberately still absent, and each still reported by name: floating-point ARITHMETIC (FADD/FMUL/FDIV/
-// FCVT/FCMP and the whole scalar-FP box beyond the FMOV register moves below), the saturating and widening
-// integer forms, the pairwise-widening and long multiplies, the crypto and CRC blocks, and SVE. A guest that
-// needs those will say so precisely.
+// It has since grown well past that starting subset, by the same method: the saturating group, the widening
+// and narrowing three-different group, the permutes, the shift-by-immediate space, the vector floating-point
+// subset, and the AdvSIMD SCALAR spellings of all of it (normalised into the vector handlers below, see the
+// `scalar` note at the top of interp_exec_simd).
+//
+// Deliberately still absent, and each still reported by name: the crypto block, BFloat16, the
+// reciprocal-estimate family, the saturating-doubling multiplies, the by-element (indexed) forms, and SVE.
+// A guest that needs those will say so precisely rather than getting an approximation.
 static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     uint64_t gpc = cpu->pc;
     int rd = (int)(insn & 31), rn = (int)((insn >> 5) & 31), rm = (int)((insn >> 16) & 31);
     unsigned q = (insn >> 30) & 1, u = (insn >> 29) & 1;
+
+    // ---- The cryptographic extension: AES and the two-register SHA forms ----
+    // Tested first, before the scalar normalisation below, because the SHA group lives at bits[31:30] == 01 and
+    // would otherwise be rewritten into a vector spelling that means something else. Both groups pin
+    // bits[21:17] to 10100, which no other AdvSIMD box uses (two-register-misc is 10000 and pairwise is 11000).
+    // Named rather than left to the catch-all: a guest reaching here is asking for a feature this engine does
+    // not advertise, which is a different fact from a decoder gap, and the S-boxes and round functions are a
+    // self-contained block that should be added deliberately if a guest ever needs them.
+    if ((insn & 0xFF3E0C00u) == 0x4E280800u || (insn & 0xFF3E0C00u) == 0x5E280800u)
+        return interp_undefined(cpu, insn, "AdvSIMD cryptographic extension (AES/SHA)");
 
     // ---- The scalar floating-point space ----
     // Tested first because it is exactly disjoint from every AdvSIMD box below and the test is one mask: the
@@ -3429,15 +3559,22 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     // handled by a parallel switch. Two things it must NOT do: use interp_vec_lanes (which would give 2 lanes
     // for, say, a scalar 32-bit form), and apply the vector group's "1D is reserved" checks (a scalar form is
     // 64-bit-only precisely where the vector one is reserved).
+    // `decode` carries the rewrite and `insn` keeps the guest's ACTUAL instruction word. Only the group-selection
+    // masks below read `decode`; every field extraction reads `insn` (which is equivalent, since the rewrite
+    // clears only bits 30 and 28 and the sole field either of those carries is Q, overridden here), and every
+    // interp_undefined() report reads `insn` -- so a diagnostic always names the encoding the guest executed.
+    // Reporting the rewritten word instead sends the reader to `objdump` with a bit pattern that either decodes
+    // as a different instruction or is not an instruction at all.
     unsigned scalar = 0;
+    uint32_t decode = insn;
     if ((insn & 0xDE000000u) == 0x5E000000u) {
         scalar = 1;
-        insn &= ~UINT32_C(0x50000000); // clear bit30 (becomes Q == 0) and bit28 (becomes the vector op0)
+        decode &= ~UINT32_C(0x50000000); // clear bit30 (becomes Q == 0) and bit28 (becomes the vector op0)
         q = 0;
     }
 
     // ---- AdvSIMD copy: DUP (element/general), INS (element/general), SMOV, UMOV ----
-    if ((insn & 0x9F208400u) == 0x0E000400u) {
+    if ((decode & 0x9F208400u) == 0x0E000400u) {
         unsigned op = (insn >> 29) & 1, imm4 = (insn >> 11) & 0xFu, imm5 = (insn >> 16) & 0x1Fu;
         unsigned size, index;
         if (op) { // INS (element): copy one lane of Rn to one lane of Rd
@@ -3455,7 +3592,9 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         case 0: { // DUP (element): broadcast one lane of Rn across Rd
             if (!interp_imm5_element(imm5, &size, &index))
                 return interp_undefined(cpu, insn, "AdvSIMD copy -- reserved imm5");
-            if (size == 3 && !q) return interp_undefined(cpu, insn, "AdvSIMD copy -- DUP 1D is reserved");
+            // There is no 1D vector arrangement, but the SCALAR spelling of this encoding is exactly
+            // "DUP Dd, Vn.D[index]" (which the assembler prints as MOV) -- so it must not be rejected here.
+            if (size == 3 && !q && !scalar) return interp_undefined(cpu, insn, "AdvSIMD copy -- DUP 1D is reserved");
             interp_vec source = interp_vec_read(cpu, rn), result;
             uint64_t element = interp_vec_element(&source, size, index);
             memset(result.byte, 0, sizeof result.byte);
@@ -3507,7 +3646,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     // ---- AdvSIMD modified immediate: MOVI / MVNI / ORR (imm) / BIC (imm) ----
     // Must be tested BEFORE shift-by-immediate: the two share an encoding box and are separated only by immh
     // (bits 22:19) being zero here and non-zero there.
-    if ((insn & 0x9FF80400u) == 0x0F000400u) {
+    if ((decode & 0x9FF80400u) == 0x0F000400u) {
         unsigned op = (insn >> 29) & 1, cmode = (insn >> 12) & 0xFu, o2 = (insn >> 11) & 1;
         uint64_t imm8 = (uint64_t)(((insn >> 16) & 7u) << 5) | ((insn >> 5) & 0x1Fu);
         uint64_t pattern;
@@ -3541,7 +3680,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     }
 
     // ---- AdvSIMD shift by immediate: SSHR / USHR / SSRA / USRA / SHL ----
-    if ((insn & 0x9F800400u) == 0x0F000400u) {
+    if ((decode & 0x9F800400u) == 0x0F000400u) {
         unsigned immh = (insn >> 19) & 0xFu, immb = (insn >> 16) & 7u, opcode = (insn >> 11) & 0x1Fu;
         unsigned size;
         if (immh & 8u)
@@ -3747,7 +3886,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     }
 
     // ---- AdvSIMD EXT: concatenate Rn:Rm and extract a byte-aligned window ----
-    if ((insn & 0xBFE08400u) == 0x2E000000u) {
+    if ((decode & 0xBFE08400u) == 0x2E000000u) {
         unsigned position = (insn >> 11) & 0xFu;
         unsigned bytes = q ? 16u : 8u;
         if (!q && (position & 8u)) return interp_undefined(cpu, insn, "AdvSIMD EXT -- imm4 out of range for 8B");
@@ -3763,7 +3902,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     }
 
     // ---- AdvSIMD table lookup: TBL / TBX ----
-    if ((insn & 0xBF208C00u) == 0x0E000000u) {
+    if ((decode & 0xBF208C00u) == 0x0E000000u) {
         unsigned length = (insn >> 13) & 3u, extend = (insn >> 12) & 1u;
         unsigned bytes = q ? 16u : 8u;
         interp_vec index_vector = interp_vec_read(cpu, rm), result = interp_vec_read(cpu, rd);
@@ -3789,7 +3928,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     // UZP1/ZIP1 for every de-interleaving struct-of-arrays copy, and `uzp1 v31.2d, v30.2d, v31.2d` is what a
     // 128-bit-pair spill in another hl-engine build reduces to, i.e. it is on the path of running this engine
     // under itself.
-    if ((insn & 0xBF208C00u) == 0x0E000800u) {
+    if ((decode & 0xBF208C00u) == 0x0E000800u) {
         unsigned size = (insn >> 22) & 3u, opcode = (insn >> 12) & 7u;
         if (size == 3 && !q) return interp_undefined(cpu, insn, "AdvSIMD permute -- 1D form is reserved");
         interp_vec left = interp_vec_read(cpu, rn), right = interp_vec_read(cpu, rm), result;
@@ -3831,7 +3970,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
 
     // ---- AdvSIMD across lanes: ADDV / UADDLV / SADDLV / UMAXV / SMAXV / UMINV / SMINV ----
     // Tested before two-register-misc: both live at bits[21:17] == 10000/11000 and differ only in bit 20.
-    if ((insn & 0x9F3E0C00u) == 0x0E300800u) {
+    if ((decode & 0x9F3E0C00u) == 0x0E300800u) {
         unsigned size = (insn >> 22) & 3u, opcode = (insn >> 12) & 0x1Fu;
         // ---- the floating-point reductions: FMAXNMV / FMAXV / FMINNMV / FMINV ----
         // Same field reinterpretation as the other FP boxes (bit23 selects max vs min, bit22 is sz), and they
@@ -3929,7 +4068,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     }
 
     // ---- AdvSIMD two-register misc: NOT / RBIT / CNT / REV16 / REV32 / REV64 / CMEQ-zero / ABS / NEG ----
-    if ((insn & 0x9F3E0C00u) == 0x0E200800u) {
+    if ((decode & 0x9F3E0C00u) == 0x0E200800u) {
         unsigned size = (insn >> 22) & 3u, opcode = (insn >> 12) & 0x1Fu;
         interp_vec source = interp_vec_read(cpu, rn), result;
         memset(result.byte, 0, sizeof result.byte);
@@ -4254,7 +4393,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     // It selects WHICH HALF of the 128-bit narrow-side register is used: the "2" mnemonics (ADDHN2, SMULL2)
     // read the upper half of their narrow sources, or write the upper half of their narrow destination while
     // leaving the lower half untouched. Getting that backwards silently corrupts half a register.
-    if ((insn & 0x9F200C00u) == 0x0E200000u) {
+    if ((decode & 0x9F200C00u) == 0x0E200000u) {
         unsigned size = (insn >> 22) & 3u, opcode = (insn >> 12) & 0xFu;
         interp_vec left = interp_vec_read(cpu, rn), right = interp_vec_read(cpu, rm);
         int narrowing = opcode == 0x4 || opcode == 0x6; // ADDHN/RADDHN and SUBHN/RSUBHN
@@ -4362,7 +4501,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     }
 
     // ---- AdvSIMD three same: the bitwise group, the compares, ADD/SUB, MIN/MAX, ADDP, shifts ----
-    if ((insn & 0x9F200400u) == 0x0E200400u) {
+    if ((decode & 0x9F200400u) == 0x0E200400u) {
         unsigned size = (insn >> 22) & 3u, opcode = (insn >> 11) & 0x1Fu;
         interp_vec left = interp_vec_read(cpu, rn), right = interp_vec_read(cpu, rm), result;
         memset(result.byte, 0, sizeof result.byte);
@@ -4804,6 +4943,17 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
+
+    // ---- AdvSIMD three-same-EXTRA ----
+    //   0 Q U 01110 size 0 Rm 1 opcode(14:11) 1 Rn Rd
+    // Same mask as the copy group above and separated from it only by bit15, which is why they sit together.
+    // This is where the later dot-product and matrix extensions live -- SDOT/UDOT (FEAT_DotProd),
+    // SMMLA/UMMLA/USMMLA (FEAT_I8MM), SQRDMLAH/SQRDMLSH (FEAT_RDM) and the FCMLA/FCADD complex forms. Named
+    // rather than left to the catch-all for the same reason as the crypto block: each is an optional feature
+    // this engine does not advertise, so a guest reaching one is a feature question, not a decoder gap.
+    if ((decode & 0x9F208400u) == 0x0E008400u)
+        return interp_undefined(cpu, insn,
+                               "AdvSIMD three-same-extra (SDOT/UDOT, SMMLA/USMMLA, SQRDMLAH, FCMLA/FCADD)");
 
     return interp_undefined(cpu, insn, "scalar floating-point and Advanced SIMD");
 }
