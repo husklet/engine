@@ -238,8 +238,24 @@ static void *activation_signal_relay(void *unused) {
     return NULL;
 }
 
+static const int activation_forwarded[] = {SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2};
+static volatile sig_atomic_t activation_relay_detached;
+
+/* The guest is a fork of this process and has no relay thread.  An inherited relay handler
+ * makes the relay's kill() write into the shared self-pipe instead of acting on the guest:
+ * a default-disposition guest is never terminated and the relay reissues the same signal
+ * forever.  Restore the default disposition in the child; a guest that wants a handler
+ * installs its own through rt_sigaction.  The flag is inherited as 1, so a fork by an
+ * already-detached guest keeps whatever dispositions that guest chose. */
+static void activation_signal_relay_fork_child(void) {
+    size_t index;
+    if (activation_relay_detached) return;
+    activation_relay_detached = 1;
+    for (index = 0; index < sizeof(activation_forwarded) / sizeof(activation_forwarded[0]); ++index)
+        (void)signal(activation_forwarded[index], SIG_DFL);
+}
+
 static int activation_signal_relay_start(pthread_t *thread) {
-    static const int forwarded[] = {SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2};
     struct sigaction action;
     size_t index;
     int flags;
@@ -260,8 +276,9 @@ static int activation_signal_relay_start(pthread_t *thread) {
     action.sa_handler = activation_signal_handler;
     action.sa_flags = SA_RESTART;
     sigfillset(&action.sa_mask);
-    for (index = 0; index < sizeof(forwarded) / sizeof(forwarded[0]); ++index)
-        if (sigaction(forwarded[index], &action, NULL) != 0) goto fail;
+    for (index = 0; index < sizeof(activation_forwarded) / sizeof(activation_forwarded[0]); ++index)
+        if (sigaction(activation_forwarded[index], &action, NULL) != 0) goto fail;
+    if (pthread_atfork(NULL, NULL, activation_signal_relay_fork_child) != 0) goto fail;
     if (pthread_create(thread, NULL, activation_signal_relay, NULL) == 0) return 0;
 fail:
     hl_host_process_fd_private_remove(activation_signal_pipe[0]);
@@ -430,6 +447,16 @@ static void hl_activation_child(void) {
         request.size == sizeof(request) && request.path_size > 1 && request.path_size <= sizeof(request.path) &&
         request.path[0] == '/' && request.path[request.path_size - 1] == 0 &&
         (request.guest_isa == HL_GUEST_ISA_AARCH64 || request.guest_isa == HL_GUEST_ISA_X86_64)) {
+        /* Armed before the reply: activation_start returns to the embedder as soon as this
+         * reply is acknowledged, and the embedder may signal immediately.  A signal landing
+         * before the handler exists would hit SIG_DFL and kill the engine process outright,
+         * never reaching the guest. */
+        if (activation_signal_relay_start(&signal_thread) != 0) {
+            reply.status = HL_STATUS_PLATFORM_FAILURE;
+            (void)transfer((int)descriptor, &reply, sizeof(reply), 1);
+            _exit(124);
+        }
+        signal_relay = 1;
         reply.status = HL_STATUS_OK;
         if (transfer((int)descriptor, &reply, sizeof(reply), 1) != 0) _exit(124);
         if (request.test_flags == 4) _exit(123);
@@ -447,13 +474,6 @@ static void hl_activation_child(void) {
         activation_guest_isa = request.guest_isa;
         activation_result = &reply.result;
         activation_status = status;
-        if (status == HL_STATUS_OK) {
-            if (activation_signal_relay_start(&signal_thread) != 0) {
-                status = HL_STATUS_PLATFORM_FAILURE;
-                activation_status = status;
-            } else
-                signal_relay = 1;
-        }
         if (status == HL_STATUS_OK && hl_run_config_file_with(request.path, activation_run_config) != 0 &&
             activation_status == HL_STATUS_OK) activation_status = HL_STATUS_CORRUPT;
         status = activation_status;
