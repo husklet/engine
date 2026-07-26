@@ -126,8 +126,8 @@ Ascending name order makes the fold independent of the order in which concurrent
 digest is requested through `sink->digest` / `source->digest`; `MANIFEST` and the restore-side
 `RECOVERY.jsonl` are excluded from the fold.
 
-Version numbers (`src/linux_abi/checkpoint.c`): capture writes `CKPT_VERSION` = 1, restore accepts 1 through
-`CKPT_RESTORE_VERSION_MAX` = 3, and version 2 selects the legacy `ckpt_region_v2` layout on read.
+Version numbers (`src/linux_abi/checkpoint.c`): capture writes `CKPT_VERSION` = 1 and restore accepts
+exactly that version.
 
 ## Restore: the source
 

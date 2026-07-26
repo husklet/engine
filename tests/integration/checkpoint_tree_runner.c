@@ -847,15 +847,14 @@ int main(int argc, char **argv) {
                                 !strcmp(argv[3], "io-missing-child-default") ||
                                 !strcmp(argv[3], "io-fifo-refusal") ||
                                 !strcmp(argv[3], "io-queued-device") || !strcmp(argv[3], "io-queued-missing"));
-    int backward_v2_case = argc == 5 && !strcmp(argv[3], "backward-v2");
-    const char *capture_engine = backward_v2_case ? argv[4] : argv[1];
+    const char *capture_engine = argv[1];
     const char *guest_mode = io_case ? argv[3] + 3 : NULL;
     int io_capture_refusal = io_case && !strcmp(guest_mode, "fifo-refusal");
     int io_strict_restore = io_case && !strcmp(guest_mode, "missing-child-strict");
     /* Same image as the strict case, restored with no policy at all: the default must prune, not refuse. */
     int io_default_restore = io_case && !strcmp(guest_mode, "missing-child-default");
     if (io_case && !io_capture_refusal && !io_strict_restore && !io_default_restore) permissive_case = 1;
-    if ((argc != 3 && !backward_v2_case && !pipe_case && !deleted_case && !threads_case && !memfd_case && !eventfd_case &&
+    if ((argc != 3 && !pipe_case && !deleted_case && !threads_case && !memfd_case && !eventfd_case &&
          !timerfd_case && !inotify_case && !epoll_case && !socketpair_case && !socket_state_case &&
          !connected_socket_case && !signal_case && !connecting_refusal_case && !connecting_fallback_case && !corrupt_magic_case &&
          !corrupt_truncated_case && !corrupt_content_case && !corrupt_missing_case && !corrupt_extra_case &&
