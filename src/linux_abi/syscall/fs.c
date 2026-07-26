@@ -3567,6 +3567,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // SEQPACKET/O_DIRECT-pipe last-close is recorded here while this end is still open, so the shared
         // ownership tracker can wake a blocked peer with EOF. Shared with the execve CLOEXEC sweep.
         fd_reset_emul(cf);
+        // A guest that closes its copy right after handing the fd to a peer is the case XNU's unix-rights
+        // GC can tear down; retire any receipts that have come in so the engine's holds stay bounded.
+        cmsg_inflight_sweep();
         int r = close(cf);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
         break;

@@ -2438,6 +2438,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 cmsg_tmpfds_close();
                 cmsg_seq_finish(0);
                 cmsg_event_finish(0);
+                cmsg_inflight_finish(0);
                 if (hctl != hstack) free(hctl);
                 G_RET(c) = (uint64_t)(-(cerr ? cerr : EINVAL));
                 break;
@@ -2476,6 +2477,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (nr == 211) cmsg_tmpfds_close();
         if (nr == 211) cmsg_seq_finish(r >= 0);
         if (nr == 211) cmsg_event_finish(r >= 0);
+        if (nr == 211) cmsg_inflight_finish(r >= 0);
         if (r > 0 && peekaddr) r = 0; // guest supplied no data room; only the source address was wanted
         // SEQPACKET-as-DGRAM EOF: coerce a peer-closed recvmsg's ECONNRESET to 0 (EOF). (See case 199.)
         if (nr == 212 && r < 0 && errno == ECONNRESET && seq_is((int)a0)) r = 0;
@@ -2757,6 +2759,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     cmsg_tmpfds_close();
                     cmsg_seq_finish(0);
                     cmsg_event_finish(0);
+                    cmsg_inflight_finish(0);
                     if (hctl != hstack) free(hctl);
                     err = cerr ? cerr : EINVAL;
                     break;
@@ -2777,6 +2780,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                             : recvmsg((int)a0, &mh, msgflags_l2m(rf));
             if (nr == 269) cmsg_tmpfds_close();
             if (nr == 269) cmsg_event_finish(r >= 0);
+            if (nr == 269) cmsg_inflight_finish(r >= 0);
             if (r < 0) {
                 err = errno;
                 if (hctl != hstack) free(hctl);
