@@ -458,6 +458,7 @@ static int g_nfilemap;
 static _Atomic uint64_t g_filemap_shared_lo = UINT64_MAX;
 static _Atomic uint64_t g_filemap_shared_hi;
 static _Atomic uint64_t g_filemap_shared_epoch;
+static _Atomic int g_filemap_emulated_shared;
 #define FILEMAP_SHARED_FILTER_WORDS 1024u
 #define FILEMAP_SHARED_FILTER_BITS (FILEMAP_SHARED_FILTER_WORDS * 64u)
 // Monotonic page bloom for the executable-alias store observer. A stale bit only causes a locked registry
@@ -618,6 +619,8 @@ static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t o
         g_filemap[g_nfilemap++] = (struct guest_file_mapping){
             address, address + size, offset,           (uint64_t)st.st_dev, (uint64_t)st.st_ino, 0,
             0,       retained,       (uint32_t)shared, (uint32_t)emulated};
+        if (shared && emulated)
+            atomic_store_explicit(&g_filemap_emulated_shared, 1, memory_order_release);
         if (shared) atomic_fetch_add_explicit(&g_filemap_shared_epoch, 1, memory_order_seq_cst);
     } else if (retained >= 0) {
         int shared_source = 0;
@@ -626,6 +629,10 @@ static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t o
         if (!shared_source) close(retained);
     }
     pthread_mutex_unlock(&g_filemap_lock);
+}
+
+static int filemap_emulated_shared_active(void) {
+    return atomic_load_explicit(&g_filemap_emulated_shared, memory_order_acquire);
 }
 
 static ssize_t filemap_pread(int fd, void *buffer, size_t length, off_t offset) {
@@ -2132,6 +2139,14 @@ static pthread_mutex_t g_threg_m = PTHREAD_MUTEX_INITIALIZER;
 // semaphores). Called from the fork child path in proc.c.
 static void thread_after_fork(void) {
     pthread_mutex_init(&g_threg_m, NULL); // thread registry (tkill/tgkill lookup, thread_register)
+    /*
+     * Only the calling host thread survives a guest fork. A vanished peer may
+     * have held either process-private file-map lock while publishing or
+     * replaying shared mutations. The child owns a private copy of the
+     * registry and cursor, so rebuild both locks before its first replay.
+     */
+    pthread_mutex_init(&g_filemap_lock, NULL);
+    pthread_mutex_init(&g_filemap_replay_lock, NULL);
     // SINGLE-THREADED-PARENT FAST PATH: with no peer thread at fork, no private-futex bucket lock could have
     // been held (bucket locks are taken only transiently by the holder, never across a guest fork) and no
     // waiter could be parked, and the tid registry already lists only the calling thread. The entire reset

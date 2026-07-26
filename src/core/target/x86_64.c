@@ -366,7 +366,7 @@ static void jit86_store_alias_changed(uint64_t guest, uint64_t size) {
 }
 
 static int jit86_store_alias_observation_active(void) {
-    return g_nfilemap != 0;
+    return g_rwx_guest != 0 || filemap_emulated_shared_active();
 }
 
 static void jit86_smc_commit(struct cpu *cpu) {
