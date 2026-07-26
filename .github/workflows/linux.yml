@@ -186,24 +186,40 @@ jobs:
   #
   # compat-network carries the plain suite AND the ICMP-denied bridge rerun, so
   # the former `typed-network` + `typed-network-icmp` pair is one label now.
+  #
+  # FIVE buckets covering all 24 sharded lanes -- the same runner count as when
+  # they covered 16. Bucket contents are balanced on MEASURED per-lane suite
+  # wall clock (aarch64 Linux, tmpfs scratch, seconds):
+  #   soak 263 | memory 123 | ipc 36 time 27 threads 19 signals 18
+  #   core-workload 21 process 17 syscall-edges 15 core-syscall 12
+  #   isa-x86-64 11 syscall 10 | completeness 8 posix 8 abi-corpus 6
+  #   filesystem 6 libc 5 network 5 abi 4 procfs 4 core-abi 2 core-regress 2
+  #   isa-aarch64 2 isolation 2
+  # compat-soak alone is 263s of the 626s total, so it is the critical path and
+  # NO split across three or more buckets can finish sooner. The mac lane was
+  # consolidated 5->2 because macos-26 admission, not compute, was its
+  # bottleneck; ubuntu-24.04-arm has no such queue, and each bucket pays a real
+  # cost the mac's does not -- it builds `compat-engines` plus its own guest
+  # corpus. Fewer buckets would concentrate that build without shortening the
+  # job, so the count stays at five and the lanes are spread for retry headroom.
   linux-compat:
     name: compat / ${{ matrix.name }}
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: fs-proc
-            targets: compat-filesystem compat-procfs compat-process
-          - name: net-ipc
-            targets: compat-network compat-ipc compat-isolation
-          - name: syscall
-            targets: compat-syscall compat-syscall-edges compat-abi compat-completeness
-          - name: libc-posix
-            targets: compat-libc compat-posix compat-time
-          - name: mem-signals
-            targets: compat-memory compat-signals compat-threads
+          - name: soak
+            targets: compat-soak
+          - name: memory
+            targets: compat-memory
+          - name: ipc-time-threads
+            targets: compat-ipc compat-time compat-threads compat-signals
+          - name: core-syscall
+            targets: compat-core-workload compat-process compat-syscall-edges compat-core-syscall compat-isa-x86-64 compat-syscall
+          - name: abi-fs-net
+            targets: compat-completeness compat-posix compat-abi-corpus compat-filesystem compat-libc compat-network compat-abi compat-procfs compat-core-abi compat-core-regress compat-isa-aarch64 compat-isolation
     steps:
       - uses: actions/checkout@v5
       - uses: DeterminateSystems/nix-installer-action@v22
@@ -215,14 +231,16 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Compat suites
-        timeout-minutes: 40
+        timeout-minutes: 55
         shell: bash
         run: |
           set -o pipefail
           # The typed compat scratch is mapped as the guest's /tmp; on this ext4
           # runner it must be tmpfs-backed for statx-btime/memfd-seals to behave.
           sudo mkdir -p /mnt/hl-scratch && sudo mount -t tmpfs -o size=4G tmpfs /mnt/hl-scratch && sudo chmod 1777 /mnt/hl-scratch
-          export HL_MATRIX_SCRATCH_DIR=/mnt/hl-scratch
+          # NOT exported globally: the scratch filesystem is per-lane, see
+          # scratch_for() below. Suites with no entry get the tmpfs.
+          tmpfs_scratch=/mnt/hl-scratch
           # Portable bound: output to a FILE, never a pipe. The compat suite leaves
           # processes alive by design (pc-forkoutlive has a child outlive its parent;
           # the fork-server/supervisor are long-lived) and they inherit this step's
@@ -251,10 +269,14 @@ jobs:
           # bytes of output (mkfifoat, truncate-eof-bus). Building stays parallel;
           # suites run one at a time. Each lane builds only its own guest corpus.
           # Bound the STEP, not just one suite. Several suites plus the retry can
-          # outlast the 40min step timeout, and a step GitHub kills emits no
+          # outlast the 55min step timeout, and a step GitHub kills emits no
           # ::error, so the failure lands with no diagnostic tail. Stop 60s short
           # of the deadline so the reporting tail below always runs.
-          deadline=$((SECONDS + 2280))
+          # 3180+60 <= 55*60, and 55 <= the 60min job timeout -- I18 checks both.
+          # Raised from 2280/40min with the lane count: the widest bucket now
+          # cross-builds twelve suites' guest corpora before any case runs, and
+          # compat-soak's bucket must fit 263s of suite time twice if it retries.
+          deadline=$((SECONDS + 3180))
           budget() {
             local left=$((deadline - SECONDS - 60))
             if [ "$left" -gt 0 ]; then echo "$left"; else echo 0; fi
@@ -271,11 +293,28 @@ jobs:
             echo "::error title=Linux compat (${{ matrix.name }}) build failed::$msg"
             exit 1
           fi
+          # The scratch dir is the guest's /tmp, so its filesystem is an INPUT to
+          # every case that touches a file. Most suites want the tmpfs mounted
+          # above; compat-core-syscall does not. Its edge_fallocate golden needs
+          # FALLOC_FL_ZERO_RANGE and its edge_lseekhole golden needs
+          # lseek(fd,-1,SEEK_DATA) -> EINVAL, and tmpfs provides neither. A plain
+          # `cc` build of both cases reproduces the engine's tmpfs output byte for
+          # byte, and the ext4 output byte for byte, so forcing tmpfs here would
+          # be testing tmpfs rather than the engine. Leaving the variable unset
+          # puts the scratch under the build tree, i.e. the runner's ext4 --
+          # exactly the filesystem the goldens were captured against.
+          scratch_for() {
+            case "$1" in
+            compat-core-syscall) unset HL_MATRIX_SCRATCH_DIR ;;
+            *) export HL_MATRIX_SCRATCH_DIR="$tmpfs_scratch" ;;
+            esac
+          }
           run_suites() {
             local st=0 suite_st=0 cap=0 t=
             : > "$1"
             for t in ${{ matrix.targets }}; do
               suite_st=0
+              scratch_for "$t"
               cap=$(budget)
               if [ "$cap" -le 0 ]; then st=124; break; fi
               if [ "$cap" -gt 2100 ]; then cap=2100; fi
