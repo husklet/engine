@@ -108,24 +108,8 @@ static void emit_crash_diagnostic(const char *message, size_t size) {
         host->log->emit(host->context, HL_LOG_TAG_SIGNAL, message, size);
 }
 
-// ---------------------------------------------------------------------------
-// The host-CPU fork.
-//
-// Everything from here to the matching #else is the same-ISA transliterating JIT: an AArch64 assembler,
-// the block-ABI stubs built on it, and a translate_block that copies most guest instruction words
-// verbatim into the code arena. All of it presupposes that the host CPU executes AArch64, so it is
-// selectable only on an AArch64 host.
-//
-// On any other host CPU the guest's ISA is not the host's, and there is nothing to transliterate INTO.
-// interp.c supplies the same seam -- translate_block, run_block/block_return, the pcache entry points,
-// the SMC and soft-TLB hooks -- by decoding and executing AArch64 rather than emitting it. See its header
-// comment for why that substitution is possible at all: core/dispatch.c's whole contract with a backend is
-// `translate_block` then `run_block`, and nothing in it requires the result to be machine code.
-//
-// struct cpu is shared by both, deliberately: it is the checkpoint format (sizeof(struct cpu) is written
-// into the image and validated on restore), so keeping one layout is what lets the two backends read each
-// other's guest state.
-// ---------------------------------------------------------------------------
+// Host-CPU fork: an AArch64 host takes the same-ISA transliterating JIT below; any other takes interp.c,
+// which supplies the same seam by decoding AArch64. Both share struct cpu: it is the checkpoint format.
 #include "../../host/host_cpu.h"
 #if defined(HL_HOST_CPU_AARCH64)
 // Keep the unity consumers' compact encoder vocabulary while the assembler itself is an independently
@@ -162,9 +146,6 @@ static void e_ldp_q(int rt, int rt2, int rn, int off) { hl_a64_ldp_q(&g_emit, rt
 // transliterate + mangle + §B + LSE + depth-gate
 #include "../../translator/guest/aarch64/translate.c"
 #else
-// The non-AArch64 host arm of the fork opened above: decode and execute AArch64 instead of emitting it.
-// interp.c defines the same names the three JIT files above do, which is what keeps everything below this
-// point -- linux_abi, the shared dispatcher, the ELF loader, checkpoint/restore -- identical on both hosts.
 #include "../../translator/guest/aarch64/interp.c"
 #endif
 // clone/futex/threads (declares run_guest)
@@ -204,18 +185,9 @@ static void do_sigreturn(struct cpu *c) {
     hl_aarch64_signal_restore(c);
 }
 
-// Fault capture is a property of the BACKEND, not of the guest ISA -- it asks "where did the guest's state
-// live at the instant of the fault", and the two backends answer differently in kind.
-//
-// The transliterating JIT keeps guest registers in the MATCHING host registers, so capture reconstructs guest
-// state out of the host mcontext, the faulting host PC needs the provenance map to become instruction-exact,
-// and a fold's scratch registers have to be replayed out of cpu->mscratch. The interpreter keeps guest state
-// in *c at all times and writes cpu->pc at every instruction boundary: there is nothing to reconstruct, no
-// host PC to map back (it emits no host code), and no folds. Its capture only has to answer whether the fault
-// happened inside a marked guest access.
-//
-// Both arms return 0 for "this was not a guest fault", so an engine-side bug still reaches the crash report
-// rather than being dressed up as a guest signal.
+// Fault capture is per BACKEND: the JIT reconstructs guest state from the host mcontext and refines the host
+// PC via the provenance map and cpu->mscratch folds; the interpreter has cpu->pc current. Both return 0 for
+// "not a guest fault".
 #if defined(HL_HOST_CPU_AARCH64)
 static int sigframe_capture_fault(struct cpu *c, void *native_context) {
     if (!hl_aarch64_signal_capture(c, native_context, signal_cache_contains, NULL)) return 0;
@@ -243,10 +215,7 @@ static int sigframe_capture_fault(struct cpu *c, void *native_context) {
 }
 #endif
 
-// The mirror of the fork above. The JIT resumes by rewriting the host mcontext so the handler returns into
-// block_return, which unwinds the translated frame back to the dispatcher. The interpreter has no translated
-// frame to unwind: it siglongjmps out of the handler to the sigsetjmp at the top of run_block, which then
-// returns to the dispatcher normally.
+// The JIT returns into block_return to unwind the translated frame; the interpreter siglongjmps to run_block.
 #if defined(HL_HOST_CPU_AARCH64)
 static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {
     hl_aarch64_signal_resume(c, native_context, (uintptr_t)block_return);
@@ -395,12 +364,8 @@ static void diag_crash(int s, siginfo_t *si, void *uc) {
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
     ucontext_t *u = (ucontext_t *)uc;
 #if defined(HL_HOST_HAS_A64_CONTEXT)
-    // The fields this report goes on to print -- x16/x17/x30 and x0/x1/x9/x10 -- are the engine's own
-    // scratch and link registers under the same-ISA JIT's register model, so on an AArch64 host they are
-    // the single most useful thing in a crash dump: they say which trampoline was mid-flight. That model
-    // is what makes them meaningful, and it does not exist on any other host CPU, where guest state lives
-    // in struct cpu rather than in the host register file. Leave the report's fixed column layout intact
-    // and let those columns read zero rather than print seven host registers under AArch64 names.
+    // These are the JIT's scratch and link registers -- which trampoline was mid-flight -- and mean nothing
+    // under another register file. Keep the column layout; they read zero.
     uint64_t *regs = u ? HL_HOST_UC_REGS(u) : NULL;
 #else
     uint64_t *regs = NULL;

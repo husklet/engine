@@ -723,21 +723,8 @@ static void lazy_diag(void) {
 // (documented residual, a separate broad g2h change): syscall POINTER args that point into the low
 // non-PIE image are read 1:1 in service.c and are NOT redirected here.
 
-// HOST-CPU GATE, covering everything from here to the end of nonpie_fixup. The fixup works by reading the
-// faulting HOST instruction as a 32-bit AArch64 word (`*(uint32_t *)HL_HOST_UC_PC(uc)`), matching it against
-// A64 encodings (LDR/STR immediate, the SIMD&FP forms, LDAPR, the LSE atomics, CAS), servicing it out of the
-// AArch64 register file the kernel parked in the signal context (HL_HOST_UC_REGS / HL_HOST_UC_VREGS), and
-// then advancing the host PC by exactly 4 because every A64 instruction is 4 bytes. All five of those facts
-// are properties of the HOST backend, not of the x86-64 guest: they hold precisely because the x86-64
-// frontend currently lowers guest accesses to AArch64 host code. On a host CPU whose code is not A64 there
-// is no instruction here that this decoder could ever legitimately match -- the emitted access that faulted
-// was some other ISA's, its length is not 4, and its operands are not in HL_HOST_UC_REGS -- so treating the
-// word at the host PC as an A64 encoding would be a guess that either corrupts guest state or steps the PC
-// into the middle of an instruction. There is simply nothing for it to fix up, so the #else arm declines.
-// The guard also carries the inline `dmb ishld` on the LDAPR path with it, which is A64 assembly and would
-// not even assemble elsewhere -- it is inside the emulation of an A64 instruction, so it belongs here.
-// A future x86-64 host backend needs its own absolute-DATA fixup written against x86 encodings; it belongs
-// in that #else arm, not in a widened version of this decoder.
+// HOST-CPU GATE to the end of nonpie_fixup: it decodes a 4-byte A64 word at the host PC out of
+// HL_HOST_UC_REGS/VREGS, so another host backend needs its own absolute-DATA fixup in the #else arm.
 #if defined(HL_HOST_HAS_A64_CONTEXT)
 
 // Atomic RMW helpers (truly atomic, width-typed) used by the LSE/CAS fixup paths below.
@@ -922,12 +909,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
 
 #else
 
-// Not an AArch64 host: decline every fault. 0 is the "not handled" answer -- the same one the decoder above
-// returns for an encoding it refuses to guess at -- and it is what keeps a genuine fault on the reporting
-// path: all three call sites (jit86_lazyguard, jit86_syncguard, the FAULT_ON diagnostic jit86_faulth) spell it
-// `if (nonpie_fixup(si, uc)) return;`, so on 0 they carry on to deliver_guest_fault /
-// deliver_guest_fatal_fault / SIG_DFL + raise, or to the [FAULT] dump. Returning 1 here would advance nothing
-// and resume the faulting instruction, spinning forever on a real crash.
+// Not an AArch64 host: nothing to decode. 0 ("not handled") keeps the fault on the deliver/re-raise path.
 static int nonpie_fixup(siginfo_t *si, void *ucv) {
     (void)si;
     (void)ucv;
@@ -955,14 +937,8 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
 // cpu_loop_exit_atomic) and would tax every correctly-aligned lock in every guest. The trade is
 // deliberate and documented: correctness for split-lock programs, no cost on the aligned path.
 
-// HOST-CPU GATE, as for nonpie_fixup above and for the same reason. The whole premise of this fixup is that
-// the BUS_ADRALN was raised by one specific AArch64 instruction that the AArch64 host backend emitted for a
-// guest atomic: it fetches the 4-byte word at the host PC, matches the LSE atomic-memory-op and CASAL
-// encodings, reads Rs/Rn/Rt out of HL_HOST_UC_REGS (with Rn==31 meaning the host SP), and steps the host PC
-// by 4. Only an AArch64 host has an ISA where an unaligned atomic faults at all -- x86's `lock` and `xchg`
-// are architecturally legal at any address and a split-lock access completes in hardware -- so on an x86-64
-// host the synthetic SIGBUS this exists to repair can never be raised in the first place, and any BUS_ADRALN
-// that does arrive is not ours to emulate. The #else arm declines so it reaches the crash report.
+// HOST-CPU GATE, as for nonpie_fixup: this decodes A64 LSE/CASAL, and only AArch64 faults on an unaligned
+// atomic at all (x86's `lock`/`xchg` are legal at any address), so on x86-64 that SIGBUS cannot arise.
 #if defined(HL_HOST_HAS_A64_CONTEXT)
 
 static _Atomic unsigned g_unaligned_atomic_lock;
@@ -1032,10 +1008,7 @@ static int lse_align_fixup(int sig, siginfo_t *si, void *ucv) {
 
 #else
 
-// Not an AArch64 host: nothing emitted an LSE atomic, so decline. 0 means "not handled", which is what lets
-// jit86_lazyguard fall through to hrm_fault_hook / deliver_guest_fault / deliver_guest_fatal_fault and, in
-// the end, re-raise with the default action -- a real SIGBUS is still reported as a crash rather than being
-// swallowed and resumed at the same faulting PC.
+// Not an AArch64 host: no LSE atomic was emitted. 0 ("not handled") lets a real SIGBUS reach the crash path.
 static int lse_align_fixup(int sig, siginfo_t *si, void *ucv) {
     (void)sig;
     (void)si;
@@ -1055,14 +1028,8 @@ static int lse_align_fixup(int sig, siginfo_t *si, void *ucv) {
 // LDR+DMB ISHLD sequence), write the zero-extended value into Rt, and step the host PC past the LDAPR.
 // Returns 1 iff handled; declines (0) for anything that is not one of our LDAPRs so real faults flow on.
 
-// HOST-CPU GATE, third of the same kind. LDAPR is an AArch64 instruction and g_host_lrcpc is derived from
-// AArch64 AT_HWCAP, so this handler can only ever describe faults taken in AArch64 host code: it fetches the
-// 4-byte word at the host PC, tests it against the LDAPR{B,H,,} encoding, resolves Xn (or the host SP for
-// Rn==31) through HL_HOST_UC_REGS, writes the loaded value back into Rt there, and advances the host PC by 4.
-// An x86-64 host emits no LDAPR -- x86-TSO gives load-acquire ordering for free on an ordinary MOV, which is
-// the entire reason the acquire edge needed synthesizing on AArch64 in the first place -- and unaligned loads
-// never alignment-fault on x86, so the synthetic BUS_ADRALN this repairs cannot occur. Nothing to fix up: the
-// #else arm declines, and the g_host_lrcpc / DMB ISHLD dependencies stay inside the guard with it.
+// HOST-CPU GATE, third of the same kind: LDAPR is A64, and x86-64 (TSO gives the acquire edge free) emits
+// none and never alignment-faults a load.
 #if defined(HL_HOST_HAS_A64_CONTEXT)
 
 static int ldapr_align_fixup(int sig, siginfo_t *si, void *ucv) {
@@ -1100,10 +1067,7 @@ static int ldapr_align_fixup(int sig, siginfo_t *si, void *ucv) {
 
 #else
 
-// Not an AArch64 host: no LDAPR was ever emitted, so decline. 0 is "not handled" -- jit86_lazyguard tests it
-// and continues through the rest of its chain (lse_align_fixup, hrm_fault_hook, the SIGBUS-to-guest route,
-// nonpie_fixup, the lazy-map classifier) and ultimately to deliver_guest_fault / a re-raise, so a genuine
-// alignment or bus error is still attributed and reported instead of being resumed into a fault loop.
+// Not an AArch64 host: no LDAPR was emitted. 0 ("not handled") lets a genuine alignment fault be reported.
 static int ldapr_align_fixup(int sig, siginfo_t *si, void *ucv) {
     (void)sig;
     (void)si;

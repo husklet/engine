@@ -1,8 +1,6 @@
 # CMake toolchain file — x86_64 Linux.
 #
-# This is a CROSS file on an aarch64 host and the NATIVE one on an x86_64 host; the header used to say
-# "cross from an aarch64 host" because that was the only host there was. See the find-root block at the
-# bottom, which is the one part that genuinely differs between those two cases.
+# A CROSS file on an aarch64 host, the NATIVE one on an x86_64 host; only the find-root block below differs.
 #
 # Nix is the single toolchain authority. The C compiler is taken from
 # $X86_64_LINUX_CC, exported by the flake devShell (see flake.nix devShells:
@@ -36,10 +34,8 @@ if(_hl_cc)
 endif()
 
 # Cross builds must not probe the host for libraries/headers -- but whether THIS is a cross build depends on
-# the host CPU, which is exactly the assumption that inverted when x86_64 Linux became a host. On an aarch64
-# host this file is a cross file and the three modes below are right. On an x86_64 host it names the native
-# compiler, and `PROGRAM NEVER` then breaks the unconditional `find_program(HL_BASH_EXECUTABLE ... REQUIRED)`
-# in CMakeLists.txt, because a native build legitimately needs host tools. Apply them only when cross.
+# the host CPU. Unconditionally, `PROGRAM NEVER` breaks CMakeLists.txt's REQUIRED find_program() on a native
+# x86_64 build, which needs host tools.
 if(NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
   set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
   set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)

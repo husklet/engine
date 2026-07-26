@@ -6264,12 +6264,8 @@ static void report_unimpl(uint64_t pc, struct insn *I) {
 }
 
 // ---------------- host entry trampolines (adapted from jit.c, x86 reg set) ----------------
-// The arch test is as load-bearing as the compiler test: both arms below are AArch64 assembly, and the outer
-// guard used to select between them on the COMPILER alone, so an x86-64 build fed the ARM64 register names to
-// the host assembler. HL_HOST_CPU_AARCH64 (not a bare defined(__aarch64__)) is deliberately the same macro
-// core/dispatch.c gates its own copy of this construct on, so the two agree by spelling and not by luck --
-// dispatch.c only compiles ITS trampolines when the x86 frontend has not defined G_OWN_TRAMPOLINES, i.e. these
-// are the ones the x86 dispatcher actually enters, and the pair must never disagree about which host it is on.
+// The arch test is as load-bearing as the compiler test: both arms below are AArch64 assembly, and the
+// guard once selected between them on the COMPILER alone. Same macro core/dispatch.c gates its copy on.
 #if defined(__GNUC__) && !defined(__clang__) && defined(HL_HOST_CPU_AARCH64)
 /* GCC ignores naked on AArch64 functions.  Define the two ABI trampolines as
    assembler functions so no compiler-generated prologue can corrupt SP or the
@@ -6320,17 +6316,10 @@ __attribute__((naked)) static void block_return(void) {
         "ret\n");
 }
 #else
-// Non-AArch64 host. Every emitter in this directory writes ARM64 machine code (emit.c's header says so), so
-// there is nothing for a trampoline to enter here and no host register file to spill into cpu -- an x86-64
-// host back end is a separate piece of work. These two definitions exist only so the rest of the engine still
-// compiles and links: block_return's ADDRESS is baked into emitted blocks (hl_x86_emit_block_return) and is
-// cache.c's image-slide anchor for the persistent code cache, and core/dispatch.c CALLS run_block, so both
-// must be real, address-taken function symbols -- they are `static` to match the forward declaration emit.c
-// makes on this same arm.
-//
-// Reaching either means the dispatcher tried to execute a translated block on a host whose ISA the emitters
-// cannot target, which is a build-configuration error and not a recoverable runtime state: say so on stderr
-// and abort rather than jumping into foreign machine code. Nothing on the AArch64 path changes.
+// Non-AArch64 host: the emitters here write ARM64, so no trampoline can enter anything. These exist only
+// so the engine links -- block_return's ADDRESS is baked into emitted blocks and anchors cache.c's image
+// slide, and dispatch.c CALLS run_block. `static` matches emit.c's declaration and keeps the dual
+// archive's two definitions from colliding (findings 3.7). Abort: reaching either is a build error.
 static void run_block(struct cpu *cpu, void *code) {
     (void)cpu;
     (void)code;

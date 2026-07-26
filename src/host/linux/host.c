@@ -843,15 +843,10 @@ static hl_host_result hl_linux_thread_cpu(void *context) {
     return hl_linux_clock(CLOCK_THREAD_CPUTIME_ID);
 }
 
-/* The architectural counter is the CPU's own free-running tick source, which the translator uses to serve a
- * guest clock read inline instead of exiting the block: it needs the tick RATE to bake a tick->ns multiplier.
- * There is no portable way to ask for that, so the question is per host CPU, not per host OS -- hence
- * HL_HOST_CPU_AARCH64 rather than __aarch64__, which said nothing about whether THIS OS is the one whose
- * register-read spelling follows. x86-64's counterpart is the TSC, whose frequency is not architecturally
- * readable at all (CPUID.15H is absent or lies on most parts, so it has to be calibrated against a known
- * clock); that calibration is deliberately not attempted here. NOT_SUPPORTED is a first-class answer, not a
- * failure: it means "no baked multiplier can be trusted", and the one caller (s1_calibrate) responds by
- * clearing its fast-clock flag and letting the guest's clock reads take the ordinary block-exit path. */
+/* Reports the tick RATE of the CPU's free-running counter, which the translator bakes into a tick->ns
+ * multiplier to serve guest clock reads inline.  x86-64's TSC frequency is not architecturally readable
+ * (CPUID.15H is absent or lies on most parts) and is not calibrated here; NOT_SUPPORTED is a first-class
+ * answer, and s1_calibrate then clears its fast-clock flag. */
 static hl_host_result hl_linux_architectural_counter(void *context) {
     (void)context;
 #if defined(HL_HOST_CPU_AARCH64)

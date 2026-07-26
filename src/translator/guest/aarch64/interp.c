@@ -1,77 +1,17 @@
-// translator/guest/aarch64/interp.c -- the AArch64 guest frontend for every host CPU that is NOT AArch64:
-// an AArch64 DECODER + EXECUTOR, in place of the same-ISA transliterating JIT in translate.c.
-//
-// WHY THIS FILE EXISTS AT ALL
-// ---------------------------
-// translate.c is a transliterator, not a compiler. It copies most guest instruction words verbatim into the
-// host code arena and rewrites only the ones that name an engine-stolen register, because it assumes the
-// guest register file IS the host register file (x28 = cpu pointer, x30 = host link, x18/x16/x17 = engine
-// scratch, everything else holding the guest's own value). That assumption is not an optimization detail --
-// it is the whole design -- and it is true only when the host CPU executes AArch64. On an x86-64 Linux host
-// there is nothing to transliterate INTO: no AArch64 assembler output can run, and there is no AArch64-
-// register file for guest values to live in.
-//
-// So this backend keeps the guest's architectural state where struct cpu already puts it and interprets. The
-// substitution is possible because the shared dispatcher's ENTIRE contract with a backend (core/dispatch.c's
-// run_guest loop) is three lines:
-//
-//     code = translate_block(G_PC(c));   // produce something callable for this guest PC
-//     run_block(c, code);                // ... call it
-//     // on return: c->reason says why it stopped, c->pc is the next guest PC, and every piece of guest
-//     // architectural state is back in *c.
-//
-// Nothing there requires `code` to be machine code, and nothing there requires run_block to be a trampoline.
-// `code` is a block descriptor allocated from the same arena, and run_block is the C loop below. Everything
-// downstream -- the block cache and its SMC invalidation, the whole of linux_abi (syscalls, signals,
-// container, ELF), the stop-the-world machinery, even the checkpoint format -- is reused UNCHANGED, because
-// struct cpu is untouched and the reason codes describe GUEST events rather than host ones.
-//
-// struct cpu is deliberately shared with the JIT and must not be edited: sizeof(struct cpu) is written into
-// the checkpoint image and validated on restore, so one layout is what lets the two backends read each
-// other's guest state. Its host_save[12]/host_v[16] fields are AArch64 callee-saved spill slots for
-// run_block/block_return; this backend simply never touches them (it has no host register file to spill).
-//
-// WHAT IS AND IS NOT IMPLEMENTED, AND HOW TO EXTEND IT
-// ----------------------------------------------------
-// Implemented: the whole integer core (data-processing immediate and register, every branch form, the
-// hint/barrier space, SVC, and the `ic ivau`/ISB self-modifying-code interception); the full load/store space
-// including the exclusives with a monitor, the LSE atomics, LDAPR, and the AdvSIMD single- and
-// multi-structure forms with their de-interleaving and replicating variants; the system registers this engine
-// models (MRS/MSR, including TPIDR_EL0, FPCR and FPSR); scalar floating point with FPCR/FPSR honoured (see the
-// "Floating point" section for the projection onto the host FP unit and where it does not apply); and the
-// AdvSIMD integer and floating-point subsets the corpus reaches, plus CRC32.
-//
-// Still routed to interp_undefined() with a TODO(amd64-host) marker naming the class, because nothing in the
-// corpus has asked for them: SVE and SME; the crypto block (AES/SHA/SM3/SM4); BFloat16 (BFCVT and friends);
-// the reciprocal-estimate family (FRECPE/FRECPS/FRSQRTE/FRSQRTS/FMULX/URECPE/URSQRTE), deliberately reported
-// rather than approximated because an almost-right reciprocal iteration is worse than an honest refusal; the
-// saturating-doubling multiplies (SQDMULL/SQDMLAL/SQDMLSL) and SUQADD/USQADD; the by-element (indexed) AdvSIMD
-// forms; pointer authentication; and memory tagging.
-//
-// The extension points, in the order a follow-up will want them:
-//   * interp_step() is the single top-level decoder. It switches on op0 = insn[28:25] exactly as the ARM ARM
-//     top-level table does, and hands each group to one interp_exec_<group>() function. Adding a group means
-//     filling in that one function; nothing else moves.
-//   * interp_read_guest() / interp_write_guest() are the guest memory accessors every load/store goes through.
-//     They carry the non-PIE rebias, use memcpy (never a cast-and-deref, so an unaligned guest access cannot
-//     fault or be reordered by the host compiler), and are bracketed by the fault marker described below. A
-//     new memory-touching instruction calls them and needs no new fault plumbing.
-//   * interp_block_ends() is the pre-scan's view of where a block stops. It must stay in agreement with the
-//     set of instructions interp_step() answers INTERP_END for; see translate_block() for why a disagreement
-//     is safe but wasteful.
-//   * interp_undefined() is the single diagnostic exit. Every unimplemented class funnels through it, so
-//     "how far does this guest get" is always answered by one line on stderr naming the exact encoding.
-//
-// PERFORMANCE IS EXPLICITLY NOT A GOAL HERE. The block descriptor only delimits the guest instruction range;
-// run_block re-fetches and re-decodes every instruction on every execution. Caching the decoded form in the
-// descriptor is the obvious later optimisation and is discussed at translate_block(). Correctness first.
+// translator/guest/aarch64/interp.c -- an AArch64 decoder + executor, selected by the unity build on every
+// host CPU that is NOT AArch64; an AArch64 host picks translate.c + stubs.c (see docs/amd64-host.md).
+// translate.c transliterates guest instructions into host code, so it assumes the guest register file IS the
+// host register file -- true only on the ARM64 diagonal. Substituting this is legal because core/dispatch.c's
+// run_guest asks only for translate_block(pc) -> something callable, run_block(c, code) to call it, and
+// c->reason/c->pc/all guest state in *c on return; block cache, linux_abi, stop-the-world and checkpoint are
+// reused unchanged, and struct cpu keeps the JIT's layout (its sizeof is checked on restore). Extension
+// points: interp_step (top-level decoder), interp_read_guest/interp_write_guest (every guest access),
+// interp_block_ends (the pre-scan's terminator set), interp_undefined (the diagnostic exit every
+// unimplemented class reaches). Performance is not a goal: every instruction is re-decoded.
 
 #include <setjmp.h>
-// The guest's floating point is computed by the HOST's floating-point unit with the guest's FPCR.RMode
-// projected onto the host's rounding control; see the long note at "Floating point" below for why that is the
-// design and where it is not enough. <fenv.h> is the portable spelling of that projection (glibc implements it
-// over MXCSR on x86-64) and <math.h> supplies the two operations C has no operator for -- fma, which is the
-// only correctly-rounded spelling of FMADD, and sqrt.
+// Guest FP runs on the HOST FPU with guest FPCR.RMode projected onto host rounding control: <fenv.h> is that
+// projection, <math.h> has fma -- the only correctly-rounded FMADD -- and sqrt.
 #include <fenv.h>
 #include <math.h>
 
@@ -82,148 +22,63 @@
 #include "../../../host/range.h"
 #include "../../../linux_abi/logical_vma.h"
 
-// ---------------------------------------------------------------------------
-// Engine-wide debug/identity state that stubs.c owns for the JIT.
-// ---------------------------------------------------------------------------
-// These are not JIT concepts, they are engine concepts that happened to be declared in the JIT's stub file
-// because that was the first unit in the TU to need them. Everything downstream of this include -- the
-// dispatcher's trace hook, the syscall tracer, the container's /proc synthesis, the ELF loader, the
-// checkpoint writer -- reads them, so the backend that replaces stubs.c has to own them too. Values are the
-// production defaults (all tracing off), reset explicitly in engine_global_init().
+// Engine-wide debug/identity state that stubs.c owns for the JIT; the trace hook, syscall tracer, /proc
+// synthesis, ELF loader and checkpoint writer all read it, so this backend must own it too.
 static int g_trace;         // G_TRACE_DUMP: per-block guest PC + register dump
 static int g_systrace;      // syscall tracer
 static int g_dbg_nochain;   // suppress inter-block chaining so every block re-enters the dispatcher
 static int g_dbg_gprdump;   // dump all guest GPRs per block, for a register-value differential
-// Guest path of the image this process is running, i.e. what /proc/self/exe must report. Set by the loader
-// before the guest starts; a string literal rather than NULL so an early reader cannot dereference nothing.
+// What /proc/self/exe must report; a literal, not NULL, so an early reader cannot deref it.
 static const char *g_exe_path = "";
 
-// ---------------------------------------------------------------------------
-// Non-PIE image geometry, and the one place a guest address is not a host address.
-// ---------------------------------------------------------------------------
-// Really defined (and set by load_elf) in linux_abi/elf.c + linux_abi/container/vfs.c, both compiled LATER in
-// this same unity TU. Re-listing them here as tentative definitions -- exactly as translate.c does -- merges
-// with that single later definition and lets the code below un-bias a PC. All three are 0 for PIE and
-// static-PIE images, which is every image the test matrix loads, so every use is inert there.
+// Non-PIE geometry -- the one place a guest address is not a host address. Really defined (by load_elf) in
+// elf.c + container/vfs.c, LATER in this unity TU; these tentative definitions merge with that one, as in
+// translate.c. All 0 for PIE and static-PIE images.
 static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
 
-// Guest-signal delivery, really defined in linux_abi/signal.c -- which is compiled LATER in this same unity TU,
-// so these are declared (not defined) here. Only the architecturally-trapping instruction classes need them
-// (UDF, BRK, HLT and the EL2/EL3 forms); every other guest signal this backend produces travels the
-// dispatcher's reason codes instead. Declaring a static before its definition is ordinary C and is the same
-// technique translate.c uses for the tentative definitions above.
-//
-// raise_guest_signal owns the DISPOSITION: a guest handler gets the signal queued, SIG_IGN drops it, and
-// SIG_DFL for these fatal-default signals goes through guest_group_fatal so the container reports 128+signo
-// with the core-dump flag. sigq_flush is what converts that process-wide queueing into the THREAD-directed
-// delivery a synchronous fault requires; see interp_raise_sync_signal below for why both are needed.
+// Guest-signal delivery, really defined later in this unity TU by signal.c; used only by the trapping
+// classes (UDF, BRK, HLT, HVC/SMC). raise_guest_signal owns the DISPOSITION (SIG_DFL -> guest_group_fatal,
+// 128+signo with the core-dump flag); sigq_flush makes it THREAD-directed.
 static void raise_guest_signal(struct cpu *c, int sig);
 static void sigq_flush(int sig);
 
-// PC-relative base for ADR/ADRP and for the return address a BL/BLR writes to x30.
-//
-// A non-PIE ET_EXEC is mapped HIGH (its low link range is reserved), and the dispatcher biases the guest PC
-// into that high mapping before it looks the block up. But the image's own baked absolute pointers are LOW
-// (non-PIE means no dynamic relocations), and real code compares an ADR/ADRP-computed pointer against such a
-// stored pointer for identity. Materialising the HIGH value therefore breaks pointer identity. So compute
-// PC-relative VALUES against the LOW (un-biased) PC; a data access through the resulting low pointer is
-// served from the real high mapping by the nonpie_fixup fault path, and the dispatcher re-biases a low PC
-// back to high on entry. Control flow keeps the HIGH pc throughout -- only the produced address is low.
-//
-// This is character-for-character translate.c's pcrel_base, and it must stay that way: linux_abi/signal.c
-// hands the guest an un-biased PC in its signal frame through this same function (via
-// signal_canonicalize_pc in core/target/aarch64.c), so the two backends must agree on what "the guest's own
-// view of this PC" is or a restored checkpoint would disagree with itself.
+// PC-relative base for ADR/ADRP and BL/BLR's x30. A non-PIE ET_EXEC is mapped HIGH, but its baked absolute
+// pointers are LOW and real code compares an ADR/ADRP result against them, so PC-relative VALUES use the LOW
+// link address while control flow keeps the HIGH pc. Must stay identical to translate.c's pcrel_base:
+// signal.c hands the guest a PC through this function.
 static uint64_t pcrel_base(uint64_t gpc) {
     if (g_nonpie_lo && gpc >= g_nonpie_lo + g_nonpie_bias && gpc < g_nonpie_hi + g_nonpie_bias)
         return gpc - g_nonpie_bias;
     return gpc;
 }
 
-// Guest VA -> host VA. They are equal, with exactly one exception: a non-PIE ET_EXEC's low link range is
-// served at +g_nonpie_bias. This is the ENTIRE address translation layer, and it must stay that way -- the
-// engine's whole memory model is that the guest runs on real host mappings, which is what lets mmap, fork,
-// shared memory, file mappings and the checkpoint work at all. Mirrors hl_x86_guest_pointer in
-// core/target/x86_64.c so both frontends fold the same way.
+// Guest VA -> host VA, equal but for a non-PIE ET_EXEC's low link range, served at +g_nonpie_bias: the whole
+// address translation layer. Mirrors hl_x86_guest_pointer.
 static uint64_t interp_guest_pointer(uint64_t address) {
     return g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi ? address + g_nonpie_bias : address;
 }
 
-// ---------------------------------------------------------------------------
-// The fault model.
-// ---------------------------------------------------------------------------
-// With the JIT, a guest fault happens inside emitted code and hl_aarch64_signal_capture has to RECONSTRUCT
-// guest state by copying the interrupted host register file back into struct cpu. Here that reconstruction
-// problem does not exist: struct cpu is already authoritative at every instruction boundary and cpu->pc is
-// exact. What the host handler needs instead is a way to ABANDON the C access that is in flight and get back
-// to the dispatcher, because the faulting instruction is a memcpy inside interp_read_guest/
-// interp_write_guest, and simply returning from the handler would re-execute it and fault forever.
-//
-// So: a thread-local marker is armed around every guest memory access, run_block does a sigsetjmp at its
-// top, and the handler siglongjmps back through it.
-//
-// WHY siglongjmp OUT OF A SIGNAL HANDLER IS SAFE HERE. It is the standard interpreter technique, and the
-// specific reasons it is sound in this engine are:
-//   * The jump target is in the SAME thread. sigsetjmp/siglongjmp are async-signal-safe and are defined for
-//     exactly this use; the saved-mask form (savemask = 1) restores the signal mask the handler entered
-//     with, so the thread does not return with SIGSEGV still blocked.
-//   * Nothing between the sigsetjmp and the marked access owns a resource that needs unwinding. The
-//     dispatcher releases g_jit_lock BEFORE calling run_block, run_block itself takes no lock and allocates
-//     nothing, and everything it touches is either automatic storage (discarded by the jump) or *cpu.
-//   * Guest architectural state is already correct. A load commits its destination register only AFTER the
-//     marked memcpy has returned (memcpy into a local, marker cleared, then the register write), and a
-//     store reads its source register into a local BEFORE the marked memcpy. So the abandoned instruction
-//     has made no partial architectural change, and cpu->pc still names it -- which is precisely what the
-//     guest's own signal handler is entitled to see.
-//   * The reason code is chosen by the handler path (linux_abi/signal.c sets c->reason = R_BRANCH and queues
-//     the guest signal in c->tpending before asking us to resume), so run_block returning normally after the
-//     jump lands the dispatcher in the ordinary "deliver a pending signal" path.
-static __thread struct cpu *g_interp_marker_cpu;   // the cpu whose run_block armed the marker (NULL = none)
+// The fault model. struct cpu is authoritative at every instruction boundary, so nothing needs reconstructing
+// as in the JIT; the handler only has to ABANDON the in-flight memcpy in the guest accessors, which would
+// otherwise re-execute and fault forever. A marker is armed around every guest access, run_block sigsetjmps
+// at its top (savemask = 1: the jump arrives from a handler with the signal blocked), the handler siglongjmps
+// back. Sound because nothing in between holds a lock, and a load commits its destination only after the
+// marked memcpy returns while a store reads its sources into locals first: the abandoned instruction made no
+// partial architectural change and cpu->pc still names it.
+static __thread struct cpu *g_interp_marker_cpu;   // the cpu whose run_block armed the marker
 static __thread sigjmp_buf g_interp_marker_jmp;    // where interp_signal_resume goes
-static __thread int g_interp_marker_armed;         // 1 while g_interp_marker_jmp is valid
-static __thread int g_interp_access_active;        // 1 while a guest memory access is in flight
+static __thread int g_interp_marker_armed;         // 1 while the buffer is valid
+static __thread int g_interp_access_active;        // 1 while a guest access is in flight
 static __thread uint64_t g_interp_access_address;  // its effective guest address
 static __thread uint64_t g_interp_access_bytes;    // its size
-static __thread int g_interp_access_write;         // 1 for a store, 0 for a load
+static __thread int g_interp_access_write;         // 1 for a store
 
-// ---- The past-EOF SIGBUS ledger ----
-//
-// Linux raises SIGBUS/BUS_ADRERR for an access to a whole page of a file mapping that lies past the file's
-// end. The engine cannot let the HOST deliver that: linux_abi/syscall/mem.c deliberately re-maps the
-// genuinely-past-EOF tail of a MAP_PRIVATE file mapping as anonymous zero (see the long note at its
-// "Past-EOF tail zero-fill"), because ld.so maps a .so's whole vaddr span from the first segment and a stray
-// engine-side touch of one of those pages must not kill the engine. The guest-visible SIGBUS is therefore
-// owed by the TRANSLATOR, from a ledger mem.c maintains (gbus_add) and core/bus.h exposes as
-// jit_guest_bus_active() / jit_guest_bus_fault(). The JIT pays for it with an inline guard around every
-// emitted access (emit_a64_bus_guard in translate.c); an interpreter is already in C, so one predicate here
-// covers every access instead.
-//
-// This is the ONE chokepoint: interp_access_begin is called by interp_read_guest, interp_write_guest and by
-// each atomic/exclusive site, i.e. it is exactly "a guest access to [address, bytes) is about to happen".
-// Adding the query anywhere else would mean auditing ~50 call sites and re-auditing them on every new
-// instruction class.
-//
-// Two details that are easy to get wrong:
-//
-//   * The LEDGER HOLDS HOST ADDRESSES -- gbus_add is fed the value mmap returned -- while the guest's own
-//     signal handler compares si_addr against its GUEST pointer. Those differ by g_nonpie_bias for an access
-//     folded into a non-PIE ET_EXEC's high mapping, so the query uses interp_guest_pointer(address) and the
-//     reported fault address is converted back. (The JIT's guard queries the un-folded address and is
-//     therefore wrong in exactly that case; it is not reachable for any image the matrix loads, since a
-//     past-EOF file mapping inside a non-PIE image's link range cannot occur, but there is no reason to
-//     reproduce the defect here.)
-//   * The reported address is the FIRST past-EOF byte in the access, not the access's base -- which is what
-//     jit_guest_bus_fault already returns, and what makes a 4-byte load straddling the EOF page boundary
-//     report the page boundary the way Linux does.
-//
-// Escaping is the same siglongjmp the host-fault path uses, for the same reason: the caller is several
-// frames deep in an instruction whose source registers have already been read into locals and whose
-// destination has not been written, so abandoning it leaves cpu->pc naming an instruction that has not
-// executed. cpu->reason = R_BUS is what interp_dispatch.h's arm turns into raise_guest_bus().
+// The past-EOF SIGBUS ledger. mem.c re-maps the past-EOF tail of a MAP_PRIVATE file mapping as anonymous
+// zero, so that SIGBUS is owed by the TRANSLATOR, from mem.c's ledger via core/bus.h; interp_access_begin is
+// the single chokepoint. The ledger holds HOST addresses (differing by g_nonpie_bias for a folded non-PIE
+// access) and reports the FIRST past-EOF byte, not the access base.
 static void interp_bus_ledger_check(uint64_t address, uint64_t bytes) {
-    // Inert for every guest that never maps a file past its end: g_bus is empty, so `enabled` is 0 and this
-    // is one relaxed atomic load per access.
-    if (!jit_guest_bus_active()) return;
+    if (!jit_guest_bus_active()) return; // inert unless some guest maps a file past its end
     uint64_t host = interp_guest_pointer(address);
     uint64_t host_fault = jit_guest_bus_fault(host, bytes);
     if (host_fault == 0) return;
@@ -242,10 +97,8 @@ static void interp_access_begin(uint64_t address, uint64_t bytes, int write) {
     g_interp_access_address = address;
     g_interp_access_bytes = bytes;
     g_interp_access_write = write;
-    // Publish LAST: the handler tests this flag to decide whether the fault is a guest memory fault, so the
-    // description must already be readable when it becomes true. Ordinary stores suffice -- the reader is a
-    // signal handler on this same thread, not another CPU -- but the compiler must not sink them past the
-    // flag, hence the barrier.
+    // Publish LAST: the handler reads this flag to decide the fault is a guest access, so the description
+    // must already be readable when it turns true.
     __atomic_store_n(&g_interp_access_active, 1, __ATOMIC_RELEASE);
 }
 
@@ -253,58 +106,31 @@ static void interp_access_end(void) {
     __atomic_store_n(&g_interp_access_active, 0, __ATOMIC_RELEASE);
 }
 
-// Called (via sigframe_capture_fault in core/target/aarch64.c) from the host SIGSEGV/SIGBUS guard on the
-// faulting thread. Returns 1 when the fault happened inside a marked guest access -- in which case *c is
-// ALREADY the correct guest state and there is nothing to reconstruct -- and 0 otherwise, so that a genuine
-// engine bug in our own C still reaches the crash report instead of being laundered into a guest signal.
-//
-// Note what is deliberately NOT tested: the host PC. The JIT's capture predicate is "is the host PC inside a
-// retained code cache", because that is the only way to tell emitted guest code from engine code when the
-// two share a register file. Here the arena holds no executable code at all, and the faulting host PC is
-// inside memcpy or inside this file -- indistinguishable from an engine bug by address. The marker is the
-// discriminator, and it is a strictly more precise one: it is set only around an access the GUEST asked for.
+// Called (via sigframe_capture_fault) from the host SIGSEGV/SIGBUS guard. 1 = the fault was inside a marked
+// guest access and *c is already correct; 0 = an engine bug in our own C, which must reach the crash report
+// rather than become a guest signal. The host PC, the JIT's discriminator, cannot separate the two here.
 static int interp_signal_capture(struct cpu *c, void *ucontext) {
     (void)ucontext;
     if (c == NULL) return 0;
     if (!__atomic_load_n(&g_interp_access_active, __ATOMIC_ACQUIRE)) return 0;
     if (g_interp_marker_cpu != c) return 0; // a fault on another thread's cpu is not this thread's to own
-    // The only state the caller cannot derive: which guest address the abandoned access was aiming at. The
-    // host siginfo's si_addr is the faulting HOST address, which differs from the guest address for a folded
-    // non-PIE access, and on some hosts is imprecise for a straddling access -- so record the exact
-    // architectural effective address the decoder computed. linux_abi/signal.c consumes fault_addr for the
-    // R_BUS path and fills sync_address from siginfo for the SIGSEGV path.
+    // si_addr is the HOST address: it differs for a folded non-PIE access, and some hosts are imprecise.
     c->fault_addr = g_interp_access_address;
     return 1;
 }
 
-// Called (via sigframe_resume_dispatch) once the handler has decided the guest owns this fault and has set
-// up c->sync_signal / c->sync_code / c->tpending / c->reason. Abandons the in-flight access and returns
-// control to run_block, which returns to the dispatcher with the reason the handler chose.
+// Called (via sigframe_resume_dispatch) once the handler has set c->sync_signal/sync_code/tpending/reason.
 static void interp_signal_resume(struct cpu *c, void *ucontext) {
     (void)ucontext;
     if (!g_interp_marker_armed || g_interp_marker_cpu != c) {
-        // Cannot happen through the capture-then-resume protocol (resume is only ever reached after
-        // interp_signal_capture returned 1, which already proved the marker belongs to this cpu). Returning
-        // is the only safe action left: the handler returns, the faulting access re-executes and re-faults,
-        // and the loop is at least visible rather than a jump through a stale buffer.
+        // Unreachable via capture-then-resume; returning re-faults visibly, better than a stale-buffer jump.
         return;
     }
     siglongjmp(g_interp_marker_jmp, 1);
 }
 
-// ---------------------------------------------------------------------------
-// Guest memory. Not yet used by any implemented instruction -- the integer core touches no memory -- but
-// written now because it is the framework the load/store group plugs into, and because getting the fault
-// bracketing right once is the point of this file.
-// ---------------------------------------------------------------------------
-// UNALIGNED ACCESS. AArch64 permits unaligned normal-memory loads and stores, and real guests rely on it.
-// memcpy is used rather than a cast-and-deref for two independent reasons: on a host that traps unaligned
-// access the deref would fault where the guest expects success, and even on x86-64 (where it would not)
-// dereferencing a misaligned pointer is undefined behaviour that the compiler is free to assume away.
-// The guest is little-endian AArch64 (the engine models no big-endian guest: see g_aarch64_cpu_model), and
-// every host CPU this file can be compiled for is little-endian too. That equality is what lets a guest value
-// be moved with a plain memcpy of its low-order bytes instead of an explicit per-byte assembly. It is an
-// assumption rather than a fact about C, so state it where it would break.
+// AArch64 permits unaligned access and real guests rely on it, so memcpy rather than cast-and-deref: a host
+// that traps unaligned would fault where the guest expects success, and a misaligned deref is UB anyway.
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #error "the aarch64 interpreter backend assumes a little-endian host"
 #endif
@@ -325,33 +151,20 @@ static int interp_write_guest(uint64_t address, const void *source, unsigned byt
     return 1;
 }
 
-// Load `bytes` (1, 2, 4 or 8) from the guest, zero-extended into a 64-bit value. The destination register is
-// written by the CALLER, after this has returned -- which is what makes the fault path clean: if the access
-// faults, the siglongjmp unwinds before any architectural state changed, so cpu->pc still names an
-// instruction that has not executed and the guest's own handler sees exactly that.
 static uint64_t interp_load_bits(uint64_t address, unsigned bytes) {
     uint64_t value = 0;
     interp_read_guest(address, &value, bytes);
     return value;
 }
 
-// Store the low `bytes` bytes of `value`. The caller has already read every source register into locals, so
-// an abandoned store likewise leaves no half-committed state.
 static void interp_store_bits(uint64_t address, uint64_t value, unsigned bytes) {
     interp_write_guest(address, &value, bytes);
 }
 
-// The host pointer an atomic read-modify-write operates on directly. The LSE and exclusive paths below need
-// the address as a pointer rather than as bytes, because their whole point is that the access is indivisible
-// and so cannot be expressed as a memcpy in and a memcpy out.
-//
-// Alignment is the guest's responsibility here and the architecture agrees: an atomic or exclusive access to
-// an unaligned address is a guest fault (SP alignment and atomicity both require natural alignment), so
-// refusing to proceed is correct rather than conservative. Returning NULL lets the caller raise it as such
-// instead of invoking a misaligned host atomic, which on some hosts silently loses atomicity.
-// A vector load/store of `bytes` (1, 2, 4, 8 or 16). Split into 64-bit chunks so it reuses the same
-// unaligned-safe, fault-marked path as an integer access. A load of fewer than 16 bytes zeroes the rest of the
-// destination register, which interp_vec_write handles via the q argument.
+// The host pointer an atomic RMW works on directly. An unaligned atomic or exclusive access is a guest
+// fault, so NULL lets the caller raise it rather than invoke a misaligned host atomic, which on some hosts
+// silently loses atomicity.
+// A vector load/store of 1..16 bytes on the fault-marked path; a short load zeroes the rest of the register.
 static void interp_vec_load(struct cpu *cpu, int reg, uint64_t address, unsigned bytes);
 static void interp_vec_store(struct cpu *cpu, int reg, uint64_t address, unsigned bytes);
 
@@ -361,13 +174,8 @@ static void *interp_atomic_pointer(uint64_t address, unsigned bytes) {
     return (void *)(uintptr_t)host;
 }
 
-// ---------------------------------------------------------------------------
-// Guest register file and condition flags.
-// ---------------------------------------------------------------------------
-// Register 31 means XZR in most encodings and SP in a few (the add/sub immediate and add/sub extended-
-// register forms, and the destination of a non-flag-setting logical immediate). Getting that wrong is a
-// silent wrong-answer bug, so the two meanings get two differently-named accessors at every use site rather
-// than one accessor and a per-site flag.
+// Register 31 is XZR in most encodings and SP in a few (add/sub immediate and extended-register, and a
+// non-flag-setting logical immediate's destination): a silent wrong-answer bug, hence two named accessors.
 static uint64_t interp_gpr(const struct cpu *cpu, int reg) {
     return reg == 31 ? UINT64_C(0) : cpu->x[reg];
 }
@@ -387,8 +195,7 @@ static void interp_set_gpr_sp(struct cpu *cpu, int reg, uint64_t value) {
         cpu->x[reg] = value;
 }
 
-// A 32-bit result always zero-extends into the 64-bit register; there is no partial-register write on
-// AArch64. Funnelling every 32-bit destination through here is what keeps that invariant in one place.
+// A 32-bit result always zero-extends into the 64-bit register; every 32-bit destination goes through here.
 static void interp_set_gpr32(struct cpu *cpu, int reg, uint32_t value) {
     interp_set_gpr(cpu, reg, (uint64_t)value);
 }
@@ -397,12 +204,8 @@ static void interp_set_gpr32_sp(struct cpu *cpu, int reg, uint32_t value) {
     interp_set_gpr_sp(cpu, reg, (uint64_t)value);
 }
 
-// cpu->nzcv holds the flags EXACTLY as `mrs Xt, nzcv` reads them and `msr nzcv, Xt` writes them: N at bit
-// 31, Z at 30, C at 29, V at 28, everything else zero. That is the JIT's representation (stubs.c spills with
-// `mrs x0,nzcv` and reloads with `msr nzcv,x9`), and it is also what crosses a signal frame: guest/aarch64/
-// signal.c stores cpu->nzcv into the sigcontext's pstate word at mc+272 and reads it straight back on
-// sigreturn. So a guest handler that inspects uc_mcontext.pstate, and a checkpoint written by either
-// backend, both see the same bits. Do not switch to a packed 4-bit form.
+// cpu->nzcv holds the flags EXACTLY as `mrs Xt, nzcv` reads them: N at 31, Z at 30, C at 29, V at 28, rest
+// zero -- the JIT's form, and what signal.c stores into the sigcontext pstate word at mc+272 and reads back.
 #define INTERP_NZCV_N (UINT64_C(1) << 31)
 #define INTERP_NZCV_Z (UINT64_C(1) << 30)
 #define INTERP_NZCV_C (UINT64_C(1) << 29)
@@ -413,43 +216,31 @@ static void interp_set_flags(struct cpu *cpu, unsigned n, unsigned z, unsigned c
                 (v ? INTERP_NZCV_V : 0);
 }
 
-// FPCR/FPSR. Per-thread, and deliberately NOT added to struct cpu -- that layout is the checkpoint format and
-// is shared with the JIT, which does not model these fields either (emitted code uses the host's real FPCR,
-// which is only meaningful when the host is AArch64). These two words ARE this backend's floating-point
-// control and status: FPCR.RMode selects the rounding of every FP result, FPCR.FZ/FZ16/DN change what the
-// arithmetic does with denormals and NaNs, and FPSR accumulates the five IEEE exception bits plus the AdvSIMD
-// saturation bit. See the "Floating point" section below for how they are consumed.
-//
-// They are guest-visible by two routes and must agree on both: MRS/MSR (the cases in interp_exec_branch_system
-// above), and the FPSIMD record guest/aarch64/signal.c writes into a signal frame, which carries FPSR and FPCR
-// as the two words following V31 -- so a guest handler that inspects uc_mcontext's fpsimd_context reads exactly
-// these.
+// FPCR/FPSR. Per-thread, and NOT in struct cpu -- that layout is the checkpoint format shared with the JIT,
+// which does not model them. Guest-visible by MRS/MSR and by signal.c's FPSIMD record; the two must agree.
 static __thread uint64_t g_interp_fpcr;
 static __thread uint64_t g_interp_fpsr;
 
-// FPCR fields. Only these are modelled; everything else a guest writes is dropped by INTERP_FPCR_WRITABLE,
-// which is itself a deliberate, guest-visible answer (see the MSR FPCR case).
+// FPCR fields; only these are modelled.
 #define INTERP_FPCR_FZ16(f) (((f) >> 19) & 1u)  // flush-to-zero for HALF-precision operations
 #define INTERP_FPCR_RMODE(f) (((f) >> 22) & 3u) // 00 nearest-even, 01 +inf, 10 -inf, 11 zero
 #define INTERP_FPCR_FZ(f) (((f) >> 24) & 1u)    // flush-to-zero for single/double
 #define INTERP_FPCR_DN(f) (((f) >> 25) & 1u)    // default-NaN mode
 #define INTERP_FPCR_AHP(f) (((f) >> 26) & 1u)   // alternative (non-IEEE) half-precision format
 
-// The bits MSR FPCR may set. Everything else -- notably the six exception TRAP-ENABLE bits IDE/IXE/UFE/OFE/
-// DZE/IOE at [15:8] -- reads back as zero, which is how the architecture spells "this implementation does not
-// support trapped floating-point exceptions", and is the truth here: nothing below ever traps.
+// The bits MSR FPCR may set. The rest -- notably the trap-enable bits at [15:8] -- reads back zero, the
+// architectural spelling of "no trapped FP exceptions": nothing here traps.
 #define INTERP_FPCR_WRITABLE                                                                                           \
     ((UINT64_C(1) << 19) | (UINT64_C(3) << 22) | (UINT64_C(1) << 24) | (UINT64_C(1) << 25) | (UINT64_C(1) << 26))
 
-// FPSR cumulative-exception bits, at their architectural positions. QC is the AdvSIMD saturation flag; it is
-// not an IEEE exception and is set by the saturating integer instructions rather than by the FP core.
+// FPSR cumulative-exception bits, at their architectural positions.
 #define INTERP_FPSR_IOC 0x01u      // invalid operation
 #define INTERP_FPSR_DZC 0x02u      // divide by zero
 #define INTERP_FPSR_OFC 0x04u      // overflow
 #define INTERP_FPSR_UFC 0x08u      // underflow
 #define INTERP_FPSR_IXC 0x10u      // inexact
-#define INTERP_FPSR_IDC 0x80u      // input denormal (set only when FPCR.FZ actually flushed one)
-#define INTERP_FPSR_QC 0x08000000u // AdvSIMD cumulative saturation
+#define INTERP_FPSR_IDC 0x80u      // input denormal: only when FPCR.FZ flushed one
+#define INTERP_FPSR_QC 0x08000000u // AdvSIMD saturation, not an IEEE exception: set by saturating integer ops
 #define INTERP_FPSR_WRITABLE (0x9Fu | INTERP_FPSR_QC)
 
 static void interp_fpsr_raise(unsigned bits) {
@@ -464,8 +255,7 @@ static unsigned interp_flag_c(const struct cpu *cpu) { return (cpu->nzcv & INTER
 
 static unsigned interp_flag_v(const struct cpu *cpu) { return (cpu->nzcv & INTERP_NZCV_V) != 0; }
 
-// ConditionHolds(). The low bit of the condition field inverts the test, except for the 0b111x pair where
-// 0b1111 (NV) also means "always" -- the architecture defines NV as AL, not as "never".
+// ConditionHolds(). The low bit inverts the test, except for 0b1111 (NV), which is AL, not "never".
 static int interp_cond_holds(const struct cpu *cpu, unsigned cond) {
     unsigned n = interp_flag_n(cpu), z = interp_flag_z(cpu), c = interp_flag_c(cpu), v = interp_flag_v(cpu);
     int result;
@@ -483,9 +273,7 @@ static int interp_cond_holds(const struct cpu *cpu, unsigned cond) {
     return result;
 }
 
-// AddWithCarry(). Returns the result and, when `flags` is non-NULL, the NZCV it would set. Subtraction is
-// expressed as AddWithCarry(a, ~b, 1), which is how the architecture defines it and is why SUBS leaves C set
-// on "no borrow" rather than clear.
+// AddWithCarry(). Subtraction is AddWithCarry(a, ~b, 1), which is why SUBS leaves C set on "no borrow".
 static uint64_t interp_add_with_carry64(uint64_t a, uint64_t b, unsigned carry_in, struct cpu *cpu, int set) {
     uint64_t partial, result;
     int carry_a = __builtin_add_overflow(a, b, &partial);
@@ -506,7 +294,7 @@ static uint32_t interp_add_with_carry32(uint32_t a, uint32_t b, unsigned carry_i
     return result;
 }
 
-// Logical operations set N and Z from the result and always CLEAR C and V (they do not compute a carry).
+// Logical operations set N and Z from the result and always CLEAR C and V.
 static void interp_set_logical_flags(struct cpu *cpu, uint64_t result, unsigned sf) {
     unsigned negative = sf ? (unsigned)((result >> 63) & 1) : (unsigned)((result >> 31) & 1);
     uint64_t masked = sf ? result : (uint32_t)result;
@@ -522,15 +310,9 @@ static uint64_t interp_ror64(uint64_t value, unsigned amount) {
     return amount ? ((value >> amount) | (value << (64 - amount))) : value;
 }
 
-// CRC32/CRC32C, in the REFLECTED form the architecture defines. ARM spells it as bit-reversing the operands,
-// doing a polynomial division by the generator, and bit-reversing the result; that is algebraically identical to
-// the ordinary table-free reflected CRC loop below, which is also what the zlib and ACLE `__crc32*` spellings
-// compute -- so a guest that checksums with these and compares against its own software CRC agrees. The two
-// constants are the reflections of 0x04C11DB7 (CRC-32) and 0x1EDC6F41 (CRC-32C, Castagnoli).
-//
-// The data operand is consumed LOW BYTE FIRST, which is what makes CRC32X equal to two CRC32W steps over the
-// same little-endian bytes. An implementation that fed it high byte first would produce plausible-looking
-// checksums that never match anything, with no other symptom.
+// CRC32/CRC32C in the architecture's REFLECTED form, which this table-free loop and zlib/ACLE `__crc32*`
+// agree on. The constants reflect 0x04C11DB7 and 0x1EDC6F41 (Castagnoli). The data operand is consumed LOW
+// BYTE FIRST; high byte first gives checksums that never match, with no other symptom.
 static uint64_t interp_crc32(uint32_t accumulator, uint64_t data, unsigned bytes, int castagnoli) {
     uint32_t polynomial = castagnoli ? 0x82F63B78u : 0xEDB88320u;
     for (unsigned index = 0; index < bytes; index++) {
@@ -546,9 +328,8 @@ static uint32_t interp_ror32(uint32_t value, unsigned amount) {
     return amount ? ((value >> amount) | (value << (32 - amount))) : value;
 }
 
-// DecodeBitMasks(). Shared by the logical-immediate group (immediate = 1, which forbids the all-ones
-// element) and by the bitfield group (immediate = 0, which permits it). Returns 0 for an encoding the
-// architecture leaves UNDEFINED so the caller can route it to interp_undefined rather than invent a result.
+// DecodeBitMasks(). immediate = 1 (logical-immediate group) forbids the all-ones element, 0 (bitfield group)
+// permits it. Returns 0 for an encoding the architecture leaves UNDEFINED, so the caller can refuse it.
 static int interp_bit_masks(unsigned sf, unsigned immn, unsigned imms, unsigned immr, int immediate,
                            uint64_t *wmask_out, uint64_t *tmask_out) {
     uint32_t combined = (immn << 6) | ((~imms) & 0x3Fu); // N : NOT(imms)
@@ -580,81 +361,32 @@ static int interp_bit_masks(unsigned sf, unsigned immn, unsigned imms, unsigned 
     return 1;
 }
 
-// ---------------------------------------------------------------------------
-// The other exit: an architecturally-defined trap, delivered to the guest.
-// ---------------------------------------------------------------------------
-// The counterpart of interp_undefined below, and the two must never be confused. This one is for an
-// instruction the ARCHITECTURE defines as raising a synchronous exception at EL0 -- UDF and the whole
-// RESERVED group, BRK, HLT, HVC/SMC/DCPS. Those are guest events: Linux turns them into a signal at the
-// faulting PC and the program may well survive (a SIGILL handler that advances uc_mcontext.pc past the word
-// is the documented way to probe for an instruction, and __builtin_trap's BRK is caught by any debugger or
-// crash reporter the guest installs). Reporting them as an engine gap would stop the run with exit code 70
-// and lose the program; conversely, turning a genuine gap into a silent SIGILL would replace a precise
-// "encoding 0x… class=…" message with an obscure guest crash. Hence two functions, and every decode site
-// picks one deliberately.
-//
-// WHY THIS IS NOT JUST raise_guest_signal(). Linux delivers a fault-class signal with a full siginfo --
-// si_code says WHICH kind of illegal instruction (ILL_ILLOPC) or trap (TRAP_BRKPT), and si_addr is the
-// faulting PC -- and it FORCES delivery: force_sig_fault ignores the thread's signal mask, because a
-// synchronous fault whose handler never runs would simply re-execute the same instruction forever.
-// raise_guest_signal is the process-directed kill(2)-shaped route: it stamps SI_USER, carries no address,
-// and honours the mask. So this composes the two mechanisms linux_abi/signal.c already has, exactly as
-// raise_guest_bus/raise_guest_fetch_fault do for a memory fault:
-//
-//   1. c->sync_signal / c->sync_code / c->sync_address are the SYNCHRONOUS siginfo. maybe_deliver_signal
-//      reads them (rather than the async g_sigcode/g_sigaddr slots) precisely when the signal arrives via
-//      the THREAD-directed pending word and c->sync_signal names it -- `synchronous = had_t &&
-//      c->sync_signal == sig` in signal.c.
-//   2. Clearing the mask bit is what makes it forced.
-//   3. raise_guest_signal is still called, because it -- and nothing reachable from this file -- owns the
-//      DISPOSITION: SIG_DFL for these fatal-default signals goes through guest_group_fatal (so the parent's
-//      wait4 reconstructs WIFSIGNALED/WTERMSIG and the core-dump flag, which is what sigill_probe's forked
-//      child pins), SIG_IGN drops it, and a handler gets it queued. g_sigact is a file-static of an
-//      anonymous struct type in signal.c and cannot be declared here, so there is no way to ask the
-//      question directly.
-//   4. sigq_flush then converts that PROCESS-wide queued instance into the THREAD-directed one a
-//      synchronous fault must be: without it the instance sits in the process queue where an unrelated
-//      guest thread could claim it -- running the handler on the wrong thread with SI_USER siginfo -- and
-//      this thread would ALSO deliver it via the tpending bit set below. One synchronous fault, one
-//      delivery, on the thread that took it.
-//
-// The residual gap, which needs a change outside this file: with SIG_IGN installed, Linux resets the
-// disposition and kills the process (force_sig_info_to_task), while here step 3 drops the signal and the
-// instruction re-executes forever. Closing it needs a raise_guest_sync_signal(c, sig, code, addr) beside
-// raise_guest_bus() in linux_abi/signal.c -- which would also collapse steps 1-4 into one call.
-// (`si_code`/`si_addr` are glibc macros over siginfo_t's union, so the parameters cannot carry those names.)
+// A trap the ARCHITECTURE defines -- UDF and the RESERVED group, BRK, HLT, HVC/SMC/DCPS -- not a gap in this
+// backend: a guest event the program may well survive, where interp_undefined below must stop the run; every
+// decode site picks one of the two deliberately. Not plain raise_guest_signal(), the mask-honouring SI_USER
+// route: Linux delivers a fault-class signal with full siginfo and FORCES it past the mask, since a
+// synchronous fault whose handler never runs re-executes forever. Hence the sync siginfo fields, the
+// unmasking, and sigq_flush to make the queued instance THREAD-directed -- else another thread could claim it
+// AND this one would deliver it again via tpending. Gap: under SIG_IGN Linux kills the process while this
+// drops the signal and loops (needs a raise_guest_sync_signal() in signal.c).
 static void interp_raise_sync_signal(struct cpu *cpu, int signo, int signal_code, uint64_t fault_address) {
     cpu->sync_signal = signo;
     cpu->sync_code = signal_code;
     cpu->sync_address = fault_address;
-    cpu->sigmask &= ~(1ull << (signo - 1)); // forced: a sync fault is delivered even if the guest blocked it
+    cpu->sigmask &= ~(1ull << (signo - 1)); // forced: delivered even if the guest blocked it
     raise_guest_signal(cpu, signo);         // owns the disposition; does not return for SIG_DFL
-    sigq_flush(signo);                      // drop the process-directed instance it queued (see 4 above)
+    sigq_flush(signo);                      // drop the process-directed instance it queued
     __atomic_or_fetch(&cpu->tpending, 1ull << signo, __ATOMIC_SEQ_CST);
-    // Resume as a plain branch. cpu->pc has been left ON the trapping instruction by the caller, which is
-    // both what the guest's frame must name and what makes a handler that returns without advancing re-take
-    // the trap -- real Linux behaviour for every member of this group.
+    // cpu->pc is left ON the trapping instruction: what the guest's frame must name, and what makes a
+    // handler that returns without advancing re-take the trap, as Linux does here.
     cpu->reason = R_BRANCH;
 }
 
-// ---------------------------------------------------------------------------
-// The one diagnostic exit.
-// ---------------------------------------------------------------------------
-// Every encoding this backend cannot execute funnels through here, and it means exactly one thing: THIS BACKEND
-// HAS A GAP. It deliberately does not also mean "the guest executed something illegal", because the two demand
-// opposite responses -- a gap must stop the engine loudly, an illegal instruction must become a guest SIGILL and
-// let the program carry on -- and guessing wrong in either direction is worse than saying exactly what was seen.
-//
-// Where the architecture makes the distinction unambiguous, it is drawn at the decode site rather than here.
-// interp_step's op0 == 0000 case is the whole of the RESERVED group, so every encoding in it is UNDEFINED by
-// definition and raises a guest SIGILL; the exception-generation box likewise raises SIGTRAP for BRK and SIGILL
-// for HLT/HVC/SMC. What is left over is genuinely "not written yet", which is what this report says.
-//
-// The report goes out two ways, because the two answer different questions. stderr is what a developer
-// running the engine by hand needs and is the only route guaranteed to be visible (HL_ENABLE_LOGGING is 0 in
-// the production build, which compiles hl_fatal_report's log emit out entirely). jit_fail() latches the
-// status into g_jit_fatal, which the dispatcher tests at the top of every iteration -- that is what actually
-// STOPS the guest, cleanly, with exit code 70, instead of letting it run on with a skipped instruction.
+// The one diagnostic exit. Reaching it means THIS BACKEND HAS A GAP, never "the guest executed something
+// illegal" -- opposite responses; where the architecture is unambiguous the split is made at the decode site
+// (op0 == 0000, the RESERVED group, raises SIGILL; the exception-generation box SIGTRAP for BRK). stderr is
+// the only route guaranteed visible (HL_ENABLE_LOGGING is 0 in production); jit_fail's g_jit_fatal stops the
+// guest with exit code 70.
 static int interp_undefined(struct cpu *cpu, uint32_t insn, const char *class_name) {
     char message[320];
     int written = snprintf(message, sizeof message,
@@ -667,20 +399,17 @@ static int interp_undefined(struct cpu *cpu, uint32_t insn, const char *class_na
     if ((size_t)written >= sizeof message) written = (int)sizeof message - 1;
     fprintf(stderr, "%s\n", message);
     (void)jit_fail(HL_STATUS_NOT_SUPPORTED, message, (size_t)written);
-    // Leave cpu->pc ON the offending instruction so the message and the architectural state agree, and exit
-    // as an ordinary branch: the dispatcher's fatal check at the top of the next iteration is what ends the
-    // run, and R_BRANCH is the only reason that does not additionally misinterpret the state on the way out.
+    // Leave cpu->pc ON the offending instruction so message and state agree; the dispatcher's fatal check
+    // ends the run next iteration, and R_BRANCH is the only exit that does not misread it.
     cpu->reason = R_BRANCH;
     return 1;
 }
 
-// ---------------------------------------------------------------------------
 // Decode and execute.
-// ---------------------------------------------------------------------------
-#define INTERP_NEXT 0 // the instruction completed; cpu->pc has been advanced; keep going in this block
-#define INTERP_END 1  // the block ends here; cpu->reason and cpu->pc are final
+#define INTERP_NEXT 0 // instruction done, cpu->pc advanced; continue the block
+#define INTERP_END 1  // block ends here; cpu->reason and cpu->pc are final
 
-// Data processing -- immediate. Sub-class selected by insn[25:23], as in the ARM ARM table.
+// Data processing -- immediate; sub-class from insn[25:23].
 static int interp_exec_dp_immediate(struct cpu *cpu, uint32_t insn) {
     uint64_t gpc = cpu->pc;
     unsigned group = (insn >> 23) & 7;
@@ -692,7 +421,7 @@ static int interp_exec_dp_immediate(struct cpu *cpu, uint32_t insn) {
     case 1: { // PC-relative addressing: ADR / ADRP
         int64_t immediate = interp_sext((((insn >> 5) & 0x7FFFFu) << 2) | ((insn >> 29) & 3u), 21);
         uint64_t value;
-        if (insn & 0x80000000u) // ADRP: page-aligned base, immediate scaled by 4 KiB
+        if (insn & 0x80000000u) // ADRP: page base, immediate scaled by 4 KiB
             value = (pcrel_base(gpc) & ~UINT64_C(0xFFF)) + ((uint64_t)immediate << 12);
         else
             value = pcrel_base(gpc) + (uint64_t)immediate;
@@ -704,8 +433,7 @@ static int interp_exec_dp_immediate(struct cpu *cpu, uint32_t insn) {
         unsigned op = (insn >> 30) & 1, setflags = (insn >> 29) & 1, shift = (insn >> 22) & 1;
         uint64_t immediate = (insn >> 10) & 0xFFFu;
         if (shift) immediate <<= 12;
-        // Rn is <Xn|SP> in every form. Rd is <Xd|SP> for ADD/SUB but <Xd> (XZR) for ADDS/SUBS, which is what
-        // makes `cmp` (SUBS xzr, ...) discard its result instead of writing SP.
+        // Rn is <Xn|SP>; Rd is <Xd|SP> for ADD/SUB but XZR for ADDS/SUBS, so `cmp` discards its result.
         if (sf) {
             uint64_t a = interp_gpr_sp(cpu, rn);
             uint64_t result = op ? interp_add_with_carry64(a, ~immediate, 1, cpu, (int)setflags)
@@ -726,7 +454,7 @@ static int interp_exec_dp_immediate(struct cpu *cpu, uint32_t insn) {
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
-    case 3: // Add/subtract (immediate, with tags): ADDG/SUBG, part of MTE.
+    case 3: // Add/subtract (immediate, with tags): MTE
         return interp_undefined(cpu, insn, "data-processing immediate -- ADDG/SUBG (memory tagging)");
     case 4: { // Logical (immediate)
         unsigned opc = (insn >> 29) & 3, immn = (insn >> 22) & 1;
@@ -769,7 +497,7 @@ static int interp_exec_dp_immediate(struct cpu *cpu, uint32_t insn) {
             result = ~field; // MOVN
         else if (opc == 2)
             result = field; // MOVZ
-        else                // MOVK: keep the other halfwords of the current value
+        else                // MOVK: keep the other halfwords
             result = (interp_gpr(cpu, rd) & ~(UINT64_C(0xFFFF) << shift)) | field;
         if (sf)
             interp_set_gpr(cpu, rd, result);
@@ -778,7 +506,7 @@ static int interp_exec_dp_immediate(struct cpu *cpu, uint32_t insn) {
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
-    case 6: { // Bitfield: SBFM / BFM / UBFM (and every alias: SXTB..ASR, BFI/BFXIL, UBFX/LSL/LSR)
+    case 6: { // Bitfield: SBFM / BFM / UBFM and every alias
         unsigned opc = (insn >> 29) & 3, immn = (insn >> 22) & 1;
         unsigned immr = (insn >> 16) & 0x3Fu, imms = (insn >> 10) & 0x3Fu;
         uint64_t wmask, tmask;
@@ -789,7 +517,7 @@ static int interp_exec_dp_immediate(struct cpu *cpu, uint32_t insn) {
         uint64_t source = interp_gpr(cpu, rn);
         uint64_t rotated = sf ? interp_ror64(source, immr) : (uint64_t)interp_ror32((uint32_t)source, immr);
         uint64_t result;
-        if (opc == 1) { // BFM: keep the destination bits outside the inserted field
+        if (opc == 1) { // BFM: keep Rd's bits outside the field
             uint64_t destination = interp_gpr(cpu, rd);
             uint64_t bottom = (destination & ~wmask) | (rotated & wmask);
             result = (destination & ~tmask) | (bottom & tmask);
@@ -806,7 +534,7 @@ static int interp_exec_dp_immediate(struct cpu *cpu, uint32_t insn) {
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
-    default: { // 7: Extract -- EXTR (and its ROR alias when Rn == Rm)
+    default: { // 7: Extract -- EXTR (ROR when Rn == Rm)
         unsigned immn = (insn >> 22) & 1, imms = (insn >> 10) & 0x3Fu;
         int rm = (int)((insn >> 16) & 31);
         if (((insn >> 29) & 3) != 0 || ((insn >> 21) & 1) != 0 || immn != sf)
@@ -828,8 +556,7 @@ static int interp_exec_dp_immediate(struct cpu *cpu, uint32_t insn) {
     }
 }
 
-// ShiftReg(): the shift a data-processing-register operand applies to Rm. `amount` is already masked to the
-// operand size by the encoding (imm6's top bit is reserved in 32-bit forms, which the caller rejects).
+// ShiftReg(). `amount` is already masked to the operand size by the encoding.
 static uint64_t interp_shift_operand(uint64_t value, unsigned shift_type, unsigned amount, unsigned sf) {
     if (sf) {
         switch (shift_type) {
@@ -848,12 +575,9 @@ static uint64_t interp_shift_operand(uint64_t value, unsigned shift_type, unsign
     }
 }
 
-// ExtendReg(): the sign/zero-extended, then shifted, Rm of an add/sub extended-register form. option selects
-// the source width and signedness; UXTX/SXTX (option 3/7) read the whole 64-bit register.
+// ExtendReg(): Rm sign/zero-extended per `option`, then shifted. UXTX/SXTX read the whole register.
 static uint64_t interp_extend_operand(const struct cpu *cpu, int rm, unsigned option, unsigned shift,
                                       unsigned sf) {
-    // The register read is <R><m>, which is Wm for every option except UXTX/SXTX. Reading the full 64-bit
-    // value and masking below is equivalent and avoids a second accessor.
     uint64_t value = interp_gpr(cpu, rm);
     uint64_t extended;
     switch (option) {
@@ -870,15 +594,13 @@ static uint64_t interp_extend_operand(const struct cpu *cpu, int rm, unsigned op
     return sf ? extended : (uint64_t)(uint32_t)extended;
 }
 
-// Data processing -- register. Sub-class selected by insn[28:21] together with insn[30] (op0/op1/op2/op3 in
-// the ARM ARM table); the tests below are written in the order that table lists them.
+// Data processing -- register; sub-class from insn[28:21] plus insn[30], in ARM ARM table order.
 static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
     uint64_t gpc = cpu->pc;
     unsigned sf = (insn >> 31) & 1;
     int rd = (int)(insn & 31), rn = (int)((insn >> 5) & 31), rm = (int)((insn >> 16) & 31);
 
-    // Add/subtract (shifted register) and Add/subtract (extended register) share insn[28:24] == 01011 and are
-    // separated by insn[21].
+    // Add/subtract, shifted and extended register; insn[21] separates them.
     if ((insn & 0x1F000000u) == 0x0B000000u) {
         unsigned op = (insn >> 30) & 1, setflags = (insn >> 29) & 1;
         uint64_t operand;
@@ -887,14 +609,14 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
             unsigned option = (insn >> 13) & 7, shift = (insn >> 10) & 7;
             if (shift > 4) return interp_undefined(cpu, insn, "data-processing register -- extend shift > 4");
             operand = interp_extend_operand(cpu, rm, option, shift, sf);
-            destination_is_sp = 1; // Rn is <Xn|SP>, and Rd is <Xd|SP> unless flag-setting
+            destination_is_sp = 1; // Rn is <Xn|SP>; Rd too unless flag-setting
         } else { // shifted register
             unsigned shift_type = (insn >> 22) & 3, amount = (insn >> 10) & 0x3Fu;
             if (shift_type == 3) return interp_undefined(cpu, insn, "data-processing register -- add/sub ROR");
             if (!sf && (amount & 0x20u))
                 return interp_undefined(cpu, insn, "data-processing register -- 32-bit add/sub shift > 31");
             operand = interp_shift_operand(interp_gpr(cpu, rm), shift_type, amount, sf);
-            destination_is_sp = 0; // this form names neither SP; encoding 31 is XZR throughout
+            destination_is_sp = 0; // this form names no SP; 31 is XZR throughout
         }
         if (sf) {
             uint64_t a = destination_is_sp ? interp_gpr_sp(cpu, rn) : interp_gpr(cpu, rn);
@@ -917,7 +639,7 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // Logical (shifted register): insn[28:24] == 01010. opc selects AND/ORR/EOR/ANDS and N inverts Rm.
+    // Logical (shifted register). opc selects AND/ORR/EOR/ANDS and N inverts Rm.
     if ((insn & 0x1F000000u) == 0x0A000000u) {
         unsigned opc = (insn >> 29) & 3, shift_type = (insn >> 22) & 3, negate = (insn >> 21) & 1;
         unsigned amount = (insn >> 10) & 0x3Fu;
@@ -928,7 +650,7 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
         uint64_t a = interp_gpr(cpu, rn), result;
         switch (opc) {
         case 0: result = a & operand; break;  // AND / BIC
-        case 1: result = a | operand; break;  // ORR / ORN  (MOV register is ORR with Rn == XZR)
+        case 1: result = a | operand; break;  // ORR / ORN  (MOV reg is ORR with Rn == XZR)
         case 2: result = a ^ operand; break;  // EOR / EON
         default: result = a & operand; break; // ANDS / BICS
         }
@@ -942,13 +664,12 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // Everything remaining in this group has insn[28:24] == 11010 or 11011.
     if ((insn & 0x1F000000u) == 0x1B000000u) { // Data-processing (3 source)
         unsigned op31 = (insn >> 21) & 7, o0 = (insn >> 15) & 1;
         int ra = (int)((insn >> 10) & 31);
         uint64_t addend = interp_gpr(cpu, ra);
         switch (op31) {
-        case 0: { // MADD / MSUB (and MUL / MNEG, which are these with Ra == XZR)
+        case 0: { // MADD / MSUB (MUL / MNEG with Ra == XZR)
             if (sf) {
                 uint64_t product = interp_gpr(cpu, rn) * interp_gpr(cpu, rm);
                 interp_set_gpr(cpu, rd, o0 ? addend - product : addend + product);
@@ -959,7 +680,7 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
             }
             break;
         }
-        case 1: { // SMADDL / SMSUBL (SMULL / SMNEGL with Ra == XZR); 64-bit form only
+        case 1: { // SMADDL / SMSUBL (SMULL / SMNEGL with Ra == XZR)
             if (!sf) return interp_undefined(cpu, insn, "data-processing register -- 32-bit widening multiply");
             int64_t product = (int64_t)(int32_t)interp_gpr(cpu, rn) * (int64_t)(int32_t)interp_gpr(cpu, rm);
             interp_set_gpr(cpu, rd, o0 ? addend - (uint64_t)product : addend + (uint64_t)product);
@@ -971,7 +692,7 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
             interp_set_gpr(cpu, rd, (uint64_t)(product >> 64));
             break;
         }
-        case 5: { // UMADDL / UMSUBL (UMULL / UMNEGL with Ra == XZR); 64-bit form only
+        case 5: { // UMADDL / UMSUBL (UMULL / UMNEGL with Ra == XZR)
             if (!sf) return interp_undefined(cpu, insn, "data-processing register -- 32-bit widening multiply");
             uint64_t product = (uint64_t)(uint32_t)interp_gpr(cpu, rn) * (uint64_t)(uint32_t)interp_gpr(cpu, rm);
             interp_set_gpr(cpu, rd, o0 ? addend - product : addend + product);
@@ -990,7 +711,7 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    if ((insn & 0x1FE00000u) == 0x1A000000u) { // Add/subtract (with carry): ADC / ADCS / SBC / SBCS
+    if ((insn & 0x1FE00000u) == 0x1A000000u) { // ADC / ADCS / SBC / SBCS
         unsigned op = (insn >> 30) & 1, setflags = (insn >> 29) & 1;
         if ((insn & 0x0000FC00u) != 0) return interp_undefined(cpu, insn, "data-processing register -- rotate/flag ops");
         unsigned carry = interp_flag_c(cpu);
@@ -1009,15 +730,14 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    if ((insn & 0x1FE00000u) == 0x1A400000u) { // Conditional compare (register and immediate): CCMN / CCMP
+    if ((insn & 0x1FE00000u) == 0x1A400000u) { // Conditional compare: CCMN / CCMP
         unsigned op = (insn >> 30) & 1, setflags = (insn >> 29) & 1;
         unsigned cond = (insn >> 12) & 0xFu, immediate_form = (insn >> 11) & 1;
         unsigned nzcv = insn & 0xFu;
         if (!setflags || ((insn >> 10) & 1) != 0 || ((insn >> 4) & 1) != 0)
             return interp_undefined(cpu, insn, "data-processing register -- unallocated conditional-compare form");
         if (!interp_cond_holds(cpu, cond)) {
-            // Condition failed: NZCV is REPLACED by the encoded literal. Not "left alone" -- that literal is
-            // how a chained compare passes a known-false verdict down to the next CCMP.
+            // Condition failed: NZCV is REPLACED by the encoded nzcv literal, not left alone.
             interp_set_flags(cpu, (nzcv >> 3) & 1, (nzcv >> 2) & 1, (nzcv >> 1) & 1, nzcv & 1);
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
@@ -1040,7 +760,7 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    if ((insn & 0x1FE00000u) == 0x1A800000u) { // Conditional select: CSEL / CSINC / CSINV / CSNEG
+    if ((insn & 0x1FE00000u) == 0x1A800000u) { // CSEL / CSINC / CSINV / CSNEG
         unsigned op = (insn >> 30) & 1, setflags = (insn >> 29) & 1, op2 = (insn >> 10) & 3;
         if (setflags || (op2 & 2))
             return interp_undefined(cpu, insn, "data-processing register -- unallocated conditional-select form");
@@ -1084,7 +804,7 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
                 result = ((wide & UINT64_C(0x00FF00FF00FF00FF)) << 8) | ((wide >> 8) & UINT64_C(0x00FF00FF00FF00FF));
                 break;
             }
-            case 2: // REV (32-bit form) / REV32 (64-bit form): byte-swap within each word
+            case 2: // REV (32-bit form) / REV32 (64-bit form)
                 if (sf) {
                     uint64_t wide = value;
                     result = ((wide & UINT64_C(0x000000FF000000FF)) << 24) |
@@ -1106,12 +826,8 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
                     result = (uint32_t)value ? (uint64_t)__builtin_clz((uint32_t)value) : 32u;
                 break;
             case 5: { // CLS
-                // CountLeadingSignBits(x) is CLZ over the (datasize-1)-bit value x[N-1:1] EOR x[N-2:0]. That
-                // narrower value is bits [N-1:1] of (x ^ (x << 1)), so it has to be SHIFTED DOWN before the
-                // count, and the count is then one less than a full-width CLZ because the value is one bit
-                // short. An all-ones operand is the case that catches getting this wrong: the fold is 1, the
-                // narrowed value is 0, and the answer is the full 63 (every bit matches the sign bit) rather
-                // than anything a CLZ of the unshifted fold could produce.
+                // CountLeadingSignBits is CLZ over bits [N-1:1] of (x ^ (x << 1)): the fold must be shifted
+                // DOWN first, and the count is one less than a full-width CLZ. All-ones is the catching case.
                 if (sf) {
                     uint64_t narrowed = (value ^ (value << 1)) >> 1;
                     result = narrowed ? (uint64_t)__builtin_clzll(narrowed) - 1u : 63u;
@@ -1130,18 +846,17 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
         }
-        // insn[30] == 0: 2 source
         unsigned opcode = (insn >> 10) & 0x3Fu;
         if ((insn >> 29) & 1) return interp_undefined(cpu, insn, "data-processing register -- flag-setting 2-source");
         uint64_t a = interp_gpr(cpu, rn), b = interp_gpr(cpu, rm), result;
         switch (opcode) {
-        case 2: // UDIV: division by zero yields 0, it does not trap
+        case 2: // UDIV: /0 yields 0, it does not trap
             if (sf)
                 result = b ? a / b : 0;
             else
                 result = (uint32_t)b ? (uint64_t)((uint32_t)a / (uint32_t)b) : 0;
             break;
-        case 3: // SDIV: division by zero yields 0; INT_MIN / -1 saturates to INT_MIN (no overflow trap)
+        case 3: // SDIV: /0 yields 0, INT_MIN / -1 saturates to INT_MIN; neither traps
             if (sf) {
                 int64_t x = (int64_t)a, y = (int64_t)b;
                 result = y == 0 ? 0 : (y == -1 && x == INT64_MIN ? (uint64_t)x : (uint64_t)(x / y));
@@ -1155,9 +870,8 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
         case 9: result = interp_shift_operand(a, 1, (unsigned)(b & (sf ? 63u : 31u)), sf); break; // LSRV
         case 10: result = interp_shift_operand(a, 2, (unsigned)(b & (sf ? 63u : 31u)), sf); break; // ASRV
         case 11: result = interp_shift_operand(a, 3, (unsigned)(b & (sf ? 63u : 31u)), sf); break; // RORV
-        // CRC32B/H/W/X (opcode 10000..10011) and CRC32CB/H/W/X (10100..10111). The accumulator and result are
-        // always 32-bit; sf selects only whether the DATA operand is a W or an X register, which is why sf must
-        // be 1 for exactly the ..X forms and 0 for the others.
+        // CRC32B/H/W/X (10000..10011) and CRC32CB/H/W/X (10100..10111). sf names the DATA operand width
+        // only, so it must be 1 for exactly the ..X forms; accumulator and result are always 32-bit.
         case 16:
         case 17:
         case 18:
@@ -1170,8 +884,7 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
             if ((data_bytes == 8) != (sf != 0))
                 return interp_undefined(cpu, insn, "data-processing register -- CRC32 size/sf mismatch");
             result = interp_crc32((uint32_t)a, b, data_bytes, (opcode & 4u) != 0);
-            // The result is a 32-bit value in a W register whatever sf said, so it cannot go through the
-            // sf-selected write below.
+            // Always a W register, so not the sf-selected write below.
             interp_set_gpr32(cpu, rd, (uint32_t)result);
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
@@ -1189,22 +902,14 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
     return interp_undefined(cpu, insn, "data-processing register -- unallocated encoding");
 }
 
-// Branches, exception generating and system instructions.
-//
-// Every form here ends the block. Returning to the dispatcher at every branch is what makes this backend
-// simple AND is what makes it at least as prompt as the JIT at noticing an async signal: the JIT's inline
-// branch-target cache exists precisely so an indirect branch does NOT have to come back here, and dropping
-// it costs throughput and nothing else. c->irq is polled by run_block, so a signal is never worse off.
+// Branches, exception generating and system instructions. Every form here ends the block.
 static int interp_exec_branch_system(struct cpu *cpu, uint32_t insn) {
     uint64_t gpc = cpu->pc;
 
-    // Unconditional branch (immediate): B / BL
     if ((insn & 0x7C000000u) == 0x14000000u) {
         int64_t offset = interp_sext(insn & 0x3FFFFFFu, 26) << 2;
         if (insn & 0x80000000u) {
-            // BL writes the return address as the guest's OWN view of it: for a non-PIE image that is the
-            // low, un-biased address, so the value matches the image's baked pointers and a later RET
-            // through it is re-biased by the dispatcher. Identical to the JIT's emit_set_x30(pcrel_base + 4).
+            // pcrel_base: the guest's own view of the return address, un-biased for a non-PIE image.
             cpu->x[30] = pcrel_base(gpc) + 4;
         }
         cpu->pc = gpc + (uint64_t)offset;
@@ -1212,8 +917,7 @@ static int interp_exec_branch_system(struct cpu *cpu, uint32_t insn) {
         return INTERP_END;
     }
 
-    // Conditional branch (immediate): B.cond, and BC.cond (the v8.8 consistent-branch hint, which differs
-    // only in bit 4 and has identical architectural effect).
+    // B.cond, and BC.cond (the v8.8 hint: bit 4 apart, same architectural effect).
     if ((insn & 0xFF000010u) == 0x54000000u || (insn & 0xFF000010u) == 0x54000010u) {
         int64_t offset = interp_sext((insn >> 5) & 0x7FFFFu, 19) << 2;
         cpu->pc = interp_cond_holds(cpu, insn & 0xFu) ? gpc + (uint64_t)offset : gpc + 4;
@@ -1221,7 +925,6 @@ static int interp_exec_branch_system(struct cpu *cpu, uint32_t insn) {
         return INTERP_END;
     }
 
-    // Compare and branch (immediate): CBZ / CBNZ
     if ((insn & 0x7E000000u) == 0x34000000u) {
         unsigned sf = (insn >> 31) & 1, nonzero = (insn >> 24) & 1;
         int64_t offset = interp_sext((insn >> 5) & 0x7FFFFu, 19) << 2;
@@ -1232,8 +935,7 @@ static int interp_exec_branch_system(struct cpu *cpu, uint32_t insn) {
         return INTERP_END;
     }
 
-    // Test and branch (immediate): TBZ / TBNZ. The bit position is b5:b40, so a 64-bit-register bit index
-    // above 31 is expressed by insn[31] rather than by an sf field.
+    // TBZ / TBNZ: the bit position is b5:b40, so insn[31] is its high bit and not an sf field.
     if ((insn & 0x7E000000u) == 0x36000000u) {
         unsigned nonzero = (insn >> 24) & 1;
         unsigned bit = (unsigned)(((insn >> 31) & 1) << 5) | ((insn >> 19) & 0x1Fu);
@@ -1245,7 +947,7 @@ static int interp_exec_branch_system(struct cpu *cpu, uint32_t insn) {
         return INTERP_END;
     }
 
-    // Unconditional branch (register): BR / BLR / RET (and the PAC/ERET forms, which are not modelled).
+    // BR / BLR / RET (the PAC/ERET forms are not modelled).
     if ((insn & 0xFE000000u) == 0xD6000000u) {
         unsigned opc = (insn >> 21) & 0xFu, op2 = (insn >> 16) & 0x1Fu, op3 = (insn >> 10) & 0x3Fu;
         int rn = (int)((insn >> 5) & 31);
@@ -1272,114 +974,62 @@ static int interp_exec_branch_system(struct cpu *cpu, uint32_t insn) {
         return INTERP_END;
     }
 
-    // Exception generation: SVC / HVC / SMC / BRK / HLT / DCPS.
     if ((insn & 0xFF000000u) == 0xD4000000u) {
         unsigned opc = (insn >> 21) & 7, ll = insn & 3u;
         if (opc == 0 && ll == 1) {
-            // SVC: the guest PC stays ON the svc while the kernel runs, which is an AArch64 ABI property and
-            // therefore the same on every host. G_DISPATCH_REASON advances it by 4 after service() unless the
-            // syscall (execve, sigreturn) set pc itself.
+            // The PC stays ON the svc; the dispatcher advances it unless the syscall set pc itself.
             cpu->pc = gpc;
             cpu->reason = R_SYSCALL;
             return INTERP_END;
         }
-        // Everything else in this box is a GUEST event, not an engine limitation, so none of it belongs in
-        // interp_undefined -- which latches a fatal engine status and stops the run with exit code 70. What
-        // Linux/AArch64 does with each:
-        //
-        //   BRK #imm (opc == 001)  -- brk_handler() -> SIGTRAP/TRAP_BRKPT with si_addr and the PC left ON the
-        //     BRK. The kernel does not advance past it, so a handler that returns re-executes it and traps
-        //     again; that is real Linux behaviour and is reproduced here by leaving cpu->pc == gpc. This is the
-        //     common case by far: __builtin_trap(), UBSan's trap-on-undefined, and a compiled `assert` that
-        //     the compiler decided to fold into a trap all reach it.
-        //   HLT #imm (opc == 010)  -- an EXTERNAL-debug halting instruction. With halting debug disabled, which
-        //     it always is for an emulated EL0 process, the architecture leaves HLT UNDEFINED, so Linux
-        //     delivers SIGILL. That is also what the JIT produces on an AArch64 host, where the guest's HLT is
-        //     copied verbatim and executed: matching it keeps the two backends' guest-visible behaviour equal.
-        //   HVC / SMC (opc == 000, LL 10/11) and DCPS1/2/3 (opc == 101) -- EL2/EL3 and debug-state
-        //     instructions, all UNDEFINED at EL0, so SIGILL as well.
-        //
-        // interp_raise_sync_signal() is the delivery route: it carries the siginfo Linux stamps for these
-        // (si_code and si_addr, which a debugger or crash reporter in the guest reads), forces delivery past
-        // a blocked mask the way force_sig_fault does, and still lets linux_abi/signal.c apply the guest's
-        // disposition -- a handler runs, SIG_IGN drops it, and SIG_DFL goes through guest_group_fatal so the
-        // container reports 128+signo with the core-dump flag. See its header for the composition and for
-        // the one residual gap.
-        //
-        // si_code: Linux/arm64 reports TRAP_BRKPT(1) for a user BRK (arm64_notify_die from brk_handler) and
-        // ILL_ILLOPC(1) for anything the undefined-instruction path injects. They are the same number, but
-        // they are written separately below because they are different constants that only happen to agree.
+        // A GUEST event, not an engine gap: this must not reach interp_undefined (fatal, exit 70). BRK is
+        // SIGTRAP/TRAP_BRKPT with the PC left ON it, so a handler that returns re-executes; HLT, HVC/SMC and
+        // DCPS are UNDEFINED at EL0, so SIGILL.
         int signo = opc == 1 ? 5 /* SIGTRAP */ : 4 /* SIGILL */;
         int signal_code = opc == 1 ? 1 /* TRAP_BRKPT */ : 1 /* ILL_ILLOPC */;
-        cpu->pc = gpc; // the faulting instruction, which is what the guest's frame must name
-        // si_addr is pcrel_base(gpc), not gpc: the frame's own pc field is canonicalized through
-        // signal_canonicalize_pc (core/target/aarch64.c), which IS pcrel_base, so a handler comparing
-        // si_addr against uc_mcontext.pc -- the obvious thing to do with a trap -- must see the same
-        // number. They differ for a biased ET_EXEC, which is every -no-pie fixture in the corpus.
+        cpu->pc = gpc; // the faulting instruction the guest's frame must name
+        // si_addr is pcrel_base(gpc): signal_canonicalize_pc treats the frame's own pc the same way.
         interp_raise_sync_signal(cpu, signo, signal_code, pcrel_base(gpc));
         return INTERP_END;
     }
 
-    // Hints (the NOP space): 1101 0101 0000 0011 0010 CRm op2 11111. Every member is architecturally a no-op
-    // for a user-space emulator -- NOP, YIELD, WFE/WFI (we are not a scheduler), SEV/SEVL, the pointer-auth
-    // hints, BTI, CSDB/SSBB and the trace barriers. Treating the whole space as NOP rather than enumerating
-    // it is deliberate: a hint the architecture adds later is still a hint.
+    // Hints (the NOP space). Every member is a no-op at EL0; taking the whole space covers later hints.
     if ((insn & 0xFFFFF01Fu) == 0xD503201Fu) {
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
 
-    // Barriers: 1101 0101 0000 0011 0011 CRm op2 11111.
-    // Note the trailing 0x1F: like the hint space, the barrier encodings pin Rt to 11111, so the constant is
-    // 0xD503301F and not 0xD5033000. Getting that wrong sends every barrier -- including the ISB that commits
-    // the guest's icache maintenance -- into the MRS/MSR catch-all below instead.
+    // Barriers. Rt is pinned to 11111: the constant is 0xD503301F, and 0xD5033000 would catch no barrier.
     if ((insn & 0xFFFFF01Fu) == 0xD503301Fu) {
         unsigned op2 = (insn >> 5) & 7;
         if (op2 == 6) {
-            // ISB is the architecturally visible commit point of the guest's icache-maintenance dance
-            // (dc cvau; dsb; ic ivau; dsb; isb). Exit R_ICCOMMIT so the dispatcher runs smc_commit() and any
-            // block whose SOURCE bytes were rewritten is dropped before the guest can execute them. The
-            // interpreter needs this exactly as much as the JIT does, for a subtler reason: it re-decodes on
-            // every execution, so the guest's new BYTES are picked up for free -- but the cached block
-            // EXTENT was computed from the old bytes, and a rewrite that moves the block-ending branch would
-            // otherwise leave the region boundary stale.
+            // ISB commits the icache dance: exit R_ICCOMMIT so smc_commit() drops rewritten blocks. New
+            // BYTES come free from re-decoding, but the cached block EXTENT came from the old ones.
             cpu->pc = gpc + 4;
             cpu->reason = R_ICCOMMIT;
             return INTERP_END;
         }
-        // DSB / DMB / SB / CLREX. A guest thread is a host thread here, and this interpreter's guest loads
-        // and stores are ordinary C accesses that the host compiler and CPU may reorder, so a guest data
-        // barrier must become a real host barrier. Sequentially consistent is stronger than any of these
-        // orderings and is the only one that is correct for all of them.
+        // DSB / DMB / SB / CLREX. Guest threads are host threads and guest accesses are ordinary C accesses
+        // the host may reorder, so a guest barrier needs a real host one; SEQ_CST covers every ordering here.
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
 
-    // Cache maintenance, of which exactly two members matter to a translator.
-    if ((insn & 0xFFFFFFE0u) == 0xD50B7B20u) { // dc cvau, Xt -- clean data cache to point of unification
-        // A pure no-op for a dynamic translator: the host never instruction-fetches guest pages, so the
-        // guest's data writes need no clean before we re-read them. (Real guests reach here because
-        // __clear_cache issues the whole dance unconditionally.)
+    if ((insn & 0xFFFFFFE0u) == 0xD50B7B20u) { // dc cvau, Xt
+        // No-op: the host never instruction-fetches guest pages.
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
-    if ((insn & 0xFFFFFFE0u) == 0xD50B7520u) { // ic ivau, Xt -- invalidate instruction cache by VA
-        // The guest is telling us it has rewritten code. Record the line and exit R_ICFLUSH; the dispatcher
-        // refreshes any emulated file mapping over that page and calls smc_icflush() to QUEUE the dirty line
-        // (the drop itself happens at the ISB, see above). pc resumes past the ic ivau.
+    if ((insn & 0xFFFFFFE0u) == 0xD50B7520u) { // ic ivau, Xt
+        // Record the line and exit R_ICFLUSH; smc_icflush() only QUEUES it, the drop happens at the ISB.
         cpu->smc_va = interp_gpr(cpu, (int)(insn & 31));
         cpu->pc = gpc + 4;
         cpu->reason = R_ICFLUSH;
         return INTERP_END;
     }
 
-    // ---- DC ZVA: zero the data cache block containing Xt ----
-    // The block size is the one the guest was TOLD about via DCZID_EL0, not the host's. The JIT lowers this to
-    // four explicit 16-byte stores for exactly that reason: copying the opcode verbatim would clear whatever
-    // the host CPU's block size happens to be, and a runtime that places live metadata immediately after a
-    // zeroed block then sees it corrupted. g_aarch64_cpu_model.dczid_el0 == 4 advertises 2^4 words = 64 bytes,
-    // so 64 bytes is what gets zeroed.
+    // DC ZVA zeroes the block size advertised in DCZID_EL0 (== 4, so 64 bytes), never the host's.
     if ((insn & 0xFFFFFFE0u) == 0xD50B7420u) {
         uint64_t address = interp_gpr(cpu, (int)(insn & 31)) & ~UINT64_C(63);
         for (unsigned offset = 0; offset < 64u; offset += 8)
@@ -1388,52 +1038,40 @@ static int interp_exec_branch_system(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- MSR (immediate): DAIFSet / DAIFClr and the other PSTATE fields ----
-    // Interrupt masking is an EL1 concept with no meaning for an emulated EL0 process, so these are no-ops --
-    // which is also what they effectively are for a Linux user-space program that executes them at all.
+    // MSR (immediate): DAIF and the other PSTATE fields. Interrupt masking is meaningless at EL0.
     if ((insn & 0xFFF8F01Fu) == 0xD500401Fu) {
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
 
-    // ---- MRS / MSR: system register access ----
-    // Every value handed to the guest here comes from g_aarch64_cpu_model (cpu.h) or from emulated state, never
-    // from the host CPU. That is a security property, not a convenience: this is an x86-64 host, so a host
-    // register read is not merely wrong but meaningless, and even on an AArch64 host forwarding an ID register
-    // leaks the real CPU and can make a guest JIT emit extensions the engine never advertised.
+    // MRS / MSR. Every value comes from g_aarch64_cpu_model (cpu.h) or emulated state, never the host.
     if ((insn & 0xFFD00000u) == 0xD5100000u) {
         int rt = (int)(insn & 31);
         uint32_t reg = insn & 0xFFFFFFE0u;
         int is_read = (insn & 0x00200000u) != 0; // bit 21 is L: 1 = MRS, 0 = MSR
 
-        // The EL1 ID-register space (op0 == 3, op1 == 0). HWCAP_CPUID is deliberately absent from the model, so
-        // these are architecturally inaccessible at EL0; the JIT answers 0 rather than trapping, because a
-        // trap here is far more disruptive to a guest that probes optimistically than a zero is.
-        // Mask spelled exactly as translate.c's (0xFFFF0000 == 0xD5380000, i.e. op0 == 3 && op1 == 0 && CRn == 0)
-        // so the two backends deny precisely the same register set. A guest's ifunc resolver branches on these,
-        // so a broader or narrower gate here would make the same binary take a different path per backend.
+        // EL1 ID-register space: absent from the model, so read 0 rather than trap. The mask matches
+        // translate.c's so both backends deny the same set -- guest ifunc resolvers branch on it.
         if (is_read && (insn & 0xFFFF0000u) == 0xD5380000u && !g_aarch64_cpu_model.user_id_registers) {
             interp_set_gpr(cpu, rt, 0);
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
         }
         switch (reg) {
-        case 0xD53B0020u: // MRS CTR_EL0 -- cache type. IDC=1/DIC=0 describe THIS translator's coherence model:
-                          // no data-cache clean is needed before we re-read a guest's written bytes, but the
-                          // guest must keep issuing `ic ivau` because that is the engine's SMC interception
-                          // point. 64-byte I/D lines.
+        case 0xD53B0020u: // MRS CTR_EL0. IDC=1/DIC=0: no clean needed before re-reading guest writes, but
+                          // `ic ivau` must keep coming -- the engine's SMC interception point.
             interp_set_gpr(cpu, rt, g_aarch64_cpu_model.ctr_el0);
             break;
-        case 0xD53B00E0u: // MRS DCZID_EL0 -- the DC ZVA block size the guest may rely on (see DC ZVA above)
+        case 0xD53B00E0u: // MRS DCZID_EL0 -- the DC ZVA block size
             interp_set_gpr(cpu, rt, g_aarch64_cpu_model.dczid_el0);
             break;
-        case 0xD53BD040u: // MRS TPIDR_EL0 -- the thread pointer, which the engine emulates in cpu->tls
+        case 0xD53BD040u: // MRS TPIDR_EL0 -- the thread pointer, emulated in cpu->tls
             interp_set_gpr(cpu, rt, cpu->tls);
             break;
         case 0xD51BD040u: // MSR TPIDR_EL0
             cpu->tls = interp_gpr(cpu, rt);
             break;
-        case 0xD53BD060u: // MRS TPIDRRO_EL0 -- read-only alias; the engine keeps one thread pointer
+        case 0xD53BD060u: // MRS TPIDRRO_EL0 -- read-only alias
             interp_set_gpr(cpu, rt, cpu->tls);
             break;
         case 0xD53B4200u: // MRS NZCV
@@ -1442,74 +1080,50 @@ static int interp_exec_branch_system(struct cpu *cpu, uint32_t insn) {
         case 0xD51B4200u: // MSR NZCV -- only the four condition flags are writable
             cpu->nzcv = interp_gpr(cpu, rt) & (INTERP_NZCV_N | INTERP_NZCV_Z | INTERP_NZCV_C | INTERP_NZCV_V);
             break;
-        case 0xD53B4220u: // MRS DAIF -- no interrupts are masked from an emulated EL0's point of view
+        case 0xD53B4220u: // MRS DAIF -- nothing is masked at an emulated EL0
             interp_set_gpr(cpu, rt, 0);
             break;
-        case 0xD51B4220u: // MSR DAIF -- see the MSR-immediate note above
+        case 0xD51B4220u: // MSR DAIF
             break;
         case 0xD53B4400u: // MRS FPCR
             interp_set_gpr(cpu, rt, g_interp_fpcr);
             break;
-        case 0xD51B4400u: // MSR FPCR -- authoritative: RMode selects the rounding of every FP result below,
-                          // and FZ/FZ16/DN change what the arithmetic does with denormals and NaNs.
-            // Masked to the fields this backend models, which is a GUEST-VISIBLE answer and the correct one:
-            // the six exception trap-enable bits read back as zero, which is how the architecture says
-            // "trapped floating-point exceptions are not implemented", and it is exactly what glibc's
-            // feenableexcept() tests for (it writes the bit, reads FPCR back, and reports failure when it did
-            // not stick). Every common AArch64 implementation answers the same way, so a guest sees here what
-            // it would see on the hardware the JIT runs on.
+        case 0xD51B4400u: // MSR FPCR
+            // The six trap-enable bits mask out and read back zero -- "no trapped FP exceptions", which
+            // is what glibc's feenableexcept() probes for.
             g_interp_fpcr = interp_gpr(cpu, rt) & INTERP_FPCR_WRITABLE;
             break;
         case 0xD53B4420u: // MRS FPSR
             interp_set_gpr(cpu, rt, g_interp_fpsr);
             break;
-        case 0xD51B4420u: // MSR FPSR -- the guest clearing or presetting the cumulative exception bits, which
-                          // is what feclearexcept/fesetexceptflag compile to. Only the six IEEE sticky bits
-                          // and the AdvSIMD saturation bit QC are writable; the rest are RES0.
+        case 0xD51B4420u: // MSR FPSR. Only the six IEEE sticky bits and QC are writable; the rest are RES0.
             g_interp_fpsr = interp_gpr(cpu, rt) & INTERP_FPSR_WRITABLE;
             break;
-        case 0xD53BE000u: // MRS CNTFRQ_EL0 -- the counter frequency the guest should assume
-            // 1 GHz, chosen so that the counter below IS a nanosecond count. Any other frequency would force a
-            // scaling step whose rounding the guest could observe drifting against clock_gettime, which is
-            // served from the same host monotonic clock.
+        case 0xD53BE000u: // MRS CNTFRQ_EL0 -- 1 GHz, so the counter below IS a nanosecond count
             interp_set_gpr(cpu, rt, UINT64_C(1000000000));
             break;
         case 0xD53BE020u: // MRS CNTPCT_EL0 (physical counter)
         case 0xD53BE040u: // MRS CNTVCT_EL0 (virtual counter)
         case 0xD53BE0C0u: // MRS CNTVCTSS_EL0 (self-synchronising virtual counter)
-            // The same host monotonic clock the engine answers clock_gettime from, in nanoseconds, matching the
-            // 1 GHz frequency reported above. Sharing one source is what keeps a guest that cross-checks the
-            // counter against clock_gettime (every runtime with its own fast clock does) from seeing time move
-            // backwards between the two.
+            // The host monotonic clock clock_gettime is answered from: the two can never disagree.
             interp_set_gpr(cpu, rt, now_ns());
             break;
         default:
-            // An unmodelled register. Reporting rather than guessing is the right default here: silently
-            // answering 0 for a register the guest actually depends on produces a failure arbitrarily far from
-            // its cause, and the report names the exact encoding so the model can be extended deliberately.
+            // Unmodelled: report the encoding rather than answer 0 and fail far from the cause.
             return interp_undefined(cpu, insn, "system -- unmodelled system register (MRS/MSR)");
         }
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
 
-    // ---- The remaining SYS/SYSL cache and TLB maintenance space ----
     if ((insn & 0xFFC00000u) == 0xD5000000u)
         return interp_undefined(cpu, insn, "system -- SYS/SYSL maintenance operation");
 
     return interp_undefined(cpu, insn, "branches, exception generating and system -- unallocated encoding");
 }
 
-// ---------------------------------------------------------------------------
-// The vector register file.
-// ---------------------------------------------------------------------------
-// cpu->v[] is 64 uint64_t holding V0..V31 as {low 64, high 64} pairs, in that order -- the layout
-// guest/aarch64/signal.c memcpy's straight into the sigframe's fpsimd_context and back, so it is part of the
-// guest-visible ABI and not a private choice.
-//
-// A vector is manipulated here as 16 raw bytes rather than as a union of typed arrays, because element size
-// is a runtime value decoded from the instruction (size + Q) and not a compile-time type. That keeps one
-// element accessor pair instead of one per width.
+// The vector register file. cpu->v[] holds V0..V31 as {low, high} uint64 pairs -- the layout
+// guest/aarch64/signal.c memcpy's into the sigframe's fpsimd_context, so guest-visible ABI.
 typedef struct {
     uint8_t byte[16];
 } interp_vec;
@@ -1520,21 +1134,16 @@ static interp_vec interp_vec_read(const struct cpu *cpu, int reg) {
     return value;
 }
 
-// THE RULE THAT IS EASY TO GET WRONG: writing a D-form (Q == 0, 64-bit) result must ZERO the upper 64 bits of
-// the destination register. The architecture requires it for every AdvSIMD and scalar-FP write, and silently
-// preserving the old upper half is the classic vector-interpreter bug -- it stays invisible until some later
-// routine reads the top half of a register it believes it fully defined. Funnelling every vector write through
-// this one function is what makes the rule impossible to forget at a call site.
+// THE RULE THAT IS EASY TO GET WRONG: a D-form (Q == 0) write must ZERO the upper 64 bits of the
+// destination, for every AdvSIMD and scalar-FP write; keeping the old half is invisible until it is read.
 static void interp_vec_write(struct cpu *cpu, int reg, interp_vec value, unsigned q) {
     if (!q) memset(value.byte + 8, 0, 8);
     memcpy(&cpu->v[2 * reg], value.byte, 16);
-    // The JIT sets this to the (nonzero) cpu pointer at the first vector write of a region so a syscall exit
-    // knows it must spill V state. Nothing needs spilling here -- cpu->v[] IS the register file and is always
-    // current -- but the field is part of the checkpoint image, so keep it truthful rather than stale.
+    // Nothing to spill here, but vdirty is in the checkpoint image the JIT shares; keep it truthful.
     cpu->vdirty = (uint64_t)(uintptr_t)cpu;
 }
 
-// Element read/write. `size` is the architecture's log2 of the element width: 0 = B, 1 = H, 2 = S, 3 = D.
+// `size` is the architecture's log2 element width: 0 = B, 1 = H, 2 = S, 3 = D.
 static uint64_t interp_vec_element(const interp_vec *value, unsigned size, unsigned index) {
     uint64_t element = 0;
     memcpy(&element, value->byte + (index << size), (size_t)1u << size);
@@ -1557,9 +1166,7 @@ static uint64_t interp_element_sext(uint64_t element, unsigned size) {
     return (uint64_t)interp_sext(element, 8u << size);
 }
 
-// AdvSIMDExpandImm(): the shared immediate decoder for MOVI/MVNI and the immediate forms of ORR/BIC. Produces
-// the 64-bit pattern that is then replicated across the destination. Returns 0 for a reserved cmode/op
-// combination so the caller can report it rather than invent a value.
+// AdvSIMDExpandImm(), for MOVI/MVNI and immediate ORR/BIC. Returns 0 for a reserved cmode/op.
 static int interp_advsimd_expand_imm(unsigned op, unsigned cmode, unsigned o2, unsigned q, uint64_t imm8,
                                      uint64_t *out) {
     unsigned selector = (cmode >> 1) & 7, low = cmode & 1;
@@ -1577,16 +1184,12 @@ static int interp_advsimd_expand_imm(unsigned op, unsigned cmode, unsigned o2, u
     } else if (selector == 6) { // 32-bit element with a "moving ones" low field (MSL)
         uint32_t narrow = low ? (uint32_t)((imm8 << 16) | 0xFFFFu) : (uint32_t)((imm8 << 8) | 0xFFu);
         imm64 = ((uint64_t)narrow << 32) | narrow;
-    } else if (!low && !op) { // 8-bit element replicated across all 8 bytes: MOVI Vd.8B/16B, #imm8
+    } else if (!low && !op) { // 8-bit element replicated: MOVI Vd.8B/16B, #imm8
         if (o2) return 0;
         imm64 = imm8 * UINT64_C(0x0101010101010101);
     } else if (!low) {
-        // cmode == 1110 with op == 1: MOVI Dd, #imm / MOVI Vd.2D, #imm, where each BIT of imm8 expands to a
-        // whole BYTE of the 64-bit element -- imm8<0> becomes the LOWEST byte and imm8<7> the highest. This is
-        // how a lane mask is materialised in one instruction, so `movi v0.2d, #0xffffffff` (imm8 == 0x0f) means
-        // 0x00000000ffffffff and NOT the byte-replicated 0x0f0f0f0f0f0f0f0f the op == 0 spelling above gives.
-        // Sharing that arm was a silent wrong-answer bug: -O2 emits this form for the clamp mask in any
-        // vectorised saturating add, so the mask compared as ~1.08e18 instead of 2^32-1 and never fired.
+        // cmode == 1110 with op == 1: each BIT of imm8 becomes a whole BYTE of the element (imm8<0> lowest),
+        // so `movi v0.2d, #0xffffffff` is 0x00000000ffffffff, not the op == 0 arm's byte replication.
         if (o2) return 0;
         imm64 = 0;
         for (unsigned byte = 0; byte < 8u; byte++)
@@ -1597,7 +1200,7 @@ static int interp_advsimd_expand_imm(unsigned op, unsigned cmode, unsigned o2, u
         uint32_t narrow = (sign << 31) | ((exponent & 4u) ? 0x3E000000u : 0x40000000u) |
                           ((exponent & 3u) << 23) | (fraction << 19);
         imm64 = ((uint64_t)narrow << 32) | narrow;
-    } else { // double-precision float expansion (64-bit element, Q must be 1)
+    } else { // double-precision float expansion (Q must be 1)
         if (!q) return 0;
         uint64_t sign = (imm8 >> 7) & 1, exponent = (imm8 >> 4) & 7, fraction = imm8 & 0xFu;
         imm64 = (sign << 63) | ((exponent & 4u) ? UINT64_C(0x3FC0000000000000) : UINT64_C(0x4000000000000000)) |
@@ -1607,8 +1210,7 @@ static int interp_advsimd_expand_imm(unsigned op, unsigned cmode, unsigned o2, u
     return 1;
 }
 
-// The imm5 field of the AdvSIMD "copy" group encodes the element size in the position of its lowest set bit
-// and the lane index in the bits above it. Returns 0 when no bit is set, which is a reserved encoding.
+// imm5 encodes the element size in its lowest set bit and the lane index above it; none set is reserved.
 static int interp_imm5_element(unsigned imm5, unsigned *size_out, unsigned *index_out) {
     if (imm5 & 1u) {
         *size_out = 0;
@@ -1655,46 +1257,21 @@ static void interp_vec_store(struct cpu *cpu, int reg, uint64_t address, unsigne
     }
 }
 
-// The access width of a SIMD&FP load/store, which is spelled opc<1>:size rather than plain size: 0b0_00..0b0_11
-// select B/H/S/D and 0b1_00 selects the 16-byte Q form. Returns 0 for an unallocated combination.
+// SIMD&FP access width, spelled opc<1>:size and NOT plain size. 0 means unallocated.
 static unsigned interp_simd_access_bytes(unsigned size, unsigned opc) {
     if (opc & 2u) return size == 0 ? 16u : 0u;
     return 1u << size;
 }
 
-// ---------------------------------------------------------------------------
-// Loads and stores.
-// ---------------------------------------------------------------------------
-// Two things in this group are where an interpreter silently corrupts a guest, so both are handled in exactly
-// one place each:
-//
-//   * Rn == 31 IS SP, NOT XZR, for every addressing mode here. There is no load/store form that uses XZR as
-//     a base -- `ldr x1, [sp]` is spelled with Rn == 31 and is the first instruction a static-pie image
-//     executes. Every base read below goes through interp_gpr_sp, and every base WRITEBACK goes through
-//     interp_set_gpr_sp. Rt/Rt2/Rm remain ordinary registers where 31 is XZR.
-//   * The access itself is a memcpy (interp_load_bits / interp_store_bits), never a cast-and-deref, so an
-//     unaligned guest access -- which AArch64 permits for normal memory and real guests rely on -- works
-//     instead of faulting or being miscompiled. The one exception is the atomic/exclusive family, where the
-//     architecture REQUIRES natural alignment and a misaligned access is a guest fault.
-//
-// Ordering of side effects is deliberate throughout: an access happens only after every source register has
-// been read into a local, and a base writeback happens only after the access has completed. That is what lets
-// the fault path just siglongjmp away without having to undo anything (see the fault-model comment at the top
-// of this file), and it is also the architecturally required order when the base and the transfer register
-// are the same register.
+// Loads and stores. Three rules, each enforced in one place:
+//   * Rn == 31 IS SP, NOT XZR, in every addressing mode here (interp_gpr_sp / interp_set_gpr_sp). Rt/Rt2/Rm
+//     keep the ordinary meaning where 31 is XZR.
+//   * Every guest access goes through interp_load_bits / interp_store_bits, which memcpy, so unaligned
+//     accesses work. The atomic/exclusive family REQUIRES natural alignment instead.
+//   * Read sources into locals, then access, then write the base back: the fault path has nothing to undo.
 
-// The local exclusive monitor for LDXR/STXR. AArch64's load/store-exclusive pair is a compare-and-swap
-// spelled as two instructions, and what a guest actually depends on is that the pair either commits as a
-// whole or fails and is retried.
-//
-// So the monitor records the address AND the value LDXR observed, and STXR performs a real host
-// compare-and-swap of that observed value against the new one. Guest threads are real host threads here, so a
-// plain store would not be atomic against a peer; the CAS makes the pair genuinely atomic for the idiom the
-// pair exists to express. What it does NOT reproduce is ABA: a peer that writes a different value and then
-// writes the original one back leaves the CAS succeeding where real hardware would have cleared the monitor
-// and failed. That is a strictly more permissive outcome than hardware, it is the same trade every
-// interpreter without hardware monitor emulation makes, and it is invisible to lock and refcount code (which
-// is what uses ll/sc) because those only care that the read-modify-write was not interleaved.
+// The local exclusive monitor for LDXR/STXR: it records the address AND the value LDXR observed, and STXR
+// compare-and-swaps against it. ABA is NOT reproduced -- more permissive, invisible to lock/refcount code.
 static __thread int g_interp_monitor_valid;
 static __thread uint64_t g_interp_monitor_address;
 static __thread unsigned g_interp_monitor_bytes;
@@ -1706,10 +1283,8 @@ static void interp_monitor_clear(void) {
 }
 
 
-// A guest data fault this backend detects itself, rather than by taking a host signal: a misaligned atomic,
-// which the architecture defines as an alignment fault. Routed through the same reason the JIT's inline
-// soft-TLB probe uses for an address it cannot serve, so linux_abi/signal.c raises it on the guest as an
-// ordinary synchronous SIGBUS/SIGSEGV at this exact PC.
+// A misaligned atomic: an alignment fault, reported through the JIT's soft-TLB-probe reason so signal.c
+// raises it as an ordinary synchronous SIGBUS.
 static int interp_alignment_fault(struct cpu *cpu, uint64_t address) {
     cpu->fault_addr = address;
     cpu->bus_ea = address;
@@ -1722,18 +1297,10 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
     int rt = (int)(insn & 31), rn = (int)((insn >> 5) & 31);
     int rt2 = (int)((insn >> 10) & 31), rm = (int)((insn >> 16) & 31);
     unsigned vector = (insn >> 26) & 1;
-    // Q here is the AdvSIMD structure forms' vector-length bit; the scalar addressing modes below do not use it.
     unsigned q = (insn >> 30) & 1;
 
-    // ---- AdvSIMD load/store multiple structures: LD1/ST1 and the de-interleaving LD2/LD3/LD4, ST2/ST3/ST4 ----
-    // A different top-level encoding from the scalar loads, which is why it is tested here explicitly rather
-    // than falling out of the size/opc decode below.
-    //   0 Q 0011 000 L 000000 opcode size Rn Rt   (no offset)
-    //   0 Q 0011 001 L 0 Rm   opcode size Rn Rt   (post-index; Rm == 11111 selects the implicit immediate)
-    // `opcode` names both the number of registers and whether they INTERLEAVE. The distinction is the whole
-    // point of the group: LD1 with four registers is four consecutive full-register loads, while LD4 walks
-    // memory one element at a time round-robin across the four registers -- the de-interleaving array-of-structs
-    // load that a vectorising compiler emits and that cannot be expressed as "copy N bytes into a register".
+    // AdvSIMD load/store multiple structures. `opcode` names both the register count and whether they
+    // INTERLEAVE: LD1 x4 is four whole-register loads, LD4 walks memory one element at a time across four.
     if ((insn & 0xBF200000u) == 0x0C000000u) {
         unsigned load = (insn >> 22) & 1u, opcode = (insn >> 12) & 0xFu, esize_code = (insn >> 10) & 3u;
         int post_index = (insn & 0x00800000u) != 0;
@@ -1751,8 +1318,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         unsigned bytes = q ? 16u : 8u;
         uint64_t base = interp_gpr_sp(cpu, rn);
         uint64_t address = base;
-        // The 1D arrangement (size == 11, Q == 0) exists only for the one-register LD1/ST1 form; a
-        // multi-register form needs a whole 128-bit vector per register when the element is 64 bits wide.
+        // The 1D arrangement exists only for the one-register LD1/ST1 form.
         if (esize_code == 3 && !q && registers > 1)
             return interp_undefined(cpu, insn, "AdvSIMD load/store -- 1D arrangement with several registers");
         if (interleaved) {
@@ -1762,9 +1328,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
                     int reg = (rt + (int)index) % 32; // the register list wraps at V31
                     if (load) {
                         uint64_t element = interp_load_bits(address, element_bytes);
-                        // Read-modify-write one lane at a time, but the FIRST lane of each register starts from
-                        // zero rather than from the register's old contents: the lanes this instruction does not
-                        // write (all of bits [127:64] in a Q == 0 form) must end up zero, not stale.
+                        // Lane 0 starts from zero: unwritten lanes must end up zero, not stale.
                         interp_vec value;
                         if (lane == 0)
                             memset(value.byte, 0, sizeof value.byte);
@@ -1801,9 +1365,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             }
         }
         if (post_index) {
-            // Rm == 31 means the immediate form, whose increment is the whole transfer size; otherwise the
-            // increment is the register Rm. Committed AFTER every access, so an abandoned access leaves the
-            // base register naming exactly what the guest's own fault handler expects.
+            // Rm == 31: the increment is the whole transfer size.
             uint64_t increment = rm == 31 ? (uint64_t)registers * bytes : interp_gpr(cpu, rm);
             interp_set_gpr_sp(cpu, rn, base + increment);
         }
@@ -1811,24 +1373,10 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- AdvSIMD load/store SINGLE structure, and the LD1R/LD2R/LD3R/LD4R replicating loads ----
-    //   0 Q 0011 010 L R 00000 opcode S size Rn Rt   (no offset)
-    //   0 Q 0011 011 L R Rm    opcode S size Rn Rt   (post-index; Rm == 11111 selects the implicit immediate)
-    // A different box from the multi-structure forms above (bits[29:24] is 001101 rather than 001100), and it
-    // transfers ONE element per register rather than a whole vector. Two things make its decode unusual:
-    //
-    //   * The number of registers is (R ? 2 : 1) + (opcode<0> ? 2 : 0), so the four counts are spread across
-    //     two disjoint fields -- R is not a count and opcode<0> is not a size.
-    //   * The lane INDEX is assembled from Q, S and size, and how many of those bits participate depends on the
-    //     element width: an 8-bit access indexes with Q:S:size (16 lanes), a 16-bit one with Q:S:size<1>, a
-    //     32-bit one with Q:S, and a 64-bit one with Q alone. Reading `size` as a lane count here (as every
-    //     other AdvSIMD group would) produces an out-of-range lane and a silently wrong address.
-    //
-    // The replicate forms (opcode<2:1> == 11, load only) instead read ONE element and broadcast it across the
-    // whole destination -- that is what a vectorising compiler emits to get a scalar into every lane, so it is
-    // much more common in real code than its corner of the encoding space suggests.
-    // bits[29:24] == 001101 identifies the box on its own; bit23 is the post-index selector and bit21 is R,
-    // so neither may be part of the mask (an earlier version tested bit21 and silently rejected every LD2R/LD4R).
+    // AdvSIMD load/store SINGLE structure, and the LD1R..LD4R replicating loads. Register count is
+    // (R ? 2 : 1) + (opcode<0> ? 2 : 0); the lane INDEX is Q:S:size for 8-bit, Q:S:size<1> for 16-bit, Q:S
+    // for 32-bit, Q alone for 64-bit -- `size` is NOT a lane count. The mask covers bits[29:24] only, since
+    // bit23 is post-index and bit21 is R and either one would reject every LD2R/LD4R.
     if ((insn & 0xBF000000u) == 0x0D000000u) {
         unsigned load = (insn >> 22) & 1u, replicate_group = (insn >> 21) & 1u;
         unsigned opcode = (insn >> 13) & 7u, selector = (insn >> 12) & 1u, size_field = (insn >> 10) & 3u;
@@ -1851,7 +1399,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             }
         } else {
             switch (opcode >> 1) {
-            case 0: // 8-bit: the index uses every one of Q, S and both size bits
+            case 0: // 8-bit: the index uses Q, S and both size bits
                 element_size = 0;
                 index = (q << 3) | (selector << 2) | size_field;
                 break;
@@ -1860,7 +1408,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
                 element_size = 1;
                 index = (q << 2) | (selector << 1) | (size_field >> 1);
                 break;
-            default: // 32-bit when size == 00, 64-bit when size == 01 (and then S must be 0)
+            default: // 32-bit when size == 00, 64-bit when size == 01 (S must then be 0)
                 if (size_field == 0) {
                     element_size = 2;
                     index = (q << 1) | selector;
@@ -1877,8 +1425,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
                 int reg = (rt + (int)entry) % 32;
                 if (load) {
                     uint64_t element = interp_load_bits(address, bytes);
-                    // A single-lane LOAD leaves every other lane of the destination unchanged, including the
-                    // upper 64 bits -- unlike the multi-structure forms, Q here only widens the index range.
+                    // A single-lane LOAD leaves every other lane unchanged, [127:64] included.
                     interp_vec value = interp_vec_read(cpu, reg);
                     interp_vec_set_element(&value, element_size, index, element);
                     interp_vec_write(cpu, reg, value, 1);
@@ -1897,25 +1444,22 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- Load register (literal): LDR/LDRSW/PRFM, PC-relative ----
     if ((insn & 0x3B000000u) == 0x18000000u) {
         unsigned opc = (insn >> 30) & 3;
         int64_t offset = interp_sext((insn >> 5) & 0x7FFFFu, 19) << 2;
-        // pcrel_base, not the raw PC, for the same reason ADR uses it: a non-PIE image's architectural PC is
-        // its low link address, and interp_guest_pointer re-biases the resulting low address to the real high
-        // mapping. Using it here also means a faulting literal load reports the address the guest expects.
+        // pcrel_base, not the raw PC: a non-PIE image's architectural PC is its low link address.
         uint64_t address = pcrel_base(gpc) + (uint64_t)offset;
-        if (vector) { // LDR St/Dt/Qt, literal: opc selects 4, 8 or 16 bytes
+        if (vector) { // LDR St/Dt/Qt, literal
             if (opc == 3) return interp_undefined(cpu, insn, "loads and stores -- unallocated SIMD literal size");
             interp_vec_load(cpu, rt, address, 4u << opc);
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
         }
-        if (opc == 3) { // PRFM (literal): a hint, and a translator has no cache to prefetch into
+        if (opc == 3) { // PRFM (literal): a hint
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
         }
-        if (opc == 2) // LDRSW: 4 bytes, sign-extended into a 64-bit register
+        if (opc == 2) // LDRSW
             interp_set_gpr(cpu, rt, (uint64_t)interp_sext(interp_load_bits(address, 4), 32));
         else if (opc == 1) // LDR Xt
             interp_set_gpr(cpu, rt, interp_load_bits(address, 8));
@@ -1925,10 +1469,9 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- Load/store pair: STP/LDP/LDPSW/STNP/LDNP, in all four addressing modes ----
     if ((insn & 0x3A000000u) == 0x28000000u) {
         unsigned opc = (insn >> 30) & 3, load = (insn >> 22) & 1, mode = (insn >> 23) & 3;
-        if (vector) { // STP/LDP of two S, D or Q registers -- glibc's memcpy moves 32 bytes at a time this way
+        if (vector) { // STP/LDP of two S, D or Q registers
             if (opc == 3) return interp_undefined(cpu, insn, "loads and stores -- unallocated SIMD pair opc");
             unsigned element = 4u << opc; // opc 0/1/2 -> 4, 8, 16 bytes per register
             int64_t vector_offset = interp_sext((insn >> 15) & 0x7Fu, 7) * (int64_t)element;
@@ -1952,14 +1495,13 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         unsigned scale = opc == 2 ? 3u : 2u;
         int64_t offset = interp_sext((insn >> 15) & 0x7Fu, 7) << scale;
         uint64_t base = interp_gpr_sp(cpu, rn);
-        // mode 0 = LDNP/STNP (plain signed offset, no writeback), 1 = post-index, 2 = signed offset,
-        // 3 = pre-index. Post-index is the one mode that accesses the UN-updated base.
+        // mode 0 = LDNP/STNP, 1 = post-index, 2 = signed offset, 3 = pre-index. Only 1 uses the OLD base.
         int writeback = mode == 1 || mode == 3;
         uint64_t address = mode == 1 ? base : base + (uint64_t)offset;
         if (load) {
             uint64_t first = interp_load_bits(address, bytes);
             uint64_t second = interp_load_bits(address + bytes, bytes);
-            if (opc == 1) { // LDPSW: two 32-bit loads, each sign-extended into a 64-bit register
+            if (opc == 1) { // LDPSW: two 32-bit loads, sign-extended
                 interp_set_gpr(cpu, rt, (uint64_t)interp_sext(first, 32));
                 interp_set_gpr(cpu, rt2, (uint64_t)interp_sext(second, 32));
             } else if (bytes == 8) {
@@ -1970,34 +1512,30 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
                 interp_set_gpr32(cpu, rt2, (uint32_t)second);
             }
         } else {
-            // Read both source registers BEFORE either store, so that a store which overlaps the base or
-            // transfer registers still writes the values the instruction was given.
             uint64_t first = interp_gpr(cpu, rt), second = interp_gpr(cpu, rt2);
             interp_store_bits(address, first, bytes);
             interp_store_bits(address + bytes, second, bytes);
         }
-        // Writeback LAST. If Rn is also a transfer register the architecture calls the result CONSTRAINED
-        // UNPREDICTABLE, and doing the writeback last is the behaviour real cores pick.
+        // Writeback LAST: Rn as a transfer register too is CONSTRAINED UNPREDICTABLE; last is what cores do.
         if (writeback) interp_set_gpr_sp(cpu, rn, base + (uint64_t)offset);
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
 
-    // ---- Load/store exclusive, and the ordered (LDAR/STLR) and CAS members of the same box ----
+    // Load/store exclusive, plus the ordered (LDAR/STLR) and CAS members of the box.
     if ((insn & 0x3F000000u) == 0x08000000u) {
         unsigned size = (insn >> 30) & 3, o2 = (insn >> 23) & 1, load = (insn >> 22) & 1;
         unsigned o1 = (insn >> 21) & 1, o0 = (insn >> 15) & 1;
         int rs = rm;
         unsigned bytes = 1u << size;
 
-        if (o2 && o1) { // Compare and swap: CAS / CASA / CASL / CASAL (Rt2 is 11111)
+        if (o2 && o1) { // CAS / CASA / CASL / CASAL (Rt2 is 11111)
             if (rt2 != 31) return interp_undefined(cpu, insn, "loads and stores -- unallocated CAS encoding");
             uint64_t address = interp_gpr_sp(cpu, rn);
             void *pointer = interp_atomic_pointer(address, bytes);
             if (pointer == NULL) return interp_alignment_fault(cpu, address);
             uint64_t compare = interp_gpr(cpu, rs), swap = interp_gpr(cpu, rt);
-            // The comparand and the returned old value are the ACCESS width, not the register width, so mask
-            // both: `casb w0, w1, [x2]` compares only the low byte.
+            // Comparand and returned value are the ACCESS width, not the register width.
             uint64_t mask = bytes == 8 ? UINT64_MAX : ((UINT64_C(1) << (bytes * 8)) - 1u);
             uint64_t expected = compare & mask, observed;
             interp_access_begin(address, bytes, 1);
@@ -2041,15 +1579,11 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             return INTERP_NEXT;
         }
 
-        if (o2) { // Load-acquire / store-release WITHOUT a monitor: LDAR / LDLAR / STLR / STLLR
+        if (o2) { // LDAR / LDLAR / STLR / STLLR: ordered access, no monitor
             if (o1 || rs != 31 || rt2 != 31)
                 return interp_undefined(cpu, insn, "loads and stores -- unallocated ordered-access encoding");
             uint64_t address = interp_gpr_sp(cpu, rn);
-            // The host is x86-TSO, where loads already have acquire semantics and stores already have release
-            // semantics, so these fences are compiled away into nothing on the host that matters. They are
-            // written anyway rather than assumed: this file is the non-AArch64 backend generally, not the
-            // x86-64 backend specifically, and on a weaker host they are load-bearing. The COMPILER also has
-            // to be stopped from reordering the surrounding accesses, which a TSO argument does not cover.
+            // Free on x86-TSO, but this backend is not x86-only and the compiler must be stopped anyway.
             if (load) {
                 uint64_t value = interp_load_bits(address, bytes);
                 __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -2068,10 +1602,8 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
 
         uint64_t address = interp_gpr_sp(cpu, rn);
 
-        // CASP / CASPA / CASPL / CASPAL. These share o1 == 1 with LDXP/STXP and are separated from them by
-        // BIT 31, not by the size field: LDXP/STXP always have bit31 == 1 (their size is 0b10 or 0b11), while
-        // CASP encodes bit31 == 0 with bit30 as its lone size bit. Testing only `size < 2` therefore rejects
-        // every CASP as an unallocated pair size, which is what the ISA regression guest caught.
+        // CASP shares o1 == 1 with LDXP/STXP and is separated by BIT 31, not by size: `size < 2` alone
+        // rejects every CASP as an unallocated pair size.
         if (o1 && !(insn & 0x80000000u)) {
             if (rt2 != 31) return interp_undefined(cpu, insn, "loads and stores -- unallocated CASP encoding");
             // Rs and Rt must both be even: each names the first of a register PAIR.
@@ -2086,8 +1618,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             uint64_t observed_low, observed_high;
             interp_access_begin(address, total, 1);
             if (element == 4) {
-                // A 32-bit pair is one naturally-aligned 64-bit location; low-order register first, because the
-                // guest is little-endian.
+                // A 32-bit pair is one aligned 64-bit location; low register first (little-endian guest).
                 uint64_t expected = (compare_low & 0xFFFFFFFFu) | ((compare_high & 0xFFFFFFFFu) << 32);
                 uint64_t replacement = (swap_low & 0xFFFFFFFFu) | ((swap_high & 0xFFFFFFFFu) << 32);
                 __atomic_compare_exchange_n((uint64_t *)pointer, &expected, replacement, 0, __ATOMIC_SEQ_CST,
@@ -2104,7 +1635,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
                 observed_high = (uint64_t)(expected >> 64);
             }
             interp_access_end();
-            // Like CAS, CASP returns the PRE-EXISTING pair in the comparand registers whether or not it swapped.
+            // Like CAS, CASP returns the PRE-EXISTING pair whether or not it swapped.
             if (element == 8) {
                 interp_set_gpr(cpu, rs, observed_low);
                 interp_set_gpr(cpu, rs + 1, observed_high);
@@ -2116,7 +1647,6 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             return INTERP_NEXT;
         }
 
-        // The genuine exclusive pair (LDXP/STXP), whose only allocated sizes are the 32-bit and 64-bit pairs.
         if (o1 && size < 2)
             return interp_undefined(cpu, insn, "loads and stores -- unallocated exclusive-pair size");
         unsigned access_bytes = o1 ? bytes * 2u : bytes;
@@ -2127,7 +1657,6 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             uint64_t first = interp_load_bits(address, bytes);
             uint64_t second = o1 ? interp_load_bits(address + bytes, bytes) : 0;
             if (o0) __atomic_thread_fence(__ATOMIC_ACQUIRE); // LDAXR/LDAXP
-            // Arm the monitor with what we observed, which is what the store-exclusive will compare against.
             g_interp_monitor_address = address;
             g_interp_monitor_bytes = access_bytes;
             g_interp_monitor_value = first;
@@ -2144,7 +1673,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             return INTERP_NEXT;
         }
 
-        // STXR / STLXR / STXP / STLXP. Rs receives 0 on success, 1 on failure.
+        // STXR / STLXR / STXP / STLXP: Rs receives 0 on success, 1 on failure.
         if (!o1 && rt2 != 31)
             return interp_undefined(cpu, insn, "loads and stores -- unallocated store-exclusive encoding");
         void *pointer = interp_atomic_pointer(address, bytes);
@@ -2156,7 +1685,6 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             if (o0) __atomic_thread_fence(__ATOMIC_RELEASE); // STLXR/STLXP
             interp_access_begin(address, access_bytes, 1);
             if (!o1) {
-                // Single register: one compare-and-swap against the value LDXR observed.
                 switch (bytes) {
                 case 1: {
                     uint8_t expected = (uint8_t)g_interp_monitor_value;
@@ -2184,12 +1712,9 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
                 }
                 }
             } else {
-                // STXP: a 128-bit (or 64-bit) pair must commit indivisibly. A 64-bit pair fits one 128-bit
-                // compare-and-swap; a 32-bit pair fits one 64-bit compare-and-swap. __atomic on a 16-byte
-                // object can lower to a libatomic lock rather than a real instruction on some hosts, which
-                // would not be atomic against a peer using the 8-byte path -- but every access to a given
-                // location by a given guest goes through this same code, so the lock is consistent with
-                // itself. Correctness over cleverness; a native cmpxchg16b lowering is a later change.
+                // STXP: the pair must commit indivisibly -- a 64-bit pair is one 128-bit CAS, a 32-bit
+                // pair one 64-bit CAS. __atomic on 16 bytes may lower to a libatomic lock, consistent only
+                // because every access to the location goes through this code.
                 uint64_t desired2 = interp_gpr(cpu, rt2);
                 if (bytes == 4) {
                     uint64_t expected = (g_interp_monitor_value & 0xFFFFFFFFu) |
@@ -2208,21 +1733,15 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             }
             interp_access_end();
         }
-        // The monitor is cleared by ANY store-exclusive, successful or not: the architecture requires a
-        // failed STXR to leave no armed monitor, or a retry loop could succeed without re-reading.
+        // ANY store-exclusive clears the monitor, or a retry loop could succeed without re-reading.
         interp_monitor_clear();
         interp_set_gpr32(cpu, rs, failed);
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
 
-    // ---- LDAPR (FEAT_LRCPC): an acquire load with RCpc rather than RCsc ordering ----
-    //   size 111000 0 0 1 11111 1100 00 Rn Rt
-    // It sits inside the LSE atomic box below (Rs == 11111, opc == 100, o3 == 1 would decode as an atomic), so
-    // it has to be recognised BEFORE that decode arms the atomic path. For this backend an RCpc acquire and an
-    // RCsc acquire come out the same: the guest's loads are ordinary C accesses that the host compiler and CPU
-    // may reorder, so any guest acquire has to become a real host barrier, and sequential consistency is
-    // stronger than either ordering. (Weakening it would be an optimisation, not a correctness fix.)
+    // LDAPR (FEAT_LRCPC) sits inside the LSE atomic box below, so it must be recognised BEFORE that
+    // decode. RCpc and RCsc come out the same here: SEQ_CST is stronger than either.
     if ((insn & 0x3FFFFC00u) == 0x38BFC000u && !vector) {
         unsigned bytes = 1u << ((insn >> 30) & 3);
         uint64_t value = interp_load_bits(interp_gpr_sp(cpu, rn), bytes);
@@ -2235,8 +1754,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- Atomic memory operations (LSE): LDADD/LDCLR/LDEOR/LDSET/LDSMAX/LDSMIN/LDUMAX/LDUMIN/SWP ----
-    // Encoding shares the register-offset box but is distinguished by bits[11:10] == 00.
+    // Atomic memory operations (LSE), sharing the register-offset box; bits[11:10] == 00 selects them.
     if ((insn & 0x3B200C00u) == 0x38200000u) {
         unsigned size = (insn >> 30) & 3, opc = (insn >> 12) & 7, o3 = (insn >> 15) & 1;
         int rs = rm;
@@ -2246,10 +1764,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         void *pointer = interp_atomic_pointer(address, bytes);
         if (pointer == NULL) return interp_alignment_fault(cpu, address);
         uint64_t operand = interp_gpr(cpu, rs), old = 0;
-        // Every one of these is a real host read-modify-write, not a load followed by a store: guest threads
-        // are host threads, so an interleaved peer would otherwise lose an update. SEQ_CST covers all four
-        // acquire/release combinations the A and R bits encode; on x86-TSO the stronger ordering costs nothing
-        // beyond what the locked instruction already implies.
+        // Real host read-modify-writes, not load-then-store: an interleaved peer would lose an update.
         interp_access_begin(address, bytes, 1);
 #define INTERP_LSE_RMW(type, expression)                                                                        \
     do {                                                                                                        \
@@ -2284,7 +1799,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
                                   __atomic_fetch_add(slot, argument, __ATOMIC_SEQ_CST),
                                   __atomic_fetch_add(slot, argument, __ATOMIC_SEQ_CST));
                 break;
-            case 1: // LDCLR: bit CLEAR, so the operand is complemented into an AND
+            case 1: // LDCLR: bit CLEAR, so the operand is complemented
                 INTERP_LSE_WIDTHS(__atomic_fetch_and(slot, (uint8_t)~argument, __ATOMIC_SEQ_CST),
                                   __atomic_fetch_and(slot, (uint16_t)~argument, __ATOMIC_SEQ_CST),
                                   __atomic_fetch_and(slot, (uint32_t)~argument, __ATOMIC_SEQ_CST),
@@ -2306,11 +1821,8 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             case 5: // LDSMIN
             case 6: // LDUMAX
             case 7: { // LDUMIN
-                // There is no __atomic_fetch_max, so these are a compare-and-swap retry loop. The loop is what
-                // makes them atomic against a peer guest thread: a load-compare-store would let another thread's
-                // update land in between and be lost, which is precisely the bug these instructions exist to
-                // avoid. The comparison happens at the ACCESS width and in the right signedness, so the sign
-                // extension for the signed forms is part of the type the macro instantiates.
+                // No __atomic_fetch_max, so these are a CAS retry loop: a load-compare-store would let a
+                // peer's update land in between. Comparison is at the ACCESS width and signedness.
                 unsigned want_max = opc == 4 || opc == 6;
                 unsigned is_signed = opc < 6;
 #define INTERP_LSE_MINMAX(type, signed_type)                                                                     \
@@ -2347,7 +1859,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
 #undef INTERP_LSE_WIDTHS
 #undef INTERP_LSE_RMW
         interp_access_end();
-        // Rt receives the PRE-operation value. Rt == 31 makes it the ST<op> alias, which discards it.
+        // Rt receives the PRE-operation value; Rt == 31 is the ST<op> alias, which discards it.
         if (bytes == 8)
             interp_set_gpr(cpu, rt, old);
         else
@@ -2356,12 +1868,9 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- The three single-register integer addressing modes ----
-    // All three share the size/opc field layout, so decode the operation once and the address per mode.
-    //   opc == 0            store of (1 << size) bytes
-    //   opc == 1            zero-extending load
-    //   opc == 2            sign-extending load into a 64-bit register (or PRFM when size == 3)
-    //   opc == 3            sign-extending load into a 32-bit register
+    // The three single-register integer addressing modes, sharing one size/opc layout:
+    //   opc == 0  store of (1 << size) bytes        1  zero-extending load
+    //   opc == 2  sign-extending load into Xt       3  sign-extending load into Wt   (2 with size 3 is PRFM)
     unsigned size = (insn >> 30) & 3;
     unsigned opc = (insn >> 22) & 3;
     int scaled = (insn & 0x3B000000u) == 0x39000000u;
@@ -2372,8 +1881,6 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
     if (!vector && ((insn & 0x3B200C00u) == 0x38200400u || (insn & 0x3B200C00u) == 0x38200C00u))
         return interp_undefined(cpu, insn, "loads and stores -- LDRAA/LDRAB (pointer authentication)");
 
-    // A SIMD&FP access shares all three addressing modes with the integer one; only the transfer width and the
-    // load/store test differ (opc<1>:size gives the width, opc<0> selects load).
     unsigned bytes = vector ? interp_simd_access_bytes(size, opc) : (1u << size);
     if (vector && bytes == 0)
         return interp_undefined(cpu, insn, "loads and stores -- unallocated SIMD/FP access size");
@@ -2386,16 +1893,14 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         address = base + (((uint64_t)((insn >> 10) & 0xFFFu)) << scale);
     } else if (register_offset) {
         unsigned option = (insn >> 13) & 7, s = (insn >> 12) & 1;
-        // S selects whether the index is scaled by the access size; option selects the index width and
-        // signedness. Only 010/011/110/111 (UXTW/LSL/SXTW/SXTX) are allocated here.
+        // S scales the index by the access size; only options 010/011/110/111 are allocated here.
         if ((option & 3u) < 2u)
             return interp_undefined(cpu, insn, "loads and stores -- unallocated register-offset extend option");
         address = base + interp_extend_operand(cpu, rm, option, s ? scale : 0u, 1);
     } else {
         unsigned mode = (insn >> 10) & 3;
         int64_t offset = interp_sext((insn >> 12) & 0x1FFu, 9);
-        // mode 0 = LDUR/STUR (unscaled signed offset), 1 = post-index, 2 = LDTR/STTR (an "unprivileged"
-        // access, which at EL0 is an ordinary one, so it behaves exactly like mode 0), 3 = pre-index.
+        // mode 0 = LDUR/STUR, 1 = post-index, 2 = LDTR/STTR (at EL0 the same as 0), 3 = pre-index.
         writeback = mode == 1 || mode == 3;
         writeback_value = base + (uint64_t)offset;
         address = mode == 1 ? base : base + (uint64_t)offset;
@@ -2407,9 +1912,9 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         else
             interp_vec_store(cpu, rt, address, bytes);
     } else if (opc == 0) { // store
-        uint64_t value = interp_gpr(cpu, rt); // read the source before the access; see the ordering note above
+        uint64_t value = interp_gpr(cpu, rt); // source read before the access
         interp_store_bits(address, value, bytes);
-    } else if (opc == 2 && size == 3) { // PRFM / PRFUM: a hint with no architectural effect here
+    } else if (opc == 2 && size == 3) { // PRFM / PRFUM: a hint
         (void)0;
     } else if (opc == 1) { // zero-extending load
         uint64_t value = interp_load_bits(address, bytes);
@@ -2423,7 +1928,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         uint64_t value = (uint64_t)interp_sext(interp_load_bits(address, bytes), bytes * 8u);
         if (opc == 2) // 64-bit destination
             interp_set_gpr(cpu, rt, value);
-        else // 32-bit destination: sign-extend within 32 bits, then zero-extend to 64
+        else // 32-bit destination
             interp_set_gpr32(cpu, rt, (uint32_t)value);
     }
     if (writeback) interp_set_gpr_sp(cpu, rn, writeback_value);
@@ -2431,79 +1936,18 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
     return INTERP_NEXT;
 }
 
-// ---------------------------------------------------------------------------
-// Floating point: FPCR/FPSR, and how a guest FP result is actually computed.
-// ---------------------------------------------------------------------------
-// THE DECISION, AND WHY: PROJECT FPCR ONTO THE HOST FP ENVIRONMENT AND LET THE HOST FP UNIT COMPUTE.
+// Floating point: FPCR/FPSR, and how a guest FP result is computed.
+// Project FPCR onto the host FP environment (<fenv.h>; this file backs every non-AArch64 host) and let the
+// host compute: for FADD/FSUB/FMUL/FDIV/FSQRT/FMADD and single <-> double both ISAs define the same
+// correctly-rounded IEEE-754 result. guest/x86_64/x87state.c is this same map read right to left.
 //
-// Two designs were available, and the choice is not obvious enough to leave implicit.
-//   (a) Model IEEE-754 in software: unpack, compute on integers, round, repack. Host-independent by
-//       construction, and about a thousand lines whose every rounding decision is mine to get wrong.
-//   (b) Observe that the host FP unit is ALSO IEEE-754, with the same four rounding modes and the same five
-//       exceptions, install the guest's FPCR.RMode into the host's rounding control around each operation,
-//       let the hardware compute, and harvest the raised exceptions back into FPSR.
-//
-// This file does (b), for three reasons:
-//
-//   * For FADD/FSUB/FMUL/FDIV/FSQRT/FMADD and the conversions between single and double, an x86-64 SSE
-//     operation and an AArch64 FP operation ARE THE SAME FUNCTION: both are defined as the correctly-rounded
-//     IEEE-754 result under the active rounding mode, so they agree bit for bit. Bit-exactness then comes
-//     from silicon rather than from my arithmetic, which matters because a rounding bug in a hand-written
-//     soft-float surfaces as a one-digit difference in printf output arbitrarily far from its cause -- the
-//     single hardest class of defect to localise in this corpus.
-//   * The engine already does this projection in the mirror direction and it is proven there.
-//     guest/x86_64/x87state.c maps a guest MXCSR onto the host AArch64 FPCR/FPSR field by field, including
-//     the rounding-mode permutation and the five exception bits. This is that same map read right to left.
-//   * It is far less code, and the code it does still need (interp_fp_pack below) is code a soft-float would
-//     have needed anyway.
-//
-// The projection is spelled with <fenv.h> rather than with STMXCSR/LDMXCSR. fenv is the portable name for
-// exactly the register this needs -- glibc implements fesetround/fetestexcept on x86-64 over MXCSR and on
-// AArch64 over FPCR/FPSR -- and this file is the AArch64 frontend for EVERY non-AArch64 host, so an
-// x86-specific spelling would have to be paired with a fallback that no build compiles and nothing tests.
-// guest/x86_64/avx.c already reaches for fegetround() in its own non-AArch64 arm for the same reason.
-//
-// WHERE THE TWO ISAs GENUINELY DISAGREE, AND SO WHERE THE HOST IS NOT ASKED.
-// The projection is sound only for the parts that agree. These do not, and each is computed here instead:
-//
-//   * NaN propagation. AArch64's FPProcessNaNs prefers a SIGNALLING operand over a quiet one regardless of
-//     position (op1 SNaN, then op2 SNaN, then op1 QNaN, then op2 QNaN); x86 SSE prefers the FIRST operand
-//     regardless of whether it signals. So (QNaN_a op SNaN_b) differs. Every operation below therefore
-//     screens its operands for NaN FIRST and produces the result itself; the host only ever sees non-NaNs.
-//   * The default NaN. When an invalid operation has no NaN operand at all (0/0, inf-inf, 0*inf, sqrt of a
-//     negative), AArch64 produces FPDefaultNaN, whose SIGN BIT IS CLEAR (0x7ff8000000000000 for a double).
-//     x86 produces the "QNaN indefinite", whose sign bit is SET. interp_fp_postprocess replaces any NaN the
-//     host manufactured out of non-NaN inputs rather than forwarding it.
-//   * FPCR.DN (default-NaN mode) and FPCR.FZ (flush-to-zero) have no portable host spelling at all -- x86
-//     has no DN, and splits FZ into separate output (FZ) and input (DAZ) bits -- so both are modelled here.
-//     Linux leaves both clear, which is why nothing in the corpus notices either way.
-//   * FMIN/FMAX and FMINNM/FMAXNM. AArch64's FMAX propagates NaNs and defines max(+0,-0) = +0 by ANDing the
-//     operand signs; x86's MAXSD returns its SECOND operand for any NaN and for either zero. Different
-//     functions, so computed here.
-//   * The integer conversions. FCVTZS/FCVTZU SATURATE to the destination range and raise Invalid; x86's
-//     CVTTSD2SI produces the integer indefinite instead. And x86-64 has no baseline instruction for
-//     unsigned-64 <-> floating point in either direction (the compiler's open-coded sequence for it is only
-//     correctly rounded in round-to-nearest). Both directions therefore go through interp_fp_pack /
-//     interp_fp_to_int, which also yields the fixed-point forms (a scale is just an addend on the exponent)
-//     and all five rounding variants FCVT{N,A,P,M,Z} for free.
-//   * Half precision. F16C is not baseline on x86-64 and a `_Float16` cast is round-to-nearest whatever the
-//     FP environment says -- the same conclusion guest/x86_64/avx.c reached from the other side, see
-//     avx_f32_to_f16_software. Software here too, sharing interp_fp_pack.
-//
-// ONE KNOWN, BOUNDED DIVERGENCE, stated rather than hidden. Tininess detection: AArch64 decides "underflow"
-// from the magnitude of the value BEFORE rounding, x86-64 decides it AFTER. IEEE-754 explicitly permits
-// either, so the two disagree for exactly one class of value -- one whose exact magnitude lies below the
-// smallest normal but which rounds up to exactly the smallest normal. The RESULT is identical either way;
-// only FPSR.UFC differs, and only for that value, and only for a host-computed operation (interp_fp_pack,
-// which does the conversions, implements AArch64's rule). Closing it would need a third format wider than
-// double, which is not available portably.
-//
-// PERFORMANCE. Each guest FP instruction costs an fegetround/fesetround/feclearexcept/fetestexcept bracket
-// on top of the decode. That is several times the cost of the arithmetic and it is the right trade for a
-// backend whose stated goal is correctness; the bracket also RESTORES the host rounding mode on the way out,
-// so the guest's FP environment can never leak into the engine's own C.
+// Handled below instead, because the ISAs differ: NaN propagation (AArch64 prefers a SIGNALLING operand, in
+// operand order; x86 the first), the default NaN (AArch64's sign bit is CLEAR, x86's SET), FPCR.DN and
+// FPCR.FZ/FZ16, FMIN/FMAX (signs ANDed for max(+0,-0)), and the integer and half conversions, which x86-64
+// has no baseline correctly-rounded instruction for. AArch64 also detects tininess BEFORE rounding and
+// x86-64 after, so FPSR.UFC can differ for a value tiny before rounding that rounds up to normal.
 
-// The three formats, ordered so that (fmt + 1) is the AdvSIMD element-size code the vector accessors take.
+// The three formats, ordered so (fmt + 1) is the AdvSIMD element-size code the vector accessors take.
 #define INTERP_FP_H 0u
 #define INTERP_FP_S 1u
 #define INTERP_FP_D 2u
@@ -2532,8 +1976,7 @@ static uint64_t interp_fp_sign_mask(unsigned fmt) {
     return UINT64_C(1) << (interp_fp_width(fmt) - 1u);
 }
 
-// The ptype field of the scalar-FP encodings. 10 is unallocated in every box that uses it as a format (the
-// one encoding that spells 10 there is FMOV to/from Vn.D[1], which is not a format-carrying form).
+// ptype: 10 is unallocated as a format (only FMOV to/from Vn.D[1] spells it, and carries no format).
 static int interp_fp_type_fmt(unsigned type, unsigned *fmt) {
     switch (type) {
     case 0: *fmt = INTERP_FP_S; return 1;
@@ -2543,7 +1986,7 @@ static int interp_fp_type_fmt(unsigned type, unsigned *fmt) {
     }
 }
 
-// FPUnpack's classification. QNAN/SNAN are last so a "is this a NaN" test is one comparison.
+// QNAN/SNAN last, so "is this a NaN" is one comparison.
 #define INTERP_FPC_ZERO 0u
 #define INTERP_FPC_DENORM 1u
 #define INTERP_FPC_NORM 2u
@@ -2558,13 +2001,10 @@ static unsigned interp_fp_class(uint64_t bits, unsigned fmt) {
     if (biased == 0) return frac == 0 ? INTERP_FPC_ZERO : INTERP_FPC_DENORM;
     if (biased != interp_fp_inf_exp(fmt)) return INTERP_FPC_NORM;
     if (frac == 0) return INTERP_FPC_INF;
-    // The quiet bit is the MOST significant fraction bit. Its being set is what makes a NaN quiet, and it is
-    // also what a signalling NaN must have OR-ed in when the architecture "quiets" it.
     return ((frac >> (mant - 1u)) & 1u) ? INTERP_FPC_QNAN : INTERP_FPC_SNAN;
 }
 
-// Rounding modes. The first four are FPCR.RMode verbatim; RA (ties away from zero) is not an FPCR encoding at
-// all -- it is the mode FCVTA*/FRINTA name directly -- so it lives beyond the 2-bit field.
+// The first four are FPCR.RMode verbatim; RA (ties away) has no FPCR encoding -- FCVTA*/FRINTA name it.
 #define INTERP_RM_RN 0u // to nearest, ties to even
 #define INTERP_RM_RP 1u // toward +infinity
 #define INTERP_RM_RM 2u // toward -infinity
@@ -2580,8 +2020,6 @@ static int interp_fp_host_round(unsigned rmode) {
     }
 }
 
-// Given the bits a rounding step is about to discard, does `rmode` move the magnitude away from zero?
-// `lsb` is the least significant retained bit, which only round-to-nearest-even consults.
 static int interp_fp_round_away(unsigned rmode, unsigned sign, int round_bit, int sticky, unsigned lsb) {
     switch (rmode) {
     case INTERP_RM_RN: return round_bit && (sticky || lsb);
@@ -2592,16 +2030,9 @@ static int interp_fp_round_away(unsigned rmode, unsigned sign, int round_bit, in
     }
 }
 
-// The host FP-environment bracket. Enter installs the guest's rounding mode and clears the host's cumulative
-// exception flags; leave reads them back, maps them onto FPSR bit positions and RESTORES the host's mode.
-//
-// Restoring matters: the engine's own C runs between guest instructions (the dispatcher, syscall service, the
-// whole of linux_abi) and must not silently inherit a guest's round-toward-zero. Clearing the host's sticky
-// flags is safe because nothing in this tree reads fetestexcept outside this bracket.
-//
-// The empty asm memory barriers and the volatile operands in the callers below exist because GCC compiles
-// with FENV_ACCESS effectively OFF: it does not know that fesetround changes the meaning of a subsequent FP
-// operation and is free to hoist one out of the bracket. avx.c states the same hazard for the same reason.
+// Enter installs the guest rounding mode and clears the host's sticky flags; leave harvests them onto FPSR
+// and RESTORES the host mode, so the engine's own C cannot inherit it. Barriers and volatiles stop GCC
+// (FENV_ACCESS off) hoisting FP work out.
 typedef struct {
     int host_round;
 } interp_fpenv;
@@ -2628,8 +2059,6 @@ static unsigned interp_fp_env_leave(interp_fpenv *env) {
     return bits;
 }
 
-// Raw bits <-> host types. memcpy rather than a union or a cast for the same reason the guest memory
-// accessors use it: type-punning through a pointer is undefined behaviour the compiler may assume away.
 static double interp_fp_to_double(uint64_t bits) {
     double value;
     memcpy(&value, &bits, sizeof value);
@@ -2654,9 +2083,7 @@ static uint64_t interp_fp_from_float(float value) {
     return (uint64_t)bits;
 }
 
-// Half -> double, exactly, by re-encoding rather than by arithmetic (so it raises nothing and needs no
-// bracket). A half denormal becomes a double NORMAL, which is why the leading one has to be found and the
-// exponent walked down -- the same renormalisation FPUnpack does.
+// Exact re-encoding, so it raises nothing. A half denormal becomes a double NORMAL.
 static double interp_fp_half_to_double(uint64_t bits) {
     uint64_t sign = (bits & 0x8000u) ? (UINT64_C(1) << 63) : 0;
     unsigned biased = (unsigned)((bits >> 10) & 0x1Fu);
@@ -2675,10 +2102,7 @@ static double interp_fp_half_to_double(uint64_t bits) {
     return interp_fp_to_double(sign | ((uint64_t)((int)biased - 15 + 1023) << 52) | (frac << 42));
 }
 
-// Every value of every format handled here widens to a host double EXACTLY: binary16 and binary32 are
-// subsets of binary64 in both precision and exponent range. That is what lets the comparisons -- and the
-// half-precision arithmetic -- borrow the host's double unit without adding a rounding step of their own.
-// Callers must have screened NaNs first: a float -> double conversion of a signalling NaN quiets it.
+// Widening to double is EXACT here, so comparisons and half arithmetic add no rounding. Screen NaNs first.
 static double interp_fp_widen(uint64_t bits, unsigned fmt) {
     if (fmt == INTERP_FP_D) return interp_fp_to_double(bits);
     if (fmt == INTERP_FP_S) return (double)interp_fp_to_float((uint32_t)bits);
@@ -2690,16 +2114,12 @@ static uint64_t interp_fp_default_nan(unsigned fmt) {
     return ((uint64_t)interp_fp_inf_exp(fmt) << mant) | (UINT64_C(1) << (mant - 1u));
 }
 
-// FPProcessNaN: quiet the operand (or answer the default NaN under FPCR.DN), raising Invalid if it signalled.
 static uint64_t interp_fp_process_nan(uint64_t bits, unsigned fmt) {
     if (interp_fp_class(bits, fmt) == INTERP_FPC_SNAN) interp_fpsr_raise(INTERP_FPSR_IOC);
     if (INTERP_FPCR_DN(g_interp_fpcr)) return interp_fp_default_nan(fmt);
     return bits | (UINT64_C(1) << (interp_fp_mant(fmt) - 1u));
 }
 
-// FPProcessNaNs / FPProcessNaNs3, as one loop. The architectural order is every SIGNALLING operand first, in
-// operand order, and only then every quiet one -- which is where AArch64 parts company with x86, whose binary
-// operations simply prefer the first source. Returns 1 (and *result) when an operand was a NaN.
 static int interp_fp_process_nans(unsigned fmt, unsigned count, const uint64_t *operands, uint64_t *result) {
     for (unsigned pass = 0; pass < 2; pass++)
         for (unsigned index = 0; index < count; index++) {
@@ -2712,10 +2132,7 @@ static int interp_fp_process_nans(unsigned fmt, unsigned count, const uint64_t *
     return 0;
 }
 
-// FPUnpack's flush-to-zero step, applied to an INPUT operand. FPCR.FZ governs single and double; half has its
-// own FPCR.FZ16, because a half denormal is representable in every wider format and flushing it is a separate
-// decision. A flush is what sets FPSR.IDC -- the bit means "an input was denormal AND was discarded", not
-// merely "an input was denormal", which is why nothing sets it when FZ is clear.
+// On an INPUT: FPCR.FZ governs single/double, FPCR.FZ16 half. FPSR.IDC means "denormal AND discarded".
 static uint64_t interp_fp_flush_input(uint64_t bits, unsigned fmt) {
     unsigned flush = fmt == INTERP_FP_H ? INTERP_FPCR_FZ16(g_interp_fpcr) : INTERP_FPCR_FZ(g_interp_fpcr);
     if (!flush || interp_fp_class(bits, fmt) != INTERP_FPC_DENORM) return bits;
@@ -2723,16 +2140,10 @@ static uint64_t interp_fp_flush_input(uint64_t bits, unsigned fmt) {
     return bits & interp_fp_sign_mask(fmt);
 }
 
-// The common tail of every FP result, whether the host computed it or interp_fp_pack did. Two jobs:
-// substitute the architectural default NaN for whatever NaN encoding the host invented, and apply FPCR.FZ to
-// a denormal result. Then commit the accumulated exception bits to FPSR.
 static uint64_t interp_fp_postprocess(unsigned fmt, uint64_t bits, unsigned raised) {
     unsigned cls = interp_fp_class(bits, fmt);
     if (cls >= INTERP_FPC_QNAN) {
-        // Reachable only when the operands held no NaN (they are screened before the host is asked), i.e. this
-        // is an invalid operation: 0/0, inf-inf, 0*inf, sqrt of a negative. AArch64 answers FPDefaultNaN;
-        // x86-64's QNaN indefinite has the sign bit set and another host could pick a third encoding, so the
-        // value is replaced rather than forwarded. The Invalid flag itself came back from the host in `raised`.
+        // No operand was a NaN, so this is an invalid operation and the host's NaN is not FPDefaultNaN.
         bits = interp_fp_default_nan(fmt);
     } else if (cls == INTERP_FPC_DENORM) {
         unsigned flush = fmt == INTERP_FP_H ? INTERP_FPCR_FZ16(g_interp_fpcr) : INTERP_FPCR_FZ(g_interp_fpcr);
@@ -2745,40 +2156,28 @@ static uint64_t interp_fp_postprocess(unsigned fmt, uint64_t bits, unsigned rais
     return bits;
 }
 
-// Round the exact value (-1)^sign * significand * 2^exponent into `fmt` under `rmode`, and return its
-// encoding. OFC/UFC/IXC are OR-ed into *raised, which is never cleared, so a caller can accumulate.
-//
-// This is the file's only soft-float rounder, and it exists because three things cannot be delegated to the
-// host: an unsigned 64-bit integer -> floating point conversion (x86-64 has no baseline instruction and the
-// compiler's open-coded sequence is only correct in round-to-nearest); a conversion to half precision (F16C
-// is not baseline and a _Float16 cast ignores the rounding mode); and the fixed-point conversion forms, whose
-// scale factor is an exponent addend that no host instruction can apply without a second rounding.
-//
-// Unlike the host-computed paths it implements AArch64's BEFORE-rounding tininess rule exactly: `lsb_exp` is
-// clamped to the subnormal ulp using the value's own exponent, so a quantity that is tiny before rounding
-// raises Underflow even when it rounds up to the smallest normal.
+// Round (-1)^sign * significand * 2^exponent into `fmt` under `rmode`; OFC/UFC/IXC are OR-ed into *raised.
+// The only soft-float rounder here: unsigned-64 -> FP, conversion to half and the fixed-point forms have no
+// correctly-rounded baseline x86-64 instruction. Clamping `lsb_exp` to the subnormal ulp is AArch64's
+// BEFORE-rounding tininess rule.
 static uint64_t interp_fp_pack(unsigned sign, uint64_t significand, int exponent, unsigned fmt, unsigned rmode,
                                unsigned *raised) {
     unsigned mant = interp_fp_mant(fmt);
     uint64_t sign_bit = sign ? interp_fp_sign_mask(fmt) : 0;
-    if (significand == 0) return sign_bit; // an exact zero keeps its sign and raises nothing
+    if (significand == 0) return sign_bit; // exact zero keeps its sign
 
-    // The exponent of the value's leading one, then the exponent of the least significant bit the result can
-    // hold: one ulp of a normal result at this magnitude, or the fixed ulp of the subnormal range if coarser.
     int value_exp = exponent + (63 - __builtin_clzll(significand));
     int min_exp = 1 - interp_fp_bias(fmt) - (int)mant; // exponent of the smallest subnormal's last bit
     int lsb_exp = value_exp - (int)mant;
     int tiny = lsb_exp < min_exp;
     if (tiny) lsb_exp = min_exp;
 
-    // Shift the significand down onto that ulp, keeping the round bit and a sticky bit. A shift of 64 or more
-    // is reachable only in the clamped (tiny) case, where the whole significand is below the result's ulp.
+    // A shift of 64 or more arises only in the clamped (tiny) case.
     int shift = lsb_exp - exponent;
     uint64_t quotient;
     int round_bit = 0, sticky = 0;
     if (shift <= 0) {
-        // A left shift here cannot overflow: shift is (leading-one position - mant) when unclamped, so the
-        // leading one lands exactly at bit `mant`, and in the clamped case it lands strictly below it.
+        // Cannot overflow: unclamped the leading one lands exactly at bit `mant`, clamped strictly below.
         quotient = significand << (unsigned)(-shift);
     } else if (shift >= 64) {
         quotient = 0;
@@ -2794,14 +2193,10 @@ static uint64_t interp_fp_pack(unsigned sign, uint64_t significand, int exponent
     if (inexact) *raised |= INTERP_FPSR_IXC;
 
     if ((quotient >> mant) == 0) {
-        // Subnormal (or zero): the biased exponent is 0 and the stored fraction IS the quotient, so nothing
-        // has to be assembled. Underflow is raised on the architecture's before-rounding test.
         if (tiny && inexact) *raised |= INTERP_FPSR_UFC;
         return sign_bit | quotient;
     }
-    // A round-up can carry out of the significand (1.111..1 -> 10.000..0), moving the result into the next
-    // binade. Note that the subnormal branch above needs no equivalent: there, a carry into bit `mant` lands
-    // exactly on the encoding of the smallest normal (biased exponent 1, zero fraction) all by itself.
+    // A round-up carries into the next binade; in the subnormal branch such a carry IS the smallest normal.
     if (quotient >> (mant + 1u)) {
         quotient >>= 1;
         lsb_exp++;
@@ -2809,8 +2204,7 @@ static uint64_t interp_fp_pack(unsigned sign, uint64_t significand, int exponent
     if (tiny && inexact) *raised |= INTERP_FPSR_UFC; // tiny before rounding, normal after: still Underflow
     int biased = lsb_exp + (int)mant + interp_fp_bias(fmt);
     if (biased >= (int)interp_fp_inf_exp(fmt)) {
-        // Overflow. IEEE-754 gives an infinity when the active mode rounds AWAY from zero at this sign and the
-        // largest finite otherwise, and always raises Inexact alongside Overflow.
+        // IEEE-754: infinity if the mode rounds AWAY from zero at this sign, else the largest finite.
         *raised |= INTERP_FPSR_OFC | INTERP_FPSR_IXC;
         int away = rmode == INTERP_RM_RN || rmode == INTERP_RM_RA || (rmode == INTERP_RM_RP && !sign) ||
                    (rmode == INTERP_RM_RM && sign);
@@ -2820,8 +2214,6 @@ static uint64_t interp_fp_pack(unsigned sign, uint64_t significand, int exponent
     return sign_bit | ((uint64_t)(unsigned)biased << mant) | (quotient & interp_fp_mant_mask(fmt));
 }
 
-// A host double narrowed to half. NaNs are handled by the callers (they never reach here through the
-// arithmetic paths); an infinity converts exactly.
 static uint64_t interp_fp_half_from_double(double value, unsigned rmode, unsigned *raised) {
     uint64_t bits = interp_fp_from_double(value);
     unsigned sign = (unsigned)(bits >> 63);
@@ -2835,16 +2227,13 @@ static uint64_t interp_fp_half_from_double(double value, unsigned rmode, unsigne
     return interp_fp_pack(sign, significand, exponent, INTERP_FP_H, rmode, raised);
 }
 
-// ---- the arithmetic ----
 #define INTERP_FPOP_ADD 0u
 #define INTERP_FPOP_SUB 1u
 #define INTERP_FPOP_MUL 2u
 #define INTERP_FPOP_DIV 3u
 
-// FADD/FSUB/FMUL/FDIV. Half precision is computed in the host's DOUBLE unit and then rounded to half, which
-// is exact rather than a double-rounding hazard: binary64 carries 53 bits of significand and the classical
-// bound for a single arithmetic operation to survive a second rounding is 2p+2 == 24 bits, with binary16's
-// whole exponent range sitting far inside binary64's.
+// Half computes in the host's DOUBLE unit then rounds to half: exact, since 53 bits exceed the 24 that
+// binary16 needs to survive a second rounding.
 static uint64_t interp_fp_arith(unsigned fmt, unsigned op, uint64_t a, uint64_t b) {
     a = interp_fp_flush_input(a, fmt);
     b = interp_fp_flush_input(b, fmt);
@@ -2908,10 +2297,7 @@ static uint64_t interp_fp_sqrt(unsigned fmt, uint64_t a) {
     return interp_fp_postprocess(fmt, out, raised);
 }
 
-// FPMulAdd: addend + a*b with a SINGLE rounding, which is what C's fma() is defined to be. On a host with
-// FMA3 glibc's ifunc resolves to the hardware instruction and the projection is exact; on a host without it,
-// glibc's software path is still correctly rounded under the active mode. Using `x*y + z` instead would round
-// twice and is a different function.
+// addend + a*b with a SINGLE rounding, which is what C's fma() is defined to be; `x*y + z` rounds twice.
 static uint64_t interp_fp_muladd(unsigned fmt, uint64_t addend, uint64_t a, uint64_t b) {
     addend = interp_fp_flush_input(addend, fmt);
     a = interp_fp_flush_input(a, fmt);
@@ -2921,10 +2307,8 @@ static uint64_t interp_fp_muladd(unsigned fmt, uint64_t addend, uint64_t a, uint
                          (class_a == INTERP_FPC_ZERO && class_b == INTERP_FPC_INF);
     uint64_t operands[3] = {addend, a, b}, nan;
     int have_nan = interp_fp_process_nans(fmt, 3, operands, &nan);
-    // FPMulAdd's one asymmetry, and it is deliberate in the architecture: a QUIET NaN addend does NOT win over
-    // an invalid multiply. inf*0 with a quiet-NaN addend is Invalid and answers the default NaN, where plain
-    // NaN propagation would have forwarded the addend's payload. A SIGNALLING addend still wins, which is why
-    // this is tested after the propagation rule rather than before it.
+    // A QUIET NaN addend does NOT win over an invalid multiply (inf*0 gives the default NaN); a SIGNALLING
+    // one does.
     if (zero_times_inf && interp_fp_class(addend, fmt) == INTERP_FPC_QNAN) {
         interp_fpsr_raise(INTERP_FPSR_IOC);
         return interp_fp_default_nan(fmt);
@@ -2953,9 +2337,7 @@ static uint64_t interp_fp_muladd(unsigned fmt, uint64_t addend, uint64_t a, uint
     return interp_fp_postprocess(fmt, out, raised);
 }
 
-// FPMax/FPMin and FPMaxNum/FPMinNum. The NM forms are the IEEE-754 minNum/maxNum: a QUIET NaN operand is
-// replaced by the infinity that loses, so the other operand is returned -- and note that a SIGNALLING NaN is
-// NOT substituted, so it still propagates (with Invalid) through the plain form underneath.
+// The NM forms swap a QUIET NaN for the losing infinity; a SIGNALLING NaN still propagates with Invalid.
 static uint64_t interp_fp_minmax(unsigned fmt, uint64_t a, uint64_t b, int want_max, int numeric) {
     a = interp_fp_flush_input(a, fmt);
     b = interp_fp_flush_input(b, fmt);
@@ -2973,8 +2355,7 @@ static uint64_t interp_fp_minmax(unsigned fmt, uint64_t a, uint64_t b, int want_
     double x = interp_fp_widen(a, fmt), y = interp_fp_widen(b, fmt);
     uint64_t chosen = (want_max ? (x > y) : (x < y)) ? a : b;
     if (interp_fp_class(chosen, fmt) == INTERP_FPC_ZERO) {
-        // +0 and -0 compare EQUAL, so the numeric comparison above cannot separate them. The architecture
-        // combines the operand signs instead: FPMax ANDs them (so +0 wins) and FPMin ORs them (so -0 does).
+        // +0 and -0 compare EQUAL: FPMax ANDs the operand signs (+0 wins), FPMin ORs them (-0 wins).
         unsigned sign_a = (a & interp_fp_sign_mask(fmt)) != 0, sign_b = (b & interp_fp_sign_mask(fmt)) != 0;
         unsigned sign = want_max ? (sign_a & sign_b) : (sign_a | sign_b);
         return sign ? interp_fp_sign_mask(fmt) : UINT64_C(0);
@@ -2982,9 +2363,7 @@ static uint64_t interp_fp_minmax(unsigned fmt, uint64_t a, uint64_t b, int want_
     return chosen;
 }
 
-// FPCompare, writing NZCV. `quiet_signals` selects the FCMPE/FCCMPE forms, which raise Invalid for a QUIET
-// NaN as well as a signalling one. No host arithmetic: the operands widen to double exactly, and comparing
-// two non-NaN doubles raises nothing, so there is nothing to bracket or harvest.
+// `quiet_signals` selects FCMPE/FCCMPE, which raise Invalid for a quiet NaN too.
 static void interp_fp_compare(struct cpu *cpu, unsigned fmt, uint64_t a, uint64_t b, int quiet_signals) {
     a = interp_fp_flush_input(a, fmt);
     b = interp_fp_flush_input(b, fmt);
@@ -3004,8 +2383,7 @@ static void interp_fp_compare(struct cpu *cpu, unsigned fmt, uint64_t a, uint64_
         interp_set_flags(cpu, 0, 0, 1, 0);
 }
 
-// FPRoundInt: round to an integral value in the SAME format. `exact` is what distinguishes FRINTX (which
-// raises Inexact when it changes the value) from FRINTI and the five explicitly-moded FRINTs (which do not).
+// `exact` selects FRINTX, which raises Inexact when the value moves. Same format in and out.
 static uint64_t interp_fp_round_integral(unsigned fmt, uint64_t bits, unsigned rmode, int exact) {
     bits = interp_fp_flush_input(bits, fmt);
     uint64_t nan;
@@ -3019,14 +2397,12 @@ static uint64_t interp_fp_round_integral(unsigned fmt, uint64_t bits, unsigned r
     unsigned biased = (unsigned)((bits >> mant) & (uint64_t)interp_fp_inf_exp(fmt));
     uint64_t significand = biased == 0 ? frac : (frac | (UINT64_C(1) << mant));
     int exponent = (int)(biased == 0 ? 1u : biased) - interp_fp_bias(fmt) - (int)mant;
-    if (exponent >= 0) return bits; // already integral: every retained bit is at or above the units place
+    if (exponent >= 0) return bits; // already integral
 
     unsigned shift = (unsigned)(-exponent);
     uint64_t magnitude;
     int round_bit, sticky;
     if (shift >= 64) {
-        // |value| < 1 and smaller than the significand can express against the units place. The integer part
-        // is 0 and the whole value is the discarded fraction, so only the rounding direction decides.
         magnitude = 0;
         round_bit = shift == 64 ? (int)((significand >> 63) & 1u) : 0;
         sticky = (significand & (shift == 64 ? ~(UINT64_C(1) << 63) : UINT64_MAX)) != 0;
@@ -3037,15 +2413,11 @@ static uint64_t interp_fp_round_integral(unsigned fmt, uint64_t bits, unsigned r
     }
     if (interp_fp_round_away(rmode, sign, round_bit, sticky, (unsigned)(magnitude & 1u))) magnitude++;
     if (exact && (round_bit || sticky)) interp_fpsr_raise(INTERP_FPSR_IXC);
-    // The result is an integer no larger than 2^mant (we only got here because the value had a fraction), so
-    // repacking it is exact and the mode is irrelevant. A zero result keeps the operand's sign: FRINTM of
-    // -0.4 is -1.0 but FRINTZ of -0.4 is -0.0, and interp_fp_pack preserves that by construction.
+    // A zero result keeps the operand's sign: FRINTM of -0.4 is -1.0, FRINTZ of -0.4 is -0.0.
     unsigned raised = 0;
     return interp_fp_pack(sign, magnitude, 0, fmt, INTERP_RM_RZ, &raised);
 }
 
-// FPConvertNaN: a NaN crossing formats keeps its sign and the TOP bits of its payload, is always quiet on the
-// way out, and raises Invalid if the source signalled.
 static uint64_t interp_fp_convert_nan(uint64_t bits, unsigned from, unsigned to) {
     if (interp_fp_class(bits, from) == INTERP_FPC_SNAN) interp_fpsr_raise(INTERP_FPSR_IOC);
     if (INTERP_FPCR_DN(g_interp_fpcr)) return interp_fp_default_nan(to);
@@ -3056,15 +2428,11 @@ static uint64_t interp_fp_convert_nan(uint64_t bits, unsigned from, unsigned to)
     return sign | ((uint64_t)interp_fp_inf_exp(to) << to_mant) | payload | (UINT64_C(1) << (to_mant - 1u));
 }
 
-// FCVT between formats. Widening is exact; narrowing rounds, and double -> single is the one narrowing the
-// host does natively and identically (cvtsd2ss is the correctly-rounded IEEE result under MXCSR, exactly as
-// AArch64's FCVT is under FPCR).
+// Widening is exact; double -> single is the one narrowing the host does identically.
 static uint64_t interp_fp_convert(unsigned from, unsigned to, uint64_t bits) {
     if (interp_fp_class(bits, from) >= INTERP_FPC_QNAN) return interp_fp_convert_nan(bits, from, to);
     bits = interp_fp_flush_input(bits, from);
     if (interp_fp_width(to) > interp_fp_width(from)) {
-        // Exact in every direction: a wider format holds every value of a narrower one, including its
-        // denormals (which become normals) and its infinities.
         double wide = interp_fp_widen(bits, from);
         if (to == INTERP_FP_D) return interp_fp_postprocess(to, interp_fp_from_double(wide), 0);
         return interp_fp_postprocess(to, interp_fp_from_float((float)wide), 0);
@@ -3085,23 +2453,16 @@ static uint64_t interp_fp_convert(unsigned from, unsigned to, uint64_t bits) {
     return interp_fp_postprocess(to, out, raised);
 }
 
-// The value SatQ() produces for an out-of-range conversion, per destination width and signedness. A 32-bit
-// destination is returned sign-extended into 64 bits; the caller narrows it when it writes a W register.
+// SatQ()'s out-of-range value; a 32-bit destination comes back sign-extended to 64.
 static uint64_t interp_fp_int_saturate(unsigned sign, unsigned dest_bits, int is_signed) {
     if (!is_signed) return sign ? UINT64_C(0) : (dest_bits == 64 ? UINT64_MAX : ((UINT64_C(1) << dest_bits) - 1u));
     uint64_t limit = UINT64_C(1) << (dest_bits - 1u);
     return sign ? (UINT64_C(0) - limit) : (limit - 1u);
 }
 
-// FPToFixed: floating point to a `dest_bits`-wide integer, rounding per `rmode`, keeping `fbits` fractional
-// bits (0 for the plain FCVT* forms, 64-scale for the fixed-point ones -- a scale is nothing but an addend on
-// the exponent, which is why one function serves both).
-//
-// The architectural ORDER of the two exceptions matters and is easy to get wrong: the value is rounded to an
-// integer FIRST (raising Inexact if that changed it), and only then range-checked (raising Invalid and
-// saturating). So FCVTZU of -0.5 is 0 with Inexact and NO Invalid -- it rounds to zero, which is in range --
-// while FCVTZU of -1.5 saturates to 0 with both. And a NaN is replaced by the value 0 BEFORE the range check,
-// so it yields 0 with Invalid alone, no Inexact and no saturation.
+// FP to a `dest_bits`-wide integer, keeping `fbits` fractional bits (a scale is only an exponent addend).
+// ORDER matters: round to an integer FIRST (Inexact), then range-check (Invalid + saturate) -- FCVTZU of
+// -0.5 is 0 with Inexact and no Invalid, -1.5 saturates with both, and a NaN becomes 0 before the check.
 static uint64_t interp_fp_to_int(unsigned fmt, uint64_t bits, unsigned dest_bits, int is_signed, unsigned rmode,
                                 unsigned fbits) {
     bits = interp_fp_flush_input(bits, fmt);
@@ -3126,8 +2487,7 @@ static uint64_t interp_fp_to_int(unsigned fmt, uint64_t bits, unsigned dest_bits
     uint64_t magnitude = 0;
     int inexact = 0, too_large = 0;
     if (exponent >= 0) {
-        // Already an integer, so nothing is inexact -- but it may not fit in the 64-bit magnitude below, let
-        // alone in the destination, and shifting it there first would lose the very bits that prove it.
+        // Already an integer, so nothing is inexact -- but it may not fit 64 bits, let alone the destination.
         too_large = exponent >= 64 || (significand >> (64 - (unsigned)exponent)) != 0;
         if (!too_large) magnitude = significand << (unsigned)exponent;
     } else {
@@ -3175,7 +2535,6 @@ static uint64_t interp_fp_to_int(unsigned fmt, uint64_t bits, unsigned dest_bits
     return magnitude;
 }
 
-// FixedToFP: an integer (optionally scaled down by 2^fbits) to floating point.
 static uint64_t interp_fp_from_int(unsigned fmt, uint64_t value, unsigned source_bits, int is_signed, unsigned rmode,
                                   unsigned fbits) {
     unsigned sign = 0;
@@ -3187,18 +2546,12 @@ static uint64_t interp_fp_from_int(unsigned fmt, uint64_t value, unsigned source
     } else {
         magnitude = source_bits == 32 ? (uint64_t)(uint32_t)value : value;
     }
-    // Two statements, deliberately: passing interp_fp_pack(...) and `raised` as two arguments of one call
-    // leaves their evaluation order unspecified, and the compiler is free to read `raised` BEFORE the pack that
-    // fills it in -- which silently drops every Inexact/Overflow/Underflow this conversion raises. (Found by
-    // the FPSR probe: UCVTF of UINT64_MAX rounds up to 2^64 and must report Inexact, and reported nothing.)
+    // Two statements: as two arguments of one call, `raised` may be read before the pack that fills it.
     unsigned raised = 0;
     uint64_t packed = interp_fp_pack(sign, magnitude, -(int)fbits, fmt, rmode, &raised);
     return interp_fp_postprocess(fmt, packed, raised);
 }
 
-// VFPExpandImm: the 8-bit FMOV-immediate encoding. One sign bit, then an exponent built as NOT(b) followed by
-// (E-3) copies of b and then imm8<5:4>, then imm8<3:0> as the top of the fraction. The point of the odd
-// exponent construction is that it spans a small window around 1.0 in every format with the same 8 bits.
 static uint64_t interp_fp_expand_imm(unsigned fmt, uint64_t imm8) {
     unsigned exp_bits = interp_fp_width(fmt) - interp_fp_mant(fmt) - 1u;
     unsigned mant = interp_fp_mant(fmt);
@@ -3211,16 +2564,10 @@ static uint64_t interp_fp_expand_imm(unsigned fmt, uint64_t imm8) {
     return (sign << (interp_fp_width(fmt) - 1u)) | (exponent << mant) | ((imm8 & 0xFu) << (mant - 4u));
 }
 
-// ---------------------------------------------------------------------------
-// Integer saturation, for the AdvSIMD saturating group.
-// ---------------------------------------------------------------------------
-// FPSR.QC is CUMULATIVE and sticky exactly like the IEEE exception bits: any saturating instruction whose
-// result was clamped sets it, nothing clears it but MSR FPSR, so a guest checks it once after a whole run of
-// them. It is not an IEEE exception and no FP operation touches it.
+// AdvSIMD saturation. FPSR.QC is cumulative and sticky: any clamped result sets it, only MSR FPSR clears.
 
-// SQADD / SQSUB on one element. The 64-bit element form is real, so the wide case cannot be computed in a
-// wider signed type; it uses overflow detection instead, and the clamp direction follows from the WRAPPED
-// sign (a sum that wrapped positive was really too negative, and vice versa).
+// The 64-bit element form is real, so the wide case detects overflow and clamps by the WRAPPED sign rather
+// than computing in a wider type.
 static uint64_t interp_sqadd_element(uint64_t a, uint64_t b, unsigned size, int subtract) {
     unsigned esize = 8u << size;
     int64_t x = (int64_t)interp_element_sext(a, size), y = (int64_t)interp_element_sext(b, size);
@@ -3265,11 +2612,8 @@ static uint64_t interp_uqadd_element(uint64_t a, uint64_t b, unsigned size, int 
     return sum;
 }
 
-// The saturating NARROWING conversions. `size` is the DESTINATION element width and the source element is
-// twice that, so the source is at most 64 bits and the destination at most 32 -- which is why this needs no
-// 64-bit edge case even though SQADD above does. Three combinations exist and they are genuinely different:
-// SQXTN is signed->signed, UQXTN unsigned->unsigned, and SQXTUN signed->UNSIGNED (a negative source saturates
-// to zero rather than to the most negative value).
+// Saturating NARROWING. `size` is the DESTINATION width and the source element is twice it. SQXTN is
+// signed->signed, UQXTN unsigned->unsigned, SQXTUN signed->UNSIGNED.
 static uint64_t interp_sat_narrow(uint64_t element, unsigned size, int source_signed, int dest_signed) {
     unsigned esize = 8u << size;
     uint64_t mask = interp_element_mask(size);
@@ -3304,9 +2648,6 @@ static uint64_t interp_sat_narrow(uint64_t element, unsigned size, int source_si
     return value;
 }
 
-// Polynomial (carry-less) multiply of two `bits`-wide operands, low 64 bits of the product in *low and the
-// high 64 in *high. PMUL keeps only the low half of an 8x8 product; PMULL keeps the whole 16-bit or, in the
-// 64x64 form the crypto and CRC code uses, the whole 128-bit one.
 static void interp_poly_mul(uint64_t a, uint64_t b, unsigned bits, uint64_t *low, uint64_t *high) {
     uint64_t result_low = 0, result_high = 0;
     for (unsigned bit = 0; bit < bits; bit++) {
@@ -3319,19 +2660,8 @@ static void interp_poly_mul(uint64_t a, uint64_t b, unsigned bits, uint64_t *low
     *high = result_high;
 }
 
-// ---------------------------------------------------------------------------
-// The cryptographic extension: AES, SHA1 and SHA256.
-// ---------------------------------------------------------------------------
-// These are here because the engine ADVERTISES them. g_aarch64_cpu_model.hwcap is 0x1fb, whose bits 3, 4, 5
-// and 6 are HWCAP_AES, HWCAP_PMULL, HWCAP_SHA1 and HWCAP_SHA2 -- so every guest that asks what the CPU can do
-// is told these instructions exist, and an ifunc resolver in OpenSSL, libcrypto, Go's crypto or a checksumming
-// library will select exactly the code paths that use them. Reporting them as an unimplemented class would
-// therefore not be a gap a guest could avoid: it would abort a run that the engine itself invited.
-//
-// The tables are GENERATED (by the multiplicative inverse in GF(2^8) followed by the FIPS-197 affine
-// transform, checked against the published S(0x53) == 0xED and S(0x00) == 0x63) rather than transcribed,
-// because a 256-entry table typed by hand is exactly the kind of thing that is wrong in one entry and passes
-// every test that does not happen to hit it.
+// AES, SHA1 and SHA256. hwcap 0x1fb advertises HWCAP_AES/PMULL/SHA1/SHA2, so guest ifunc resolvers pick
+// these paths. The tables are GENERATED (GF(2^8) inverse then the FIPS-197 affine transform).
 static const uint8_t interp_aes_sbox[256] = {
     0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76,
     0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0,
@@ -3370,7 +2700,7 @@ static const uint8_t interp_aes_inv_sbox[256] = {
     0x17, 0x2B, 0x04, 0x7E, 0xBA, 0x77, 0xD6, 0x26, 0xE1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0C, 0x7D,
 };
 
-// GF(2^8) multiply by x, modulo the AES polynomial 0x11B. Every MixColumns coefficient is built from this.
+// GF(2^8) multiply by x, modulo the AES polynomial 0x11B.
 static uint8_t interp_aes_xtime(uint8_t a) {
     return (uint8_t)((a & 0x80u) ? (uint8_t)((a << 1) ^ 0x1Bu) : (uint8_t)(a << 1));
 }
@@ -3385,10 +2715,8 @@ static uint8_t interp_aes_mul(uint8_t a, uint8_t b) {
     return result;
 }
 
-// ShiftRows and its inverse. The state is column-major -- byte 4*column + row -- and ShiftRows moves each row
-// left by its own index, so the byte written at (column, row) is read from (column + row) mod 4. Getting the
-// direction backwards still round-trips through AESE/AESD and so still passes a naive encrypt-then-decrypt
-// test; only a published test vector catches it, which is why the fixture goldens are the oracle here.
+// The state is column-major (byte 4*column + row), so (column, row) reads from (column + row) mod 4. A
+// reversed direction still round-trips through AESE/AESD: only test vectors catch it.
 static void interp_aes_shift_rows(const uint8_t *in, uint8_t *out, int inverse) {
     for (unsigned column = 0; column < 4u; column++)
         for (unsigned row = 0; row < 4u; row++) {
@@ -3400,7 +2728,6 @@ static void interp_aes_shift_rows(const uint8_t *in, uint8_t *out, int inverse) 
         }
 }
 
-// MixColumns / InvMixColumns: each column is multiplied by a fixed polynomial over GF(2^8).
 static void interp_aes_mix_columns(const uint8_t *in, uint8_t *out, int inverse) {
     static const uint8_t forward[4] = {2, 3, 1, 1}, backward[4] = {14, 11, 13, 9};
     const uint8_t *coefficient = inverse ? backward : forward;
@@ -3413,7 +2740,7 @@ static void interp_aes_mix_columns(const uint8_t *in, uint8_t *out, int inverse)
         }
 }
 
-// ---- SHA helpers, named as the architecture names them ----
+// ---- SHA helpers ----
 static uint32_t interp_ror32_bits(uint32_t value, unsigned amount) {
     amount &= 31u;
     return amount ? ((value >> amount) | (value << (32u - amount))) : value;
@@ -3435,8 +2762,7 @@ static uint32_t interp_sha_parity(uint32_t x, uint32_t y, uint32_t z) {
     return (x ^ y ^ z);
 }
 
-// Read/write the low element of a vector register as a scalar of `fmt`. A scalar FP write ZEROES bits
-// [127:N] of the destination, which is what interp_vec_write's q == 0 does.
+// The low element as a scalar of `fmt`. A scalar FP write ZEROES bits [127:N] (interp_vec_write's q == 0).
 static uint64_t interp_fp_read(const struct cpu *cpu, int reg, unsigned fmt) {
     interp_vec value = interp_vec_read(cpu, reg);
     return interp_vec_element(&value, fmt + 1u, 0);
@@ -3449,20 +2775,16 @@ static void interp_fp_write(struct cpu *cpu, int reg, unsigned fmt, uint64_t bit
     interp_vec_write(cpu, reg, result, 0);
 }
 
-// ---------------------------------------------------------------------------
-// The scalar floating-point encoding space.
-// ---------------------------------------------------------------------------
-// Every member has bits[30:29] == 00 and bits[28:24] == 11110, or 11111 for the three-source multiply-adds.
-// bit30 is what separates this from the AdvSIMD SCALAR boxes, which share op0 == 1111 but pin bits[31:30] to
-// 01; bit29 (S) must be 0 because the architecture allocates no S == 1 form here. bit31 is free only because
-// the two conversion boxes use it as `sf` (the general-register width); every other form requires M == 0.
+// The scalar FP encoding space: bits[30:29] == 00, bits[28:24] == 11110 (11111 for the three-source
+// multiply-adds). bit30 separates it from the AdvSIMD SCALAR boxes (bits[31:30] == 01); bit31 is `sf` in the
+// conversion boxes and M, which must be 0, elsewhere.
 static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
     uint64_t gpc = cpu->pc;
     int rd = (int)(insn & 31), rn = (int)((insn >> 5) & 31), rm = (int)((insn >> 16) & 31);
     unsigned type = (insn >> 22) & 3u, sf = (insn >> 31) & 1u;
     unsigned fmt = INTERP_FP_S;
 
-    // ---- Floating-point data-processing (3 source): FMADD / FMSUB / FNMADD / FNMSUB ----
+    // ---- 3-source: FMADD / FMSUB / FNMADD / FNMSUB ----
     if ((insn & 0x7F000000u) == 0x1F000000u) {
         if (sf) return interp_undefined(cpu, insn, "scalar FP -- 3-source with M set");
         if (!interp_fp_type_fmt(type, &fmt))
@@ -3471,10 +2793,8 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
         int ra = (int)((insn >> 10) & 31);
         uint64_t addend = interp_fp_read(cpu, ra, fmt);
         uint64_t left = interp_fp_read(cpu, rn, fmt), right = interp_fp_read(cpu, rm, fmt);
-        // The architecture spells all four as ONE FPMulAdd with sign-flipped operands:
         //   FMADD =  Ra + Rn*Rm    FMSUB  =  Ra - Rn*Rm    FNMADD = -Ra - Rn*Rm    FNMSUB = -Ra + Rn*Rm
-        // and the flip is a literal sign-bit toggle (FPNeg), which matters for a NaN operand: the sign of its
-        // payload flips too, and that sign is observable in the propagated result.
+        // One FPMulAdd; the flip is a literal sign-bit toggle (FPNeg), so a propagated NaN's sign flips.
         uint64_t sign = interp_fp_sign_mask(fmt);
         if (o1) addend ^= sign;
         if (o1 != o0) left ^= sign;
@@ -3484,7 +2804,7 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
     }
 
     if (!((insn >> 21) & 1u)) {
-        // ---- Conversion between floating-point and FIXED-point ----
+        // ---- FP <-> fixed-point ----
         // fbits = 64 - scale, and a 32-bit general register cannot name more than 32 fractional bits.
         unsigned rmode = (insn >> 19) & 3u, opcode = (insn >> 16) & 7u, scale = (insn >> 10) & 0x3Fu;
         unsigned fbits = 64u - scale;
@@ -3511,11 +2831,10 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // bit21 == 1. The remaining boxes are selected by bits[11:10], with the four bits[11:10] == 00 boxes
-    // separated further by how far up bits[15:10] the fixed field reaches -- most specific first.
+    // bit21 == 1. The rest are selected by bits[11:10], the four 00 boxes most specific first.
     unsigned op_low = (insn >> 10) & 3u;
 
-    if (op_low == 1) { // ---- Floating-point conditional compare: FCCMP / FCCMPE ----
+    if (op_low == 1) { // ---- FCCMP / FCCMPE ----
         if (sf) return interp_undefined(cpu, insn, "scalar FP -- FCCMP with M set");
         if (!interp_fp_type_fmt(type, &fmt)) return interp_undefined(cpu, insn, "scalar FP -- FCCMP ptype");
         unsigned cond = (insn >> 12) & 0xFu, quiet_signals = (insn >> 4) & 1u;
@@ -3523,15 +2842,13 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
             interp_fp_compare(cpu, fmt, interp_fp_read(cpu, rn, fmt), interp_fp_read(cpu, rm, fmt),
                               (int)quiet_signals);
         else
-            // The condition failed, so NO comparison happens and no exception can be raised; NZCV is loaded
-            // from the instruction's own nzcv field instead. This is how a short-circuiting `&&` over FP
-            // comparisons is compiled, which is why it is common in libm.
+            // No comparison happens and no exception can be raised; NZCV comes from the insn's nzcv field.
             cpu->nzcv = ((uint64_t)(insn & 0xFu)) << 28;
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
 
-    if (op_low == 2) { // ---- Floating-point data-processing (2 source) ----
+    if (op_low == 2) { // ---- 2-source ----
         if (sf) return interp_undefined(cpu, insn, "scalar FP -- 2-source with M set");
         if (!interp_fp_type_fmt(type, &fmt))
             return interp_undefined(cpu, insn, "scalar FP -- 2-source unallocated ptype");
@@ -3547,8 +2864,7 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
         case 6: out = interp_fp_minmax(fmt, a, b, 1, 1); break;           // FMAXNM
         case 7: out = interp_fp_minmax(fmt, a, b, 0, 1); break;           // FMINNM
         case 8:
-            // FNMUL is FPNeg(FPMul(...)) -- the sign flip is applied to the PRODUCT, after rounding and after
-            // NaN propagation, so it flips the sign of a propagated NaN too.
+            // FNMUL negates the PRODUCT, after rounding and NaN propagation, so a propagated NaN flips too.
             out = interp_fp_arith(fmt, INTERP_FPOP_MUL, a, b) ^ interp_fp_sign_mask(fmt);
             break;
         default: return interp_undefined(cpu, insn, "scalar FP -- unallocated 2-source opcode");
@@ -3558,19 +2874,18 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    if (op_low == 3) { // ---- Floating-point conditional select: FCSEL ----
+    if (op_low == 3) { // ---- FCSEL ----
         if (sf) return interp_undefined(cpu, insn, "scalar FP -- FCSEL with M set");
         if (!interp_fp_type_fmt(type, &fmt)) return interp_undefined(cpu, insn, "scalar FP -- FCSEL ptype");
         unsigned cond = (insn >> 12) & 0xFu;
-        // A pure register copy: no unpacking, no flushing, no exceptions -- a signalling NaN passes through
-        // unchanged and unreported, exactly as FMOV does.
+        // A pure register copy: no flushing, no exceptions -- a signalling NaN passes through.
         interp_fp_write(cpu, rd, fmt,
                         interp_cond_holds(cpu, cond) ? interp_fp_read(cpu, rn, fmt) : interp_fp_read(cpu, rm, fmt));
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
 
-    if ((insn & 0x0000FC00u) == 0) { // ---- Conversion between floating-point and INTEGER ----
+    if ((insn & 0x0000FC00u) == 0) { // ---- FP <-> integer ----
         unsigned rmode = (insn >> 19) & 3u, opcode = (insn >> 16) & 7u;
         if (rmode == 0 && opcode == 6) { // FMOV to a general register (Vn's low element -> Rd)
             interp_vec source = interp_vec_read(cpu, rn);
@@ -3611,10 +2926,8 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
             return INTERP_NEXT;
         }
         if (rmode == 3 && opcode == 6 && type == 1 && !sf) {
-            // ---- FJCVTZS: double -> int32 with JavaScript's ToInt32 semantics ----
-            // Two things distinguish it from FCVTZS. It WRAPS modulo 2^32 instead of saturating (that is the
-            // ToInt32 rule), and it reports exactness in Z so a JIT can branch on "this double really was a
-            // small integer" without a second compare. Z is 1 only when the conversion lost nothing at all.
+            // FJCVTZS: double -> int32 with JavaScript ToInt32 semantics. It WRAPS modulo 2^32 rather than
+            // saturating, and Z reports exactness (1 only if nothing was lost).
             uint64_t bits = interp_fp_flush_input(interp_fp_read(cpu, rn, INTERP_FP_D), INTERP_FP_D);
             unsigned cls = interp_fp_class(bits, INTERP_FP_D);
             unsigned exact = 1;
@@ -3623,8 +2936,7 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
                 interp_fpsr_raise(INTERP_FPSR_IOC);
                 exact = 0;
             } else if (cls != INTERP_FPC_ZERO) {
-                // Reuse the exact-integer machinery, but ask for a 64-bit signed destination so nothing
-                // saturates, then take the low 32 bits and decide exactness from the flags it raised.
+                // A 64-bit signed destination so nothing saturates; exactness then comes off the flags.
                 uint64_t before = g_interp_fpsr;
                 uint64_t wide = interp_fp_to_int(INTERP_FP_D, bits, 64u, 1, INTERP_RM_RZ, 0);
                 unsigned raised = (unsigned)((g_interp_fpsr & ~before) & (INTERP_FPSR_IXC | INTERP_FPSR_IOC));
@@ -3653,8 +2965,7 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
             return INTERP_NEXT;
         }
         if (opcode <= 1 || opcode == 4 || opcode == 5) {
-            // FCVT{N,A,P,M,Z}{S,U}: rmode picks the rounding for opcode 0/1, and opcode 4/5 is the FCVTA pair
-            // whose ties-away mode has no FPCR encoding at all.
+            // rmode picks the rounding for opcode 0/1; opcode 4/5 is FCVTA, whose ties-away has no FPCR code.
             unsigned convert_mode;
             if (opcode >= 4) {
                 if (rmode != 0) return interp_undefined(cpu, insn, "scalar FP -- unallocated FCVTA rmode");
@@ -3675,17 +2986,14 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
         return interp_undefined(cpu, insn, "scalar FP -- unallocated integer conversion");
     }
 
-    if ((insn & 0x00007C00u) == 0x00004000u) { // ---- Floating-point data-processing (1 source) ----
+    if ((insn & 0x00007C00u) == 0x00004000u) { // ---- 1-source ----
         if (sf) return interp_undefined(cpu, insn, "scalar FP -- 1-source with M set");
         unsigned opcode = (insn >> 15) & 0x3Fu;
         if (!interp_fp_type_fmt(type, &fmt))
             return interp_undefined(cpu, insn, "scalar FP -- 1-source unallocated ptype");
-        // FCVT names its DESTINATION in the low two bits of the opcode and its source in ptype, so it has to
-        // be split out before the single-format cases below.
+        // FCVT names its DESTINATION in the low two opcode bits and its source in ptype, so split it first.
         if ((opcode & 0x3Cu) == 0x04u) {
-            // Opcode 000110 shares this box with the three FCVT destinations but is not one: it is BFCVT
-            // (FEAT_BF16), single -> BFloat16. Say so, rather than reporting it as an FCVT with a destination
-            // type the architecture does not allocate -- which is true of the bits and useless to the reader.
+            // Opcode 000110 shares this box but is BFCVT (FEAT_BF16), single -> BFloat16, not an FCVT.
             if (opcode == 0x06u)
                 return interp_undefined(cpu, insn, "scalar FP -- BFCVT (BFloat16 conversion)");
             unsigned to;
@@ -3700,13 +3008,10 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
         uint64_t a = interp_fp_read(cpu, rn, fmt), out;
         switch (opcode) {
         case 0x00: out = a; break;                              // FMOV (register): a pure bit copy
-        case 0x01: out = a & ~interp_fp_sign_mask(fmt); break;   // FABS: FPAbs clears the sign bit and nothing else
-        case 0x02: out = a ^ interp_fp_sign_mask(fmt); break;    // FNEG: likewise a sign-bit toggle
+        case 0x01: out = a & ~interp_fp_sign_mask(fmt); break;   // FABS: clears the sign bit, nothing else
+        case 0x02: out = a ^ interp_fp_sign_mask(fmt); break;    // FNEG: a sign-bit toggle
         case 0x03: out = interp_fp_sqrt(fmt, a); break;          // FSQRT
-        // The FRINT family. All round to an integral value in the same format; they differ only in the mode
-        // and in whether the result being different from the operand is reported as Inexact. FRINTX is the
-        // only one that reports it (its whole purpose is IEEE roundToIntegralExact); FRINTI and FRINTX share
-        // FPCR.RMode and differ by nothing else.
+        // The FRINT family differs only in the mode and in whether a change is Inexact; only FRINTX is.
         case 0x08: out = interp_fp_round_integral(fmt, a, INTERP_RM_RN, 0); break; // FRINTN
         case 0x09: out = interp_fp_round_integral(fmt, a, INTERP_RM_RP, 0); break; // FRINTP
         case 0x0A: out = interp_fp_round_integral(fmt, a, INTERP_RM_RM, 0); break; // FRINTM
@@ -3721,13 +3026,12 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    if ((insn & 0x00003C00u) == 0x00002000u) { // ---- Floating-point compare: FCMP / FCMPE ----
+    if ((insn & 0x00003C00u) == 0x00002000u) { // ---- FCMP / FCMPE ----
         if (sf || ((insn >> 14) & 3u) != 0) return interp_undefined(cpu, insn, "scalar FP -- unallocated compare");
         if (!interp_fp_type_fmt(type, &fmt)) return interp_undefined(cpu, insn, "scalar FP -- compare ptype");
         unsigned opcode2 = insn & 0x1Fu;
         if (opcode2 & 7u) return interp_undefined(cpu, insn, "scalar FP -- unallocated compare opcode2");
-        // opcode2<4> is E (raise Invalid for a quiet NaN too) and opcode2<3> selects the compare-with-zero
-        // form, in which Rm is not a register operand at all.
+        // opcode2<4> is E (Invalid for a quiet NaN too); opcode2<3> selects the compare-with-zero form.
         int quiet_signals = (opcode2 >> 4) & 1;
         uint64_t b = (opcode2 & 8u) ? UINT64_C(0) : interp_fp_read(cpu, rm, fmt);
         interp_fp_compare(cpu, fmt, interp_fp_read(cpu, rn, fmt), b, quiet_signals);
@@ -3747,38 +3051,16 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
     return interp_undefined(cpu, insn, "scalar FP -- unallocated encoding");
 }
 
-// ---------------------------------------------------------------------------
 // Scalar floating-point and Advanced SIMD.
-// ---------------------------------------------------------------------------
-// Scope note, because this group is enormous and most of it will never execute here. What a static glibc
-// guest actually needs is the integer-vector subset that its string and memory routines are written in:
-// memset broadcasts a byte with DUP and stores with vector ST1/STR; strlen compares 16 bytes at a time with
-// CMEQ and finds the first hit with a horizontal reduction; memcpy is vector LDR/STR pairs. That subset is
-// what is implemented, and it was chosen by running the guest and reading interp_undefined's report rather
-// than by working down the ARM ARM.
-//
-// It has since grown well past that starting subset, by the same method: the saturating group, the widening
-// and narrowing three-different group, the permutes, the shift-by-immediate space, the vector floating-point
-// subset, and the AdvSIMD SCALAR spellings of all of it (normalised into the vector handlers below, see the
-// `scalar` note at the top of interp_exec_simd).
-//
-// Deliberately still absent, and each still reported by name: the crypto block, BFloat16, the
-// reciprocal-estimate family, the saturating-doubling multiplies, the by-element (indexed) forms, and SVE.
-// A guest that needs those will say so precisely rather than getting an approximation.
+// The subset guests actually reach. Reported, not implemented: BFloat16, reciprocal estimates,
+// saturating-doubling multiplies, by-element forms, SVE.
 static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     uint64_t gpc = cpu->pc;
     int rd = (int)(insn & 31), rn = (int)((insn >> 5) & 31), rm = (int)((insn >> 16) & 31);
     unsigned q = (insn >> 30) & 1, u = (insn >> 29) & 1;
 
-    // ---- The cryptographic extension: AES and the two-register SHA forms ----
-    // Tested first, before the scalar normalisation below, because the SHA group lives at bits[31:30] == 01 and
-    // would otherwise be rewritten into a vector spelling that means something else. Both groups pin
-    // bits[21:17] to 10100, which no other AdvSIMD box uses (two-register-misc is 10000 and pairwise is 11000).
-    // Named rather than left to the catch-all: a guest reaching here is asking for a feature this engine does
-    // not advertise, which is a different fact from a decoder gap, and the S-boxes and round functions are a
-    // self-contained block that should be added deliberately if a guest ever needs them.
-    // AES (0x4E28xxxx) and the two-register SHA forms (0x5E28xxxx) both pin bits[21:17] to 10100, which no
-    // other AdvSIMD box uses (two-register-misc is 10000 and pairwise is 11000).
+    // crypto: AES and two-register SHA
+    // Before the scalar normalisation, which would turn bits[31:30] == 01 into another encoding.
     if ((insn & 0xFF3E0C00u) == 0x4E280800u || (insn & 0xFF3E0C00u) == 0x5E280800u) {
         unsigned opcode = (insn >> 12) & 0x1Fu, size = (insn >> 22) & 3u;
         interp_vec source = interp_vec_read(cpu, rn), destination = interp_vec_read(cpu, rd), result;
@@ -3786,8 +3068,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             if (size != 0) return interp_undefined(cpu, insn, "AdvSIMD AES -- size must be 00");
             uint8_t stage[16], mixed[16];
             switch (opcode) {
-            case 0x04:   // AESE: AddRoundKey, then ShiftRows, then SubBytes
-            case 0x05: { // AESD: the same with the inverse permutation and box
+            case 0x04:   // AESE
+            case 0x05: { // AESD
                 int inverse = opcode == 0x05;
                 uint8_t combined[16];
                 for (unsigned index = 0; index < 16u; index++)
@@ -3809,7 +3091,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
         }
-        // ---- the two-register SHA forms: SHA1H, SHA1SU1, SHA256SU0 ----
+        // two-register SHA
         if (size != 0) return interp_undefined(cpu, insn, "AdvSIMD SHA -- size must be 00");
         uint32_t d[4], n[4];
         for (unsigned index = 0; index < 4u; index++) {
@@ -3818,12 +3100,12 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         }
         uint32_t out[4] = {0, 0, 0, 0};
         switch (opcode) {
-        case 0x00: // SHA1H Sd, Sn -- the standalone "rotate a by 30" that SHA-1 needs between rounds
+        case 0x00: // SHA1H
             out[0] = interp_rol32_bits(n[0], 30);
             break;
-        case 0x01: { // SHA1SU1 Vd.4S, Vn.4S: message-schedule update, second half
+        case 0x01: { // SHA1SU1
             uint32_t t[4];
-            // T = Vd EOR (Vn >> 32), i.e. Vn shifted down by one 32-bit element with zero fill.
+            // T = Vd EOR (Vn >> 32), zero fill.
             for (unsigned index = 0; index < 4u; index++)
                 t[index] = d[index] ^ (index < 3u ? n[index + 1u] : 0u);
             for (unsigned index = 0; index < 4u; index++)
@@ -3831,7 +3113,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             out[3] ^= interp_rol32_bits(t[0], 2);
             break;
         }
-        case 0x02: { // SHA256SU0 Vd.4S, Vn.4S: sigma0 applied across the rolling schedule window
+        case 0x02: { // SHA256SU0
             uint32_t t[4];
             for (unsigned index = 0; index < 4u; index++)
                 t[index] = index < 3u ? d[index + 1u] : n[0];
@@ -3851,13 +3133,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- The three-register SHA forms: SHA1C/P/M, SHA1SU0, SHA256H/H2, SHA256SU1 ----
-    //   0101 1110 000 Rm 0 opcode(14:12) 00 Rn Rd
-    // Tested here, before the scalar normalisation, for the same reason as the two-register group: bits[31:30]
-    // are 01 and the rewrite would turn this into a vector encoding that means something else entirely.
-    // The fixed bits are 31:24, 21, 15 and 11:10 ONLY -- bits 14:12 are the opcode. Masking 15:10 as one field
-    // (as an earlier version did) pins the opcode to zero, so SHA1C decoded and every other member of the group
-    // fell through to be mis-executed by a later box.
+    // three-register SHA
+    // Fixed bits are 31:24, 21, 15 and 11:10 ONLY: masking 15:10 as one field pins the opcode to zero.
     if ((insn & 0xFF208C00u) == 0x5E000000u) {
         unsigned opcode = (insn >> 12) & 7u;
         interp_vec vd = interp_vec_read(cpu, rd), vn = interp_vec_read(cpu, rn), vm = interp_vec_read(cpu, rm);
@@ -3868,10 +3145,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             w[index] = (uint32_t)interp_vec_element(&vm, 2, index);
         }
         if (opcode <= 2u) {
-            // SHA1C (choose), SHA1P (parity), SHA1M (majority). One instruction is FOUR SHA-1 rounds: the
-            // round constant is NOT applied here -- the caller folds K into Vm -- and the 160-bit state is
-            // (e : a,b,c,d) rotated left by one word each round, which is exactly the classic
-            // (a,b,c,d,e) <- (T, a, ROL(b,30), c, d) shuffle.
+            // SHA1C/P/M: FOUR SHA-1 rounds; K is folded into Vm by the caller.
             uint32_t e = y[0];
             for (unsigned round = 0; round < 4u; round++) {
                 uint32_t t = opcode == 0 ? interp_sha_choose(x[1], x[2], x[3])
@@ -3887,12 +3161,11 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             memcpy(result_words, x, sizeof result_words);
         } else if (opcode == 3u) {
-            // SHA1SU0: build {Vd<127:64>, Vn<63:0>} and fold in Vd and Vm.
+            // SHA1SU0
             uint32_t t[4] = {x[2], x[3], y[0], y[1]};
             for (unsigned index = 0; index < 4u; index++) result_words[index] = t[index] ^ x[index] ^ w[index];
         } else if (opcode == 4u || opcode == 5u) {
-            // SHA256H (part 1, returns the updated x) and SHA256H2 (part 2, returns the updated y, and takes
-            // its two state halves the other way round). Four SHA-256 rounds per instruction.
+            // SHA256H -> x, SHA256H2 -> y, halves swapped.
             int part1 = opcode == 4u;
             uint32_t a[4], b[4];
             if (part1) {
@@ -3912,8 +3185,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 uint32_t t = b[3] + sigma1 + chs + w[round];
                 uint32_t new_a3 = t + a[3];
                 uint32_t new_b3 = t + sigma0 + maj;
-                // <y, x> = ROL(y : x, 32): the top word of each half moves down, and the new words enter at
-                // the top of x and the bottom of y respectively.
+                // <y, x> = ROL(y : x, 32).
                 uint32_t carry = new_a3;
                 a[3] = a[2];
                 a[2] = a[1];
@@ -3926,7 +3198,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             memcpy(result_words, part1 ? a : b, sizeof result_words);
         } else if (opcode == 6u) {
-            // SHA256SU1: sigma1 over the rolling window, added to Vd and to {Vm<31:0>, Vn<127:32>}.
+            // SHA256SU1
             uint32_t t0[4] = {y[1], y[2], y[3], w[0]};
             uint32_t t1[2] = {w[2], w[3]};
             for (unsigned index = 0; index < 2u; index++) {
@@ -3951,61 +3223,41 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- The scalar floating-point space ----
-    // Tested first because it is exactly disjoint from every AdvSIMD box below and the test is one mask: the
-    // AdvSIMD VECTOR boxes all have bit28 == 0 (op0 == 0111) and the AdvSIMD SCALAR boxes all have bit30 == 1,
-    // while every scalar-FP encoding has bit28 == 1 and bit30 == 0. See interp_exec_fp_scalar's header.
+    // scalar FP (bit28 == 1, bit30 == 0)
     if ((insn & 0x7F000000u) == 0x1E000000u || (insn & 0x7F000000u) == 0x1F000000u)
         return interp_exec_fp_scalar(cpu, insn);
 
-    // ---- AdvSIMD SCALAR forms, normalised into their vector spelling ----
-    // bits[31:30] == 01 with bits[28:25] == 1111 is the AdvSIMD scalar space: ADD/SUB/CMxx/NEG/ABS/ADDP on D
-    // registers, the saturating group on any width, the shift-by-immediate group, the FP compares and
-    // conversions, and DUP (element). Every one of them puts U, size, opcode, Rm, Rn and Rd at EXACTLY the
-    // positions its vector counterpart does -- that is why the architecture chose those positions -- so the
-    // scalar encoding becomes the vector encoding with Q == 0 by clearing two bits, and the only remaining
-    // difference is that it operates on ONE lane and always zeroes bits [127:esize].
-    //
-    // Normalising here rather than writing a second copy of each handler is what keeps the two spellings from
-    // drifting apart, and it is why `scalar` is threaded through the lane counts below rather than being
-    // handled by a parallel switch. Two things it must NOT do: use interp_vec_lanes (which would give 2 lanes
-    // for, say, a scalar 32-bit form), and apply the vector group's "1D is reserved" checks (a scalar form is
-    // 64-bit-only precisely where the vector one is reserved).
-    // `decode` carries the rewrite and `insn` keeps the guest's ACTUAL instruction word. Only the group-selection
-    // masks below read `decode`; every field extraction reads `insn` (which is equivalent, since the rewrite
-    // clears only bits 30 and 28 and the sole field either of those carries is Q, overridden here), and every
-    // interp_undefined() report reads `insn` -- so a diagnostic always names the encoding the guest executed.
-    // Reporting the rewritten word instead sends the reader to `objdump` with a bit pattern that either decodes
-    // as a different instruction or is not an instruction at all.
+    // AdvSIMD SCALAR forms, normalised into their vector spelling
+    // Clearing bits 30 and 28 gives the vector encoding at Q == 0, but a scalar form has ONE lane and zeroes
+    // [127:esize]: `scalar` overrides interp_vec_lanes and the "1D is reserved" checks. Diagnostics use `insn`.
     unsigned scalar = 0;
     uint32_t decode = insn;
     if ((insn & 0xDE000000u) == 0x5E000000u) {
         scalar = 1;
-        decode &= ~UINT32_C(0x50000000); // clear bit30 (becomes Q == 0) and bit28 (becomes the vector op0)
+        decode &= ~UINT32_C(0x50000000);
         q = 0;
     }
 
-    // ---- AdvSIMD copy: DUP (element/general), INS (element/general), SMOV, UMOV ----
+    // AdvSIMD copy: DUP, INS, SMOV, UMOV
     if ((decode & 0x9F208400u) == 0x0E000400u) {
         unsigned op = (insn >> 29) & 1, imm4 = (insn >> 11) & 0xFu, imm5 = (insn >> 16) & 0x1Fu;
         unsigned size, index;
-        if (op) { // INS (element): copy one lane of Rn to one lane of Rd
+        if (op) { // INS (element)
             if (!interp_imm5_element(imm5, &size, &index))
                 return interp_undefined(cpu, insn, "AdvSIMD copy -- reserved imm5");
             unsigned source_index = imm4 >> size; // imm4 is the source lane, scaled by the element size
             interp_vec source = interp_vec_read(cpu, rn), destination = interp_vec_read(cpu, rd);
             interp_vec_set_element(&destination, size, index, interp_vec_element(&source, size, source_index));
-            // INS writes a single lane of an existing 128-bit register, so it must NOT zero the upper half.
+            // Single-lane write: must NOT zero the upper half.
             interp_vec_write(cpu, rd, destination, 1);
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
         }
         switch (imm4) {
-        case 0: { // DUP (element): broadcast one lane of Rn across Rd
+        case 0: { // DUP (element)
             if (!interp_imm5_element(imm5, &size, &index))
                 return interp_undefined(cpu, insn, "AdvSIMD copy -- reserved imm5");
-            // There is no 1D vector arrangement, but the SCALAR spelling of this encoding is exactly
-            // "DUP Dd, Vn.D[index]" (which the assembler prints as MOV) -- so it must not be rejected here.
+            // The SCALAR spelling is DUP Dd, Vn.D[index]: do not reject 1D.
             if (size == 3 && !q && !scalar) return interp_undefined(cpu, insn, "AdvSIMD copy -- DUP 1D is reserved");
             interp_vec source = interp_vec_read(cpu, rn), result;
             uint64_t element = interp_vec_element(&source, size, index);
@@ -4015,7 +3267,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             interp_vec_write(cpu, rd, result, q);
             break;
         }
-        case 1: { // DUP (general): broadcast a general-purpose register across Rd
+        case 1: { // DUP (general)
             if (!interp_imm5_element(imm5, &size, &index))
                 return interp_undefined(cpu, insn, "AdvSIMD copy -- reserved imm5");
             if (size == 3 && !q) return interp_undefined(cpu, insn, "AdvSIMD copy -- DUP 1D is reserved");
@@ -4027,22 +3279,22 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             interp_vec_write(cpu, rd, result, q);
             break;
         }
-        case 3: { // INS (general): one general-purpose register into one lane of Rd
+        case 3: { // INS (general)
             if (!interp_imm5_element(imm5, &size, &index))
                 return interp_undefined(cpu, insn, "AdvSIMD copy -- reserved imm5");
             interp_vec destination = interp_vec_read(cpu, rd);
             interp_vec_set_element(&destination, size, index, interp_gpr(cpu, rn) & interp_element_mask(size));
-            interp_vec_write(cpu, rd, destination, 1); // single-lane write: preserve the upper half
+            interp_vec_write(cpu, rd, destination, 1);
             break;
         }
-        case 5:   // SMOV: one lane to a general register, sign-extended
-        case 7: { // UMOV: one lane to a general register, zero-extended
+        case 5:   // SMOV
+        case 7: { // UMOV
             if (!interp_imm5_element(imm5, &size, &index))
                 return interp_undefined(cpu, insn, "AdvSIMD copy -- reserved imm5");
             interp_vec source = interp_vec_read(cpu, rn);
             uint64_t element = interp_vec_element(&source, size, index);
             if (imm4 == 5) element = interp_element_sext(element, size);
-            // Q selects the destination register width, not the vector length, in this one form.
+            // Here Q selects the destination GPR width, not the vector length.
             if (q)
                 interp_set_gpr(cpu, rd, element);
             else
@@ -4055,27 +3307,25 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- AdvSIMD modified immediate: MOVI / MVNI / ORR (imm) / BIC (imm) ----
-    // Must be tested BEFORE shift-by-immediate: the two share an encoding box and are separated only by immh
-    // (bits 22:19) being zero here and non-zero there.
+    // AdvSIMD modified immediate
+    // Must precede shift-by-immediate: same box, separated only by immh (22:19).
     if ((decode & 0x9FF80400u) == 0x0F000400u) {
         unsigned op = (insn >> 29) & 1, cmode = (insn >> 12) & 0xFu, o2 = (insn >> 11) & 1;
         uint64_t imm8 = (uint64_t)(((insn >> 16) & 7u) << 5) | ((insn >> 5) & 0x1Fu);
         uint64_t pattern;
         if (!interp_advsimd_expand_imm(op, cmode, o2, q, imm8, &pattern))
             return interp_undefined(cpu, insn, "AdvSIMD modified immediate -- reserved cmode");
-        // cmode<0> == 1 with cmode<3:1> != 111 selects the read-modify-write forms ORR/BIC rather than a
-        // plain move, and `op` then chooses between them.
+        // cmode<0> == 1 with cmode<3:1> != 111 selects ORR/BIC; `op` picks which.
         int read_modify = (cmode & 1u) && ((cmode >> 1) & 7u) != 7u;
         interp_vec result = interp_vec_read(cpu, rd);
         uint64_t low, high;
         memcpy(&low, result.byte, 8);
         memcpy(&high, result.byte + 8, 8);
         if (read_modify) {
-            if (op) { // BIC (immediate)
+            if (op) { // BIC
                 low &= ~pattern;
                 high &= ~pattern;
-            } else { // ORR (immediate)
+            } else { // ORR
                 low |= pattern;
                 high |= pattern;
             }
@@ -4091,7 +3341,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- AdvSIMD shift by immediate: SSHR / USHR / SSRA / USRA / SHL ----
+    // AdvSIMD shift by immediate
     if ((decode & 0x9F800400u) == 0x0F000400u) {
         unsigned immh = (insn >> 19) & 0xFu, immb = (insn >> 16) & 7u, opcode = (insn >> 11) & 0x1Fu;
         unsigned size;
@@ -4107,16 +3357,11 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         unsigned combined = (immh << 3) | immb;
         interp_vec source = interp_vec_read(cpu, rn), result;
         memset(result.byte, 0, sizeof result.byte);
-        // A scalar shift-by-immediate (SHL/SSHR/USHR/SSRA/USRA on a D register) is this same encoding with one
-        // lane, and the 64-bit element it names is exactly the vector group's reserved 1D form -- so the lane
-        // count and the reservation check below both have to know which spelling this is.
+        // The scalar spelling has one lane, at the vector group's reserved 1D width.
         unsigned lanes = scalar ? 1u : interp_vec_lanes(size, q);
         uint64_t mask = interp_element_mask(size);
 
-        // ---- the fixed-point FP conversions, which are the only members whose immh means something else ----
-        // SCVTF/UCVTF and FCVTZS/FCVTZU with a fractional-bit count. immh still selects the element width, but
-        // (immh:immb) is a SCALE rather than a shift: fbits = 2*esize - (immh:immb), the same relation the
-        // scalar fixed-point conversions use, which is why both go through interp_fp_to_int/from_int.
+        // fixed-point conversions: fbits = 2*esize - (immh:immb), a SCALE not a shift
         if (opcode == 0x1C || opcode == 0x1F) {
             if (size < 1) return interp_undefined(cpu, insn, "AdvSIMD shift -- fixed-point conversion needs immh != 0");
             unsigned fmt = size == 3 ? INTERP_FP_D : (size == 2 ? INTERP_FP_S : INTERP_FP_H);
@@ -4124,9 +3369,9 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             for (unsigned lane = 0; lane < lanes; lane++) {
                 uint64_t element = interp_vec_element(&source, size, lane);
                 uint64_t value;
-                if (opcode == 0x1C) // SCVTF / UCVTF (fixed-point)
+                if (opcode == 0x1C) // SCVTF / UCVTF
                     value = interp_fp_from_int(fmt, element, esize, !u, INTERP_FPCR_RMODE(g_interp_fpcr), fbits);
-                else // FCVTZS / FCVTZU (fixed-point): always round toward zero
+                else // FCVTZS / FCVTZU
                     value = interp_fp_to_int(fmt, element, esize, !u, INTERP_RM_RZ, fbits);
                 interp_vec_set_element(&result, size, lane, value & mask);
             }
@@ -4136,17 +3381,12 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         }
 
         if (opcode == 0x10 || opcode == 0x11 || opcode == 0x12 || opcode == 0x13) {
-            // The NARROWING right shifts, all sharing one shape: read elements of TWICE the destination width,
-            // shift right, and write 64 bits into the half of the destination Q selects. SHRN/RSHRN truncate,
-            // which is how a 16-byte vector compare mask gets packed into 8 bytes so a single FMOV can carry it
-            // to a general register (the core of glibc's strlen and memchr); the rest SATURATE, in three senses:
-            //   opcode 10000/10001, U == 1  SQSHRUN / SQRSHRUN   signed source, UNSIGNED saturated result
-            //   opcode 10010/10011, U == 0  SQSHRN  / SQRSHRN    signed source, signed saturated result
-            //   opcode 10010/10011, U == 1  UQSHRN  / UQRSHRN    unsigned source, unsigned saturated result
-            // The odd opcode of each pair is the ROUNDING variant, which adds half of the discarded field first.
+            // NARROWING right shifts: sources are TWICE the destination width, the 64-bit result goes in the
+            // half Q selects. SHRN/RSHRN truncate; SQSHRUN saturates signed -> unsigned, SQSHRN/UQSHRN
+            // signed/unsigned. Odd opcodes round.
             if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD shift -- narrowing shift with a 64-bit result");
             unsigned shift = 2u * esize - combined;
-            unsigned narrow_lanes = 64u / esize; // the result is always 64 bits wide; Q selects WHICH half
+            unsigned narrow_lanes = 64u / esize;
             uint64_t wide_mask = interp_element_mask(size + 1u);
             int saturating = opcode >= 0x12 || u;
             int source_signed = opcode >= 0x12 ? !u : 1;
@@ -4158,8 +3398,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 uint64_t element = interp_vec_element(&source, size + 1u, lane) & wide_mask;
                 uint64_t shifted;
                 if (saturating && source_signed) {
-                    // Shift the SIGN-EXTENDED value, so the sign is replicated rather than zeroes shifted in,
-                    // and so the saturation test below sees the true magnitude.
+                    // Shift the SIGN-EXTENDED value so saturation sees the true magnitude.
                     int64_t wide = (int64_t)interp_element_sext(element, size + 1u);
                     if (rounding && shift > 0) wide += (int64_t)(UINT64_C(1) << (shift - 1u));
                     shifted = (uint64_t)(wide >> shift) & wide_mask;
@@ -4172,10 +3411,10 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                                                  : (shifted & mask));
             }
             if (!q || scalar) {
-                // The unsuffixed mnemonic writes the low 64 bits and ZEROES the upper half.
+                // Unsuffixed: write the low 64 bits, ZERO the upper half.
                 interp_vec_write(cpu, rd, packed, 0);
             } else {
-                // The "2" mnemonic writes the UPPER 64 bits and must leave the lower half untouched.
+                // "2": write the UPPER 64 bits, leave the lower half untouched.
                 interp_vec destination = interp_vec_read(cpu, rd);
                 memcpy(destination.byte + 8, packed.byte, 8);
                 interp_vec_write(cpu, rd, destination, 1);
@@ -4185,19 +3424,17 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         }
 
         if (opcode == 0x14) {
-            // SSHLL / USHLL (and SXTL/UXTL, which are these with a zero shift). The counterpart of SHRN: widen
-            // each element to twice its size and shift left. Q selects which half of the source is consumed.
+            // SSHLL / USHLL (SXTL/UXTL at zero shift): widen; Q picks the source half.
             if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD shift -- SSHLL/USHLL with a 64-bit source");
             unsigned shift = combined - esize;
             unsigned wide_lanes = 64u / esize;
             uint64_t wide_mask = interp_element_mask(size + 1u);
             for (unsigned lane = 0; lane < wide_lanes; lane++) {
-                // Q == 1 takes the source elements from the upper half of Vn.
                 uint64_t element = interp_vec_element(&source, size, q ? lane + wide_lanes : lane);
                 if (!u) element = interp_element_sext(element, size);
                 interp_vec_set_element(&result, size + 1u, lane, (element << shift) & wide_mask);
             }
-            // The destination is a full 128-bit register in both variants.
+            // Full 128-bit destination either way.
             interp_vec_write(cpu, rd, result, 1);
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
@@ -4205,46 +3442,42 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
 
         if (size == 3 && !q && !scalar)
             return interp_undefined(cpu, insn, "AdvSIMD shift -- 64-bit element requires Q");
-        if (opcode == 0x0A && !u) { // SHL: shift left by (combined - esize)
+        if (opcode == 0x0A && !u) { // SHL
             unsigned shift = combined - esize;
             for (unsigned lane = 0; lane < lanes; lane++)
                 interp_vec_set_element(&result, size, lane,
                                        (interp_vec_element(&source, size, lane) << shift) & mask);
         } else if (opcode == 0x08 || (opcode == 0x0A && u)) {
-            // SRI (opcode 01000) and SLI (01010 with U == 1): shift and INSERT. The shifted-in bits are taken
-            // from the DESTINATION rather than being zeroes, which is what makes them bitfield inserts.
+            // SRI / SLI: the shifted-in bits come from the DESTINATION, not zeroes.
             interp_vec destination = interp_vec_read(cpu, rd);
             unsigned shift = opcode == 0x08 ? 2u * esize - combined : combined - esize;
             for (unsigned lane = 0; lane < lanes; lane++) {
                 uint64_t element = interp_vec_element(&source, size, lane) & mask;
                 uint64_t base = interp_vec_element(&destination, size, lane) & mask;
                 uint64_t moved, keep;
-                if (opcode == 0x08) { // SRI: keep the destination's TOP `shift` bits
+                if (opcode == 0x08) { // SRI: keep the destination's TOP bits
                     moved = shift >= esize ? 0 : (element >> shift);
                     keep = shift == 0 ? 0 : (mask << (esize - shift)) & mask;
-                } else { // SLI: keep the destination's BOTTOM `shift` bits
+                } else { // SLI: keep the destination's BOTTOM bits
                     moved = (element << shift) & mask;
                     keep = shift == 0 ? 0 : ((UINT64_C(1) << shift) - 1u);
                 }
                 interp_vec_set_element(&result, size, lane, (moved & ~keep) | (base & keep));
             }
         } else if (opcode == 0x0C || opcode == 0x0E) {
-            // SQSHLU (01100, U == 1 only), SQSHL and UQSHL (01110): saturating shift LEFT by an immediate.
-            // Expressed as a repeated saturating doubling so that the one-bit-at-a-time overflow test is the
-            // same one SQADD uses and FPSR.QC is set identically; a shift amount is at most esize - 1, so the
-            // cost is bounded and the alternative (a wider intermediate type) does not exist for esize == 64.
+            // SQSHLU, SQSHL, UQSHL: repeated saturating doubling, matching SQADD's QC.
             if (opcode == 0x0C && !u) return interp_undefined(cpu, insn, "AdvSIMD shift -- unallocated SQSHLU");
             unsigned shift = combined - esize;
             for (unsigned lane = 0; lane < lanes; lane++) {
                 uint64_t element = interp_vec_element(&source, size, lane);
                 uint64_t value;
-                if (opcode == 0x0E && u) { // UQSHL: unsigned source, unsigned saturation
+                if (opcode == 0x0E && u) { // UQSHL
                     value = element & mask;
                     for (unsigned step = 0; step < shift; step++) value = interp_uqadd_element(value, value, size, 0);
-                } else if (opcode == 0x0E) { // SQSHL: signed source, signed saturation
+                } else if (opcode == 0x0E) { // SQSHL
                     value = element & mask;
                     for (unsigned step = 0; step < shift; step++) value = interp_sqadd_element(value, value, size, 0);
-                } else { // SQSHLU: signed source, UNSIGNED saturation -- a negative operand saturates to zero
+                } else { // SQSHLU: UNSIGNED saturation
                     int64_t signed_element = (int64_t)interp_element_sext(element, size);
                     if (signed_element < 0) {
                         interp_fpsr_raise(INTERP_FPSR_QC);
@@ -4258,19 +3491,14 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 interp_vec_set_element(&result, size, lane, value & mask);
             }
         } else if (opcode == 0x00 || opcode == 0x02 || opcode == 0x04 || opcode == 0x06) {
-            // SSHR/USHR (00000), SSRA/USRA (00010) and their ROUNDING counterparts SRSHR/URSHR (00100) and
-            // SRSRA/URSRA (00110). The 0x02 pair accumulates into the destination; the 0x04/0x06 pair adds half
-            // of the field about to be discarded before shifting.
+            // SSHR/USHR, SSRA/USRA, and the rounding SRSHR/URSHR, SRSRA/URSRA.
             unsigned shift = 2u * esize - combined;
             int rounding = opcode == 0x04 || opcode == 0x06;
             int accumulating = opcode == 0x02 || opcode == 0x06;
             interp_vec accumulate = interp_vec_read(cpu, rd);
             for (unsigned lane = 0; lane < lanes; lane++) {
                 uint64_t element = interp_vec_element(&source, size, lane);
-                // A right shift of the FULL element width is defined for these instructions (the result is 0,
-                // or the replicated sign bit) but is undefined behaviour in C, so it is handled explicitly.
-                // The rounding increment is likewise the bit at position shift-1, which for a full-width shift
-                // is the element's top bit.
+                // A full-element-width right shift is defined here but UB in C.
                 uint64_t shifted;
                 if (u) {
                     uint64_t value = element & mask;
@@ -4297,7 +3525,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- AdvSIMD EXT: concatenate Rn:Rm and extract a byte-aligned window ----
+    // AdvSIMD EXT
     if ((decode & 0xBFE08400u) == 0x2E000000u) {
         unsigned position = (insn >> 11) & 0xFu;
         unsigned bytes = q ? 16u : 8u;
@@ -4313,33 +3541,28 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- AdvSIMD table lookup: TBL / TBX ----
+    // AdvSIMD table lookup: TBL / TBX
     if ((decode & 0xBF208C00u) == 0x0E000000u) {
         unsigned length = (insn >> 13) & 3u, extend = (insn >> 12) & 1u;
         unsigned bytes = q ? 16u : 8u;
         interp_vec index_vector = interp_vec_read(cpu, rm), result = interp_vec_read(cpu, rd);
         interp_vec table[4];
         for (unsigned entry = 0; entry <= length; entry++)
-            table[entry] = interp_vec_read(cpu, (rn + (int)entry) % 32); // the table registers wrap at V31
+            table[entry] = interp_vec_read(cpu, (rn + (int)entry) % 32);
         for (unsigned index = 0; index < bytes; index++) {
             unsigned selector = index_vector.byte[index];
             if (selector < (length + 1u) * 16u)
                 result.byte[index] = table[selector / 16u].byte[selector % 16u];
             else if (!extend)
-                result.byte[index] = 0; // TBL zeroes an out-of-range index; TBX leaves the destination byte
+                result.byte[index] = 0; // TBL zeroes an out-of-range index; TBX keeps the destination byte
         }
         interp_vec_write(cpu, rd, result, q);
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
 
-    // ---- AdvSIMD permute: ZIP1 / ZIP2 / UZP1 / UZP2 / TRN1 / TRN2 ----
-    // Same mask as TBL/TBX above and separated from it only by bits[11:10] (00 there, 10 here), which is why
-    // the two sit together. All six are pure lane shuffles -- no arithmetic, no flags, no FP -- so the whole
-    // group is one indexing rule per opcode. They matter far more than their size suggests: a compiler emits
-    // UZP1/ZIP1 for every de-interleaving struct-of-arrays copy, and `uzp1 v31.2d, v30.2d, v31.2d` is what a
-    // 128-bit-pair spill in another hl-engine build reduces to, i.e. it is on the path of running this engine
-    // under itself.
+    // AdvSIMD permute: ZIP / UZP / TRN
+    // Same mask as TBL/TBX, separated by bits[11:10] (00 there, 10 here).
     if ((decode & 0xBF208C00u) == 0x0E000800u) {
         unsigned size = (insn >> 22) & 3u, opcode = (insn >> 12) & 7u;
         if (size == 3 && !q) return interp_undefined(cpu, insn, "AdvSIMD permute -- 1D form is reserved");
@@ -4349,23 +3572,23 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         for (unsigned lane = 0; lane < lanes; lane++) {
             uint64_t element;
             switch (opcode) {
-            case 1: // UZP1: the EVEN-indexed elements of the concatenation Vn:Vm, in order
-            case 5: { // UZP2: the ODD-indexed ones
+            case 1: // UZP1 (even lanes of Vn:Vm)
+            case 5: { // UZP2 (odd)
                 unsigned offset = opcode == 5 ? 1u : 0u;
                 const interp_vec *source = lane < half ? &left : &right;
                 unsigned index = (lane < half ? lane : lane - half) * 2u + offset;
                 element = interp_vec_element(source, size, index);
                 break;
             }
-            case 2:   // TRN1: even lanes of Vn interleaved with the even lanes of Vm
-            case 6: { // TRN2: the odd lanes of each
+            case 2:   // TRN1 (even)
+            case 6: { // TRN2 (odd)
                 unsigned offset = opcode == 6 ? 1u : 0u;
                 const interp_vec *source = (lane & 1u) ? &right : &left;
                 element = interp_vec_element(source, size, (lane & ~1u) + offset);
                 break;
             }
-            case 3:   // ZIP1: interleave the LOWER halves of Vn and Vm
-            case 7: { // ZIP2: interleave the UPPER halves
+            case 3:   // ZIP1 (lower halves)
+            case 7: { // ZIP2 (upper)
                 unsigned base = opcode == 7 ? half : 0u;
                 const interp_vec *source = (lane & 1u) ? &right : &left;
                 element = interp_vec_element(source, size, base + lane / 2u);
@@ -4380,15 +3603,12 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- AdvSIMD across lanes: ADDV / UADDLV / SADDLV / UMAXV / SMAXV / UMINV / SMINV ----
-    // Tested before two-register-misc: both live at bits[21:17] == 10000/11000 and differ only in bit 20.
+    // AdvSIMD across lanes
+    // Before two-register-misc: bits[21:17] == 10000/11000, differ in bit 20.
     if ((decode & 0x9F3E0C00u) == 0x0E300800u) {
         unsigned size = (insn >> 22) & 3u, opcode = (insn >> 12) & 0x1Fu;
-        // ---- the floating-point reductions: FMAXNMV / FMAXV / FMINNMV / FMINV ----
-        // Same field reinterpretation as the other FP boxes (bit23 selects max vs min, bit22 is sz), and they
-        // are U == 1 only. Folded left to right so that a NaN or a signed zero reaches the same answer the
-        // pairwise tree in hardware would: FPMax/FPMin are associative for those cases because their NaN and
-        // zero-sign rules are symmetric in the two operands.
+        // FP reductions (U == 1): bit23 selects max vs min, bit22 is sz
+        // Folded left to right; the FPMax/FPMin NaN and zero-sign rules are symmetric.
         if (u && (opcode == 0x0Cu || opcode == 0x0Fu)) {
             unsigned fmt = (size & 1u) ? INTERP_FP_D : INTERP_FP_S, high = (size >> 1) & 1u;
             unsigned element = fmt + 1u, lanes = interp_vec_lanes(element, q);
@@ -4405,15 +3625,12 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
         }
-        // ---- the AdvSIMD SCALAR pairwise forms, which share this encoding box ----
-        // ADDP Dd, Vn.2D and the FP pairwise reductions FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP Sd/Dd, Vn.2S/2D.
-        // They are not reductions across a whole vector: they combine exactly the TWO lanes of the source, so
-        // they need their own arm rather than the fold below (which starts from lane 0 and would be equivalent
-        // only by accident) and they must bypass the vector group's size/Q reservations.
+        // AdvSIMD SCALAR pairwise, sharing this box
+        // These combine the TWO source lanes and bypass the vector size/Q reservations.
         if (scalar) {
             interp_vec source = interp_vec_read(cpu, rn), result;
             memset(result.byte, 0, sizeof result.byte);
-            if (!u && opcode == 0x1Bu) { // ADDP (scalar): 64-bit element only
+            if (!u && opcode == 0x1Bu) { // ADDP (scalar): 2D only
                 if (size != 3) return interp_undefined(cpu, insn, "AdvSIMD scalar pairwise -- ADDP needs 2D");
                 interp_vec_set_element(&result, 3, 0,
                                       interp_vec_element(&source, 3, 0) + interp_vec_element(&source, 3, 1));
@@ -4422,10 +3639,10 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 unsigned element = fmt + 1u;
                 uint64_t a = interp_vec_element(&source, element, 0), b = interp_vec_element(&source, element, 1);
                 uint64_t value;
-                if (opcode == 0x0Du) { // FADDP (scalar); bit23 set is unallocated here
+                if (opcode == 0x0Du) { // FADDP (scalar)
                     if (high) return interp_undefined(cpu, insn, "AdvSIMD scalar pairwise -- unallocated FADDP");
                     value = interp_fp_arith(fmt, INTERP_FPOP_ADD, a, b);
-                } else { // FMAXNMP/FMINNMP (0x0C) and FMAXP/FMINP (0x0F)
+                } else { // FMAXNMP/FMINNMP, FMAXP/FMINP
                     value = interp_fp_minmax(fmt, a, b, !high, opcode == 0x0Cu);
                 }
                 interp_vec_set_element(&result, element, 0, value);
@@ -4443,7 +3660,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         unsigned lanes = interp_vec_lanes(size, q);
         uint64_t accumulator = interp_vec_element(&source, size, 0);
         switch (opcode) {
-        case 0x03: { // SADDLV / UADDLV: sum every lane into an element of TWICE the width
+        case 0x03: { // SADDLV / UADDLV (DOUBLE width)
             uint64_t total = 0;
             for (unsigned lane = 0; lane < lanes; lane++) {
                 uint64_t element = interp_vec_element(&source, size, lane);
@@ -4472,48 +3689,41 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             break;
         default: return interp_undefined(cpu, insn, "AdvSIMD across lanes -- unimplemented opcode");
         }
-        // A reduction produces a SCALAR, so only the low element is defined and the rest of the register is
-        // zero -- hence the zeroed `result` above and the Q=0 write here.
+        // A reduction is a SCALAR: only the low element is defined.
         interp_vec_write(cpu, rd, result, 0);
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
 
-    // ---- AdvSIMD two-register misc: NOT / RBIT / CNT / REV16 / REV32 / REV64 / CMEQ-zero / ABS / NEG ----
+    // AdvSIMD two-register misc
     if ((decode & 0x9F3E0C00u) == 0x0E200800u) {
         unsigned size = (insn >> 22) & 3u, opcode = (insn >> 12) & 0x1Fu;
         interp_vec source = interp_vec_read(cpu, rn), result;
         memset(result.byte, 0, sizeof result.byte);
         unsigned bytes = q ? 16u : 8u;
 
-        // ---- the floating-point members of this box ----
-        // Opcodes 01100..01111 and 10110..11111 are FP, and there `size` splits the way it does in the FP
-        // three-same group: bit23 becomes an operation selector and bit22 is `sz`. That is how FRINTN (bit23
-        // clear) and FRINTP (bit23 set) share opcode 11000, and it is why reading `size` as an element width
-        // here would pick a 16-bit lane for every single-precision form.
+        // the floating-point members (opcodes 01100..01111, >= 10110)
+        // `size` is not an element width: bit23 is an operation selector, bit22 is `sz`.
         if ((opcode >= 0x0Cu && opcode <= 0x0Fu) || opcode >= 0x16u) {
             unsigned fmt = (size & 1u) ? INTERP_FP_D : INTERP_FP_S, high = (size >> 1) & 1u;
             unsigned element = fmt + 1u;
             uint64_t saved_nzcv = cpu->nzcv; // see the note in the three-same FP block
-            // FCVTL/FCVTN change the element width, so they are handled before the equal-width loop. FCVTL
-            // widens the selected half to the next format up; FCVTN narrows into the selected half. Both name
-            // the NARROW format in sz, so sz == 0 means half->single and sz == 1 means single->double.
+            // FCVTL/FCVTN change the element width; sz names the NARROW format (0 half, 1 single).
             if (opcode == 0x16u || opcode == 0x17u) {
                 if (u && opcode == 0x16u)
                     return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- FCVTXN");
                 if (high) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated FCVTL/FCVTN size");
                 unsigned narrow = (size & 1u) ? INTERP_FP_S : INTERP_FP_H, wide = narrow + 1u;
-                // The narrow side is always exactly 64 bits' worth of elements; Q says which half of the
-                // 128-bit register those 64 bits live in.
+                // The narrow side is 64 bits of elements; Q picks the half.
                 unsigned narrow_lanes = narrow == INTERP_FP_S ? 2u : 4u;
-                if (opcode == 0x17u) { // FCVTL / FCVTL2: widen
+                if (opcode == 0x17u) { // FCVTL / FCVTL2
                     for (unsigned lane = 0; lane < narrow_lanes; lane++) {
                         uint64_t element_bits =
                             interp_vec_element(&source, narrow + 1u, q ? lane + narrow_lanes : lane);
                         interp_vec_set_element(&result, wide + 1u, lane, interp_fp_convert(narrow, wide, element_bits));
                     }
                     interp_vec_write(cpu, rd, result, 1);
-                } else { // FCVTN / FCVTN2: narrow
+                } else { // FCVTN / FCVTN2
                     interp_vec packed;
                     memset(packed.byte, 0, sizeof packed.byte);
                     for (unsigned lane = 0; lane < narrow_lanes; lane++) {
@@ -4533,17 +3743,13 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             if (fmt == INTERP_FP_D && !q && !scalar)
                 return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- 2D form requires Q");
-            // Spelled as an explicit per-width choice rather than as interp_vec_lanes(element, q): the element
-            // width here is DERIVED (from sz, not from a size field), and a shift by a derived width leaves the
-            // optimiser unable to see that the lane count and the element stride come from the same number --
-            // which it reports as a possible out-of-bounds element access. Writing the two together makes the
-            // correlation visible and is also simply clearer about what the two arrangements are.
+            // Per width, not interp_vec_lanes(element, q): a derived `element` makes the optimiser warn.
             unsigned fp_lanes = scalar ? 1u : (element == 3u ? (q ? 2u : 1u) : (q ? 4u : 2u));
             for (unsigned lane = 0; lane < fp_lanes; lane++) {
                 uint64_t a = interp_vec_element(&source, element, lane), value;
                 uint64_t all_ones = interp_element_mask(element);
                 if (opcode >= 0x0Cu && opcode <= 0x0Fu) {
-                    // The compare-against-zero forms, plus FABS/FNEG which share opcode 01111 across U.
+                    // Compare-against-zero; FABS/FNEG at 01111.
                     if (opcode == 0x0Fu) {
                         value = u ? (a ^ interp_fp_sign_mask(fmt)) : (a & ~interp_fp_sign_mask(fmt));
                     } else {
@@ -4563,38 +3769,35 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                     }
                 } else {
                     switch (opcode) {
-                    case 0x18: // FRINTN (bit23 clear) / FRINTP (set), and FRINTA / FRINTX under U
+                    case 0x18: // FRINTN / FRINTP; FRINTA / FRINTX under U
                         value = interp_fp_round_integral(fmt, a, u ? INTERP_RM_RA : (high ? INTERP_RM_RP : INTERP_RM_RN),
                                                         0);
                         if (u && high) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated FRINT");
                         break;
                     case 0x19:
-                        // FRINTM / FRINTZ (U == 0), FRINTX / FRINTI (U == 1). FRINTX is the only one of the
-                        // four that reports Inexact, which is its whole reason for existing.
+                        // FRINTM/FRINTZ (U == 0), FRINTX/FRINTI (U == 1). Only FRINTX reports Inexact.
                         if (u)
                             value = interp_fp_round_integral(fmt, a, INTERP_FPCR_RMODE(g_interp_fpcr), high ? 0 : 1);
                         else
                             value = interp_fp_round_integral(fmt, a, high ? INTERP_RM_RZ : INTERP_RM_RM, 0);
                         break;
-                    case 0x1A: // FCVTNS/FCVTNU (bit23 clear) / FCVTPS/FCVTPU (set)
+                    case 0x1A: // FCVTNS/FCVTNU or FCVTPS/FCVTPU
                         value = interp_fp_to_int(fmt, a, interp_fp_width(fmt), !u, high ? INTERP_RM_RP : INTERP_RM_RN, 0);
                         break;
-                    case 0x1B: // FCVTMS/FCVTMU (bit23 clear) / FCVTZS/FCVTZU (set)
+                    case 0x1B: // FCVTMS/FCVTMU or FCVTZS/FCVTZU
                         value = interp_fp_to_int(fmt, a, interp_fp_width(fmt), !u, high ? INTERP_RM_RZ : INTERP_RM_RM, 0);
                         break;
-                    case 0x1C: // FCVTAS/FCVTAU (bit23 clear); URECPE/URSQRTE (set) are estimates, see below
+                    case 0x1C: // FCVTAS/FCVTAU; URECPE/URSQRTE estimates
                         if (high) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- URECPE/URSQRTE");
                         value = interp_fp_to_int(fmt, a, interp_fp_width(fmt), !u, INTERP_RM_RA, 0);
                         break;
                     case 0x1D:
-                        // SCVTF/UCVTF (bit23 clear). FRECPE/FRSQRTE (set) are the reciprocal ESTIMATES, whose
-                        // result is an architecturally specified but coarse approximation; reported rather than
-                        // approximated for the same reason as FRECPS above.
+                        // SCVTF/UCVTF; FRECPE/FRSQRTE are estimates, see FRECPS below.
                         if (high) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- FRECPE/FRSQRTE");
                         value = interp_fp_from_int(fmt, a, interp_fp_width(fmt), !u, INTERP_FPCR_RMODE(g_interp_fpcr),
                                                   0);
                         break;
-                    case 0x1F: // FSQRT (U == 1 only)
+                    case 0x1F: // FSQRT (U == 1)
                         if (!u) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated opcode 11111");
                         value = interp_fp_sqrt(fmt, a);
                         break;
@@ -4610,8 +3813,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         }
 
         switch (opcode) {
-        case 0x02:   // SADDLP / UADDLP: pairwise add of adjacent lanes into elements of TWICE the width
-        case 0x06: { // SADALP / UADALP: the same, accumulated into the destination
+        case 0x02:   // SADDLP / UADDLP (DOUBLE width)
+        case 0x06: { // SADALP / UADALP: accumulating
             if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated ADDLP size");
             unsigned wide = size + 1u, wide_lanes = scalar ? 1u : interp_vec_lanes(wide, q);
             uint64_t wide_mask = interp_element_mask(wide);
@@ -4632,17 +3835,14 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             return INTERP_NEXT;
         }
         case 0x03:
-            // SUQADD ("signed accumulator += unsigned operand, saturating as signed") and USQADD (the mirror).
-            // Reported rather than guessed at: mixed-signedness saturation is not the same rule as either
-            // SQADD's or UQADD's, and getting it wrong would be silent.
+            // SUQADD/USQADD: mixed-signedness saturation matches neither SQADD nor UQADD.
             return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- SUQADD/USQADD");
         case 0x04: { // CLS (U=0) / CLZ (U=1)
             if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated CLS/CLZ size");
             unsigned esize = 8u << size, lanes = scalar ? 1u : interp_vec_lanes(size, q);
             for (unsigned lane = 0; lane < lanes; lane++) {
                 uint64_t a = interp_vec_element(&source, size, lane) & interp_element_mask(size);
-                // CLS counts the leading bits that MATCH the sign bit, not counting the sign bit itself, so
-                // it is CLZ of the value with its sign folded out and is 0..esize-1 rather than 0..esize.
+                // CLS counts leading bits MATCHING the sign, excluding it: 0..esize-1.
                 uint64_t folded = ((a >> 1) ^ a) & (interp_element_mask(size) >> 1);
                 unsigned count;
                 if (!u)
@@ -4654,13 +3854,11 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             break;
         }
-        case 0x07: { // SQABS (U=0) / SQNEG (U=1): saturating, because negating the most negative value overflows
+        case 0x07: { // SQABS (U=0) / SQNEG (U=1)
             unsigned lanes = scalar ? 1u : interp_vec_lanes(size, q);
             for (unsigned lane = 0; lane < lanes; lane++) {
                 uint64_t a = interp_vec_element(&source, size, lane);
-                // Expressed as 0 - a (SQNEG) or |a| = 0 - a when negative (SQABS), so the one overflowing input
-                // -- the most negative value, whose negation is not representable -- saturates through the same
-                // helper the rest of the group uses and sets FPSR.QC identically.
+                // As 0 - a, so the one overflowing input saturates through the group's helper.
                 int64_t x = (int64_t)interp_element_sext(a, size);
                 uint64_t value;
                 if (!u && x >= 0)
@@ -4673,9 +3871,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         }
         case 0x12:   // XTN (U=0) / SQXTUN (U=1)
         case 0x14: { // SQXTN (U=0) / UQXTN (U=1)
-            // Narrowing: `size` names the RESULT element and the source elements are twice as wide, so the
-            // result is 64 bits and Q selects which half of the destination register receives it -- exactly
-            // SHRN's shape. XTN simply truncates; the other three saturate, in three different senses.
+            // Narrowing: `size` names the RESULT element and sources are twice as wide; Q picks the half.
             if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated XTN size");
             unsigned narrow_lanes = 64u / (8u << size);
             interp_vec packed;
@@ -4684,9 +3880,9 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 uint64_t wide_element = interp_vec_element(&source, size + 1u, lane);
                 uint64_t value;
                 if (opcode == 0x12 && !u)
-                    value = wide_element & interp_element_mask(size); // XTN: plain truncation
+                    value = wide_element & interp_element_mask(size); // XTN
                 else if (opcode == 0x12)
-                    value = interp_sat_narrow(wide_element, size, 1, 0); // SQXTUN: signed -> unsigned
+                    value = interp_sat_narrow(wide_element, size, 1, 0); // SQXTUN
                 else
                     value = interp_sat_narrow(wide_element, size, u ? 0 : 1, u ? 0 : 1); // UQXTN / SQXTN
                 interp_vec_set_element(&packed, size, lane, value);
@@ -4701,7 +3897,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
         }
-        case 0x13: { // SHLL / SHLL2 (U=1): widen each element and shift left by the FULL element width
+        case 0x13: { // SHLL / SHLL2 (U=1): shift by the FULL width
             if (!u || size == 3) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated SHLL");
             unsigned wide = size + 1u, wide_lanes = 64u / (8u << size);
             for (unsigned lane = 0; lane < wide_lanes; lane++) {
@@ -4719,8 +3915,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         switch (opcode) {
         case 0x00:   // REV64 (U=0) / REV32 (U=1)
         case 0x01: { // REV16 (U=0)
-            // Reverse the byte order within each container. The container is 8, 4 or 2 bytes wide depending on
-            // the opcode; `size` gives the element width being reversed, which must be smaller.
+            // Reverse bytes within each container (8, 4 or 2 by opcode); `size` is the element width.
             unsigned container = opcode == 0x01 ? 2u : (u ? 4u : 8u);
             unsigned element = 1u << size;
             if (element >= container)
@@ -4731,15 +3926,15 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                            element);
             break;
         }
-        case 0x05: { // CNT (U=0) / NOT i.e. MVN (U=1, size=00) / RBIT (U=1, size=01)
-            if (!u) { // CNT: per-byte population count
+        case 0x05: { // CNT / NOT (size=0) / RBIT (size=1)
+            if (!u) { // CNT
                 if (size != 0) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- CNT requires 8B/16B");
                 for (unsigned index = 0; index < bytes; index++)
                     result.byte[index] = (uint8_t)__builtin_popcount(source.byte[index]);
             } else if (size == 0) { // NOT / MVN
                 for (unsigned index = 0; index < bytes; index++)
                     result.byte[index] = (uint8_t)~source.byte[index];
-            } else if (size == 1) { // RBIT: reverse the bits within each byte
+            } else if (size == 1) { // RBIT
                 for (unsigned index = 0; index < bytes; index++) {
                     uint8_t value = source.byte[index];
                     value = (uint8_t)(((value & 0x55u) << 1) | ((value >> 1) & 0x55u));
@@ -4752,9 +3947,9 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             break;
         }
-        case 0x08:   // CMGT (zero, U=0) / CMGE (zero, U=1)
-        case 0x09:   // CMEQ (zero, U=0) / CMLE (zero, U=1)
-        case 0x0A: { // CMLT (zero, U=0)
+        case 0x08:   // CMGT / CMGE (zero)
+        case 0x09:   // CMEQ / CMLE (zero)
+        case 0x0A: { // CMLT (zero)
             if (size == 3 && !q && !scalar)
                 return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- 1D compare is reserved");
             uint64_t mask = interp_element_mask(size);
@@ -4769,8 +3964,6 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                     if (u) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated compare-zero");
                     holds = element < 0;
                 }
-                // A vector compare produces an all-ones element for true and all-zeroes for false, which is
-                // what makes the following horizontal reduction a "was there a hit" test.
                 interp_vec_set_element(&result, size, lane, holds ? mask : UINT64_C(0));
             }
             break;
@@ -4793,24 +3986,14 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- AdvSIMD three different: the widening and narrowing group ----
-    //   0 Q U 01110 size 1 Rm opcode(15:12) 00 Rn Rd
-    // Separated from three-same (bit10 == 1) and from across-lanes/two-reg-misc (bits[11:10] == 10) by
-    // bits[11:10] == 00 alone. This is the one structural shape nothing else in this file has: the SOURCE and
-    // DESTINATION element widths differ, and `size` always names the NARROWER of the two. So for the widening
-    // forms the sources are `size` and the result is `size + 1`, while for the narrowing ADDHN/SUBHN it is the
-    // other way round -- the same width trap SHRN sets, in a group where every member steps on it.
-    //
-    // Q does not select a lane count here (it is fixed at 64 bits of the narrow side, i.e. 64/esize lanes).
-    // It selects WHICH HALF of the 128-bit narrow-side register is used: the "2" mnemonics (ADDHN2, SMULL2)
-    // read the upper half of their narrow sources, or write the upper half of their narrow destination while
-    // leaving the lower half untouched. Getting that backwards silently corrupts half a register.
+    // AdvSIMD three different (widening/narrowing)
+    // bits[11:10] == 00 separates this from three-same and across-lanes. Source and destination widths differ
+    // and `size` always names the NARROWER; Q selects WHICH HALF the "2" mnemonics read or write.
     if ((decode & 0x9F200C00u) == 0x0E200000u) {
         unsigned size = (insn >> 22) & 3u, opcode = (insn >> 12) & 0xFu;
         interp_vec left = interp_vec_read(cpu, rn), right = interp_vec_read(cpu, rm);
         int narrowing = opcode == 0x4 || opcode == 0x6; // ADDHN/RADDHN and SUBHN/RSUBHN
-        // PMULL's 64x64 -> 128 form is the only member whose result element is 128 bits wide, so it cannot go
-        // through the element accessors at all and is handled on its own below.
+        // PMULL 64x64 -> 128: a 128-bit result element, no element accessor fits.
         if (opcode == 0xE && size == 3) {
             uint64_t a, b, low, high;
             memcpy(&a, left.byte + (q ? 8 : 0), 8);
@@ -4825,22 +4008,21 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         }
         if (size == 3)
             return interp_undefined(cpu, insn, "AdvSIMD three different -- 64-bit narrow element is reserved");
-        unsigned wide = size + 1u, lanes = 64u / (8u << size); // always 64 bits' worth of narrow elements
+        unsigned wide = size + 1u, lanes = 64u / (8u << size);
         uint64_t narrow_mask = interp_element_mask(size), wide_mask = interp_element_mask(wide);
         interp_vec result;
         memset(result.byte, 0, sizeof result.byte);
         interp_vec destination = interp_vec_read(cpu, rd);
 
         for (unsigned lane = 0; lane < lanes; lane++) {
-            // The widening forms take their narrow operand(s) from the upper half when Q is set; the narrowing
-            // forms read full-width sources from lane `lane` and place the result in the selected half.
+            // Widening forms take narrow operands from the upper half when Q is set.
             unsigned narrow_lane = q && !narrowing ? lane + lanes : lane;
             uint64_t a, b;
             if (narrowing) {
                 a = interp_vec_element(&left, wide, lane);
                 b = interp_vec_element(&right, wide, lane);
                 uint64_t sum = (opcode == 0x4 ? a + b : a - b) & wide_mask;
-                // RADDHN/RSUBHN round rather than truncate, by adding half of the discarded low field first.
+                // RADDHN/RSUBHN round: add half the discarded field first.
                 if (u) sum = (sum + (UINT64_C(1) << ((8u << size) - 1u))) & wide_mask;
                 interp_vec_set_element(&result, size, lane, (sum >> (8u << size)) & narrow_mask);
                 continue;
@@ -4848,19 +4030,18 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             a = interp_vec_element(&left, opcode == 0x1 || opcode == 0x3 ? wide : size,
                                    opcode == 0x1 || opcode == 0x3 ? lane : narrow_lane);
             b = interp_vec_element(&right, size, narrow_lane);
-            // Every widening form sign-extends when U == 0 and zero-extends when U == 1, except PMULL, whose
-            // operands are polynomials with no sign at all.
+            // Widening forms sign-extend at U == 0, zero-extend at U == 1; PMULL is polynomial.
             uint64_t extended_a = opcode == 0x1 || opcode == 0x3 ? a
                                   : (u ? a & narrow_mask : (interp_element_sext(a, size) & wide_mask));
             uint64_t extended_b = u ? (b & narrow_mask) : (interp_element_sext(b, size) & wide_mask);
             uint64_t value;
             switch (opcode) {
             case 0x0: value = extended_a + extended_b; break; // SADDL / UADDL
-            case 0x1: value = extended_a + extended_b; break; // SADDW / UADDW (Rn is already wide)
+            case 0x1: value = extended_a + extended_b; break; // SADDW / UADDW (Rn wide)
             case 0x2: value = extended_a - extended_b; break; // SSUBL / USUBL
             case 0x3: value = extended_a - extended_b; break; // SSUBW / USUBW
-            case 0x5:   // SABAL / UABAL: accumulate the absolute difference
-            case 0x7: { // SABDL / UABDL: the absolute difference alone
+            case 0x5:   // SABAL / UABAL
+            case 0x7: { // SABDL / UABDL
                 uint64_t difference;
                 if (u) {
                     uint64_t x = a & narrow_mask, y = b & narrow_mask;
@@ -4885,7 +4066,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 value = opcode == 0x8 ? base + product : (opcode == 0xA ? base - product : product);
                 break;
             }
-            case 0xE: { // PMULL: polynomial multiply, 8x8 -> 16 (the 64x64 form is handled above)
+            case 0xE: { // PMULL 8x8 -> 16
                 if (u || size != 0)
                     return interp_undefined(cpu, insn, "AdvSIMD three different -- unallocated PMULL form");
                 uint64_t low, high;
@@ -4901,18 +4082,18 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             interp_vec_set_element(&result, wide, lane, value & wide_mask);
         }
         if (!narrowing) {
-            interp_vec_write(cpu, rd, result, 1); // a widening result is always a full 128-bit register
+            interp_vec_write(cpu, rd, result, 1); // widening: full 128-bit result
         } else if (!q) {
-            interp_vec_write(cpu, rd, result, 0); // ADDHN writes the low 64 bits and ZEROES the upper half
+            interp_vec_write(cpu, rd, result, 0); // ADDHN: low 64 bits, ZERO the upper half
         } else {
-            memcpy(destination.byte + 8, result.byte, 8); // ADDHN2 writes the upper half, preserving the lower
+            memcpy(destination.byte + 8, result.byte, 8); // ADDHN2: upper half, preserve the lower
             interp_vec_write(cpu, rd, destination, 1);
         }
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
 
-    // ---- AdvSIMD three same: the bitwise group, the compares, ADD/SUB, MIN/MAX, ADDP, shifts ----
+    // AdvSIMD three same
     if ((decode & 0x9F200400u) == 0x0E200400u) {
         unsigned size = (insn >> 22) & 3u, opcode = (insn >> 11) & 0x1Fu;
         interp_vec left = interp_vec_read(cpu, rn), right = interp_vec_read(cpu, rm), result;
@@ -4921,11 +4102,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         unsigned lanes = scalar ? 1u : interp_vec_lanes(size, q);
         uint64_t mask = interp_element_mask(size);
 
-        // ---- the floating-point members of this box ----
-        // From opcode 11000 upward the fields are reinterpreted: bit23 (size<1>) stops being part of the
-        // element width and becomes an operation selector, and bit22 (size<0>) is `sz` -- 0 for single, 1 for
-        // double. That is why FADD and FSUB share one opcode and differ only in bit23, and it is the reason a
-        // naive `size` read here would silently pick a 16-bit element for every single-precision form.
+        // FP members (opcode >= 11000): bit23 the operation, bit22 `sz`
         if (opcode >= 0x18) {
             unsigned fmt = (size & 1u) ? INTERP_FP_D : INTERP_FP_S, high = (size >> 1) & 1u;
             if (fmt == INTERP_FP_D && !q && !scalar)
@@ -4934,12 +4111,10 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             unsigned element = fmt + 1u;
             interp_vec accumulate = interp_vec_read(cpu, rd);
             uint64_t sign = interp_fp_sign_mask(fmt);
-            // interp_fp_compare writes NZCV because that is what the SCALAR FCMP family is defined to do. A
-            // VECTOR compare must not touch the flags at all, so the incoming value is kept and restored below.
+            // interp_fp_compare writes NZCV as scalar FCMP must; a VECTOR compare must not.
             uint64_t saved_nzcv = cpu->nzcv;
             for (unsigned lane = 0; lane < fp_lanes; lane++) {
-                // The pairwise forms (FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP) draw both operands from the
-                // CONCATENATION Vn:Vm rather than from matching lanes, exactly as the integer ADDP does.
+                // Pairwise forms take both operands from Vn:Vm, not from matching lanes.
                 int pairwise = u && (opcode == 0x18 || opcode == 0x1A || opcode == 0x1E) &&
                                !(opcode == 0x1A && high);
                 uint64_t a, b;
@@ -4956,7 +4131,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 if (!u) {
                     switch (opcode) {
                     case 0x18: value = interp_fp_minmax(fmt, a, b, !high, 1); break; // FMAXNM / FMINNM
-                    case 0x19: { // FMLA / FMLS: fused multiply-accumulate INTO the destination lane
+                    case 0x19: { // FMLA / FMLS
                         uint64_t addend = interp_vec_element(&accumulate, element, lane);
                         value = interp_fp_muladd(fmt, addend, high ? (a ^ sign) : a, b);
                         break;
@@ -4965,11 +4140,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                         value = interp_fp_arith(fmt, high ? INTERP_FPOP_SUB : INTERP_FPOP_ADD, a, b);
                         break; // FADD / FSUB
                     case 0x1B:
-                        // FMULX. Deliberately reported rather than approximated: it is FMUL with inf * 0
-                        // redefined to +-2.0, and it exists only as the first step of a reciprocal Newton
-                        // iteration whose remaining steps (FRECPE/FRECPS below) this backend also declines. A
-                        // partially-correct reciprocal sequence is worse than an honest report, because it
-                        // produces answers that are close but not equal to the JIT's.
+                        // FMULX: one step of a reciprocal iteration whose other steps are declined too.
                         return interp_undefined(cpu, insn, "AdvSIMD three same -- FMULX");
                     case 0x1C: { // FCMEQ (register)
                         if (high) return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated FP opcode");
@@ -4979,10 +4150,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                     }
                     case 0x1E: value = interp_fp_minmax(fmt, a, b, !high, 0); break; // FMAX / FMIN
                     case 0x1F:
-                        // FRECPS / FRSQRTS, the Newton-Raphson refinement steps. Reported for the same reason
-                        // as FMULX: the architecture defines each as a SINGLE rounding of (2 - a*b) or
-                        // (3 - a*b)/2 with its own special cases for zero times infinity, and an
-                        // almost-right version of a reciprocal iteration is the worst possible outcome.
+                        // FRECPS / FRSQRTS: a SINGLE rounding of (2 - a*b) or (3 - a*b)/2.
                         return interp_undefined(cpu, insn, "AdvSIMD three same -- FRECPS/FRSQRTS");
                     default: return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated FP opcode");
                     }
@@ -4990,8 +4158,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                     switch (opcode) {
                     case 0x18: value = interp_fp_minmax(fmt, a, b, !high, 1); break; // FMAXNMP / FMINNMP
                     case 0x1A:
-                        // FADDP when bit23 is clear, FABD (the absolute difference) when it is set -- and FABD
-                        // is not pairwise, which is why the `pairwise` predicate above excludes it.
+                        // FADDP at bit23 clear, FABD at set; FABD is NOT pairwise, hence the exclusion.
                         value = high ? (interp_fp_arith(fmt, INTERP_FPOP_SUB, a, b) & ~sign)
                                      : interp_fp_arith(fmt, INTERP_FPOP_ADD, a, b);
                         break;
@@ -5000,15 +4167,14 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                         value = interp_fp_arith(fmt, INTERP_FPOP_MUL, a, b);
                         break; // FMUL
                     case 0x1C: // FCMGE / FCMGT
-                    case 0x1D: { // FACGE / FACGT: the same comparison on the ABSOLUTE values
+                    case 0x1D: { // FACGE / FACGT (absolute)
                         uint64_t x = a, y = b;
                         if (opcode == 0x1D) {
                             x &= ~sign;
                             y &= ~sign;
                         }
                         interp_fp_compare(cpu, fmt, x, y, 0);
-                        // "greater or equal" is C set with the unordered case excluded, and "greater" adds
-                        // Z clear. A vector compare answers all-ones or all-zeroes, never a flag.
+                        // "ge" is C set minus unordered; "gt" adds Z clear.
                         int ordered = !(interp_flag_c(cpu) && interp_flag_v(cpu));
                         int holds = ordered && interp_flag_c(cpu) && (!high || !interp_flag_z(cpu));
                         value = holds ? interp_element_mask(element) : UINT64_C(0);
@@ -5024,15 +4190,13 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 }
                 interp_vec_set_element(&result, element, lane, value);
             }
-            // A vector FP compare writes NZCV as a side effect of borrowing interp_fp_compare, which the
-            // architecture does NOT do -- only the SCALAR FCMP family touches the flags. Restore them.
             if (opcode == 0x1C || opcode == 0x1D) cpu->nzcv = saved_nzcv;
             interp_vec_write(cpu, rd, result, q);
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
         }
 
-        if (opcode == 0x03) { // the purely bitwise group: size is a sub-opcode here, not an element width
+        if (opcode == 0x03) { // bitwise group: size is a sub-opcode, not an element width
             interp_vec destination = interp_vec_read(cpu, rd);
             for (unsigned index = 0; index < bytes; index++) {
                 uint8_t a = left.byte[index], b = right.byte[index], d = destination.byte[index];
@@ -5041,24 +4205,19 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                     switch (size) {
                     case 0: value = (uint8_t)(a & b); break;         // AND
                     case 1: value = (uint8_t)(a & ~b); break;        // BIC
-                    case 2: value = (uint8_t)(a | b); break;         // ORR (and the MOV alias when Rn == Rm)
+                    case 2: value = (uint8_t)(a | b); break;         // ORR (MOV when Rn == Rm)
                     default: value = (uint8_t)(a | (uint8_t)~b); break; // ORN
                     }
                 } else {
-                    // The three insert/select forms all take the DESTINATION as a third operand, and which
-                    // register supplies the mask differs -- which is exactly why they are easy to get backwards
-                    // and why a mistake is invisible until a vectorised `?:` gives the opposite answer.
-                    //   BSL  the DESTINATION is the mask:  Vd = Vd ? Vn : Vm
-                    //   BIT  Vm is the mask, insert if true:  Vd = Vm ? Vn : Vd
-                    //   BIF  Vm is the mask, insert if false: Vd = Vm ? Vd : Vn
-                    // BSL had Vn and Vm the wrong way round here, so every `cmgt`/`fcmgt` + `bsl` pair -- which
-                    // is what -O2 emits for a vectorised min/max or clamp -- selected the operand the guest did
-                    // NOT ask for and silently computed a minimum where the source said maximum.
+                    // Which register is the mask differs; backwards is invisible until a `?:` inverts.
+                    //   BSL  mask is Vd:            Vd = Vd ? Vn : Vm
+                    //   BIT  mask Vm, insert true:  Vd = Vm ? Vn : Vd
+                    //   BIF  mask Vm, insert false: Vd = Vm ? Vd : Vn
                     switch (size) {
-                    case 0: value = (uint8_t)(a ^ b); break;                          // EOR
-                    case 1: value = (uint8_t)((a & d) | (b & (uint8_t)~d)); break;     // BSL
-                    case 2: value = (uint8_t)(d ^ ((d ^ a) & b)); break;               // BIT
-                    default: value = (uint8_t)(d ^ ((d ^ a) & (uint8_t)~b)); break;    // BIF
+                    case 0: value = (uint8_t)(a ^ b); break;
+                    case 1: value = (uint8_t)((a & d) | (b & (uint8_t)~d)); break;
+                    case 2: value = (uint8_t)(d ^ ((d ^ a) & b)); break;
+                    default: value = (uint8_t)(d ^ ((d ^ a) & (uint8_t)~b)); break;
                     }
                 }
                 result.byte[index] = value;
@@ -5068,14 +4227,13 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             return INTERP_NEXT;
         }
 
-        // The vector group reserves a 64-bit element with Q == 0 (there is no 1D arrangement); the SCALAR
-        // spelling of the same encoding is precisely the D-register form, so it must not be rejected here.
+        // The vector group reserves 64-bit elements at Q == 0; the SCALAR spelling is the D form.
         if (size == 3 && !q && !scalar && opcode != 0x10)
             return interp_undefined(cpu, insn, "AdvSIMD three same -- reserved 1D form");
 
         switch (opcode) {
-        case 0x00:   // SHADD / UHADD: halving add, which cannot overflow because it halves first
-        case 0x02:   // SRHADD / URHADD: rounding halving add
+        case 0x00:   // SHADD / UHADD
+        case 0x02:   // SRHADD / URHADD
         case 0x04: { // SHSUB / UHSUB
             for (unsigned lane = 0; lane < lanes; lane++) {
                 uint64_t a = interp_vec_element(&left, size, lane), b = interp_vec_element(&right, size, lane);
@@ -5084,10 +4242,9 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                     a &= mask;
                     b &= mask;
                     if (opcode == 0x04)
-                        value = (a - b) >> 1; // the borrow bit is exactly what the shift discards
+                        value = (a - b) >> 1;
                     else
-                        // (a + b) can carry out of a 64-bit element, so the sum is formed as the average
-                        // directly: (a & b) + ((a ^ b) >> 1) is (a + b) >> 1 without the intermediate carry.
+                        // (a + b) can carry out of a 64-bit element; (a & b) + ((a ^ b) >> 1) does not.
                         value = (a & b) + (((a ^ b) >> 1) & (mask >> 1)) + (opcode == 0x02 ? ((a ^ b) & 1u) : 0u);
                 } else {
                     int64_t x = (int64_t)interp_element_sext(a, size), y = (int64_t)interp_element_sext(b, size);
@@ -5111,8 +4268,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             break;
         }
-        case 0x09:   // SQSHL / UQSHL: a saturating variable left shift (a right shift when Rm's lane is negative)
-        case 0x0A:   // SRSHL / URSHL: rounding variable shift
+        case 0x09:   // SQSHL / UQSHL: variable shift, right when Rm's lane is negative
+        case 0x0A:   // SRSHL / URSHL
         case 0x0B: { // SQRSHL / UQRSHL
             unsigned esize = 8u << size;
             for (unsigned lane = 0; lane < lanes; lane++) {
@@ -5121,12 +4278,10 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 uint64_t value;
                 if (amount >= 0) {
                     unsigned shift = (unsigned)amount;
-                    if (opcode == 0x0A) { // SRSHL/URSHL left: an exact shift, wrapping like SSHL/USHL
+                    if (opcode == 0x0A) { // SRSHL/URSHL left: exact, like SSHL
                         value = shift >= esize ? 0 : (a << shift) & mask;
                     } else if (u) {
                         uint64_t saturated = (a & mask);
-                        // Saturate when any bit would leave the element, which is the same test as "the value
-                        // no longer fits after the shift".
                         if (shift >= esize ? saturated != 0 : (saturated >> (esize - shift)) != 0) {
                             interp_fpsr_raise(INTERP_FPSR_QC);
                             value = mask;
@@ -5152,8 +4307,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                         value = (uint64_t)shifted & mask;
                     }
                 } else {
-                    // A negative amount is a right shift, which never saturates. The rounding variants add half
-                    // of the discarded field first, which is what distinguishes SRSHL from SSHL.
+                    // A negative amount is a right shift, never saturates; rounding adds half the field.
                     unsigned shift = (unsigned)(-amount);
                     int rounding = opcode == 0x0A || opcode == 0x0B;
                     if (u) {
@@ -5173,8 +4327,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             break;
         }
-        case 0x0E:   // SABD / UABD: absolute difference
-        case 0x0F: { // SABA / UABA: absolute difference accumulated into the destination
+        case 0x0E:   // SABD / UABD
+        case 0x0F: { // SABA / UABA
             interp_vec accumulate = interp_vec_read(cpu, rd);
             for (unsigned lane = 0; lane < lanes; lane++) {
                 uint64_t a = interp_vec_element(&left, size, lane), b = interp_vec_element(&right, size, lane);
@@ -5192,14 +4346,14 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             break;
         }
-        case 0x16: { // SQDMULH / SQRDMULH: doubled high half of the product, saturating
+        case 0x16: { // SQDMULH / SQRDMULH
             if (size == 0 || size == 3)
                 return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated SQDMULH element size");
             unsigned esize = 8u << size;
             for (unsigned lane = 0; lane < lanes; lane++) {
                 int64_t x = (int64_t)interp_element_sext(interp_vec_element(&left, size, lane), size);
                 int64_t y = (int64_t)interp_element_sext(interp_vec_element(&right, size, lane), size);
-                // esize is 16 or 32 here, so 2*x*y fits in int64 with room and no wide type is needed.
+                // esize is 16 or 32: 2*x*y fits in int64.
                 int64_t product = 2 * x * y;
                 if (u) product += (int64_t)(UINT64_C(1) << (esize - 1u)); // SQRDMULH rounds
                 int64_t narrowed = product >> esize;
@@ -5233,7 +4387,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             break;
         }
-        case 0x08: { // SSHL / USHL: element-wise shift by the LOW BYTE of the corresponding lane of Rm
+        case 0x08: { // SSHL / USHL: shift by Rm's LOW BYTE
             for (unsigned lane = 0; lane < lanes; lane++) {
                 uint64_t a = interp_vec_element(&left, size, lane);
                 int8_t amount = (int8_t)(interp_vec_element(&right, size, lane) & 0xFFu);
@@ -5276,7 +4430,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             break;
         }
-        case 0x17: { // ADDP: pairwise add across the CONCATENATION of Rn and Rm
+        case 0x17: { // ADDP: pairwise across Rn:Rm
             if (u) return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated ADDP U bit");
             for (unsigned lane = 0; lane < lanes; lane++) {
                 const interp_vec *source = lane < lanes / 2 ? &left : &right;
@@ -5287,7 +4441,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             break;
         }
-        case 0x12: { // MLA (U=0) / MLS (U=1): multiply-accumulate into the destination
+        case 0x12: { // MLA (U=0) / MLS (U=1)
             if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD three same -- 64-bit element MLA/MLS");
             interp_vec accumulate = interp_vec_read(cpu, rd);
             for (unsigned lane = 0; lane < lanes; lane++) {
@@ -5297,7 +4451,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             break;
         }
-        case 0x13: { // MUL (U=0) / PMUL (U=1), which is carry-less polynomial multiply, not a scaled product
+        case 0x13: { // MUL / PMUL (U=1, carry-less)
             if (u) {
                 if (size != 0) return interp_undefined(cpu, insn, "AdvSIMD three same -- PMUL requires 8B/16B");
                 for (unsigned lane = 0; lane < lanes; lane++) {
@@ -5315,7 +4469,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                                         interp_vec_element(&right, size, lane)) & mask);
             break;
         }
-        case 0x14: { // SMAXP/UMAXP (U selects signedness) -- pairwise, the same shape as ADDP
+        case 0x14: { // SMAXP / UMAXP
             for (unsigned lane = 0; lane < lanes; lane++) {
                 const interp_vec *source = lane < lanes / 2 ? &left : &right;
                 unsigned base = (lane < lanes / 2 ? lane : lane - lanes / 2) * 2u;
@@ -5356,13 +4510,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // ---- AdvSIMD three-same-EXTRA ----
-    //   0 Q U 01110 size 0 Rm 1 opcode(14:11) 1 Rn Rd
-    // Same mask as the copy group above and separated from it only by bit15, which is why they sit together.
-    // This is where the later dot-product and matrix extensions live -- SDOT/UDOT (FEAT_DotProd),
-    // SMMLA/UMMLA/USMMLA (FEAT_I8MM), SQRDMLAH/SQRDMLSH (FEAT_RDM) and the FCMLA/FCADD complex forms. Named
-    // rather than left to the catch-all for the same reason as the crypto block: each is an optional feature
-    // this engine does not advertise, so a guest reaching one is a feature question, not a decoder gap.
+    // AdvSIMD three-same-EXTRA: FEAT_DotProd / FEAT_I8MM / FEAT_RDM / FCMLA-FCADD
+    // Same mask as the copy group, separated only by bit15.
     if ((decode & 0x9F208400u) == 0x0E008400u)
         return interp_undefined(cpu, insn,
                                "AdvSIMD three-same-extra (SDOT/UDOT, SMMLA/USMMLA, SQRDMLAH, FCMLA/FCADD)");
@@ -5370,44 +4519,22 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     return interp_undefined(cpu, insn, "scalar floating-point and Advanced SIMD");
 }
 
-// One guest instruction. Fetches, decodes, executes, and leaves cpu->pc naming the NEXT instruction (or the
-// branch target). Returns INTERP_NEXT to stay in the block or INTERP_END with cpu->reason set.
-//
-// The switch is the ARM ARM's top-level encoding table on op0 = insn[28:25], in its order. Keeping that
-// shape -- rather than a flat list of masks -- is what makes the unimplemented groups obvious and lets each
-// be filled in independently.
+// One guest instruction; cpu->pc ends on the NEXT instruction or the branch target. Returns INTERP_NEXT,
+// or INTERP_END with cpu->reason set. The switch is the ARM ARM's op0 = insn[28:25] table, in order.
 static int interp_step(struct cpu *cpu) {
     uint32_t insn = 0;
     if (hl_guest_fetch_u32(cpu->pc, &insn) != 0) {
-        // The instruction itself could not be read: a logical executable mapping refused the fetch, or the
-        // page is gone. This is the interpreter's equivalent of the JIT's R_FETCHFAULT exit stub, and the
-        // dispatcher turns it into a guest SIGSEGV at exactly this PC.
+        // Unreadable instruction: the JIT's R_FETCHFAULT; a guest SIGSEGV at this PC.
         cpu->fault_addr = cpu->pc;
         cpu->reason = R_FETCHFAULT;
         return INTERP_END;
     }
     switch ((insn >> 25) & 0xF) {
     case 0x0:
-        // op0 == 0000 is the architecture's RESERVED group, and this is the one place where "unallocated" and
-        // "not implemented here" do NOT need to be conflated -- which is what interp_undefined's header
-        // anticipates. The group's only allocated member is UDF, which is defined to be PERMANENTLY undefined,
-        // so every encoding here raises an Undefined Instruction exception on real hardware; none of it is a
-        // class this backend has yet to reach. (Contrast the SME and SVE cases just below, which the
-        // architecture DOES allocate and which therefore remain genuine gaps and stay fatal.)
-        //
-        // So deliver a guest SIGILL rather than stopping the engine. That matches the JIT exactly: it copies the
-        // word verbatim, the host executes it, takes a real SIGILL, and deliver_guest_fault routes it to the
-        // guest's handler. It is also what tests/compat/signals/sigill_probe.c pins -- an installed handler runs
-        // and may advance uc_mcontext.pc past the instruction, while SIG_DFL still terminates with SIGILL.
-        //
-        // cpu->pc stays ON the undefined instruction, which is what Linux gives the handler and what makes the
-        // handler's `pc += 4` the documented way to step over it. A handler that returns without advancing
-        // re-executes it and traps again -- again, exactly real behaviour.
-        //
-        // si_code is ILL_ILLOPC (1): Linux/arm64's do_undefinstr injects exactly that, with si_addr = the
-        // faulting PC. A guest that probes for an optional instruction reads both. si_addr goes through
-        // pcrel_base for the same reason as the exception-generation group above: the frame's pc field is
-        // canonicalized the same way, and a handler compares the two.
+        // op0 == 0000 is RESERVED and its only member, UDF, is PERMANENTLY undefined -- not a gap here, so
+        // deliver a guest SIGILL instead of stopping the engine (SME and SVE below ARE allocated, stay fatal).
+        // cpu->pc stays ON the instruction so `pc += 4` in a handler steps over it; si_code ILL_ILLOPC and
+        // si_addr the faulting PC via pcrel_base.
         interp_raise_sync_signal(cpu, 4 /* SIGILL */, 1 /* ILL_ILLOPC */, pcrel_base(cpu->pc));
         return INTERP_END;
     case 0x1:
@@ -5435,16 +4562,8 @@ static int interp_step(struct cpu *cpu) {
     }
 }
 
-// The pre-scan's view of "this instruction ends a block". It must answer 1 for every encoding interp_step
-// answers INTERP_END for, and it is allowed to answer 1 for more.
-//
-// A disagreement is safe in both directions but wasteful, which is worth being explicit about. If the scan
-// ends a block EARLY, the descriptor covers fewer instructions than the guest will run straight through, and
-// run_block simply returns R_BRANCH at the boundary -- indistinguishable from a chain exit. If the scan ends
-// it LATE (because the bytes changed between translation and execution), run_block stops at the real branch
-// and never reads past it. What is NOT allowed is for the recorded source range to be a SUBSET of the bytes
-// actually executed, because map_put's range is what SMC invalidation tests -- so the scan must never skip
-// an instruction it decoded.
+// Must answer 1 wherever interp_step ends a block; more is only wasteful. The recorded range must never
+// be a SUBSET of the bytes executed -- map_put's range is what SMC tests.
 static int interp_block_ends(uint32_t insn) {
     if ((insn & 0x7C000000u) == 0x14000000u) return 1;  // B / BL
     if ((insn & 0xFF000010u) == 0x54000000u) return 1;  // B.cond
@@ -5458,74 +4577,41 @@ static int interp_block_ends(uint32_t insn) {
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// The block descriptor, and translate_block.
-// ---------------------------------------------------------------------------
-// Bound on the guest instructions one descriptor may cover. A block is capped rather than unbounded for the
-// same reason the JIT caps its emitted size: the descriptor must be admitted within the arena headroom the
-// dispatcher guarantees, and an unbounded straight-line run (generated code can contain tens of thousands of
-// instructions before its first branch) would otherwise make one block's interpretation unpreemptible by the
-// c->irq poll for an arbitrarily long time. Splitting at the cap is exactly an ordinary chain exit.
+// Block descriptor + translate_block. Cap the block so the descriptor fits the dispatcher's arena headroom
+// and one block stays preemptible by the c->irq poll; splitting at the cap is an ordinary chain exit.
 #define INTERP_BLOCK_MAX_INSNS 4096u
 
-// WHY THE DESCRIPTOR ONLY DELIMITS, AND DOES NOT CACHE DECODED INSTRUCTIONS.
-//
-// The dispatcher's only requirement is that translate_block return a DISTINCT NON-NULL pointer per guest PC:
-// map_host() returning non-NULL is what suppresses re-translation, so a NULL or a shared pointer would either
-// re-translate forever or alias two guest PCs onto one cache entry. It is allocated from the arena's existing
-// bump pointer (g_cp inside g_cache/CACHE_SZ) rather than from malloc so that ALL the existing accounting
-// keeps working untouched: the dispatcher's flush-on-full test, jit_resolve_rw_code's RW->RX resolution,
-// generation tagging, and the stop-the-world retire/reclaim discipline all reason about "is this address in
-// the current arena", and a heap pointer would silently fall out of every one of them.
-//
-// The contents are just the guest range. run_block re-fetches and re-decodes each instruction on every
-// execution. That is the simple and correct choice, and it has one real advantage worth keeping in mind when
-// it is optimised: because the guest's own bytes are the only source of truth at execution time,
-// self-modifying code is coherent almost by construction -- only the block EXTENT can go stale, which is
-// what the ic-ivau/ISB path above handles.
-//
-// Caching the decoded form here (an array of {handler, pre-extracted operands} appended after the header) is
-// the obvious later optimisation and would remove the per-execution fetch, mask and branch tree. It would
-// also make SMC coherence load-bearing rather than incidental, so it must land together with a test that a
-// rewritten line really does invalidate the decoded array.
+// The descriptor only DELIMITS: no decoded instructions are cached, so re-decoding each execution keeps SMC
+// coherent by construction and only the block EXTENT goes stale. Must be a distinct non-NULL pointer per
+// guest PC, from the arena bump pointer (not malloc) so the arena-membership accounting keeps working.
 #define INTERP_BLOCK_MAGIC UINT64_C(0x484C494E54455250) // "HLINTERP"
 
 struct interp_block {
-    uint64_t magic;       // guards against executing a foreign/stale descriptor (see run_block)
+    uint64_t magic;       // foreign/stale descriptor guard
     uint64_t guest_start; // entry guest PC == the map key
     uint64_t guest_end;   // one past the last instruction the pre-scan decoded
-    uint64_t insn_count;  // guest instructions in [guest_start, guest_end); diagnostics only
+    uint64_t insn_count;  // diagnostics only
 };
 
-// Called by the dispatcher only under G_BLOCK_ALIGN, which interp_dispatch.h defines as the literal 0 -- so
-// this is unreachable. It must nonetheless exist, because the call is compiled (inside `if (0)`, not inside
-// `#if 0`) and an omission would be a link error a long way from its cause. The body is the honest one: a
-// 4-byte arena write, so that if anyone ever turns entry alignment back on the bump pointer stays consistent
-// even though the padding can never execute on this host.
+// Unreachable (G_BLOCK_ALIGN is literal 0) but must exist: the call compiles inside `if (0)`, not `#if 0`.
 static void emit32(uint32_t instruction) {
     memcpy(g_cp, &instruction, sizeof instruction);
     g_cp += sizeof instruction;
 }
 
-// There is no second tier. The JIT's tier-2 promotion exists to fold a hot self-loop's back-edge into a
-// single host conditional branch, which presupposes emitted host branches; the interpreter's back-edge is an
-// assignment to cpu->pc and there is nothing to fold. It is never reached either -- R_TIER2 is only ever
-// raised by an emitted in-cache counter -- but core/dispatch.c calls it unconditionally after every block,
-// so the symbol must exist.
+// Never reached (nothing to fold: this back-edge is just cpu->pc), but core/dispatch.c calls it after
+// every block.
 static void tier2_promote(uint64_t gpc) {
     (void)gpc;
 }
 
 static void *translate_block(uint64_t gpc) {
     HL_LOGF(&g_jit_log, HL_LOG_TAG_TRANSLATE, "isa=aarch64 backend=interp guest_pc=%#llx", (unsigned long long)gpc);
-    // Observe writes made through another MAP_SHARED alias before reading an executable view that is backed
-    // by an emulated host-page snapshot -- the same reason translate.c does this before decoding.
+    // Observe MAP_SHARED alias writes before decoding, as translate.c does.
     uint64_t source_page = gpc & ~UINT64_C(0xFFF);
     filemap_refresh_emulated(source_page, source_page + UINT64_C(0x1000));
 
-    // Delimit the block. The scan stops after a block-ending instruction, at the instruction cap, or at the
-    // first byte it cannot fetch (in which case the range still covers that instruction, so run_block reaches
-    // it and raises R_FETCHFAULT at the right PC rather than silently ending the block one early).
+    // The range still covers an unfetchable instruction, so run_block raises R_FETCHFAULT at the right PC.
     uint64_t cursor = gpc;
     uint64_t count = 0;
     while (count < INTERP_BLOCK_MAX_INSNS) {
@@ -5536,10 +4622,7 @@ static void *translate_block(uint64_t gpc) {
         if (interp_block_ends(insn)) break;
     }
 
-    // Allocate the descriptor from the arena bump pointer. The dispatcher has already guaranteed
-    // CACHE_EMIT_HEADROOM bytes of room (it flushes wholesale, or stops the world and rotates to a fresh
-    // arena, before calling us), so this cannot overflow; the check is here because "cannot" is a property of
-    // a caller, and scribbling past the arena would corrupt whatever the kernel mapped after it.
+    // Cannot overflow: the dispatcher guaranteed CACHE_EMIT_HEADROOM. Checked anyway.
     while ((uintptr_t)g_cp & 15u)
         *g_cp++ = 0;
     if (g_cp + sizeof(struct interp_block) > g_cache + CACHE_SZ) {
@@ -5554,19 +4637,11 @@ static void *translate_block(uint64_t gpc) {
     block->guest_end = cursor;
     block->insn_count = count;
 
-    // Register the translation exactly as the JIT does, with the same argument meanings: the key is the entry
-    // PC, `host` is what map_host()/the dispatcher will hand to run_block, and [guest_start, guest_end) is
-    // the decoded SOURCE interval that map_invalidate_source_ranges() intersects against a rewritten line.
-    // `body` is the JIT's chained/indirect entry point, which is the same address as the descriptor here --
-    // there is no prologue to skip. Passing the descriptor for both keeps map_body() non-NULL, which
-    // G_DISPATCH_CHAIN's patch_links_to() treats as "this PC has a live translation" (it then finds no
-    // pending links to patch, because nothing here ever records one).
+    // Key = entry PC; [guest_start, guest_end) is the SOURCE interval map_invalidate_source_ranges() intersects.
+    // `body` = the same address (no prologue); non-NULL map_body() means "live translation" to patch_links_to().
     map_put(gpc, gpc, cursor, block, block);
-    // SMC precise gate. txpg_mark records the guest pages this block sourced, and the 64-byte line set is the
-    // finer gate txln_flush_class() classifies an `ic ivau` against. Both must be populated for the same
-    // reason as in the JIT: a flush of a line we never translated has nothing stale to drop, and a flush of a
-    // line we DID translate must reach map_invalidate_source_ranges. Without this the interpreter's cached
-    // block EXTENT would survive a rewrite of the very branch that determined it.
+    // SMC precise gate: without the page marks and the 64-byte line set (what txln_flush_class() classifies
+    // an `ic ivau` against), the cached block EXTENT survives a rewrite of the branch that determined it.
     txpg_mark(gpc, cursor);
     if (g_txln_active)
         for (uint64_t line = gpc >> 6; line <= (cursor - 1) >> 6; line++)
@@ -5574,54 +4649,27 @@ static void *translate_block(uint64_t gpc) {
     return block;
 }
 
-// ---------------------------------------------------------------------------
-// run_block / block_return -- the boundary the dispatcher calls through.
-// ---------------------------------------------------------------------------
-// interp_dispatch.h defines G_OWN_TRAMPOLINES so core/dispatch.c does not emit its AArch64 assembly pair,
-// and these are what it calls instead. They are plain C: there is no host register file holding guest state,
-// so there is nothing to spill on entry and nothing to restore on exit, and cpu->host_sp / host_save[] /
-// host_v[] stay untouched (they remain part of the checkpoint image, which is why they are still in
-// struct cpu at all).
-//
-// LOCAL linkage, and that is load-bearing rather than tidiness. __attribute__((visibility("hidden"))) is not
-// local linkage: it controls export from a shared object, but the symbol stays STB_GLOBAL inside a static link.
-// The dual activation archive links BOTH per-guest-ISA target objects into one binary, and core/target/
-// namespace.h -- which renames the per-ISA symbols precisely so the two can coexist -- does not cover these
-// two names, so a global run_block in each interpreter is a multiple definition. `static` also matches what the
-// JIT already does: its trampolines come from a file-scope __asm__ block containing `.hidden`, which the
-// assembler emits as a genuinely local symbol (nm reports a lowercase `t`, not `T`).
-//
-// Nothing is lost. interp.c is #included into the target translation unit, so every caller is in this same TU:
-// core/dispatch.c's run_block(c, code) call and core/target/aarch64.c taking &block_return. Taking the address
-// of a static function within its TU is ordinary C.
+// run_block / block_return: the dispatcher's boundary; interp_dispatch.h defines G_OWN_TRAMPOLINES so
+// core/dispatch.c calls these instead of emitting its AArch64 pair. `static` is load-bearing --
+// visibility("hidden") leaves the symbol STB_GLOBAL in a static link (docs/amd64-host-findings.md 3.7), the
+// dual archive links BOTH target objects, and namespace.h does not rename these two.
 static void run_block(struct cpu *cpu, void *code);
 static void block_return(void);
 
 static void run_block(struct cpu *cpu, void *code) {
     const struct interp_block *block = (const struct interp_block *)code;
     if (block == NULL || block->magic != INTERP_BLOCK_MAGIC) {
-        // Not a descriptor this backend wrote. The only way to get here is a restored persistent cache or
-        // checkpoint whose arena holds JIT-emitted host code -- both of which are supposed to be rejected on
-        // host-ISA identity (see pcache_engine_id below), so reaching this is an identity bug and must not be
-        // papered over by executing whatever the bytes happen to say.
+        // Not this backend's descriptor: a JIT-written pcache/checkpoint that host-ISA identity
+        // (pcache_engine_id) should have rejected.
         static const char message[] = "interpreter entered a block that it did not translate";
         (void)jit_fail(HL_STATUS_CORRUPT, message, sizeof message - 1u);
         cpu->reason = R_BRANCH;
         return;
     }
 
-    // The fault marker. sigsetjmp with savemask=1 so a siglongjmp out of the SIGSEGV/SIGBUS handler restores
-    // the mask the handler was entered with; see the fault-model comment at the top of this file for why
-    // jumping out of a handler is safe here.
+    // savemask=1: the siglongjmp arrives from a signal handler, with the signal blocked.
     if (sigsetjmp(g_interp_marker_jmp, 1) != 0) {
-        // Arrived from one of the two abandon-the-access paths, both of which have already left cpu in the
-        // state the dispatcher needs and neither of which changed any architectural state:
-        //   * interp_signal_resume, after a real host SIGSEGV/SIGBUS -- the shared handler set cpu->reason
-        //     plus sync_signal/sync_code and the pending-signal bit;
-        //   * interp_bus_ledger_check, for a past-EOF access the host was deliberately made not to fault on
-        //     -- it set cpu->reason = R_BUS and cpu->fault_addr, and interp_dispatch.h's R_BUS arm calls
-        //     raise_guest_bus.
-        // Returning is all that is left to do either way.
+        // Both abandon paths already left cpu as the dispatcher needs it; no architectural state changed.
         g_interp_access_active = 0;
         g_interp_marker_armed = 0;
         g_interp_marker_cpu = NULL;
@@ -5632,18 +4680,12 @@ static void run_block(struct cpu *cpu, void *code) {
 
     uint64_t executed = 0;
     for (;;) {
-        // Async-interrupt poll, the interpreter's form of the JIT's 2-instruction ldr+cbz block header: a
-        // caught guest signal that became pending while this thread spins in a loop with no syscalls must
-        // still reach the dispatcher at a safe boundary. Polled AFTER at least one instruction has retired,
-        // which is what guarantees forward progress -- an exit with cpu->pc unchanged would have the
-        // dispatcher hand us the same block again forever. cpu->irq is cleared by the dispatcher each
-        // iteration, so a masked-but-undeliverable signal cannot bounce us every time round.
+        // Poll AFTER one instruction retires: exiting with cpu->pc unchanged gets the same block forever.
         if (executed && cpu->irq) {
             cpu->reason = R_BRANCH;
             break;
         }
-        // Leaving the descriptor's range is an ordinary chain exit: the guest ran straight through to the
-        // next block (or past the instruction cap). cpu->pc already names where to resume.
+        // Ordinary chain exit.
         if (cpu->pc < block->guest_start || cpu->pc >= block->guest_end) {
             cpu->reason = R_BRANCH;
             break;
@@ -5656,15 +4698,9 @@ static void run_block(struct cpu *cpu, void *code) {
     g_interp_marker_cpu = NULL;
 }
 
-// The far end of a bridge that does not exist here. Under the JIT, emitted blocks branch to block_return to
-// unwind the host callee-saved state that run_block spilled; nothing in this backend's arena is executable,
-// so nothing can branch here. It must still be a real, address-taken symbol because core/target/aarch64.c's
-// sigframe_resume_dispatch bakes its address as the PC to resume a captured fault at -- and once that call
-// site is routed to interp_signal_resume (which siglongjmps instead), even that use disappears.
-//
-// Aborting rather than returning is the point: a silent return would leave cpu->reason holding the previous
-// block's value and send the dispatcher round the loop against stale state, turning a specific bug into an
-// unbounded spin somewhere else.
+// Nothing here is executable so nothing branches in, but the symbol must exist and be address-taken:
+// sigframe_resume_dispatch bakes it. Abort, not return -- a silent return spins the dispatcher on a stale
+// cpu->reason.
 static void block_return(void) {
     fprintf(stderr, "hl: block_return() entered under the aarch64 interpreter backend on a " HL_HOST_CPU_NAME
                     " host.\n"
@@ -5674,17 +4710,10 @@ static void block_return(void) {
     abort();
 }
 
-// ---------------------------------------------------------------------------
-// Self-modifying guest code.
-// ---------------------------------------------------------------------------
-// Same model as the JIT, and it must be, because the reason codes and the queue in struct cpu are part of the
-// checkpoint image: the guest is architecturally required to run the icache-maintenance dance before
-// executing freshly written bytes, the frontend intercepts `ic ivau` to record the dirty line, and the ISB
-// that ends the dance is where the recorded lines are acted on.
+// Self-modifying guest code, same model as the JIT: the reason codes and queue are checkpoint-image state.
 static void smc_queue_line(struct cpu *c, uint64_t address) {
-    // An ET_EXEC image's code is mapped at a high collision-avoidance bias while its architectural pointers
-    // stay link-time low. Translation-map source intervals use the real executable address, so normalize an
-    // ic-ivau operand the same way instruction dispatch does before classifying it.
+    // ET_EXEC code sits at a collision-avoidance bias while its pointers stay link-time low; map source
+    // intervals use the real executable address, so normalize as dispatch does.
     if (g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi) address += g_nonpie_bias;
     uint64_t start = address & ~UINT64_C(63), end = start + 64;
     for (uint32_t i = 0; i < c->smc_range_count; i++) {
@@ -5711,11 +4740,8 @@ static void aarch64_smc_queue_range(uint64_t first, uint64_t last, void *opaque)
     }
 }
 
-// Declared in abi.h and reached through G_SMC_COPYOUT: a syscall that copies to user memory writes guest
-// bytes without going through any instruction this backend decoded, so a write that lands on code the
-// interpreter has a cached EXTENT for must be queued here. This is NOT inert on the interpreter -- it is the
-// same real work the JIT does -- because the block descriptor caches where a block ends, and a copyout can
-// move the branch that determined it.
+// G_SMC_COPYOUT. NOT inert here: a syscall copying to user memory can move the branch that determined a
+// cached block extent.
 static void aarch64_smc_copyout(uint64_t first, uint64_t last) {
     if (last <= first) return;
     struct cpu *c = pthread_getspecific(g_cpu_key);
@@ -5724,25 +4750,18 @@ static void aarch64_smc_copyout(uint64_t first, uint64_t last) {
     hl_logical_vma_visit_exec_aliases(first, last, aarch64_smc_queue_range, c);
 }
 
-// A guest `ic ivau` reached the dispatcher (R_ICFLUSH). Queue only; smc_commit() below owns activation,
-// membership and content classification under g_jit_lock, so that a line whose bytes changed is classified
-// once rather than immediately looking unchanged on a second observation.
+// R_ICFLUSH: queue only; smc_commit() classifies under g_jit_lock so a changed line is classified once.
 static void smc_icflush(struct cpu *c, uint64_t va) {
-    // Latch unconditionally, even when the line turns out never to have been translated: g_smc_seen is what
-    // the rest of the engine reads to mean "this guest generates code", and it must not depend on the
-    // outcome of the precise gate.
+    // Latch even for a never-translated line: g_smc_seen means "this guest generates code" engine-wide.
     __atomic_store_n(&g_smc_seen, 1, __ATOMIC_RELEASE);
     smc_queue_line(c, va);
 }
 
-// The guest's ISB (R_ICCOMMIT): act on every line queued since the last commit. This is the JIT's
-// implementation, and the reuse is deliberate -- map_invalidate_source_ranges()/map_clear() are exactly the
-// right primitives here, because what has to be dropped is not host code (there is none) but the gpc->
-// descriptor lookup, whose recorded guest interval may no longer describe the bytes at that PC.
+// R_ICCOMMIT: what must be dropped is not host code (there is none) but the gpc->descriptor lookup.
 static int smc_commit(struct cpu *c) {
     pthread_mutex_lock(&g_jit_lock);
     txln_activate();                // arm eager line recording; may request a priming wholesale drop
-    int force_whole = g_txln_prime; // first SMC after lazy activation: no lines recorded yet -> cannot classify
+    int force_whole = g_txln_prime; // first SMC after activation: no lines recorded -> cannot classify
     g_txln_prime = 0;
     if (!force_whole && !c->smc_range_count && !c->smc_range_overflow) {
         pthread_mutex_unlock(&g_jit_lock);
@@ -5775,17 +4794,13 @@ static int smc_commit(struct cpu *c) {
         }
     }
     pthread_mutex_unlock(&g_jit_lock);
-    // Bring every peer to a dispatcher boundary before mutating the lookup: map readers are lock-free, and a
-    // peer that resolved a descriptor an instant ago must not still be inside run_block against a range this
-    // window is about to declare stale.
+    // Map readers are lock-free: a peer must not still be in run_block against a range about to go stale.
     stw_mapping_begin();
     uint32_t removed;
     if (force_whole || c->smc_range_overflow) {
         removed = g_live_map_count;
         map_clear();
-        // The inline branch-target cache is never populated by this backend (G_IBTC_FILL is a no-op), so this
-        // clear is inert. It is kept so both backends leave identical state behind a wholesale drop -- the
-        // table is process-global and a checkpoint written here can be restored by the JIT.
+        // Inert here (G_IBTC_FILL is a no-op); kept so a checkpoint written here can be restored by the JIT.
         memset(g_ibtc, 0, sizeof g_ibtc);
         txpg_clear();
     } else {
@@ -5801,14 +4816,7 @@ static int smc_commit(struct cpu *c) {
     return 1;
 }
 
-// ---------------------------------------------------------------------------
-// Contract stubs. Each one is inert for a specific, stated reason.
-// ---------------------------------------------------------------------------
-// Declared in abi.h and called through G_SOFT_TLB_REFRESH from the stop-the-world registry. This one is NOT
-// inert -- it publishes the conservative hull of the sparse logical VMAs into the cpu, and it is plain C with
-// no host-code dependency -- so it is the JIT's implementation unchanged. It is cheap and keeps the field
-// meaningful for anything that reads it (including a checkpoint), even though this backend resolves a
-// logical-VMA access inline rather than by consulting the hull.
+// Contract stubs, each inert for a stated reason -- except this one, which publishes the logical-VMA hull.
 static void aarch64_soft_filter_refresh(struct cpu *c) {
     uint64_t first = UINT64_MAX, last = 0;
     hl_logical_vma_snapshot *snapshot =
@@ -5821,17 +4829,8 @@ static void aarch64_soft_filter_refresh(struct cpu *c) {
     c->soft_filter_last = last;
 }
 
-// The soft-TLB reason handlers. The JIT emits an inline software-TLB probe into every memory instruction and
-// exits R_SOFTMISS/R_SOFTSPAN/R_SOFTCOMMIT when it cannot resolve an address, because re-entering C from
-// emitted code is expensive enough to be worth an inline fast path. This backend is ALREADY in C: when the
-// load/store group lands it will resolve a logical-VMA access inline and never need to leave the block to
-// ask, so it cannot raise these reasons at all.
-//
-// They exist because the reason codes are part of the shared vocabulary: interp_dispatch.h's
-// G_DISPATCH_REASON handles them (by turning them into a guest fetch fault rather than falling through to
-// R_BRANCH and resuming at a bogus PC) so that a checkpoint restored from a JIT-written image, or a future
-// inline-probe variant of this backend, cannot silently mis-resume. Returning "not resolved" is the only
-// answer that is true for a reason this backend never produces.
+// Never raised here (accesses resolve inline), but the codes are shared vocabulary: G_DISPATCH_REASON turns
+// R_SOFTMISS/R_SOFTSPAN/R_SOFTCOMMIT into a guest fetch fault so a JIT-written checkpoint cannot mis-resume.
 static int aarch64_soft_tlb_miss(struct cpu *c) {
     (void)c;
     return 0;
@@ -5843,69 +4842,41 @@ static int aarch64_soft_tlb_span(struct cpu *c) {
 }
 
 static int aarch64_soft_bounce_commit(struct cpu *c) {
-    // No bounce buffer can be pending: only aarch64_soft_prepare_bounce (a JIT path) ever arms one. Answer 1
-    // = "committed", which is what the JIT answers for an unarmed bounce, so the dispatcher continues rather
-    // than manufacturing a fault out of nothing.
+    // No bounce can be pending; 1 = "committed" is the JIT's answer for an unarmed bounce.
     (void)c;
     return 1;
 }
 
-// §B shadow-return prediction caches HOST return addresses, so that a guest `ret` can become a host `ret`
-// into the code arena. There are no host return addresses here and cpu->ssp is never non-zero (the shared
-// dispatcher still resets it, deliberately, so a checkpoint written by this backend cannot hand the JIT a
-// shadow stack full of another process's addresses -- see interp_dispatch.h).
-//
-// The value is not consulted: the JIT reads shadowgate() through G_BLOCK_ALIGN to decide entry padding, and
-// interp_dispatch.h defines G_BLOCK_ALIGN as the literal 0. 0 spells "§B on" in the JIT's encoding, which is
-// the value that makes every gate this function feeds take its ordinary, non-tuning path.
+// Never consulted (G_BLOCK_ALIGN is literal 0); 0 spells "§B on", the ordinary non-tuning path.
 static int shadowgate(void) {
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// The persistent translated-code cache: permanently absent on this backend.
-// ---------------------------------------------------------------------------
-// The pcache stores HOST CODE plus a table of relocations describing baked host pointers inside it. There is
-// no host code here to store, and a file written by the JIT contains AArch64 instructions that this backend
-// would have to execute to use -- so this backend must never load one and must never save one. Rather than
-// spread `#ifdef` over the call sites in core/target/aarch64.c and linux_abi/, load is a clean MISS and save
-// is a no-op, which is exactly the behaviour those call sites already handle (a cold miss is the normal
-// first-run path).
-//
-// PCACHE_FLUSH_HOOK / PCACHE_FORK_HOOK / PCACHE_EXEC_HOOKS / PCACHE_SAVE_HOOK are deliberately NOT defined:
-// every one of their call sites is inside an #ifdef, so leaving them undefined removes the bookkeeping
-// entirely instead of stubbing it.
-//
-// These globals are still needed as storage because code outside this file reads them: linux_abi/elf.c
-// honours g_force_base to map an image at a fixed VA, and core/target/aarch64.c reads g_pcache/g_coldprof and
-// writes g_pc_binid/g_pc_entry around the load/save calls below.
-#define PC_IMG_BASE 0x0000040000000000ull    // fixed guest image base, when a cache could be keyed to it
+// The persistent cache stores HOST CODE; a JIT-written file holds AArch64 instructions this backend would
+// have to execute, so load is a clean MISS and save a no-op. PCACHE_*_HOOK stay undefined so their #ifdef'd
+// call sites vanish; the globals below are storage read from outside this file.
+#define PC_IMG_BASE 0x0000040000000000ull    // fixed guest image base
 #define PC_INTERP_BASE 0x0000048000000000ull // fixed interpreter (ld.so) base
 
-static int g_pcache;             // HL_PCACHE=1 was requested (it will simply never hit)
-static int g_coldprof;           // cache timing diagnostics; production keeps this disabled
+static int g_pcache;             // HL_PCACHE=1 requested (never hits)
+static int g_coldprof;           // cache timing diagnostics
 static uint64_t g_force_base;    // one-shot fixed-VA request consumed by load_elf
 static int g_force_base_failed;  // a fixed-VA map fell back to a kernel base
-static uint64_t g_pc_binid;      // identity of guest binary + interp + argv0 + engine build + host ISA
-static uint64_t g_pc_entry;      // initial guest pc (sanity key)
-static int g_pcache_loaded;      // never set: this backend cannot restore an arena
-static int g_pcache_forked;      // never set: read by linux_abi/fork.c's save guard, which never fires here
-static int g_nreloc;             // recorded baked-host-pointer slots; always zero here
+static uint64_t g_pc_binid;      // binary + interp + argv0 + build + host ISA
+static uint64_t g_pc_entry;      // initial guest pc
+static int g_pcache_loaded;      // never set here
+static int g_pcache_forked;      // never set here
+static int g_nreloc;             // always zero here
 
-// The engine-identity mix-in for the cache key. The one thing this MUST get right even though the cache is
-// never used: host_isa is HL_HOST_CPU_ISA, not a hardcoded 1. The AArch64 JIT passes host_isa = 1 because it
-// only ever runs on an AArch64 host; passing 1 from here would make an identity computed on an x86-64 host
-// collide with a JIT-written cache for the same guest binary, and the collision would be resolved by
-// executing AArch64 instructions on x86-64. The same value is mixed into the CHECKPOINT image identity
-// (linux_abi/checkpoint.c calls this function), where the consequence of a collision is identical.
+// Engine-identity mix-in for the cache key. Must be right even though the cache never hits: host_isa is
+// HL_HOST_CPU_ISA, not a hardcoded 1 -- passing 1 would collide an x86-64-host identity with a JIT-written
+// cache for the same guest, resolved by executing AArch64 on x86-64. Same value keys the CHECKPOINT image.
 static uint64_t pcache_engine_id(void) {
     static const char tag[] = __DATE__ " " __TIME__;
     uint64_t build = hl_digest_bytes(HL_DIGEST_SEED, tag, sizeof tag - 1);
     uint64_t self = hl_identity_source(&g_jit_services, g_self_path);
     build = hl_digest_bytes(build, &self, sizeof self);
-    // The JIT folds its codegen-mode switches in here so a mode change invalidates the cache. This backend
-    // has no codegen modes; bit 0 marks "interpreter", so an identity from this backend can never equal one
-    // from the JIT even if a future host somehow shared an ISA number.
+    // Bit 0 marks "interpreter", so this identity can never equal the JIT's on a shared ISA number.
     uint64_t modes = 1u;
     return hl_identity_configuration(build, HL_HOST_CPU_ISA_AARCH64, HL_HOST_CPU_ISA, modes);
 }
@@ -5916,7 +4887,7 @@ static uint64_t pcache_make_id(const char *prog_host, const char *interp_host, c
     return hl_identity_mix(program, interpreter, pcache_engine_id(), hl_identity_name(argv0));
 }
 
-// A clean MISS, always. The caller treats 0 as "translate fresh", which is the correct and only outcome here.
+// Always a clean MISS.
 static int pcache_load(uint64_t entry_jump) {
     (void)entry_jump;
     if (g_pcache && g_coldprof)
@@ -5924,16 +4895,14 @@ static int pcache_load(uint64_t entry_jump) {
     return 0;
 }
 
-// A no-op, always. Saving would persist block descriptors that describe nothing reusable (they are keyed to
-// this process's guest mapping and hold no translated bytes), and any consumer of the file would be a JIT.
+// A no-op: descriptors are keyed to this process's mapping and hold no translated bytes.
 static void pcache_save(void) {
 }
 
-// The JIT refuses to persist an arena that a non-default codegen mode baked unrecorded host pointers into.
-// Nothing is ever persisted here, so there is nothing to poison.
+// Nothing is persisted, so nothing to poison.
 static void pcache_poison_check(void) {
 }
 
-// No cache directory is ever opened, so there is no descriptor to close.
+// No cache directory is opened.
 static void pcache_directory_close(void) {
 }

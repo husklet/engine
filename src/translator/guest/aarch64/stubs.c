@@ -2,15 +2,10 @@
 // IC, exit trampolines, block chaining. The engine's emission semantics, built on the host ARM64 assembler
 // (host/arm64/asm.c, #included before this file). Split out of the former engine/emit_arm64.c (C7).
 
-// block_return itself lives in core/dispatch.c, later in this unity TU; this only forward-declares it so the
-// exits below can bake its address. The two forms are not interchangeable at link time, so the condition
-// MUST be character-for-character the one dispatch.c uses to choose between them: GCC has no AArch64 naked
-// function, so under GCC the trampoline is a global symbol emitted by a file-scope __asm__ block, while
-// clang emits a naked static. The host-CPU test is spelled HL_HOST_CPU_AARCH64 (src/host/host_cpu.h) rather
-// than __aarch64__ because it is the HOST that decides this -- the guest ISA is aarch64 either way -- and
-// because dispatch.c is now gated on that same name; a bare __aarch64__ here would silently disagree with it.
-// On a non-AArch64 host neither ARM64 trampoline exists, and dispatch.c supplies a static placeholder, so the
-// `static` declaration is the one that matches.
+// block_return lives in core/dispatch.c, later in this unity TU; this forward-declares it so the exits below
+// can bake its address. The two forms are not interchangeable at link time, so the condition MUST be
+// character-for-character dispatch.c's: an __asm__-block global under GCC (no AArch64 naked function), a
+// naked static under clang. The HOST decides it, hence HL_HOST_CPU_AARCH64.
 #include "../../../host/host_cpu.h"
 #if defined(__GNUC__) && !defined(__clang__) && defined(HL_HOST_CPU_AARCH64)
 extern void block_return(void) __attribute__((visibility("hidden")));

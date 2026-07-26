@@ -13,12 +13,10 @@ endif()
 
 find_program(HL_BASH_EXECUTABLE NAMES bash REQUIRED)
 
-# The host is the (OS, CPU) PAIR, not the OS. Passing only CMAKE_SYSTEM_NAME was
-# correct exactly as long as `Linux` could only mean `Linux-aarch64`: the two
-# Linux host CPUs register different tests (perf.native-*, isa-fuzz.aarch64-*),
-# so a lane that is empty on one and full on the other is a real asymmetry the
-# gate has to be able to see and name. HL_HOST_ARCH is derived once in
-# CMakeLists.txt; do not re-derive it from the processor here.
+# The host is the (OS, CPU) PAIR, not the OS: the two Linux host CPUs register
+# different tests (perf.native-*, isa-fuzz.aarch64-*), so a lane empty on one and
+# full on the other is an asymmetry the gate must name. HL_HOST_ARCH comes from
+# CMakeLists.txt; do not re-derive it here.
 add_test(NAME gate.ci-lane-parity
   COMMAND ${HL_BASH_EXECUTABLE}
           ${CMAKE_SOURCE_DIR}/tools/check_lane_parity.sh

@@ -25,10 +25,7 @@
 
 #include "hl/config.h"
 
-/* CASE_MAX bounds the fixed cases[] array in main(). The largest manifest in the tree is
-   tests/compat/completeness/manifest.tsv at 167 active rows, so 256 leaves ~90 rows of headroom; the
-   overflow path below names the limit rather than blaming the manifest, because a manifest that parses
-   perfectly is not a parse error and reporting it as one sends a reader to the wrong file. */
+/* CASE_MAX bounds the fixed cases[] array in main(); overflow is the harness's limit, not a parse error. */
 enum { CASE_MAX = 256, FIELD_MAX = 512, OUTPUT_MAX = 1024 * 1024, ERROR_MAX = 64 * 1024, TIMEOUT_MS = 120000 };
 
 /* Per-case hang detector. 120s suits every suite whose cases are milliseconds of
@@ -50,36 +47,11 @@ static uint64_t suite_case_timeout_ms(void) {
 }
 
 /*
- * Host-backend timeout scale.
- *
- * Every budget above is calibrated against a JIT, because until now every supported host CPU had one, which
- * made "a case that has not finished in 120s is hung" a safe inference. On an x86_64 host it is not: neither
- * guest frontend has an amd64 back end -- both emit ARM64 -- so the backend there decodes and executes rather
- * than emitting, and guest execution costs roughly 10-50x what the ARM64-host JIT costs (docs/amd64-host.md
- * section 3). A correct-but-interpreted case would trip the detector and be killed by the process-group kill
- * below, reporting the one thing that is NOT true -- a hang -- and destroying the output that would have
- * distinguished the two. Slow and hung must not share a diagnostic.
- *
- * The scale is therefore supplied by the caller, once, where the lanes are registered
- * (cmake/Phase3Compat.cmake), and is deliberately NOT detected here. This runner cannot detect it honestly:
- * "is my backend an interpreter" is a property of the engine binary it execs, and reading that out of the
- * engine would couple the harness to backend internals and silently re-tune itself the day those internals
- * change. One environment variable set next to the test registration is greppable and reviewable; an
- * inference made inside the harness is neither.
- *
- * It MULTIPLIES HL_MATRIX_CASE_TIMEOUT_MS rather than replacing it, because the two answer different
- * questions: the absolute value is how much work THIS SUITE does (.github/workflows/linux.yml gives
- * compat-soak 600s), the scale is how much slower THIS HOST executes any of it. Both apply, so both compose.
- *
- * Unset or empty means 1 and every code path below is then bit-for-bit what it was before this existed --
- * including the diagnostic strings, so an unscaled lane's output cannot change at all. Anything else must be
- * decimal digits naming a factor in [1, TIMEOUT_SCALE_MAX], and a value outside that is a hard refusal rather
- * than a fallback to 1: falling back would present as a suite full of unexplained per-case timeouts, which is
- * precisely the diagnostic this exists to prevent. The ceiling is low on purpose -- 100 is twice the worst
- * factor docs/amd64-host.md predicts -- so that a value mistyped in milliseconds (20000) is rejected instead
- * of quietly disabling the hang detector for the rest of the run. A configuration that is slower still for
- * some other reason (a sanitized or -O0 engine) belongs in HL_MATRIX_CASE_TIMEOUT_MS, which is the axis that
- * means "this run does more work".
+ * Host-backend timeout scale; see docs/ci-green.md, "Why the timeout is scaled rather than raised for
+ * everyone". The budgets above assume a JIT host; without one a correct case is killed below and reported as
+ * hung. The caller supplies the scale at lane registration (cmake/Phase3Compat.cmake) and it MULTIPLIES
+ * HL_MATRIX_CASE_TIMEOUT_MS (how much work this SUITE does) rather than replacing it. Scale 1 is bit-for-bit
+ * the unscaled runner, diagnostics included; out of range is refused, never rounded to 1.
  */
 enum { TIMEOUT_SCALE_MAX = 100 };
 
@@ -96,8 +68,7 @@ static int load_timeout_scale(void) {
     if (value == NULL || *value == 0) return 0;
     errno = 0;
     parsed = strtoul(value, &end, 10);
-    /* strtoul() skips leading blanks and accepts a sign, wrapping "-1" into ULONG_MAX, so the first character
-       is inspected directly: a negative or padded scale has to be a rejection, not a huge budget. */
+    /* strtoul() accepts a sign, wrapping "-1" to ULONG_MAX, so the first character is checked directly. */
     if (value[0] < '0' || value[0] > '9' || errno != 0 || end == value || *end != 0 || parsed < 1 ||
         parsed > TIMEOUT_SCALE_MAX) {
         fprintf(stderr,
@@ -107,10 +78,7 @@ static int load_timeout_scale(void) {
         return 1;
     }
     timeout_scale = parsed;
-    /* Announced on stdout, in the output of a PASSING run: a green lane with a scaled budget must not be
-       readable as evidence that guest execution is comparably fast, and the run's own log is the only place a
-       reader will look. An explicit x1 announces nothing, because it IS the unscaled run -- so setting the
-       variable to 1 by hand is indistinguishable from not setting it, which is the honest reading. */
+    /* On stdout, in a PASSING run: a green scaled lane must not read as evidence of comparable speed. */
     if (timeout_scale == 1) return 0;
     printf("matrix-runner: per-case timeout scaled x%lu to %llums (HL_MATRIX_TIMEOUT_SCALE); this run tolerates "
            "slow-but-correct guest execution and is NOT evidence of speed comparable to an unscaled lane\n",
@@ -119,61 +87,19 @@ static int load_timeout_scale(void) {
 }
 
 /*
- * The stall detector: a hang is a lack of PROGRESS, not a lack of time.
- *
- * Scaling the wall-clock budget above fixed the false positive (slow-but-correct reported as a hang) and
- * created a false negative in its place: at HL_MATRIX_TIMEOUT_SCALE=30 the budget is 3600s per case, and
- * compat-soak's HL_MATRIX_CASE_TIMEOUT_MS=600000 makes it 5 HOURS. Nothing bounded a real hang any more,
- * and there was a real one to bound: the x86_64 futex-across-fork cases were observed sitting in
- * do_wait/futex_do_wait indefinitely at ZERO CPU (that engine defect is since fixed; the signature is what
- * the class looks like, and the class is what this detects).
- *
- * A larger or smaller number cannot separate the two cases, because they differ in kind rather than in
- * degree. An interpreted guest is 10-50x slower per unit of work; it is not 10-50x more idle. So measure
- * progress directly and give it its own, much shorter budget:
- *
- *   progress := the guest's captured stdout/stderr grew, OR the case's process tree consumed CPU.
- *
- * Both signals are needed. Output alone would kill a correct case that computes for minutes before
- * printing (soak/reallocchurn does exactly that), and CPU alone would kill a correct case blocked on a
- * timer. Together they are only both absent when nothing in the launch is running or producing anything,
- * which is the definition of the hang this exists to catch. Note that neither signal can be taken from the
- * runner's own pipes: tools/remote_supervisor.c writes a heartbeat byte to its stderr every 250ms, so pipe
- * traffic proves the SUPERVISOR is alive and says nothing about the guest. The capture files are the
- * guest's real output, and the process tree is where its real work happens.
- *
- * The tree is walked by parent-child descent from the runner's own child rather than by process group,
- * because the supervisor deliberately puts the engine in a group of its OWN (setpgid(0,0) in the forked
- * child there) -- a pgid scan finds the supervisor and misses every process that does the work. A
- * descendant that has been reparented away (a deliberately orphaned daemon) is not counted; its output
- * still is. Anything the host will not answer -- a non-Linux host, an unreadable /proc, more processes
- * than the table holds -- reports "unknown", which counts as progress. Missing evidence must never be
- * allowed to manufacture a hang.
- *
- * The budget is DERIVED, not invented: it is the UNSCALED per-case budget (suite_case_timeout_ms(), i.e.
- * 120s, or whatever HL_MATRIX_CASE_TIMEOUT_MS says this suite is worth), with a floor of STALL_FLOOR_MS.
- * Two consequences, both wanted:
- *
- *   * On any lane where the scale is 1 the stall budget is >= the wall budget, so the wall clock always
- *     fires first and the detector is inert BY CONSTRUCTION. The aarch64 and Darwin lanes therefore cannot
- *     change behaviour, and that is a property of the arithmetic rather than a claim about it.
- *   * A suite that says it does more work (compat-soak's 600s) automatically gets a longer stall budget
- *     too. That is the honest coupling: the one knob that means "this suite is big" already means "this
- *     suite may legitimately go quiet for longer". No second environment variable exists to get wrong.
- *
- * Why the floor cannot fire on a correct case: firing needs STALL_FLOOR_MS (60s) in which the whole
- * process tree consumed zero CPU ticks AND wrote zero bytes. The longest deliberate sleep anywhere in the
- * corpus is 10s (the 100s/1000s values in tests/compat/time are timers armed far into the future and read
- * back, never waited on), so the margin is at least 6x, and it is a margin against idleness rather than
- * against speed -- the axis a slower host does not move along.
+ * The stall detector; see docs/ci-green.md, "What re-arms the hang detector the scale disarmed".
+ * progress := captured stdout/stderr grew, OR the process tree consumed CPU -- both needed, and neither may
+ * come from this runner's pipes (remote_supervisor.c heartbeats stderr every 250ms). Walk the tree by parent
+ * link, not process group: the supervisor puts the engine in a group of its OWN. Unanswerable counts as
+ * progress -- missing evidence must never manufacture a hang. The budget is the UNSCALED per-case budget
+ * floored at STALL_FLOOR_MS, so at scale 1 it is >= the wall budget and this detector is inert.
  */
 enum { STALL_FLOOR_MS = 60000, STALL_SAMPLE_MS = 1000, STALL_PROCESS_MAX = 4096 };
 
 static uint64_t stall_timeout_ms(void) {
     uint64_t budget = suite_case_timeout_ms();
     if (budget < STALL_FLOOR_MS) budget = STALL_FLOOR_MS;
-    /* Inert whenever the wall clock would fire no later -- the unscaled case. Returning 0 rather than a
-       number that can never be reached keeps the sampling out of the poll loop entirely there. */
+    /* 0 rather than an unreachable number, so the unscaled case skips the sampling in the poll loop. */
     return budget >= case_timeout_ms() ? 0 : budget;
 }
 
@@ -185,11 +111,10 @@ typedef struct process_row {
     int descends;
 } process_row;
 
-/* Total user+system clock ticks charged to `root` and its live descendants, or -1 when the host cannot
-   answer. Ticks are monotone per process, so a sum that has not moved is proof no counted process ran. */
+/* User+system ticks for `root` and its live descendants, or -1 when the host cannot answer. Ticks are
+   monotone, so a sum that has not moved proves no counted process ran. */
 static long long tree_cpu_ticks(long root) {
-    /* static: 4096 rows is far too large for a frame in the per-case poll loop, and the runner is
-       single-threaded (one case at a time, by construction of main()). */
+    /* static: far too large for a frame in the per-case poll loop, and the runner runs one case at a time. */
     static process_row rows[STALL_PROCESS_MAX];
     DIR *directory = opendir("/proc");
     struct dirent *entry;
@@ -219,8 +144,7 @@ static long long tree_cpu_ticks(long root) {
         (void)close(descriptor);
         if (got <= 0) continue;
         text[got] = 0;
-        /* Field 2 is comm, which is parenthesised and may itself contain spaces and parentheses, so the
-           only correct place to start parsing is after the LAST ')'. */
+        /* Field 2 (comm) may contain spaces and parentheses: parse after the LAST ')'. */
         tail = strrchr(text, ')');
         if (tail == NULL) continue;
         if (sscanf(tail + 1, " %*c %ld %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &parent, &user_ticks,
@@ -233,8 +157,7 @@ static long long tree_cpu_ticks(long root) {
         count++;
     }
     (void)closedir(directory);
-    /* Transitive closure over the parent links. /proc is not ordered parent-before-child, so this is
-       repeated until it stops changing; the trees here are a handful of levels deep. */
+    /* /proc is not ordered parent-before-child, so close over the parent links to a fixed point. */
     for (pass = 0; pass < 32; ++pass) {
         int changed = 0;
         for (index = 0; index < count; ++index) {
@@ -256,27 +179,15 @@ static long long tree_cpu_ticks(long root) {
 #else
 static long long tree_cpu_ticks(long root) {
     (void)root;
-    /* No portable per-tree CPU accounting. Reporting "unknown" disables the detector rather than leaving
-       it running on the output signal alone, which would make a Darwin lane STRICTER than it is today. */
+    /* No portable per-tree CPU accounting; off beats output-only, which would make a Darwin lane stricter
+       than it is today. */
     return -1;
 }
 #endif
 
-/*
- * HL_MATRIX_SCRATCH_DIR, and why a silent fallback is a trap.
- *
- * The guest's /tmp is a per-case scratch directory, so the filesystem BENEATH it decides whether memfd
- * seals, statx btime and friends behave as the goldens (captured on Linux) say they must. The variable is
- * exported by .github/workflows/linux.yml and by nothing else, so a developer running `ctest -L
- * compat-syscall` on an ext4 build tree fails syscall/memfd-seals on both ISAs for a reason that has
- * nothing to do with the engine, and the run says nothing about why.
- *
- * It is deliberately NOT set from CMake -- see the note in cmake/Phase3Compat.cmake. Some suites' goldens
- * were captured against the build tree's own filesystem (linux.yml unsets it for compat-core-syscall for
- * exactly that reason), so a build system that forced tmpfs on every suite would break those cases to fix
- * these. Instead the runner records what it actually used and says so WHEN A RUN FAILS -- the one moment
- * the information is worth anything, and the one place it cannot add noise to a green lane.
- */
+/* HL_MATRIX_SCRATCH_DIR backs the guest's /tmp, and the filesystem beneath it decides whether memfd seals and
+   statx btime match the goldens; only .github/workflows/linux.yml exports it. Not forced from CMake: some
+   suites' goldens were captured against the build tree's own filesystem. */
 static char scratch_base_used[1024];
 static int scratch_overridden;
 static int scratch_override_rejected;
@@ -290,8 +201,7 @@ static void scratch_observe(const char *base, int overridden, int rejected) {
 #if defined(__linux__)
     {
         struct statfs info;
-        /* TMPFS_MAGIC, spelled out rather than pulled from <linux/magic.h> so the tool keeps building
-           against a bare libc header set. */
+        /* TMPFS_MAGIC spelled out, not from <linux/magic.h>: the tool builds against a bare libc. */
         if (statfs(base, &info) == 0) scratch_is_tmpfs = (unsigned long long)info.f_type == 0x01021994ULL ? 1 : 0;
     }
 #endif
@@ -572,9 +482,7 @@ invalid:
     free(line);
     fclose(file);
     return 1;
-    /* Overflow used to fall into `invalid` above, so a manifest that parses perfectly was reported as a
-       parse error -- sending the reader to the manifest to look for a malformed row that is not there.
-       The limit is the harness's, so the harness says so, and names the file it was reading. */
+    /* Not `invalid`: the manifest is fine, so do not send the reader hunting for a malformed row. */
 overflow:
     fprintf(stderr,
             "matrix-runner: %s holds more than %d active cases, which is CASE_MAX in tools/matrix_runner.c. The "
@@ -980,9 +888,7 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
             remove_tree(scratch);
             return 2;
         }
-        /* Sampled once a second rather than on every 10ms poll: a /proc walk is cheap but not free, and a
-           stall is measured in tens of seconds. `exited` guards the tail of the loop where the child is
-           already reaped and only the pipes are being drained -- there is no tree left to sample. */
+        /* Once a second, not every 10ms poll. `exited` guards the drain tail: no tree left to sample. */
         if (stall_budget != 0 && !exited && now - stall_sampled >= STALL_SAMPLE_MS) {
             uint64_t bytes = capture_bytes(capture_output, capture_error);
             long long ticks = tree_cpu_ticks((long)child);
@@ -995,9 +901,8 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
                 terminate(child);
                 close(output_pipe[0]);
                 close(error_pipe[0]);
-                /* Unlike the wall-clock path, recover whatever the guest DID print before it stopped: a
-                   hang is diagnosed from where it got to, and this path can only be reached on a lane
-                   whose budget was scaled, so no existing lane's failure text is affected. */
+                /* Unlike the wall-clock path, recover what the guest DID print: a hang is diagnosed from
+                   where it got to. */
                 (void)read_capture(capture_output, result->output, OUTPUT_MAX, &result->output_size);
                 (void)read_capture(capture_error, result->error, ERROR_MAX, &result->error_size);
                 unlink(config_path);
@@ -1178,9 +1083,7 @@ static void diagnostic(const suite_case *item, const char *isa, const char *reas
     fputc('\n', stderr);
 }
 
-/* A bare "timeout" cannot be read on a host whose budget is not the default: it does not say whether the case
-   hung or whether the scale is simply set too low for it. Name the budget that expired -- but only when it is
-   scaled, so an unscaled lane's failure text stays exactly the string it has always been. */
+/* A bare "timeout" cannot separate "hung" from "scale too low". Name the budget only when scaled. */
 static const char *timeout_reason(void) {
     static char text[96];
     if (timeout_scale == 1) return "timeout";
@@ -1189,9 +1092,7 @@ static const char *timeout_reason(void) {
     return text;
 }
 
-/* A stall is a different verdict from a timeout and must read as one: the case did not run out of time, it
-   stopped doing anything. Naming both budgets is what lets a reader tell "hung" from "the scale is too
-   low" without re-running anything. */
+/* A distinct verdict from a timeout: the case did not run out of time, it stopped doing anything. */
 static const char *stall_reason(void) {
     static char text[192];
     (void)snprintf(text, sizeof text,
@@ -1280,8 +1181,7 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
 int main(int argc, char **argv) {
     suite_case cases[CASE_MAX];
     size_t count, excluded, index, selected = 0, failures = 0;
-    /* Per-ISA tallies. One run of one suite has to answer "how did each backend do", which is the whole
-       point of a two-ISA matrix and was unanswerable while the second leg was conditional on the first. */
+    /* Per-ISA tallies: one run of one suite has to answer "how did each backend do". */
     size_t aarch64_selected = 0, aarch64_failures = 0, x86_64_selected = 0, x86_64_failures = 0;
     size_t cross_compared = 0, cross_failures = 0, cross_skipped = 0;
     int legs_aarch64 = 0, legs_x86_64 = 0, failed_aarch64 = 0, failed_x86_64 = 0, failed_cross = 0,
@@ -1291,8 +1191,7 @@ int main(int argc, char **argv) {
     unsigned long repetition;
     resource_baseline baseline;
     if (install_interrupt_handlers() != 0) return 1;
-    /* Before any case runs, so a malformed scale is one line at the top of the log instead of a verdict on a
-       suite that was measured against a budget nobody chose. */
+    /* Before any case runs, so a malformed scale is one line at the top of the log instead of a verdict. */
     if (load_timeout_scale() != 0) return 2;
     if (argc == 8) {
         only = argv[7];
@@ -1326,15 +1225,8 @@ int main(int argc, char **argv) {
         if (interrupted_signal != 0) return 128 + interrupted_signal;
         if (only != NULL && strcmp(only, cases[index].name) != 0) continue;
         selected++;
-        /*
-         * BOTH ISAs always run. They used to be chained -- the x86_64 leg was conditional on the aarch64
-         * leg having passed -- which meant one run could never report per-ISA numbers, and, worse, that a
-         * host where the two backends have DIVERGED is exactly the host where the divergence is invisible:
-         * the first ISA to fail suppressed the other's result and the cross-ISA identity check with it.
-         * The verdict is deliberately unchanged (a case failing on either ISA still fails the case, and
-         * the identity check still requires two passing legs to have something to compare), so this is a
-         * measurement fix and not a scoring change.
-         */
+        /* BOTH ISAs always run: chaining them hid divergence on exactly the host where the backends differ.
+         * Verdict unchanged -- either ISA failing still fails the case. */
         legs_aarch64 = cases[index].isa != ISA_X86_64;
         legs_x86_64 = cases[index].isa != ISA_AARCH64;
         failed_aarch64 = 0;
@@ -1384,9 +1276,7 @@ int main(int argc, char **argv) {
         }
         if (failed_aarch64 || failed_x86_64 || failed_cross || failed_resources) {
             failures++;
-            /* One line per failing case naming the LEG, because the per-leg diagnostics above are
-               interleaved with the engine's own stderr and a reader scanning a 3000-case log needs the
-               (case, ISA) pair to be greppable on its own. */
+            /* One greppable (case, ISA) line: the per-leg diagnostics interleave with engine stderr. */
             fprintf(stderr, "matrix-runner: %s FAILED on %s\n", cases[index].name,
                     failed_aarch64 && failed_x86_64 ? "BOTH ISAs"
                     : failed_aarch64                ? (legs_x86_64 ? "aarch64 only (x86_64 passed)" : "aarch64")
@@ -1399,16 +1289,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "matrix-runner: unknown active case %s\n", only);
         return 2;
     }
-    /* Repeated at the end as well as the start: the summary line is what a reader takes away from a run, and on
-       a scaled host neither a pass nor a failure count means what the same numbers mean on an unscaled one. */
+    /* Repeated by the summary, which is what a reader takes away. */
     if (timeout_scale != 1)
         printf("matrix-runner: per-case timeout was scaled x%lu; this run's timing is not comparable to an "
                "unscaled lane\n",
                timeout_scale);
-    /* Unconditional, on stdout, in a fixed shape: a per-ISA number is the deliverable of a two-ISA matrix,
-       and printing it only on failure would make a green run the one place the numbers are missing. The
-       cross-ISA line reports what was COMPARED separately from what could not be, because "not compared"
-       is a gap in the identity evidence, not a pass. */
+    /* Unconditional and fixed-shape; "not comparable" is a gap in the identity evidence, not a pass. */
     printf("matrix-runner: per-ISA: aarch64 %zu/%zu passed, x86_64 %zu/%zu passed; cross-ISA identity %zu "
            "compared, %zu mismatched, %zu not comparable (a leg failed)\n",
            aarch64_selected - aarch64_failures, aarch64_selected, x86_64_selected - x86_64_failures, x86_64_selected,

@@ -138,11 +138,7 @@ void hl_aarch64_signal_restore(struct cpu *c) {
 // to the dispatcher: it restores the host callee-saved state run_block saved at block entry and returns to
 // the run_guest loop, which then sees cpu->pc == handler and runs it.
 //
-// That 1:1 host-register reading is what confines the two functions below to an AArch64 HOST: they name
-// x0..x30 / SP / PSTATE / v0..v31 in the interrupted host context, which is a register file only an AArch64
-// host has (HL_HOST_HAS_A64_CONTEXT, src/host/native_context.h). This transliterator only ever emits into an
-// AArch64 host anyway, so on any other host CPU there is no translated code for a fault to land in and the
-// honest answer is "not mine" -- see the #else arm.
+// That 1:1 reading confines the two functions below to an AArch64 HOST (HL_HOST_HAS_A64_CONTEXT).
 #if defined(HL_HOST_HAS_A64_CONTEXT)
 int hl_aarch64_signal_capture(struct cpu *c, void *ucv, hl_aarch64_signal_cache_fn cache_contains,
                               void *callback_context) {
@@ -166,17 +162,10 @@ void hl_aarch64_signal_resume(struct cpu *c, void *ucv, uintptr_t dispatcher_ret
     HL_HOST_UC_PC(uc) = (uint64_t)dispatcher_return;
 }
 #else
-// Non-AArch64 host: this transliterator never produced any host code here (it copies guest AArch64
-// instruction words verbatim, so it can only run on an AArch64 host), so a host fault can never be a fault
-// taken inside a translated guest block -- it is an engine fault in our own C, or an async signal the kernel
-// parked on this thread. Report "did NOT capture" (0) rather than 1: os/linux/signal.c's
-// deliver_guest_fault_hint treats a 0 from sigframe_capture_fault as "not the guest's own CPU fault" and
-// either queues an externally-kill'd signal (in-syscall) or returns 0 so the host guard re-raises, and
-// sig_fatal_fault likewise returns 0 to re-raise. Returning 1 would instead synthesise a guest signal frame
-// from an uninitialised capture and swallow a real engine crash before the crash report is produced.
-//
-// The signatures are kept so core/target/aarch64.c links unchanged; resume cannot be reached at all, because
-// every call site gates it behind a successful capture, but it must still exist for that same reason.
+// Non-AArch64 host: this transliterator emitted no host code, so a host fault is never a fault inside a
+// translated block. Return 0 -- os/linux/signal.c reads that as "not the guest's own CPU fault" and
+// re-raises, whereas 1 synthesises a guest frame from an uninitialised capture and swallows a real engine
+// crash. Resume is unreachable but must still exist to link.
 int hl_aarch64_signal_capture(struct cpu *c, void *ucv, hl_aarch64_signal_cache_fn cache_contains,
                               void *callback_context) {
     (void)c;

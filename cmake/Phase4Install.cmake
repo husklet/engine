@@ -23,14 +23,10 @@ else()
 endif()
 set(HL_PACKAGE_SYSTEM_LIBS "-pthread")
 
-# Whether the embedded activation archive is installable.
-#
-# This used to test CMAKE_SYSTEM_PROCESSOR for aarch64, which disagreed with
-# Phase2Production.cmake: Phase 2 gates hl-engine-activation on the host OS
-# alone, so an x86_64 Linux host BUILT the archive and then Phase 4 refused to
-# install it or its header -- a build that produces an artifact it declares not
-# to exist. Ask the build graph instead of re-deriving the condition, so the two
-# phases cannot drift again.
+# Whether the embedded activation archive is installable. Ask the build graph
+# rather than re-deriving the condition: Phase 2 gates hl-engine-activation on the
+# host OS alone, so a host-CPU test here would make an x86_64 host build the
+# archive and then refuse to install it.
 if(TARGET hl-engine-activation)
   set(HL_HAVE_ACTIVATION TRUE)
 else()

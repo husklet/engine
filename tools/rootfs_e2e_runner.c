@@ -12,29 +12,10 @@
 #include <time.h>
 #include <unistd.h>
 
-/*
- * Per-case guest budget and its host-backend scale. tools/matrix_runner.c is the reference implementation and
- * carries the full reasoning; this is the same knob, reading the same variable, validated the same way, because
- * every runner in this harness drives the same guests and they must not disagree about how long a guest may
- * take. (One shared helper would be better than six copies of this; there is no header these four runners and
- * the two matrix runners all include, so the duplication is deliberate rather than accidental.)
- *
- * The short version: 30s was calibrated against a JIT, because until now every supported host CPU had one. An
- * x86_64 host has none -- neither guest frontend has an amd64 back end, both emit ARM64, so that host's backend
- * decodes and executes at roughly 10-50x the cost (docs/amd64-host.md section 3). The SIGKILL below would then
- * convert slow-but-correct into a report of a hang: false, and indistinguishable from a real one. It matters
- * more here than elsewhere, because this case is a DYNAMIC guest -- the loader plus libc startup is interpreted
- * before the program's own first instruction runs.
- *
- * The factor is supplied by whoever registers the lane (cmake/Phase3Gates.cmake, through the helper declared in
- * cmake/Phase3Compat.cmake, which moves this budget and the lane's CTest TIMEOUT together), never inferred here.
- * It MULTIPLIES the constant rather than replacing it: the constant is how much work a case does, the scale is
- * how much slower this host executes any of it.
- *
- * Unset, empty or 1 is bit-for-bit the unscaled runner, diagnostics included. Anything else must be decimal
- * digits naming a factor in [1, TIMEOUT_SCALE_MAX], and a bad value is refused rather than rounded back to 1: a
- * silent fallback presents as a lane full of unexplained timeouts, which is exactly what this prevents.
- */
+/* Per-case guest budget and its host-backend scale; tools/matrix_runner.c is the reference, docs/ci-green.md
+   the reasoning, and the knob is identical in all six runners. 30s assumes a JIT host; without one the SIGKILL
+   below reports slow-but-correct as a hang -- worst here, because this is a DYNAMIC guest whose loader and
+   libc startup are interpreted before its own first instruction. */
 enum { CASE_TIMEOUT_MS = 30000, TIMEOUT_SCALE_MAX = 100 };
 
 static unsigned long timeout_scale = 1;
@@ -50,8 +31,7 @@ static int load_timeout_scale(void) {
     if (value == NULL || *value == 0) return 0;
     errno = 0;
     parsed = strtoul(value, &end, 10);
-    /* strtoul() skips leading blanks and accepts a sign, wrapping "-1" into ULONG_MAX, so the first character
-       is inspected directly: a negative or padded scale has to be a rejection, not a huge budget. */
+    /* strtoul() accepts a sign, wrapping "-1" to ULONG_MAX, so the first character is checked directly. */
     if (value[0] < '0' || value[0] > '9' || errno != 0 || end == value || *end != 0 || parsed < 1 ||
         parsed > TIMEOUT_SCALE_MAX) {
         fprintf(stderr,
@@ -61,9 +41,7 @@ static int load_timeout_scale(void) {
         return 1;
     }
     timeout_scale = parsed;
-    /* On stdout, in the output of a PASSING case: a green lane with a scaled budget must not read as evidence
-       that guest execution is comparably fast. An explicit x1 announces nothing, because it IS the unscaled
-       run. */
+    /* On stdout, in a PASSING case: a green scaled lane must not read as evidence of comparable speed. */
     if (timeout_scale == 1) return 0;
     printf("rootfs-e2e-runner: per-case timeout scaled x%lu to %ums (HL_MATRIX_TIMEOUT_SCALE); this run "
            "tolerates slow-but-correct guest execution and is NOT evidence of speed comparable to an unscaled "
@@ -181,8 +159,7 @@ static int run_guest(const char *bridge, const char *engine, const char *rootfs,
     if (elapsed_ms >= budget_ms) {
         kill(child, SIGKILL);
         waitpid(child, &status, 0);
-        /* Naming the budget matters only when it is not the built-in one; at scale 1 the text stays verbatim so
-           an unscaled lane's failure output is unchanged by the existence of the knob. */
+        /* Name the budget only when scaled, so unscaled failure text is unchanged. */
         if (timeout_scale == 1)
             fprintf(stderr, "%s dynamic guest timed out\n", engine);
         else
@@ -224,8 +201,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: rootfs-e2e-runner BRIDGE ENGINE ROOTFS GUEST LOADER LIBC LOADER_PATH EXPECTED\n");
         return 2;
     }
-    /* Before the rootfs is staged, so a malformed scale is one line at the top of the log rather than a verdict
-       on a case that was measured against a budget nobody chose. */
+    /* Before the rootfs is staged, so a malformed scale is one line at the top of the log, not a verdict. */
     if (load_timeout_scale() != 0) return 2;
     if (stage_rootfs(argv[3], argv[4], argv[5], argv[6], argv[7]) != 0) {
         perror("stage rootfs");

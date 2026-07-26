@@ -228,13 +228,9 @@ static inline void hl_native_kqueue_duplicate(int source, int destination) {
     pthread_mutex_unlock(&hl_native_klock);
 }
 
-/* Move a shim kqueue's identity from one descriptor number to another.  On macOS a kqueue is a real kernel
-   object, so dup2()/F_DUPFD_CLOEXEC relocate it for free and this is a no-op.  Here the queue exists only in
-   the alias table above, keyed by descriptor NUMBER, so a relocation the shim is not told about leaves the
-   new number unknown -- every subsequent kevent() on it fails EBADF while the old number keeps a stale entry
-   that a later, unrelated descriptor could inherit.  Both halves matter, hence one call rather than a
-   duplicate/close pair at every site: register `destination` first (it keeps the queue's registrations alive
-   as a surviving alias) and only then drop `source`. */
+/* Move a shim kqueue's identity between descriptor numbers.  The queue lives only in the alias table above,
+   keyed by descriptor NUMBER: an untold relocation leaves the new number unknown (kevent() -> EBADF) and the
+   old one a stale entry another descriptor could inherit.  Register `destination` before dropping `source`. */
 static inline void hl_native_kqueue_relocate(int source, int destination) {
     if (source < 0 || destination < 0 || source == destination) return;
     hl_native_kqueue_duplicate(source, destination);

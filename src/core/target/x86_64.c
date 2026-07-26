@@ -96,9 +96,7 @@ static int jit_guest_soft_active(void);
 #include "../../translator/guest/x86_64/cpu.h"
 #include "../../translator/guest/x86_64/frame.h"
 #include "../../translator/guest/x86_64/abi.h" // cpu-interface seam (G_* contract + sysmap + normalize)
-// The dispatch seam is per (guest ISA, HOST CPU), not per guest ISA alone -- see the comment on the
-// host-CPU fork further down. dispatch.h belongs to the x86-64 -> ARM64 translator and patches AArch64
-// branch encodings; every other host runs the interpreter backend and its interp_dispatch.h.
+// The dispatch seam is per (guest ISA, HOST CPU): dispatch.h patches AArch64 branch encodings.
 #include "../../host/host_cpu.h"
 #if defined(HL_HOST_CPU_AARCH64)
 #include "../../translator/guest/x86_64/dispatch.h" // x86 dispatch seam for the SHARED engine/dispatch.c
@@ -178,21 +176,9 @@ static int jit86_avx_memory_write(uint64_t guest, const void *source, size_t len
     return 1;
 }
 
-// ---------------------------------------------------------------------------
-// The host-CPU fork.
-//
-// Everything from here to the matching #else is the x86-64 -> ARM64 translator: emit.c's "arm64 host
-// emitters", the address_* wrappers over them, translate.c's per-opcode ARM64 codegen, and a persistent
-// cache of the ARM64 code it produced. Its register model is stated at the top of this file -- guest
-// rax..r15 in host x0..x15, cpu pinned in host x28 -- so all of it presupposes an AArch64 host.
-//
-// On any other host CPU there is no ARM64 to emit. interp.c supplies the same seam by decoding and
-// executing x86-64 directly. Note that when the host CPU is itself x86-64 this is a same-ISA case and a
-// transliterator (the mirror of what guest/aarch64 does on an AArch64 host) would be far faster than an
-// interpreter; that is a deliberate later optimisation, not the correctness path.
-//
-// struct cpu is shared by both backends because it is the checkpoint format.
-// ---------------------------------------------------------------------------
+// Host-CPU fork: an AArch64 host takes the x86-64 -> ARM64 translator below (register model at the top of
+// this file); any other takes interp.c, which decodes x86-64 directly. Both share struct cpu: it is the
+// checkpoint format.
 #if defined(HL_HOST_CPU_AARCH64)
 #include "../../translator/guest/x86_64/emit.c" // x86 engine: arm64 emitters + SSE + x87
 #include "../../translator/guest/x86_64/address.h"
@@ -324,9 +310,7 @@ void emit_load_mem(struct insn *insn, uint64_t next, int width, int rt) {
 #include "../../translator/guest/x86_64/translate.c" // x86-64 translate_block + trampolines
 #include "../../translator/guest/x86_64/cache.c"     // persistent translated-code cache (HL_PCACHE=1)
 #else
-// The non-AArch64 host arm of the fork opened above: decode and execute x86-64 instead of emitting ARM64.
-// interp.c defines the same names emit.c/translate.c/cache.c do, which is what keeps everything below this
-// point -- linux_abi, the shared dispatcher, the ELF loader, checkpoint/restore -- identical on both hosts.
+// interp.c defines the same names emit.c/translate.c/cache.c do, so everything below is host-identical.
 #include "../../translator/guest/x86_64/interp.c"
 #endif
 #include "../../linux_abi/thread.c" // SHARED: clone->pthread, per-thread cpu, futex
@@ -570,17 +554,9 @@ static void do_sigreturn(struct cpu *c) {
     hl_x86_signal_restore(c);
 }
 
-// Fault capture is a property of the BACKEND, not of the guest ISA -- it asks "where did the guest's state
-// live at the instant of the fault", and the two backends answer differently in kind.
-//
-// The JIT keeps guest registers in real host registers, so capture means reconstructing guest state out of
-// the host mcontext, and the faulting host PC is only block-granular until the per-instruction provenance
-// map refines it. The interpreter keeps guest state in *c at all times and writes cpu->rip at every
-// instruction boundary, so there is nothing to reconstruct and nothing to refine -- the provenance lookup
-// would actively make it worse, because it maps HOST code addresses and this backend emits none.
-//
-// Both arms must return 0 for "this was not a guest fault", so an engine-side bug still reaches the crash
-// report instead of being dressed up as a guest signal.
+// Fault capture is per BACKEND: the JIT reconstructs guest state from the host mcontext and refines a
+// block-granular host PC via the provenance map, which the interpreter must NOT use (it maps HOST addresses
+// and this backend emits none; cpu->rip is already current). Both return 0 for "not a guest fault".
 #if defined(HL_HOST_CPU_AARCH64)
 static int sigframe_capture_fault(struct cpu *c, void *native_context) {
     if (!hl_x86_signal_capture(c, native_context, x86_signal_cache_contains, NULL)) return 0;
@@ -599,10 +575,7 @@ static int sigframe_capture_fault(struct cpu *c, void *native_context) {
 }
 #endif
 
-// The mirror of the fork above. The JIT resumes by rewriting the host mcontext so the handler returns into
-// block_return, which unwinds the translated frame back to the dispatcher. The interpreter has no translated
-// frame to unwind: it siglongjmps out of the handler to the sigsetjmp at the top of run_block, which then
-// returns to the dispatcher normally.
+// The JIT returns into block_return to unwind the translated frame; the interpreter siglongjmps to run_block.
 #if defined(HL_HOST_CPU_AARCH64)
 static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {
     hl_x86_signal_resume(c, native_context, (uintptr_t)block_return);

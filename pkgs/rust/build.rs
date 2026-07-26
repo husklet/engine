@@ -1,16 +1,8 @@
 use std::{env, path::PathBuf};
 
 /// Host triples this crate can link, and whether they need the GNU/Linux
-/// libraries that the Mach-O link does not.
-///
-/// This is a table rather than a `match` with a `_ => panic!("unsupported
-/// target")` arm because two different facts were conflated behind that panic:
-/// whether the crate SUPPORTS a host, and whether a prebuilt archive for it
-/// happens to be in the tree. Only the first belongs here. Exactly two of these
-/// archives are committed and published (see the `include` list in Cargo.toml),
-/// so `x86_64-unknown-linux-gnu` is supported and is expected to be BUILT
-/// locally -- and the diagnostic below has to say so, instead of claiming the
-/// host is unsupported.
+/// libraries the Mach-O link does not. A table rather than a panicking `match`:
+/// "host supported" and "archive present" are separate facts.
 const HOSTS: &[(&str, bool)] = &[
     ("aarch64-apple-darwin", false),
     ("aarch64-unknown-linux-gnu", true),
@@ -32,30 +24,15 @@ fn main() {
         .join("assets/lib")
         .join(directory)
         .join("libhl-engine.a");
-    // Rerun BEFORE the existence check, so producing the archive re-runs this
-    // script rather than leaving the failure cached.
+    // Before the existence check, so producing the archive re-runs this script.
     println!("cargo:rerun-if-changed=assets/lib/{directory}/libhl-engine.a");
-    // A missing archive is not an unsupported target, and saying so was the whole
-    // bug: the message has to name the command that produces the file. Only the
-    // two aarch64 archives are committed -- ~24MB each against the 10MB
-    // crates.io budget -- so on any other supported host the archive is a local
-    // build product, and this is the first thing that host sees.
-    //
-    // REPORTED, not asserted, and deliberately so. These bytes are a LINK input,
-    // and a lint is not a link. Panicking here failed `rust.clippy` -- a CTest
-    // case in the `unit` lane -- on a host whose only defect was an unbuilt local
-    // artifact: the same conflation of two facts as the
-    // `_ => panic!("unsupported target")` arm this replaced.
-    //
-    // The link directives are SKIPPED with it, and they have to be: `rustc-link-lib
-    // =static:...` makes rustc resolve the archive while producing the rlib, so
-    // emitting it against a missing file fails `cargo clippy` as hard as a panic
-    // did ("could not find native static library `hl-engine`"). Skipping leaves
-    // lints and `cargo check` working and moves the failure to the link that
-    // actually needs the bytes, where it lands as undefined references to
-    // hl_engine_* directly beneath these warnings.
+    // A missing archive is not an unsupported target: warn, and name the command
+    // that builds it -- panicking failed `rust.clippy` on hosts whose only defect
+    // was an unbuilt local artifact. The link directives are skipped with it:
+    // `rustc-link-lib=static:` makes rustc resolve the archive while producing
+    // the rlib, so emitting them would fail clippy as hard as a panic.
     if !archive.is_file() {
-        // One println per line: cargo renders `cargo:warning=` as a single line.
+        // cargo renders each `cargo:warning=` as one line.
         for line in [
             format!("hl-engine supports {target} but no prebuilt archive for it is in this tree."),
             format!("expected: {}", archive.display()),

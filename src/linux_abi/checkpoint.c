@@ -1810,14 +1810,9 @@ static int ckpt_dump_pages(struct ckpt_sink *sink, struct ckpt_sink_stream *f, s
         reg.len = len;
         reg.glen = glen;
         reg.prot = ckpt_region_prot(addr, glen);
-        // is_gna is a WHOLE-REGION claim -- restore answers it with gna_add over [addr, addr+glen) -- so it
-        // must be asked as one. The old gna_hit(addr, 1) asked whether the region's FIRST PAGE is guest-
-        // PROT_NONE, which is true of every glibc pthread stack: allocate_stack mmaps the block readable and
-        // then mprotects its lowest page into the guard, so the mapping begins PROT_NONE and continues as
-        // megabytes of ordinary stack. Restore then poisoned the entire stack, and every syscall handing the
-        // kernel a pointer into that thread's stack came back -EFAULT: pthread_join's futex on &pd->tid (the
-        // thread descriptor lives at the TOP of the block) returned EFAULT, which glibc treats as a fatal
-        // "futex facility returned an unexpected error code" and aborts on. That is checkpoint.*.threads.
+        // is_gna is a WHOLE-REGION claim (restore gna_adds the whole region), so ask it as one: gna_hit's
+        // first-page test is true of every glibc pthread stack guard, which poisoned whole stacks on restore
+        // -> -EFAULT in pthread_join's futex -> abort. docs/amd64-host-findings.md 3.8.
         reg.is_gna = gna_all(addr, glen ? glen : 1);
         pthread_mutex_lock(&g_filemap_lock);
         for (int map_index = 0; map_index < g_nfilemap; map_index++) {
@@ -2508,12 +2503,9 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
         hl_linux_snapshot_advance(&g_ckpt_snapshot, reg.addr + reg.len);
         hl_gmap_add(reg.addr, reg.len);
         hl_gmap_set_guest_length(reg.addr, reg.glen);
-        // The record carries ONE protection verdict per gmap region, so a region the guest mprotect'd in
-        // pieces cannot round-trip its PROT_NONE sub-intervals: they are dropped here, and a syscall buffer
-        // landing on a restored guard page reads as accessible instead of -EFAULT. That is a small, bounded
-        // loss of fidelity in the EFAULT oracle; recovering it needs the region record to carry the
-        // sub-intervals, which is a format change. Do NOT "fix" it by widening the claim back to any-page
-        // (see the gna_all call in ckpt_dump_pages): whole-region poisoning is far worse than under-reporting.
+        // ONE verdict per region, so PROT_NONE sub-intervals of a piecewise-mprotect'd region are dropped (a
+        // restored guard page reads accessible). Do NOT widen the claim back to any-page: whole-region
+        // poisoning is far worse.
         if (reg.is_gna)
             gna_add(reg.addr & ~(uint64_t)0xfff, (reg.addr + reg.glen + 0xfff) & ~(uint64_t)0xfff);
         else
@@ -3253,10 +3245,8 @@ static int ckpt_restore_fds_dir(const char *procdir) {
                     close(timer);
                     return -1;
                 }
-                // dup2 moved the timer onto the guest's fd number. On a host whose kqueue is a shim over
-                // epoll the queue's identity is keyed by the descriptor NUMBER, so the shim has to be told:
-                // otherwise the arming kevent() below addresses an unknown descriptor and fails EBADF. That
-                // is exactly what broke checkpoint.*.timerfd on an x86-64 Linux host.
+                // dup2 moved the timer onto the guest's fd number; a shim kqueue keys its queue by descriptor
+                // NUMBER, so it must be told or the arming kevent() below is EBADF.
                 hl_native_kqueue_relocate(timer, r.gfd);
                 close(timer);
             }
@@ -3532,9 +3522,7 @@ static int ckpt_restore_fds_dir(const char *procdir) {
                 close(instance);
                 return -1;
             }
-            // Same descriptor-number identity as the timerfd path above: tell a shim kqueue that its queue
-            // now answers to the guest's fd number, or ckpt_restore_epoll_watches's kevent() sees an unknown
-            // descriptor and the whole restore fails with "init descriptor restore failed".
+            // Same shim-kqueue descriptor-number identity as the timerfd path above.
             hl_native_kqueue_relocate(instance, r.gfd);
             close(instance);
         }
@@ -4207,14 +4195,10 @@ static int ckpt_restore_right_prepare(const struct ckpt_fd *record) {
                        (unsigned long long)record->ofd_id), -1;
     int fd = -1;
     if (record->kind == CKF_EPOLL) {
-        // A queued epoll right travels as a placeholder descriptor plus a marker the receiver expands, so any
-        // open descriptor will do. It must NOT be left where open(2) put it: this runs in the init before
-        // ckpt_fork_children, every re-forked process inherits the number, and ckpt_restore_socket_seeds_close
-        // closes it AFTER ckpt_restore_fds_dir has dup2'd the guest's own descriptors into place -- so a
-        // placeholder sitting on a low number silently destroys whichever guest descriptor now owns it.
-        // (checkpoint.*.socketpair: the placeholder landed on 4, which is the child's socketpair endpoint;
-        // recv() then reported ENOTSOCK on the eventfd the guest received into the freed slot.) Every other
-        // queued right is already hoisted into the private high band; this one was the exception.
+        // Any open descriptor will do as the placeholder, but it must not stay where open(2) put it: it is
+        // closed AFTER the guest's own descriptors are dup2'd into place, so a low number destroys whichever
+        // guest descriptor now owns it (it landed on 4, a socketpair endpoint). Hoist it into the private
+        // high band, like every other queued right.
         int placeholder = open("/dev/null", O_RDONLY | O_CLOEXEC);
         if (placeholder < 0) return -1;
         fd = hl_host_process_fd_private_adopt(placeholder);
@@ -4496,10 +4480,8 @@ static int ckpt_restore_right_prepare(const struct ckpt_fd *record) {
                 close(timer);
                 return -1;
             }
-            // adopt() hoists the descriptor into the engine's private high band with F_DUPFD_CLOEXEC and
-            // closes the original, so a shim kqueue (keyed by descriptor number) has to be moved with it --
-            // otherwise the arming kevent() below fails EBADF and the queued SCM_RIGHTS timerfd cannot be
-            // rebuilt (checkpoint.*.socketpair on an x86-64 Linux host).
+            // adopt() moves the descriptor and closes the original, so a number-keyed shim kqueue must move
+            // with it or the arming kevent() below is EBADF.
             hl_native_kqueue_relocate(timer, timerfd->fd);
             timerfd->slot = timerfd->fd;
             struct timespec now;
@@ -4859,14 +4841,9 @@ static int ckpt_restore_socket_queue_load(struct ckpt_restore_socket_endpoint *e
     return 0;
 }
 
-// SO_RCVBUF/SO_SNDBUF do not round-trip through get/setsockopt on Linux: the kernel stores twice what
-// setsockopt is given (the doubling covers sk_buff bookkeeping, see socket(7)) and getsockopt reports the
-// stored, doubled value. Capture reads with getsockopt, so feeding that number straight back to setsockopt
-// doubles the buffer on every checkpoint generation -- checkpoint.*.connected-socket set 196608, saw the
-// captured 393216, and after restore observed 786432. Halve on the way in so the kernel's doubling
-// reproduces the captured value. The kernel clamps at SOCK_MIN_{RCV,SND}BUF exactly as it did when the guest
-// first set the option, so a small buffer still lands where it landed before. macOS stores what it is given,
-// so the value must NOT be halved there.
+// SO_RCVBUF/SO_SNDBUF do not round-trip on Linux: the kernel stores twice what setsockopt gets, getsockopt
+// reports the doubled value, so replaying a capture doubles the buffer each generation. Halve on the way in
+// (Linux only -- macOS stores what it is given).
 static int ckpt_restore_socket_buffer(int fd, int name, int32_t captured) {
     int value = captured;
 #if defined(__linux__)

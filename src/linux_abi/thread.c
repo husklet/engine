@@ -1313,13 +1313,9 @@ static int gna_hit(uint64_t a, uint64_t len) {
     return 0;
 }
 
-// True iff EVERY guest page of [a,a+len) lies in a tracked guest PROT_NONE region -- the whole-mapping
-// question, which gna_hit ("any byte") cannot answer and must not be used for. The distinction matters
-// wherever a decision is taken about a MAPPING rather than about one access: glibc's pthread stack is a
-// single mmap whose FIRST page is the PROT_NONE guard and whose remaining megabytes are ordinary readable
-// stack, so gna_hit is true for a mapping that is almost entirely accessible. Walks pages rather than
-// looking for one covering interval, because a PROT_NONE reservation the guest mprotect'd in pieces is
-// tracked as several adjacent intervals that gna_add does not coalesce.
+// True iff EVERY guest page of [a,a+len) is in a tracked guest PROT_NONE region -- the whole-MAPPING
+// question, which gna_hit ("any byte") must not be used for: a glibc pthread stack is one mmap whose first
+// page is the guard. Walks pages: gna_add does not coalesce a piecewise-mprotect'd reservation's intervals.
 static int gna_all(uint64_t a, uint64_t len) {
     if (!len || __atomic_load_n(&g_ngna, __ATOMIC_ACQUIRE) == 0) return 0;
     uint64_t end = a + len;

@@ -14,12 +14,8 @@
 //!   re-exports below, so the crate's public surface is unchanged.
 #![deny(unsafe_code)]
 
-// Host platform is two axes, host OS and host CPU (see `src/host/host_cpu.h`,
-// `HL_HOST_ARCH` in CMakeLists.txt). Keep this list in step with the `HOSTS`
-// table in build.rs: that table decides what can be LINKED, this one what can be
-// COMPILED, and a host missing from either is not supported. Whether a prebuilt
-// archive for a supported host is present in the tree is a separate question
-// build.rs answers with its own diagnostic -- do not fold it back in here.
+// Keep in step with the `HOSTS` table in build.rs: that decides what can be
+// LINKED, this what can be COMPILED. Archive presence is build.rs's problem.
 #[cfg(not(any(
     all(target_arch = "aarch64", target_os = "macos"),
     all(target_arch = "aarch64", target_os = "linux"),

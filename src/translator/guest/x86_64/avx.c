@@ -1,7 +1,7 @@
 #include "avx.h"
 #include "cpu.h"
 #include "decoder.h"
-#include "../../../host/host_cpu.h" // HL_HOST_CPU_*: the half-precision converter has a per-host-CPU arm
+#include "../../../host/host_cpu.h" // HL_HOST_CPU_*: the half-precision converter forks per host CPU
 
 #include <fenv.h>
 #include <math.h>
@@ -367,26 +367,11 @@ static int avx_cmp_pred(double x, double y, int pred) {
 #pragma GCC diagnostic ignored "-Wpedantic"
 
 #if !defined(HL_HOST_CPU_AARCH64)
-// Portable single->half conversion for every host CPU that is not AArch64. Deliberately NOT the F16C
-// intrinsic (_cvtss_sh / VCVTPS2PH): that would need -mf16c, which this build cannot assume of the host --
-// the engine ships one binary per host OS/CPU pair, not per micro-architecture -- and an unconditional
-// VCVTPS2PH would SIGILL on a pre-Ivy-Bridge x86-64. Software instead, which needs no -m flag, is the same
-// answer for a future Windows host, and is the only way to honour a DIRECTED rounding mode exactly (a
-// _Float16 cast is round-to-nearest-even whatever the FP environment says, and may be a libcall the compiler
-// is free to hoist across an fesetround).
-//
-// `mode` is the x86 rounding control already normalised to imm[1:0]: 0=nearest-even, 1=down(-inf),
-// 2=up(+inf), 3=truncate(toward zero). The IEEE 754 binary32 -> binary16 cases this must get right, all of
-// which the ISA fuzz lane compares against real hardware:
-//   * NaN     -- payload is the source's mantissa[22:13] and the result is QUIET even for a signalling
-//                source, which is what VCVTPS2PH does (and forcing the quiet bit also stops a payload that
-//                truncates to zero from becoming an Infinity).
-//   * subnormal result -- the exponent floor is 2^-24 (the smallest half subnormal), so the round point
-//                moves with the exponent rather than sitting at a fixed 13 bits.
-//   * overflow -- an out-of-range magnitude becomes an Infinity only when the active mode rounds AWAY from
-//                zero at that sign, and the largest finite half (0x7bff) otherwise. Round-to-nearest crosses
-//                to Infinity at 65520 (the midpoint between 65504 and 65536), which falls out of the same
-//                guard/sticky arithmetic rather than needing its own threshold.
+// Portable single->half for every host CPU that is not AArch64. NOT the F16C intrinsic (_cvtss_sh), which
+// needs -mf16c that this build cannot assume of the host micro-architecture, and not a _Float16 cast,
+// which is round-to-nearest-even whatever the FP environment says. `mode` is the x86 rounding control as
+// ROUND* imm[1:0]: 0=nearest-even, 1=down, 2=up, 3=truncate. A NaN result is QUIET even from a signalling
+// source; overflow gives Infinity only when the mode rounds away from zero.
 static uint16_t avx_f32_to_f16_software(float f, unsigned mode) {
     uint32_t bits;
     memcpy(&bits, &f, 4);
@@ -394,33 +379,28 @@ static uint16_t avx_f32_to_f16_software(float f, unsigned mode) {
     uint32_t biased_exponent = (bits >> 23) & 0xffu;
     uint32_t mantissa = bits & 0x7fffffu;
     uint16_t sign16 = (uint16_t)(sign << 15);
-    // Direction the mode takes a value it cannot represent exactly. Nearest-even decides per value (below);
-    // the three directed modes decide by sign alone, and that same predicate is what IEEE 754 uses to choose
-    // between Infinity and the largest finite on overflow.
+    // Directed modes round by sign alone; the same predicate picks Infinity vs largest-finite on overflow.
     uint32_t away = ((mode == 1 && sign != 0) || (mode == 2 && sign == 0)) ? 1u : 0u;
     if (biased_exponent == 0xffu)
         return mantissa == 0 ? (uint16_t)(sign16 | 0x7c00u) : (uint16_t)(sign16 | 0x7e00u | (uint16_t)(mantissa >> 13));
-    if (biased_exponent == 0 && mantissa == 0) return sign16; // +-0 converts exactly, sign preserved
-    // Treat the source as significand * 2^(exponent-23) with the implicit integer bit made explicit (a
-    // binary32 subnormal has no implicit bit and a fixed exponent of -126, i.e. the biased 1 case).
+    if (biased_exponent == 0 && mantissa == 0) return sign16; // +-0 exact, sign preserved
+    // significand * 2^(exponent-23), implicit bit explicit (a binary32 subnormal has none; exponent -126).
     uint32_t significand = biased_exponent == 0 ? mantissa : (mantissa | 0x800000u);
     int32_t exponent = (int32_t)(biased_exponent == 0 ? 1u : biased_exponent) - 127;
-    // Bits to drop to land on the half's ulp: 13 for a normal result (24-bit significand -> 11), more when
-    // the result is subnormal and the ulp is pinned at 2^-24. Clamped at 25 because beyond that the dropped
-    // field already covers the whole significand, so the round bit is 0 and sticky is "significand != 0" --
-    // identical to what an unclamped (and undefined) wider shift would compute.
+    // Bits to drop to reach the half's ulp: 13 normally, more when subnormal (ulp pinned at 2^-24). The
+    // clamp at 25 only avoids UB; a wider shift gives the same round/sticky.
     int32_t shift = exponent >= -14 ? 13 : -1 - exponent;
     if (shift > 25) shift = 25;
     uint32_t half = significand >> shift;
     uint32_t round_bit = (significand >> (shift - 1)) & 1u;
     uint32_t sticky = (significand & ((1u << (shift - 1)) - 1u)) != 0 ? 1u : 0u;
     if (mode == 0)
-        half += round_bit & (sticky | (half & 1u)); // nearest-even: up on >half, or on exactly-half to even
+        half += round_bit & (sticky | (half & 1u)); // nearest-even: up on >half, or half-to-even
     else
         half += away & (round_bit | sticky);
-    if (exponent < -14) return (uint16_t)(sign16 | half); // subnormal; a carry out lands on 0x0400 exactly
+    if (exponent < -14) return (uint16_t)(sign16 | half); // subnormal; a carry out lands on 0x0400
     int32_t exponent16 = exponent + 15;
-    if (half >> 11) { // the increment carried into the next binade: 1.111..1 -> 1.000..0 * 2^(exponent+1)
+    if (half >> 11) { // the increment carried into the next binade
         half >>= 1;
         exponent16++;
     }
@@ -430,8 +410,7 @@ static uint16_t avx_f32_to_f16_software(float f, unsigned mode) {
 #endif
 
 #if defined(HL_HOST_CPU_X86_64)
-// The live MXCSR.RC, in the x86 ROUND*-immediate encoding (0 nearest-even, 1 down, 2 up, 3 truncate).
-// Defined with sse_round_d below, where the reason an x86-64 host must read it explicitly is set out.
+// Live MXCSR.RC in the ROUND*-immediate encoding; defined with sse_round_d.
 static int sse_host_rounding_control(void);
 #endif
 
@@ -453,16 +432,12 @@ static uint16_t avx_f32_to_f16(float f, int imm) {
     memcpy(&o, &h, 2);
     return o;
 #else
-    // imm[2]=1 asks for the MXCSR-controlled mode. There is no host FPCR to read here, so take the host FP
-    // environment's rounding direction -- the same thing the AArch64 arm reads out of FPCR.RMode, and what
-    // LDMXCSR/FXRSTOR will have put there once a host back end routes the guest's MXCSR into the host.
-    // Falls back to nearest-even for any direction the source does not name.
+    // imm[2]=1 asks for the MXCSR-controlled mode; with no host FPCR, use the host FP environment.
     unsigned mode = (unsigned)(imm & 3);
     if (imm & 4) {
 #if defined(HL_HOST_CPU_X86_64)
-        // NOT fegetround() on this host: glibc's x86-64 fegetround reads the **x87** control word, and the
-        // guest's MXCSR is a different register that LDMXCSR writes and FLDCW does not. Read MXCSR.RC, whose
-        // encoding is already this `mode` encoding (see sse_round_d).
+        // NOT fegetround(): glibc's x86-64 fegetround reads the **x87** control word, not the guest's
+        // MXCSR (written by LDMXCSR, not FLDCW). MXCSR.RC already uses this encoding.
         mode = (unsigned)sse_host_rounding_control();
 #else
         switch (fegetround()) {
@@ -2627,22 +2602,10 @@ static uint32_t crc32c_step(uint32_t crc, uint64_t v, int nbytes) {
 // direction regardless of MXCSR: floor/ceil/trunc already do, and explicit nearest is round-to-nearest-
 // EVEN independent of the current mode (__builtin_roundeven), not __builtin_rint (which would follow RC).
 //
-// ON AN x86-64 HOST __builtin_rint IS NOT USABLE FOR THAT, and the failure is silent. There is no ROUNDSD
-// to expand to without -msse4.1 (which the engine cannot assume of the host micro-architecture, exactly as
-// the F16C note below says), and gcc does not emit a libm call either: at -O2 it expands rint inline as
-// `|x| + 2^52 - 2^52` with the operand's sign re-applied afterwards, i.e. it rounds the MAGNITUDE. That is
-// valid only under round-to-nearest -- which -fno-rounding-math, the default, entitles gcc to assume -- and
-// the guest has just told us via LDMXCSR that the mode is something else. Under round-toward-negative-
-// infinity a negative operand's round-DOWN therefore became a round-toward-ZERO: `roundpd $4` of -2.5 gave
-// -2.0 where hardware gives -3.0 (compat/core/abi/fpedge, the `round cur` / `roundpd cur` lines).
-//
-// So on that host resolve MXCSR.RC into the explicit direction and fall through to the mode-independent
-// floor/ceil/trunc/roundeven below. The x86 RC encoding (0 nearest-even, 1 down, 2 up, 3 truncate) is
-// bit-for-bit the ROUND* imm[1:0] encoding, so it maps straight onto `mode`. MXCSR is read, never written,
-// so there is no LDMXCSR reserved-bit hazard here.
-//
-// AArch64 keeps __builtin_rint: it lowers to FRINTX, which really does read FPCR.RMode. Nothing about the
-// JIT is wrong -- this is a host-CPU-specific expansion hazard in a file that reads as host-neutral.
+// __builtin_rint cannot serve that on an x86-64 host, and fails silently: with no ROUNDSD available
+// (-msse4.1 is not assumable) gcc inlines `|x| + 2^52 - 2^52` with the sign re-applied, rounding the
+// MAGNITUDE -- valid only under round-to-nearest, i.e. not the mode LDMXCSR just set. So resolve MXCSR.RC
+// (bit-for-bit the ROUND* imm[1:0] encoding) instead. AArch64 keeps the builtin; it lowers to FRINTX.
 #if defined(HL_HOST_CPU_X86_64)
 static int sse_host_rounding_control(void) {
     return (int)((_mm_getcsr() >> 13) & 3u); // MXCSR bits 14:13 = RC

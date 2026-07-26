@@ -98,14 +98,9 @@ static int code_mapping_reserve(hl_host_code_mapping *mapping, int dual_alias) {
                                   HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING) != HL_STATUS_OK)
         return -1;
     if (g_jit_log.host == NULL) (void)hl_log_context_init(&g_jit_log, &g_jit_services, hl_option_get("HL_LOG"));
-    /* The arena must start on a host page boundary: reserve_code rejects any alignment below the host page
-       size, and the dual-alias path maps the same object twice at that granularity so the RW and RX aliases
-       differ by a whole number of pages (which is what makes g_rw2rx a constant delta). The literal 16384
-       here was the Apple-Silicon page size written down as a constant -- correct on every host the engine had
-       ever run on, and merely over-aligned on a 4 KiB host, so it never failed; but it encoded "the page size
-       is 16 KiB" in the one place that is really asking the host what its page size IS. Ask instead, and keep
-       the old constant as the floor for the case where the host cannot answer (hl_host_page_size() returns 0)
-       or answers with something that is not a power of two, both of which reserve_code would reject. */
+    /* Must start on a host page boundary: reserve_code rejects anything smaller, and the dual-alias path
+       maps the object twice at that granularity so RW and RX differ by whole pages (making g_rw2rx a constant
+       delta).  16384 is the fallback for a host that cannot answer. */
     alignment = (uint64_t)hl_host_page_size();
     if (alignment == 0 || (alignment & (alignment - 1)) != 0) alignment = 16384u;
     return hl_arena_reserve(&g_jit_services, CACHE_SZ, alignment, dual_alias, mapping);
@@ -675,11 +670,8 @@ typedef struct {
    16-byte alignment the atomic ldp/stp entry access requires. */
 #define IBTC_PAGE_ALIGN 65536u
 _Alignas(IBTC_PAGE_ALIGN) static ibtc_ent g_ibtc[IBTC_N];
-/* Both publish paths in ibtc_publish() depend on this, and only one of them says so loudly if it breaks:
-   AArch64's stp is single-copy atomic only within a 16-byte granule, and x86-64's movdqa #GP-faults on a
-   misaligned operand. A member added to ibtc_ent would grow the entry past the granule and silently
-   reintroduce the torn-dispatch hazard on the AArch64 side, which is the host every lane currently tests.
-   Assert the size here rather than leaving the alignment argument resting on a comment. */
+/* Both publish paths rest on this: AArch64's stp is single-copy atomic only within a 16-byte granule (a
+   grown ibtc_ent silently reintroduces torn dispatch), and movdqa #GP-faults if misaligned. */
 _Static_assert(sizeof(ibtc_ent) == 16, "ibtc_ent must be one 16-byte granule for the atomic pair publish");
 _Static_assert(IBTC_PAGE_ALIGN % 16u == 0u, "the ibtc table's alignment must keep every entry 16-byte aligned");
 
@@ -718,36 +710,11 @@ static uint64_t g_mtfill;
 // so it is mutually atomic with the reader's plain `ldp`. We use explicit asm rather than a
 // 16-byte __atomic (which could lower to a lock-based libatomic call that would NOT be atomic
 // against the lock-free ldp reader). Layout: target at +0, body at +8 (matches struct ibtc_ent).
-// The two halves of the requirement are independent, and each host CPU satisfies them differently:
-//   (1) ORDERING -- everything the writer did to build the body block (emission, then its IC IVAU, both
-//       already DSB-complete here) must be visible to any core before that core can see the pair.
-//   (2) SINGLE-COPY ATOMICITY of a 16-byte access, on BOTH sides. This is the property that forbids
-//       new-target/old-body; it is not something the writer can supply alone. AArch64 gets it from FEAT_LSE2
-//       covering an aligned stp/ldp pair -- note the ldp, i.e. the READER's plain load is equally load-bearing.
-// On x86-64, (1) is free: x86-TSO never reorders store->store, so the `dmb ish` has no counterpart to emit and
-// all that remains of it is the compiler barrier that stops GCC sinking the body's stores past this one --
-// which the "memory" clobber on a volatile asm already is. Only (2) needs a decision, and the choice is
-// between an aligned 16-byte SSE store and `lock cmpxchg16b`.
-//
-// We use MOVDQA, deliberately, even though cmpxchg16b is the architecturally guaranteed 16-byte atomic and
-// this one store is nowhere near a fast path (the dispatcher already took a full C crossing and holds
-// g_jit_lock to get here, so we could easily afford the locked RMW). The reason is that cmpxchg16b's
-// guarantee would buy nothing: LOCK makes the WRITE indivisible, but it cannot make a reader's load
-// indivisible, and an implementation is still free to split a plain 16-byte load into two 8-byte accesses
-// taken at different instants -- so a locked writer paired with a plain reader can still yield a torn pair.
-// Atomicity here is a property of the PAIR, exactly as the AArch64 arm's LSE2 argument is, and the only way
-// to close it with cmpxchg16b would be to make the reader a locked RMW too. That reader is emitted code on
-// the indirect-branch fast path, executed on every unpredicted `br`, by many threads, on a shared cache line;
-// turning it into a lock-prefixed write would dirty the line on every dispatch and destroy the single reason
-// the IBTC exists. So the reader must be a plain 16-byte load, and the writer must therefore be the matching
-// plain 16-byte store; movdqa is that store. Its atomicity is not a baseline-x86-64 architectural promise,
-// but Intel and AMD both document aligned 16-byte SSE/AVX accesses as atomic on AVX-capable parts, which is
-// every host this engine will ever be built for -- the same shape of premise as "FEAT_LSE2, all Apple
-// Silicon" above, and stated here rather than assumed. Two properties make the choice safe to hold:
-// g_ibtc's _Alignas plus sizeof(ibtc_ent)==16 make every slot 16-byte aligned, and movdqa #GP-faults on a
-// misaligned operand, so a layout change that broke the granule would trap loudly instead of tearing
-// silently. Note also that NO x86-64 reader exists yet (both frontends emit ARM64); when a host backend is
-// written, its emit_ibranch MUST use an aligned 16-byte SSE load, not two 8-byte loads.
+// ORDERING is free on x86-TSO: all that survives of `dmb ish` is the "memory" clobber. SINGLE-COPY ATOMICITY
+// of the 16-byte access is needed on BOTH sides -- the READER's plain load is equally load-bearing -- hence
+// movdqa, not `lock cmpxchg16b`: LOCK cannot make a plain load indivisible, and the reader is emitted
+// fast-path code that must not become a locked RMW. Intel and AMD document aligned 16-byte SSE/AVX as atomic
+// on AVX-capable parts. A future emit_ibranch MUST use one aligned 16-byte load, not two 8-byte ones.
 static inline void ibtc_publish(ibtc_ent *e, uint64_t target, void *body) {
 #if defined(HL_HOST_CPU_AARCH64)
     __asm__ volatile("dmb ish\n\t"
@@ -756,10 +723,8 @@ static inline void ibtc_publish(ibtc_ent *e, uint64_t target, void *body) {
                      : "r"(e), "r"(target), "r"(body)
                      : "memory");
 #else
-    // Build the pair in one SSE register and store it with one instruction. The vector type exists only to
-    // give the "x" constraint something to hold: a plain unsigned __int128 is not reliably allocated to an
-    // xmm register, and a 16-byte __atomic_store would lower to a libatomic call that takes a lock and is
-    // therefore NOT atomic against the lock-free reader -- the same trap the AArch64 arm avoids with asm.
+    // The vector type only gives the "x" constraint something to hold; a 16-byte __atomic_store would
+    // lower to a lock-taking libatomic call.
     typedef unsigned long long ibtc_pair __attribute__((vector_size(16)));
     ibtc_pair pair = {target, (unsigned long long)(uintptr_t)body}; // target at +0, body at +8: ibtc_ent order
     __asm__ volatile("movdqa %1, %0" : "=m"(*e) : "x"(pair) : "memory");

@@ -109,16 +109,10 @@ void jit_guest_bus_transition_end(void *opaque) {
 // G_OWN_TRAMPOLINES to suppress these aarch64 ones. (engine-dedup §B.1/§B.3: the register model is the
 // one irreducible divergence; the shared loop only CALLS run_block, never bakes its offsets.)
 //
-// The trampolines below are hand-written ARM64 and therefore belong to the HOST-CPU axis, not the guest one:
-// both frontends lower to ARM64 machine code, so both need an ARM64 boundary, and neither can use one on a
-// host whose assembler does not know `str q8, [x0, #896]`. That test used to be spelled `__aarch64__` inline
-// and shared one condition with the GCC-vs-clang naked-function question, which made the two arms below the
-// ONLY choices -- so a GCC/x86-64 build fell into the `#else` and handed ARM64 mnemonics to the x86 assembler.
-// Split the two questions apart: HL_HOST_CPU_AARCH64 (src/host/host_cpu.h) decides whether an ARM64 boundary
-// exists at all, and only inside that does the compiler decide how to spell it. stubs.c, guest/aarch64/cache.c
-// and guest/x86_64/emit.c forward-declare block_return so their exits can bake its address, and they select
-// extern-vs-static on exactly this pair of conditions; the spelling here must stay character-for-character
-// theirs or the two disagree at link time.
+// Hand-written ARM64: the HOST-CPU axis. HL_HOST_CPU_AARCH64 (src/host/host_cpu.h) decides whether an ARM64
+// boundary exists; only inside it does the compiler pick the spelling. One combined `__aarch64__` test handed
+// ARM64 mnemonics to the x86 assembler. guest/aarch64/{stubs,cache}.c and guest/x86_64/emit.c must match this
+// pair exactly.
 #ifndef G_OWN_TRAMPOLINES
 #include "../host/host_cpu.h"
 #if defined(HL_HOST_CPU_AARCH64)
@@ -174,36 +168,12 @@ __attribute__((naked)) static void block_return(void) {
 }
 #endif
 #else
-// Non-AArch64 host. These two functions exist only to be the ends of a bridge into JIT-generated ARM64: the
-// whole point of run_block is to spill the host's callee-saved registers into `struct cpu` and `br` to code
-// the translator emitted, and the whole point of block_return is to be the address that emitted code jumps
-// back through. On a HL_HOST_CPU_NAME host there is no such code -- both frontends still lower exclusively
-// through src/translator/host/aarch64, so nothing in the arena would be executable here -- and there is no
-// host codegen backend to produce any. So the bridge has no far end, and neither symbol can be given a body
-// that means anything.
-//
-// It must nonetheless be a DEFINITION, not an omission, for two reasons. First, the shared run_guest() loop
-// below calls run_block() unconditionally and the emitters bake &block_return unconditionally; leaving them
-// undefined turns a specific, explainable gap into a link error a long way from its cause. Second, and this
-// is why they abort rather than return: run_block()'s contract is that on return the guest has advanced and
-// cpu->reason says why it stopped. A stub that returned silently would satisfy the compiler, leave `reason`
-// holding whatever the previous block wrote, and send the dispatcher round the loop again -- an unbounded
-// spin re-dispatching a PC that never moves, or a bogus exit reason serviced against stale state. Failing
-// loudly the first time is the only outcome that points at the real missing piece.
-//
-// Reaching either of these is an engine bug, not a guest input or a host-service failure, so it is not
-// hl_fatal_report()'s business: that path records a status against an hl_fatal_context and (optionally) logs
-// through host services, then RETURNS to its caller so the surrounding code can unwind. There is nothing to
-// unwind to here -- run_block is the boundary itself, and block_return can only be entered from emitted code
-// whose stack we do not own. It would also mean this shared file reaching for the translator's g_jit_fatal,
-// which is cache.c's TU-local state, purely to reuse a logging shape. write(2) to stderr via fprintf plus
-// abort() is the honest primitive: it names the missing backend and leaves a core at the exact frame.
-// Note on reachability: a backend that brings its OWN entry boundary defines G_OWN_TRAMPOLINES and never
-// compiles this arm -- guest/x86_64/dispatch.h does that for the ARM64-host JIT, and both interp_dispatch.h
-// files do it for the interpreter backends, which are the amd64 host's answer. So these two are the arm for a
-// host CPU that has been given a name (src/host/host_cpu.h) but not yet a backend, which is exactly the state
-// the tree was in before the interpreters landed and exactly the state a future host will pass through. The
-// diagnostics therefore name the seam a new backend has to fill rather than any one architecture's plan.
+// Host CPU with a name but no execution backend: the ARM64 bridge has no far end. Define both anyway --
+// run_guest() and the emitters reference them unconditionally -- and abort rather than return, since a silent
+// return replays the previous block's cpu->reason and spins the dispatcher on a PC that never moves. Not
+// hl_fatal_report(): it returns to its caller to unwind, and there is nothing here to unwind to. `static` is
+// load-bearing -- the dual activation archive links both target objects and namespace.h does not rename these
+// two (docs/amd64-host-findings.md §3.7). A backend with its own boundary defines G_OWN_TRAMPOLINES instead.
 static void run_block(struct cpu *cpu, void *code) {
     (void)cpu;
     (void)code;

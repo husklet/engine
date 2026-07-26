@@ -14,11 +14,9 @@ cd "$root"
 target=$1
 archive=$2
 
-# The triple's two halves drive every decision below, so split them once instead
-# of matching whole triples: which host can inspect the archive (ELF vs Mach-O)
-# and which compiler links it (the guest-ISA-neutral <ARCH>_LINUX_CC the devShell
-# exports). Only the two aarch64 triples are committed and published; the x86_64
-# Linux one is a local build product (see tools/refresh_crate_archives.sh).
+# The triple's two halves drive every decision below -- which host can inspect the
+# archive (ELF vs Mach-O) and which compiler links it -- so split them once rather
+# than matching whole triples.
 target_arch=${target%%-*}
 case "$target" in
 aarch64-apple-darwin) target_os=darwin ;;
@@ -101,10 +99,9 @@ else
 	nm --print-armap "$archive" >"$scratch/armap"
 	grep -q '^Archive index:' "$scratch/armap"
 	nm -g --defined-only "$archive" >"$symbols"
-	# One variable per HOST CPU, matching the names flake.nix exports and the
-	# CMake toolchain files read. On its own CPU that is the native cc; the other
-	# one is the cross gcc the devShell already carries, so an x86_64 Linux host
-	# can still link-test the committed aarch64 archive rather than deferring it.
+	# One variable per HOST CPU, matching the names flake.nix exports. The
+	# non-native one is the devShell's cross gcc, so an x86_64 host can still
+	# link-test the committed aarch64 archive.
 	case "$target_arch" in
 	aarch64) : "${AARCH64_LINUX_CC:=aarch64-linux-gnu-gcc}"; cc=$AARCH64_LINUX_CC ;;
 	x86_64) : "${X86_64_LINUX_CC:=x86_64-linux-gnu-gcc}"; cc=$X86_64_LINUX_CC ;;

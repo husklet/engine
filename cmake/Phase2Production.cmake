@@ -101,9 +101,8 @@ hl_linux_production(aarch64 AARCH64 "-pthread;-lm;-ldl;-latomic")
 hl_linux_production(x86_64  X86_64  "-pthread;-lm")
 
 # ---- Linux dual-backend embedded activation archive -----------------------
-# libhl-engine-activation.a == ${HL_PACKAGE_ARCH_DIR}/libhl-engine.a, i.e.
-# build/package/linux-<host arch>/libhl-engine.a. The directory names the HOST
-# CPU, not a guest ISA -- both guest ISAs are members of this one archive.
+# libhl-engine-activation.a == ${HL_PACKAGE_ARCH_DIR}/libhl-engine.a. That
+# directory names the HOST CPU, not a guest ISA -- both ISAs are in this archive.
 # Members: the namespaced dual TUs + activation/dispatch + a FULL embedded
 # rebuild of core/ir/abi/host with -DHL_EMBEDDED_BUILD.
 set(EMBEDDED_SOURCES ${CORE_SOURCES} ${IR_SOURCES} ${LINUX_ABI_SOURCES} ${LINUX_HOST_SOURCES})

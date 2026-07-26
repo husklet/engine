@@ -14,29 +14,10 @@
 #include <time.h>
 #include <unistd.h>
 
-/*
- * Per-case hang detector and its host-backend scale. 20s is calibrated against a JIT host, because until now
- * every supported host CPU had one: on an ARM64 host every case in every suite this runner drives is
- * milliseconds of guest work, so "not finished in 20s" could only mean hung. On an x86_64 host it cannot mean
- * that. Neither guest frontend has an amd64 back end -- both emit ARM64 -- so that host's backend decodes and
- * executes instead of emitting, at roughly 10-50x the cost of the ARM64-host JIT (docs/amd64-host.md section
- * 3). The SIGKILL below would then convert slow-but-correct into a report of a hang, which is both false and
- * indistinguishable from the real thing.
- *
- * So the budget is CASE_TIMEOUT_MS times a scale the caller sets once where the lanes are registered
- * (cmake/Phase3Gates.cmake, through the helper that declares it in cmake/Phase3Compat.cmake), not something
- * inferred here: whether the engine this runner execs interprets is a
- * property of that binary, and guessing it from inside the harness would couple the harness to backend
- * internals and re-tune itself silently whenever they changed. tools/matrix_runner.c carries the same knob,
- * reads the same variable, and validates it the same way -- the two runners drive the same guests and must not
- * disagree about how long a guest is allowed to take.
- *
- * Unset or empty is 1, and at 1 every path below -- including the failure text -- is bit-for-bit what it was
- * before the knob existed. A malformed or out-of-range value is refused rather than rounded back to 1, because
- * a silent fallback presents as a suite full of unexplained timeouts: exactly what this exists to prevent. The
- * ceiling is twice the worst factor docs/amd64-host.md predicts, so a value mistyped in milliseconds is
- * rejected instead of disabling the detector.
- */
+/* Per-case hang detector and its host-backend scale; tools/matrix_runner.c is the reference, docs/ci-green.md
+   the reasoning, and the knob is identical in all six runners. 20s assumes a JIT host; without one the SIGKILL
+   below reports slow-but-correct as a hang. Scale 1 is bit-for-bit the unscaled runner, failure text
+   included. */
 enum { CASE_TIMEOUT_MS = 20000, TIMEOUT_SCALE_MAX = 100 };
 
 static unsigned long timeout_scale = 1;
@@ -48,8 +29,7 @@ static int load_timeout_scale(void) {
     if (value == NULL || *value == 0) return 0;
     errno = 0;
     parsed = strtoul(value, &end, 10);
-    /* strtoul() skips leading blanks and accepts a sign, wrapping "-1" into ULONG_MAX, so the first character
-       is inspected directly: a negative or padded scale has to be a rejection, not a huge budget. */
+    /* strtoul() accepts a sign, wrapping "-1" to ULONG_MAX, so the first character is checked directly. */
     if (value[0] < '0' || value[0] > '9' || errno != 0 || end == value || *end != 0 || parsed < 1 ||
         parsed > TIMEOUT_SCALE_MAX) {
         fprintf(stderr,
@@ -59,9 +39,7 @@ static int load_timeout_scale(void) {
         return 1;
     }
     timeout_scale = parsed;
-    /* On stdout, in the output of a PASSING run: a green lane with a scaled budget must not read as evidence
-       that guest execution is comparably fast, and the run's own log is where a reader will look. An explicit
-       x1 announces nothing, because it IS the unscaled run. */
+    /* On stdout, in a PASSING run: a green scaled lane must not read as evidence of comparable speed. */
     if (timeout_scale == 1) return 0;
     printf("linux-matrix: per-case timeout scaled x%lu to %llums (HL_MATRIX_TIMEOUT_SCALE); this run tolerates "
            "slow-but-correct guest execution and is NOT evidence of speed comparable to an unscaled lane\n",
@@ -69,24 +47,8 @@ static int load_timeout_scale(void) {
     return 0;
 }
 
-/*
- * The stall detector. tools/matrix_runner.c carries the same one, for the same reason and with the same
- * arithmetic; the two runners drive the same guests and must not disagree about when a case is hung. The
- * long-form reasoning lives beside stall_timeout_ms() there. In brief:
- *
- * Scaling the wall-clock budget stopped slow-but-correct being reported as a hang, and left nothing
- * bounding a real one -- at scale 30 this runner's budget is 600s per case, and the production-full lanes
- * are 21 suites of them. Slow and hung differ in kind, not degree: an interpreted guest is 10-50x slower
- * per unit of work and not one bit more idle. So the detector measures PROGRESS -- the case's stdout grew,
- * or something in its process tree consumed CPU -- and kills only when both have been absent for the stall
- * budget.
- *
- * That budget is the UNSCALED per-case budget with a floor of STALL_FLOOR_MS, which makes it >= the wall
- * budget whenever the scale is 1: on an unscaled lane the wall clock always fires first and this code
- * cannot change a verdict. The floor is 6x the longest deliberate sleep in the whole guest corpus (10s),
- * and it is a margin against idleness rather than against speed -- the axis a slower host does not move
- * along.
- */
+/* The stall detector; same one, same arithmetic, as tools/matrix_runner.c. The budget is the UNSCALED
+   per-case budget floored at STALL_FLOOR_MS, so at scale 1 it is >= the wall budget and cannot fire. */
 enum { STALL_FLOOR_MS = 60000, STALL_SAMPLE_MS = 1000, STALL_PROCESS_MAX = 4096 };
 
 static uint64_t stall_timeout_ms(void) {
@@ -103,10 +65,8 @@ typedef struct process_row {
     int descends;
 } process_row;
 
-/* User+system clock ticks charged to `root` and its live descendants, or -1 when the host will not say.
-   Descent by parent link rather than by process group: a guest is free to call setpgid, and a process that
-   leaves the group would otherwise look like a process that stopped running. Unknown counts as progress,
-   so missing evidence can never manufacture a hang. */
+/* User+system ticks for `root` and its live descendants, or -1 when the host will not say. Descent by parent
+   link, not process group: a guest may setpgid. Unknown counts as progress. */
 static long long tree_cpu_ticks(long root) {
     static process_row rows[STALL_PROCESS_MAX]; /* Too large for a frame in the per-case wait loop. */
     DIR *directory = opendir("/proc");
@@ -136,8 +96,7 @@ static long long tree_cpu_ticks(long root) {
         (void)close(descriptor);
         if (got <= 0) continue;
         text[got] = 0;
-        /* Field 2 is comm: parenthesised, and free to contain spaces and parentheses. The last ')' is the
-           only correct place to start parsing. */
+        /* Field 2 (comm) may contain spaces and parentheses: parse after the LAST ')'. */
         tail = strrchr(text, ')');
         if (tail == NULL) continue;
         if (sscanf(tail + 1, " %*c %ld %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &parent, &user_ticks,
@@ -171,8 +130,7 @@ static long long tree_cpu_ticks(long root) {
 #else
 static long long tree_cpu_ticks(long root) {
     (void)root;
-    /* No portable per-tree CPU accounting, so the detector stays off rather than running on the output
-       signal alone -- which would make such a host stricter than it is today. */
+    /* No portable per-tree CPU accounting; off beats output-only, which would be stricter than today. */
     return -1;
 }
 #endif
@@ -260,8 +218,7 @@ static int run_case(const char *engine, const char *guest, const char *golden, i
             while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
             break;
         }
-        /* Sampled once a second: a /proc walk is cheap but not free, and a stall is measured in tens of
-           seconds. Unknown CPU (ticks < 0) counts as progress. */
+        /* Once a second: the /proc walk is not free. Unknown CPU (ticks < 0) counts as progress. */
         if (stall_budget != 0 && now - stall_sampled >= STALL_SAMPLE_MS) {
             uint64_t bytes = output_bytes(output);
             long long ticks = tree_cpu_ticks((long)child);
@@ -279,16 +236,14 @@ static int run_case(const char *engine, const char *guest, const char *golden, i
         }
         (void)nanosleep(&tick, NULL);
     }
+    /* A distinct verdict: the case did not run out of time, it stopped doing anything. */
     if (stalled)
-        /* A distinct verdict from a timeout, and it must read as one: the case did not run out of time, it
-           stopped doing anything at all while time remained. */
         fprintf(stderr,
                 "%s: HUNG -- no stdout and no CPU in its process tree for %llums, with the %llums per-case budget "
                 "unexpired (this is a hang, not slow execution)\n",
                 guest, (unsigned long long)stall_budget, (unsigned long long)budget);
     else if (timed_out) {
-        /* Naming the budget matters only when it is not the built-in one; at scale 1 the text stays verbatim so
-           an unscaled lane's failure output is unchanged by the existence of the knob. */
+        /* Name the budget only when scaled, so unscaled failure text is unchanged. */
         if (timeout_scale == 1)
             fprintf(stderr, "%s: timed out\n", guest);
         else
@@ -327,15 +282,8 @@ static int parse_exit(const char *text, int *value) {
     return 0;
 }
 
-/*
- * Whole-suite sweep.
- *
- * This used to return on the FIRST failing case, unlike tools/matrix_runner.c, which records a failure and
- * carries on. The production-full-{aarch64,x86_64} lanes are 21 suites each of exactly this runner, so one
- * broken case anywhere in a suite reduced that suite's entire report to a single line -- and a lane whose
- * job is to measure a corpus cannot be allowed to stop measuring at the first thing it finds. Nothing
- * about the VERDICT changes: any failure still exits non-zero. Only the amount of evidence does.
- */
+/* Whole-suite sweep: record a failing case and continue, as tools/matrix_runner.c does. Returning on the
+   first failure reduced a 21-suite lane's report to one line; any failure still exits non-zero. */
 static int run_suite(const char *engine, const char *binary_root, const char *suite_root) {
     char manifest[1024], *line = NULL;
     const char *architecture = strrchr(binary_root, '/');
@@ -456,28 +404,22 @@ static int run_suite(const char *engine, const char *binary_root, const char *su
     }
     free(line);
     if (fclose(file) != 0) return 1;
-    /* The summary reports what RAN, what FAILED and what was skipped, in one line. It previously named
-       only the pass count, which was accurate solely because the first failure ended the run -- so a
-       reader could not tell a 47-case suite that passed from one that stopped at case 12, and the skip
-       counts sat beside a pass count they were not proportional to. */
+    /* What RAN, FAILED and was skipped: a pass count alone cannot say where a suite stopped. */
     printf("linux-matrix: %s: %zu of %zu active %s cases passed, %zu FAILED; %zu skipped (%zu require typed launch, "
            "%zu excluded or other ISA)\n",
            suite_root, passed, passed + failed, architecture, failed, unsupported + excluded, unsupported, excluded);
-    /* The summary line is what a reader takes away, and on a scaled host the same case count does not mean what
-       it means on an unscaled one. */
+    /* Scaled counts are not comparable to an unscaled lane. */
     if (timeout_scale != 1)
         printf("linux-matrix: per-case timeout was scaled x%lu; this run's timing is not comparable to an "
                "unscaled lane\n",
                timeout_scale);
-    /* `passed == 0` is retained as a failure: a suite that selected nothing at all is a registration bug,
-       and it looked identical to a clean sweep before anything counted the cases it did not run. */
+    /* `passed == 0` stays a failure: a suite that selected nothing is a registration bug. */
     return failed != 0 || passed == 0;
 }
 
 int main(int argc, char **argv) {
     int failed = 0;
-    /* Before any case runs, so a malformed scale is one line at the top of the log rather than a verdict on a
-       suite that was measured against a budget nobody chose. */
+    /* Before any case runs, so a malformed scale is one line at the top, not a verdict. */
     if (load_timeout_scale() != 0) return 2;
     if (argc == 5 && strcmp(argv[1], "--suite") == 0)
         return run_suite(argv[2], argv[3], argv[4]) ? EXIT_FAILURE : EXIT_SUCCESS;

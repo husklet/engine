@@ -19,15 +19,9 @@ categories = ["emulators", "api-bindings"]
 # under it. assets/lib/** keeps the archives; assets/alpine and assets/PROVENANCE
 # are excluded.
 #
-# This budget is also why the set of PUBLISHED host archives is smaller than the
-# set of SUPPORTED hosts. build.rs accepts x86_64-unknown-linux-gnu and
-# src/lib.rs compiles for it, but no third archive is committed: each one is
-# ~24 MB, and the two already here leave no room. An x86_64 Linux consumer
-# therefore builds the archive from this checkout —
-# `cmake --build <dir> --target refresh-crate-archives-linux`, which build.rs
-# names when the asset is absent. Adding a third archive to the published crate
-# is a deliberate publication decision (it needs the budget solved first), not
-# an automatic consequence of a host becoming supported.
+# The budget also keeps PUBLISHED archives a subset of SUPPORTED hosts: each is
+# ~24 MB and the two here leave no room, so x86_64-unknown-linux-gnu is supported
+# but its archive is built from the checkout (build.rs names the target).
 include = [
     "Cargo.toml",
     "README.md",

@@ -14,9 +14,8 @@ ctest=$1
 build=$2
 os=$3
 cpu=$4
-# The host is the (OS, CPU) pair. `Linux` alone stopped identifying a host once
-# there were two Linux host CPUs registering different tests, so the token is
-# what HL_CI_HOSTS declares and cmake/LaneParity.cmake passes.
+# The host is the (OS, CPU) pair -- two Linux host CPUs register different tests.
+# HL_CI_HOSTS declares the token.
 host=$os-$cpu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 lanes_file=$root/cmake/CiLanes.cmake
@@ -30,9 +29,7 @@ lanes_in() {
 	' "$lanes_file"
 }
 
-# Data-driven, not a `case` arm per host: adding Windows/amd64 is one line in
-# cmake/CiLanes.cmake, and an unknown host must be rejected rather than silently
-# checking nothing.
+# An unknown host must be rejected rather than silently checking nothing.
 if ! lanes_in HL_CI_HOSTS | grep -Fqx -- "$host"; then
 	printf 'lane-parity: %s is not declared in HL_CI_HOSTS (%s)\n' \
 		"$host" "$lanes_file" >&2
@@ -56,9 +53,9 @@ Darwin)
 	;;
 esac
 
-# The lists above are per host OS. Drop the lanes HL_CI_HOST_CPU_ONLY reserves
-# for a DIFFERENT CPU of this OS, and reject an entry naming an undeclared host
-# -- a stale exemption silently stops checking a lane that does apply here.
+# The lists above are per host OS. Drop the lanes HL_CI_HOST_CPU_ONLY reserves for
+# a DIFFERENT CPU of this OS, and reject an entry naming an undeclared host: a
+# stale exemption stops checking a lane that applies here.
 cpu_only=$(lanes_in HL_CI_HOST_CPU_ONLY)
 for entry in $cpu_only; do
 	if ! lanes_in HL_CI_HOSTS | grep -Fqx -- "${entry%%:*}"; then
@@ -70,8 +67,8 @@ done
 if [ -n "$cpu_only" ]; then
 	kept=
 	for label in $labels; do
-		# A lane may be reserved to SEVERAL host tokens, so the test is
-		# "named at all, but not for this host" -- not "some entry differs".
+		# A lane may be reserved to SEVERAL tokens: test "named at all,
+		# but not for this host", not "some entry differs".
 		reserved=0
 		mine=0
 		for entry in $cpu_only; do

@@ -247,9 +247,7 @@ invariants)
 			fi
 		done
 	}
-	# One workflow file per HOST TOKEN (see HL_CI_HOSTS in cmake/CiLanes.cmake):
-	#   Darwin-aarch64 -> mac.yml            Linux-aarch64 -> linux.yml
-	#   Linux-x86_64   -> linux-x86_64.yml   (no compat shards; see I20)
+	# One workflow file per HOST TOKEN (HL_CI_HOSTS in cmake/CiLanes.cmake).
 	check_shards "$wfdir/mac.yml" "$(lanes_in HL_CI_SHARDED_DARWIN)" I13 || exit 1
 	check_shards "$wfdir/linux.yml" "$(lanes_in HL_CI_SHARDED_LINUX)" I14 || exit 1
 
@@ -261,11 +259,9 @@ invariants)
 	# Linux engine with a manifest note claiming it passed. Asymmetry is now
 	# legal only when HL_CI_SHARDED_HOST_ONLY declares it.
 	#
-	# A host is the (OS, CPU) pair now, and parity holds between the hosts that
-	# shard compat at all -- HL_CI_COMPAT_HOSTS. Linux-x86_64 is not one: the
-	# engine cannot execute guests on an x86_64 host yet, so requiring parity
-	# from it would mean exempting all 24 lanes, which asserts nothing. I20
-	# below is what keeps that host honest instead.
+	# A host is the (OS, CPU) pair, and parity holds only between the hosts
+	# that shard compat -- HL_CI_COMPAT_HOSTS. Requiring it of Linux-x86_64
+	# would mean exempting all 24 lanes; I20 keeps it honest instead.
 	hosts=$(lanes_in HL_CI_HOSTS)
 	compat_hosts=$(lanes_in HL_CI_COMPAT_HOSTS)
 	linux_lanes=$(lanes_in HL_CI_SHARDED_LINUX)
@@ -279,9 +275,9 @@ invariants)
 			"$host" >&2
 		parity=1
 	done
-	# There is ONE sharded lane list per host OS, so a second compat host on the
-	# same OS would leave that list unable to say which host it describes. Split
-	# the list when that happens rather than letting this guard pick one.
+	# ONE sharded lane list per host OS, so a second compat host on the same OS
+	# would leave it unable to say which host it describes. Split the list
+	# rather than letting this guard pick one.
 	sole_host_for() {
 		set -- $(printf '%s\n' $compat_hosts | grep -e "^$1-" || true)
 		[ "$#" -eq 1 ] || return 1
@@ -345,11 +341,8 @@ invariants)
 		fi
 	done
 	# I20: a host token absent from HL_CI_COMPAT_HOSTS shards nothing, so its
-	# workflow must name no lane at all. I13/I14 cannot see this -- each of them
-	# looks at exactly one other file -- so without it linux-x86_64.yml could
-	# grow a `targets: compat-memory` line and run a compat shard on a host that
-	# cannot execute guests. The check inverts with the declaration: shard compat
-	# there and this stops applying the moment the token is declared.
+	# workflow must name no lane. I13/I14 cannot see this -- each looks at one
+	# other file. It stops applying once the token is declared.
 	if ! has Linux-x86_64 "$compat_hosts"; then
 		check_shards "$wfdir/linux-x86_64.yml" "" I20 || parity=1
 	fi

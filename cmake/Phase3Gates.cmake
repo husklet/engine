@@ -256,22 +256,12 @@ add_test(NAME production.matrix
   COMMAND $<TARGET_FILE:linux-matrix>
           ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-x86_64 ${_matrix_args})
 set_tests_properties(production.matrix PROPERTIES LABELS "production" RESOURCE_LOCK hl-guest TIMEOUT 1800 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-# linux-matrix enforces a per-case budget of its own; hl_matrix_timeout_scale
-# (cmake/Phase3Compat.cmake) is what keeps the two budgets consistent on a host
-# whose backend interprets. No-op wherever the scale is 1.
 hl_matrix_timeout_scale(production.matrix)
 
 # test-linux-production-{aarch64-,}full: whole-suite sweeps via linux-matrix.
 #
-# 21 suites per guest ISA, each one process. The runner used to stop at its first
-# failing case, so a lane whose job is to sweep a corpus reported one case per
-# suite and nothing about the other 46; it now records the failure and continues,
-# matching matrix-runner, and its summary names what ran, what failed and what it
-# skipped. The verdict is unchanged -- any failure is still a non-zero exit -- so
-# these lanes are not weakened, only made legible. The budget below still bounds
-# the whole sweep, and the runner's own stall detector (tools/linux_matrix.c)
-# bounds a hung case to a minute rather than to the scaled per-case budget, which
-# is what keeps "continue past failures" from turning one hang into hours.
+# The runner continues past a failing case; any failure is still a non-zero exit,
+# and its stall detector bounds a hung case to a minute.
 set(_full_suites
   abi:tests/compat/abi  abi-corpus:tests/compat/abi/corpus  libc:tests/compat/libc
   completeness:tests/compat/completeness  posix:tests/compat/posix
@@ -478,44 +468,10 @@ set(HL_PERF_HEAVY_SAMPLES 7 CACHE STRING "perf samples for heavy cases")
 set(HL_PERF_OP_SAMPLES 7  CACHE STRING "perf samples for OS-op cases")
 
 # --- whether the thresholds above are ENFORCED, as a function of the host CPU -
-# Every PERF_LIMIT_ pair above describes a JIT: they are tracked numbers measured
-# on an ARM64 host, and DOCS.md's "Performance and release" roadmap item commits
-# to enforcing them. An x86_64 host has no JIT for either guest ISA -- both
-# frontends emit ARM64, so its backend decodes and executes at roughly 10-50x the
-# cost (docs/amd64-host.md section 3). Enforced there, all thirteen cases fail
-# for the one reason that is already known and documented, which measures nothing.
-#
-# Three ways out, and the choice matters more than it looks:
-#
-#   (a) a second, host-conditional set of thresholds. Rejected: nobody has
-#       measured them. The interpreters are being written right now, so any
-#       number written today blesses whatever a half-finished backend happens to
-#       do, and the first real optimisation would "regress" against it.
-#   (b) declare the lane not-applicable on this host and skip it. Rejected: it
-#       stops exercising the path entirely -- perf-runner drives 13 real guest
-#       launches per case through the production engine, which is the densest
-#       execution coverage in the tree outside the compat matrix -- and it would
-#       empty a lane cmake/CiLanes.cmake declares for Linux, which
-#       gate.ci-lane-parity would then have to be taught to exempt.
-#   (c) run them and report, enforce nothing. Chosen.
-#
-# (c) is not merely the least-red option. The Stage-2 same-ISA transliterator
-# (docs/amd64-host.md section 3) needs a number to beat, and an interpreter
-# baseline recorded by the same runner, on the same fixtures, in the same format
-# as the aarch64-host numbers is exactly that. The measurement is the deliverable;
-# the verdict is what cannot be honest yet.
-#
-# What that must never become is a green case implying a threshold was met. So
-# record-only cases are RENAMED (`.record-only`) rather than merely relabelled --
-# a CTest summary line is often all anyone reads -- the thresholds are dropped
-# from the perf-runner command line instead of being widened, and every case
-# echoes what was not enforced. The --label perf-runner records is deliberately
-# NOT renamed: `metric=linux-startup-x86_64` has to stay comparable across hosts
-# and across Stage 2, and record-only-ness is a property of the run, not of the
-# metric.
-#
-# aarch64 hosts are untouched by all of this: HL_PERF_ENFORCE is ON there, so
-# every case keeps its name, its thresholds and its verdict.
+# Every PERF_LIMIT_ pair above describes a JIT host, which an x86_64 host is not;
+# OFF records the measurement without a verdict (docs/ci-green.md, "Why the perf
+# thresholds are recorded rather than re-set or skipped"). Record-only cases are
+# RENAMED so a green line cannot read as a threshold met; --label is not.
 if(HL_HOST_ARCH STREQUAL "x86_64")
   set(_hl_perf_enforce_default OFF)
 else()
@@ -531,16 +487,14 @@ function(hl_perf_linux case arch warmups samples payload expect)
   list(GET PERF_LIMIT_${case} 1 _p99)
   set(_guest /tmp/hl-perf-linux-${case}-${arch})
   set(_name perf.linux-${case}-${arch})
-  # A STRING, not a list: it is interpolated into a -DCMD1= command line that
-  # cmake/RunSequence.cmake splits with separate_arguments, and a CMake list
-  # would arrive there as semicolons.
+  # A STRING, not a list: cmake/RunSequence.cmake splits the -DCMD1= line with
+  # separate_arguments, and a CMake list would arrive there as semicolons.
   set(_limits "--max-cold-us ${_cold} --max-p99-us ${_p99}")
   set(_record "")
   if(NOT HL_PERF_ENFORCE)
     set(_name ${_name}.record-only)
     set(_limits "")
-    # Appended as the LAST step so the enforced path's command list is byte-for-
-    # byte what it was: aarch64 gets CMD0+CMD1 exactly as before.
+    # LAST, so the enforced path's command list is unchanged.
     set(_record "-DCMD2=${CMAKE_COMMAND} -E echo RECORD-ONLY ${_name}: measured but NOT gated. Its tracked thresholds (cold ${_cold}us p99 ${_p99}us) describe a JIT host and were not applied here. See docs/ci-green.md.")
   endif()
   add_test(NAME ${_name}
@@ -577,8 +531,7 @@ foreach(_arch aarch64 x86_64)
   # the case, exactly like the Makefile's `$(RM) -r` prologue.
   list(GET PERF_LIMIT_warm-cache 0 _wc_cold)
   list(GET PERF_LIMIT_warm-cache 1 _wc_p99)
-  # Same record-only decision as hl_perf_linux above, spelled again because this
-  # case has a three-step prologue of its own and does not go through it.
+  # Same record-only decision as hl_perf_linux, which this case does not use.
   set(_wc_name perf.linux-warm-cache-${_arch})
   set(_wc_limits "--max-cold-us ${_wc_cold} --max-p99-us ${_wc_p99}")
   set(_wc_record "")
@@ -598,13 +551,7 @@ foreach(_arch aarch64 x86_64)
     LABELS "perf;perf-linux" RUN_SERIAL TRUE TIMEOUT 1800
     WORKING_DIRECTORY /tmp)
 
-  # Deliberately NOT record-only on any host. This case applies no timing
-  # threshold at all: the assertions live inside tests/perf/resource.c and bound
-  # retained RSS growth (2048 pages) plus a return to the descriptor and thread
-  # baseline after teardown. Those are leak bounds, and a leak is not a function
-  # of how fast the backend executes -- an interpreter with no code cache should
-  # retain less, not more. Suspending it because the neighbouring cases are
-  # unenforceable would drop a real gate for an unrelated reason.
+  # NOT record-only anywhere: tests/perf/resource.c asserts leak bounds, not time.
   add_test(NAME perf.linux-resource-${_arch}
     COMMAND ${CMAKE_COMMAND}
       "-DCMD0=${CMAKE_COMMAND} -E copy_if_different ${HL_PERF}/resource-${_arch} /tmp/hl-perf-linux-resource-${_arch}"
@@ -614,25 +561,11 @@ foreach(_arch aarch64 x86_64)
     LABELS "perf;perf-linux" RUN_SERIAL TRUE WORKING_DIRECTORY /tmp)
 endforeach()
 
-# perf-native-<host cpu>: the NATIVE baseline the perf-linux numbers above are
-# read against. Every case here is one of the perf-linux payloads run DIRECTLY
-# by the host instead of through the engine, so the pair is the engine's
-# overhead; no thresholds are applied, because a native number is a measurement,
-# not a verdict.
-#
-# That only works where the fixture's ISA IS the host CPU, which is why this was
-# `perf.native-*-aarch64` guarded on an aarch64 processor. The guard was right;
-# the arch in the name was not a property of the lane. Sections 1-2 above build
-# every one of these payloads for BOTH ISAs unconditionally, and an x86_64 host
-# executes the x86_64 ones exactly as an aarch64 host executes the aarch64 ones
-# (verified: build/e2e/guest-exit-x86_64 exits 42 natively here). So the family
-# follows HL_HOST_ARCH and the perf-native LANE is non-empty on both host CPUs
-# rather than being an aarch64-only lane the parity gate has to exempt.
-#
-# CMAKE_HOST_SYSTEM_* is what is checked, not HL_HOST_ARCH alone: HL_HOST_ARCH
-# describes the TARGET host, and a cross configure (cmake/toolchains/) can name
-# a CPU this machine cannot execute. The Makefile guarded the same way, with
-# uname -s/-m, and exited 2.
+# perf-native-<host cpu>: the NATIVE baseline the perf-linux numbers are read
+# against -- the same payloads run directly by the host, no thresholds. It needs
+# the fixture's ISA to BE the host CPU, so the family follows HL_HOST_ARCH and is
+# non-empty on both. CMAKE_HOST_SYSTEM_* is checked too, because HL_HOST_ARCH
+# names the TARGET host, which a cross configure can set to an unrunnable CPU.
 if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND
    ((HL_HOST_ARCH STREQUAL "aarch64" AND
      CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$") OR
@@ -717,14 +650,8 @@ add_test(NAME isa-fuzz.x86_64-regress
           --list "${HL_ISA_FUZZ_REGRESS_SEEDS}" --ignore-mxcsr)
 
 # The aarch64 oracle is the ARM64 HOST running the same binary, so run.sh
-# refuses to run anywhere else (tests/fuzz/isa/aarch64/run.sh exits 2 on a
-# non-ARM host); register it only where it can pass.
-#
-# Consequence worth stating, because a green lane hides it: on an x86_64 host
-# `isa-fuzz` is isa-fuzz.x86_64-regress ALONE -- one of three cases -- so half
-# the differential ISA fuzz coverage is host-conditional. gate.ci-lane-parity
-# proves the lane is non-empty, not that it is complete. cmake/CiLanes.cmake and
-# DOCS.md 7.5.1 repeat this where the lanes are declared and documented.
+# refuses to run anywhere else; register it only where it can pass. So on x86_64
+# `isa-fuzz` is one of these three cases alone: non-empty, not complete.
 if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
   add_test(NAME isa-fuzz.aarch64-regress
     COMMAND ${CMAKE_SOURCE_DIR}/tests/fuzz/isa/aarch64/run.sh
@@ -760,38 +687,12 @@ add_custom_target(bench
 # ===========================================================================
 # 9. the host-backend timeout scale, for the lanes not driven by matrix-runner
 # ===========================================================================
-# hl_matrix_timeout_scale() (cmake/Phase3Compat.cmake, where HL_MATRIX_TIMEOUT_SCALE
-# and the reasoning behind the factor live) already covers the compat suites and
-# the production-full lanes. The four runners registered ABOVE carry per-case
-# budgets of their own -- e2e-runner 30s, config-e2e-runner 30s, rootfs-e2e-runner
-# 30s, checkpoint-tree-runner 15s -- and were left out of that change, which on an
-# x86_64 host leaves ~150 tests killing correct-but-interpreted guests and
-# reporting a hang. They now read the SAME variable: one knob for the whole
-# harness, because four would let the lanes drift out of step, and a guest is
-# allowed exactly one answer to "how long may this take on this host".
-#
-# BOTH layers move together or neither is fixed. The runner's own budget fires
-# first, so scaling only the CTest TIMEOUT changes nothing; scaling only the
-# runner's lets CTest kill the whole test before any case names itself, which is
-# strictly worse than the bug. hl_matrix_timeout_scale() is the single place that
-# does both, which is why it is reused verbatim rather than reimplemented here.
-#
-# Selected by name from the directory's TESTS property, the same idiom the
-# isa-fuzz block above uses, rather than by repeating the four case lists:
-# a scenario added to section 5 or a case added to HL_E2E_CASES must not be able
-# to become the one test in its lane that still has an unscaled budget. Each
-# pattern is asserted non-empty so a rename cannot silently empty the sweep.
-#
-#   e2e-oracle.*             68 cases  -> tools/e2e_runner.c            (30s)
-#   production.config-*       3 cases  -> tools/config_e2e_runner.c     (30s)
-#   perf.linux-warm-cache-*   2 cases  -> the same runner as its payload, so the
-#                                         same budget; matches the .record-only
-#                                         spelling this host uses as well
-#   dynamic-e2e.*             2 cases  -> tools/rootfs_e2e_runner.c     (30s)
-#   checkpoint.*             78 cases  -> tests/integration/checkpoint_tree_runner.c (15s)
-#
-# At scale 1 hl_matrix_timeout_scale() writes nothing, so the aarch64 lanes'
-# generated CTestTestfile.cmake is byte-identical with this block present.
+# hl_matrix_timeout_scale() (cmake/Phase3Compat.cmake) covers the compat suites
+# and the production-full lanes; the four runners registered ABOVE carry per-case
+# budgets of their own (30s, 15s for checkpoint-tree-runner) and read the SAME
+# variable. Selected from the directory's TESTS property, not by repeating the
+# case lists, so a case added to a lane cannot become the one left unscaled. Each
+# pattern is asserted non-empty so a rename cannot empty the sweep.
 set(_hl_scaled_patterns
   "^e2e-oracle\\."
   "^production\\.config-"

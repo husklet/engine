@@ -1,77 +1,19 @@
 name: Linux x86-64
 
-# The x86_64 Linux HOST lane. A separate file from linux.yml, not a second job
-# inside it, for three reasons:
-#   * I13/I14 map one workflow file to one HL_CI_SHARDED_* list. A second host's
-#     jobs in the same file would put every compat label in two shards of one
-#     file, which I14 rejects -- correctly: that is how a lane gets run twice and
-#     counted once.
-#   * this host is not a release gate (see the publish note below), so it has to
-#     be independently referenceable.
-#   * linux.yml's per-SHA concurrency group is tuned to a lane that keeps up.
+# The x86_64 Linux HOST lane. A file of its own because I13/I14 map one workflow
+# file to one HL_CI_SHARDED_* list, and because linux.yml's per-SHA concurrency
+# group is tuned to a lane that keeps up.
 #
-# SCOPE, deliberately narrow -- but no longer for the reason it used to give.
-# This block said "the engine does not yet EXECUTE guests on an x86_64 host";
-# that is now false. Both interpreter backends run guests, and a sweep of all 24
-# compat manifests on this host CPU measures 2632/3013 (case, guest-ISA) runs
-# passing: 87.4% overall, 85.7% on the aarch64 guest, 89.0% on the x86-64 guest.
+# Scope: configure, build the host libraries, production engines and both guest
+# fixture corpora, run the host-only `unit` lane, link an x86_64 host archive into
+# the crate. Guests DO run here; every other lane is absent for not being GREEN
+# yet, not for being impossible -- docs/ci-green.md, "What IS hidden by the lanes
+# absent from linux-x86_64.yml", is the accounting. Split HL_CI_SHARDED_LINUX per
+# host CPU BEFORE declaring Linux-x86_64 in HL_CI_COMPAT_HOSTS: declaring it
+# switches I20 off and leaves this file with no structural guard at all.
 #
-# So what this job proves is narrower than what the host can do: the tree
-# configures, the host libraries, production engines and both guest fixture
-# corpora build, the host-only `unit` lane passes on this host CPU, and the Rust
-# crate accepts and links an x86_64 host archive. Everything below is absent
-# because it is not yet GREEN here, which is a different claim from impossible,
-# and the ~381 failing runs are unmeasured by CI rather than absent from the
-# tree. docs/ci-green.md, "What IS hidden by the lanes absent from
-# linux-x86_64.yml", is the accounting.
-#
-# Lanes deliberately ABSENT, and what unblocks each:
-#   compat-*        the sharded compat matrix. NOT blocked on a backend any
-#                   more; blocked on being green. The gateable subset is the
-#                   suites measured green on BOTH guest ISAs -- today that is
-#                   compat-syscall-edges (52/52 per ISA), with compat-time
-#                   (39/39 per ISA) held back only because timer assertions are
-#                   the classic hosted-runner flake. The argument and the
-#                   measurements live beside HL_CI_COMPAT_HOSTS in
-#                   cmake/CiLanes.cmake; the reason a label is the unit is that
-#                   cmake/Phase3Compat.cmake gives each one ONE CTest case
-#                   covering both ISAs, so a suite green on the x86-64 guest and
-#                   red on the aarch64 one is a red lane, not half a green one.
-#                   Sharding a subset also needs cmake/CiLanes.cmake's
-#                   HL_CI_SHARDED_LINUX split per host CPU first: I19 refuses a
-#                   second compat host on an OS whose lane list cannot say which
-#                   host it describes, and declaring Linux-x86_64 in
-#                   HL_CI_COMPAT_HOSTS before that switches I20 OFF, leaving
-#                   this file with no structural guard at all.
-#   production*     the production-full sweeps; same story, plus their runner
-#                   (tools/linux_matrix.c) is where the remaining hangs land.
-#   e2e-oracle      each case launches a guest through a production engine, and
-#   checkpoint*     these runners still carry unscaled per-case budgets
-#   dynamic-e2e     (tools/e2e_runner.c and friends at 30s,
-#   lifecycle       tests/integration/checkpoint_tree_runner.c at 15s), so an
-#   integration     interpreted guest trips them as if it had hung.
-#   perf-linux      a measurement OF the engine, so it needs the engine. The
-#                   host baseline it is read against, perf-native, does register
-#                   on this host now -- but it is registry-only on every host,
-#                   because a measurement is not a pass/fail verdict.
-#   isa-fuzz        registry-only everywhere, and on an x86_64 host it is
-#                   isa-fuzz.x86_64-regress ALONE: the aarch64 differential
-#                   oracle is an ARM64 host CPU executing the same binary.
-#   package         the installed-consumer link gate; it runs the built runner.
-#   e2e-mac, macos  Darwin-only by construction.
-#
-# What this lane adds that no existing lane has: it compiles the x86_64 host arms
-# of every host-CPU guard, and it cross-compiles the aarch64 ones (see the
-# `Cross-compile the aarch64 host arms` step). The aarch64 runners do neither
-# direction -- they only ever build their own arm.
-#
-# publish.yml is NOT extended to need this job, and invariant P1 still pins
-# `needs: [linux, mac]`. What a release ships is the crate, and the crate ships
-# two aarch64 archives -- nothing in a release artifact is built by an x86_64
-# host. Gating every release on a lane that runs no guest case would add release
-# latency and no release signal. Revisit together with HL_CI_COMPAT_HOSTS above:
-# once this host gates a compat subset it carries a genuine release signal, and
-# then it belongs in `needs:` and in P1.
+# publish.yml does NOT need this job and P1 still pins `needs: [linux, mac]`: a
+# release ships two aarch64 archives. Revisit once this host gates compat.
 
 on:
   pull_request: {}
@@ -83,54 +25,38 @@ permissions:
   contents: read
 
 concurrency:
-  # Same rationale as linux.yml: every main commit keeps its own group so a
-  # queued verdict is not superseded; other refs coalesce by ref.
+  # As linux.yml: a main commit keeps its own group, other refs coalesce by ref.
   group: linux-x86-64-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   linux-x86-64:
     runs-on: ubuntu-24.04
-    # Two full engine builds (the flake check and the crate archive) plus ~3000
-    # cross-built guest fixtures, none of it prebuilt for this host CPU yet.
+    # Two full engine builds plus ~3000 cross-built guest fixtures, no warm cache.
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v5
 
-      # Host facts as a ::notice annotation. This lane exists to catch host-CPU
-      # divergence, so the host facts are the first thing worth recording; the
-      # job-log endpoint needs admin rights, so they have to travel through the
-      # annotations API to be comparable against the aarch64 lane's.
+      # Host facts as a ::notice: the job-log endpoint needs admin rights.
       - name: Runner environment
         timeout-minutes: 5
         run: tools/ci_env.sh ubuntu-24.04
 
       - uses: DeterminateSystems/nix-installer-action@v22
         with:
-          # Disable the post-run install-diagnostic upload: it periodically hangs
-          # for tens of minutes on the runner, stalling the whole job past its
-          # timeout even though every test step already passed.
+          # The post-run diagnostic upload periodically hangs for tens of minutes.
           diagnostic-endpoint: ""
 
       - uses: nix-community/cache-nix-action@v7
         with:
-          # runner.arch is already in the key, so this cache is disjoint from the
-          # aarch64 lane's rather than fighting it. Keyed on flake.lock only, for
-          # the reason spelled out in linux.yml: flake.lock is what pins the
-          # nixpkgs the guest cross toolchains come from, and hashing flake.nix
-          # too discarded them on every unrelated edit to it.
+          # runner.arch keeps this disjoint from the aarch64 lane's cache. flake.lock
+          # only (see linux.yml): hashing flake.nix discarded the cross toolchains.
           primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
 
-      # The flake's outputs are per system, so this is the x86_64-linux attribute
-      # of the same derivation linux.yml builds on aarch64: host libraries, the
-      # runner, the activation archive and both production engines.
-      #
-      # `format` is not repeated here -- clang-format over a fixed file list is
-      # host-independent, and linux.yml already gates it. There is no
-      # `.#checks.x86_64-linux.rust` at all: flake.nix gates the crate outputs on
-      # `hasCrateArchive`, false without a committed x86_64 archive. Absent by
-      # decision, not by omission.
+      # The x86_64-linux attribute of the derivation linux.yml builds on aarch64.
+      # No `.#checks.x86_64-linux.rust`: flake.nix gates the crate outputs on
+      # `hasCrateArchive`, false without a committed archive.
       - name: Test C package
         timeout-minutes: 60
         run: tools/ci_run.sh 3420 "Test C package" -- nix build --print-build-logs .#checks.x86_64-linux.package
@@ -139,25 +65,11 @@ jobs:
         timeout-minutes: 30
         run: tools/ci_run.sh 1620 "Test unit suite (Nix check)" -- nix build --print-build-logs .#checks.x86_64-linux.unit
 
-      # The INVERSE gate, and the cheapest useful thing this runner does.
-      #
-      # Every host-CPU guard this lane exists for has two arms, and an x86_64
-      # runner compiles only one of them -- while the aarch64 runners compile
-      # only the other. So the risk that actually matters is not "amd64 breaks":
-      # it is "amd64 work silently breaks the aarch64 host", which is the host
-      # that ships and is corpus-green. Cross-compiling the ARM64 arms here
-      # catches that class of regression in a couple of minutes on THIS runner,
-      # with no aarch64 hardware, before the long build below.
-      #
-      # It compiles the aarch64 production engines and both unity target TUs, so
-      # it covers the HL_HOST_CPU_AARCH64 arm of every guard, including the ones
-      # inside src/core/target/{aarch64,x86_64}.c.
-      #
-      # -DHL_BUILD_TESTS=OFF is deliberate and must stay off: guest fixtures and
-      # the ~3000-binary test matrix are not the point and would make this slow
-      # enough that someone deletes it. The point is only that the ARM64 arms
-      # still COMPILE. `-k 0` so one broken TU reports every other break too,
-      # instead of one error at a time across pushes.
+      # The INVERSE gate: an x86_64 runner compiles only the x86_64 arm of every
+      # host-CPU guard and the aarch64 runners only the other, so the risk that
+      # matters is amd64 work breaking the aarch64 host that ships. Building the
+      # HL_HOST_CPU_AARCH64 arms here catches it with no aarch64 hardware, and
+      # -DHL_BUILD_TESTS=OFF must stay off because only compilation is the point.
       - name: Cross-compile the aarch64 host arms
         timeout-minutes: 25
         run: |
@@ -170,20 +82,11 @@ jobs:
             test -f build-arm-check/linux-production/hl-engine-linux-x86_64
           '
 
-      # The gate this whole job exists for. The sandboxed check above has no
-      # guest cross compilers, so cmake/GuestFixtures.cmake reduces the registry
-      # and cmake/LaneParity.cmake declines to register at all -- meaning
-      # gate.ci-lane-parity runs HERE and nowhere else on this host CPU.
-      #
-      # It asserts that every lane cmake/CiLanes.cmake declares selects at least
-      # one test on the (Linux, x86_64) host. That was false before this lane
-      # existed: `perf-native` was declared for Linux but registered only on an
-      # aarch64 host, so it selected zero tests and took `ctest -L unit` red with
-      # it. --no-tests=error because `ctest -L <missing>` exits 0 on its own; I15
-      # enforces it on every workflow step.
-      #
-      # Longer than linux.yml's equivalent step: a bare `ninja` cross-builds both
-      # guest fixture corpora, ~3000 binaries, with no warm cache for this CPU.
+      # The gate this job exists for. The sandboxed check above has no guest cross
+      # compilers, so cmake/LaneParity.cmake declines to register there and
+      # gate.ci-lane-parity runs HERE and nowhere else on this host CPU, asserting
+      # every lane cmake/CiLanes.cmake declares is non-empty on (Linux, x86_64).
+      # --no-tests=error because `ctest -L <missing>` exits 0 (I15).
       - name: Test CMake build (configure, build, ctest, install)
         timeout-minutes: 75
         run: |
@@ -198,36 +101,21 @@ jobs:
             test -x build-ci-sdk/bin/hl-engine-runner
           '
 
-      # The crate's x86_64 host archive is BUILT here, never committed: the two
-      # committed archives are ~24MB each against the 10MB crates.io budget
-      # documented in pkgs/rust/Cargo.toml, so a third is a publication decision
-      # rather than a consequence of a host becoming supported. pkgs/rust/build.rs
-      # accepts x86_64-unknown-linux-gnu and fails with the command below when the
-      # asset is absent, which is exactly what a repo consumer on this host sees.
-      #
-      # This is the only CI coverage of that path, and it is a POSITIVE one: it
-      # builds the archive with the same script a developer runs, installs it to
-      # assets/lib/x86_64-unknown-linux-gnu/, and then links it.
+      # BUILT here, never committed: a third archive against the 10MB crates.io
+      # budget is a publication decision. Only CI coverage of build.rs's x86_64 arm.
       - name: Build the x86_64 crate archive
         timeout-minutes: 40
         run: tools/ci_run.sh 2340 "Build the x86_64 crate archive" -- nix develop --command cmake --build build-ci --target refresh-crate-archives-linux
 
-      # --lib ONLY, like linux.yml: the integration suites need a built engine
-      # plus guest fixtures at test time, and the packaged_archive gate launches
-      # guests -- which this host cannot do yet. The lib tests are pure host code,
-      # including the wire encoder tests that pin the launch-config ABI against
-      # include/hl/config.h, and they link the archive built above, so they prove
-      # build.rs's x86_64 link line end to end.
+      # --lib ONLY, like linux.yml: the integration suites and packaged_archive
+      # launch guests. These link the archive above, proving build.rs's link line.
       - name: Test Rust unit suite against the built archive
         timeout-minutes: 20
         run: tools/ci_run.sh 1020 "Test Rust unit suite against the built archive" -- nix develop --command cargo test --manifest-path pkgs/rust/Cargo.toml --locked --lib
 
-      # -D warnings promotes the crate's `warn` lint levels to hard errors here
-      # only. --all-targets, matching linux.yml and the `rust.clippy` CTest case:
-      # clippy lints the integration targets without running or linking them, so
-      # this needs no engine. It already ran once inside `ctest -L unit` above,
-      # WITHOUT the archive; running it again after the archive exists covers the
-      # other side of build.rs's branch.
+      # -D warnings promotes the crate's `warn` lint levels to errors here only.
+      # This ran inside `ctest -L unit` WITHOUT the archive; rerunning it now
+      # covers the other side of build.rs's branch.
       - name: Lint Rust crate (clippy)
         timeout-minutes: 20
         run: tools/ci_run.sh 1020 "Lint Rust crate (clippy)" -- nix develop --command cargo clippy --manifest-path pkgs/rust/Cargo.toml --all-targets --locked -- -D warnings
