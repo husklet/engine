@@ -2137,10 +2137,16 @@ static void set_guest_comm(const char *execpath) {
 // Set the task comm verbatim (not a basename): prctl(PR_SET_NAME) renames the running task, and Linux
 // exposes that exact name through /proc/self/{comm,status:Name,stat:field2}. Keeps the procfs comm surface
 // in sync with the prctl name so a rename after boot/exec is reflected everywhere.
-static void set_guest_comm_name(const char *name) {
-    snprintf(g_comm_store, sizeof g_comm_store, "%.15s", (name && name[0]) ? name : "init");
+// `leader` says whether the renamed task is the thread-group leader. Only the leader owns the PROCESS comm
+// surface (/proc/<pid>/{comm,status,stat}); a worker renaming itself must not clobber it, or concurrent
+// pthread_setname_np callers overwrite each other. Every task still renames its own HOST thread, which is
+// what a peer's /proc/<pid>/task/<tid>/comm reads.
+static void set_guest_comm_name(const char *name, int leader) {
+    char resolved[16];
+    snprintf(resolved, sizeof resolved, "%.15s", (name && name[0]) ? name : "init");
+    if (leader) memcpy(g_comm_store, resolved, sizeof resolved);
 #if defined(__linux__)
-    (void)prctl(PR_SET_NAME, (unsigned long)g_comm_store, 0, 0, 0); // keep the host task name in sync (see set_guest_comm)
+    (void)prctl(PR_SET_NAME, (unsigned long)resolved, 0, 0, 0); // keep the host task name in sync (see set_guest_comm)
 #endif
 }
 

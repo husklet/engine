@@ -826,6 +826,21 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
         return 1;
     }
 
+    // ---- LDAPR (x86-TSO acquire load, emit.c e_ldapr) -- must precede the LSE decode below, whose mask
+    // LDAPR also matches (it lands on o3=1/opc=4 there and would decline). Stack accesses (push/pop/call/
+    // ret) use the guest RSP register directly and skip the address emitter's runtime bias fold, so a
+    // non-PIE guest running on a stack inside its own low image (makecontext/coroutine stacks in .bss)
+    // arrives here: the store half is already served by the STR/STUR path, the load half is this.
+    if ((insn & 0x3FFFFC00u) == 0x38BFC000u) {
+        int size = insn >> 30; // 0=B 1=H 2=W 3=X
+        uint64_t val = 0;
+        memcpy(&val, (const void *)real, (size_t)1u << size); // little-endian host==guest; zero-extends
+        __asm__ __volatile__("dmb ishld" ::: "memory");       // the acquire edge LDAPR would have supplied
+        if (rt != 31) X[rt] = val;
+        HL_HOST_UC_PC(uc) += 4;
+        return 1;
+    }
+
     // ---- LSE atomic RMW: size[31:30] 111 0 00 A R 1 Rs[20:16] o3[15] opc[14:12] 00 Rn[9:5] Rt[4:0] ----
     if ((insn & 0x3F200C00u) == 0x38200000u) {
         int size = insn >> 30, o3 = (insn >> 15) & 1, opc = (insn >> 12) & 7;

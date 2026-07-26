@@ -880,7 +880,11 @@ static void pipe_pushback_set(int fd, const void *data, size_t len) {
     g_fd_pb_len[fd] = len;
 }
 
-static char g_procname[16]; // prctl PR_SET_NAME / PR_GET_NAME (the 15-char process/thread name)
+// prctl PR_SET_NAME / PR_GET_NAME name (15 chars). PER-THREAD on Linux: every task has its own comm, and
+// glibc's pthread_setname_np/getname_np short-circuit to prctl for the calling thread. A single shared slot
+// made concurrent workers overwrite each other's name. Empty means "never set on this thread" -> readers
+// fall back to the process comm (proc_comm), which is what a fresh task inherits.
+static __thread char g_procname[16];
 
 // getdents directory-stream cache (guest fd -> host DIR*). MUST be invalidated on close(), else a reused
 // fd gets a stale DIR* already at EOF (a second opendir of the same path then reads nothing -- broke glob).

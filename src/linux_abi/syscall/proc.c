@@ -1408,13 +1408,18 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             }
             name[15] = 0;
             snprintf(g_procname, sizeof g_procname, "%.15s", name);
-            set_guest_comm_name(g_procname); // keep /proc/self/{comm,status,stat} in sync with the new name
+            // Leader only: keep /proc/self/{comm,status,stat} in sync. A worker renames just its own task.
+            set_guest_comm_name(g_procname, c->tid == 0);
             G_RET(c) = 0;
             break;
         } // PR_SET_NAME
         if ((int)a0 == 16) {
             char name[16] = {0};
-            snprintf(name, sizeof name, "%s", g_procname);
+            // Never set on this thread -> report the process comm, which is what a fresh task inherits.
+            if (g_procname[0])
+                snprintf(name, sizeof name, "%s", g_procname);
+            else
+                proc_comm(name, sizeof name);
             if (guest_copy_to(a1, name, sizeof name) != sizeof name) {
                 G_RET(c) = (uint64_t)(-EFAULT);
                 break;
