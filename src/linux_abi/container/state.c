@@ -238,7 +238,7 @@ static unsigned long long acct_mem_total(void) {
 // A same-ISA JIT keeps guest VA == host VA, so a restore MAP_FIXEDs every guest region back to its exact
 // address. But macOS ASLR places kernel-chosen guest mmaps (heap, stack, anon/file maps) at LOW addresses
 // that differ every exec -- so a VA free in the checkpointed run can be occupied by the fresh restore
-// process's own libraries. When HL_CHECKPOINT_DIR or HL_RESTORE_DIR is set, guest allocations are
+// process's own libraries. When HL_CHECKPOINT or HL_RESTORE is set, guest allocations are
 // instead HINTED into a high arena well above the engine's own mappings and the pcache image/interp bases
 // (0x40../0x48..TB) -- a range reliably free in any process, so the restore's MAP_FIXED always lands. Inert
 // (returns 0 -> normal kernel placement) unless armed, so a normal launch and the whole gate are unchanged.

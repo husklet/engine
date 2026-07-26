@@ -111,40 +111,6 @@ fn validate_open_files(open_files: Option<u32>, guest_fd_limit: u32) -> Result<(
     }
 }
 
-/// Applies the directory rules to one checkpoint directory, reporting failures against `field`.
-///
-/// Capture and restore directories are validated independently: a valid capture directory must never
-/// mask an invalid restore directory (or the reverse).
-fn validate_checkpoint_directory(
-    directory: Option<&std::path::Path>,
-    field: &'static str,
-) -> Result<(), SpecError> {
-    let Some(directory) = directory else {
-        return Ok(());
-    };
-    if !directory.is_absolute() {
-        return Err(spec_error(
-            SpecErrorCategory::Invalid,
-            field,
-            "checkpoint directories must be absolute",
-        ));
-    }
-    if directory.parent().is_none() || directory.file_name().is_none() {
-        return Err(spec_error(
-            SpecErrorCategory::Invalid,
-            field,
-            "checkpoint directory must name a non-root destination",
-        ));
-    }
-    Ok(())
-}
-
-/// The streaming sentinel is not a path: it selects a caller-supplied store and is never opened. It is the
-/// one value allowed where an absolute directory is otherwise required.
-fn is_stream_sentinel(path: Option<&std::path::Path>) -> bool {
-    path.is_some_and(|path| path.as_os_str() == crate::checkpoint_stream::SENTINEL)
-}
-
 pub(super) fn validate_checkpoint(
     capabilities: &EngineCapabilities,
     spec: &MachineSpec,
@@ -158,8 +124,8 @@ pub(super) fn validate_checkpoint(
         ));
     }
     if !checkpoint.enabled
-        && (checkpoint.capture_directory.is_some()
-            || checkpoint.restore_directory.is_some()
+        && (checkpoint.capture
+            || checkpoint.restore
             || checkpoint.maximum_pause_ms.is_some()
             || checkpoint.mode != crate::spec::CheckpointMode::Full
             || checkpoint.incompatible_resources
@@ -174,24 +140,12 @@ pub(super) fn validate_checkpoint(
     if !checkpoint.enabled {
         return Ok(());
     }
-    if checkpoint.capture_directory.is_none() && checkpoint.restore_directory.is_none() {
+    if !checkpoint.capture && !checkpoint.restore {
         return Err(spec_error(
             SpecErrorCategory::Conflict,
             "checkpoint",
-            "a capture or restore directory is required",
+            "capture or restore must be selected",
         ));
-    }
-    if !is_stream_sentinel(checkpoint.capture_directory.as_deref()) {
-        validate_checkpoint_directory(
-            checkpoint.capture_directory.as_deref(),
-            "checkpoint.capture_directory",
-        )?;
-    }
-    if !is_stream_sentinel(checkpoint.restore_directory.as_deref()) {
-        validate_checkpoint_directory(
-            checkpoint.restore_directory.as_deref(),
-            "checkpoint.restore_directory",
-        )?;
     }
     // The capability set is the single source of truth for which guests can be checkpointed;
     // reading it here makes discovery and preflight structurally incapable of disagreeing.

@@ -61,13 +61,12 @@ pending `ECONNRESET`, allowing application retry logic.
 
 ## Image durability
 
-Described here for the directory sink. A streaming sink expresses the same ordering through explicit group and
-commit calls — see docs/checkpoint-sink.md.
+Ordering is expressed through explicit group and commit calls — see docs/checkpoint-sink.md.
 
-- Each process image is published by temporary-directory rename after all files are synchronized.
-- `MANIFEST` is synchronized and published last.
-- The manifest authenticates the path, size, and content of every engine-owned image file.
-- Modified, truncated, missing, and unexpected image files are rejected before runtime mutation.
+- Each process image is published all-or-nothing by `group_commit`.
+- `commit` carries the `MANIFEST` and happens last.
+- The manifest authenticates the name, size, and content of every engine-owned image object.
+- Modified, truncated, missing, and unexpected image objects are rejected before runtime mutation.
 - Every process image is semantically checked for metadata identity, CPU layout and leader, memory-region and
   sparse-page bounds, descriptor count/range/kind, external-resource viability, and queued rights.
 - A completed image is reusable; repeated restores do not modify its authenticated contents.

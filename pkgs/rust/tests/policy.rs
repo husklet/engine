@@ -111,36 +111,24 @@ fn cache_policy_is_explicit_and_read_write_host_store_is_supported() {
 }
 
 #[test]
-fn checkpoint_validates_capture_and_restore_directories_independently() {
+fn checkpoint_requires_a_direction_when_enabled() {
     let mut value = spec();
     value.checkpoint.enabled = true;
-    value.checkpoint.capture_directory = Some("/tmp/checkpoint".into());
-    value.checkpoint.restore_directory = Some("relative/restore".into());
     let error = Engine::new().validate(&value).unwrap_err();
-    assert_eq!(error.category, hl_engine::spec::SpecErrorCategory::Invalid);
-    assert_eq!(error.field, "checkpoint.restore_directory");
+    assert_eq!(error.category, hl_engine::spec::SpecErrorCategory::Conflict);
+    assert_eq!(error.field, "checkpoint");
 
-    value.checkpoint.capture_directory = Some("relative/checkpoint".into());
-    value.checkpoint.restore_directory = Some("/tmp/restore".into());
-    let error = Engine::new().validate(&value).unwrap_err();
-    assert_eq!(error.category, hl_engine::spec::SpecErrorCategory::Invalid);
-    assert_eq!(error.field, "checkpoint.capture_directory");
-
-    value.checkpoint.capture_directory = Some("/tmp/checkpoint".into());
-    value.checkpoint.restore_directory = Some("/".into());
-    let error = Engine::new().validate(&value).unwrap_err();
-    assert_eq!(error.category, hl_engine::spec::SpecErrorCategory::Invalid);
-    assert_eq!(error.field, "checkpoint.restore_directory");
-
-    value.checkpoint.restore_directory = Some("/tmp/restore".into());
+    value.checkpoint.capture = true;
+    Engine::new().validate(&value).unwrap();
+    value.checkpoint.capture = false;
+    value.checkpoint.restore = true;
     Engine::new().validate(&value).unwrap();
 
+    // A direction without `enabled` is a conflict, not a silent arming.
     let mut value = spec();
-    value.checkpoint.enabled = true;
-    value.checkpoint.restore_directory = Some("relative/restore".into());
+    value.checkpoint.restore = true;
     let error = Engine::new().validate(&value).unwrap_err();
-    assert_eq!(error.category, hl_engine::spec::SpecErrorCategory::Invalid);
-    assert_eq!(error.field, "checkpoint.restore_directory");
+    assert_eq!(error.category, hl_engine::spec::SpecErrorCategory::Conflict);
 }
 
 #[test]
@@ -152,7 +140,7 @@ fn checkpoint_observability_and_debug_require_valid_bounded_policy() {
         hl_engine::spec::SpecErrorCategory::Conflict
     );
     value.checkpoint.enabled = true;
-    value.checkpoint.capture_directory = Some("/tmp/checkpoint".into());
+    value.checkpoint.capture = true;
     value.checkpoint.maximum_pause_ms = Some(0);
     assert_eq!(
         Engine::new().validate(&value).unwrap_err().field,
@@ -163,16 +151,8 @@ fn checkpoint_observability_and_debug_require_valid_bounded_policy() {
     value.checkpoint.incompatible_resources = IncompatibleResourcePolicy::Refuse;
     Engine::new().validate(&value).unwrap();
 
-    value.checkpoint.restore_directory = Some("/tmp/restore".into());
+    value.checkpoint.restore = true;
     Engine::new().validate(&value).unwrap();
-
-    let mut value = spec();
-    value.checkpoint.enabled = true;
-    value.checkpoint.capture_directory = Some("relative/checkpoint".into());
-    assert_eq!(
-        Engine::new().validate(&value).unwrap_err().category,
-        hl_engine::spec::SpecErrorCategory::Invalid
-    );
 
     // x86_64 checkpoint is now ACCEPTED. The x86_64 fd-restore bug (a guest that
     // dup2'd fd 1 onto a file wrote to the launcher's stdio after restore instead
@@ -182,7 +162,7 @@ fn checkpoint_observability_and_debug_require_valid_bounded_policy() {
     // capability set, which now advertises x86_64, so the launch is accepted.
     let mut value = MachineSpec::new(hl_engine::Guest::X86_64, "/bin/true");
     value.checkpoint.enabled = true;
-    value.checkpoint.restore_directory = Some("/tmp/restore".into());
+    value.checkpoint.restore = true;
     Engine::new().validate(&value).unwrap();
 
     let mut value = spec();
@@ -236,7 +216,7 @@ fn checkpoint_capability_and_validation_agree_for_every_guest() {
     for guest in [Guest::Aarch64, Guest::X86_64] {
         let mut value = MachineSpec::new(guest, "/bin/true");
         value.checkpoint.enabled = true;
-        value.checkpoint.capture_directory = Some("/tmp/hl-checkpoint-capability".into());
+        value.checkpoint.capture = true;
         let outcome = engine.validate(&value);
         if checkpoint.supports(guest) {
             assert!(

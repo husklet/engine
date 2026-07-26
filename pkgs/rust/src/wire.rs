@@ -14,7 +14,7 @@ fn checked_bytes(value: &OsStr) -> Result<&[u8], Error> {
 }
 
 const MAGIC: u32 = 0x484c_4346;
-const ABI: u32 = 14;
+const ABI: u32 = 1;
 
 /// The launch ABI this crate encodes, as declared by `include/hl/config.h`.
 ///
@@ -24,8 +24,8 @@ const ABI: u32 = 14;
 pub const fn launch_abi() -> u32 {
     ABI
 }
-const HEADER_SIZE: usize = 200;
-const HEADER_SIZE_U32: u32 = 200;
+const HEADER_SIZE: usize = 184;
+const HEADER_SIZE_U32: u32 = 184;
 const MAGIC_OFFSET: usize = 0;
 const POOL_SIZE_OFFSET: usize = 4;
 const HEADER_SIZE_OFFSET: usize = 8;
@@ -52,27 +52,28 @@ const NETWORK_BRIDGE_OFFSET: usize = 96;
 const IP_OFFSET: usize = 100;
 const FILESYSTEM_GENERATION_OFFSET: usize = 104;
 const ARGUMENTS_OFFSET: usize = 108;
-const CHECKPOINT_DIRECTORY_OFFSET: usize = 124;
-const RESTORE_DIRECTORY_OFFSET: usize = 128;
+const CHECKPOINT_MODE_OFFSET: usize = 124;
+const CHECKPOINT_POLICY_OFFSET: usize = 128;
 const RESULT_OFFSET: usize = 132;
 const PUBLISH_COUNT_OFFSET: usize = 136;
 const INTERFACES_OFFSET: usize = 140;
 const FILE_OWNERS_OFFSET: usize = 144;
+const RESERVED_OFFSET: usize = 148;
 const PROCESS_DOMAIN_OFFSET: usize = 152;
 const EXECUTABLE_HOST_OFFSET: usize = 168;
-const RESERVED_OFFSET: usize = 172;
-const NETWORK_TRANSPORT_OFFSET: usize = 176;
-const RESERVED_ABI11_OFFSET: usize = 180;
-const LOWER_COUNT_OFFSET: usize = 184;
-const OVERLAY_WORK_OFFSET: usize = 188;
-const CHECKPOINT_POLICY_OFFSET: usize = 192;
+const NETWORK_TRANSPORT_OFFSET: usize = 172;
+const LOWER_COUNT_OFFSET: usize = 176;
+const OVERLAY_WORK_OFFSET: usize = 180;
+
+/// `checkpoint_mode` bits, mirroring `HL_CONFIG_CHECKPOINT_CAPTURE` / `_RESTORE`.
+pub(crate) const CHECKPOINT_CAPTURE: u32 = 1;
+pub(crate) const CHECKPOINT_RESTORE: u32 = 2;
 
 const _: () = assert!(MEMORY_OFFSET % 8 == 0);
 const _: () = assert!(RESULT_OFFSET == 132);
-const _: () = assert!(EXECUTABLE_HOST_OFFSET + 8 == NETWORK_TRANSPORT_OFFSET);
-const _: () = assert!(RESERVED_OFFSET + 4 == NETWORK_TRANSPORT_OFFSET);
-const _: () = assert!(RESERVED_ABI11_OFFSET + 4 == LOWER_COUNT_OFFSET);
-const _: () = assert!(OVERLAY_WORK_OFFSET + 12 == HEADER_SIZE);
+const _: () = assert!(RESERVED_OFFSET + 4 == PROCESS_DOMAIN_OFFSET);
+const _: () = assert!(EXECUTABLE_HOST_OFFSET + 4 == NETWORK_TRANSPORT_OFFSET);
+const _: () = assert!(OVERLAY_WORK_OFFSET + 4 == HEADER_SIZE);
 
 struct Pool(Vec<u8>);
 
@@ -373,8 +374,6 @@ pub(crate) fn encode(
     let file_owners = file_owners(config)?;
     let file_owners = pool.string(file_owners.as_deref())?;
     let filesystem_generation = pool.path(config.filesystem_generation.as_deref())?;
-    let checkpoint_directory = pool.path(config.checkpoint_directory.as_deref())?;
-    let restore_directory = pool.path(config.restore_directory.as_deref())?;
     let publish = pool.publish(&config.publish)?;
     let volumes = volumes(config)?;
     let volumes = pool.string(volumes.as_deref())?;
@@ -430,8 +429,7 @@ pub(crate) fn encode(
     header.u32(IP_OFFSET, ipv4);
     header.u32(FILESYSTEM_GENERATION_OFFSET, filesystem_generation);
     header.u32(ARGUMENTS_OFFSET, arguments);
-    header.u32(CHECKPOINT_DIRECTORY_OFFSET, checkpoint_directory);
-    header.u32(RESTORE_DIRECTORY_OFFSET, restore_directory);
+    header.u32(CHECKPOINT_MODE_OFFSET, config.checkpoint_mode);
     header.u32(
         CHECKPOINT_POLICY_OFFSET,
         match config.checkpoint_policy {
@@ -594,7 +592,7 @@ mod tests {
         assert_eq!(word(&wire, NETWORK_ISOLATED_OFFSET), 0);
         assert_eq!(word(&wire, NETWORK_TRANSPORT_OFFSET), 2);
         assert_eq!(word(&wire, RESERVED_OFFSET), 0);
-        assert_eq!(word(&wire, RESERVED_ABI11_OFFSET), 0);
+        assert_eq!(word(&wire, RESERVED_OFFSET), 0);
         assert_eq!(string(&wire, NETWORK_NAMESPACE_OFFSET), None);
     }
 
@@ -606,12 +604,6 @@ mod tests {
             "/overlay/work",
         );
         let wire = encode(&config, &[OsString::from("/bin/true")], None).unwrap();
-        // Overlay arrived in HL_CONFIG_ABI_OVERLAY (12), but the encoder only ever emits the
-        // current HL_CONFIG_ABI. That constant moved to 13 when checkpoint_policy was added and to
-        // 14 when policy value 0 stopped meaning refuse; the overlay layout is unchanged by both:
-        // lower_layer_count/overlay_work_offset keep their offsets and the checkpoint words are
-        // appended after them. src/core/config.c accepts 12 and 14 (13 is rejected outright), so
-        // pinning 12 here only asserted "nothing newer was ever added".
         assert_eq!(word(&wire, ABI_OFFSET), ABI);
         assert_eq!(word(&wire, HEADER_SIZE_OFFSET), HEADER_SIZE_U32);
         assert_eq!(word(&wire, LOWER_COUNT_OFFSET), 2);
@@ -623,7 +615,7 @@ mod tests {
             &pool[offset..offset + b"/lower/high\0/lower/low\0".len()],
             b"/lower/high\0/lower/low\0"
         );
-        assert_eq!(word(&wire, RESERVED_ABI11_OFFSET), 0);
+        assert_eq!(word(&wire, RESERVED_OFFSET), 0);
     }
 
     #[test]
@@ -651,30 +643,28 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_directories_use_the_c_abi_offsets() {
+    fn checkpoint_mode_uses_the_c_abi_offset() {
         let capture = encode(
-            &Config::new().checkpoint_directory("/run/hl/checkpoints/container"),
+            &Config::new().checkpoint_mode(CHECKPOINT_CAPTURE),
             &[OsString::from("/bin/true")],
             None,
         )
         .unwrap();
-        assert_eq!(
-            string(&capture, CHECKPOINT_DIRECTORY_OFFSET),
-            Some("/run/hl/checkpoints/container")
-        );
-        assert_eq!(string(&capture, RESTORE_DIRECTORY_OFFSET), None);
+        assert_eq!(word(&capture, CHECKPOINT_MODE_OFFSET), CHECKPOINT_CAPTURE);
 
-        let restore = encode(
-            &Config::new().restore_directory("/run/hl/checkpoints/container"),
+        let both = encode(
+            &Config::new().checkpoint_mode(CHECKPOINT_CAPTURE | CHECKPOINT_RESTORE),
             &[OsString::from("/bin/true")],
             None,
         )
         .unwrap();
-        assert_eq!(string(&restore, CHECKPOINT_DIRECTORY_OFFSET), None);
         assert_eq!(
-            string(&restore, RESTORE_DIRECTORY_OFFSET),
-            Some("/run/hl/checkpoints/container")
+            word(&both, CHECKPOINT_MODE_OFFSET),
+            CHECKPOINT_CAPTURE | CHECKPOINT_RESTORE
         );
+
+        let none = encode(&Config::new(), &[OsString::from("/bin/true")], None).unwrap();
+        assert_eq!(word(&none, CHECKPOINT_MODE_OFFSET), 0);
     }
 
     #[test]

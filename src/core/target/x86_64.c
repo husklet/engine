@@ -829,7 +829,7 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
     }
     // opt8: load the guest image + interp at FIXED VAs so the translated arena is byte-identical across
     // runs (one-shot g_force_base, cleared inside load_elf). Only when the persistent cache is enabled.
-    if (g_pcache || hl_option_get("HL_CHECKPOINT_DIR")) g_force_base = PC_IMG_BASE;
+    if (g_pcache || hl_option_get("HL_CHECKPOINT")) g_force_base = PC_IMG_BASE;
     load_elf(prog_host, lm);
     g_loadbase = lm->base;
     *jump = lm->entry;
@@ -843,7 +843,7 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
     if (has_interp) {
         static char ib[4200];
         interp_host = xresolve_overlay(interp, ib, sizeof ib);
-        if (g_pcache || hl_option_get("HL_CHECKPOINT_DIR")) g_force_base = PC_INTERP_BASE;
+        if (g_pcache || hl_option_get("HL_CHECKPOINT")) g_force_base = PC_INTERP_BASE;
         load_elf(interp_host, li);
         *jump = li->entry;
         *at_base = li->base;
@@ -863,7 +863,7 @@ static const char *load_program(const char *prog, struct loaded *lm, struct load
 // behavior is byte-identical.
 static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t jump, uint64_t at_base) {
     uint64_t heap;
-    uint64_t heap_address = hl_option_get("HL_CHECKPOINT_DIR") ? UINT64_C(0x0000050000000000) : 0;
+    uint64_t heap_address = hl_option_get("HL_CHECKPOINT") ? UINT64_C(0x0000050000000000) : 0;
     if (hl_gmap_map_anonymous(heap_address, 256u << 20, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
                               HL_HOST_MEMORY_PRIVATE, &heap) != HL_STATUS_OK)
         return 70;
@@ -922,8 +922,8 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
         g_host_launch_monotonic_ns = now.value;
     }
     if (bound_shadow_activate() != 0) return 70;
-    const char *rdir = hl_option_get("HL_RESTORE_DIR");
-    if (rdir && rdir[0]) return ckpt_restore_tree(rootfs, rdir);
+    const char *rdir = hl_option_get("HL_RESTORE");
+    if (rdir != NULL) return ckpt_restore_tree(rootfs);
     if (argc < 1 || !argv || !argv[0]) return 2;
     // Persistent translated-code cache: enabled only by the centralized HL_PCACHE option.
     g_coldprof = 0;
@@ -1050,16 +1050,27 @@ int hl_engine_entry(int argc, char **argv) {
     //   --client SOCK [--rootfs DIR] PROG [args...]   : forward a launch request to that server
     if (route.mode == HL_CLI_SERVER) return hl_server_main(argc, argv);
     if (route.mode == HL_CLI_CLIENT) return hl_client_main(argc, argv);
-    while (ai + 1 < argc) { // --rootfs DIR / --vol guest:host (repeatable)
-        if (strcmp(argv[ai], "--rootfs") == 0) {
+    // Valued options need a following argument; the checkpoint flags do not.
+    while (ai < argc && argv[ai][0] == '-') {
+        int valued = ai + 1 < argc;
+        if (strcmp(argv[ai], "--checkpoint") == 0) {
+            hl_option_set("HL_CHECKPOINT", "1", 1);
+            ai += 1;
+        } else if (strcmp(argv[ai], "--restore") == 0) {
+            hl_option_set("HL_RESTORE", "1", 1);
+            ai += 1;
+        } else if (!valued) {
+            break;
+        } else if (strcmp(argv[ai], "--rootfs") == 0) {
             rootfs = argv[ai + 1];
             ai += 2;
-        } else if (strcmp(argv[ai], "--checkpoint") == 0) {
-            hl_option_set("HL_CHECKPOINT_DIR", argv[ai + 1], 1);
-            ai += 2;
-        } else if (strcmp(argv[ai], "--restore") == 0) {
-            hl_option_set("HL_RESTORE_DIR", argv[ai + 1], 1);
-            ai += 2;
+        } else if (strcmp(argv[ai], "--checkpoint-store") == 0 && ai + 2 < argc) {
+            if (hl_ckpt_channel_adopt(argv[ai + 1], argv[ai + 2]) != 0) {
+                fprintf(stderr, "hl-engine: --checkpoint-store %s %s is not an inherited descriptor pair\n",
+                        argv[ai + 1], argv[ai + 2]);
+                return 2;
+            }
+            ai += 3;
         } else if (strcmp(argv[ai], "--restore-policy") == 0) {
             if (ckpt_recovery_policy_set(argv[ai + 1]) != 0) return 2;
             ai += 2;
@@ -1093,7 +1104,7 @@ int hl_engine_entry(int argc, char **argv) {
         } else
             break;
     }
-    if (hl_option_get("HL_RESTORE_DIR")) return hl_standalone_run(rootfs, NULL, 0, NULL, NULL, NULL);
+    if (hl_option_get("HL_RESTORE")) return hl_standalone_run(rootfs, NULL, 0, NULL, NULL, NULL);
     if (ai >= argc) {
         fprintf(stderr, "usage: %s [--rootfs DIR] [--vol guest:host]... [-p H:C]... <x86-64-elf> [args...]\n", argv[0]);
         return 2;

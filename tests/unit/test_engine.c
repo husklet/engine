@@ -83,10 +83,10 @@ static int check_fd_import_rollback(uint32_t invalid_result) {
 }
 
 static const char *const extended_option_names[16] = {
-    "HL_LOWER",      "HL_PUBLISH",        "HL_VOLUMES",        "HL_ULIMITS",
-    "HL_NETNS",      "HL_PCACHE_DIR",     "HL_NETBR",          "HL_IP",
-    "HL_FSGEN_FILE", "HL_EGRESS_SOCKS",   "HL_CHECKPOINT_DIR", "HL_RESTORE_DIR",
-    "HL_PCACHE",     "HL_PUBLISH_DAEMON", "HL_UNTRUSTED",      "HL_SANDBOX"};
+    "HL_LOWER",      "HL_PUBLISH",        "HL_VOLUMES",    "HL_ULIMITS",
+    "HL_NETNS",      "HL_PCACHE_DIR",     "HL_NETBR",      "HL_IP",
+    "HL_FSGEN_FILE", "HL_EGRESS_SOCKS",   "HL_CHECKPOINT", "HL_RESTORE",
+    "HL_PCACHE",     "HL_PUBLISH_DAEMON", "HL_UNTRUSTED",  "HL_SANDBOX"};
 
 static int option_matches(const hl_options *options, const char *name, const char *expected) {
     const char *actual = hl_options_get(options, name);
@@ -169,7 +169,8 @@ typedef struct run_context {
     hl_status status;
 } run_context;
 
-typedef struct box_abi1 {
+/* An undersized box is rejected outright: there is one accepted generation and no field-presence gating. */
+typedef struct box_short {
     HL_ABI_HEADER;
     uint32_t flags;
     int32_t uid;
@@ -178,33 +179,7 @@ typedef struct box_abi1 {
     const char *working_directory;
     const char *hostname;
     const char *environment;
-} box_abi1;
-
-/* Exactly the historical prefix of box ABI 4: it carries the checkpoint directories but not the policy word. */
-typedef struct box_abi4 {
-    HL_ABI_HEADER;
-    uint32_t flags;
-    int32_t uid;
-    int32_t gid;
-    uint32_t reserved;
-    const char *working_directory;
-    const char *hostname;
-    const char *environment;
-    const char *lower_layers;
-    const hl_engine_publish_rule *publish;
-    uint32_t publish_count;
-    const char *volumes;
-    const char *limits;
-    const char *network_namespace;
-    const char *translation_cache;
-    const char *network_bridge;
-    const char *ip;
-    const char *filesystem_generation;
-    const char *egress_proxy;
-    const char *checkpoint_directory;
-    const char *restore_directory;
-    const char *file_owners;
-} box_abi4;
+} box_short;
 
 static void *run_engine(void *opaque) {
     run_context *context = opaque;
@@ -268,8 +243,7 @@ int main(void) {
     hl_engine *second_engine = NULL;
     hl_engine_box_config box;
     hl_engine_box_config second_box;
-    box_abi1 old_box;
-    box_abi4 box4;
+    box_short short_box;
     char default_policy[2] = {(char)('0' + HL_CONFIG_CHECKPOINT_DEFAULT), 0};
     char refuse_policy[2] = {(char)('0' + HL_CONFIG_CHECKPOINT_REFUSE), 0};
     hl_options source_options;
@@ -442,7 +416,7 @@ int main(void) {
     box.ip = ip;
     box.filesystem_generation = fsgen;
     box.egress_proxy = proxy;
-    box.checkpoint_directory = checkpoint;
+    box.checkpoint_mode = HL_CONFIG_CHECKPOINT_CAPTURE;
     box.flags = HL_ENGINE_BOX_PUBLISH_EXTERNAL | HL_ENGINE_BOX_SENTRY_ONLY;
     config.box = &box;
     HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK);
@@ -476,7 +450,7 @@ int main(void) {
     expected_extended_values[7] = "10.0.0.2";
     expected_extended_values[8] = "/run/fs-generation";
     expected_extended_values[9] = "127.0.0.1:1080";
-    expected_extended_values[10] = "/checkpoints/out";
+    expected_extended_values[10] = "1";
     expected_extended_values[12] = "1";
     expected_extended_values[13] = "1";
     expected_extended_values[14] = "1";
@@ -495,20 +469,18 @@ int main(void) {
     expected_extended = 0;
     memset(expected_extended_values, 0, sizeof(expected_extended_values));
 
-    /* ABI 1's exact historical prefix remains accepted without reading ABI 2 storage. */
-    memset(&old_box, 0, sizeof(old_box));
-    old_box.abi = HL_ENGINE_BOX_ABI_1;
-    old_box.size = sizeof(old_box);
-    old_box.uid = -1;
-    old_box.gid = -1;
-    old_box.hostname = "old-abi";
-    HL_CHECK(sizeof(old_box) == offsetof(hl_engine_box_config, lower_layers));
-    config.box = (const hl_engine_box_config *)(const void *)&old_box;
-    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK);
-    hl_engine_destroy(engine);
+    /* An undersized box is an ABI mismatch, not a partially-read one. */
+    memset(&short_box, 0, sizeof(short_box));
+    short_box.abi = HL_ENGINE_BOX_ABI;
+    short_box.size = sizeof(short_box);
+    short_box.uid = -1;
+    short_box.gid = -1;
+    short_box.hostname = "short-box";
+    HL_CHECK(sizeof(short_box) < sizeof(hl_engine_box_config));
+    config.box = (const hl_engine_box_config *)(const void *)&short_box;
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_ABI_MISMATCH && engine == NULL);
 
-    /* checkpoint_policy means what the DECLARED box ABI says it means, per generation. Asserted in both
-     * directions so neither the permissive default nor the pre-remap refusal can be flipped silently. */
+    /* checkpoint_policy is carried verbatim; zero is the permissive restore default. */
     memset(&engine_exit, 0, sizeof(engine_exit));
     engine_exit.abi = HL_ENGINE_ABI;
     engine_exit.size = sizeof(engine_exit);
@@ -518,7 +490,7 @@ int main(void) {
     box.size = sizeof(box);
     box.uid = -1;
     box.gid = -1;
-    box.checkpoint_directory = "/checkpoints/policy";
+    box.checkpoint_mode = HL_CONFIG_CHECKPOINT_CAPTURE;
     box.checkpoint_policy = HL_CONFIG_CHECKPOINT_DEFAULT;
     config.box = &box;
     expected_checkpoint_policy = default_policy;
@@ -527,28 +499,6 @@ int main(void) {
     hl_engine_destroy(engine);
     box.checkpoint_policy = HL_CONFIG_CHECKPOINT_REFUSE;
     expected_checkpoint_policy = refuse_policy;
-    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK);
-    HL_CHECK(hl_engine_run(engine, 0, NULL, &engine_exit) == HL_STATUS_OK);
-    hl_engine_destroy(engine);
-    /* ABI 4 and ABI 3 have no policy word: zero meant refuse when they were compiled, so refuse it is. */
-    memset(&box4, 0, sizeof(box4));
-    box4.abi = HL_ENGINE_BOX_ABI_4;
-    box4.size = sizeof(box4);
-    box4.uid = -1;
-    box4.gid = -1;
-    box4.checkpoint_directory = "/checkpoints/policy";
-    HL_CHECK(sizeof(box4) == offsetof(hl_engine_box_config, checkpoint_policy));
-    config.box = (const hl_engine_box_config *)(const void *)&box4;
-    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK);
-    HL_CHECK(hl_engine_run(engine, 0, NULL, &engine_exit) == HL_STATUS_OK);
-    hl_engine_destroy(engine);
-    box4.abi = HL_ENGINE_BOX_ABI_3;
-    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK);
-    HL_CHECK(hl_engine_run(engine, 0, NULL, &engine_exit) == HL_STATUS_OK);
-    hl_engine_destroy(engine);
-    /* ABI 1 predates the checkpoint directories too, so it selects no checkpointing and no policy. */
-    expected_checkpoint_policy = NULL;
-    config.box = (const hl_engine_box_config *)(const void *)&old_box;
     HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK);
     HL_CHECK(hl_engine_run(engine, 0, NULL, &engine_exit) == HL_STATUS_OK);
     hl_engine_destroy(engine);
@@ -569,13 +519,13 @@ int main(void) {
     box.flags = HL_ENGINE_BOX_SANDBOX | HL_ENGINE_BOX_SENTRY_ONLY;
     HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
     box.flags = 0;
-    box.checkpoint_directory = "/checkpoint";
-    box.restore_directory = "/restore";
+    box.checkpoint_mode = HL_CONFIG_CHECKPOINT_CAPTURE | HL_CONFIG_CHECKPOINT_RESTORE;
     HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK && engine != NULL);
     hl_engine_destroy(engine);
     engine = NULL;
-    box.checkpoint_directory = NULL;
-    box.restore_directory = NULL;
+    box.checkpoint_mode = 4;
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    box.checkpoint_mode = 0;
     box.ip = "10.0.0.2";
     HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
     box.ip = NULL;
@@ -686,7 +636,7 @@ int main(void) {
 
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_INTERRUPT, 2) == EXIT_SUCCESS);
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_FORCE_STOP, 9) == EXIT_SUCCESS);
-    HL_CHECK(fake_box_seen == 15); /* +5 checkpoint-policy generations */
+    HL_CHECK(fake_box_seen == 12); /* +2 checkpoint-policy runs */
     HL_CHECK(check_concurrent_destroy(&fake, &services, &config) == EXIT_SUCCESS);
 
     config.abi++;

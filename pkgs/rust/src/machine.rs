@@ -1,7 +1,5 @@
 use std::{
-    fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    fs::File,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -20,8 +18,7 @@ use crate::{
 pub struct Machine {
     child: Child,
     pauses: Mutex<usize>,
-    checkpoint_directory: Option<PathBuf>,
-    /// Set when the image is carried by a caller-supplied store instead of a directory.
+    /// Set when this launch was armed with a caller-supplied checkpoint store.
     store: Option<StoreChannel>,
 }
 
@@ -44,11 +41,10 @@ impl Drop for StoreChannel {
 }
 
 impl Machine {
-    pub(crate) const fn new(child: Child, checkpoint_directory: Option<PathBuf>) -> Self {
+    pub(crate) const fn new(child: Child) -> Self {
         Self {
             child,
             pauses: Mutex::new(0),
-            checkpoint_directory,
             store: None,
         }
     }
@@ -62,7 +58,6 @@ impl Machine {
         Self {
             child,
             pauses: Mutex::new(0),
-            checkpoint_directory: None,
             store: Some(StoreChannel {
                 server,
                 trigger,
@@ -206,98 +201,6 @@ impl Machine {
             machine: self,
             active: true,
         })
-    }
-
-    /// Persists the complete native process tree and waits for atomic manifest publication.
-    ///
-    /// A checkpoint-armed machine exits after capture. The destination must not already contain data;
-    /// this prevents stale process records from being mistaken for members of the new checkpoint.
-    ///
-    /// # Blocking
-    /// This call blocks the calling thread: it polls for manifest publication with `std::thread::sleep`
-    /// until the capture completes or `timeout` expires. Async callers must run it on a blocking
-    /// boundary (for example `tokio::task::spawn_blocking`).
-    ///
-    /// # Trigger file ownership
-    /// Capture is requested through a shared-memory generation counter kept in a **sibling** file named
-    /// `<capture-directory>.trigger`. That file is deliberately outside the capture directory so that
-    /// removing or replacing the directory never disturbs it, and every engine process in the guest tree
-    /// keeps it mapped `MAP_SHARED` for the whole run; the engine records the generation it observed at
-    /// startup so a stale trigger cannot false-fire on a later launch or restore. It is therefore **not**
-    /// deleted when capture completes.
-    ///
-    /// Ownership belongs to the caller: once the machine has exited and the checkpoint directory is no
-    /// longer in use, delete `<capture-directory>.trigger` alongside the directory itself. Deleting it
-    /// while the machine is alive is unsupported and drops checkpoint requests.
-    ///
-    /// # Errors
-    /// Returns a typed control error if capture was not configured, the destination is unsafe, the native
-    /// interrupt fails, the process exits without publishing a manifest, or the deadline expires.
-    pub fn checkpoint(&self, timeout: Duration) -> Result<PathBuf, ControlError> {
-        let directory = self
-            .checkpoint_directory
-            .as_ref()
-            .ok_or_else(|| ControlError::unsupported("checkpoint"))?;
-        if directory.exists() {
-            let mut entries = std::fs::read_dir(directory)
-                .map_err(|error| checkpoint_error("inspect checkpoint directory", &error))?;
-            if entries
-                .next()
-                .transpose()
-                .map_err(|error| checkpoint_error("inspect checkpoint directory", &error))?
-                .is_some()
-            {
-                return Err(checkpoint_context(
-                    "checkpoint destination already contains data",
-                ));
-            }
-        } else {
-            std::fs::create_dir(directory)
-                .map_err(|error| checkpoint_error("create checkpoint directory", &error))?;
-        }
-
-        let trigger = PathBuf::from(format!("{}.trigger", directory.display()));
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&trigger)
-            .map_err(|error| checkpoint_error("open checkpoint trigger", &error))?;
-        let mut bytes = [0_u8; 4];
-        let read = file
-            .read(&mut bytes)
-            .map_err(|error| checkpoint_error("read checkpoint trigger", &error))?;
-        if read != 0 && read != bytes.len() {
-            return Err(checkpoint_context("checkpoint trigger is corrupt"));
-        }
-        let generation = u32::from_le_bytes(bytes).wrapping_add(1).max(1);
-        file.seek(SeekFrom::Start(0))
-            .and_then(|_| file.write_all(&generation.to_le_bytes()))
-            .and_then(|()| file.set_len(4))
-            .and_then(|()| file.sync_data())
-            .map_err(|error| checkpoint_error("publish checkpoint request", &error))?;
-
-        crate::ffi::signal(self.id(), checkpoint_interrupt_signal())
-            .map_err(|error| checkpoint_error("interrupt checkpoint target", &error))?;
-        let manifest = directory.join("MANIFEST");
-        let deadline = Instant::now() + timeout;
-        loop {
-            if manifest.is_file() {
-                return Ok(directory.clone());
-            }
-            if self.child.completed() {
-                return Err(checkpoint_context(
-                    "engine exited without publishing a complete checkpoint manifest",
-                ));
-            }
-            if Instant::now() >= deadline {
-                return Err(checkpoint_context(
-                    "checkpoint deadline expired before manifest publication",
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
     }
 
     pub(crate) fn release_pause(&self, report: bool) -> Result<(), ControlError> {

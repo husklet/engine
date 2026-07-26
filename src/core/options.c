@@ -31,7 +31,7 @@ enum hl_option_shape {
 enum { HL_OPTION_STORE_LIMIT = 64 * 1024 * 1024 };
 
 static const hl_option_definition hl_option_definitions[] = {
-    HL_LAUNCH_OPTION("HL_CHECKPOINT_DIR", "aarch64 checkpoint output directory", HL_OPTION_PATH),
+    HL_LAUNCH_OPTION("HL_CHECKPOINT", "arm checkpoint capture over the store channel", HL_OPTION_FLAG),
     HL_LAUNCH_OPTION("HL_CHECKPOINT_POLICY", "checkpoint incompatible-resource recovery policy", HL_OPTION_INTEGER),
     HL_LAUNCH_OPTION("HL_CPUS", "guest-visible CPU quota", HL_OPTION_INTEGER),
     HL_LAUNCH_OPTION("HL_CWD", "initial guest working directory", HL_OPTION_PATH),
@@ -56,7 +56,7 @@ static const hl_option_definition hl_option_definitions[] = {
     HL_LAUNCH_OPTION("HL_PROCESS_DOMAIN", "opaque launch process ownership identity", HL_OPTION_TEXT),
     HL_LAUNCH_OPTION("HL_PUBLISH", "guest-to-host port publication rules", HL_OPTION_RECORDS),
     HL_LAUNCH_OPTION("HL_PUBLISH_DAEMON", "host daemon publishes guest ports", HL_OPTION_FLAG),
-    HL_LAUNCH_OPTION("HL_RESTORE_DIR", "aarch64 checkpoint directory selected for restore", HL_OPTION_PATH),
+    HL_LAUNCH_OPTION("HL_RESTORE", "restore the image held by the store channel", HL_OPTION_FLAG),
     HL_LAUNCH_OPTION("HL_ROOTFS_RO", "mount the guest root filesystem read-only", HL_OPTION_FLAG),
     HL_LAUNCH_OPTION("HL_SANDBOX", "apply host confinement to the untrusted worker", HL_OPTION_FLAG),
     HL_LAUNCH_OPTION("HL_UID", "initial guest user identity", HL_OPTION_INTEGER),

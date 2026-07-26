@@ -72,8 +72,6 @@ static int launch_strings_valid(const hl_launch_config *config, const char *pool
         config->filesystem_generation_offset,
         config->egress_proxy_offset,
         config->debug_log_offset,
-        config->checkpoint_directory_offset,
-        config->restore_directory_offset,
         config->result_path_offset,
         config->network_interfaces_offset,
         config->file_owners_offset,
@@ -113,9 +111,9 @@ static int launch_publish(const hl_launch_config *config, const char *pool, char
 static int launch_lowers(const hl_launch_config *config, const char *pool, char *output, size_t capacity) {
     size_t used = 0;
     uint32_t offset = config->lower_layers_offset;
+    // Validation ties a zero count to a zero offset, so there is nothing to emit.
     if (config->lower_layer_count == 0) {
-        const char *legacy = launch_string(config, pool, offset);
-        if (snprintf(output, capacity, "%s", legacy) >= (int)capacity) return -1;
+        output[0] = 0;
         return 0;
     }
     for (uint32_t index = 0; index < config->lower_layer_count; index++) {
@@ -154,11 +152,8 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     memcpy(&pool_size, prefix + 4, 4);
     memcpy(&header_size, prefix + 8, 4);
     memcpy(&abi, prefix + 12, 4);
-    if (magic != HL_CONFIG_MAGIC ||
-        (abi != HL_CONFIG_ABI && abi != HL_CONFIG_ABI_OVERLAY && abi != HL_CONFIG_ABI_NETWORK_TRANSPORT &&
-         abi != HL_CONFIG_ABI_LEGACY) ||
-        header_size < offsetof(hl_launch_config, network_transport) || header_size > HL_LAUNCH_HEADER_LIMIT ||
-        pool_size == 0 || pool_size > HL_LAUNCH_POOL_LIMIT) {
+    if (magic != HL_CONFIG_MAGIC || abi != HL_CONFIG_ABI || header_size < sizeof(hl_launch_config) ||
+        header_size > HL_LAUNCH_HEADER_LIMIT || pool_size == 0 || pool_size > HL_LAUNCH_POOL_LIMIT) {
         fprintf(stderr, "hl-engine: launch config has an invalid prefix\n");
         return 78;
     }
@@ -258,11 +253,9 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     // ambient host env, which the FFI spawn never forwards) — "" leaves it unset so direct egress is unchanged.
     s = launch_string(&cfg, pool, cfg.egress_proxy_offset);
     if (s[0]) APPLY_OPTION("HL_EGRESS_SOCKS", s);
-    s = launch_string(&cfg, pool, cfg.checkpoint_directory_offset);
-    if (s[0]) APPLY_OPTION("HL_CHECKPOINT_DIR", s);
-    s = launch_string(&cfg, pool, cfg.restore_directory_offset);
-    if (s[0]) APPLY_OPTION("HL_RESTORE_DIR", s);
-    if (cfg.abi >= HL_CONFIG_ABI_CHECKPOINT_POLICY) {
+    if (cfg.checkpoint_mode & HL_CONFIG_CHECKPOINT_CAPTURE) APPLY_OPTION("HL_CHECKPOINT", "1");
+    if (cfg.checkpoint_mode & HL_CONFIG_CHECKPOINT_RESTORE) APPLY_OPTION("HL_RESTORE", "1");
+    {
         char checkpoint_policy[2] = {(char)('0' + cfg.checkpoint_policy), 0};
         APPLY_OPTION("HL_CHECKPOINT_POLICY", checkpoint_policy);
     }

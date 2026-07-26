@@ -19,9 +19,14 @@
 void hl_ckpt_channel_publish(int broker);
 int hl_ckpt_channel_broker(void);
 
+/* Adopt an already-inherited broker/trigger pair given as decimal descriptor numbers. This is the standalone
+ * engine's equivalent of what activation does over SCM_RIGHTS: the descriptors are registered as
+ * engine-private so the guest descriptor scan never sees them. Returns 0, or -1 on a malformed argument. */
+int hl_ckpt_channel_adopt(const char *broker, const char *trigger);
+
 /* This process's private request/response channel, created on first use and re-created after a fork so a
  * child never shares a channel (and therefore never interleaves a request) with its parent.
- * Returns -1 when no broker was published (the directory sink is in use) or the connect failed. */
+ * Returns -1 when no broker was published or the connect failed. */
 int hl_ckpt_channel_acquire(void);
 
 /* One round trip. `name` (or NULL) is sent NUL-terminated; `payload` is `request->length` bytes. Reply
@@ -36,9 +41,8 @@ int hl_ckpt_channel_call(hl_ckpt_request *request, const char *name, const void 
  * process to announce itself and returns its channel descriptor (-1 on timeout or error). */
 /* The checkpoint TRIGGER is a 4-byte generation counter shared by every engine process and bumped by the
  * embedder to request a capture. ckpt_poll reads it at every safepoint, so it has to be a plain memory load;
- * it cannot be a message. With a workspace directory it is a mapped file next to the workspace. With a
- * streaming sink there is no directory, so it is an anonymous shared mapping whose descriptor activation
- * hands to the engine exactly like the broker. */
+ * it cannot be a message. It is an anonymous shared mapping whose descriptor activation hands to the engine
+ * exactly like the broker. */
 void hl_ckpt_trigger_publish(int descriptor);
 int hl_ckpt_trigger_descriptor(void);
 

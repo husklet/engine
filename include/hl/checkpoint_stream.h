@@ -42,11 +42,6 @@ HL_EXTERN_C_BEGIN
 #define HL_CKPT_STREAM_NAME_MAX 512u
 #define HL_CKPT_STREAM_PAYLOAD_MAX (4u * 1024u * 1024u)
 
-/* Selects the streaming sink/source instead of a workspace directory. It is carried in the launch config's
- * checkpoint_directory / restore_directory string rather than in a new config field, so the launch ABI is
- * unchanged: the value is not a path and is never opened. */
-#define HL_CKPT_STREAM_SENTINEL "@hl-checkpoint-stream"
-
 typedef enum hl_ckpt_stream_op {
     /* --- sink (capture) --- */
     HL_CKPT_OP_OBJECT_BEGIN = 1,    /* name, flags -> ok            : opens `stream` */
@@ -61,7 +56,7 @@ typedef enum hl_ckpt_stream_op {
     HL_CKPT_OP_CLAIM = 10,          /* name -> status 0 acquired / 1 already held */
     HL_CKPT_OP_UNCLAIM = 11,        /* name -> ok */
     HL_CKPT_OP_COMMIT = 12,         /* payload = manifest -> ok     : the image is complete */
-    /* --- rendezvous (replaces access()/opendir() over the workspace; see docs/checkpoint-sink.md) --- */
+    /* --- rendezvous (the coordinator's "has that peer finished?"; see docs/checkpoint-sink.md) --- */
     HL_CKPT_OP_GROUP_PRESENT = 13, /* name -> value = 1 when that group has been committed */
     HL_CKPT_OP_GROUP_COUNT = 14,   /* name = prefix -> value = committed groups with that prefix */
     /* --- digest (accumulated as bytes are emitted; never re-reads the store) --- */

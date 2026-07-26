@@ -8,10 +8,9 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_ENGINE_ABI 5u
-#define HL_ENGINE_BOX_ABI 5u
-#define HL_ENGINE_BOX_ABI_4 4u
-#define HL_ENGINE_BOX_ABI_3 3u
-#define HL_ENGINE_BOX_ABI_1 1u
+/* The one accepted box generation. A box declaring anything else, or smaller than the struct below, is
+ * rejected outright -- there is no per-generation field-presence gating to read past. */
+#define HL_ENGINE_BOX_ABI 1u
 
 typedef struct hl_engine hl_engine;
 
@@ -98,13 +97,13 @@ typedef struct hl_engine_box_config {
     const char *ip;
     const char *filesystem_generation;
     const char *egress_proxy;
-    const char *checkpoint_directory;
-    const char *restore_directory;
     /* Newline-separated normalized-relative-path<TAB>uid<TAB>gid records. */
     const char *file_owners;
+    /* HL_CONFIG_CHECKPOINT_CAPTURE|RESTORE; zero disables checkpointing. The image travels over the
+     * store channel activation hands the engine -- there is no location to name here. */
+    uint32_t checkpoint_mode;
     /* HL_CONFIG_CHECKPOINT_*; zero asks for no policy (permissive restore). */
     uint32_t checkpoint_policy;
-    uint32_t reserved_checkpoint;
 } hl_engine_box_config;
 
 typedef struct hl_engine_config {

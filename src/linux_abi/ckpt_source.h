@@ -1,26 +1,21 @@
 // hl/linux_abi -- checkpoint SOURCE: the read side of the sink, and the only way the restore driver is
 // allowed to obtain image bytes.
 //
-// Streaming a checkpoint out is half a feature if it cannot be streamed back in. Restore, however, does not
-// consume the image as a stream: it opens objects by name, seeks inside them, and enumerates the workspace to
-// discover the process tree. So the source is deliberately NOT the mirror image of the sink's byte stream --
-// it is a small random-access, enumerable interface:
+// Restore does not consume the image as a stream: it opens objects BY NAME, seeks inside them, and
+// enumerates them to discover the process tree. So the source is deliberately not the mirror of the sink's
+// byte stream -- it is a small random-access, enumerable interface answered by the embedder over the same
+// channel the sink writes to:
 //
 //   size(name)                 -> object length, or -1 when it does not exist
 //   read(name, offset, out, n) -> bytes, short at end of object
-//   list(prefix)               -> the object names under a prefix (what opendir provided)
+//   list(prefix)               -> the object names under a prefix
 //   digest()                   -> the image digest, to authenticate the manifest
 //
-// Two implementations: the directory source (the historical workspace, unchanged on disk) and the streaming
-// source, which asks the embedder over the same channel the sink writes to.
-//
-// THE FILE* SEAM. The restore driver is ~40 call sites of fopen/fread/fseek over image paths. Rewriting all
-// of them into an explicit cursor API would be a large, risky, behaviour-preserving-by-inspection change, so
-// instead a source object is materialised into memory and handed back as a FILE* over that memory. For the
-// directory source this is still a plain fopen, so the historical path is byte-for-byte what it always was.
-// For the streaming source it means one object at a time is held in the restoring process's address space --
-// which is the honest cost of a store that cannot be mapped or seeked, and is bounded by the largest single
-// object (a process's `pages` image).
+// THE FILE* SEAM. The restore driver is ~40 call sites of fopen/fread/fseek over image objects. Rewriting
+// all of them into an explicit cursor API would be a large, risky, behaviour-preserving-by-inspection
+// change, so instead an object is materialised into memory and handed back as a FILE* over that memory.
+// One object at a time is held in the restoring process's address space -- the honest cost of a store that
+// cannot be mapped or seeked, bounded by the largest single object (a process's `pages` image).
 
 #ifndef HL_LINUX_ABI_CKPT_SOURCE_H
 #define HL_LINUX_ABI_CKPT_SOURCE_H
@@ -39,7 +34,6 @@ typedef struct ckpt_source_vtable {
 
 struct ckpt_source {
     const ckpt_source_vtable *ops;
-    char root[1024]; // directory source: the workspace. Empty for the streaming source.
 };
 
 static struct ckpt_source g_ckpt_source;
@@ -47,92 +41,6 @@ static struct ckpt_source g_ckpt_source;
 static struct ckpt_source *ckpt_source_current(void) {
     return g_ckpt_source.ops ? &g_ckpt_source : NULL;
 }
-
-// Image paths are built throughout the restore driver as "<workspace>/<object>". Both sources are addressed
-// by OBJECT NAME, so a path is reduced by stripping the workspace prefix; for the streaming source the
-// "workspace" is the sentinel, which is never a real path and therefore cannot collide with one.
-// Returns NULL when `path` is not an image path at all -- the restore driver also touches guest paths, and
-// those must keep going to the host filesystem untouched.
-static const char *ckpt_source_relative(const char *path) {
-    static char normalized[1400];
-    const char *root = g_ckpt_source.root[0] ? g_ckpt_source.root : HL_CKPT_STREAM_SENTINEL;
-    size_t length = strlen(root);
-    if (strncmp(path, root, length) != 0 || path[length] != '/') return NULL;
-    const char *name = path + length + 1;
-    // A couple of call sites address a workspace-level object from inside a group as "proc.<gpid>/../<name>".
-    // Collapse that here rather than teaching every implementation about "..".
-    const char *up = strstr(name, "/../");
-    if (up == NULL) return name;
-    snprintf(normalized, sizeof normalized, "%s", up + 4);
-    return normalized;
-}
-
-// ---------------------------------------------------------------- directory source
-
-static int64_t ckpt_source_dir_size(struct ckpt_source *source, const char *name) {
-    char path[1400];
-    struct stat status;
-    snprintf(path, sizeof path, "%s/%s", source->root, name);
-    if (stat(path, &status) != 0 || !S_ISREG(status.st_mode)) return -1;
-    return (int64_t)status.st_size;
-}
-
-static int64_t ckpt_source_dir_read(struct ckpt_source *source, const char *name, uint64_t offset, void *out,
-                                    size_t size) {
-    char path[1400];
-    snprintf(path, sizeof path, "%s/%s", source->root, name);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    size_t done = 0;
-    while (done < size) {
-        ssize_t count = pread(fd, (char *)out + done, size - done, (off_t)(offset + done));
-        if (count < 0 && errno == EINTR) continue;
-        if (count < 0) {
-            close(fd);
-            return -1;
-        }
-        if (count == 0) break;
-        done += (size_t)count;
-    }
-    close(fd);
-    return (int64_t)done;
-}
-
-static int ckpt_source_dir_list(struct ckpt_source *source, const char *prefix, char *out, size_t capacity) {
-    DIR *directory = opendir(source->root);
-    struct dirent *entry;
-    size_t used = 0;
-    int count = 0;
-    if (!directory) return -1;
-    size_t length = strlen(prefix);
-    while ((entry = readdir(directory)) != NULL) {
-        if (strncmp(entry->d_name, prefix, length) != 0) continue;
-        size_t size = strlen(entry->d_name) + 1;
-        if (used + size > capacity) {
-            closedir(directory);
-            return -1;
-        }
-        memcpy(out + used, entry->d_name, size);
-        used += size;
-        count++;
-    }
-    closedir(directory);
-    return count;
-}
-
-static int ckpt_source_dir_digest(struct ckpt_source *source, uint64_t *hash, uint64_t *files,
-                                  uint64_t *bytes) {
-    return ckpt_image_digest(source->root, hash, files, bytes);
-}
-
-static const ckpt_source_vtable g_ckpt_source_dir_ops = {
-    .size = ckpt_source_dir_size,
-    .read = ckpt_source_dir_read,
-    .list = ckpt_source_dir_list,
-    .digest = ckpt_source_dir_digest,
-};
-
-// ---------------------------------------------------------------- streaming source
 
 static int64_t ckpt_source_stream_size(struct ckpt_source *source, const char *name) {
     hl_ckpt_reply reply;
@@ -193,30 +101,24 @@ static const ckpt_source_vtable g_ckpt_source_stream_ops = {
 
 // ---------------------------------------------------------------- binding and the FILE* seam
 
-static struct ckpt_source *ckpt_source_bind(const char *directory) {
-    if (!strcmp(directory, HL_CKPT_STREAM_SENTINEL)) {
-        if (hl_ckpt_channel_broker() < 0) return NULL;
-        g_ckpt_source.ops = &g_ckpt_source_stream_ops;
-        g_ckpt_source.root[0] = '\0';
-        return &g_ckpt_source;
-    }
-    g_ckpt_source.ops = &g_ckpt_source_dir_ops;
-    snprintf(g_ckpt_source.root, sizeof g_ckpt_source.root, "%s", directory);
+// Fails (NULL) when no broker descriptor was inherited from activation: there is nowhere to read from.
+static struct ckpt_source *ckpt_source_bind(void) {
+    if (hl_ckpt_channel_broker() < 0) return NULL;
+    g_ckpt_source.ops = &g_ckpt_source_stream_ops;
     return &g_ckpt_source;
 }
 
-static int64_t ckpt_source_object_size(const char *path) {
+static int64_t ckpt_source_object_size(const char *name) {
     struct ckpt_source *source = ckpt_source_current();
-    const char *name = source ? ckpt_source_relative(path) : NULL;
-    return name ? source->ops->size(source, name) : -1;
+    return source ? source->ops->size(source, name) : -1;
 }
 
-// Whole-object load, replacing hl_host_file_load over an image path. `size` bytes exactly, or -1.
-static int ckpt_source_load(const char *path, void *out, size_t size) {
+// Whole-object load. `size` bytes exactly, or -1.
+static int ckpt_source_load(const char *name, void *out, size_t size) {
     struct ckpt_source *source = ckpt_source_current();
-    const char *name = source ? ckpt_source_relative(path) : NULL;
-    if (!name) return -1;
-    int64_t actual = source->ops->size(source, name);
+    int64_t actual;
+    if (!source) return -1;
+    actual = source->ops->size(source, name);
     if (actual < 0 || (uint64_t)actual < size) return -1;
     return source->ops->read(source, name, 0, out, size) == (int64_t)size ? 0 : -1;
 }
@@ -239,19 +141,12 @@ static struct {
     void *bytes;
 } g_ckpt_source_open[CKPT_SOURCE_OPEN_MAX];
 
-// Open an image object for reading. Mirrors fopen(path, "rb") and is a plain fopen on the directory source.
-static FILE *ckpt_source_fopen(const char *path) {
+// Open an image object for reading. Mirrors fopen(name, "rb") over the materialised bytes.
+static FILE *ckpt_source_fopen(const char *name) {
     struct ckpt_source *source = ckpt_source_current();
+    int64_t size;
     if (!source) return NULL;
-    const char *name = ckpt_source_relative(path);
-    if (source->ops == &g_ckpt_source_dir_ops) {
-        char full[1400];
-        if (!name) return fopen(path, "rb"); // not an image object: a guest path, opened as it always was
-        snprintf(full, sizeof full, "%s/%s", source->root, name);
-        return fopen(full, "rb");
-    }
-    if (!name) return NULL;
-    int64_t size = source->ops->size(source, name);
+    size = source->ops->size(source, name);
     if (size < 0) return NULL;
     void *bytes = malloc((size_t)size == 0 ? 1 : (size_t)size);
     if (!bytes) return NULL;

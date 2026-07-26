@@ -28,24 +28,26 @@ int main(void) {
     HL_CHECK(offsetof(hl_launch_config, pool_size) == 4);
     HL_CHECK(offsetof(hl_launch_config, header_size) == 8);
     HL_CHECK(offsetof(hl_launch_config, abi) == 12);
-    HL_CHECK(offsetof(hl_launch_config, restore_directory_offset) == 128);
+    HL_CHECK(offsetof(hl_launch_config, checkpoint_mode) == 124);
+    HL_CHECK(offsetof(hl_launch_config, checkpoint_policy) == 128);
     HL_CHECK(offsetof(hl_launch_config, result_path_offset) == 132);
     HL_CHECK(offsetof(hl_launch_config, publish_count) == 136);
     HL_CHECK(offsetof(hl_launch_config, network_interfaces_offset) == 140);
     HL_CHECK(offsetof(hl_launch_config, file_owners_offset) == 144);
     HL_CHECK(offsetof(hl_launch_config, process_domain) == 152);
-    HL_CHECK(offsetof(hl_launch_config, network_transport) == 176);
-    HL_CHECK(offsetof(hl_launch_config, lower_layer_count) == 184);
-    HL_CHECK(offsetof(hl_launch_config, overlay_work_offset) == 188);
-    HL_CHECK(sizeof(hl_launch_config) == 200);
+    HL_CHECK(offsetof(hl_launch_config, executable_host_offset) == 168);
+    HL_CHECK(offsetof(hl_launch_config, network_transport) == 172);
+    HL_CHECK(offsetof(hl_launch_config, lower_layer_count) == 176);
+    HL_CHECK(offsetof(hl_launch_config, overlay_work_offset) == 180);
+    HL_CHECK(sizeof(hl_launch_config) == 184);
     HL_CHECK(sizeof(hl_launch_result) == 32);
 
     memset(&wire, 0, sizeof(wire));
     wire.config.magic = HL_CONFIG_MAGIC;
     wire.config.abi = HL_CONFIG_ABI + 1;
     HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_ABI_MISMATCH);
-    // 13 encoded checkpoint_policy 0 as "refuse"; reject it instead of silently restoring permissively.
-    wire.config.abi = HL_CONFIG_ABI_CHECKPOINT_POLICY;
+    // One accepted generation: anything else is a mismatched archive, not something to reinterpret.
+    wire.config.abi = HL_CONFIG_ABI - 1;
     HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_ABI_MISMATCH);
     wire.config.abi = HL_CONFIG_ABI;
     wire.config.pool_size = sizeof(wire.pool);
@@ -100,9 +102,11 @@ int main(void) {
     wire.config.reserved = 1;
     HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_CORRUPT);
     wire.config.reserved = 0;
-    wire.config.reserved_abi11 = 1;
+    wire.config.checkpoint_mode = 4;
     HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_CORRUPT);
-    wire.config.reserved_abi11 = 0;
+    wire.config.checkpoint_mode = HL_CONFIG_CHECKPOINT_CAPTURE | HL_CONFIG_CHECKPOINT_RESTORE;
+    HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_OK);
+    wire.config.checkpoint_mode = 0;
     wire.config.lower_layers_offset = 1;
     wire.config.lower_layer_count = 1;
     wire.config.overlay_work_offset = 24;
@@ -117,28 +121,14 @@ int main(void) {
     wire.config.lower_layers_offset = 0;
     wire.config.lower_layer_count = 0;
 
+    // A record shorter than the current struct is rejected outright; there is no shorter generation.
     {
-        unsigned char legacy[176 + 4] = {0};
-        uint32_t word;
-        uint64_t identity = 1;
-        word = HL_CONFIG_MAGIC;
-        memcpy(legacy + 0, &word, sizeof word);
-        word = 4;
-        memcpy(legacy + 4, &word, sizeof word);
-        word = 176;
-        memcpy(legacy + 8, &word, sizeof word);
-        word = HL_CONFIG_ABI_LEGACY;
-        memcpy(legacy + 12, &word, sizeof word);
-        memcpy(legacy + offsetof(hl_launch_config, process_domain), &identity, sizeof identity);
-        legacy[176] = '\0';
-        HL_CHECK(hl_launch_config_validate(legacy, sizeof legacy, &config, &pool) == HL_STATUS_OK);
-        HL_CHECK(config.network_transport == HL_CONFIG_NETWORK_VIRTUAL && pool == (const char *)legacy + 176);
-        word = 1;
-        memcpy(legacy + offsetof(hl_launch_config, network_isolated), &word, sizeof word);
-        HL_CHECK(hl_launch_config_validate(legacy, sizeof legacy, &config, NULL) == HL_STATUS_OK);
-        HL_CHECK(config.network_transport == HL_CONFIG_NETWORK_ISOLATED);
-        memcpy(legacy + offsetof(hl_launch_config, reserved), &word, sizeof word);
-        HL_CHECK(hl_launch_config_validate(legacy, sizeof legacy, NULL, NULL) == HL_STATUS_CORRUPT);
+        unsigned char truncated[160 + 4] = {0};
+        uint32_t word = HL_CONFIG_MAGIC;
+        memcpy(truncated + 0, &word, sizeof word);
+        word = HL_CONFIG_ABI;
+        memcpy(truncated + 12, &word, sizeof word);
+        HL_CHECK(hl_launch_config_validate(truncated, sizeof truncated, NULL, NULL) == HL_STATUS_INVALID_ARGUMENT);
     }
     return EXIT_SUCCESS;
 }
