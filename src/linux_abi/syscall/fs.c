@@ -503,14 +503,11 @@ static void fd_reset_emul(int fd) {
 // g_fdpath, which silently accepts a bad/regular-file dirfd -- so those errnos were never produced (fstatat
 // on a non-dir dirfd wrongly "succeeded", symlinkat/linkat leaked macOS EOPNOTSUPP, statx returned EBADF for
 // a non-dir dirfd). hl shares the host descriptor table, so validate against the real fd. Returns 0 (ok) or
-// -errno. Absolute paths, AT_FDCWD, and the empty path (AT_EMPTY_PATH / the ENOENT case) never consult the
+// -errno. `raw` is the stable host-local copy imported at the svc_fs boundary; validating it again as a
+// guest address is both redundant and wrong because a host pthread stack may overlap guest VM bookkeeping
+// ranges. Absolute paths, AT_FDCWD, and the empty path (AT_EMPTY_PATH / the ENOENT case) never consult the
 // dirfd. (LTP fstatat01 / statx03 / symlinkat01 / linkat01.)
 static int at_dirfd_check(int dirfd, const char *raw) {
-    // A bad path pointer (unmapped, or a PROT_NONE guard page -- the LTP tst_get_bad_addr idiom) faults
-    // during the kernel's getname() copy BEFORE the dirfd is resolved, so EFAULT precedes EBADF/ENOTDIR.
-    // On the Linux engine a guest PROT_NONE page is a real host PROT_NONE mapping, so reading raw[0] to
-    // classify absolute-vs-relative would fault the engine itself; screen the pointer first.
-    if (raw && guest_bad_ptr((uintptr_t)raw, 1)) return -EFAULT;
     if (!raw || !raw[0] || raw[0] == '/') return 0; // empty or absolute: the dirfd is not walked
     if (dirfd == -100 /*AT_FDCWD*/) return 0;       // cwd-relative
     struct stat ds;
@@ -1618,13 +1615,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
         }
-        // a bad pathname pointer -> EFAULT (getname copy_from_user), before any resolution; and a
-        // relative path under a bad/non-dir dirfd -> EBADF/ENOTDIR. (LTP unlink07.) guest_bad_ptr also faults
-        // a PROT_NONE guard page (tst_get_bad_addr), which hl force-maps host-readable.
-        if (!a1 || guest_bad_ptr(a1, 1)) {
-            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
-            break;
-        }
+        // The pathname was already imported and validated at the svc_fs boundary.
         {
             int adc = at_dirfd_check((int)a0, (const char *)a1);
             if (adc) {
@@ -1786,12 +1777,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
         }
         int r = unlinkat(ATFD(a0), p, (a2 & 0x200) ? AT_REMOVEDIR : 0);
+        int e = errno;
         hl_fdcache_metadata_evict(p);
         hl_fdcache_access_evict(p);
         hl_fdcache_readlink_evict(p);
         if (r >= 0 && aino) memf_try_adopt(adev, aino);
         if (r >= 0 && nlink >= 2) hl_fdcache_metadata_evict_inode((dev_t)ps.st_dev, (ino_t)ps.st_ino);
-        G_RET(c) = r < 0 ? (uint64_t)(-errno) : 0;
+        G_RET(c) = r < 0 ? (uint64_t)(-(int64_t)e) : 0;
         break;
     }
     // symlinkat(target, newdirfd, linkpath) -- the link is CREATED at (newdirfd, linkpath)
@@ -4398,14 +4390,8 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
         }
-        // Validate the guest pointers before any deref: a bad path or result buffer must return -EFAULT, not
-        // fault the engine. guest_bad_ptr (not host_addr_mapped) also faults a PROT_NONE guard page -- the LTP
-        // tst_get_bad_addr idiom -- which hl force-maps host-readable (and zero-filled, so raw[0] must NOT be
-        // consulted here or the guard page reads as an empty "" path). host_addr_mapped wrongly passed it.
-        if (raw && guest_bad_ptr((uintptr_t)raw, 1)) {
-            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
-            break;
-        }
+        // The pathname was already imported and validated at the svc_fs boundary. Validate only the
+        // still-guest-owned output buffer here.
         if (guest_accessible_prefix(a4, 256, HL_LOGICAL_VMA_WRITE) != 256) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
