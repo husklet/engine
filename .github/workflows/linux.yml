@@ -69,12 +69,13 @@ jobs:
         timeout-minutes: 30
         run: tools/ci_run.sh 1620 "Test Rust package" -- nix build --print-build-logs .#checks.aarch64-linux.rust
 
-      # The CMake build is being brought up as the standard build path to replace
-      # the hand-written Makefile. Gating it here keeps it honest: it must
-      # configure, build, pass the unit suite via CTest, and produce an
-      # installable SDK on every push, so it cannot silently rot while `make`
-      # remains authoritative. The source lists are duplicated between the two
-      # builds today, so this step is what catches drift.
+      # The standard build path: configure, build, run the unit suite through
+      # CTest, and produce an installable SDK on every push.
+      #
+      # `ctest -L unit` carries gate.ci-lane-parity, which asserts every lane
+      # cmake/CiLanes.cmake declares selects at least one test on this host --
+      # the guard against a renamed label silently emptying a shard below.
+      # --no-tests=error because `ctest -L <missing>` exits 0 on its own.
       - name: Test CMake build (configure, build, ctest, install)
         timeout-minutes: 30
         run: |
@@ -82,37 +83,11 @@ jobs:
             set -e
             cmake -G Ninja -B build-ci
             ninja -C build-ci
-            ctest --test-dir build-ci -L unit --output-on-failure
+            ctest --test-dir build-ci -L unit --no-tests=error --output-on-failure
             cmake --install build-ci --prefix "$PWD/build-ci-sdk"
             test -f build-ci-sdk/lib/libhl-engine.a
             test -f build-ci-sdk/lib/pkgconfig/hl-engine.pc
             test -x build-ci-sdk/bin/hl-engine-runner
-          '
-
-      # Coverage-parity gate for the Makefile retirement (docs/makefile-retirement.md).
-      # ADDITIVE: it does not replace or weaken the `typed-<suite>` jobs below --
-      # those keep running `make` exactly as before. This asserts only that every
-      # typed suite the compat matrix shards on ALSO exists as a CTest label with a
-      # non-empty test set, so a suite cannot be dropped from the CMake side (or
-      # added to the Makefile side only) without a red build. It is a name/registry
-      # check against `ctest -N`, so it costs seconds, not a suite run.
-      - name: Compat coverage parity (make typed-* vs ctest labels)
-        timeout-minutes: 15
-        run: |
-          tools/ci_run.sh 720 "Compat coverage parity" -- nix develop --command sh -c '
-            set -e
-            missing=
-            for s in filesystem isolation network procfs process memory syscall \
-                     syscall_edges abi completeness ipc libc posix signals threads time; do
-              label="compat-$(echo "$s" | tr _ -)"
-              n=$(ctest --test-dir build-ci -N -L "^${label}$" | grep -c "Test *#" || true)
-              echo "typed-$s -> ctest -L $label : $n test(s)"
-              [ "$n" -ge 1 ] || missing="$missing typed-$s"
-            done
-            if [ -n "$missing" ]; then
-              echo "::error title=CMake compat coverage gap::no CTest label for:$missing"
-              exit 1
-            fi
           '
 
       # The three Rust gates below are plain `nix develop` steps, NOT flake
@@ -202,13 +177,15 @@ jobs:
       # stronger release and integration gates from reporting their results.
       - name: Check the committed crate archives match the C sources
         timeout-minutes: 15
-        run: tools/ci_run.sh 720 "Check the committed crate archives match the C sources" -- nix develop --command make check-crate-archives
+        run: tools/ci_run.sh 720 "Check the committed crate archives match the C sources" -- nix develop --command cmake --build build-ci --target check-crate-archives
 
-  # Runtime compatibility, sharded across parallel runners. This used to be one
-  # step inside `linux` running `test-linux-production-typed`, i.e. every suite
-  # sequentially in a single job. Each bucket runs the same `typed-<suite>`
-  # targets the aggregate chains, so a shard and a full local run execute
-  # identical commands.
+  # Runtime compatibility, sharded across parallel runners. `targets` names CTest
+  # LABELS, and cmake/CiLanes.cmake is the source of truth for the set: I14 fails
+  # if a declared lane is missing here or named twice, and gate.ci-lane-parity
+  # (in the unit lane above) fails if a lane selects zero tests.
+  #
+  # compat-network carries the plain suite AND the ICMP-denied bridge rerun, so
+  # the former `typed-network` + `typed-network-icmp` pair is one label now.
   linux-compat:
     name: compat / ${{ matrix.name }}
     runs-on: ubuntu-24.04-arm
@@ -218,15 +195,15 @@ jobs:
       matrix:
         include:
           - name: fs-proc
-            targets: typed-filesystem typed-procfs typed-process
+            targets: compat-filesystem compat-procfs compat-process
           - name: net-ipc
-            targets: typed-network typed-network-icmp typed-ipc typed-isolation
+            targets: compat-network compat-ipc compat-isolation
           - name: syscall
-            targets: typed-syscall typed-syscall_edges typed-abi typed-completeness
+            targets: compat-syscall compat-syscall-edges compat-abi compat-completeness
           - name: libc-posix
-            targets: typed-libc typed-posix typed-time
+            targets: compat-libc compat-posix compat-time
           - name: mem-signals
-            targets: typed-memory typed-signals typed-threads
+            targets: compat-memory compat-signals compat-threads
     steps:
       - uses: actions/checkout@v5
       - uses: DeterminateSystems/nix-installer-action@v22
@@ -268,11 +245,11 @@ jobs:
           # empty stdout while passing 8/8 locally. A genuine break still fails both attempts;
           # the first-attempt failure is surfaced as a ::warning so a real intermittent bug
           # stays visible rather than being silently greened by the retry.
-          # One make invocation PER SUITE. `make -j N goal1 goal2` builds in parallel AND runs the
-          # goals' recipes concurrently, so a bucket's suites were executing at the same time --
-          # several of them contain load-sensitive stress gates, and the symptom was cases timing
-          # out after the runner's full 120s per-case budget having produced ZERO bytes of output
-          # (mkfifoat, truncate-eof-bus). Building stays parallel; suites run one at a time.
+          # Build ONCE, then one `ctest` PER LANE. Several suites contain
+          # load-sensitive stress gates whose symptom under concurrency was cases
+          # timing out after the full 120s per-case budget having produced ZERO
+          # bytes of output (mkfifoat, truncate-eof-bus). Building stays parallel;
+          # suites run one at a time. Each lane builds only its own guest corpus.
           # Bound the STEP, not just one suite. Several suites plus the retry can
           # outlast the 40min step timeout, and a step GitHub kills emits no
           # ::error, so the failure lands with no diagnostic tail. Stop 60s short
@@ -282,6 +259,18 @@ jobs:
             local left=$((deadline - SECONDS - 60))
             if [ "$left" -gt 0 ]; then echo "$left"; else echo 0; fi
           }
+          # Build only this lane's engines and guest corpus, inside the same
+          # deadline so a hung build still reports instead of being step-killed.
+          fixtures=""
+          for t in ${{ matrix.targets }}; do fixtures="$fixtures $t-fixtures"; done
+          bst=0
+          run_bounded "$(budget)" build.log \
+            nix develop --command sh -c "cmake -G Ninja -B build-ci && cmake --build build-ci --parallel \"\$(nproc)\" --target compat-engines$fixtures" || bst=$?
+          if [ "$bst" -ne 0 ]; then
+            msg=$(tail -c 1500 build.log); msg=${msg//'%'/'%25'}; msg=${msg//$'\n'/'%0A'}; msg=${msg//$'\r'/'%0D'}
+            echo "::error title=Linux compat (${{ matrix.name }}) build failed::$msg"
+            exit 1
+          fi
           run_suites() {
             local st=0 suite_st=0 cap=0 t=
             : > "$1"
@@ -290,8 +279,10 @@ jobs:
               cap=$(budget)
               if [ "$cap" -le 0 ]; then st=124; break; fi
               if [ "$cap" -gt 2100 ]; then cap=2100; fi
+              # --no-tests=error: `ctest -L <missing>` exits 0, so without it a
+              # renamed label turns this step silently green. I15 enforces it.
               run_bounded "$cap" "$1.part" \
-                nix develop --command sh -c "make -s -j\"\$(nproc)\" CC=\"\$NATIVE_CC\" $t" || suite_st=$?
+                nix develop --command ctest --test-dir build-ci -L "^$t\$" --no-tests=error --output-on-failure || suite_st=$?
               cat "$1.part" >> "$1"
               if [ "$suite_st" -ne 0 ]; then
                 # Preserve timeout as the most informative aggregate status,
