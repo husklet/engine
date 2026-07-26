@@ -4240,6 +4240,7 @@ static int ckpt_prepare_restore_pipes(const char *base) {
     g_nrestore_pipes = 0;
     for (int process = 0; process < g_nrprocs; process++) {
         char path[1300];
+        if (!g_rprocs[process].viable) continue; // a stopped process must not fail the restore it was pruned from
         snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
@@ -4993,6 +4994,7 @@ static int ckpt_prepare_restore_sockets(const char *base) {
     g_nrestore_rights = 0;
     for (int process = 0; process < g_nrprocs; ++process) {
         char path[1300];
+        if (!g_rprocs[process].viable) continue;
         snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
@@ -5122,6 +5124,7 @@ static int ckpt_prepare_restore_socket_states(const char *base) {
     g_nrestore_sockets = 0;
     for (int process = 0; process < g_nrprocs; ++process) {
         char records_path[1300];
+        if (!g_rprocs[process].viable) continue;
         snprintf(records_path, sizeof records_path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
         FILE *records = ckpt_source_fopen(records_path);
         if (!records) return -1;
@@ -5217,6 +5220,7 @@ static int ckpt_prepare_restore_eventfds(const char *base) {
     g_nrestore_eventfds = 0;
     for (int process = 0; process < g_nrprocs; process++) {
         char path[1300];
+        if (!g_rprocs[process].viable) continue;
         snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
@@ -5295,6 +5299,7 @@ static int ckpt_prepare_restore_signalfds(const char *base) {
     g_nrestore_signalfds = 0;
     for (int process = 0; process < g_nrprocs; ++process) {
         char path[1300];
+        if (!g_rprocs[process].viable) continue;
         snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
@@ -5320,6 +5325,7 @@ static int ckpt_prepare_restore_timerfds(const char *base) {
     g_nrestore_timerfds = 0;
     for (int process = 0; process < g_nrprocs; process++) {
         char path[1300];
+        if (!g_rprocs[process].viable) continue;
         snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
