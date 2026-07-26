@@ -3033,7 +3033,23 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             break;
         }
         /* Flags are semantic requirements, not hints. Do not silently erase RWF_NOWAIT/APPEND/SYNC. */
-        if (G_A5(c) != 0) {
+        // RWF_APPEND is a semantic requirement: pwritev2 must ignore the supplied offset and land the
+        // write at end-of-file, without moving the file position. The typed box takes no flags, so
+        // resolve end-of-file from the file's own metadata and issue a positioned write there.
+        uint64_t vector_flags = G_A5(c);
+        if (nr == 287 && (vector_flags & 0x10u) != 0 && g_host_services != NULL && g_host_services->file != NULL &&
+            g_host_services->file->metadata != NULL) {
+            hl_host_file_metadata metadata;
+            hl_host_result status =
+                g_host_services->file->metadata(g_host_services->context, source.host_handle, &metadata);
+            if (status.status != HL_STATUS_OK) {
+                result = bound_host_error(status.status);
+                break;
+            }
+            vector_offset = metadata.size;
+            vector_flags &= ~UINT64_C(0x10);
+        }
+        if (vector_flags != 0) {
             result = -95; /* Linux EOPNOTSUPP; macOS's native value is 102. */
             break;
         }
@@ -3733,6 +3749,27 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
              guest_copy_from(output_offset, a3, sizeof(*output_offset)) != (ssize_t)sizeof(*output_offset))) {
             result = -EFAULT;
             break;
+        }
+        // Linux rejects a same-file copy whose ranges overlap (EINVAL) instead of copying through the
+        // overlap.  Mirrors the native path in io.c case 285, using the typed identity for sameness.
+        if (G_A4(c) > 0 && g_host_services != NULL && g_host_services->file != NULL &&
+            g_host_services->file->metadata != NULL) {
+            hl_host_file_metadata in_meta, out_meta;
+            hl_host_result in_status = g_host_services->file->metadata(g_host_services->context, source.host_handle,
+                                                                      &in_meta);
+            hl_host_result out_status = g_host_services->file->metadata(g_host_services->context, output.host_handle,
+                                                                       &out_meta);
+            if (in_status.status == HL_STATUS_OK && out_status.status == HL_STATUS_OK &&
+                in_meta.stable_device == out_meta.stable_device && in_meta.stable_object == out_meta.stable_object) {
+                off_t in_start = input_offset ? *input_offset : (off_t)source.offset;
+                off_t out_start = output_offset ? *output_offset : (off_t)output.offset;
+                off_t length = (off_t)G_A4(c);
+                if (in_start >= 0 && out_start >= 0 && in_start < out_start + length &&
+                    out_start < in_start + length) {
+                    result = -EINVAL;
+                    break;
+                }
+            }
         }
         while (done < (size_t)G_A4(c)) {
             size_t chunk = (size_t)G_A4(c) - done;
