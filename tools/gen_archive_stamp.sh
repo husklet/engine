@@ -22,7 +22,9 @@ cd "$root"
 
 out=${1:?usage: gen_archive_stamp.sh <output-header>}
 
-manifest=$(tools/crate_archive_manifest.sh)
+# Invoke through bash: the nix build sandbox copies sources without the
+# executable bit, so a direct call exits 126.
+manifest=$(bash tools/crate_archive_manifest.sh)
 
 tmp=$out.tmp.$$
 trap 'rm -f "$tmp"' EXIT
