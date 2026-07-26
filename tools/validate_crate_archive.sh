@@ -3,7 +3,8 @@
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
-	printf 'usage: %s <aarch64-unknown-linux-gnu|aarch64-apple-darwin> <archive>\n' "$0" >&2
+	printf 'usage: %s <host-triple> <archive>\n' "$0" >&2
+	printf '  host-triple: aarch64-apple-darwin | {aarch64,x86_64}-unknown-linux-gnu\n' >&2
 	exit 2
 fi
 
@@ -12,6 +13,21 @@ cd "$root"
 
 target=$1
 archive=$2
+
+# The triple's two halves drive every decision below, so split them once instead
+# of matching whole triples: which host can inspect the archive (ELF vs Mach-O)
+# and which compiler links it (the guest-ISA-neutral <ARCH>_LINUX_CC the devShell
+# exports). Only the two aarch64 triples are committed and published; the x86_64
+# Linux one is a local build product (see tools/refresh_crate_archives.sh).
+target_arch=${target%%-*}
+case "$target" in
+aarch64-apple-darwin) target_os=darwin ;;
+aarch64-unknown-linux-gnu | x86_64-unknown-linux-gnu) target_os=linux ;;
+*)
+	printf 'validate-crate-archive: unknown host triple %s\n' "$target" >&2
+	exit 2
+	;;
+esac
 
 # An archive can only be inspected and linked on its own kind of host: the
 # Darwin half needs Apple libtool/nm/clang, the Linux half needs GNU nm and the
@@ -22,7 +38,7 @@ archive=$2
 # unaffected -- a stale archive still fails on both hosts.
 host=$(uname -s)
 defer_reason=
-if [ "$target" = aarch64-apple-darwin ] && [ "$host" != Darwin ]; then
+if [ "$target_os" = darwin ] && [ "$host" != Darwin ]; then
 	# Prefer a real Darwin host when the bridge exists. Do not let Linux read
 	# the archive while libtool is still publishing it through the shared mount.
 	if command -v mac >/dev/null 2>&1; then
@@ -30,7 +46,7 @@ if [ "$target" = aarch64-apple-darwin ] && [ "$host" != Darwin ]; then
 	fi
 	defer_reason='no Darwin host; Mach-O link test deferred to macOS CI'
 	symbol_prefix=_
-elif [ "$target" = aarch64-unknown-linux-gnu ] && [ "$host" != Linux ]; then
+elif [ "$target_os" = linux ] && [ "$host" != Linux ]; then
 	defer_reason='no Linux host; ELF link test deferred to Linux CI'
 	symbol_prefix=
 fi
@@ -71,7 +87,7 @@ trap 'rm -rf "$scratch"' EXIT HUP INT TERM
 
 members=$scratch/members
 symbols=$scratch/symbols
-if [ "$target" = aarch64-apple-darwin ]; then
+if [ "$target_os" = darwin ]; then
 	/usr/bin/ar -t "$archive" >"$members"
 	# Apple libtool has no read-only TOC command. Repacking the input into
 	# scratch forces it to consume every member and produce a fresh TOC.
@@ -85,8 +101,15 @@ else
 	nm --print-armap "$archive" >"$scratch/armap"
 	grep -q '^Archive index:' "$scratch/armap"
 	nm -g --defined-only "$archive" >"$symbols"
-	: "${AARCH64_LINUX_CC:=aarch64-linux-gnu-gcc}"
-	linker=("$AARCH64_LINUX_CC" -D_GNU_SOURCE -Iinclude -o "$scratch/link-test"
+	# One variable per HOST CPU, matching the names flake.nix exports and the
+	# CMake toolchain files read. On its own CPU that is the native cc; the other
+	# one is the cross gcc the devShell already carries, so an x86_64 Linux host
+	# can still link-test the committed aarch64 archive rather than deferring it.
+	case "$target_arch" in
+	aarch64) : "${AARCH64_LINUX_CC:=aarch64-linux-gnu-gcc}"; cc=$AARCH64_LINUX_CC ;;
+	x86_64) : "${X86_64_LINUX_CC:=x86_64-linux-gnu-gcc}"; cc=$X86_64_LINUX_CC ;;
+	esac
+	linker=($cc -D_GNU_SOURCE -Iinclude -o "$scratch/link-test"
 		tools/dual_backend_e2e_runner.c -Wl,--whole-archive "$archive"
 		-Wl,--no-whole-archive -pthread -ldl -lm -latomic)
 fi

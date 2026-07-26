@@ -31,7 +31,7 @@ enum { CASE_MAX = 256, FIELD_MAX = 512, OUTPUT_MAX = 1024 * 1024, ERROR_MAX = 64
  * whole host. Raising the constant for everyone would blunt the detector, so the
  * budget is an explicit opt-in the caller sets for the suites that need it.
  * Values outside [1s, 1h] are ignored rather than trusted. */
-static uint64_t case_timeout_ms(void) {
+static uint64_t suite_case_timeout_ms(void) {
     const char *value = getenv("HL_MATRIX_CASE_TIMEOUT_MS");
     char *end = NULL;
     unsigned long parsed;
@@ -40,6 +40,75 @@ static uint64_t case_timeout_ms(void) {
     parsed = strtoul(value, &end, 10);
     if (errno != 0 || end == value || *end != 0 || parsed < 1000 || parsed > 3600000) return TIMEOUT_MS;
     return (uint64_t)parsed;
+}
+
+/*
+ * Host-backend timeout scale.
+ *
+ * Every budget above is calibrated against a JIT, because until now every supported host CPU had one, which
+ * made "a case that has not finished in 120s is hung" a safe inference. On an x86_64 host it is not: neither
+ * guest frontend has an amd64 back end -- both emit ARM64 -- so the backend there decodes and executes rather
+ * than emitting, and guest execution costs roughly 10-50x what the ARM64-host JIT costs (docs/amd64-host.md
+ * section 3). A correct-but-interpreted case would trip the detector and be killed by the process-group kill
+ * below, reporting the one thing that is NOT true -- a hang -- and destroying the output that would have
+ * distinguished the two. Slow and hung must not share a diagnostic.
+ *
+ * The scale is therefore supplied by the caller, once, where the lanes are registered
+ * (cmake/Phase3Compat.cmake), and is deliberately NOT detected here. This runner cannot detect it honestly:
+ * "is my backend an interpreter" is a property of the engine binary it execs, and reading that out of the
+ * engine would couple the harness to backend internals and silently re-tune itself the day those internals
+ * change. One environment variable set next to the test registration is greppable and reviewable; an
+ * inference made inside the harness is neither.
+ *
+ * It MULTIPLIES HL_MATRIX_CASE_TIMEOUT_MS rather than replacing it, because the two answer different
+ * questions: the absolute value is how much work THIS SUITE does (.github/workflows/linux.yml gives
+ * compat-soak 600s), the scale is how much slower THIS HOST executes any of it. Both apply, so both compose.
+ *
+ * Unset or empty means 1 and every code path below is then bit-for-bit what it was before this existed --
+ * including the diagnostic strings, so an unscaled lane's output cannot change at all. Anything else must be
+ * decimal digits naming a factor in [1, TIMEOUT_SCALE_MAX], and a value outside that is a hard refusal rather
+ * than a fallback to 1: falling back would present as a suite full of unexplained per-case timeouts, which is
+ * precisely the diagnostic this exists to prevent. The ceiling is low on purpose -- 100 is twice the worst
+ * factor docs/amd64-host.md predicts -- so that a value mistyped in milliseconds (20000) is rejected instead
+ * of quietly disabling the hang detector for the rest of the run. A configuration that is slower still for
+ * some other reason (a sanitized or -O0 engine) belongs in HL_MATRIX_CASE_TIMEOUT_MS, which is the axis that
+ * means "this run does more work".
+ */
+enum { TIMEOUT_SCALE_MAX = 100 };
+
+static unsigned long timeout_scale = 1;
+
+static uint64_t case_timeout_ms(void) {
+    return suite_case_timeout_ms() * timeout_scale;
+}
+
+static int load_timeout_scale(void) {
+    const char *value = getenv("HL_MATRIX_TIMEOUT_SCALE");
+    char *end = NULL;
+    unsigned long parsed;
+    if (value == NULL || *value == 0) return 0;
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    /* strtoul() skips leading blanks and accepts a sign, wrapping "-1" into ULONG_MAX, so the first character
+       is inspected directly: a negative or padded scale has to be a rejection, not a huge budget. */
+    if (value[0] < '0' || value[0] > '9' || errno != 0 || end == value || *end != 0 || parsed < 1 ||
+        parsed > TIMEOUT_SCALE_MAX) {
+        fprintf(stderr,
+                "matrix-runner: HL_MATRIX_TIMEOUT_SCALE=\"%s\" is not a decimal factor in [1, %d]; refusing to "
+                "run rather than silently using the unscaled per-case timeout\n",
+                value, TIMEOUT_SCALE_MAX);
+        return 1;
+    }
+    timeout_scale = parsed;
+    /* Announced on stdout, in the output of a PASSING run: a green lane with a scaled budget must not be
+       readable as evidence that guest execution is comparably fast, and the run's own log is the only place a
+       reader will look. An explicit x1 announces nothing, because it IS the unscaled run -- so setting the
+       variable to 1 by hand is indistinguishable from not setting it, which is the honest reading. */
+    if (timeout_scale == 1) return 0;
+    printf("matrix-runner: per-case timeout scaled x%lu to %llums (HL_MATRIX_TIMEOUT_SCALE); this run tolerates "
+           "slow-but-correct guest execution and is NOT evidence of speed comparable to an unscaled lane\n",
+           timeout_scale, (unsigned long long)case_timeout_ms());
+    return 0;
 }
 
 #ifndef AARCH64_DYNAMIC_LOADER
@@ -855,6 +924,17 @@ static void diagnostic(const suite_case *item, const char *isa, const char *reas
     fputc('\n', stderr);
 }
 
+/* A bare "timeout" cannot be read on a host whose budget is not the default: it does not say whether the case
+   hung or whether the scale is simply set too low for it. Name the budget that expired -- but only when it is
+   scaled, so an unscaled lane's failure text stays exactly the string it has always been. */
+static const char *timeout_reason(void) {
+    static char text[96];
+    if (timeout_scale == 1) return "timeout";
+    (void)snprintf(text, sizeof text, "timeout after %llums (HL_MATRIX_TIMEOUT_SCALE=%lu)",
+                   (unsigned long long)case_timeout_ms(), timeout_scale);
+    return text;
+}
+
 static int run_one(const suite_case *item, const char *bridge, const char *engine, const char *binary_root,
                    const char *suite_root, const char *isa, capture *result) {
     char guest[1024], expected_path[1024], binary[256], rootfs[1024] = {0};
@@ -919,7 +999,7 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
         else if (result->output_size != expected_size)
             fprintf(stderr, "matrix-runner: %s [%s] stdout length: got=%zu expected=%zu\n", item->name, isa,
                     result->output_size, expected_size);
-        diagnostic(item, isa, status == 2 ? "timeout" : "exit/stdout mismatch", result);
+        diagnostic(item, isa, status == 2 ? timeout_reason() : "exit/stdout mismatch", result);
         free(expected);
         return 1;
     }
@@ -935,6 +1015,9 @@ int main(int argc, char **argv) {
     unsigned long repetition;
     resource_baseline baseline;
     if (install_interrupt_handlers() != 0) return 1;
+    /* Before any case runs, so a malformed scale is one line at the top of the log instead of a verdict on a
+       suite that was measured against a budget nobody chose. */
+    if (load_timeout_scale() != 0) return 2;
     if (argc == 8) {
         only = argv[7];
     } else if (argc == 9 || argc == 10) {
@@ -998,6 +1081,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "matrix-runner: unknown active case %s\n", only);
         return 2;
     }
+    /* Repeated at the end as well as the start: the summary line is what a reader takes away from a run, and on
+       a scaled host neither a pass nor a failure count means what the same numbers mean on an unscaled one. */
+    if (timeout_scale != 1)
+        printf("matrix-runner: per-case timeout was scaled x%lu; this run's timing is not comparable to an "
+               "unscaled lane\n",
+               timeout_scale);
     if (failures != 0) {
         fprintf(stderr, "matrix-runner: %zu of %zu selected case(s) FAILED; %zu excluded\n", failures, selected,
                 excluded);

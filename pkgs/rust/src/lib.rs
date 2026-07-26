@@ -14,11 +14,21 @@
 //!   re-exports below, so the crate's public surface is unchanged.
 #![deny(unsafe_code)]
 
+// Host platform is two axes, host OS and host CPU (see `src/host/host_cpu.h`,
+// `HL_HOST_ARCH` in CMakeLists.txt). Keep this list in step with the `HOSTS`
+// table in build.rs: that table decides what can be LINKED, this one what can be
+// COMPILED, and a host missing from either is not supported. Whether a prebuilt
+// archive for a supported host is present in the tree is a separate question
+// build.rs answers with its own diagnostic -- do not fold it back in here.
 #[cfg(not(any(
     all(target_arch = "aarch64", target_os = "macos"),
-    all(target_arch = "aarch64", target_os = "linux")
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "x86_64", target_os = "linux")
 )))]
-compile_error!("hl-engine supports only aarch64-apple-darwin and aarch64-unknown-linux-gnu hosts");
+compile_error!(
+    "hl-engine supports only the aarch64-apple-darwin, aarch64-unknown-linux-gnu and \
+     x86_64-unknown-linux-gnu hosts"
+);
 
 // Internal contract layers (formerly the api/provider/protocol/runtime crates).
 pub(crate) mod api;

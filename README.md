@@ -6,7 +6,14 @@ HL Engine runs AArch64 and x86-64 Linux programs on AArch64 macOS and Linux host
 | --- | --- | --- |
 | macOS AArch64 | Supported | AArch64, x86-64 |
 | Linux AArch64 | Supported | AArch64, x86-64 |
-| Linux x86-64 | In progress | AArch64, x86-64 |
+| Linux x86-64 | Builds and passes the host unit lane; **runs no guests yet** | none yet |
+
+"Supported" means the exact-golden compatibility, lifecycle and production matrices pass on that host for both guest
+ISAs. Linux x86-64 is not there: the engine, both guest fixture corpora and the `unit` lane build and pass on it, and
+the published Rust crate accepts the host, but neither guest ISA has a code generator for an x86-64 host yet — both
+production frontends emit ARM64 directly. `production.smoke-x86_64` is the milestone to watch.
+[`docs/amd64-host.md`](docs/amd64-host.md) explains the seam and what is gated on what. Windows is a reserved
+boundary with no code.
 
 ```sh
 cargo add hl-engine
@@ -42,6 +49,8 @@ Applied container closures contribute only mounts and environment edits; the eng
 - [`DOCS.md`](DOCS.md) — normative design: layering, public contracts, build and test model, roadmap. Start here.
   It indexes the rest of `docs/`.
 - [`docs/arch.md`](docs/arch.md) — where each layer lives in the source, at symbol level.
+- [`docs/amd64-host.md`](docs/amd64-host.md) — the x86-64 Linux host: the host-CPU seam and what still gates guest
+  execution there.
 - [`pkgs/rust/README.md`](pkgs/rust/README.md) — the Rust crate's own API surface.
 
 Build and test, from a `nix develop` shell:

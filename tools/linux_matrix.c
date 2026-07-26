@@ -13,6 +13,61 @@
 #include <time.h>
 #include <unistd.h>
 
+/*
+ * Per-case hang detector and its host-backend scale. 20s is calibrated against a JIT host, because until now
+ * every supported host CPU had one: on an ARM64 host every case in every suite this runner drives is
+ * milliseconds of guest work, so "not finished in 20s" could only mean hung. On an x86_64 host it cannot mean
+ * that. Neither guest frontend has an amd64 back end -- both emit ARM64 -- so that host's backend decodes and
+ * executes instead of emitting, at roughly 10-50x the cost of the ARM64-host JIT (docs/amd64-host.md section
+ * 3). The SIGKILL below would then convert slow-but-correct into a report of a hang, which is both false and
+ * indistinguishable from the real thing.
+ *
+ * So the budget is CASE_TIMEOUT_MS times a scale the caller sets once where the lanes are registered
+ * (cmake/Phase3Gates.cmake, through the helper that declares it in cmake/Phase3Compat.cmake), not something
+ * inferred here: whether the engine this runner execs interprets is a
+ * property of that binary, and guessing it from inside the harness would couple the harness to backend
+ * internals and re-tune itself silently whenever they changed. tools/matrix_runner.c carries the same knob,
+ * reads the same variable, and validates it the same way -- the two runners drive the same guests and must not
+ * disagree about how long a guest is allowed to take.
+ *
+ * Unset or empty is 1, and at 1 every path below -- including the failure text -- is bit-for-bit what it was
+ * before the knob existed. A malformed or out-of-range value is refused rather than rounded back to 1, because
+ * a silent fallback presents as a suite full of unexplained timeouts: exactly what this exists to prevent. The
+ * ceiling is twice the worst factor docs/amd64-host.md predicts, so a value mistyped in milliseconds is
+ * rejected instead of disabling the detector.
+ */
+enum { CASE_TIMEOUT_MS = 20000, TIMEOUT_SCALE_MAX = 100 };
+
+static unsigned long timeout_scale = 1;
+
+static int load_timeout_scale(void) {
+    const char *value = getenv("HL_MATRIX_TIMEOUT_SCALE");
+    char *end = NULL;
+    unsigned long parsed;
+    if (value == NULL || *value == 0) return 0;
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    /* strtoul() skips leading blanks and accepts a sign, wrapping "-1" into ULONG_MAX, so the first character
+       is inspected directly: a negative or padded scale has to be a rejection, not a huge budget. */
+    if (value[0] < '0' || value[0] > '9' || errno != 0 || end == value || *end != 0 || parsed < 1 ||
+        parsed > TIMEOUT_SCALE_MAX) {
+        fprintf(stderr,
+                "linux-matrix: HL_MATRIX_TIMEOUT_SCALE=\"%s\" is not a decimal factor in [1, %d]; refusing to run "
+                "rather than silently using the unscaled per-case timeout\n",
+                value, TIMEOUT_SCALE_MAX);
+        return 1;
+    }
+    timeout_scale = parsed;
+    /* On stdout, in the output of a PASSING run: a green lane with a scaled budget must not read as evidence
+       that guest execution is comparably fast, and the run's own log is where a reader will look. An explicit
+       x1 announces nothing, because it IS the unscaled run. */
+    if (timeout_scale == 1) return 0;
+    printf("linux-matrix: per-case timeout scaled x%lu to %llums (HL_MATRIX_TIMEOUT_SCALE); this run tolerates "
+           "slow-but-correct guest execution and is NOT evidence of speed comparable to an unscaled lane\n",
+           timeout_scale, (unsigned long long)((uint64_t)CASE_TIMEOUT_MS * timeout_scale));
+    return 0;
+}
+
 static uint64_t milliseconds(void) {
     struct timespec value;
     if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0;
@@ -44,6 +99,7 @@ static int same_file(int actual, const char *expected_path) {
 
 static int run_case(const char *engine, const char *guest, const char *golden, int expected_exit) {
     const struct timespec tick = {0, 10000000};
+    const uint64_t budget = (uint64_t)CASE_TIMEOUT_MS * timeout_scale;
     char temporary[] = "/tmp/hl-linux-matrix-XXXXXX";
     int output = mkstemp(temporary);
     int status = 0, timed_out = 0;
@@ -77,7 +133,7 @@ static int run_case(const char *engine, const char *guest, const char *golden, i
             close(output);
             return 1;
         }
-        if (milliseconds() - start >= UINT64_C(20000)) {
+        if (milliseconds() - start >= budget) {
             timed_out = 1;
             (void)kill(-child, SIGKILL);
             while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
@@ -85,9 +141,15 @@ static int run_case(const char *engine, const char *guest, const char *golden, i
         }
         (void)nanosleep(&tick, NULL);
     }
-    if (timed_out)
-        fprintf(stderr, "%s: timed out\n", guest);
-    else if (!WIFEXITED(status) || WEXITSTATUS(status) != expected_exit)
+    if (timed_out) {
+        /* Naming the budget matters only when it is not the built-in one; at scale 1 the text stays verbatim so
+           an unscaled lane's failure output is unchanged by the existence of the knob. */
+        if (timeout_scale == 1)
+            fprintf(stderr, "%s: timed out\n", guest);
+        else
+            fprintf(stderr, "%s: timed out after %llums (HL_MATRIX_TIMEOUT_SCALE=%lu)\n", guest,
+                    (unsigned long long)budget, timeout_scale);
+    } else if (!WIFEXITED(status) || WEXITSTATUS(status) != expected_exit)
         fprintf(stderr, "%s: exit mismatch status=%d expected=%d\n", guest, status, expected_exit);
     else if (!same_file(output, golden))
         fprintf(stderr, "%s: stdout differs from %s\n", guest, golden);
@@ -241,11 +303,20 @@ static int run_suite(const char *engine, const char *binary_root, const char *su
     if (fclose(file) != 0) return 1;
     printf("linux-matrix: %zu active %s cases passed; %zu require typed launch; %zu excluded or other ISA\n", passed,
            architecture, unsupported, excluded);
+    /* The summary line is what a reader takes away, and on a scaled host the same case count does not mean what
+       it means on an unscaled one. */
+    if (timeout_scale != 1)
+        printf("linux-matrix: per-case timeout was scaled x%lu; this run's timing is not comparable to an "
+               "unscaled lane\n",
+               timeout_scale);
     return passed == 0;
 }
 
 int main(int argc, char **argv) {
     int failed = 0;
+    /* Before any case runs, so a malformed scale is one line at the top of the log rather than a verdict on a
+       suite that was measured against a budget nobody chose. */
+    if (load_timeout_scale() != 0) return 2;
     if (argc == 5 && strcmp(argv[1], "--suite") == 0)
         return run_suite(argv[2], argv[3], argv[4]) ? EXIT_FAILURE : EXIT_SUCCESS;
     if (argc < 5 || (argc - 2) % 3 != 0) {

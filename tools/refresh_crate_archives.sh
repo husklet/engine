@@ -9,17 +9,24 @@
 # The three halves are independently runnable so no single machine has to be
 # both an aarch64 Linux host and an Apple silicon mac:
 #
-#   --linux       build+install aarch64-unknown-linux-gnu (needs aarch64 Linux)
+#   --linux       build+install the NATIVE Linux archive for THIS host's CPU:
+#                 <aarch64|x86_64>-unknown-linux-gnu (needs a Linux host)
 #   --darwin      build+install aarch64-apple-darwin (needs Darwin, or the `mac`
 #                 bridge over a shared checkout)
 #   --emit PATH   with --darwin: write the built archive to PATH instead of
 #                 installing it, so it can be carried to another host
 #   --from PATH   with --darwin: install PATH's bytes instead of building
-#   --provenance  rewrite the generated block from the archives already in the
-#                 tree, then run the freshness check
+#   --provenance  rewrite the generated block from the PUBLISHED archives already
+#                 in the tree, then run the freshness check
 #
 # No flags means --linux --darwin --provenance, the original one-shot dual-host
 # behaviour.
+#
+# PUBLISHED is narrower than SUPPORTED, and only the published archives appear in
+# PROVENANCE.md: the two aarch64 ones are ~24MB each against the 10MB crates.io
+# budget (pkgs/rust/Cargo.toml), so the x86_64 Linux archive is a LOCAL build
+# product for consumers of this repo. --linux produces it; nothing commits it,
+# and --provenance neither records nor requires it.
 #
 # Split flow: on the mac, `--darwin --emit /somewhere/libhl-engine.a`; carry the
 # file over; on the Linux host, `--linux` then `--darwin --from <file>` then
@@ -96,8 +103,26 @@ sha256() {
 is_darwin() { [ "$(uname -s)" = Darwin ]; }
 have_mac() { command -v "$MAC" >/dev/null 2>&1; }
 
-linux_asset=pkgs/rust/assets/lib/aarch64-unknown-linux-gnu/libhl-engine.a
+# The host CPU, normalised the same way CMakeLists.txt normalises
+# CMAKE_SYSTEM_PROCESSOR into HL_HOST_ARCH. --linux builds a NATIVE archive, so
+# the host CPU decides both the CMake package directory and which asset triple
+# the result is filed under. Getting that wrong was silent and bad: the guard
+# below tested only is_darwin() while its own message said "needs an aarch64
+# Linux host", so on an x86_64 Linux host it built an x86_64 archive and
+# installed it as the aarch64 asset -- an archive that links nowhere, over the
+# one the crate publishes.
+host_arch=
+case "$(uname -m)" in
+aarch64 | arm64) host_arch=aarch64 ;;
+x86_64 | amd64) host_arch=x86_64 ;;
+esac
+
+linux_target=$host_arch-unknown-linux-gnu
+linux_asset=pkgs/rust/assets/lib/$linux_target/libhl-engine.a
 darwin_asset=pkgs/rust/assets/lib/aarch64-apple-darwin/libhl-engine.a
+# What PROVENANCE.md certifies and `cargo publish` ships. Fixed, never derived
+# from the host: an x86_64 build must not be filed under the aarch64 field.
+published_linux_asset=pkgs/rust/assets/lib/aarch64-unknown-linux-gnu/libhl-engine.a
 linux_build=$BUILD/crate-archive-linux
 mac_build=$BUILD/crate-archive-macos
 
@@ -107,17 +132,21 @@ mac_build=$BUILD/crate-archive-macos
 # archive that still has the expected path and provenance.
 
 if [ "$do_linux" = 1 ]; then
-	if is_darwin; then
-		printf 'refresh-crate-archives: --linux needs an aarch64 Linux host\n' >&2
+	if [ "$(uname -s)" != Linux ] || [ -z "$host_arch" ]; then
+		printf 'refresh-crate-archives: --linux builds a NATIVE archive; this host is %s/%s\n' \
+			"$(uname -s)" "$(uname -m)" >&2
+		printf 'refresh-crate-archives: run it on a Linux host whose CPU is aarch64 or x86_64\n' >&2
 		exit 1
 	fi
-	printf 'refresh-crate-archives: building the linux-gnu archive\n'
+	printf 'refresh-crate-archives: building the %s archive\n' "$linux_target"
 	"$CMAKE" -S "$root" -B "$linux_build" -G Ninja -DHL_BUILD_TESTS=OFF
 	"$NINJA" -C "$linux_build" hl-engine-activation
-	install -m 0644 "$linux_build/package/linux-aarch64/libhl-engine.a" "$linux_asset.tmp"
-	tools/validate_crate_archive.sh aarch64-unknown-linux-gnu "$linux_asset.tmp"
+	mkdir -p "$(dirname -- "$linux_asset")"
+	# package/linux-<arch> is HL_PACKAGE_ARCH_DIR; it encodes the HOST platform.
+	install -m 0644 "$linux_build/package/linux-$host_arch/libhl-engine.a" "$linux_asset.tmp"
+	tools/validate_crate_archive.sh "$linux_target" "$linux_asset.tmp"
 	mv -f "$linux_asset.tmp" "$linux_asset"
-	tools/validate_crate_archive.sh aarch64-unknown-linux-gnu "$linux_asset"
+	tools/validate_crate_archive.sh "$linux_target" "$linux_asset"
 fi
 
 if [ "$do_darwin" = 1 ] && [ -z "$darwin_from" ]; then
@@ -176,7 +205,17 @@ if [ "$do_darwin" = 1 ] && [ -n "$darwin_from" ]; then
 fi
 
 if [ "$do_provenance" = 1 ]; then
-	for asset in "$linux_asset" "$darwin_asset"; do
+	# The block certifies the PUBLISHED archives, and this host cannot have just
+	# produced the published Linux one -- its --linux half builds a different
+	# triple. Rewriting the block anyway would restate a stale aarch64 digest
+	# against a fresh source manifest, i.e. certify bytes nobody rebuilt.
+	if [ "$host_arch" != aarch64 ]; then
+		printf 'refresh-crate-archives: --provenance certifies the aarch64 archives; this host is %s\n' \
+			"$(uname -m)" >&2
+		printf 'refresh-crate-archives: run it on the aarch64 host that produced them\n' >&2
+		exit 1
+	fi
+	for asset in "$published_linux_asset" "$darwin_asset"; do
 		[ -s "$asset" ] || {
 			printf 'refresh-crate-archives: %s is missing; build it first\n' "$asset" >&2
 			exit 1
@@ -188,7 +227,7 @@ if [ "$do_provenance" = 1 ]; then
 		commit="$commit (with uncommitted changes under src/ or include/)"
 	fi
 	manifest=$(tools/crate_archive_manifest.sh)
-	linux_sha=$(sha256 "$linux_asset" | cut -d' ' -f1)
+	linux_sha=$(sha256 "$published_linux_asset" | cut -d' ' -f1)
 	darwin_sha=$(sha256 "$darwin_asset" | cut -d' ' -f1)
 	abi=$(sed -n 's/^#define HL_CONFIG_ABI \([0-9]*\).*/\1/p' include/hl/config.h | head -1)
 

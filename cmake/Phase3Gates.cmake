@@ -256,6 +256,10 @@ add_test(NAME production.matrix
   COMMAND $<TARGET_FILE:linux-matrix>
           ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-x86_64 ${_matrix_args})
 set_tests_properties(production.matrix PROPERTIES LABELS "production" RESOURCE_LOCK hl-guest TIMEOUT 1800 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# linux-matrix enforces a per-case budget of its own; hl_matrix_timeout_scale
+# (cmake/Phase3Compat.cmake) is what keeps the two budgets consistent on a host
+# whose backend interprets. No-op wherever the scale is 1.
+hl_matrix_timeout_scale(production.matrix)
 
 # test-linux-production-{aarch64-,}full: whole-suite sweeps via linux-matrix.
 set(_full_suites
@@ -286,6 +290,7 @@ foreach(_arch aarch64 x86_64)
     set_tests_properties(production.full-${_arch}.${_label} PROPERTIES
       LABELS "production;production-full;production-full-${_arch}"
       RESOURCE_LOCK hl-guest TIMEOUT 3600 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    hl_matrix_timeout_scale(production.full-${_arch}.${_label})
   endforeach()
   add_test(NAME production.full-${_arch}.soak
     COMMAND $<TARGET_FILE:linux-matrix> --suite
@@ -293,6 +298,7 @@ foreach(_arch aarch64 x86_64)
             ${CMAKE_BINARY_DIR}/soak/${_arch} ${CMAKE_SOURCE_DIR}/tests/soak)
   set_tests_properties(production.full-${_arch}.soak PROPERTIES
     LABELS "production;production-full" RESOURCE_LOCK hl-guest RUN_SERIAL TRUE TIMEOUT 3600 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  hl_matrix_timeout_scale(production.full-${_arch}.soak)
 endforeach()
 # The x86_64 lane also sweeps the committed ISA corpus.
 add_test(NAME production.full-x86_64.isa
@@ -300,6 +306,7 @@ add_test(NAME production.full-x86_64.isa
           ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-x86_64
           ${HL_COMPAT}/isa/x86_64 ${CMAKE_SOURCE_DIR}/tests/compat/isa/x86_64)
 set_tests_properties(production.full-x86_64.isa PROPERTIES LABELS "production;production-full" RESOURCE_LOCK hl-guest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+hl_matrix_timeout_scale(production.full-x86_64.isa)
 
 # test-linux-production-config
 add_test(NAME production.config-env
@@ -460,18 +467,80 @@ set(HL_PERF_SAMPLES 25    CACHE STRING "perf samples")
 set(HL_PERF_HEAVY_SAMPLES 7 CACHE STRING "perf samples for heavy cases")
 set(HL_PERF_OP_SAMPLES 7  CACHE STRING "perf samples for OS-op cases")
 
+# --- whether the thresholds above are ENFORCED, as a function of the host CPU -
+# Every PERF_LIMIT_ pair above describes a JIT: they are tracked numbers measured
+# on an ARM64 host, and DOCS.md's "Performance and release" roadmap item commits
+# to enforcing them. An x86_64 host has no JIT for either guest ISA -- both
+# frontends emit ARM64, so its backend decodes and executes at roughly 10-50x the
+# cost (docs/amd64-host.md section 3). Enforced there, all thirteen cases fail
+# for the one reason that is already known and documented, which measures nothing.
+#
+# Three ways out, and the choice matters more than it looks:
+#
+#   (a) a second, host-conditional set of thresholds. Rejected: nobody has
+#       measured them. The interpreters are being written right now, so any
+#       number written today blesses whatever a half-finished backend happens to
+#       do, and the first real optimisation would "regress" against it.
+#   (b) declare the lane not-applicable on this host and skip it. Rejected: it
+#       stops exercising the path entirely -- perf-runner drives 13 real guest
+#       launches per case through the production engine, which is the densest
+#       execution coverage in the tree outside the compat matrix -- and it would
+#       empty a lane cmake/CiLanes.cmake declares for Linux, which
+#       gate.ci-lane-parity would then have to be taught to exempt.
+#   (c) run them and report, enforce nothing. Chosen.
+#
+# (c) is not merely the least-red option. The Stage-2 same-ISA transliterator
+# (docs/amd64-host.md section 3) needs a number to beat, and an interpreter
+# baseline recorded by the same runner, on the same fixtures, in the same format
+# as the aarch64-host numbers is exactly that. The measurement is the deliverable;
+# the verdict is what cannot be honest yet.
+#
+# What that must never become is a green case implying a threshold was met. So
+# record-only cases are RENAMED (`.record-only`) rather than merely relabelled --
+# a CTest summary line is often all anyone reads -- the thresholds are dropped
+# from the perf-runner command line instead of being widened, and every case
+# echoes what was not enforced. The --label perf-runner records is deliberately
+# NOT renamed: `metric=linux-startup-x86_64` has to stay comparable across hosts
+# and across Stage 2, and record-only-ness is a property of the run, not of the
+# metric.
+#
+# aarch64 hosts are untouched by all of this: HL_PERF_ENFORCE is ON there, so
+# every case keeps its name, its thresholds and its verdict.
+if(HL_HOST_ARCH STREQUAL "x86_64")
+  set(_hl_perf_enforce_default OFF)
+else()
+  set(_hl_perf_enforce_default ON)
+endif()
+option(HL_PERF_ENFORCE
+  "enforce the tracked cold/p99 perf thresholds (OFF records the measurement without a verdict)"
+  ${_hl_perf_enforce_default})
+
 # hl_perf_linux(<case> <arch> <warmups> <samples> <payload> <expect-status>)
 function(hl_perf_linux case arch warmups samples payload expect)
   list(GET PERF_LIMIT_${case} 0 _cold)
   list(GET PERF_LIMIT_${case} 1 _p99)
   set(_guest /tmp/hl-perf-linux-${case}-${arch})
-  add_test(NAME perf.linux-${case}-${arch}
+  set(_name perf.linux-${case}-${arch})
+  # A STRING, not a list: it is interpolated into a -DCMD1= command line that
+  # cmake/RunSequence.cmake splits with separate_arguments, and a CMake list
+  # would arrive there as semicolons.
+  set(_limits "--max-cold-us ${_cold} --max-p99-us ${_p99}")
+  set(_record "")
+  if(NOT HL_PERF_ENFORCE)
+    set(_name ${_name}.record-only)
+    set(_limits "")
+    # Appended as the LAST step so the enforced path's command list is byte-for-
+    # byte what it was: aarch64 gets CMD0+CMD1 exactly as before.
+    set(_record "-DCMD2=${CMAKE_COMMAND} -E echo RECORD-ONLY ${_name}: measured but NOT gated. Its tracked thresholds (cold ${_cold}us p99 ${_p99}us) describe a JIT host and were not applied here. See docs/ci-green.md.")
+  endif()
+  add_test(NAME ${_name}
     COMMAND ${CMAKE_COMMAND}
       "-DCMD0=${CMAKE_COMMAND} -E copy_if_different ${payload} ${_guest}"
-      "-DCMD1=$<TARGET_FILE:perf-runner> --label linux-${case}-${arch} --warmups ${warmups} --samples ${samples} --expect ${expect} --max-cold-us ${_cold} --max-p99-us ${_p99} -- ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${arch} ${_guest}"
+      "-DCMD1=$<TARGET_FILE:perf-runner> --label linux-${case}-${arch} --warmups ${warmups} --samples ${samples} --expect ${expect} ${_limits} -- ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${arch} ${_guest}"
+      ${_record}
       -P ${CMAKE_SOURCE_DIR}/cmake/RunSequence.cmake)
   # Timing measurements are meaningless when other tests contend for the CPU.
-  set_tests_properties(perf.linux-${case}-${arch} PROPERTIES
+  set_tests_properties(${_name} PROPERTIES
     LABELS "perf;perf-linux" RUN_SERIAL TRUE TIMEOUT 1800 WORKING_DIRECTORY /tmp)
 endfunction()
 
@@ -498,16 +567,34 @@ foreach(_arch aarch64 x86_64)
   # the case, exactly like the Makefile's `$(RM) -r` prologue.
   list(GET PERF_LIMIT_warm-cache 0 _wc_cold)
   list(GET PERF_LIMIT_warm-cache 1 _wc_p99)
-  add_test(NAME perf.linux-warm-cache-${_arch}
+  # Same record-only decision as hl_perf_linux above, spelled again because this
+  # case has a three-step prologue of its own and does not go through it.
+  set(_wc_name perf.linux-warm-cache-${_arch})
+  set(_wc_limits "--max-cold-us ${_wc_cold} --max-p99-us ${_wc_p99}")
+  set(_wc_record "")
+  if(NOT HL_PERF_ENFORCE)
+    set(_wc_name ${_wc_name}.record-only)
+    set(_wc_limits "")
+    set(_wc_record "-DCMD3=${CMAKE_COMMAND} -E echo RECORD-ONLY ${_wc_name}: measured but NOT gated. Its tracked thresholds (cold ${_wc_cold}us p99 ${_wc_p99}us) describe a JIT host and were not applied here. See docs/ci-green.md.")
+  endif()
+  add_test(NAME ${_wc_name}
     COMMAND ${CMAKE_COMMAND}
       "-DCMD0=${CMAKE_COMMAND} -E copy_if_different ${HL_PERF}/translate-${_arch} /tmp/hl-perf-linux-warm-cache-${_arch}"
       "-DCMD1=${CMAKE_COMMAND} -E rm -rf /tmp/hl-perf-cache-warm-linux-${_arch}"
-      "-DCMD2=$<TARGET_FILE:perf-runner> --label linux-warm-cache-${_arch} --warmups ${HL_PERF_WARMUPS} --samples ${HL_PERF_SAMPLES} --max-cold-us ${_wc_cold} --max-p99-us ${_wc_p99} -- $<TARGET_FILE:config-e2e-runner> env ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${_arch} /tmp/hl-perf-linux-warm-cache-${_arch} 0 1 /tmp/hl-perf-cache-warm-linux-${_arch}"
+      "-DCMD2=$<TARGET_FILE:perf-runner> --label linux-warm-cache-${_arch} --warmups ${HL_PERF_WARMUPS} --samples ${HL_PERF_SAMPLES} ${_wc_limits} -- $<TARGET_FILE:config-e2e-runner> env ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${_arch} /tmp/hl-perf-linux-warm-cache-${_arch} 0 1 /tmp/hl-perf-cache-warm-linux-${_arch}"
+      ${_wc_record}
       -P ${CMAKE_SOURCE_DIR}/cmake/RunSequence.cmake)
-  set_tests_properties(perf.linux-warm-cache-${_arch} PROPERTIES
+  set_tests_properties(${_wc_name} PROPERTIES
     LABELS "perf;perf-linux" RUN_SERIAL TRUE TIMEOUT 1800
     WORKING_DIRECTORY /tmp)
 
+  # Deliberately NOT record-only on any host. This case applies no timing
+  # threshold at all: the assertions live inside tests/perf/resource.c and bound
+  # retained RSS growth (2048 pages) plus a return to the descriptor and thread
+  # baseline after teardown. Those are leak bounds, and a leak is not a function
+  # of how fast the backend executes -- an interpreter with no code cache should
+  # retain less, not more. Suspending it because the neighbouring cases are
+  # unenforceable would drop a real gate for an unrelated reason.
   add_test(NAME perf.linux-resource-${_arch}
     COMMAND ${CMAKE_COMMAND}
       "-DCMD0=${CMAKE_COMMAND} -E copy_if_different ${HL_PERF}/resource-${_arch} /tmp/hl-perf-linux-resource-${_arch}"
@@ -517,28 +604,49 @@ foreach(_arch aarch64 x86_64)
     LABELS "perf;perf-linux" RUN_SERIAL TRUE WORKING_DIRECTORY /tmp)
 endforeach()
 
-# perf-native-aarch64: only meaningful when the host can run the AArch64 Linux
-# fixtures directly (Makefile guards this with uname -s/-m and exits 2).
+# perf-native-<host cpu>: the NATIVE baseline the perf-linux numbers above are
+# read against. Every case here is one of the perf-linux payloads run DIRECTLY
+# by the host instead of through the engine, so the pair is the engine's
+# overhead; no thresholds are applied, because a native number is a measurement,
+# not a verdict.
+#
+# That only works where the fixture's ISA IS the host CPU, which is why this was
+# `perf.native-*-aarch64` guarded on an aarch64 processor. The guard was right;
+# the arch in the name was not a property of the lane. Sections 1-2 above build
+# every one of these payloads for BOTH ISAs unconditionally, and an x86_64 host
+# executes the x86_64 ones exactly as an aarch64 host executes the aarch64 ones
+# (verified: build/e2e/guest-exit-x86_64 exits 42 natively here). So the family
+# follows HL_HOST_ARCH and the perf-native LANE is non-empty on both host CPUs
+# rather than being an aarch64-only lane the parity gate has to exempt.
+#
+# CMAKE_HOST_SYSTEM_* is what is checked, not HL_HOST_ARCH alone: HL_HOST_ARCH
+# describes the TARGET host, and a cross configure (cmake/toolchains/) can name
+# a CPU this machine cannot execute. The Makefile guarded the same way, with
+# uname -s/-m, and exited 2.
 if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND
-   CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+   ((HL_HOST_ARCH STREQUAL "aarch64" AND
+     CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$") OR
+    (HL_HOST_ARCH STREQUAL "x86_64" AND
+     CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")))
+  set(_native ${HL_HOST_ARCH})
   function(hl_perf_native case warmups samples payload expect)
-    add_test(NAME perf.native-${case}-aarch64
-      COMMAND $<TARGET_FILE:perf-runner> --label native-${case}-aarch64
+    add_test(NAME perf.native-${case}-${_native}
+      COMMAND $<TARGET_FILE:perf-runner> --label native-${case}-${_native}
               --warmups ${warmups} --samples ${samples} --expect ${expect} -- ${payload})
-    set_tests_properties(perf.native-${case}-aarch64 PROPERTIES
+    set_tests_properties(perf.native-${case}-${_native} PROPERTIES
       LABELS "perf;perf-native" RUN_SERIAL TRUE WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endfunction()
-  hl_perf_native(startup ${HL_PERF_WARMUPS} ${HL_PERF_SAMPLES} ${HL_E2E}/guest-exit-aarch64 42)
+  hl_perf_native(startup ${HL_PERF_WARMUPS} ${HL_PERF_SAMPLES} ${HL_E2E}/guest-exit-${_native} 42)
   hl_perf_native(compute ${HL_PERF_WARMUPS} ${HL_PERF_HEAVY_SAMPLES}
-                 ${HL_COMPAT}/core/workload/aarch64/busyloop 0)
+                 ${HL_COMPAT}/core/workload/${_native}/busyloop 0)
   hl_perf_native(syscall-startup ${HL_PERF_WARMUPS} ${HL_PERF_SAMPLES}
-                 ${HL_COMPAT}/syscall/aarch64/gettid 0)
+                 ${HL_COMPAT}/syscall/${_native}/gettid 0)
   hl_perf_native(syscall-1m ${HL_PERF_WARMUPS} ${HL_PERF_HEAVY_SAMPLES}
-                 ${HL_PERF}/syscall-aarch64 0)
+                 ${HL_PERF}/syscall-${_native} 0)
   hl_perf_native(fork-stress 1 ${HL_PERF_HEAVY_SAMPLES}
-                 ${HL_COMPAT}/process/aarch64/forkstorm 0)
+                 ${HL_COMPAT}/process/${_native}/forkstorm 0)
   foreach(_op mmap file pipe event ipc-latency ipc-throughput)
-    hl_perf_native(${_op} ${HL_PERF_WARMUPS} ${HL_PERF_OP_SAMPLES} ${HL_PERF}/${_op}-aarch64 0)
+    hl_perf_native(${_op} ${HL_PERF_WARMUPS} ${HL_PERF_OP_SAMPLES} ${HL_PERF}/${_op}-${_native} 0)
   endforeach()
 endif()
 
@@ -599,7 +707,14 @@ add_test(NAME isa-fuzz.x86_64-regress
           --list "${HL_ISA_FUZZ_REGRESS_SEEDS}" --ignore-mxcsr)
 
 # The aarch64 oracle is the ARM64 HOST running the same binary, so run.sh
-# refuses to run anywhere else; register it only where it can pass.
+# refuses to run anywhere else (tests/fuzz/isa/aarch64/run.sh exits 2 on a
+# non-ARM host); register it only where it can pass.
+#
+# Consequence worth stating, because a green lane hides it: on an x86_64 host
+# `isa-fuzz` is isa-fuzz.x86_64-regress ALONE -- one of three cases -- so half
+# the differential ISA fuzz coverage is host-conditional. gate.ci-lane-parity
+# proves the lane is non-empty, not that it is complete. cmake/CiLanes.cmake and
+# DOCS.md 7.5.1 repeat this where the lanes are declared and documented.
 if(CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
   add_test(NAME isa-fuzz.aarch64-regress
     COMMAND ${CMAKE_SOURCE_DIR}/tests/fuzz/isa/aarch64/run.sh

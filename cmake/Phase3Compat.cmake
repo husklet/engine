@@ -398,6 +398,77 @@ endif()
 set(HL_ENGINE_AARCH64 ${HL_MATRIX_ENGINE_DIR}/hl-engine-linux-aarch64)
 set(HL_ENGINE_X86_64  ${HL_MATRIX_ENGINE_DIR}/hl-engine-linux-x86_64)
 
+# --- the per-case timeout budget, as a function of the HOST CPU --------------
+# tools/matrix_runner.c and tools/linux_matrix.c kill a case that outruns a
+# per-case budget (120s and 20s) and report a hang. Both budgets were calibrated
+# on a JIT host, which was every host there was: on an ARM64 host these cases are
+# milliseconds of guest work, so "did not finish" could only mean hung.
+#
+# An x86_64 host has no JIT. Neither guest frontend has an amd64 back end -- both
+# emit ARM64 -- so its backend decodes and executes, at roughly 10-50x the cost
+# (docs/amd64-host.md section 3). Leaving the budgets alone there would turn
+# slow-but-correct into a killed process reported as a hang: the worst available
+# diagnostic, because it is both false and identical to the true one.
+#
+# So the scale is declared HERE, beside the test registration, and passed to the
+# runners in the environment. It is not detected inside them -- see the long note
+# above case_timeout_ms() in tools/matrix_runner.c for why a harness must not
+# infer its own budget from the backend it is testing.
+#
+# HL_HOST_ARCH is the axis, taken from CMakeLists.txt, which derives it once and
+# normalises arm64/aarch64 and amd64/x86_64. CMAKE_SYSTEM_PROCESSOR is not
+# re-tested here: two spellings of one host CPU are exactly how a guard like this
+# comes to apply on one machine and not its twin.
+#
+# 30 is a placeholder with a reason, not a measurement: the interpreters are
+# being written, nothing has been measured, and 30 is the middle of the range
+# docs/amd64-host.md predicts. Raise or lower it with -D once there are numbers;
+# what must not happen is that it silently stays at 1.
+if(HL_HOST_ARCH STREQUAL "x86_64")
+  set(_hl_timeout_scale_default 30)
+else()
+  set(_hl_timeout_scale_default 1)
+endif()
+set(HL_MATRIX_TIMEOUT_SCALE ${_hl_timeout_scale_default} CACHE STRING
+    "multiply every per-case guest timeout by this factor (>1 where the host backend interprets)")
+# The runners reject a malformed scale; rejecting it at configure time as well
+# means a typo cannot survive as far as a test verdict.
+if(NOT HL_MATRIX_TIMEOUT_SCALE MATCHES "^[1-9][0-9]*$" OR HL_MATRIX_TIMEOUT_SCALE GREATER 100)
+  message(FATAL_ERROR
+    "HL_MATRIX_TIMEOUT_SCALE='${HL_MATRIX_TIMEOUT_SCALE}' must be an integer factor in [1, 100]. "
+    "It multiplies the per-case guest timeout; a run that needs more than 100x wants a different budget "
+    "(HL_MATRIX_CASE_TIMEOUT_MS), not a larger factor.")
+endif()
+
+# hl_matrix_timeout_scale(<test> ...)
+#   Scales the CTest budget of tests driven by matrix-runner / linux-matrix and
+#   hands them the factor. Both layers have to move together: a per-case budget
+#   of 20s x 30 buys nothing if CTest kills the whole suite at its own TIMEOUT
+#   first, and that failure is worse than the one being fixed -- CTest reports
+#   the suite, so no case is named at all.
+#
+#   At scale 1 this function writes NOTHING. That is the point: the aarch64
+#   lanes' generated CTestTestfile.cmake is byte-identical to what it was before
+#   this existed, so "the default changes nothing" is a property of the build
+#   rather than a claim about it. It also means the multiplier applies to
+#   whatever budget the caller already set, including CTest's own 1500s default
+#   for a test that set none.
+function(hl_matrix_timeout_scale)
+  if(HL_MATRIX_TIMEOUT_SCALE EQUAL 1)
+    return()
+  endif()
+  foreach(_test IN LISTS ARGN)
+    get_test_property(${_test} TIMEOUT _hl_current_timeout)
+    if(NOT _hl_current_timeout)
+      set(_hl_current_timeout 1500)
+    endif()
+    math(EXPR _hl_scaled_timeout "${_hl_current_timeout} * ${HL_MATRIX_TIMEOUT_SCALE}")
+    set_tests_properties(${_test} PROPERTIES
+      TIMEOUT ${_hl_scaled_timeout}
+      ENVIRONMENT HL_MATRIX_TIMEOUT_SCALE=${HL_MATRIX_TIMEOUT_SCALE})
+  endforeach()
+endfunction()
+
 # hl_compat_suite(<label> <bin-subdir> <suite-source-dir> [SERIAL] [LOCKS ...])
 #   Adds `compat.<label>` running the whole suite through matrix-runner, with
 #   LABELS <label> so `ctest -L compat-ipc` selects exactly that suite.
@@ -449,6 +520,8 @@ function(hl_compat_suite label bindir suitedir)
   # `ctest -L compat-ipc` select one suite. Extra LOCKS narrow it further.
   set_tests_properties(compat.${label} PROPERTIES
     RESOURCE_LOCK "hl-guest;${C_LOCKS}" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  # Last, so it scales the TIMEOUT set above rather than being overwritten by it.
+  hl_matrix_timeout_scale(compat.${label})
 endfunction()
 
 hl_compat_suite(abi          ${HL_COMPAT}/abi          tests/compat/abi)
@@ -542,4 +615,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             ${HL_TESTS}/compat/network icmp-bridge)
   set_tests_properties(compat.network-icmp-bridge PROPERTIES
     LABELS "compat;compat-network" RESOURCE_LOCK "hl-guest;hl-net" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  # Runs the same suite through matrix-runner, so it needs the same budget. It
+  # sets no TIMEOUT of its own, so the scale applies to CTest's 1500s default.
+  hl_matrix_timeout_scale(compat.network-icmp-bridge)
 endif()

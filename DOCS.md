@@ -6,6 +6,7 @@ completion roadmap. The rest of `docs/` is subordinate detail.
 | Document | Covers |
 |---|---|
 | `docs/arch.md` | Where each layer defined here lives, at symbol level. Read it before touching `src/core`. |
+| `docs/amd64-host.md` | The x86-64 Linux host: the host-CPU seam, the host-CPU x guest-ISA matrix, and why an interpreter comes before a transliterator. |
 | `docs/makefile-retirement-darwin-evidence.md` | Measured `make`-vs-CTest equivalence, recorded before the Makefile was deleted. |
 | `docs/ci-green.md` | Differential compat findings, `excluded-macos` justifications, runtime self-skips, open gaps. |
 | `docs/checkpoint-sink.md` | The `ckpt_sink`/`ckpt_source` interface and the embedder-supplied checkpoint store. |
@@ -23,11 +24,18 @@ benchmark harness.
 the only guest operating-system personality. The engine translates guest machine code, implements the Linux ABI, and
 delegates native operating-system work through a typed host-service interface.
 
-The final system has three independent axes:
+The final system has three independent axes, the last of which is itself a pair:
 
 - **Guest operating system:** Linux.
 - **Guest instruction set:** initially AArch64 and x86-64.
-- **Host platform:** macOS and Linux behind the same service contract.
+- **Host platform:** macOS and Linux behind the same service contract — and, independently of the host OS, the
+  **host CPU**: AArch64 and x86-64.
+
+Host OS and host CPU are separate axes and they compose. They are named once per language and nowhere re-derived:
+`HL_HOST_CPU_*` in `src/host/host_cpu.h`, `HL_HOST_ARCH` in `CMakeLists.txt`, `hostCPUs` in `flake.nix`, beside the
+host-OS names `src/host/<os>/`, `CMAKE_SYSTEM_NAME` and `hostBackends`. A guest ISA equal to the host CPU permits
+same-ISA transliteration; it is never a reason to treat the two as one fact. `docs/amd64-host.md` records the seam and
+the current state of the host-CPU x guest-ISA matrix.
 
 This ordering is an implementation priority, not an architectural dependency. The current production effort ports and
 finishes the known-working macOS-hosted Linux engine. Every behavior is separated into translator, Linux ABI, and
@@ -171,9 +179,32 @@ The translator has four responsibilities:
 It does not implement Linux syscalls and does not access paths, native files, processes, clocks, signals, or sockets.
 Executable-memory allocation and instruction-cache publication are host services.
 
+**Two code paths live here, and only one of them executes guests today. State which is which before reading the
+directory layout, because the layout suggests otherwise.**
+
+- **The IR / codegen pipeline** — `include/hl/ir.h`, `include/hl/codegen.h`, `src/translator/codegen.c` and the
+  per-host-CPU lowerers under `src/translator/host/{aarch64,x86_64}/` — is the pipeline responsibilities 2-4 describe.
+  It is real, symmetric across both host CPUs, validated and unit-tested (`unit.codegen`), and it is **published API**:
+  `codegen.h` and `ir.h` ship through `hl-engine.pc`. It is **not on the production execution path**. `hl_codegen_block`
+  and `hl_codegen_function` have no caller in `src/`; the only caller in the tree is `tests/unit/test_codegen.c`. The IR
+  it lowers has 17 opcodes with no flags, no vector values, no atomics and no syscalls, so it cannot express either
+  production frontend as those frontends exist. Read `src/translator/host/x86_64/` as "an x86-64 lowerer for this IR",
+  not as "the x86-64 host backend the engine needs".
+- **The production frontends** — `src/translator/guest/{aarch64,x86_64}/` — are what actually runs guests, and they
+  emit host machine code **directly**, bypassing the IR. `guest/x86_64/emit.c` is a set of ARM64 host emitters (its own
+  header says so, NEON/SSE included); `guest/aarch64/translate.c` is a same-ISA transliterator that copies most guest
+  instructions verbatim and mangles only stolen-register users. Both therefore presuppose an ARM64 host CPU. Bringing up
+  a new host CPU is new code generation in these directories, not a matter of selecting an existing lowerer.
+  `docs/amd64-host.md` is the detail.
+
+`src/translator/reloc.c`, in the same area, IS live on the production path: `guest/*/cache.c` calls `hl_reloc_slide`
+when it loads a persistent-cache artifact at a different base.
+
 IR blocks end with explicit terminators. Values refer only to valid prior definitions. Validation runs before lowering.
-Persistent cache identity includes every code-changing input: guest ISA, host ISA, IR ABI, codegen ABI, translator
-features, page assumptions, and relevant execution modes. A cache mismatch is a miss, never a best-effort load.
+Persistent cache identity includes every code-changing input: guest ISA, host CPU, IR ABI, codegen ABI, translator
+features, page assumptions, and relevant execution modes. A cache mismatch is a miss, never a best-effort load. The
+host CPU is part of that key because two hosts sharing a cache directory would otherwise accept and execute each
+other's host code.
 
 Persistent artifacts use the typed File service only. The engine creates or opens the configured private cache
 directory once, validates it without following a final symlink, and pins that directory handle for the run. Every
@@ -308,6 +339,13 @@ parent-only synchronization state into the child.
 The fake backend is deterministic and exists for core unit tests. It must model contract semantics faithfully enough
 to test validation, rollback, lifecycle, and error propagation; it is not a production fallback.
 
+`src/host/<os>/` is keyed by host OS alone and is host-CPU-neutral: `src/host/linux/` compiles and passes its provider
+tests unchanged on an x86-64 host. The host CPU is therefore **not** an axis of this directory — it is an axis of the
+translator (3.3) and of the target roots under `src/core/target/`. Code that must branch on it uses `HL_HOST_CPU_*`
+from `src/host/host_cpu.h`, never a bare compiler predefine: `defined(__x86_64__)` says nothing about which OS's
+`ucontext_t` layout and calling convention apply, and mixing the two produced an Apple-shaped register access that
+could not compile against a Linux `ucontext_t`.
+
 ### 3.7 Runner boundary (`src/runner`, `src/core/target`)
 
 The runner is a generic Linux-program launcher. It accepts engine configuration, guest executable, argument and
@@ -411,8 +449,8 @@ Cross/host toolchain files live in `cmake/toolchains/`:
 
 | file | builds |
 |---|---|
-| `cmake/toolchains/aarch64-linux.cmake` | aarch64 Linux, forcing `$AARCH64_LINUX_CC`. Only needed when `$CC` is not already the intended host compiler; a native devShell build needs no toolchain file. |
-| `cmake/toolchains/x86_64-linux.cmake`  | x86_64 guest fixtures |
+| `cmake/toolchains/aarch64-linux.cmake` | aarch64 Linux **host** archives, forcing `$AARCH64_LINUX_CC`. Only needed when `$CC` is not already the intended host compiler; a native devShell build needs no toolchain file. From an x86-64 Linux host it is a genuine cross file, which is how CI compiles the AArch64 arm of every host-CPU guard without AArch64 hardware. |
+| `cmake/toolchains/x86_64-linux.cmake`  | x86-64 Linux **host** archives, forcing `$X86_64_LINUX_CC`. Not guest fixtures: guest binaries are built per ISA by `cmake/GuestFixtures.cmake` regardless of which toolchain file configured the tree. As with the aarch64 file, a native devShell build on that host needs no toolchain file. |
 | `cmake/toolchains/macos-remote.cmake`  | macOS artifacts **from a Linux host**, by forwarding each compiler and binutils invocation to the macOS host through OrbStack's `mac` (see `tools/remote/`). The build directory must live inside the repo, because only that path is shared with the macOS side. |
 
 Nix remains the toolchain authority: the toolchain files read the same `AARCH64_LINUX_CC` /
@@ -440,9 +478,13 @@ hash `flake.nix` -- rather than a newly added dependency.
 verifies is a `check`, which is also why checks can compile — they get a real stdenv, whereas a
 `writeShellApplication` does not carry the cc-wrapper variables and so cannot invoke the compiler correctly.
 
-Hosts and guest ISAs are data tables in `flake.nix` (`hostBackends`, `guestISAs`), not `system == "..."`
-branches, so `x86_64-linux` is first class today and a Windows host backend is a one-entry addition once
-`src/host/windows/` has code.
+Host OSes, host CPUs and guest ISAs are data tables in `flake.nix` (`hostBackends`, `hostCPUs`, `guestISAs`), not
+`system == "..."` branches, so adding a member is an entry rather than a new branch: a Windows host backend is one
+entry once `src/host/windows/` has code. `x86_64-linux` is a full member of `systems` — its devShell, `packages.default`
+and `checks.{format,lint,package,unit}` all exist and are green — but read that as "first class in the build", not
+"first class as a host": `checks.x86_64-linux.rust` deliberately does not exist (`hasCrateArchive` is false without a
+committed x86-64 crate archive), and no guest executes on an x86-64 host yet. See the host table in `README.md` for
+what is proven, and `docs/amd64-host.md` for what gates the rest.
 
 ### 7.1 Build libraries and runner
 
@@ -478,11 +520,24 @@ ninja -C build format-check
 Architectural ownership is enforced by the library build and link graph, not by tests that inspect
 source text. The `macos` lane builds the mac host tests and executes them on a real mac host.
 
+A few unit cases are host-CPU-conditional in a way the pass count does not show. `unit.codegen` builds IR for both
+host-CPU lowerers on every host but only *executes* the emitted bytes on a matching host
+(`#if defined(__aarch64__)` / `#elif defined(__x86_64__)`), and every CI runner was ARM64 — so the x86-64 lowerer's
+output had never been executed on any machine. Running the lane on an x86-64 Linux host executes it, and it passes.
+That is a real coverage gain from the host itself rather than from any new test, and it is the kind of gain a
+second host CPU is worth having for.
+
 **Always pass `--no-tests=error`.** `ctest -L <label>` exits 0 when the label matches nothing, so a
 typo or a renamed label reports success. Invariant I15 (`tools/check_ci_workflows.sh`) rejects any
 workflow step that omits it.
 
 ### 7.4 Linux-host production tests
+
+These lanes run guests through the `build/linux-production` engines, so they need a host CPU those engines have a
+backend for. Today that is **AArch64 only** — on an x86-64 Linux host the tests are registered (the guest fixtures and
+the CTest registry are host-CPU-neutral, which is what `gate.ci-lane-parity` checks) but cannot pass until the x86-64
+translator backends land. `production.smoke-x86_64` is the cheapest end-to-end proof and the milestone to watch;
+`docs/amd64-host.md` section 6 tracks it.
 
 On a Linux/AArch64 host:
 
@@ -553,16 +608,39 @@ remote-supervisor --no-tests=error`.
 
 `cmake/CiLanes.cmake` declares, per host, which lanes CI shards (`HL_CI_SHARDED_*`), which the main
 job runs directly (`HL_CI_DIRECT_*`), and which exist but no workflow runs (`HL_CI_REGISTRY_*`).
-It is the single source of truth, and two guards hang off it:
+It is the single source of truth, and these guards hang off it:
 
 | guard | asserts |
 |---|---|
 | `gate.ci-lane-parity` (`cmake/LaneParity.cmake`, `tools/check_lane_parity.sh`; runs in the `unit` label) | every declared lane selects **at least one** test on this host |
 | `unit.ci-workflow-invariants` I13/I14 | every sharded lane is named by **exactly one** workflow shard, and no shard names an undeclared lane |
 | `unit.ci-workflow-invariants` I15 | every `ctest -L` step in a workflow passes `--no-tests=error` |
+| `unit.ci-workflow-invariants` I19 | every sharded lane runs on every host in `HL_CI_COMPAT_HOSTS`, unless `HL_CI_SHARDED_HOST_ONLY` declares the asymmetry (and the exemption is not stale) |
+| `unit.ci-workflow-invariants` I20 | a host **not** in `HL_CI_COMPAT_HOSTS` shards nothing, so its workflow may name no lane at all |
 
 Adding a suite is one edit to `cmake/CiLanes.cmake` plus one shard entry. Forgetting either turns a
 build red instead of silently dropping coverage.
+
+**A host is an (OS, CPU) pair, not an OS.** `HL_CI_HOSTS` declares the tokens — `Linux-aarch64`,
+`Linux-x86_64`, `Darwin-aarch64`, spelled `<CMAKE_SYSTEM_NAME>-<HL_HOST_ARCH>` — one workflow file each
+(`linux.yml`, `linux-x86_64.yml`, `mac.yml`). `HL_CI_COMPAT_HOSTS` is the subset that runs guests and therefore shards
+the compat matrix; `Linux-x86_64` is absent, which is what I20 turns into a hard failure if a compat shard shows up in
+its workflow before the declaration does. `HL_CI_HOST_CPU_ONLY` (`<host-token>:<lane>`) exempts a lane that can only be
+non-empty on some CPUs of its OS; it is empty today.
+
+**A green lane is not necessarily an equal lane, and two are not:**
+
+- `isa-fuzz` has three cases on an AArch64 host and **one** on x86-64. The aarch64 differential oracle *is* the ARM64
+  host CPU executing the same binary, so `tests/fuzz/isa/aarch64/run.sh` refuses a non-ARM host and
+  `isa-fuzz.aarch64-regress{,-pie}` are registered only there. On an x86-64 host the lane is
+  `isa-fuzz.x86_64-regress` alone: **half the differential ISA fuzz coverage is host-conditional.** Do not read a green
+  `isa-fuzz` on an x86-64 host as full fuzz coverage.
+- `perf-native` runs the host's own ISA fixtures directly, as the baseline the `perf-linux` numbers are read against,
+  so which eleven measurements it contains depends on the host CPU. It is registry-only on every host, and no
+  thresholds are applied: a native number is a measurement, not a verdict.
+
+`gate.ci-lane-parity` counts tests per lane. It cannot compare them, so neither asymmetry is machine-detectable —
+which is exactly why both are written down here and at the declaration.
 
 ### 7.6 Installation and consumers
 
@@ -595,6 +673,23 @@ the repository — `pkgs/rust/assets/lib/aarch64-unknown-linux-gnu/libhl-engine.
 `pkgs/rust/assets/lib/aarch64-apple-darwin/libhl-engine.a` — and `cargo publish` ships exactly those bytes. A crate user
 runs the engine that was compiled when the archives were last regenerated, not the engine in this tree.
 
+**Published is narrower than supported, deliberately.** The crate accepts three hosts —
+`aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu` — but commits archives for only the two
+aarch64 ones. Each archive is ~24 MB against the 10 MB crates.io budget documented in `pkgs/rust/Cargo.toml`, so a third
+is a publication decision that needs that budget solved first, not an automatic consequence of a host becoming
+supported. On an x86-64 Linux host the archive is a **local build product**:
+
+```text
+cmake --build <build-dir> --target refresh-crate-archives-linux
+```
+
+`build.rs` prints exactly that command when the asset is missing. The failure a consumer sees is "supported host, no
+archive in this tree, here is how to build it" — never "unsupported target", which is what it used to say and which sent
+the reader looking for missing host support instead of a missing file. `refresh-crate-archives-linux` builds the
+**native** archive for whatever Linux host CPU it runs on and files it under the matching triple;
+`PROVENANCE.md` records only the two published archives, and `--provenance` refuses to run anywhere it could not have
+produced them.
+
 Consequently **every change to a C source or header under `src/` or `include/` requires regenerating both archives**,
 in the same commit as the change. Skipping it ships an engine missing that change, and nothing about the crate build
 reveals it: the archive still links, and a stale archive still launches guests. Releases 0.1.17, 0.1.18 and 0.1.26
@@ -607,15 +702,18 @@ Regenerate both, and rewrite `pkgs/rust/assets/PROVENANCE.md`, with one command:
 cmake --build <build-dir> --target refresh-crate-archives
 ```
 
-It must run on an aarch64 Linux host, and it needs the mac for the darwin half: the macOS archive is compiled by
-`clang` on Apple silicon, reached through the `MAC` bridge (`mac`, see 7.5) over the shared `/Users/x/dd` checkout. On
-Darwin itself `MAC` is `env` and the command builds both locally.
+Regenerating the two **published** archives must run on an aarch64 Linux host, and it needs the mac for the darwin
+half: the macOS archive is compiled by `clang` on Apple silicon, reached through the `MAC` bridge (`mac`, see 7.5) over
+the shared `/Users/x/dd` checkout. On Darwin itself `MAC` is `env` and the command builds both locally. An x86-64 Linux
+host can run `--linux` — it builds its own `x86_64-unknown-linux-gnu` archive, which nothing publishes — but not
+`--provenance`, which certifies bytes only the aarch64 host can have produced and refuses elsewhere rather than
+restating a stale digest under a fresh manifest.
 
 When no single machine is both hosts, `tools/refresh_crate_archives.sh` takes `--linux`, `--darwin` and
 `--provenance` and each half runs on its own machine (targets `refresh-crate-archives-{linux,darwin,provenance}`).
 `--darwin --emit <file>` on a mac writes the archive out for transport; `--darwin --from <file>` on the other host
-installs those bytes. `--provenance` hashes whatever is committed and reruns the freshness check, so either host can
-record the result. See `pkgs/rust/assets/PROVENANCE.md` for the copy-pasteable sequence.
+installs those bytes. `--provenance` hashes the published archives as committed and reruns the freshness check, so
+either aarch64 host can record the result. See `pkgs/rust/assets/PROVENANCE.md` for the copy-pasteable sequence.
 
 Two CI gates protect this, on Linux and on `publish`:
 
@@ -769,12 +867,39 @@ path that weakens Linux behavior, isolation, invalidation, or error fidelity is 
 
 ### Add a host platform
 
+A host platform is two axes (section 1), and they are added independently. Do not mix the two checklists: a new host OS
+needs a service backend, a new host CPU needs code generation, and neither implies the other.
+
+**Add a host OS** (`src/host/<os>/`, `hostBackends` in `flake.nix`):
+
 1. Implement service groups without including guest or translator internals.
 2. Pass public ABI validation and common provider tests.
 3. Run the Linux production matrix with exact goldens.
 4. Add fork, signal/fault, executable-memory, descriptor, and teardown stress.
 5. Run the full cross-host compatibility suite.
 6. Establish native and engine performance baselines.
+
+**Add a host CPU** (`HL_HOST_CPU_*` in `src/host/host_cpu.h`, `HL_HOST_ARCH` in `CMakeLists.txt`, `hostCPUs` in
+`flake.nix`). The host backend is host-CPU-neutral, so nothing in step 1 above repeats here; what is new is the
+translator side (3.3) and the CI axis:
+
+1. Name the CPU on all three axes above, and normalise the spelling once (`arm64`/`aarch64`, `amd64`/`x86_64`).
+   Branch on `HL_HOST_CPU_*`, never on a bare compiler predefine.
+2. Confirm the host backend and both guest fixture corpora build unchanged; the fixtures are cross-built and
+   host-CPU-neutral.
+3. Provide a guest→host code path for **each** guest ISA. Both production frontends emit ARM64 directly, so on any other
+   host CPU each guest ISA needs its own backend; an interpreter first, then a transliterator or emitter, is the staging
+   `docs/amd64-host.md` argues for.
+4. Add the host token to `HL_CI_HOSTS` in `cmake/CiLanes.cmake` and give it one workflow file. Pass
+   `gate.ci-lane-parity` on it — every declared lane must select at least one test there — using `HL_CI_HOST_CPU_ONLY`
+   for a lane that genuinely cannot be non-empty, and stating any lane whose *contents* differ (see 7.5.1).
+5. Cross-compile the other host CPUs' arms from this one, and have that be a CI step. Every host-CPU guard has one arm
+   per CPU and a runner compiles only its own; the aarch64 arms are cross-compiled from the x86-64 job for exactly
+   this reason.
+6. Only once guests execute: add the token to `HL_CI_COMPAT_HOSTS`, shard the compat matrix on it, run the production
+   matrix with exact goldens, and establish the `perf-native` / `perf-linux` pair as baselines. That is also the point
+   at which the host becomes a release gate (`publish.yml`, invariant P1) — until then it proves the build, not the
+   product.
 
 ## 12. Completion roadmap
 

@@ -247,6 +247,9 @@ invariants)
 			fi
 		done
 	}
+	# One workflow file per HOST TOKEN (see HL_CI_HOSTS in cmake/CiLanes.cmake):
+	#   Darwin-aarch64 -> mac.yml            Linux-aarch64 -> linux.yml
+	#   Linux-x86_64   -> linux-x86_64.yml   (no compat shards; see I20)
 	check_shards "$wfdir/mac.yml" "$(lanes_in HL_CI_SHARDED_DARWIN)" I13 || exit 1
 	check_shards "$wfdir/linux.yml" "$(lanes_in HL_CI_SHARDED_LINUX)" I14 || exit 1
 
@@ -257,24 +260,55 @@ invariants)
 	# of the matrix, and why smcprecise could fail deterministically on the
 	# Linux engine with a manifest note claiming it passed. Asymmetry is now
 	# legal only when HL_CI_SHARDED_HOST_ONLY declares it.
+	#
+	# A host is the (OS, CPU) pair now, and parity holds between the hosts that
+	# shard compat at all -- HL_CI_COMPAT_HOSTS. Linux-x86_64 is not one: the
+	# engine cannot execute guests on an x86_64 host yet, so requiring parity
+	# from it would mean exempting all 24 lanes, which asserts nothing. I20
+	# below is what keeps that host honest instead.
+	hosts=$(lanes_in HL_CI_HOSTS)
+	compat_hosts=$(lanes_in HL_CI_COMPAT_HOSTS)
 	linux_lanes=$(lanes_in HL_CI_SHARDED_LINUX)
 	darwin_lanes=$(lanes_in HL_CI_SHARDED_DARWIN)
 	host_only=$(lanes_in HL_CI_SHARDED_HOST_ONLY)
 	has() { printf '%s\n' $2 | grep -Fqx -- "$1"; }
 	parity=0
+	for host in $compat_hosts; do
+		has "$host" "$hosts" && continue
+		printf 'VIOLATION: I19 `%s` is in HL_CI_COMPAT_HOSTS but not HL_CI_HOSTS\n' \
+			"$host" >&2
+		parity=1
+	done
+	# There is ONE sharded lane list per host OS, so a second compat host on the
+	# same OS would leave that list unable to say which host it describes. Split
+	# the list when that happens rather than letting this guard pick one.
+	sole_host_for() {
+		set -- $(printf '%s\n' $compat_hosts | grep -e "^$1-" || true)
+		[ "$#" -eq 1 ] || return 1
+		printf '%s\n' "$1"
+	}
+	sole_or_fail() {
+		if ! sole_host_for "$1"; then
+			printf 'VIOLATION: I19 HL_CI_COMPAT_HOSTS must name exactly one %s host while HL_CI_SHARDED_%s is keyed by OS\n' \
+				"$1" "$2" >&2
+			return 1
+		fi
+	}
+	linux_host=$(sole_or_fail Linux LINUX) || parity=1
+	darwin_host=$(sole_or_fail Darwin DARWIN) || parity=1
 	for lane in $darwin_lanes; do
 		has "$lane" "$linux_lanes" && continue
-		if ! printf '%s\n' $host_only | grep -Fqx -- "Darwin:$lane"; then
-			printf 'VIOLATION: I19 `%s` is sharded on Darwin only; declare `Darwin:%s` in HL_CI_SHARDED_HOST_ONLY or shard it on Linux\n' \
-				"$lane" "$lane" >&2
+		if ! has "$darwin_host:$lane" "$host_only"; then
+			printf 'VIOLATION: I19 `%s` is sharded on %s only; declare `%s:%s` in HL_CI_SHARDED_HOST_ONLY or shard it on Linux\n' \
+				"$lane" "$darwin_host" "$darwin_host" "$lane" >&2
 			parity=1
 		fi
 	done
 	for lane in $linux_lanes; do
 		has "$lane" "$darwin_lanes" && continue
-		if ! printf '%s\n' $host_only | grep -Fqx -- "Linux:$lane"; then
-			printf 'VIOLATION: I19 `%s` is sharded on Linux only; declare `Linux:%s` in HL_CI_SHARDED_HOST_ONLY or shard it on Darwin\n' \
-				"$lane" "$lane" >&2
+		if ! has "$linux_host:$lane" "$host_only"; then
+			printf 'VIOLATION: I19 `%s` is sharded on %s only; declare `%s:%s` in HL_CI_SHARDED_HOST_ONLY or shard it on Darwin\n' \
+				"$lane" "$linux_host" "$linux_host" "$lane" >&2
 			parity=1
 		fi
 	done
@@ -283,11 +317,17 @@ invariants)
 	for entry in $host_only; do
 		host=${entry%%:*}
 		lane=${entry#*:}
-		case "$host" in
+		if ! has "$host" "$compat_hosts"; then
+			printf 'VIOLATION: I19 `%s` names no compat host; use <host-token>:<lane> from HL_CI_COMPAT_HOSTS\n' \
+				"$entry" >&2
+			parity=1
+			continue
+		fi
+		case "${host%%-*}" in
 		Linux) own=$linux_lanes; other=$darwin_lanes ;;
 		Darwin) own=$darwin_lanes; other=$linux_lanes ;;
 		*)
-			printf 'VIOLATION: I19 `%s` names no host; use Linux:<lane> or Darwin:<lane>\n' \
+			printf 'VIOLATION: I19 `%s` names a host OS with no HL_CI_SHARDED_* list\n' \
 				"$entry" >&2
 			parity=1
 			continue
@@ -295,7 +335,7 @@ invariants)
 		esac
 		if ! has "$lane" "$own"; then
 			printf 'VIOLATION: I19 `%s` exempts `%s`, absent from HL_CI_SHARDED_%s\n' \
-				"$entry" "$lane" "$host" >&2
+				"$entry" "$lane" "${host%%-*}" >&2
 			parity=1
 		fi
 		if has "$lane" "$other"; then
@@ -304,6 +344,15 @@ invariants)
 			parity=1
 		fi
 	done
+	# I20: a host token absent from HL_CI_COMPAT_HOSTS shards nothing, so its
+	# workflow must name no lane at all. I13/I14 cannot see this -- each of them
+	# looks at exactly one other file -- so without it linux-x86_64.yml could
+	# grow a `targets: compat-memory` line and run a compat shard on a host that
+	# cannot execute guests. The check inverts with the declaration: shard compat
+	# there and this stops applying the moment the token is declared.
+	if ! has Linux-x86_64 "$compat_hosts"; then
+		check_shards "$wfdir/linux-x86_64.yml" "" I20 || parity=1
+	fi
 	[ "$parity" -eq 0 ] || exit 1
 
 	# I15: `ctest -L <label>` EXITS 0 when the label matches nothing. Every
