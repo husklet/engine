@@ -1348,6 +1348,26 @@ static int bound_path_copy(uint64_t address, char path[HL_LINUX_PATH_MAX + 1], s
     return -HL_LINUX_ENAMETOOLONG;
 }
 
+/*
+ * The bounce buffer these routes use runs BEFORE the typed file is consulted, so it must not be able to
+ * fail first: Linux tests the descriptor's access mode next to fdget_pos, and a read that moves no bytes
+ * never reaches copy_to_user.  `for_read` names the access mode the descriptor has to carry.
+ */
+static int bound_access_rejects(const hl_linux_fd_snapshot *file, int for_read) {
+    uint32_t mode = file->status_flags & HL_LINUX_O_ACCMODE;
+    return for_read ? mode == HL_LINUX_O_WRONLY : mode == HL_LINUX_O_RDONLY;
+}
+
+/* Classify an unusable read destination: a 1-byte pread at the position the read would use reveals EOF
+   (and EISDIR on a directory) without consuming anything or moving the position. */
+static int64_t bound_read_no_copy(const hl_linux_fd_snapshot *file, uint64_t offset, int positioned) {
+    unsigned char probe;
+    int64_t probed;
+    if (bound_access_rejects(file, 1)) return -EBADF;
+    probed = hl_linux_pread64(g_linux_box, file->fd, &probe, 1, positioned ? offset : file->offset);
+    return probed <= 0 ? probed : -EFAULT;
+}
+
 static int bound_vectors_copy(uint64_t address, uint64_t count, hl_host_iovec vectors[HL_LINUX_IOV_MAX]) {
     uint64_t index;
     size_t array_size;
@@ -1357,10 +1377,9 @@ static int bound_vectors_copy(uint64_t address, uint64_t count, hl_host_iovec ve
     array_size = (size_t)count * sizeof(*vectors);
     if (guest_copy_from(vectors, address, array_size) != (ssize_t)array_size) return -HL_LINUX_EFAULT;
     for (index = 0; index < count; ++index) {
-        uint64_t base = vectors[index].address;
-        uint64_t size = vectors[index].size;
-        if (size > SIZE_MAX || (size != 0 && base == 0))
-            return -HL_LINUX_EFAULT;
+        // Only the descriptor ARRAY is validated here.  import_iovec does not dereference the payload
+        // bases, so an unusable base must be judged later, where EOF can still make it irrelevant.
+        if (vectors[index].size > SIZE_MAX) return -HL_LINUX_EFAULT;
     }
     return 0;
 }
@@ -1385,7 +1404,7 @@ static int64_t bound_vector_io(const hl_linux_fd_snapshot *file, hl_host_iovec g
         if (output) {
             size_t prefix = guest_accessible_prefix(guest_vectors[index].address, size, HL_LOGICAL_VMA_WRITE);
             if (prefix == 0) {
-                if (usable == 0) result = -EFAULT;
+                if (usable == 0) result = bound_read_no_copy(file, offset, positioned);
                 goto issue_or_fail;
             }
             size = prefix;
@@ -1399,7 +1418,7 @@ static int64_t bound_vector_io(const hl_linux_fd_snapshot *file, hl_host_iovec g
             ssize_t copied = guest_copy_from(buffers[usable], guest_vectors[index].address, size);
             if (copied <= 0) {
                 if (usable == 0) {
-                    result = -EFAULT;
+                    result = bound_access_rejects(file, 0) ? -EBADF : -EFAULT;
                     goto cleanup;
                 }
                 goto issue_or_fail;
@@ -1913,7 +1932,7 @@ static int64_t bound_guest_read(const hl_linux_fd_snapshot *file, uint64_t guest
     if (size == 0) return positioned ? hl_linux_pread64(g_linux_box, file->fd, NULL, 0, offset)
                                      : hl_linux_read(g_linux_box, file->fd, NULL, 0);
     size_t accessible = guest_accessible_prefix(guest, size, HL_LOGICAL_VMA_WRITE);
-    if (accessible == 0) return -EFAULT;
+    if (accessible == 0) return bound_read_no_copy(file, offset, positioned);
     void *buffer = malloc(accessible);
     if (buffer == NULL) return -ENOMEM;
     int64_t result = positioned ? hl_linux_pread64(g_linux_box, file->fd, buffer, accessible, offset)
@@ -1930,6 +1949,7 @@ static int64_t bound_guest_write(const hl_linux_fd_snapshot *file, uint64_t gues
                                  int positioned) {
     if (size == 0) return positioned ? hl_linux_pwrite64(g_linux_box, file->fd, NULL, 0, offset)
                                      : hl_linux_write(g_linux_box, file->fd, NULL, 0);
+    if (bound_access_rejects(file, 0)) return -EBADF;
     void *buffer = malloc(size);
     if (buffer == NULL) return -ENOMEM;
     ssize_t copied = guest_copy_from(buffer, guest, size);
@@ -2974,7 +2994,11 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 70: {
         static _Thread_local hl_host_iovec vectors[HL_LINUX_IOV_MAX];
         result = bound_vectors_copy(a1, a2, vectors);
-        if (result != 0) break;
+        if (result != 0) {
+            // do_readv/do_writev test the access mode at fdget_pos, ahead of import_iovec.
+            if (result == -HL_LINUX_EFAULT && bound_access_rejects(&source, nr == 65 || nr == 69)) result = -EBADF;
+            break;
+        }
         result = bound_vector_io(&source, vectors, (uint32_t)a2, nr == 65 || nr == 69, nr == 69 || nr == 70, a3);
         break;
     }
@@ -3004,9 +3028,28 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             (uint64_t)(uint32_t)a3 | ((uint64_t)(uint32_t)G_A4(c) << 32); /* AArch64 split offset. */
 #endif
         result = bound_vectors_copy(a1, a2, vectors);
-        if (result != 0) break;
+        if (result != 0) {
+            if (result == -HL_LINUX_EFAULT && bound_access_rejects(&source, nr == 286)) result = -EBADF;
+            break;
+        }
         /* Flags are semantic requirements, not hints. Do not silently erase RWF_NOWAIT/APPEND/SYNC. */
-        if (G_A5(c) != 0) {
+        // RWF_APPEND is a semantic requirement: pwritev2 must ignore the supplied offset and land the
+        // write at end-of-file, without moving the file position. The typed box takes no flags, so
+        // resolve end-of-file from the file's own metadata and issue a positioned write there.
+        uint64_t vector_flags = G_A5(c);
+        if (nr == 287 && (vector_flags & 0x10u) != 0 && g_host_services != NULL && g_host_services->file != NULL &&
+            g_host_services->file->metadata != NULL) {
+            hl_host_file_metadata metadata;
+            hl_host_result status =
+                g_host_services->file->metadata(g_host_services->context, source.host_handle, &metadata);
+            if (status.status != HL_STATUS_OK) {
+                result = bound_host_error(status.status);
+                break;
+            }
+            vector_offset = metadata.size;
+            vector_flags &= ~UINT64_C(0x10);
+        }
+        if (vector_flags != 0) {
             result = -95; /* Linux EOPNOTSUPP; macOS's native value is 102. */
             break;
         }
@@ -3706,6 +3749,27 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
              guest_copy_from(output_offset, a3, sizeof(*output_offset)) != (ssize_t)sizeof(*output_offset))) {
             result = -EFAULT;
             break;
+        }
+        // Linux rejects a same-file copy whose ranges overlap (EINVAL) instead of copying through the
+        // overlap.  Mirrors the native path in io.c case 285, using the typed identity for sameness.
+        if (G_A4(c) > 0 && g_host_services != NULL && g_host_services->file != NULL &&
+            g_host_services->file->metadata != NULL) {
+            hl_host_file_metadata in_meta, out_meta;
+            hl_host_result in_status = g_host_services->file->metadata(g_host_services->context, source.host_handle,
+                                                                      &in_meta);
+            hl_host_result out_status = g_host_services->file->metadata(g_host_services->context, output.host_handle,
+                                                                       &out_meta);
+            if (in_status.status == HL_STATUS_OK && out_status.status == HL_STATUS_OK &&
+                in_meta.stable_device == out_meta.stable_device && in_meta.stable_object == out_meta.stable_object) {
+                off_t in_start = input_offset ? *input_offset : (off_t)source.offset;
+                off_t out_start = output_offset ? *output_offset : (off_t)output.offset;
+                off_t length = (off_t)G_A4(c);
+                if (in_start >= 0 && out_start >= 0 && in_start < out_start + length &&
+                    out_start < in_start + length) {
+                    result = -EINVAL;
+                    break;
+                }
+            }
         }
         while (done < (size_t)G_A4(c)) {
             size_t chunk = (size_t)G_A4(c) - done;

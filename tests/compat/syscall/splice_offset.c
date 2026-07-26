@@ -8,7 +8,7 @@
 
 int main(void) {
     char path[64];
-    snprintf(path, sizeof path, "build/compat/syscall/hl_splice_%d", (int)getpid());
+    snprintf(path, sizeof path, "/tmp/hl_splice_%d", (int)getpid());
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     write(fd, "abcdefghij", 10);
     lseek(fd, 1, SEEK_SET);

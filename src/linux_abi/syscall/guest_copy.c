@@ -13,6 +13,8 @@
  * mapping quiescence boundary.
  */
 #include "../logical_vma.h"
+#include <poll.h>
+#include <sys/ioctl.h>
 
 #ifndef G_SMC_COPYOUT
 #error "target must define G_SMC_COPYOUT(guest_first, guest_last)"
@@ -202,6 +204,57 @@ static int guest_fd_rejects(int fd, int for_read) {
 }
 
 /*
+ * Would this read have moved zero bytes anyway?  Linux resolves the descriptor and consults the source
+ * before ->read_iter reaches copy_to_user, so a read that transfers nothing never observes a bad buffer:
+ * EOF returns 0 and a non-blocking source with nothing ready returns EAGAIN.  Both must be reported
+ * WITHOUT consuming data or touching the descriptor's flags, so seekable sources are probed with pread at
+ * the current position (which does not advance it) and non-seekable ones with poll + FIONREAD.
+ * Returns 0/-1 like read(2), with errno set on -1.
+ */
+static ssize_t guest_read_would_not_copy(int fd, off_t offset, int positional) {
+    if (guest_fd_rejects(fd, 1)) {
+        errno = EBADF;
+        return -1;
+    }
+    off_t probe_offset = positional ? offset : lseek(fd, 0, SEEK_CUR);
+    if (probe_offset >= 0) {
+        unsigned char probe;
+        ssize_t probed = pread(fd, &probe, 1, probe_offset);
+        if (probed <= 0) return probed; // EOF -> 0; a real error (ESPIPE on pread of a pipe) -> that errno
+        errno = EFAULT;
+        return -1;
+    }
+    short want = POLLIN;
+#ifdef POLLRDHUP
+    want |= POLLRDHUP;
+#endif
+    struct pollfd ready = {.fd = fd, .events = want};
+    if (poll(&ready, 1, 0) > 0) {
+        short hup = POLLHUP;
+#ifdef POLLRDHUP
+        hup |= POLLRDHUP;
+#endif
+        if (ready.revents & (POLLIN | hup)) {
+            // A queue that reports readable-or-hung-up with nothing pending is at EOF.  FIONREAD itself
+            // fails on a pty slave whose master is gone, where POLLHUP alone settles it.
+            int pending = 0;
+            int counted = ioctl(fd, FIONREAD, &pending) == 0;
+            if (counted ? pending == 0 : (ready.revents & POLLHUP) != 0) return 0;
+        }
+    } else {
+        int flags = fcntl(fd, F_GETFL);
+        if (flags >= 0 && (flags & O_NONBLOCK)) {
+            errno = EAGAIN;
+            return -1;
+        }
+        // A blocking source with nothing ready would sleep in ->read_iter; there is no non-destructive
+        // way to reach the copy it would eventually attempt, so report the buffer complaint.
+    }
+    errno = EFAULT;
+    return -1;
+}
+
+/*
  * read/pread into a guest range.  One host syscall consumes all canonical and
  * direct spans, retaining atomic file-position advancement and kernel short
  * read/EINTR behavior.  A fault after a valid prefix exposes only that prefix
@@ -216,31 +269,7 @@ static ssize_t guest_fd_read(int fd, uint64_t guest, size_t length, off_t offset
     size_t covered = 0;
     int count =
         guest_iov_range(guest, length, HL_LOGICAL_VMA_WRITE, vectors, pins, guest_bases, GUEST_IOV_STACK_MAX, &covered);
-    if (count < 0) {
-        /*
-         * Linux resolves the descriptor before copy_to_user, so a missing fd -- or one that is not open for
-         * reading at all -- outranks the buffer complaint.
-         */
-        if (guest_fd_rejects(fd, 1)) {
-            errno = EBADF;
-            return -1;
-        }
-        /*
-         * A read at EOF succeeds without touching the destination. Probe at
-         * the same file position without advancing it before classifying the
-         * inaccessible guest range. This covers regular files and null-like
-         * seekable devices; non-seekable sources still correctly fault when
-         * data would have to be copied.
-         */
-        off_t probe_offset = positional ? offset : lseek(fd, 0, SEEK_CUR);
-        if (probe_offset >= 0) {
-            unsigned char probe;
-            ssize_t probed = pread(fd, &probe, 1, probe_offset);
-            if (probed <= 0) return probed;
-        }
-        errno = EFAULT;
-        return -1;
-    }
+    if (count < 0) return guest_read_would_not_copy(fd, offset, positional);
     ssize_t result = positional ? preadv(fd, vectors, count, offset) : readv(fd, vectors, count);
     if (result > 0) {
         size_t remaining = (size_t)result;
@@ -320,6 +349,9 @@ static ssize_t guest_fd_vector_flags(int fd, uint64_t guest_vectors, size_t gues
             pins + host_count, guest_bases + host_count, GUEST_IOV_STACK_MAX - host_count, &covered);
         if (count < 0) {
             if (!host_count) {
+                // The descriptor array itself imported fine, so a read that moves nothing still never
+                // reaches the payload segment: same EOF/would-block escape as plain read(2).
+                if (output) return guest_read_would_not_copy(fd, offset, positional);
                 errno = guest_fd_rejects(fd, output) ? EBADF : EFAULT;
                 return -1;
             }
