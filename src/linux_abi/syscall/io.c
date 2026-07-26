@@ -1325,7 +1325,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             char *nl = strchr(name, '\n');
             if (nl) *nl = 0;
             snprintf(g_procname, sizeof g_procname, "%.15s", name);
-            set_guest_comm_name(g_procname);
+            set_guest_comm_name(g_procname, c->tid == 0);
             char rendered[32];
             int rendered_size = snprintf(rendered, sizeof rendered, "%s\n", g_procname);
             (void)ftruncate(wfd, 0);
