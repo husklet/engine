@@ -6,14 +6,24 @@ HL Engine runs AArch64 and x86-64 Linux programs on AArch64 macOS and Linux host
 | --- | --- | --- |
 | macOS AArch64 | Supported | AArch64, x86-64 |
 | Linux AArch64 | Supported | AArch64, x86-64 |
-| Linux x86-64 | Builds and passes the host unit lane; **runs no guests yet** | none yet |
+| Linux x86-64 | In progress — see below | AArch64 (interpreted) |
 
-"Supported" means the exact-golden compatibility, lifecycle and production matrices pass on that host for both guest
-ISAs. Linux x86-64 is not there: the engine, both guest fixture corpora and the `unit` lane build and pass on it, and
-the published Rust crate accepts the host, but neither guest ISA has a code generator for an x86-64 host yet — both
-production frontends emit ARM64 directly. `production.smoke-x86_64` is the milestone to watch.
-[`docs/amd64-host.md`](docs/amd64-host.md) explains the seam and what is gated on what. Windows is a reserved
-boundary with no code.
+"Supported" means the exact-golden compatibility, lifecycle and production matrices pass on that host for **both**
+guest ISAs. Linux x86-64 is not there yet, and the table says only what is proven on it:
+
+- The engine, both guest fixture corpora and `ctest -L unit` (115/115) build and pass, and the published Rust crate
+  accepts the host.
+- An **AArch64** Linux guest runs to completion through the production engine. `production.smoke-aarch64`,
+  `compat.isa-aarch64` and `lifecycle.exit-aarch64` pass.
+- An **x86-64** Linux guest reaches glibc's `init_cpu_features` and stops in legacy SSE. `production.smoke-x86_64`
+  is the milestone to watch.
+- Guest execution there is **interpreted**, not JIT-compiled, so it is roughly 10-50× slower than on an AArch64
+  host and the `perf-linux` lane is record-only rather than threshold-enforcing. Neither guest ISA has a code
+  generator for an x86-64 host: both production frontends emit ARM64 directly.
+
+[`docs/amd64-host.md`](docs/amd64-host.md) explains the seam, the (host CPU × guest ISA) matrix and the staging;
+[`docs/amd64-host-findings.md`](docs/amd64-host-findings.md) records the defects that work turned up and what a
+reviewer needs to know. Windows is a reserved boundary with no code.
 
 ```sh
 cargo add hl-engine
