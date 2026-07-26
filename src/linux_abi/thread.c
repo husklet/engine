@@ -636,7 +636,46 @@ static ssize_t filemap_pread(int fd, void *buffer, size_t length, off_t offset) 
     return result;
 }
 
+static ssize_t filemap_pwrite(int fd, const void *buffer, size_t length, off_t offset) {
+    const unsigned char *cursor = buffer;
+    size_t written = 0;
+    while (written < length) {
+        ssize_t result = pwrite(fd, cursor + written, length - written, offset + (off_t)written);
+        if (result > 0) {
+            written += (size_t)result;
+            continue;
+        }
+        if (result < 0 && errno == EINTR) continue;
+        return written != 0 ? (ssize_t)written : result;
+    }
+    return (ssize_t)written;
+}
+
 static int filemap_source_fd(struct guest_file_mapping *mapping);
+
+/*
+ * A Linux 4K-offset file mapping cannot always be represented by a native
+ * 16K-offset mmap on Apple silicon.  mmap therefore materializes those VMAs
+ * as private snapshots (emulated=1).  MAP_SHARED stores must still update the
+ * backing object before a following syscall can notify another process.
+ */
+static void filemap_flush_emulated(uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return;
+    pthread_mutex_lock(&g_filemap_lock);
+    for (int index = 0; index < g_nfilemap; ++index) {
+        struct guest_file_mapping *mapping = &g_filemap[index];
+        if (!mapping->shared || !mapping->emulated || hi <= mapping->lo || lo >= mapping->hi) continue;
+        uint64_t first = lo > mapping->lo ? lo : mapping->lo;
+        uint64_t last = hi < mapping->hi ? hi : mapping->hi;
+        uint64_t offset = mapping->offset + first - mapping->lo;
+        int fd = filemap_source_fd(mapping);
+        if (fd < 0) continue;
+        if (filemap_pwrite(fd, (const void *)(uintptr_t)first, (size_t)(last - first), (off_t)offset) ==
+            (ssize_t)(last - first))
+            filemap_publish(HL_LINUX_FILE_EVENT_WRITE, mapping->device, mapping->inode, offset, last - first);
+    }
+    pthread_mutex_unlock(&g_filemap_lock);
+}
 
 static void filemap_refresh_emulated(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
@@ -809,11 +848,19 @@ static void filemap_written_identity(uint64_t device, uint64_t inode, int source
     pthread_mutex_lock(&g_filemap_lock);
     for (int i = 0; i < g_nfilemap; ++i) {
         struct guest_file_mapping *mapping = &g_filemap[i];
-        if (mapping->shared || mapping->follow_hi <= mapping->follow_lo || mapping->device != device ||
-            mapping->inode != inode)
+        if (mapping->device != device || mapping->inode != inode)
             continue;
-        uint64_t map_lo = mapping->offset + mapping->follow_lo;
-        uint64_t map_hi = mapping->offset + mapping->follow_hi;
+        uint64_t map_lo;
+        uint64_t map_hi;
+        if (mapping->shared && mapping->emulated) {
+            map_lo = mapping->offset;
+            map_hi = mapping->offset + mapping->hi - mapping->lo;
+        } else if (!mapping->shared && mapping->follow_hi > mapping->follow_lo) {
+            map_lo = mapping->offset + mapping->follow_lo;
+            map_hi = mapping->offset + mapping->follow_hi;
+        } else {
+            continue;
+        }
         uint64_t lo = offset > map_lo ? offset : map_lo;
         uint64_t hi = end < map_hi ? end : map_hi;
         int fd = source_fd >= 0 ? source_fd : filemap_source_fd(mapping);

@@ -366,11 +366,16 @@ static void jit86_store_alias_changed(uint64_t guest, uint64_t size) {
 }
 
 static int jit86_store_alias_observation_active(void) {
-    return g_rwx_guest != 0 && g_nfilemap != 0;
+    return g_nfilemap != 0;
 }
 
 static void jit86_smc_commit(struct cpu *cpu) {
     stw_mapping_begin();
+    if (cpu->smc_range_overflow)
+        filemap_flush_emulated(0, UINT64_MAX);
+    else
+        for (uint64_t index = 0; index < cpu->smc_range_count; ++index)
+            filemap_flush_emulated(cpu->smc_ranges[index][0], cpu->smc_ranges[index][1]);
     uint32_t removed;
     if (cpu->smc_range_overflow) {
         removed = g_live_map_count;

@@ -346,9 +346,10 @@ static int smc_on_write(uint64_t a) {
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_SYSCALL) {                                                                                    \
+        /* Publish emulated MAP_SHARED stores before a write/socket/futex syscall can notify a peer. */                \
+        if ((c)->smc_range_count || (c)->smc_range_overflow) jit86_smc_commit(c);                                     \
         service(c);                                                                                                    \
         if ((c)->exited) break;                                                                                        \
-        if ((c)->smc_range_count || (c)->smc_range_overflow) jit86_smc_commit(c);                                     \
         if ((c)->redirect) (c)->redirect = 0; /* else rip already = next (set at exit) */                              \
     }                                                                                                                  \
     /* R_BRANCH: c->rip already holds the target */
