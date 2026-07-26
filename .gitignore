@@ -26,5 +26,9 @@ test.db
 # Scratch dirs created in the CWD by the filesystem/error-matrix compat cases.
 hl_errmat_*/
 
+# Test artifact: tests/compat/filesystem/pcachex/libmap.c writes this into the CWD when the
+# fixture is run without the explicit blob path the manifest passes.
+pclib_blob_*.bin
+
 # CMake build trees
 build-*/
