@@ -32,7 +32,7 @@
 //! happens**. Nothing is rolled back: whatever partial writes your store accepted are yours to discard.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::{Read, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -70,6 +70,31 @@ const OP_DIGEST: u32 = 15;
 const OP_SOURCE_LIST: u32 = 16;
 const OP_SOURCE_SIZE: u32 = 17;
 const OP_SOURCE_READ: u32 = 18;
+
+/// Protocol operation names, for the capture-progress diagnostics.
+const fn op_name(op: u32) -> &'static str {
+    match op {
+        OP_OBJECT_BEGIN => "OBJECT_BEGIN",
+        OP_OBJECT_WRITE => "OBJECT_WRITE",
+        OP_OBJECT_WRITE_AT => "OBJECT_WRITE_AT",
+        OP_OBJECT_TELL => "OBJECT_TELL",
+        OP_OBJECT_FINISH => "OBJECT_FINISH",
+        OP_OBJECT_ABORT => "OBJECT_ABORT",
+        OP_GROUP_BEGIN => "GROUP_BEGIN",
+        OP_GROUP_COMMIT => "GROUP_COMMIT",
+        OP_GROUP_ABORT => "GROUP_ABORT",
+        OP_CLAIM => "CLAIM",
+        OP_UNCLAIM => "UNCLAIM",
+        OP_COMMIT => "COMMIT",
+        OP_GROUP_PRESENT => "GROUP_PRESENT",
+        OP_GROUP_COUNT => "GROUP_COUNT",
+        OP_DIGEST => "DIGEST",
+        OP_SOURCE_LIST => "SOURCE_LIST",
+        OP_SOURCE_SIZE => "SOURCE_SIZE",
+        OP_SOURCE_READ => "SOURCE_READ",
+        _ => "UNKNOWN",
+    }
+}
 
 const HASH_BASIS: u64 = 14_695_981_039_346_656_037;
 const HASH_PRIME: u64 = 1_099_511_628_211;
@@ -260,10 +285,71 @@ struct Object {
     bytes: Vec<u8>,
 }
 
+/// What one engine process has done on its own channel.
+///
+/// A capture that never commits used to be indistinguishable from a capture that never started: the caller
+/// saw a deadline and nothing else. This is the evidence that tells those apart -- who announced itself,
+/// what each one last asked for, and which process images were opened but never committed.
+#[derive(Clone, Debug, Default)]
+struct Participant {
+    host_pid: u64,
+    last_op: &'static str,
+    open_groups: BTreeSet<String>,
+    committed_groups: BTreeSet<String>,
+    aborted_groups: BTreeSet<String>,
+}
+
+/// A rendered snapshot of capture progress, used to explain a capture that did not finish.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Progress {
+    /// Engine processes that opened a channel.
+    pub(crate) participants: usize,
+    /// Process images opened but neither committed nor aborted.
+    pub(crate) incomplete: Vec<String>,
+    /// Process images the engine explicitly abandoned (a refused resource, or a failed dump).
+    pub(crate) aborted: Vec<String>,
+    /// Process images that completed.
+    pub(crate) committed: Vec<String>,
+    /// One `pid N: last op X` line per participant.
+    pub(crate) detail: Vec<String>,
+}
+
+impl Progress {
+    /// Did any engine process get as far as opening a process image?
+    pub(crate) fn any_image_started(&self) -> bool {
+        !self.incomplete.is_empty() || !self.aborted.is_empty() || !self.committed.is_empty()
+    }
+}
+
+impl std::fmt::Display for Progress {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} engine process(es) attached",
+            self.participants
+        )?;
+        for (label, names) in [
+            ("committed", &self.committed),
+            ("still open", &self.incomplete),
+            ("aborted", &self.aborted),
+        ] {
+            if !names.is_empty() {
+                write!(formatter, "; {label} {}", names.join(", "))?;
+            }
+        }
+        if !self.detail.is_empty() {
+            write!(formatter, "; {}", self.detail.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
 /// Everything the server knows that is not in the embedder's store. Guarded by one lock: capture is not a
 /// throughput-critical path, and one lock makes the ordering guarantees obvious.
 #[derive(Default)]
 struct State {
+    /// Per-channel capture progress, keyed by the channel id the acceptor assigned.
+    participants: BTreeMap<u64, Participant>,
     open: HashMap<(u64, u64), Object>,
     /// Objects finished inside a group, held until the group is committed.
     staged: HashMap<String, Vec<Object>>,
@@ -311,6 +397,63 @@ impl SinkServer {
             .lock()
             .ok()
             .and_then(|state| state.failure.clone())
+    }
+
+    /// Records that an engine process announced itself on the broker.
+    pub(crate) fn attach(&self, id: u64, host_pid: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            let participant = state.participants.entry(id).or_default();
+            participant.host_pid = host_pid;
+            participant.last_op = "HELLO";
+        }
+    }
+
+    /// A snapshot of who is participating and how far each one got.
+    pub(crate) fn progress(&self) -> Progress {
+        let Ok(state) = self.state.lock() else {
+            return Progress::default();
+        };
+        let mut progress = Progress {
+            participants: state.participants.len(),
+            ..Progress::default()
+        };
+        for participant in state.participants.values() {
+            for group in &participant.open_groups {
+                progress.incomplete.push(group.clone());
+            }
+            for group in &participant.aborted_groups {
+                progress.aborted.push(group.clone());
+            }
+            for group in &participant.committed_groups {
+                progress.committed.push(group.clone());
+            }
+            progress.detail.push(format!(
+                "pid {} last op {}",
+                participant.host_pid, participant.last_op
+            ));
+        }
+        progress
+    }
+
+    /// Folds one protocol operation into the participant record for `id`.
+    fn observe(state: &mut State, id: u64, op: &'static str, group: Option<&str>) {
+        let participant = state.participants.entry(id).or_default();
+        participant.last_op = op;
+        let Some(group) = group else { return };
+        match op {
+            "GROUP_BEGIN" => {
+                participant.open_groups.insert(group.to_owned());
+            }
+            "GROUP_COMMIT" => {
+                participant.open_groups.remove(group);
+                participant.committed_groups.insert(group.to_owned());
+            }
+            "GROUP_ABORT" => {
+                participant.open_groups.remove(group);
+                participant.aborted_groups.insert(group.to_owned());
+            }
+            _ => {}
+        }
     }
 
     fn record_failure(&self, message: String) {
@@ -392,6 +535,14 @@ impl SinkServer {
     #[allow(clippy::too_many_lines)]
     fn dispatch(&self, id: u64, request: &Request, name: &str, payload: &[u8]) -> Reply {
         let key = (id, request.stream);
+        if let Ok(mut state) = self.state.lock() {
+            let group = matches!(
+                request.op,
+                OP_GROUP_BEGIN | OP_GROUP_COMMIT | OP_GROUP_ABORT
+            )
+            .then_some(name);
+            Self::observe(&mut state, id, op_name(request.op), group);
+        }
         match request.op {
             OP_OBJECT_BEGIN => {
                 if name.len() > NAME_MAX {
@@ -632,13 +783,14 @@ pub(crate) fn serve(
     std::thread::spawn(move || {
         let mut workers = Vec::new();
         while server.running.load(Ordering::SeqCst) {
-            let Some(mut channel) =
+            let Some((mut channel, host_pid)) =
                 crate::ffi::broker_accept(&broker, std::time::Duration::from_millis(50))
             else {
                 continue;
             };
             let worker = Arc::clone(&server);
             let id = workers.len() as u64 + 1;
+            worker.attach(id, host_pid);
             workers.push(std::thread::spawn(move || {
                 worker.serve(&mut channel, id);
             }));
