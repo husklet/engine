@@ -298,7 +298,10 @@ hl_status hl_codegen_x86_64_function(const hl_ir_function *function, hl_code_buf
                 }
                 status = hl_x86_64_load_value(output, instruction->operands[operand], (uint8_t)(12u + operand),
                                               &operand_registers[operand]);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
             }
             if (instruction->result.id != 0)
                 destination = instruction->result.id <= HL_ARRAY_COUNT(hl_x86_64_registers)
@@ -319,7 +322,10 @@ hl_status hl_codegen_x86_64_function(const hl_ir_function *function, hl_code_buf
                 static const uint8_t opcodes[] = {UINT8_C(0x01), UINT8_C(0x29), UINT8_C(0x21), UINT8_C(0x09),
                                                   UINT8_C(0x31)};
                 status = hl_x86_64_emit_binary(output, UINT8_C(0x89), destination, operand_registers[0], wide);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_binary(output, opcodes[instruction->opcode - HL_IR_OP_ADD], destination,
                                                operand_registers[1], wide);
                 break;
@@ -387,81 +393,174 @@ hl_status hl_codegen_x86_64_function(const hl_ir_function *function, hl_code_buf
                         : 8u;
                 if (instruction->opcode == HL_IR_OP_STORE) {
                     status = hl_x86_64_spill_access(output, 0x89, operand_registers[1], frame_size - 8u);
-                    if (status != HL_STATUS_OK) return status;
+                    if (status != HL_STATUS_OK) {
+                        final_status = status;
+                        goto done;
+                    }
                 }
                 /* r13=original, r12=effective */
                 status = hl_x86_64_emit_binary(output, 0x89, 13, operand_registers[0], 1);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_binary(output, 0x89, 12, 13, 1);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 if (instruction->immediate != 0) {
                     status = hl_x86_64_emit_constant(output, 11, instruction->immediate, 1);
-                    if (status != HL_STATUS_OK) return status;
+                    if (status != HL_STATUS_OK) {
+                        final_status = status;
+                        goto done;
+                    }
                     status = hl_x86_64_emit_binary(output, 0x01, 12, 11, 1);
-                    if (status != HL_STATUS_OK) return status;
+                    if (status != HL_STATUS_OK) {
+                        final_status = status;
+                        goto done;
+                    }
                     status = hl_x86_64_emit_binary(output, 0x39, 12, 13, 1);
-                    if (status != HL_STATUS_OK) return status;
+                    if (status != HL_STATUS_OK) {
+                        final_status = status;
+                        goto done;
+                    }
                     status = hl_x86_64_success_or_fault(output, 0x83, frame_size); /* jae */
-                    if (status != HL_STATUS_OK) return status;
+                    if (status != HL_STATUS_OK) {
+                        final_status = status;
+                        goto done;
+                    }
                 }
                 /* r13=size; require size>=width and effective<=size-width. */
                 status = hl_x86_64_emit_rex(output, 13, 7, 1);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, 0x8b);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, 0x6f); /* r13,[rdi+16] */
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, 16);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, 0x49);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, 0x83);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, 0xfd); /* cmp r13,imm8 */
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, (uint8_t)width);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_success_or_fault(output, 0x83, frame_size);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, 0x49);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, 0x83);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, 0xed); /* sub r13,imm8 */
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, (uint8_t)width);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_binary(output, 0x39, 12, 13, 1); /* cmp effective,size-width */
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_success_or_fault(output, 0x86, frame_size); /* jbe */
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 /* r13=memory base, [r13+r12]. */
                 status = hl_x86_64_emit_rex(output, 13, 7, 1);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, 0x8b);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, 0x6f);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, 8);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 if (instruction->opcode == HL_IR_OP_STORE) {
                     status = hl_x86_64_spill_access(output, 0x8b, 11, frame_size - 8u);
-                    if (status != HL_STATUS_OK) return status;
+                    if (status != HL_STATUS_OK) {
+                        final_status = status;
+                        goto done;
+                    }
                 }
                 {
                     uint8_t data_register = instruction->opcode == HL_IR_OP_LOAD ? destination : 11;
                     status = hl_x86_64_emit_byte(
                         output, (uint8_t)(UINT8_C(0x43) | (width == 8 ? 8u : 0u) | (data_register >= 8 ? 4u : 0u)));
                 }
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, instruction->opcode == HL_IR_OP_LOAD ? 0x8b : 0x89);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(
                     output,
                     (uint8_t)(UINT8_C(0x44) | ((instruction->opcode == HL_IR_OP_LOAD ? destination : 11) & 7u) << 3));
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, 0x25); /* base=r13,index=r12 */
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_x86_64_emit_byte(output, 0); /* disp8 */
                 break;
             }

@@ -1834,12 +1834,14 @@ static hl_host_result hl_linux_file_metadata_get(void *context, hl_host_handle f
     struct stat status;
     int descriptor;
     if (output == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    /* Define *output before any early return: hl_linux_errno_result() maps errno 0 to HL_STATUS_OK,
+     * so a caller keying off .status could otherwise read an unwritten field. */
+    memset(output, 0, sizeof(*output));
     pthread_mutex_lock(&host->lock);
     descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if (fstat(descriptor, &status) != 0) return hl_linux_errno_result();
-    memset(output, 0, sizeof(*output));
     output->stable_device = (uint64_t)status.st_dev;
     output->stable_object = (uint64_t)status.st_ino;
     output->size = (uint64_t)status.st_size;
