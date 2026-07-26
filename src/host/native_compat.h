@@ -120,6 +120,9 @@ struct kevent {
 #define NOTE_REVOKE UINT32_C(0x0040)
 #define NOTE_TRIGGER UINT32_C(0x01000000)
 #define NOTE_NSECONDS UINT32_C(0x00000004)
+// macOS-only hint (minimal power-aware timer coalescing); inert in this Linux shim, whose timerfd is
+// already an exact hrtimer.
+#define NOTE_CRITICAL UINT32_C(0x00000020)
 
 #define EV_SET(event, identifier, event_filter, event_flags, event_fflags, event_data, event_udata)                  \
     (*(event) = (struct kevent){(uintptr_t)(identifier), (int16_t)(event_filter), (uint16_t)(event_flags),          \

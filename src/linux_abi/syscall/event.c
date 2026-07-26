@@ -652,7 +652,7 @@ static void kqueue_rebuild_after_fork(void) {
             uint16_t flg = EV_ADD | (one ? EV_ONESHOT : 0);
             int64_t arm = one ? delay : iv;
             if (arm < 0) arm = 0;
-            EV_SET(&kv, 1, EVFILT_TIMER, flg, NOTE_NSECONDS, arm, NULL);
+            EV_SET(&kv, 1, EVFILT_TIMER, flg, NOTE_NSECONDS | NOTE_CRITICAL, arm, NULL);
             kevent(fd, &kv, 1, NULL, 0, NULL);
         }
         // inotify: Linux children inherit the instance AND its watches. The watch fds (O_EVTONLY opens) are
@@ -1988,7 +1988,7 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         if ((int)a0 >= 0 && (int)a0 < HL_NFD) g_tfd_first_oneshot[(int)a0] = first_distinct ? 1 : 0;
         uint16_t fl = EV_ADD | ((periodic && !first_distinct) ? 0 : EV_ONESHOT);
         int64_t arm_ns = (periodic && !first_distinct) ? interval_ns : first_delay;
-        EV_SET(&kv, 1, EVFILT_TIMER, fl, NOTE_NSECONDS, arm_ns, NULL);
+        EV_SET(&kv, 1, EVFILT_TIMER, fl, NOTE_NSECONDS | NOTE_CRITICAL, arm_ns, NULL);
         G_RET(c) = kevent((int)a0, &kv, 1, NULL, 0, NULL) < 0 ? (uint64_t)(-errno) : 0;
         break;
     }

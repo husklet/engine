@@ -32,17 +32,20 @@ int main(void){
     int eagain = read(fd,&n,8)==-1 && errno==EAGAIN;
     close(fd);
 
-    // 2) count reset after read: periodic, let some fire, read once (>=1), then a nonblocking read
-    // returns EAGAIN because the accumulated count was consumed.
-    fd = timerfd_create(CLOCK_MONOTONIC, 0);
+    // 2) count reset after read: periodic, let several fire, read once (>=3), then the accumulated count
+    // must be gone -- the next read either blocks-as-EAGAIN or reports only ticks accrued SINCE the read.
+    // (Requiring a bare EAGAIN asserted that the second read lands inside one 10ms period, which is a
+    // property of the host's scheduling, not of timerfd: one descheduled slice past the interval makes a
+    // fresh expiry legitimately readable. The invariant under test is the reset, so test the reset.)
+    fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     memset(&its,0,sizeof its);
     its.it_value.tv_nsec=10*1000*1000; its.it_interval.tv_nsec=10*1000*1000;
     timerfd_settime(fd,0,&its,NULL);
-    usleep(35*1000);
-    n=0; int firstpos = rd(fd,&n) && n>=1;
-    int fl=fcntl(fd,F_GETFL); fcntl(fd,F_SETFL,fl|O_NONBLOCK);
+    usleep(45*1000); // >=4 periods elapse, so the >=3 floor keeps margin on a slow host
+    n=0; int firstpos = rd(fd,&n) && n>=3;
     errno=0; uint64_t n2=0;
-    int consumed = (read(fd,&n2,8)==-1 && errno==EAGAIN);
+    ssize_t again = read(fd,&n2,8);
+    int consumed = (again==-1 && errno==EAGAIN) || (again==8 && n2<n);
     close(fd);
 
     // 3) timerfd_settime returns the previous setting in old_value.

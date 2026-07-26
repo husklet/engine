@@ -106,6 +106,7 @@ struct sigq_ent {
     int pid;        // si_pid
     int uid;        // si_uid
     uint64_t addr;  // si_addr
+    int tag;        // source id (POSIX timer id + 1); 0 = untagged. Never reaches the guest siginfo.
 };
 
 static struct {
@@ -125,20 +126,57 @@ static int sig_is_rt(int s) {
 // Returns 1 iff a new instance was actually enqueued -- the signalfd wake byte must be written ONLY then,
 // or a coalesced-away duplicate leaves a spare byte in the self-pipe and signalfd reports one siginfo
 // record too many (a second read that Linux answers with EAGAIN).
-static int sigq_push(int sig, int code, uint64_t value, int pid, int uid, uint64_t addr) {
+static int sigq_push(int sig, int tag, int code, uint64_t value, int pid, int uid, uint64_t addr) {
     if (sig < 1 || sig > 64) return 0;
     int queued = 0;
     pthread_mutex_lock(&g_sigq_lk);
     int cap = sig_is_rt(sig) ? SIGQ_DEPTH : 1;
     if (g_sigq[sig].count < cap) {
         int t = (g_sigq[sig].head + g_sigq[sig].count) % SIGQ_DEPTH;
-        g_sigq[sig].e[t] = (struct sigq_ent){code, value, pid, uid, addr};
+        g_sigq[sig].e[t] = (struct sigq_ent){code, value, pid, uid, addr, tag};
         g_sigq[sig].count++;
         queued = 1;
     }
     pthread_mutex_unlock(&g_sigq_lk);
     __atomic_or_fetch(&g_pending, 1ull << sig, __ATOMIC_SEQ_CST);
     return queued;
+}
+
+// Is an instance tagged `tag` still queued for `sig`? Linux queues at most ONE signal per POSIX timer --
+// further expirations of the SAME timer raise timer_getoverrun instead of a second delivery -- while two
+// DISTINCT timers sharing one signo each carry their own instance. A bare pending bit cannot express that.
+static int sigq_tag_queued(int sig, int tag) {
+    if (sig < 1 || sig > 64) return 0;
+    int found = 0;
+    pthread_mutex_lock(&g_sigq_lk);
+    for (int i = 0; i < g_sigq[sig].count; i++)
+        if (g_sigq[sig].e[(g_sigq[sig].head + i) % SIGQ_DEPTH].tag == tag) {
+            found = 1;
+            break;
+        }
+    pthread_mutex_unlock(&g_sigq_lk);
+    return found;
+}
+
+// Discard queued instances tagged `tag` (Linux drops a timer's pending signal at timer_delete). Timer ids
+// are reused array slots, so a stale entry would otherwise coalesce away the NEW timer's first expiry.
+static void sigq_drop_tag(int sig, int tag) {
+    if (sig < 1 || sig > 64 || tag == 0) return;
+    pthread_mutex_lock(&g_sigq_lk);
+    int kept = 0;
+    struct sigq_ent copy[SIGQ_DEPTH];
+    for (int i = 0; i < g_sigq[sig].count; i++) {
+        struct sigq_ent e = g_sigq[sig].e[(g_sigq[sig].head + i) % SIGQ_DEPTH];
+        if (e.tag != tag) copy[kept++] = e;
+    }
+    int dropped = g_sigq[sig].count - kept;
+    for (int i = 0; i < kept; i++) g_sigq[sig].e[i] = copy[i];
+    g_sigq[sig].head = 0;
+    g_sigq[sig].count = kept;
+    pthread_mutex_unlock(&g_sigq_lk);
+    // Only when this call emptied the queue: an untouched empty queue may still have a bit set by the host
+    // async path, which carries its siginfo in the single-slot g_sig* arrays.
+    if (dropped > 0 && kept == 0) __atomic_and_fetch(&g_pending, ~(1ull << sig), __ATOMIC_SEQ_CST);
 }
 
 // Pop the oldest queued instance of `sig` into *out. Returns 1 iff one was dequeued; clears the g_pending
@@ -676,19 +714,19 @@ static void raise_guest_signal_si(struct cpu *c, int sig, int code, uint64_t val
     // handler disposition (Linux delivers a blocked signal to signalfd, not to a handler). Feed the
     // self-pipe (readability) AND queue the siginfo (ssi_int/pid/code); the read path drains it in order.
     if (blocked && sfd_routed(sig)) {
-        if (sigq_push(sig, code, value, pid, uid, 0)) sfd_deliver(sig);
+        if (sigq_push(sig, 0, code, value, pid, uid, 0)) sfd_deliver(sig);
         return;
     }
     // custom handler -> queue for the dispatcher's maybe_deliver_signal (carries per-instance siginfo)
     if (h > 1) {
-        sigq_push(sig, code, value, pid, uid, 0);
+        sigq_push(sig, 0, code, value, pid, uid, 0);
         return;
     }
     // SIG_IGN
     if (h == 1) return;
     // blocked, no handler: queue pending for delivery on unblock (also feeds any signalfd via sfd_deliver)
     if (blocked) {
-        if (sigq_push(sig, code, value, pid, uid, 0)) sfd_deliver(sig);
+        if (sigq_push(sig, 0, code, value, pid, uid, 0)) sfd_deliver(sig);
         return;
     }
     // SIGCHLD/CONT/URG/WINCH: ignore
