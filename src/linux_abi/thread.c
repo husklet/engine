@@ -1285,20 +1285,27 @@ static void gro_clear_raw(uint64_t lo, uint64_t hi) {
 static int gro_hit(uint64_t a, uint64_t len) {
     if (!len || __atomic_load_n(&g_ngro, __ATOMIC_ACQUIRE) == 0) return 0;
     uint64_t end = a + len;
-    uint64_t generation = atomic_load_explicit(&g_gro_generation, memory_order_acquire);
-    if (generation & 1) return 1;
-    int count = __atomic_load_n(&g_ngro, __ATOMIC_ACQUIRE);
-    int hit = 0;
-    for (int i = 0; i < count; i++) {
-        uint64_t lo = __atomic_load_n(&g_gro[i].lo, __ATOMIC_RELAXED);
-        uint64_t hi = __atomic_load_n(&g_gro[i].hi, __ATOMIC_RELAXED);
-        if (a < hi && end > lo) {
-            hit = 1;
-            break;
+    // RETRY the seqlock instead of answering "read-only" while a writer is mid-update: any concurrent
+    // mprotect/mmap (a peer's thread-stack allocation) otherwise EFAULTs an unrelated writable address.
+    for (int attempt = 0; attempt < 4096; attempt++) {
+        uint64_t generation = atomic_load_explicit(&g_gro_generation, memory_order_acquire);
+        if (generation & 1) {
+            sched_yield();
+            continue;
         }
+        int count = __atomic_load_n(&g_ngro, __ATOMIC_ACQUIRE);
+        int hit = 0;
+        for (int i = 0; i < count; i++) {
+            uint64_t lo = __atomic_load_n(&g_gro[i].lo, __ATOMIC_RELAXED);
+            uint64_t hi = __atomic_load_n(&g_gro[i].hi, __ATOMIC_RELAXED);
+            if (a < hi && end > lo) {
+                hit = 1;
+                break;
+            }
+        }
+        if (atomic_load_explicit(&g_gro_generation, memory_order_acquire) == generation) return hit;
     }
-    if (atomic_load_explicit(&g_gro_generation, memory_order_acquire) != generation) return 1;
-    return hit;
+    return 1; // a writer that never settles: keep the conservative answer
 }
 
 // execve replaces the whole address space -> drop all tracked PROT_NONE ranges (they're gone with the old
@@ -1698,10 +1705,14 @@ static long futex_lock_pi(struct cpu *c, int *uaddr, const void *key, int tryloc
         int expect = __atomic_load_n(uaddr, __ATOMIC_SEQ_CST);
         uint32_t v = (uint32_t)expect;
         uint32_t owner = v & HL_FUTEX_TID_MASK;
-        if (owner == 0) { // free (owner slot 0; FUTEX_OWNER_DIED may still be set on a robust mutex)
-            int others = fbk_parked(b, futex_key(key)) - (parked ? 1 : 0); // waiters left behind
-            int nv = (int)((uint32_t)mytid | (v & HL_FUTEX_OWNER_DIED) |
-                           (others > 0 ? HL_FUTEX_WAITERS : 0));
+        int others = fbk_parked(b, futex_key(key)) - (parked ? 1 : 0); // waiters left behind
+        // A fresh arrival must not steal from a queued waiter: Linux hands the rt_mutex to the top waiter, so
+        // an unlocker that immediately re-locks queues behind it. Stealing starved waiters out to ETIMEDOUT.
+        // Only when the parked count is exact -- an overflowed bucket counts foreign addresses, and blocking
+        // on a phantom waiter would park us with nobody left to wake us.
+        int must_queue = !parked && others > 0 && !b->imprecise;
+        if (owner == 0 && !must_queue) { // free (FUTEX_OWNER_DIED may still be set on a robust mutex)
+            int nv = (int)((uint32_t)mytid | (v & HL_FUTEX_OWNER_DIED) | (others > 0 ? HL_FUTEX_WAITERS : 0));
             // Acquire atomically vs a racing userspace fast-path locker (cmpxchg 0->tid): if the word moved
             // underfoot, retry from the re-read instead of clobbering the new owner (double-ownership bug).
             if (!__atomic_compare_exchange_n(uaddr, &expect, nv, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) continue;

@@ -1,6 +1,7 @@
 #define _DEFAULT_SOURCE
 #include "../range.h"
 
+#include <errno.h>
 #include <sys/mman.h>
 #include <stdio.h>
 #include <string.h>
@@ -18,7 +19,14 @@ int hl_host_address_mapped(uintptr_t address) {
     uintptr_t page;
     if (page_size == 0) return 0;
     page = address & ~((uintptr_t)page_size - 1);
-    return mincore((void *)page, page_size, &resident) == 0;
+    // Only ENOMEM means unmapped. mincore() also reports EAGAIN when the kernel is transiently out of
+    // resources, which under load turned live guest addresses into spurious EFAULTs.
+    for (int attempt = 0; attempt < 64; attempt++) {
+        errno = 0;
+        if (mincore((void *)page, page_size, &resident) == 0) return 1;
+        if (errno != EAGAIN) return errno != ENOMEM;
+    }
+    return 1;
 }
 
 int hl_host_region_query(uintptr_t address, hl_host_region *region) {
