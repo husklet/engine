@@ -836,22 +836,6 @@ static int ckpt_capture_file_blob(int fd, char *record_path, size_t record_capac
     return ckpt_sink_finish(sink, &output);
 }
 
-static int ckpt_rmrf(const char *path) {
-    DIR *d = opendir(path);
-    if (d) {
-        struct dirent *e;
-        char child[2048];
-        while ((e = readdir(d))) {
-            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-            snprintf(child, sizeof child, "%s/%s", path, e->d_name);
-            if (ckpt_rmrf(child) != 0) unlink(child);
-        }
-        closedir(d);
-        return rmdir(path);
-    }
-    return unlink(path);
-}
-
 // Called at the top of the dispatcher loop (a clean safepoint: all guest arch state is spilled into `c`).
 // Referenced by engine/dispatch.c via the G_CKPT_POLL seam (aarch64-only). Cheap: a NULL test + one shared
 // memory load on the hot path. When the trigger generation advances, the container INIT coordinates the
