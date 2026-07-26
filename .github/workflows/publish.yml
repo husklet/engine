@@ -57,7 +57,7 @@ jobs:
       # archive from reaching cargo publish even if those workflows later change.
       - name: Verify crate archives are current
         timeout-minutes: 15
-        run: tools/ci_run.sh 720 "Verify crate archives are current" -- nix develop --command make check-crate-archives
+        run: tools/ci_run.sh 720 "Verify crate archives are current" -- nix develop --command sh -c 'cmake -G Ninja -B build-ci -DHL_BUILD_TESTS=OFF && cmake --build build-ci --target check-crate-archives'
 
       - name: Verify packaged archive launches a guest
         timeout-minutes: 20

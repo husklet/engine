@@ -6,7 +6,7 @@ completion roadmap. The rest of `docs/` is subordinate detail.
 | Document | Covers |
 |---|---|
 | `docs/arch.md` | Where each layer defined here lives, at symbol level. Read it before touching `src/core`. |
-| `docs/makefile-retirement.md` | What still blocks deleting the Makefile. |
+| `docs/makefile-retirement-darwin-evidence.md` | Measured `make`-vs-CTest equivalence, recorded before the Makefile was deleted. |
 | `docs/ci-green.md` | Differential compat findings, `excluded-macos` justifications, runtime self-skips, open gaps. |
 | `docs/checkpoint-sink.md` | The `ckpt_sink`/`ckpt_source` interface and the embedder-supplied checkpoint store. |
 | `docs/checkpoint-restore-io.md` | Restore recovery policies and external-resource reconnection. |
@@ -377,7 +377,7 @@ Two build systems are present while the project migrates to CMake. Neither requi
   is the path new work should use.
 * **Make.** The historical build. It is still what CI runs for the Linux compat shards and for the entire
   macOS lane, so it cannot be deleted yet. `nix build`, `checks.package` and `checks.unit` are CMake, so the
-  two are exercised together on every push. Remaining conversion work: docs/makefile-retirement.md.
+  two are exercised together on every push.
 
 A few CTest cases and build targets shell out to `bash` scripts under `tools/` (lane parity, direct launches,
 crate-archive currency, the remote-macOS lane). No test suite is implemented in a shell script.
@@ -387,20 +387,20 @@ crate-archive currency, the remote-macOS lane). No test suite is implemented in 
 ```text
 cmake -G Ninja -B build-cmake
 ninja -C build-cmake
-ctest --test-dir build-cmake -L unit    # or -L compat-ipc, etc. -- one label per suite
+ctest --test-dir build-cmake -L unit --no-tests=error   # one label per suite
 cmake --install build-cmake --prefix /usr/local
 cmake --build build-cmake --target uninstall     # exact install_manifest.txt consumer
 ```
 
 `ctest --test-dir build-cmake -N` and `--print-labels` enumerate the registry; a Linux `nix develop`
-configure registers 394 cases. Nothing is hand-maintained, so neither can drift.
-`gate.makefile-lane-parity` fails the build if any historical lane label selects zero tests — `ctest -L`
-on an unknown label exits 0, which would otherwise turn a mistyped CI step green.
+configure registers 396 cases, a Darwin one 195. Nothing is hand-maintained, so neither can drift.
+`gate.ci-lane-parity` fails the build if any lane declared in `cmake/CiLanes.cmake` selects zero tests
+— `ctest -L` on an unknown label exits 0, which would otherwise turn a mistyped CI step green. Pass
+`--no-tests=error` on every label selection for the same reason.
 
 A second configure with `-DHL_SANITIZE=ON` is the ASan/UBSan build.
 
 No toolchain file is needed for a native build: inside the devShell `$CC` is the intended host compiler.
-(Use a build directory other than `build/`, which is the Makefile's output tree.)
 
 Installing yields a usable SDK: headers under `include/hl`, the static archives (including
 `libhl-engine-activation.a`), both pkg-config files, and `bin/hl-engine-runner`. Set
@@ -413,10 +413,10 @@ Cross/host toolchain files live in `cmake/toolchains/`:
 |---|---|
 | `cmake/toolchains/aarch64-linux.cmake` | aarch64 Linux, forcing `$AARCH64_LINUX_CC`. Only needed when `$CC` is not already the intended host compiler; a native devShell build needs no toolchain file. |
 | `cmake/toolchains/x86_64-linux.cmake`  | x86_64 guest fixtures |
-| `cmake/toolchains/macos-remote.cmake`  | macOS artifacts **from a Linux host**, by forwarding each compiler and binutils invocation to the macOS host through OrbStack's `mac` (see `tools/remote/`). This replaces the Makefile's `MAC=mac` recipe prefix. The build directory must live inside the repo, because only that path is shared with the macOS side. |
+| `cmake/toolchains/macos-remote.cmake`  | macOS artifacts **from a Linux host**, by forwarding each compiler and binutils invocation to the macOS host through OrbStack's `mac` (see `tools/remote/`). The build directory must live inside the repo, because only that path is shared with the macOS side. |
 
 Nix remains the toolchain authority: the toolchain files read the same `AARCH64_LINUX_CC` /
-`X86_64_LINUX_CC` the devShell exports and the Makefile consumes. The devShell also exports `$CC` (and
+`X86_64_LINUX_CC` the devShell exports. The devShell also exports `$CC` (and
 `$NATIVE_CC`) as the **native** compiler, so a bare `cmake`/`make` in the shell targets the host. The
 per-ISA variables stay explicit because the guest ISA is not always the host ISA.
 
@@ -444,130 +444,137 @@ Hosts and guest ISAs are data tables in `flake.nix` (`hostBackends`, `guestISAs`
 branches, so `x86_64-linux` is first class today and a Windows host backend is a one-entry addition once
 `src/host/windows/` has code.
 
-### 7.1 Build libraries and runner (Make)
+### 7.1 Build libraries and runner
 
 ```text
-make all
-make linux-compile
+cmake -G Ninja -B build
+ninja -C build
 ```
 
-`make all` builds the portable libraries, selected native host library, and generic runner. `make linux-compile`
-compiles and links every portable unit and the Linux host.
-
-Use a separate output directory when comparing configurations:
+`ninja` with no target builds every library, production engine, runner, test binary and guest
+fixture. Use a separate build directory when comparing configurations; nothing is written into the
+source tree, so there is no `clean` target.
 
 ```text
-make BUILD=build-release DEBUG=0 all
-make BUILD=build-debug DEBUG=1 all
+cmake -G Ninja -B build-debug -DHL_DEBUG_LOGGING=1
+cmake -G Ninja -B build-asan  -DHL_SANITIZE=ON
 ```
 
 ### 7.2 Debug logging
 
 ```text
-make BUILD=build-debug DEBUG=1 all
+cmake -G Ninja -B build-debug -DHL_DEBUG_LOGGING=1 && ninja -C build-debug
 HL_LOG=log:fs,log:jit build-debug/bin/hl-engine-runner ...
 ```
 
 ### 7.3 Unit and behavior tests
 
 ```text
-make test
-make test-macos
-make format-check
+ctest --test-dir build -L unit --no-tests=error
+ctest --test-dir build -L macos --no-tests=error      # Darwin host
+ninja -C build format-check
 ```
 
-`make test` runs C unit tests and native compatibility smoke tests. Architectural ownership is enforced by the
-library build and link graph, not by tests that inspect source text. `make test-macos`
-cross-builds the mac host tests and executes them on the real mac host using `mac`.
+Architectural ownership is enforced by the library build and link graph, not by tests that inspect
+source text. The `macos` lane builds the mac host tests and executes them on a real mac host.
+
+**Always pass `--no-tests=error`.** `ctest -L <label>` exits 0 when the label matches nothing, so a
+typo or a renamed label reports success. Invariant I15 (`tools/check_ci_workflows.sh`) rejects any
+workflow step that omits it.
 
 ### 7.4 Linux-host production tests
 
 On a Linux/AArch64 host:
 
 ```text
-make run-linux-production-smoke
-make test-linux-production-matrix
+ctest --test-dir build -L production --no-tests=error
+ctest --test-dir build -L production-full --no-tests=error
 ```
 
-The smoke test proves production JIT entry, exact stdout, and guest exit status. The matrix runner executes selected
-x86-64 Linux guests through the production engine and requires exact golden output, exit status, timeout handling, and
-process-group cleanup. A zero exit with incorrect output is a failure.
+The smoke tests prove production JIT entry, exact stdout, and guest exit status. The matrix runner
+executes selected x86-64 Linux guests through the production engine and requires exact golden output,
+exit status, timeout handling, and process-group cleanup. A zero exit with incorrect output is a
+failure.
 
-### 7.5 macOS production tests
+### 7.5 The compatibility matrix and the macOS lane
 
-The `MAC` variable names the command used to execute on the mac host. It is empty on Darwin and defaults to `mac` on
-other hosts:
-
-```text
-make MAC=mac compat-engines
-make MAC=mac compat-memory
-make MAC=mac compat-filesystem
-make MAC=mac compat-ipc
-make MAC=mac e2e-compat
-make MAC=mac e2e-mac-build
-make MAC=mac e2e-lifecycle-signal
-make MAC=mac e2e-lifecycle-control
-make MAC=mac e2e-lifecycle-hygiene
-make MAC=mac e2e-embedding-fd
-make MAC=mac e2e-embedding-stdio
-make MAC=mac e2e-embedding-dir
-```
-
-Production mac engines are compiled, linked, codesigned with the JIT entitlement, and actually executed. A successful
-cross-compile is not a test pass.
-
-Focused suite targets include:
+Each compat suite is one CTest case driving `tools/matrix-runner` over the whole suite manifest. The
+suites are selected by label:
 
 ```text
 compat-abi               compat-abi-corpus
 compat-completeness      compat-libc
-compat-core              compat-core-abi
-compat-core-syscall      compat-core-regress
-compat-core-workload     compat-filesystem
-compat-ipc               compat-isolation
-compat-memory            compat-network
-compat-posix             compat-process
-compat-procfs            compat-signals
+compat-core-abi          compat-core-syscall
+compat-core-regress      compat-core-workload
+compat-filesystem        compat-ipc
+compat-isa-aarch64       compat-isa-x86-64
+compat-isolation         compat-memory
+compat-network           compat-posix
+compat-process           compat-procfs
+compat-signals           compat-soak
 compat-syscall           compat-syscall-edges
 compat-threads           compat-time
-compat-soak
 ```
 
-The matrix runner maps the guest's `/tmp` to a per-case scratch directory taken from the build tree. A few cases
-(`memfd-seals`, and anything asserting statx btime) require that scratch to be tmpfs-backed. When the build tree
-lives on a disk filesystem, point the runner at a tmpfs: `export HL_MATRIX_SCRATCH_DIR=/dev/shm`. CI mounts a tmpfs
-at `/mnt/hl-scratch` for exactly this reason (`.github/workflows/linux.yml`).
-
-The behavioral gate is six independent subgates, aggregated by `e2e-mac-gates`:
-`e2e-lifecycle-signal`, `e2e-lifecycle-control`, `e2e-lifecycle-hygiene`, `e2e-embedding-fd`,
-`e2e-embedding-stdio`, `e2e-embedding-dir`. Run each with its own timeout. The compatibility matrix is separate:
-`.github/workflows/mac.yml` shards `compat-*` across five parallel jobs and never runs the `e2e-compat` umbrella.
-The host firewall reliably admits at most four signed launches from one launching process, so a manifest-only
-firewall audit runs first in every gate (`cmake/RunSequence.cmake`, `cmake/Phase4Mac.cmake`) and keeps each subgate
-inside that budget with distinct artifact identities. CI builds and signs only that subgate's artifacts in a
-preceding step; compilation never shares the execution process. Local shared-host runs must be serialized, verify no
-other `mac` workload is active, and allow a bounded settle interval between gates. There is deliberately no
-recursive umbrella and no firewall retry.
-
-Remote execution is supervised. Cancellation, timeout, or bridge loss terminates the remote process group and reaps
-children. Validate the supervisor with:
+CTest does not build what a test needs, so build the lane first. Every suite has a narrow build
+target, which is exactly what a CI shard uses:
 
 ```text
-make remote-supervisor-test
+cmake --build build --target compat-engines compat-memory-fixtures
+ctest --test-dir build -L '^compat-memory$' --no-tests=error
 ```
+
+The runner launches the engine on the host it runs on (bridge `env`). Driving a macOS build from a
+Linux host is a separate path: `cmake/toolchains/macos-remote.cmake`, or
+`tools/run_remote_macos_ctest.sh`, which configures and runs CTest on the mac itself.
+
+Production mac engines are compiled, linked, codesigned with the JIT entitlement, and actually
+executed. A successful cross-compile is not a test pass.
+
+The matrix runner maps the guest's `/tmp` to a per-case scratch directory taken from the build tree.
+A few cases (`memfd-seals`, and anything asserting statx btime) require that scratch to be
+tmpfs-backed. When the build tree lives on a disk filesystem, point the runner at a tmpfs:
+`export HL_MATRIX_SCRATCH_DIR=/dev/shm`. CI mounts a tmpfs at `/mnt/hl-scratch` for exactly this
+reason (`.github/workflows/linux.yml`).
+
+The behavioral gate is the `e2e-mac` label: lifecycle identity, signal and control gates per guest
+ISA, the three embedding bindings per ISA, and the bridge jobserver. The host firewall reliably
+admits at most four signed launches from one launching process, so a manifest-only firewall audit
+runs first in every gate (`cmake/RunSequence.cmake`, `cmake/Phase4Mac.cmake`) and keeps each subgate
+inside that budget with distinct artifact identities; the sequencing is expressed as CTest fixtures
+and `RESOURCE_LOCK`s. Local shared-host runs must verify no other `mac` workload is active. There is
+deliberately no firewall retry.
+
+Remote execution is supervised. Cancellation, timeout, or bridge loss terminates the remote process
+group and reaps children. Validate the supervisor with `ctest --test-dir build -R
+remote-supervisor --no-tests=error`.
+
+### 7.5.1 CI lanes and what stops one from being dropped
+
+`cmake/CiLanes.cmake` declares, per host, which lanes CI shards (`HL_CI_SHARDED_*`), which the main
+job runs directly (`HL_CI_DIRECT_*`), and which exist but no workflow runs (`HL_CI_REGISTRY_*`).
+It is the single source of truth, and two guards hang off it:
+
+| guard | asserts |
+|---|---|
+| `gate.ci-lane-parity` (`cmake/LaneParity.cmake`, `tools/check_lane_parity.sh`; runs in the `unit` label) | every declared lane selects **at least one** test on this host |
+| `unit.ci-workflow-invariants` I13/I14 | every sharded lane is named by **exactly one** workflow shard, and no shard names an undeclared lane |
+| `unit.ci-workflow-invariants` I15 | every `ctest -L` step in a workflow passes `--no-tests=error` |
+
+Adding a suite is one edit to `cmake/CiLanes.cmake` plus one shard entry. Forgetting either turns a
+build red instead of silently dropping coverage.
 
 ### 7.6 Installation and consumers
 
-The Make build is the single authoritative source list for development and packaging. Install the public headers,
+CMake is the single authoritative source list for development and packaging. Install the public headers,
 portable archives, selected host-provider archive, generic runner, and generated `pkg-config` metadata with:
 
 ```text
-make HOST=linux PREFIX=/usr/local install
-make HOST=macos PREFIX=/usr/local install
+cmake --install <build-dir> --prefix /usr/local
 ```
 
-Packagers can prepend a staging root with `DESTDIR`; the path recorded in `hl-engine.pc` remains `PREFIX`. `uninstall`
-removes only files owned by this package. `make package-test` installs into an isolated staging root, compiles a pure-C
+Packagers can prepend a staging root with `DESTDIR`; the path recorded in `hl-engine.pc` remains `PREFIX`. The
+`uninstall` target removes only files owned by this package. The `package` lane installs into an isolated staging root, compiles a pure-C
 consumer using only the installed include/library contract (the same flags emitted in `hl-engine.pc`, without requiring
 the `pkg-config` program on build hosts), runs it against the real host provider, uninstalls, and verifies that its
 public header was removed. Rust `build.rs` integrations consume this same installed C ABI and must not compile a second
@@ -615,8 +622,7 @@ Two CI gates protect this, on Linux and on `publish`:
 - `check-crate-archives` recomputes the `source-manifest` hash in `PROVENANCE.md` — a digest over every C source
   and header the archives are built from (`tools/crate_archive_manifest.sh`) — plus the SHA-256 of each committed archive,
   and fails with the regeneration command when the sources have moved on. This is the *currency* check, and it is pure
-  hashing: seconds, no extra compilation. Both workflows currently invoke it as
-  `make check-crate-archives`; the CMake target `check-crate-archives` runs the same
+  hashing: seconds, no extra compilation. Both workflows invoke the `check-crate-archives` target, which runs
   `tools/check_crate_archives.sh`. The gate also structurally validates both archives. Repacking and force-loading
   the Mach-O archive needs a Darwin host, so the Linux runner does the host-independent part (ar container, member
   list, required symbols) and the macOS workflow runs the same gate for the link test. Requiring the Mach-O link on
@@ -687,8 +693,7 @@ Performance is part of correctness because an execution engine that is pathologi
 software reliably. Measurements use release builds and the C performance runner:
 
 ```text
-ctest --test-dir <build-dir> -L perf-linux      # or -L perf-native, -L perf-macos
-make BUILD=build-perf DEBUG=0 perf-compat       # the Makefile equivalent
+ctest --test-dir <build-dir> -L perf-linux --no-tests=error   # or -L perf-native, -L perf-macos
 ```
 
 Report at least:

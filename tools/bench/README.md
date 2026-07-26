@@ -61,15 +61,15 @@ build/tools/bench-runner report build/bench/*.csv
 
 CSV columns: `env,arch,phase,us,ok,us_min,us_max,repeats`.
 
-### The default way: `make bench`
+### The default way: the `bench` target
 
 Builds both-arch guests + the production engine + the runner, runs the local
 backends, and prints the table:
 
 ```sh
-make bench                                   # native + qemu + hl-engine (local arch)
-make bench BENCH_ARCH=amd64                  # x86_64 guests
-make bench BENCH_REPEATS=9
+ninja -C <build-dir> bench                     # native + qemu + hl-engine (local arch)
+BENCH_ARCH=amd64 ninja -C <build-dir> bench    # x86_64 guests
+BENCH_REPEATS=9 ninja -C <build-dir> bench
 ```
 
 ### Per-env flags
@@ -84,7 +84,7 @@ Docker is left to the Manager because it needs a reachable daemon. On host (nati
 the host docker is reached with `DOCKER="mac docker"`:
 
 ```sh
-make bench BENCH_ENVS='native qemu hl-engine docker' DOCKER='mac docker'
+BENCH_ENVS='native qemu hl-engine docker' DOCKER='mac docker' ninja -C <build-dir> bench
 # or directly:
 DOCKER='mac docker' build/tools/bench-runner run --env docker --arch arm64 \
     --image debian:stable-slim --out build/bench/docker-arm64.csv
@@ -98,7 +98,7 @@ linux/amd64`); a `--sock /path/docker.sock` routes to a specific daemon socket.
 - **docker** cell: `DOCKER="mac docker"` (host daemon) + `--arch {arm64,amd64}`
   + `--image`. Runs the SAME static-PIE guest binary inside the container.
 - **mac / host** commands: prefix with `mac` (host (native)) as needed.
-- **x86_64 build**: `make build/perf/combined-bench-x86_64` (sqlite off by
+- **x86_64 build**: `ninja -C <build-dir> perf/combined-bench-x86_64` (sqlite off by
   default on the aarch64 cross host; a native amd64 cell can enable it with
   `COMBINED_BENCH_SQLITE_x86_64=1`). Engine:
   `build/linux-production/hl-engine-linux-x86_64`.
@@ -112,7 +112,7 @@ one per (arch, env), then `report` merges them into the phase × (env, arch)
 table. From the repo root on an OrbStack arm64 Linux machine:
 
 ```sh
-nix develop -c bash -c 'CC=cc make build/perf/combined-bench-aarch64 \
+nix develop -c bash -c 'ninja -C <build-dir> perf/combined-bench-aarch64 \
     build/perf/combined-bench-x86_64 build/tools/bench-runner \
     build/linux-production/hl-engine-linux-aarch64 \
     build/linux-production/hl-engine-linux-x86_64'
@@ -130,7 +130,7 @@ DOCKER='mac docker' $R run --env docker --arch amd64 --out results/docker-amd64.
 $R report --baseline hl-engine results/*.csv
 ```
 
-`make bench` runs the locally-reachable cells automatically. On a real amd64
+The `bench` target runs the locally-reachable cells automatically. On a real amd64
 host add `--env native --arch amd64` for the true native-amd baseline.
 
 ## How to read

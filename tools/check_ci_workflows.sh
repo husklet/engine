@@ -126,7 +126,7 @@ invariants)
 			if (!job_timeouts[i] && !job_calls[i])
 				bad("I4 " job_files[i] " job `" job_names[i] "` has no timeout")
 		for (i = 1; i <= steps; i++) {
-			if (step_runs[i] ~ /(nix build|nix develop|make |cargo )/ &&
+			if (step_runs[i] ~ /(nix build|nix develop|cargo )/ &&
 			    !step_timeouts[i])
 				bad("I5 " step_files[i] " step `" step_names[i] "` has no timeout")
 			if (step_runs[i] ~ /attempt 1/ &&
@@ -140,7 +140,7 @@ invariants)
 			# Every test-lane gate must name its own failure: the job-log
 			# endpoint needs admin rights, so a step that only exits
 			# non-zero is undiagnosable from the public check-run data.
-			if (step_runs[i] ~ /(nix build|nix develop|make |cargo )/ &&
+			if (step_runs[i] ~ /(nix build|nix develop|cargo )/ &&
 			    step_runs[i] !~ /ci_run\.sh/ && step_runs[i] !~ /::error/ &&
 			    step_runs[i] !~ /for attempt in/)
 				bad("I17 " step_files[i] " step `" step_names[i] "` reports no ::error on failure")
@@ -194,58 +194,62 @@ invariants)
 		fi
 	done
 
-	# I13-I15: the sharded compat matrices replaced whole-suite aggregates, so a
-	# suite the Makefile aggregate runs but no shard names is silently unrun.
-	logical_line() {
-		awk -v pat="$1" '
-		index($0, pat) == 1 { collecting = 1 }
-		collecting {
-			line = line " " $0
-			if ($0 !~ /\\$/) {
-				gsub(/\\/, " ", line)
-				print line
-				exit
-			}
-		}' Makefile
+	# I13-I15: the sharded compat matrices are the only place a suite runs, so a
+	# lane cmake/CiLanes.cmake declares but no shard names is silently unrun.
+	# cmake/CiLanes.cmake is the source of truth; gate.ci-lane-parity separately
+	# proves each declared lane is a NON-EMPTY CTest selection on its host.
+	lanes_in() {
+		awk -v name="$1" '
+		$0 ~ "^set\\(" name "$" { on = 1; next }
+		on && /^\)/ { exit }
+		on { gsub(/[ \t]/, ""); if ($0 != "" && $0 !~ /^#/) print }
+		' cmake/CiLanes.cmake
 	}
 	shard_targets() {
 		sed -n 's/^ *targets: *//p' "$1" | tr ' ' '\n' | sed '/^$/d'
 	}
+	# Both directions: a declared lane must be sharded exactly once, and no shard
+	# may name a lane that is not declared.
+	check_shards() {
+		wf=$1
+		declared=$2
+		id=$3
+		shards=$(shard_targets "$wf")
+		for lane in $declared; do
+			count=$(printf '%s\n' "$shards" | grep -Fxc -- "$lane" || true)
+			if [ "$count" -eq 0 ]; then
+				printf 'VIOLATION: %s %s runs no shard for `%s`\n' \
+					"$id" "$wf" "$lane" >&2
+				return 1
+			fi
+			# Consolidating buckets must MOVE a lane, not copy it: a lane named
+			# twice burns a scarce runner on work already covered.
+			if [ "$count" -gt 1 ]; then
+				printf 'VIOLATION: %s %s runs `%s` in %s shards\n' \
+					"$id" "$wf" "$lane" "$count" >&2
+				return 1
+			fi
+		done
+		for lane in $shards; do
+			if ! printf '%s\n' $declared | grep -Fqx -- "$lane"; then
+				printf 'VIOLATION: %s %s shards `%s`, undeclared in cmake/CiLanes.cmake\n' \
+					"$id" "$wf" "$lane" >&2
+				return 1
+			fi
+		done
+	}
+	check_shards "$wfdir/mac.yml" "$(lanes_in HL_CI_SHARDED_DARWIN)" I13 || exit 1
+	check_shards "$wfdir/linux.yml" "$(lanes_in HL_CI_SHARDED_LINUX)" I14 || exit 1
 
-	shards=$(shard_targets "$wfdir/mac.yml")
-	for suite in $(logical_line 'e2e-compat:'); do
-		case "$suite" in
-		compat-engines) continue ;;
-		compat-*) ;;
-		*) continue ;;
-		esac
-		count=$(printf '%s\n' "$shards" | grep -Fxc -- "$suite" || true)
-		if [ "$count" -eq 0 ]; then
-			printf 'VIOLATION: I13 mac.yml runs no shard for `%s`\n' "$suite" >&2
-			exit 1
-		fi
-		# Consolidating buckets must move a suite, not copy it: a suite named
-		# twice burns a scarce macOS runner on work already covered.
-		if [ "$count" -gt 1 ]; then
-			printf 'VIOLATION: I13 mac.yml runs `%s` in %s shards\n' "$suite" "$count" >&2
-			exit 1
-		fi
-	done
-
-	shards=$(shard_targets "$wfdir/linux.yml")
-	typed_suites=$(logical_line 'TYPED_SUITES :=' | sed 's/.*TYPED_SUITES := *//')
-	for suite in $typed_suites; do
-		if ! printf '%s\n' "$shards" | grep -Fqx -- "typed-$suite"; then
-			printf 'VIOLATION: I14 linux.yml runs no shard for `typed-%s`\n' "$suite" >&2
-			exit 1
-		fi
-	done
-
-	parity=$(sed -n '/for s in /,/; do/p' "$wfdir/linux.yml" |
-		tr -d '\\' | sed 's/.*for s in //; s/; do.*//')
-	if [ "$(printf '%s\n' $typed_suites | LC_ALL=C sort)" != \
-		"$(printf '%s\n' $parity | LC_ALL=C sort)" ]; then
-		printf '%s\n' 'VIOLATION: I15 the CTest parity list is not TYPED_SUITES' >&2
+	# I15: `ctest -L <label>` EXITS 0 when the label matches nothing. Every
+	# label-driven step must pass --no-tests=error or a dropped lane reports
+	# green. `-N` is listing, not running, and is exempt.
+	if awk '/^[ \t]*#/ { next }
+		/ctest/ && / -L / && !/--no-tests=error/ && !/ -N / {
+			print "  " FILENAME ": " $0 > "/dev/stderr"; bad = 1
+		}
+		END { exit !bad }' "$wfdir"/*.yml; then
+		printf '%s\n' 'VIOLATION: I15 a `ctest -L` step lacks --no-tests=error' >&2
 		exit 1
 	fi
 
@@ -267,7 +271,7 @@ publish-gate)
 		'uses: ./.github/workflows/linux.yml' \
 		'uses: ./.github/workflows/mac.yml' \
 		'needs: [linux, mac]' \
-		'make check-crate-archives' \
+		'--target check-crate-archives' \
 		'--test packaged_archive'
 	do
 		if ! grep -Fq -- "$pattern" "$pub"; then
