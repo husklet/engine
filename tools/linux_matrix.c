@@ -212,7 +212,10 @@ static int run_suite(const char *engine, const char *binary_root, const char *su
             }
             memcpy(binary, fields[2], source_size - 2);
             binary[source_size - 2] = 0;
-        } else if (strncmp(fields[5], "prebuilt", 8) == 0 && source_size != 0 && source_size < sizeof(binary)) {
+        } else if (source_size != 0 && source_size < sizeof(binary)) {
+            /* A source without a .c suffix names the built artifact directly -- a prebuilt
+               corpus binary, or a fixture the build produces (e.g. a symlink). Mirrors
+               matrix_runner.c, which strips .c when present and otherwise uses the name. */
             memcpy(binary, fields[2], source_size + 1);
         } else {
             fprintf(stderr, "linux-matrix: invalid source %s\n", fields[2]);
