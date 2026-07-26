@@ -336,9 +336,11 @@ static int activation_run_config(const char *rootfs, const char *executable_host
     config.fd_bindings = bindings;
     config.fd_binding_count = count;
     if (executable_host != NULL) {
-        hl_host_result opened = activation_services->file->open_relative(
-            activation_services->context, HL_HOST_HANDLE_CWD, executable_host, strlen(executable_host),
-            HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW, 0, 0);
+        /* Same contract as the CLI entry path: the launcher names a program, and execve(2) follows a
+           program symlink. NOFOLLOW made every symlinked entry program fail the launch with ELOOP. */
+        hl_host_result opened =
+            activation_services->file->open_relative(activation_services->context, HL_HOST_HANDLE_CWD, executable_host,
+                                                     strlen(executable_host), HL_HOST_FILE_READ, 0, 0);
         if (opened.status != HL_STATUS_OK) {
             activation_status = (hl_status)opened.status;
             return 78;
