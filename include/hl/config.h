@@ -7,13 +7,9 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_CONFIG_MAGIC UINT32_C(0x484c4346)
-#define HL_CONFIG_ABI 14u
-#define HL_CONFIG_ABI_LEGACY 10u
-#define HL_CONFIG_ABI_NETWORK_TRANSPORT 11u
-#define HL_CONFIG_ABI_OVERLAY 12u
-#define HL_CONFIG_ABI_CHECKPOINT_POLICY 13u
-/* 13 carries checkpoint_policy with the retired meaning (0 == refuse) and is rejected, not reinterpreted. */
-#define HL_CONFIG_ABI_CHECKPOINT_DEFAULT 14u
+/* The one accepted launch generation. Any other value is rejected with HL_STATUS_ABI_MISMATCH -- that is
+ * what catches a prebuilt archive built against different headers. */
+#define HL_CONFIG_ABI 1u
 /* Zero is "no policy asked for": restore is permissive, capture keeps refusing what it cannot capture. */
 #define HL_CONFIG_CHECKPOINT_DEFAULT 0u
 #define HL_CONFIG_CHECKPOINT_RECONNECT 1u

@@ -8,10 +8,9 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_ENGINE_ABI 5u
-#define HL_ENGINE_BOX_ABI 5u
-#define HL_ENGINE_BOX_ABI_4 4u
-#define HL_ENGINE_BOX_ABI_3 3u
-#define HL_ENGINE_BOX_ABI_1 1u
+/* The one accepted box generation. A box declaring anything else, or smaller than the struct below, is
+ * rejected outright -- there is no per-generation field-presence gating to read past. */
+#define HL_ENGINE_BOX_ABI 1u
 
 typedef struct hl_engine hl_engine;
 

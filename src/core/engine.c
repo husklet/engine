@@ -312,66 +312,41 @@ static int hl_engine_proxy_valid(const char *value) {
 static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_config *box) {
     char number[32];
     char publish[1024];
-    uint32_t known_flags = HL_ENGINE_BOX_ROOTFS_READ_ONLY | HL_ENGINE_BOX_SANDBOX | HL_ENGINE_BOX_NETWORK_ISOLATED;
-    const size_t abi1_size = offsetof(hl_engine_box_config, lower_layers);
-    const size_t abi3_size = offsetof(hl_engine_box_config, file_owners);
-    const size_t abi4_size = offsetof(hl_engine_box_config, checkpoint_policy);
-    int has_checkpoint_policy;
-    int has_checkpoint_directories;
-    int has_v2;
+    uint32_t known_flags = HL_ENGINE_BOX_ROOTFS_READ_ONLY | HL_ENGINE_BOX_SANDBOX | HL_ENGINE_BOX_NETWORK_ISOLATED |
+                           HL_ENGINE_BOX_PUBLISH_EXTERNAL | HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED |
+                           HL_ENGINE_BOX_SENTRY_ONLY;
     if (box == NULL) return HL_STATUS_OK;
-    if ((box->abi != HL_ENGINE_BOX_ABI_1 && box->abi != HL_ENGINE_BOX_ABI_3 && box->abi != HL_ENGINE_BOX_ABI_4 &&
-         box->abi != HL_ENGINE_BOX_ABI) ||
-        (box->abi == HL_ENGINE_BOX_ABI_1 && box->size != abi1_size) ||
-        (box->abi == HL_ENGINE_BOX_ABI_3 && box->size < abi3_size) ||
-        (box->abi == HL_ENGINE_BOX_ABI_4 && box->size < abi4_size) ||
-        (box->abi == HL_ENGINE_BOX_ABI && box->size < sizeof(*box)))
-        return HL_STATUS_ABI_MISMATCH;
-    has_v2 = box->abi >= HL_ENGINE_BOX_ABI_4;
-    has_checkpoint_policy = box->abi >= HL_ENGINE_BOX_ABI;
-    /* ABI 1's struct ends before these fields; reading them would run off the caller's allocation. */
-    has_checkpoint_directories = box->abi >= HL_ENGINE_BOX_ABI_3;
-    if (has_v2)
-        known_flags |=
-            HL_ENGINE_BOX_PUBLISH_EXTERNAL | HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED | HL_ENGINE_BOX_SENTRY_ONLY;
+    /* One accepted generation. An undersized box is rejected rather than partially read. */
+    if (box->abi != HL_ENGINE_BOX_ABI || box->size < sizeof(*box)) return HL_STATUS_ABI_MISMATCH;
     if ((box->flags & ~known_flags) != 0 || box->reserved != 0 || box->uid < -1 || box->gid < -1 ||
-        (has_checkpoint_policy &&
-         (box->checkpoint_policy > HL_CONFIG_CHECKPOINT_REFUSE || box->reserved_checkpoint != 0)))
+        box->checkpoint_policy > HL_CONFIG_CHECKPOINT_REFUSE || box->reserved_checkpoint != 0)
         return HL_STATUS_INVALID_ARGUMENT;
     if (box->working_directory != NULL && box->working_directory[0] != '/') return HL_STATUS_INVALID_ARGUMENT;
     if (!hl_engine_hostname_valid(box->hostname) || !hl_engine_environment_valid(box->environment))
         return HL_STATUS_INVALID_ARGUMENT;
-    if (has_v2) {
 #define VALIDATE_BOX_STRING(field, option)                                                                             \
     if (!hl_engine_nonempty_string(box->field)) return HL_STATUS_INVALID_ARGUMENT;
-        HL_BOX_STRING_FIELDS(VALIDATE_BOX_STRING)
+    HL_BOX_STRING_FIELDS(VALIDATE_BOX_STRING)
 #undef VALIDATE_BOX_STRING
-        if (!hl_engine_absolute_string(box->translation_cache) ||
-            !hl_engine_absolute_string(box->filesystem_generation) ||
-            !hl_engine_absolute_string(box->checkpoint_directory) ||
-            !hl_engine_absolute_string(box->restore_directory) || !hl_engine_lower_valid(box->lower_layers) ||
-            box->publish_count > 32 || ((box->publish_count == 0) != (box->publish == NULL)) ||
-            !hl_engine_volumes_valid(box->volumes) || !hl_engine_limits_valid(box->limits) ||
-            !hl_engine_identity_valid(box->network_namespace, 39) ||
-            !hl_engine_identity_valid(box->network_bridge, 40) || !hl_engine_ip_valid(box->ip) ||
-            !hl_engine_proxy_valid(box->egress_proxy) ||
-            ((box->flags & HL_ENGINE_BOX_SANDBOX) && (box->flags & HL_ENGINE_BOX_SENTRY_ONLY)) ||
-            ((box->flags & HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED) && box->translation_cache != NULL) ||
-            (box->ip != NULL && box->network_bridge == NULL) ||
-            ((box->flags & HL_ENGINE_BOX_PUBLISH_EXTERNAL) && box->publish_count == 0) ||
-            ((box->flags & HL_ENGINE_BOX_NETWORK_ISOLATED) &&
-             (box->publish_count != 0 || box->network_bridge != NULL || box->ip != NULL || box->egress_proxy != NULL)))
+    if (!hl_engine_absolute_string(box->translation_cache) || !hl_engine_absolute_string(box->filesystem_generation) ||
+        !hl_engine_absolute_string(box->checkpoint_directory) || !hl_engine_absolute_string(box->restore_directory) ||
+        !hl_engine_lower_valid(box->lower_layers) || box->publish_count > 32 ||
+        ((box->publish_count == 0) != (box->publish == NULL)) || !hl_engine_volumes_valid(box->volumes) ||
+        !hl_engine_limits_valid(box->limits) || !hl_engine_identity_valid(box->network_namespace, 39) ||
+        !hl_engine_identity_valid(box->network_bridge, 40) || !hl_engine_ip_valid(box->ip) ||
+        !hl_engine_proxy_valid(box->egress_proxy) ||
+        ((box->flags & HL_ENGINE_BOX_SANDBOX) && (box->flags & HL_ENGINE_BOX_SENTRY_ONLY)) ||
+        ((box->flags & HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED) && box->translation_cache != NULL) ||
+        (box->ip != NULL && box->network_bridge == NULL) ||
+        ((box->flags & HL_ENGINE_BOX_PUBLISH_EXTERNAL) && box->publish_count == 0) ||
+        ((box->flags & HL_ENGINE_BOX_NETWORK_ISOLATED) &&
+         (box->publish_count != 0 || box->network_bridge != NULL || box->ip != NULL || box->egress_proxy != NULL)))
+        return HL_STATUS_INVALID_ARGUMENT;
+    for (uint32_t index = 0; index < box->publish_count; ++index)
+        if (box->publish[index].host_port == 0 || box->publish[index].guest_port == 0)
             return HL_STATUS_INVALID_ARGUMENT;
-        for (uint32_t index = 0; index < box->publish_count; ++index)
-            if (box->publish[index].host_port == 0 || box->publish[index].guest_port == 0)
-                return HL_STATUS_INVALID_ARGUMENT;
-    }
-    if (has_checkpoint_directories && (box->checkpoint_directory != NULL || box->restore_directory != NULL)) {
-        /* The one place the box's policy word acquires meaning. A box ABI without the field was compiled
-         * against headers where 0 meant refuse and observed exactly that, so give it refuse; only the
-         * current ABI's 0 means "no policy requested" and selects the permissive restore default. */
-        uint32_t policy = has_checkpoint_policy ? box->checkpoint_policy : HL_CONFIG_CHECKPOINT_REFUSE;
-        number[0] = (char)('0' + policy);
+    if (box->checkpoint_directory != NULL || box->restore_directory != NULL) {
+        number[0] = (char)('0' + box->checkpoint_policy);
         number[1] = 0;
         if (hl_options_set(&engine->options, "HL_CHECKPOINT_POLICY", number, 1) != HL_STATUS_OK)
             return HL_STATUS_OUT_OF_MEMORY;
@@ -383,16 +358,12 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
         (box->hostname != NULL && engine->owned_hostname == NULL) ||
         (box->environment != NULL && engine->owned_environment == NULL))
         return HL_STATUS_OUT_OF_MEMORY;
-    memset(&engine->box_config, 0, sizeof(engine->box_config));
-    memcpy(&engine->box_config, box,
-           box->abi == HL_ENGINE_BOX_ABI_1   ? abi1_size
-           : box->abi == HL_ENGINE_BOX_ABI_3 ? abi3_size
-           : box->abi == HL_ENGINE_BOX_ABI_4 ? abi4_size
-                                             : sizeof(*box));
+    engine->box_config = *box;
+    engine->box_config.size = sizeof(engine->box_config);
     engine->box_config.working_directory = engine->owned_working_directory;
     engine->box_config.hostname = engine->owned_hostname;
     engine->box_config.environment = engine->owned_environment;
-    if (has_v2) {
+    {
         size_t string_index = 0;
 #define COPY_BOX_STRING(field, option)                                                                                 \
     engine->owned_box_strings[string_index] = hl_engine_copy_string(box->field);                                       \
@@ -429,7 +400,7 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
     if ((box->flags & HL_ENGINE_BOX_NETWORK_ISOLATED) != 0 &&
         hl_options_set(&engine->options, "HL_NET_ISOLATE", "1", 1) != 0)
         return HL_STATUS_OUT_OF_MEMORY;
-    if (has_v2) {
+    {
 #define APPLY_BOX_STRING(field, option)                                                                                \
     if (hl_engine_set_option(&engine->options, option, engine->box_config.field) != 0) return HL_STATUS_OUT_OF_MEMORY;
         HL_BOX_STRING_FIELDS(APPLY_BOX_STRING)

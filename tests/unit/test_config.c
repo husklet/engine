@@ -44,8 +44,8 @@ int main(void) {
     wire.config.magic = HL_CONFIG_MAGIC;
     wire.config.abi = HL_CONFIG_ABI + 1;
     HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_ABI_MISMATCH);
-    // 13 encoded checkpoint_policy 0 as "refuse"; reject it instead of silently restoring permissively.
-    wire.config.abi = HL_CONFIG_ABI_CHECKPOINT_POLICY;
+    // One accepted generation: anything else is a mismatched archive, not something to reinterpret.
+    wire.config.abi = HL_CONFIG_ABI - 1;
     HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_ABI_MISMATCH);
     wire.config.abi = HL_CONFIG_ABI;
     wire.config.pool_size = sizeof(wire.pool);
@@ -117,28 +117,14 @@ int main(void) {
     wire.config.lower_layers_offset = 0;
     wire.config.lower_layer_count = 0;
 
+    // A record shorter than the current struct is rejected outright; there is no shorter generation.
     {
-        unsigned char legacy[176 + 4] = {0};
-        uint32_t word;
-        uint64_t identity = 1;
-        word = HL_CONFIG_MAGIC;
-        memcpy(legacy + 0, &word, sizeof word);
-        word = 4;
-        memcpy(legacy + 4, &word, sizeof word);
-        word = 176;
-        memcpy(legacy + 8, &word, sizeof word);
-        word = HL_CONFIG_ABI_LEGACY;
-        memcpy(legacy + 12, &word, sizeof word);
-        memcpy(legacy + offsetof(hl_launch_config, process_domain), &identity, sizeof identity);
-        legacy[176] = '\0';
-        HL_CHECK(hl_launch_config_validate(legacy, sizeof legacy, &config, &pool) == HL_STATUS_OK);
-        HL_CHECK(config.network_transport == HL_CONFIG_NETWORK_VIRTUAL && pool == (const char *)legacy + 176);
-        word = 1;
-        memcpy(legacy + offsetof(hl_launch_config, network_isolated), &word, sizeof word);
-        HL_CHECK(hl_launch_config_validate(legacy, sizeof legacy, &config, NULL) == HL_STATUS_OK);
-        HL_CHECK(config.network_transport == HL_CONFIG_NETWORK_ISOLATED);
-        memcpy(legacy + offsetof(hl_launch_config, reserved), &word, sizeof word);
-        HL_CHECK(hl_launch_config_validate(legacy, sizeof legacy, NULL, NULL) == HL_STATUS_CORRUPT);
+        unsigned char truncated[176 + 4] = {0};
+        uint32_t word = HL_CONFIG_MAGIC;
+        memcpy(truncated + 0, &word, sizeof word);
+        word = HL_CONFIG_ABI;
+        memcpy(truncated + 12, &word, sizeof word);
+        HL_CHECK(hl_launch_config_validate(truncated, sizeof truncated, NULL, NULL) == HL_STATUS_INVALID_ARGUMENT);
     }
     return EXIT_SUCCESS;
 }
