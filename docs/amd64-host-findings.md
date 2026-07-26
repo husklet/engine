@@ -279,6 +279,43 @@ suites), the aarch64 `MOVI Vd.2D` per-bit-to-per-byte expansion, and the `/proc/
 That is a caution about pinning, not about the survey: pinning was correct and necessary, because
 concurrent rebuilds otherwise make a multi-suite sweep measure several different binaries.
 
+## 3.11 The non-PIE rip-relative address rewrite is a per-backend obligation, and nothing enforces it
+
+The sharpest bug found on this branch, and the one most worth reading before writing another backend.
+
+A non-PIE `ET_EXEC` is mapped HIGH (the low 4 GB is reserved) and the dispatcher biases the guest PC to that
+high mapping. But the image's own **baked absolute pointers are LOW** — a non-PIE has no dynamic relocations,
+so the linker's addresses are final. Any instruction that *materialises* an address from the PC therefore has
+to produce the LOW value, or it will not compare equal to a pointer the image stored at link time.
+
+The AArch64 side has always known this: `guest/aarch64/translate.c`'s `pcrel_base()` un-biases `ADR`/`ADRP`,
+with a comment about gcc ICEing when an `adrp`-computed pointer fails to match a baked one. The x86-64 JIT
+learned it too — `guest/x86_64/lower/mov.c` rewrites rip-relative `LEA`, added when glibc's thread exit
+compared a tcache pointer against `lea __tcache_dummy(%rip)`, and its comment calls itself "the exact
+analogue of the aarch64 engine's adr/adrp PC un-biasing".
+
+**The x86-64 interpreter did not have it, and the symptom was a deadlock rather than a wrong number.**
+glibc's `__malloc_fork_lock_parent` walks the arena list with `lea main_arena(%rip),%r12` as the loop
+sentinel and `main_arena.next` — a baked LOW self-pointer — as the cursor. HIGH never equals LOW, so the
+single-arena loop never terminated: it took `main_arena.mutex`, came round again, found it already 1, and
+parked in `__lll_lock_wait_private` **on a lock it was itself holding**. Nothing wakes that. Every `fork(2)`
+from an x86-64 non-PIE guest that had ever started a thread hung at zero CPU, which is three whole compat
+suites — and every fixture in the corpus is built `-static`, i.e. non-PIE.
+
+Two things generalise:
+
+- **Address *materialisation* is un-biased; rip-relative *accesses* stay biased.** Only the value handed to
+  the program changes. Getting that backwards breaks memory access instead of pointer comparison.
+- **`call_return_pc` / `interp_call_return_pc` is the sibling obligation** and is duplicated the same way.
+  A new backend must implement both, and there is no test that fails loudly if it implements neither —
+  it fails as a hang in glibc, several frames from the cause.
+
+For diagnosis: the signature is a process at `State: S`, `/proc/<pid>/wchan` = `futex_do_wait`, and
+**`00:00:00` CPU time over many minutes**. A spin or a lost update burns CPU; this does not. That distinction
+is what separates "the interpreter is slow" from "the interpreter deadlocked", and no amount of timeout
+scaling addresses the second — which is why the harness now has a progress-based stall detector rather than
+a larger number.
+
 ## 4. Documentation that misleads
 
 These cost real time on this task and will cost it again.
@@ -375,7 +412,10 @@ word means everywhere else in this repo.
 
 Also outstanding, and tracked rather than hidden:
 
-- `checkpoint.x86_64.threads`, the one remaining checkpoint failure, needs a **design decision**: the
+- `checkpoint.x86_64.threads` is still the one remaining checkpoint failure (77/78), and it needs a
+  **design decision**. Note the non-PIE `LEA` fix in section 3.11 did NOT close it, although that fixture
+  forks after threading and so looked like a candidate: it still fails, consistently and in 2.2 s rather
+  than by timeout. The original diagnosis stands: the
   x86-64 guest pins only its main stack, so anonymous guest mmaps -- which is what glibc pthread stacks are
   -- get kernel-chosen host addresses, and a re-forked child restores after engine init when those VAs are
   no longer reliably free. The aarch64 guest is immune only because its mmaps live in a biased window the
