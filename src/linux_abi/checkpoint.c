@@ -1188,6 +1188,21 @@ static int ckpt_is_descendant(int64_t candidate, int64_t root) {
 
 // ================================ CHECKPOINT (per process) ================================
 
+// Does `path` name the container's controlling terminal?
+//
+// `isatty(guest_fd)` cannot answer that. The capture runs inside the engine, and the engine's own descriptor
+// table is not the guest's: guest fd numbers index the engine's descriptors, which are the pty only where a
+// guest fd happens to alias the engine's inherited stdin. An interactive shell's stdout, stderr and its
+// job-control dup (bash's fd 255) therefore looked like ordinary character DEVICES and were recorded by host
+// path -- "/dev/pts/7". Restore then reopened that path, which by then names a recycled, unrelated pty (or
+// nothing at all, refusing the whole image), instead of inheriting the launcher's terminal like fd 0.
+static int ckpt_path_is_ctty(const char *path) {
+    struct stat device, terminal;
+    int tf = isatty(0) ? 0 : isatty(1) ? 1 : isatty(2) ? 2 : -1;
+    if (tf < 0 || path == NULL || fstat(tf, &terminal) != 0 || stat(path, &device) != 0) return 0;
+    return S_ISCHR(device.st_mode) && S_ISCHR(terminal.st_mode) && device.st_rdev == terminal.st_rdev;
+}
+
 // Snapshot every path-backed / tty guest fd into `recs`; REFUSE (return -1) on any GUEST-owned pathless
 // kernel-object fd (P3). MUST run BEFORE any checkpoint output file is opened, so the writer's own fds are
 // never mistaken for guest fds.
@@ -1318,10 +1333,16 @@ static int ckpt_scan_fds(struct ckpt_fd *recs, int cap, int *out_n) {
                     g_linux_box->host->context, snapshot.host_handle, (hl_host_bytes){fp, sizeof(fp) - 1});
                 if (metadata.type == HL_HOST_FILE_TYPE_CHARACTER && isatty(fd)) {
                     r.kind = CKF_TTY;
+                    r.offset = 0;
                 } else if (device_path.status == HL_STATUS_OK && device_path.value < sizeof fp) {
                     fp[device_path.value] = 0;
-                    r.kind = CKF_DEVICE;
-                    if (path_copy(r.path, sizeof r.path, fp) != 0) return -1;
+                    if (metadata.type == HL_HOST_FILE_TYPE_CHARACTER && ckpt_path_is_ctty(fp)) {
+                        r.kind = CKF_TTY;
+                        r.offset = 0;
+                    } else {
+                        r.kind = CKF_DEVICE;
+                        if (path_copy(r.path, sizeof r.path, fp) != 0) return -1;
+                    }
                 } else {
                     fprintf(stderr, "[ckpt] refuse: device fd %d has no recoverable path\n", fd);
                     return -1;
@@ -1501,8 +1522,13 @@ static int ckpt_scan_fds(struct ckpt_fd *recs, int cap, int *out_n) {
             } else if (S_ISCHR(status.st_mode) || S_ISBLK(status.st_mode)) {
                 if (path_size >= sizeof path) return -1;
                 path[path_size] = '\0';
-                r.kind = CKF_DEVICE;
-                if (path_copy(r.path, sizeof r.path, path) != 0) return -1;
+                if (S_ISCHR(status.st_mode) && ckpt_path_is_ctty(path)) {
+                    r.kind = CKF_TTY;
+                    r.offset = 0;
+                } else {
+                    r.kind = CKF_DEVICE;
+                    if (path_copy(r.path, sizeof r.path, path) != 0) return -1;
+                }
             } else if (S_ISREG(status.st_mode) || S_ISDIR(status.st_mode)) {
                 if (path_size >= sizeof path) return -1;
                 path[path_size] = '\0';
