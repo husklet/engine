@@ -290,8 +290,16 @@ fn round_trip(foreground: Option<&str>, interrupt: bool) -> bool {
     if interrupt {
         // The restored shell is still waiting on its foreground job; Ctrl-C must end the job and give the
         // prompt back, exactly as it would have before the capture.
-        thread::sleep(Duration::from_millis(500));
-        session.send(b"\x03");
+        //
+        // Retyped rather than typed once: `spawn_with_store` returns as soon as the restore has been asked
+        // for, and a ^C that lands before the job's process group has been re-created cannot reach a group
+        // that does not exist yet. A person hits it again; so does this. (It must never kill the machine
+        // either -- the restore driver ignores terminal signals until it has replayed the guest's own
+        // dispositions -- which is why the early ones are simply discarded instead of fatal.)
+        for _ in 0..SYNC_ATTEMPTS {
+            thread::sleep(Duration::from_millis(500));
+            session.send(b"\x03");
+        }
     }
     // The restored shell must serve MORE than one line. Establishing readiness the same way the pre-capture
     // half does costs one command, so a shell that accepts a single line and then reports EOF fails here

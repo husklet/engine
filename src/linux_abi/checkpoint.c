@@ -3607,6 +3607,19 @@ static void ckpt_reinstall_sigacts(const struct ckpt_meta *m) {
     }
 }
 
+// Survive a terminal signal typed while the tree is still being rebuilt.
+//
+// A restoring process is not the guest yet: until it has replayed the guest's dispositions
+// (ckpt_reinstall_sigacts) it carries the HOST defaults, so a ^C at the pty -- which the embedder's user can
+// type at any moment, and which an acceptance test aims at the restored foreground job -- terminates the
+// restore driver itself and takes the whole machine with it. Ignore the terminal-generated signals for that
+// window; reinstall_sigacts then overwrites every disposition, SIG_DFL included. Each re-forked process does
+// this again on entry, because it inherits the init's already-replayed dispositions.
+static void ckpt_restore_hold_tty_signals(void) {
+    static const int tty[] = {SIGINT, SIGQUIT, SIGHUP, SIGTSTP, SIGTTIN, SIGTTOU};
+    for (size_t i = 0; i < sizeof tty / sizeof tty[0]; ++i) (void)signal(tty[i], SIG_IGN);
+}
+
 // The process table read from the checkpoint (one entry per proc.<gpid>/meta), used to rebuild the tree.
 struct ckpt_proc {
     int gpid, ppid, pgid, sid;
@@ -5285,6 +5298,7 @@ static void ckpt_fork_children(int gpid) {
 // parent) and resume it. Never returns.
 static void ckpt_restore_proc_run(int gpid) {
     char pd[1200];
+    ckpt_restore_hold_tty_signals();
     snprintf(pd, sizeof pd, "proc.%d", gpid);
     struct ckpt_meta m;
     if (ckpt_read_meta_dir(pd, &m) != 0) _exit(70);
@@ -5339,6 +5353,7 @@ static void ckpt_restore_proc_run(int gpid) {
 // RAM FIRST (before engine init, so MAP_FIXED lands on free VAs), then re-forks the tree.
 static int ckpt_restore_tree(const char *rootfs) {
     struct ckpt_manifest man;
+    ckpt_restore_hold_tty_signals();
     // Bind the image source before anything is read; every re-forked child inherits the binding.
     if (ckpt_source_bind() == NULL) {
         fprintf(stderr, "[restore] restore requested without a broker descriptor\n");
