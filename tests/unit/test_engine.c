@@ -187,6 +187,25 @@ static void *run_engine(void *opaque) {
     return NULL;
 }
 
+/* A stop requested between create and run must be replayed onto the guest process once it
+ * exists, never rejected.  The embedder's spawn returns before the engine object is built,
+ * so rejecting HL_ENGINE_CREATED silently loses a control-API signal. */
+static int check_pre_run_stop(hl_fake_host *fake, hl_host_services *services, hl_engine_config *config,
+                              uint32_t request, int32_t expected_signal) {
+    run_context context;
+    memset(&context, 0, sizeof(context));
+    context.result.abi = HL_ENGINE_ABI;
+    context.result.size = sizeof(context.result);
+    hl_engine_backend_register(&fake_backend);
+    HL_CHECK(hl_engine_create(config, services, &context.engine) == HL_STATUS_OK);
+    HL_CHECK(hl_engine_request(context.engine, request, NULL, 0) == HL_STATUS_OK);
+    HL_CHECK(hl_engine_run(context.engine, 0, NULL, &context.result) == HL_STATUS_OK);
+    HL_CHECK(context.result.kind == HL_ENGINE_EXIT_SIGNAL && context.result.guest_status == expected_signal);
+    HL_CHECK(__atomic_load_n(&fake->live_processes, __ATOMIC_ACQUIRE) == 0);
+    hl_engine_destroy(context.engine);
+    return EXIT_SUCCESS;
+}
+
 static int check_concurrent_stop(hl_fake_host *fake, hl_host_services *services, hl_engine_config *config,
                                  uint32_t request, int32_t expected_signal) {
     run_context context;
@@ -196,7 +215,6 @@ static int check_concurrent_stop(hl_fake_host *fake, hl_host_services *services,
     context.result.size = sizeof(context.result);
     hl_engine_backend_register(&fake_backend);
     HL_CHECK(hl_engine_create(config, services, &context.engine) == HL_STATUS_OK);
-    HL_CHECK(hl_engine_request(context.engine, request, NULL, 0) == HL_STATUS_BUSY);
     hl_fake_host_block_process_wait(fake, 1);
     HL_CHECK(pthread_create(&thread, NULL, run_engine, &context) == 0);
     while (__atomic_load_n(&fake->live_processes, __ATOMIC_ACQUIRE) == 0)
@@ -634,9 +652,11 @@ int main(void) {
     expected_seed_cpu = NULL;
     expected_seed_volume = NULL;
 
+    HL_CHECK(check_pre_run_stop(&fake, &services, &config, HL_ENGINE_REQUEST_INTERRUPT, 2) == EXIT_SUCCESS);
+    HL_CHECK(check_pre_run_stop(&fake, &services, &config, HL_ENGINE_REQUEST_FORCE_STOP, 9) == EXIT_SUCCESS);
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_INTERRUPT, 2) == EXIT_SUCCESS);
     HL_CHECK(check_concurrent_stop(&fake, &services, &config, HL_ENGINE_REQUEST_FORCE_STOP, 9) == EXIT_SUCCESS);
-    HL_CHECK(fake_box_seen == 12); /* +2 checkpoint-policy runs */
+    HL_CHECK(fake_box_seen == 14); /* +2 checkpoint-policy runs, +2 pre-run stops */
     HL_CHECK(check_concurrent_destroy(&fake, &services, &config) == EXIT_SUCCESS);
 
     config.abi++;

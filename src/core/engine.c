@@ -739,11 +739,13 @@ hl_status hl_engine_request(hl_engine *engine, uint32_t request, const void *dat
     else
         return HL_STATUS_NOT_SUPPORTED;
     hl_engine_lock(engine);
-    if (engine->state == HL_ENGINE_CREATED || engine->state == HL_ENGINE_FINISHED ||
-        engine->state == HL_ENGINE_DESTROYING) {
+    if (engine->state == HL_ENGINE_FINISHED || engine->state == HL_ENGINE_DESTROYING) {
         hl_engine_unlock(engine);
         return HL_STATUS_BUSY;
     }
+    /* HL_ENGINE_CREATED is accepted, not rejected: a caller that signals between
+     * create and run must not have that signal silently discarded.  hl_engine_run
+     * replays pending_termination once the guest process exists. */
     engine->pending_termination = reason;
     process = engine->process;
     hl_engine_unlock(engine);

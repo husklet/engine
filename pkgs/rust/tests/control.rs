@@ -56,6 +56,23 @@ fn typed_signal_and_shutdown_control_the_initial_process() {
     assert_eq!(machine.wait().unwrap(), Exit::Signal(9));
 }
 
+/// A guest that is already running with the default disposition must still die from an
+/// externally delivered SIGTERM.  The engine process left its own relay handler installed in
+/// the forked guest, so the relayed `kill` bounced back into the parent's self-pipe instead of
+/// terminating anything and `sleep 30` ran to completion.  Signalling only immediately after
+/// `spawn` hid this: that raced ahead of the fork.
+#[test]
+fn a_running_default_disposition_guest_dies_from_an_external_term() {
+    let mut spec = launch_spec("/bin/sleep");
+    spec.process.argv.push("30".into());
+    let machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
+    machine.initial_process().unwrap();
+    machine
+        .signal(SignalTarget::InitialProcess, Signal::Terminate)
+        .unwrap();
+    assert_eq!(machine.wait().unwrap(), Exit::Signal(15));
+}
+
 #[test]
 fn pause_guards_are_reference_counted() {
     let mut spec = launch_spec("/bin/sleep");
