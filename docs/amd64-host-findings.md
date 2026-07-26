@@ -163,6 +163,77 @@ freestanding test guests (no libc, one layer at a time) found all of them where 
 - **`SMAXP`/`SMINP` are opcode `0x14`/`0x15`**; `0x1A`/`0x1B` are the floating-point pair.
 - **A folded `CLS`** that computed `x ^ (x << 1)` without shifting down, returning 62 for all-ones.
 
+## 3.6 Host-neutral-looking C whose correctness depends on the host CPU
+
+A class of its own, distinct from "unguarded inline asm", because nothing about the source hints at a host
+dependency. Two instances, both in `src/translator/guest/x86_64/avx.c`, both found only by differential
+testing against native hardware:
+
+- **`sse_round_d`/`sse_round_f` used `__builtin_rint` for the MXCSR-controlled rounding mode.** Without
+  `-msse4.1` there is no `ROUNDSD` to expand to and GCC emits no libm call either; at `-O2` it expands the
+  builtin inline as `|x| + 2^52 - 2^52` with the sign re-applied — i.e. it rounds the **magnitude**. That is
+  valid only under round-to-nearest, which `-fno-rounding-math` (the default) entitles GCC to assume. So
+  under round-toward-negative-infinity a negative operand's round-*down* became round-toward-*zero*: −2.5
+  gave −2.0 where hardware gives −3.0. On AArch64 the identical builtin lowers to `FRINTX`, which genuinely
+  reads `FPCR.RMode` — so **the JIT does not have this bug, and it is not a missing step**. This is what
+  `fpedge` was failing on.
+- **`avx_f32_to_f16`'s MXCSR-controlled arm used `fegetround()`**, and glibc's x86-64 `fegetround` reads the
+  **x87 control word** — a different register from the guest's MXCSR, which `LDMXCSR` writes and `FLDCW`
+  does not. No test covers it. Latent landmine, now closed.
+
+The lesson for a future host: `grep` for inline asm is not sufficient. A `__builtin_` whose lowering is
+mode-sensitive, or a libc call that reads a control register, is equally host-specific and completely
+invisible to that grep.
+
+## 3.7 `visibility("hidden")` is not local linkage
+
+Worth stating because it cost a link failure and the distinction is easy to get wrong. The dual activation
+archive links **both** target objects into one binary, and `src/core/target/namespace.h` — which renames the
+per-ISA symbols precisely so the two can coexist — does **not** cover `run_block`/`block_return`.
+
+The JIT gets away with that only because its trampolines come from a file-scope `__asm__` block with
+`.hidden`, which GCC emits as a genuinely **local** symbol: `nm` on either aarch64 target object shows a
+lowercase `t`. A C definition marked `__attribute__((visibility("hidden")))` is still `STB_GLOBAL` — hidden
+visibility governs export from a shared object, not linkage within a static link. So two backends each
+defining one collide, the linker then rejects the whole object, and it cascades into ~300 undefined
+ARM64-emitter references from `lower/*.c`. Both interpreters are now `static`.
+
+## 3.8 Pre-existing checkpoint/restore defects (fixed here)
+
+Found because the same five cases failed on **both** guest ISAs, which is impossible for a bug in either
+interpreter. Full detail in the commit; the important one for anyone running an AArch64 host:
+
+**The guest-PROT_NONE ledger is captured with the wrong predicate, and it is host-neutral.** Capture set
+`reg.is_gna = gna_hit(addr, 1)` — "does this region's *first page* happen to be guest-PROT_NONE" — while
+restore answers the same question with `gna_add` over the **whole** region. glibc's `allocate_stack` mmaps a
+pthread stack readable and then mprotects its lowest page into the guard page, so **every thread stack
+begins PROT_NONE**, and restore poisoned the entire 8 MiB. Any syscall handed a pointer into it returns
+`-EFAULT`, and `pthread_join`'s `futex` on `pd->tid` — which lives at the *top* of the block — is exactly
+such a call; glibc treats `EFAULT` there as unrecoverable and calls `futex_fatal_error()`. **This should be
+failing on aarch64 hosts too. Somebody with one should confirm it.**
+
+The other three are Linux-host-specific rather than amd64-specific, so they would hit an aarch64 **Linux**
+host identically: a shim kqueue's identity not following its descriptor across restore's `dup2` relocation
+(three missed sites); `SO_RCVBUF`/`SO_SNDBUF` not round-tripping because Linux stores twice what
+`setsockopt` is given and reports the doubled value, so every checkpoint generation doubled the buffer; and
+a queued-epoll placeholder that was never hoisted into the private descriptor band, landing on fd 4 — a
+child's socketpair endpoint — which a later seeds-close then destroyed.
+
+## 3.9 Two golden files that cannot be met
+
+- **`tests/compat/isa/x86_64/expected/isa-regress.out` differs from real x86-64 hardware on 107 lines.**
+  Every difference is two-NaN-operand selection or NaN sign (`subps-nan2` golden `7fc00001` vs hardware
+  `ffc00001`; `subps-nan3` taking src2's NaN where hardware takes src1's; the whole
+  `addpd/mulpd/haddpd/hsubpd/addsubpd` NaN block). The interpreter is byte-identical to running the fixture
+  natively on this host, so the **golden** is what disagrees with the hardware — it was evidently captured
+  from the AArch64-hosted JIT or an emulator and encodes ARM NaN semantics. Consequence:
+  `compat.isa-x86-64` is **unreachable** on an amd64 host, not merely unimplemented. Regenerating it on real
+  x86-64 hardware is the fix, and doing so would expose a genuine two-NaN-selection gap in the AArch64 JIT.
+- Related JIT defects found the same way, not fixed here: **`FCOMI`/`FUCOMI` are wrong for unordered
+  operands** (a bare ARM `FCMP` sets `NZCV=0011` for unordered, so x86 `CF` comes out 0 and `ZF` 0 where
+  both must be 1, and `PF` is never written), and **x87 `C1` is not modelled at all** — a stale `C1` left by
+  glibc's `fmod` FPREM loop surfaced in an unrelated `FNSTENV` hundreds of instructions later.
+
 ## 4. Documentation that misleads
 
 These cost real time on this task and will cost it again.
@@ -259,10 +330,23 @@ word means everywhere else in this repo.
 
 Also outstanding, and tracked rather than hidden:
 
-- `perf-linux` enforces tracked cold/p99 thresholds a JIT can meet and an interpreter cannot; the amd64
-  lane must not report a pass implying threshold compliance it did not check.
-- The matrix runners' 20 s per-case timeout will turn "slow but correct" into a failure indistinguishable
-  from a hang on an interpreter host.
+- `checkpoint.x86_64.threads`, the one remaining checkpoint failure, needs a **design decision**: the
+  x86-64 guest pins only its main stack, so anonymous guest mmaps -- which is what glibc pthread stacks are
+  -- get kernel-chosen host addresses, and a re-forked child restores after engine init when those VAs are
+  no longer reliably free. The aarch64 guest is immune only because its mmaps live in a biased window the
+  host never allocates from. It needs a reserved VA window for x86-64 anonymous guest mmaps, the way
+  `HL_CHECKPOINT` already pins the main stack. Deliberately not patched.
+- Nested engine-in-engine (an amd64 host interpreting the **AArch64 build of hl-engine**, which in turn
+  JIT-compiles an x86-64 guest) gets as far as the inner engine reaching `main`, parsing argv, writing its
+  usage to stdout and exiting 2 -- so the loader, libc startup, TLS and stdio all work through the
+  interpreter on a dynamically-linked PIE. With an inner guest it fails at `HL_STATUS_RESOURCE_LIMIT` during
+  the inner engine's own setup. Note the obvious suspect has been **ruled out**: a bare guest doing
+  `memfd_create` + `ftruncate(64 MiB)` + both `mmap` aliases + a `PROT_NONE` over-reserve + `MAP_FIXED` RWX
+  behaves identically to native under the interpreter.
+- `lower/*.c` is still worked around with 21 aborting stubs rather than fixed; see section 3.3.
+- The `perf-linux` and per-case-timeout items are handled: `perf-linux` is record-only on this host and all
+  six runners now scale their per-case budget from `HL_MATRIX_TIMEOUT_SCALE`. Neither weakens the aarch64
+  lanes, which are byte-identical.
 - `isa-fuzz.aarch64-*` needs an ARM64 host as its differential oracle, so half the fuzz coverage is
   host-conditional. A green `isa-fuzz` on an amd64 host is **not** full coverage — on that host
   `isa-fuzz.x86_64-*` becomes the native-oracle lane for the first time, which is a gain, but the aarch64
