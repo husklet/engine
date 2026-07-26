@@ -12,11 +12,11 @@ verified by `check-crate-archives` in CI. Do not edit it by hand.
 <!-- BEGIN GENERATED ARCHIVE PROVENANCE -->
 
 ```
-source-commit: 8c549c4354b57b4f4b7077908782bff2e35d5f9f
+source-commit: e31f85d0482f051fefaf01ca02ef749cdd108b42
 config-abi: 13
-source-manifest: 6df31d30cfd54dbaac7c9d80db6b6b16c41d16f85df5e48ece7f772251c6ece1
-aarch64-unknown-linux-gnu: b8c23202ca85968eac665e03c952af838ad07b3bf38e1973a30f859c1884a8c3
-aarch64-apple-darwin: b6c1ebbb7beb5db3b8e9d851a7916c4c9862fe613ac022492a63ed1f3407a852
+source-manifest: f61ff3ca27133c411edb39f3c45c5df5f4cfa9f8fa0309dcaebf0cfee6822421
+aarch64-unknown-linux-gnu: 58771f94544b3e6f32c7f7967470a6e393bee4c2958228c91467fe38d3b159c4
+aarch64-apple-darwin: bff71f6cbd082dd4b335c1451994af073362524d33d1340cee81b61092bc0457
 ```
 
 <!-- END GENERATED ARCHIVE PROVENANCE -->
@@ -42,6 +42,25 @@ It builds the linux-gnu archive locally (aarch64 Linux) and the darwin archive
 on an Apple silicon mac through the `mac` bridge, copies both into
 `assets/lib/`, and rewrites the generated block above. Commit the archives and
 this file together with the source change.
+
+If no single machine is both hosts, the three halves run independently:
+
+```
+# on the Apple silicon mac, in a checkout of the same commit
+tools/refresh_crate_archives.sh --darwin --emit /path/libhl-engine.a
+
+# on the aarch64 Linux host, same commit
+tools/refresh_crate_archives.sh --linux
+tools/refresh_crate_archives.sh --darwin --from /path/libhl-engine.a
+tools/refresh_crate_archives.sh --provenance
+```
+
+`--darwin` on the mac installs directly into `assets/lib/` when the checkout is
+shared, so `--emit`/`--from` are only needed when the two hosts do not share a
+tree. Either host can run `--provenance`; it hashes whatever is committed and
+then runs the freshness check. On a Linux host with no reachable mac,
+`--from` additionally needs `--allow-unvalidated-darwin`, because that host
+cannot repack or link a Mach-O archive.
 
 `pkgs/rust/tests/packaged_archive.rs` additionally launches a guest through the
 committed archive, so a broken archive fails on both hosts in CI; the manifest

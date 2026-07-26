@@ -1748,9 +1748,24 @@ endif
 # The Rust crate at pkgs/rust/ links the PREBUILT archives committed under
 # pkgs/rust/assets/lib/ and never compiles src/; `cargo publish` ships those
 # bytes. Regenerate both whenever a C source or header changes.
-.PHONY: refresh-crate-archives check-crate-archives print-archive-sources
+# The dual-host one-shot, plus the three halves for people who only have one of
+# the two machines. DARWIN_ARCHIVE=<file> feeds a darwin archive built elsewhere.
+.PHONY: refresh-crate-archives refresh-crate-archives-linux \
+	refresh-crate-archives-darwin refresh-crate-archives-provenance \
+	check-crate-archives print-archive-sources
 refresh-crate-archives:
 	MAKE='$(MAKE)' BUILD='$(BUILD)' tools/refresh_crate_archives.sh
+
+refresh-crate-archives-linux:
+	MAKE='$(MAKE)' BUILD='$(BUILD)' tools/refresh_crate_archives.sh --linux
+
+refresh-crate-archives-darwin:
+	MAKE='$(MAKE)' BUILD='$(BUILD)' tools/refresh_crate_archives.sh --darwin \
+		$(if $(DARWIN_ARCHIVE),--from '$(DARWIN_ARCHIVE)') \
+		$(if $(EMIT),--emit '$(EMIT)')
+
+refresh-crate-archives-provenance:
+	MAKE='$(MAKE)' BUILD='$(BUILD)' tools/refresh_crate_archives.sh --provenance
 
 check-crate-archives:
 	@tools/check_crate_archives.sh

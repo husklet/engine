@@ -601,8 +601,13 @@ cmake --build <build-dir> --target refresh-crate-archives
 
 It must run on an aarch64 Linux host, and it needs the mac for the darwin half: the macOS archive is compiled by
 `clang` on Apple silicon, reached through the `MAC` bridge (`mac`, see 7.5) over the shared `/Users/x/dd` checkout. On
-Darwin itself `MAC` is `env` and the command builds both locally. Without a reachable mac the darwin compile fails
-immediately rather than silently refreshing half the pair.
+Darwin itself `MAC` is `env` and the command builds both locally.
+
+When no single machine is both hosts, `tools/refresh_crate_archives.sh` takes `--linux`, `--darwin` and
+`--provenance` and each half runs on its own machine (targets `refresh-crate-archives-{linux,darwin,provenance}`).
+`--darwin --emit <file>` on a mac writes the archive out for transport; `--darwin --from <file>` on the other host
+installs those bytes. `--provenance` hashes whatever is committed and reruns the freshness check, so either host can
+record the result. See `pkgs/rust/assets/PROVENANCE.md` for the copy-pasteable sequence.
 
 Two CI gates protect this, on Linux and on `publish`:
 
@@ -611,7 +616,10 @@ Two CI gates protect this, on Linux and on `publish`:
   and fails with the regeneration command when the sources have moved on. This is the *currency* check, and it is pure
   hashing: seconds, no extra compilation. Both workflows currently invoke it as
   `make check-crate-archives`; the CMake target `check-crate-archives` runs the same
-  `tools/check_crate_archives.sh`.
+  `tools/check_crate_archives.sh`. The gate also structurally validates both archives. Repacking and force-loading
+  the Mach-O archive needs a Darwin host, so the Linux runner does the host-independent part (ar container, member
+  list, required symbols) and the macOS workflow runs the same gate for the link test. Requiring the Mach-O link on
+  Linux previously made this step red on every commit regardless of freshness.
 - `pkgs/rust/tests/packaged_archive.rs` launches a guest through the committed archive on both hosts. This is the
   *correctness* check.
 

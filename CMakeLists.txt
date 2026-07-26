@@ -221,5 +221,16 @@ add_custom_target(refresh-crate-archives
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   USES_TERMINAL)
 
+# The halves, for a host that is not both aarch64 Linux and Apple silicon.
+foreach(_half linux darwin provenance)
+  add_custom_target(refresh-crate-archives-${_half}
+    COMMAND ${CMAKE_COMMAND} -E env
+            BUILD=${CMAKE_BINARY_DIR}/crate-archives
+            ${HL_BASH_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tools/refresh_crate_archives.sh --${_half}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    USES_TERMINAL)
+endforeach()
+
 # --- clang-format targets ---------------------------------------------------
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Format.cmake)
