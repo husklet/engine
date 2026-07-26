@@ -204,6 +204,19 @@ static void do_sigreturn(struct cpu *c) {
     hl_aarch64_signal_restore(c);
 }
 
+// Fault capture is a property of the BACKEND, not of the guest ISA -- it asks "where did the guest's state
+// live at the instant of the fault", and the two backends answer differently in kind.
+//
+// The transliterating JIT keeps guest registers in the MATCHING host registers, so capture reconstructs guest
+// state out of the host mcontext, the faulting host PC needs the provenance map to become instruction-exact,
+// and a fold's scratch registers have to be replayed out of cpu->mscratch. The interpreter keeps guest state
+// in *c at all times and writes cpu->pc at every instruction boundary: there is nothing to reconstruct, no
+// host PC to map back (it emits no host code), and no folds. Its capture only has to answer whether the fault
+// happened inside a marked guest access.
+//
+// Both arms return 0 for "this was not a guest fault", so an engine-side bug still reaches the crash report
+// rather than being dressed up as a guest signal.
+#if defined(HL_HOST_CPU_AARCH64)
 static int sigframe_capture_fault(struct cpu *c, void *native_context) {
     if (!hl_aarch64_signal_capture(c, native_context, signal_cache_contains, NULL)) return 0;
     uint64_t exact_pc;
@@ -224,10 +237,25 @@ static int sigframe_capture_fault(struct cpu *c, void *native_context) {
     }
     return 1;
 }
+#else
+static int sigframe_capture_fault(struct cpu *c, void *native_context) {
+    return interp_signal_capture(c, native_context);
+}
+#endif
 
+// The mirror of the fork above. The JIT resumes by rewriting the host mcontext so the handler returns into
+// block_return, which unwinds the translated frame back to the dispatcher. The interpreter has no translated
+// frame to unwind: it siglongjmps out of the handler to the sigsetjmp at the top of run_block, which then
+// returns to the dispatcher normally.
+#if defined(HL_HOST_CPU_AARCH64)
 static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {
     hl_aarch64_signal_resume(c, native_context, (uintptr_t)block_return);
 }
+#else
+static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {
+    interp_signal_resume(c, native_context);
+}
+#endif
 // path jail + overlay + /proc synth
 #include "../../linux_abi/container/vfs.c"
 #include "../../linux_abi/image.h"

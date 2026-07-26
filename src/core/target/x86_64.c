@@ -570,6 +570,18 @@ static void do_sigreturn(struct cpu *c) {
     hl_x86_signal_restore(c);
 }
 
+// Fault capture is a property of the BACKEND, not of the guest ISA -- it asks "where did the guest's state
+// live at the instant of the fault", and the two backends answer differently in kind.
+//
+// The JIT keeps guest registers in real host registers, so capture means reconstructing guest state out of
+// the host mcontext, and the faulting host PC is only block-granular until the per-instruction provenance
+// map refines it. The interpreter keeps guest state in *c at all times and writes cpu->rip at every
+// instruction boundary, so there is nothing to reconstruct and nothing to refine -- the provenance lookup
+// would actively make it worse, because it maps HOST code addresses and this backend emits none.
+//
+// Both arms must return 0 for "this was not a guest fault", so an engine-side bug still reaches the crash
+// report instead of being dressed up as a guest signal.
+#if defined(HL_HOST_CPU_AARCH64)
 static int sigframe_capture_fault(struct cpu *c, void *native_context) {
     if (!hl_x86_signal_capture(c, native_context, x86_signal_cache_contains, NULL)) return 0;
     // Recover the EXACT faulting guest RIP from the per-instruction provenance map (translate.c records
@@ -581,10 +593,25 @@ static int sigframe_capture_fault(struct cpu *c, void *native_context) {
     if (jit_instruction_guest_pc(host_pc, &exact_pc)) c->rip = exact_pc;
     return 1;
 }
+#else
+static int sigframe_capture_fault(struct cpu *c, void *native_context) {
+    return interp_signal_capture(c, native_context);
+}
+#endif
 
+// The mirror of the fork above. The JIT resumes by rewriting the host mcontext so the handler returns into
+// block_return, which unwinds the translated frame back to the dispatcher. The interpreter has no translated
+// frame to unwind: it siglongjmps out of the handler to the sigsetjmp at the top of run_block, which then
+// returns to the dispatcher normally.
+#if defined(HL_HOST_CPU_AARCH64)
 static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {
     hl_x86_signal_resume(c, native_context, (uintptr_t)block_return);
 }
+#else
+static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {
+    interp_signal_resume(c, native_context);
+}
+#endif
 
 static int fastclk_fault_fixup(siginfo_t *info, void *native_context) {
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
