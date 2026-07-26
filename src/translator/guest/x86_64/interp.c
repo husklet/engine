@@ -203,8 +203,56 @@ void emit32(uint32_t instruction) {
 static __thread sigjmp_buf g_interp_fault_pad;
 static __thread int g_interp_pad_armed;             // a run_block landing pad is live on this thread
 static __thread volatile int g_interp_guest_access; // a guest memory access is in flight right now
+// The cpu run_block armed the pad for. The host-fault route does not need it (the shared delivery path is
+// handed the cpu it recovered from TLS), but the past-EOF ledger check below runs in ordinary guest context
+// with no siginfo to work from and must reach the same struct cpu to record the fault on.
+static __thread struct cpu *g_interp_pad_cpu;
 
-static inline void interp_access_begin(void) {
+// ---- The past-EOF SIGBUS ledger ----
+//
+// Linux raises SIGBUS/BUS_ADRERR for an access to a whole page of a file mapping past the file's end. The
+// HOST cannot be allowed to deliver that here: linux_abi/syscall/mem.c deliberately re-maps the
+// genuinely-past-EOF tail of a MAP_PRIVATE file mapping as anonymous zero (its "Past-EOF tail zero-fill"),
+// because ld.so maps a .so's whole vaddr span from the first segment and a stray engine-side touch of one of
+// those pages must not kill the engine. The guest-visible SIGBUS is therefore owed by the TRANSLATOR, out of
+// a ledger mem.c maintains (gbus_add) and core/bus.h publishes as jit_guest_bus_active() /
+// jit_guest_bus_fault(). The JIT pays for it with an inline guard around every emitted access
+// (emit_x86_bus_guard in emit.c); an interpreter is already in C, so one predicate per access does it.
+//
+// Every guest access in this backend is bracketed by interp_access_begin/interp_access_end, so that pair is
+// the one place the query belongs -- putting it in the individual accessors would mean auditing each of them
+// again for every new instruction class, and the locked-RMW and CMPXCHG paths (which take a host pointer and
+// operate on it directly) would each need their own copy.
+//
+// The address handed in is the GUEST address, because that is what the guest's handler compares si_addr
+// against; the ledger stores HOST addresses (gbus_add is fed what mmap returned), so the query rebases with
+// hl_x86_guest_pointer and the answer is rebased back. Those differ only inside a non-PIE ET_EXEC's link
+// range. jit_guest_bus_fault already returns the FIRST past-EOF byte of the access rather than its base,
+// which is what makes a 4-byte load straddling the EOF page boundary report the boundary as Linux does.
+//
+// Escaping through the same siglongjmp the host-fault path uses is sound for the same reason: the caller is
+// several frames deep inside an instruction that has read its source operands into locals and written
+// nothing back, so abandoning it leaves cpu->rip naming an instruction that has not executed. R_BUS is what
+// interp_dispatch.h's arm turns into raise_guest_bus().
+static void interp_bus_ledger_check(uint64_t guest_address, uint64_t length) {
+    // Inert for every guest that never maps a file past its end: the ledger is empty, so `enabled` is 0 and
+    // this costs one relaxed atomic load per access.
+    if (!jit_guest_bus_active()) return;
+    uint64_t host = hl_x86_guest_pointer(guest_address);
+    uint64_t host_fault = jit_guest_bus_fault(host, length);
+    if (host_fault == 0) return;
+    struct cpu *cpu = g_interp_pad_cpu;
+    if (cpu == NULL || !g_interp_pad_armed) return; // no landing pad: unreachable from run_block
+    uint64_t guest_fault = host_fault - (host - guest_address);
+    cpu->fault_addr = guest_fault;
+    cpu->bus_ea = guest_fault;
+    cpu->reason = R_BUS;
+    g_interp_guest_access = 0;
+    siglongjmp(g_interp_fault_pad, 1);
+}
+
+static inline void interp_access_begin(uint64_t guest_address, uint64_t length) {
+    interp_bus_ledger_check(guest_address, length);
     g_interp_guest_access = 1;
     __atomic_signal_fence(__ATOMIC_SEQ_CST); // the marker must be visible to a handler BEFORE the access
 }
@@ -275,7 +323,7 @@ static inline void interp_tso_fence(void) {
 static uint64_t interp_load(uint64_t guest_address, int width) {
     uint64_t value = 0;
     const void *host = (const void *)(uintptr_t)hl_x86_guest_pointer(guest_address);
-    interp_access_begin();
+    interp_access_begin(guest_address, (uint64_t)width);
     memcpy(&value, host, (size_t)width); // unaligned-safe; little-endian host == little-endian guest
     interp_access_end();
     interp_tso_fence();
@@ -285,7 +333,7 @@ static uint64_t interp_load(uint64_t guest_address, int width) {
 static void interp_store(uint64_t guest_address, int width, uint64_t value) {
     void *host = (void *)(uintptr_t)hl_x86_guest_pointer(guest_address);
     interp_tso_fence();
-    interp_access_begin();
+    interp_access_begin(guest_address, (uint64_t)width);
     memcpy(host, &value, (size_t)width);
     interp_access_end();
     // A store into an emulated MAP_SHARED mapping, or into an executable alias of one, must be queued so
@@ -307,7 +355,7 @@ static void interp_store(uint64_t guest_address, int width, uint64_t value) {
 // to guest memory only after the last access has returned.
 static void interp_load_bytes(uint64_t guest_address, void *destination, unsigned length) {
     const void *host = (const void *)(uintptr_t)hl_x86_guest_pointer(guest_address);
-    interp_access_begin();
+    interp_access_begin(guest_address, length);
     memcpy(destination, host, length); // unaligned-safe, and one window for the whole operand
     interp_access_end();
     interp_tso_fence();
@@ -316,7 +364,7 @@ static void interp_load_bytes(uint64_t guest_address, void *destination, unsigne
 static void interp_store_bytes(uint64_t guest_address, const void *source, unsigned length) {
     void *host = (void *)(uintptr_t)hl_x86_guest_pointer(guest_address);
     interp_tso_fence();
-    interp_access_begin();
+    interp_access_begin(guest_address, length);
     memcpy(host, source, length);
     interp_access_end();
     if (jit86_store_alias_observation_active()) jit86_store_alias_changed(guest_address, (uint64_t)length);
@@ -333,6 +381,48 @@ static uint64_t interp_call_return_pc(uint64_t pc) {
         pc < g_nonpie_hi + g_nonpie_bias)
         return pc - g_nonpie_bias;
     return pc;
+}
+
+static uint64_t interp_ea(const struct cpu *cpu, const struct insn *insn, uint64_t next);
+
+// The other half of non-PIE pointer identity, and the same rule as interp_call_return_pc applied to data.
+//
+// A biased ET_EXEC's baked absolute pointers keep their LOW link values -- in .data, in the .tdata TLS
+// template, and in 32-bit `mov $imm` materializations -- because nothing rewrites the image's own bytes. A
+// rip-relative LEA does not dereference anything: it materializes a pointer VALUE, and that value is
+// compared against those baked ones. Computed from the biased runtime rip it comes out HIGH, so every such
+// comparison silently disagrees.
+//
+// This is not hypothetical and it is not cosmetic. glibc's `__malloc_fork_lock_parent` walks the arena list
+// with `lea main_arena(%rip),%r12` as the loop sentinel and `main_arena.next` -- a baked LOW self-pointer --
+// as the cursor. HIGH != LOW, so the loop does not terminate after the single arena: it takes
+// main_arena.mutex, comes round again, finds it already 1, and parks in __lll_lock_wait_private on a lock it
+// holds itself. Nothing ever wakes it. Every fork(2) from an x86-64 non-PIE guest that has ever started a
+// thread deadlocks at zero CPU -- which is what production.full-x86_64.{process,ipc,threads} were burning
+// their whole per-case budget on. The JIT does not have this bug: lower/mov.c performs exactly this rewrite,
+// with the same guards, added for the sibling failure where glibc's thread-exit path compared a tcache
+// pointer against `lea __tcache_dummy(%rip)`.
+//
+// The guards are the JIT's, verbatim, and each earns its place:
+//   * 64-bit operand size only. A 32-bit LEA truncates to 32 bits, so the low value is what it yields anyway.
+//   * rip-relative only. Every other addressing mode is built from register values that are already in the
+//     guest's own domain.
+//   * target inside the image's link range only, so a rip-relative LEA of something outside the image (there
+//     is none in practice, but the arithmetic permits it) is untouched.
+//   * for a Go image, narrowed to the type section. Whole-image rewriting also catches code-address LEAs
+//     (`LEAQ asyncPreempt(SB)`) that Go's findfunc requires HIGH, which crashes the runtime.
+// Inert for PIE and static-PIE images, i.e. for everything the matrix loads except the -no-pie corpus.
+//
+// Dereferencing the LOW pointer this returns still works: hl_x86_guest_pointer folds it back into the high
+// mapping on every access, exactly as it does for a baked pointer the guest loaded out of .data.
+static uint64_t interp_lea_value(const struct cpu *cpu, const struct insn *insn, uint64_t next) {
+    if (insn->opsize == 8 && insn->rip_rel && g_nonpie_lo) {
+        uint64_t link_target = (next - g_nonpie_bias) + (uint64_t)insn->disp;
+        uint64_t range_lo = g_nonpie_types_lo ? g_nonpie_types_lo : g_nonpie_lo;
+        uint64_t range_hi = g_nonpie_types_lo ? g_nonpie_types_hi : g_nonpie_hi;
+        if (link_target >= range_lo && link_target < range_hi) return link_target;
+    }
+    return interp_ea(cpu, insn, next);
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -638,7 +728,7 @@ static uint64_t interp_locked_rmw(uint64_t guest_address, int width, enum interp
     void *pointer = (void *)(uintptr_t)host_address;
     uint64_t old = 0;
     if ((host_address & (uint64_t)(width - 1)) == 0) {
-        interp_access_begin();
+        interp_access_begin(guest_address, (uint64_t)width);
         switch (width) {
         case 1: {
             unsigned char *p = pointer;
@@ -686,7 +776,7 @@ static uint64_t interp_locked_rmw(uint64_t guest_address, int width, enum interp
         uint64_t next_value;
         while (__atomic_exchange_n(lock, 1u, __ATOMIC_ACQUIRE))
             ; // spin: an exchange always makes forward progress
-        interp_access_begin();
+        interp_access_begin(guest_address, (uint64_t)width);
         memcpy(&old, pointer, (size_t)width);
         next_value = interp_rmw_apply(kind, old, operand, carry_in, width);
         memcpy(pointer, &next_value, (size_t)width);
@@ -1139,16 +1229,24 @@ static void run_block(struct cpu *cpu, void *code) {
     // The landing pad for a guest memory fault. savemask=1 because the jump arrives from a signal handler
     // with the fault signal blocked; without it the next guest fault would kill the process.
     int previous = g_interp_pad_armed;
+    struct cpu *previous_cpu = g_interp_pad_cpu;
     if (sigsetjmp(g_interp_fault_pad, 1) != 0) {
-        // A guest access faulted; the shared delivery path queued the guest signal, set cpu->reason and
-        // longjmped here. cpu->rip already names the faulting instruction.
+        // A guest access was abandoned. Either route left cpu ready for the dispatcher and changed no
+        // architectural state, and cpu->rip already names the faulting instruction:
+        //   * a real host SIGSEGV/SIGBUS -- the shared delivery path queued the guest signal and set
+        //     cpu->reason;
+        //   * interp_bus_ledger_check -- a past-EOF access the host was deliberately made not to fault on,
+        //     which set cpu->reason = R_BUS and cpu->fault_addr for interp_dispatch.h's R_BUS arm.
         g_interp_guest_access = 0;
         g_interp_pad_armed = previous;
+        g_interp_pad_cpu = previous_cpu;
         return;
     }
     g_interp_pad_armed = 1;
+    g_interp_pad_cpu = cpu;
     interp_execute(cpu);
     g_interp_pad_armed = previous;
+    g_interp_pad_cpu = previous_cpu;
 }
 
 static void block_return(void) {
@@ -1390,9 +1488,11 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
     // ---- LEA (8D): the address, never a dereference ----------------------------------------------
     case 0x8D: {
         if (!insn->is_mem) return interp_undefined(cpu, insn, pc, "LEA with a register operand (#UD encoding)");
-        // Deliberately interp_ea, not interp_load: LEA computes an address in the GUEST domain and must not
-        // rebias, or a non-PIE guest would see a pointer it never formed.
-        interp_reg_write(cpu, insn, insn->reg, insn->opsize, interp_ea(cpu, insn, next));
+        // Deliberately an ADDRESS computation, never interp_load: LEA produces a value in the GUEST's own
+        // pointer domain and must not be rebiased, or a non-PIE guest would see a pointer it never formed.
+        // interp_lea_value is interp_ea plus the one case where the guest's domain and the effective address
+        // genuinely differ -- a rip-relative LEA into a biased ET_EXEC's link range; see its header.
+        interp_reg_write(cpu, insn, insn->reg, insn->opsize, interp_lea_value(cpu, insn, next));
         cpu->rip = next;
         return STEP_NEXT;
     }
@@ -1869,8 +1969,11 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
     }
 
     // ---- HLT (F4): privileged, so #GP in user space -> SIGSEGV -----------------------------------
+    // si_code SI_KERNEL(0x80) with si_addr 0, which is how Linux reports a #GP -- the same pair the SSE
+    // alignment #GP above uses. SEGV_ACCERR would claim a mapped page was accessed with the wrong
+    // permission, which is a different (and checkable) statement about a fault that has no address at all.
     case 0xF4:
-        return interp_guest_trap(cpu, pc, 11 /*SIGSEGV*/, 2 /*SEGV_ACCERR*/);
+        return interp_guest_trap(cpu, pc, 11 /*SIGSEGV*/, 128 /*SI_KERNEL*/);
 
     default: break;
     }
@@ -1878,11 +1981,33 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
     // x87: the D8..DF ESC space, decoded here but implemented next to the SSE floating point below.
     if (op >= 0xD8 && op <= 0xDF) return interp_step_x87(cpu, insn, pc, next);
     if (op == 0xD7) return interp_undefined(cpu, insn, pc, "TODO(amd64-host): XLATB");
-    if (op == 0xCD || op == 0xCE || op == 0xCF || op == 0xCA || op == 0xCB)
-        return interp_undefined(cpu, insn, pc, "software interrupt / far return (INT/INTO/IRET/RETF)");
+
+    // ---- The rest of the one-byte map, split on what the ARCHITECTURE says ------------------------
+    // Three different things live next to each other here and they need three different answers. The split
+    // below is the same one interp_guest_trap/interp_undefined draw everywhere else in this file: an
+    // encoding the architecture DEFINES as faulting at CPL 3 is a guest signal, and only an encoding that is
+    // legal and simply not written yet is an engine gap.
+    //
+    // INTO (CE) is INVALID in 64-bit mode -- AMD removed it along with the rest of the 32-bit
+    // overflow/BCD group -- so it is #UD, exactly like UD2, and can never become "implemented later".
+    if (op == 0xCE) return interp_guest_trap(cpu, pc, 4 /*SIGILL*/, 2 /*ILL_ILLOPN*/);
+
+    // Port I/O. A Linux user process runs at CPL 3 with IOPL 0 and an empty I/O permission bitmap (nothing
+    // in this container model ever calls ioperm/iopl, and the engine models no I/O ports), so IN/OUT/INS/OUTS
+    // raise #GP(0) unconditionally. Reporting an engine gap here would be wrong in the way that matters:
+    // there is no implementation to add.
     if (op == 0x6C || op == 0x6D || op == 0x6E || op == 0x6F || op == 0xE4 || op == 0xE5 || op == 0xE6 || op == 0xE7 ||
         op == 0xEC || op == 0xED || op == 0xEE || op == 0xEF)
-        return interp_undefined(cpu, insn, pc, "port I/O (IN/OUT/INS/OUTS), privileged");
+        return interp_guest_trap(cpu, pc, 11 /*SIGSEGV*/, 128 /*SI_KERNEL*/);
+
+    // INT imm8 (CD), IRET (CF) and the far returns (CA/CB) stay REPORTED, and deliberately so even though
+    // most of what a 64-bit Linux process could do with them would fault. `int $0x80` is the one that
+    // matters: it is not a fault at all but Linux's 32-bit syscall gate, which a real guest can and does use,
+    // and which this backend does not implement. Folding it into a blanket #GP would turn a missing engine
+    // feature into an obscure guest SIGSEGV -- the precise failure mode the two-function split exists to
+    // prevent. IRET and the far returns are likewise legal instructions with a real (if exotic) meaning.
+    if (op == 0xCD || op == 0xCF || op == 0xCA || op == 0xCB)
+        return interp_undefined(cpu, insn, pc, "software interrupt / far return (INT/IRET/RETF)");
     return interp_undefined(cpu, insn, pc, "one-byte opcode");
 }
 
@@ -4334,7 +4459,7 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
             uint64_t host_address = hl_x86_guest_pointer(operand.address);
             void *pointer = (void *)(uintptr_t)host_address;
             int swapped = 0;
-            interp_access_begin();
+            interp_access_begin(operand.address, (uint64_t)width);
             if ((host_address & (uint64_t)(width - 1)) == 0) {
                 switch (width) {
                 case 1: {
@@ -4452,7 +4577,7 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
         if (insn->lock) {
             uint64_t host_address = hl_x86_guest_pointer(operand.address);
             uint64_t probe = expected;
-            interp_access_begin();
+            interp_access_begin(operand.address, 8);
             equal = __atomic_compare_exchange_n((uint64_t *)(uintptr_t)host_address, &probe, desired, 0,
                                                 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
             interp_access_end();
