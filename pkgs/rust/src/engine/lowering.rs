@@ -321,8 +321,9 @@ fn lower_projections(
         .collect::<Vec<_>>();
     let mut projections = Vec::new();
     if !materialized.is_empty() {
-        let (projection, mounts) = crate::projection::Projection::materialize(&materialized)?;
-        config.mounts.extend(mounts);
+        let (projection, materialized) = crate::projection::Projection::materialize(&materialized)?;
+        config.mounts.extend(materialized.mounts);
+        config.namespace_links.extend(materialized.links);
         projections.push(projection);
     }
     for entry in &entries {

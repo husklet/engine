@@ -112,6 +112,28 @@ restart:;
     }
     if (root_fd < 0) return -1;
     if (volidx >= 0 && g_vols[volidx].isfile) {
+        if (g_vols[volidx].issymlink && !nofollow) {
+            char target[4096], next[8192], parent[8192];
+            ssize_t length = readlinkat(root_fd, vol_fbase(volidx), target, sizeof target - 1);
+            if (length < 0) return -errno;
+            target[length] = 0;
+            const char *suffix = gbuf + g_vols[volidx].glen;
+            if (++follows > 40) {
+                resolve_loop_mark();
+                return -ELOOP;
+            }
+            if (target[0] == '/') {
+                if (path_concat(next, sizeof next, target, suffix) != 0) return -ENAMETOOLONG;
+            } else {
+                vol_parent_guest(volidx, parent, sizeof parent);
+                char joined[8192];
+                if (path_concat(joined, sizeof joined, parent, target) != 0 ||
+                    path_concat(next, sizeof next, joined, suffix) != 0)
+                    return -ENAMETOOLONG;
+            }
+            if (path_copy(gbuf, sizeof gbuf, next) != 0) return -ENAMETOOLONG;
+            goto restart;
+        }
         // File bind-mount (jail_match matched only the exact mount point): `root_fd` is the host file's
         // PARENT dir. Hand back that parent + the file's basename so the caller's openat opens the bound
         // file itself -- a single-file mount has no interior to walk per-component.
@@ -407,10 +429,13 @@ static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, uint32_t 
         else
             snprintf(rooted, sizeof rooted, "%s", absolute);
         int volume = jail_match(rooted);
-        if (volume >= 0) {
+        if (volume >= 0 && !g_vols[volume].issymlink) {
             route_root = g_vols[volume].handle;
             relative = g_vols[volume].isfile ? vol_fbase(volume) : rooted + g_vols[volume].glen;
+        } else if (volume < 0) {
+            relative = rooted;
         } else {
+            route_root = HL_HOST_HANDLE_INVALID;
             relative = rooted;
         }
         while (*relative == '/')

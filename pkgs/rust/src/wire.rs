@@ -226,11 +226,12 @@ fn file_owners(config: &Config) -> Result<Option<OsString>, Error> {
 
 fn volumes(config: &Config) -> Result<Option<OsString>, Error> {
     use std::os::unix::ffi::OsStringExt;
-    if config.mounts.is_empty() {
+    if config.mounts.is_empty() && config.namespace_links.is_empty() {
         return Ok(None);
     }
     let mut output = Vec::new();
-    for (index, mount) in config.mounts.iter().enumerate() {
+    let mut index = 0;
+    for mount in &config.mounts {
         let host = checked_bytes(mount.host.as_os_str())?;
         let guest = checked_bytes(mount.guest.as_os_str())?;
         if host.contains(&b',')
@@ -253,6 +254,28 @@ fn volumes(config: &Config) -> Result<Option<OsString>, Error> {
         output.extend_from_slice(guest);
         output.push(b':');
         output.extend_from_slice(host);
+        index += 1;
+    }
+    for (host, guest) in &config.namespace_links {
+        let host = checked_bytes(host.as_os_str())?;
+        let guest = checked_bytes(guest.as_os_str())?;
+        if host.contains(&b',')
+            || host.contains(&b':')
+            || guest.contains(&b',')
+            || guest.contains(&b':')
+        {
+            return Err(Error::InvalidConfig(
+                "namespace link paths must not contain ':' or ','",
+            ));
+        }
+        if index != 0 {
+            output.push(b',');
+        }
+        output.extend_from_slice(b"link:");
+        output.extend_from_slice(guest);
+        output.push(b':');
+        output.extend_from_slice(host);
+        index += 1;
     }
     Ok(Some(OsString::from_vec(output)))
 }

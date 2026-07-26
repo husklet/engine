@@ -19,10 +19,15 @@ pub(crate) struct Projection {
     root: PathBuf,
 }
 
+pub(crate) struct Materialized {
+    pub(crate) mounts: Vec<Mount>,
+    pub(crate) links: Vec<(PathBuf, PathBuf)>,
+}
+
 impl Projection {
     pub(crate) fn materialize(
         entries: &[&NamespaceEntry],
-    ) -> Result<(Self, Vec<Mount>), SpecError> {
+    ) -> Result<(Self, Materialized), SpecError> {
         let root = create_root()?;
         let projection = Self { root };
         let result = projection.populate(entries);
@@ -32,7 +37,7 @@ impl Projection {
         }
     }
 
-    fn populate(&self, entries: &[&NamespaceEntry]) -> Result<Vec<Mount>, SpecError> {
+    fn populate(&self, entries: &[&NamespaceEntry]) -> Result<Materialized, SpecError> {
         let mut ordered = entries.to_vec();
         ordered.sort_by(|left, right| {
             left.path()
@@ -46,12 +51,21 @@ impl Projection {
         }
         let paths = ordered.iter().map(|entry| entry.path()).collect::<Vec<_>>();
         let mut mounts = Vec::new();
+        let mut links = Vec::new();
         for entry in &ordered {
             let path = entry.path();
-            if paths
+            let has_ancestor = paths
                 .iter()
-                .any(|candidate| *candidate != path && path.starts_with(candidate))
+                .any(|candidate| *candidate != path && path.starts_with(candidate));
+            if matches!(entry, NamespaceEntry::Symlink(value) if value.target.is_absolute())
+                || (matches!(entry, NamespaceEntry::Symlink(_)) && !has_ancestor)
             {
+                links.push((self.host_path(path)?, path.to_owned()));
+            }
+            if has_ancestor {
+                continue;
+            }
+            if matches!(entry, NamespaceEntry::Symlink(_)) {
                 continue;
             }
             if matches!(entry, NamespaceEntry::File(value) if matches!(value.source, FileSource::Mutable(_)))
@@ -74,7 +88,7 @@ impl Projection {
                 ));
             }
         }
-        Ok(mounts)
+        Ok(Materialized { mounts, links })
     }
 
     fn create(&self, entry: &NamespaceEntry) -> Result<(), SpecError> {

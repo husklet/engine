@@ -40,6 +40,7 @@ pub struct Config {
     pub(crate) checkpoint_mode: u32,
     pub(crate) checkpoint_policy: crate::spec::IncompatibleResourcePolicy,
     pub(crate) mounts: Vec<Mount>,
+    pub(crate) namespace_links: Vec<(PathBuf, PathBuf)>,
     pub(crate) file_owners: Vec<(PathBuf, u32, u32)>,
     pub(crate) process_domain: Option<Domain>,
     pub(crate) executable_host: Option<PathBuf>,

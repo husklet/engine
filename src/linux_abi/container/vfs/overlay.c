@@ -869,7 +869,9 @@ static int overlay_readdir(const char *gdir, char (**names_out)[256], uint8_t **
         child[k] = 0;
         // The file mount's own leaf (rest fully consumed, no further '/') lists as a regular file; an
         // intermediate dir of a nested mount, or a directory mount's child, lists as a directory.
-        uint8_t cty = (g_vols[i].isfile && rest[k] == 0) ? DT_REG : DT_DIR;
+        uint8_t cty = (g_vols[i].issymlink && rest[k] == 0)
+                          ? DT_LNK
+                          : (g_vols[i].isfile && rest[k] == 0) ? DT_REG : DT_DIR;
         int dup = 0;
         for (int j = 0; j < ns; j++)
             if (!strcmp(seen[j], child)) {

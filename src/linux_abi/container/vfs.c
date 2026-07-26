@@ -195,6 +195,35 @@ static int canonicalize_path(const char *path, char *destination, size_t capacit
     return 0;
 }
 
+// Preserve the final symlink inode while canonicalizing its parent directory.
+// Namespace projections need the guest to observe and follow the link itself;
+// ordinary bind sources continue to bind their canonical target.
+static int canonicalize_link_path(const char *path, char *destination, size_t capacity) {
+    char copy[4200], parent[4200];
+    if (path_copy(copy, sizeof copy, path) != 0) return -1;
+    char *slash = strrchr(copy, '/');
+    if (slash == NULL || slash[1] == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    const char *name = slash + 1;
+    if (slash == copy)
+        copy[1] = 0;
+    else
+        *slash = 0;
+    if (canonicalize_path(copy, parent, sizeof parent) != 0) return -1;
+    if (path_join(destination, capacity, parent, name) != 0) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    struct stat status;
+    if (lstat(destination, &status) != 0 || !S_ISLNK(status.st_mode)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
 // realpath(g_rootfs) -- the true rootfs boundary
 static char g_rootfs_canon[4200];
 static size_t g_rootfs_canon_len;
@@ -1496,6 +1525,7 @@ struct vol {
     int ro;                // 1 = read-only bind (`-v …:ro`): write-intent syscalls under `guest` fail EROFS
     int isfile;            // 1 = single-file bind (`-v host/f:/ctr/f`): `fd` is the host file's PARENT dir, `hcanon`
                            // is the file itself, and `guest` matches ONLY its exact path (a file has no children).
+    int issymlink;         // projected link: resolve its target in the guest namespace
     int dead;              // 1 = detached by a runtime umount2(2): skipped by jail_match/jail_is_vol so the mount
                            // point reverts to the underlying rootfs/overlay content (the slot is never compacted --
                            // append-only keeps concurrent path resolves race-free).
@@ -1547,7 +1577,12 @@ static void add_vol(const char *spec) { // "[ro:]guestpath:hostdir" -> a confine
     // Optional read-only marker. A guest path always begins with '/', so a leading "ro:"/"rw:" token is
     // unambiguous; absent (the legacy `guest:host` form) it defaults to read-write -> byte-identical.
     int ro = 0;
-    if (!strncmp(spec, "ro:", 3)) {
+    int preserve_link = 0;
+    if (!strncmp(spec, "link:", 5)) {
+        ro = 1;
+        preserve_link = 1;
+        spec += 5;
+    } else if (!strncmp(spec, "ro:", 3)) {
         ro = 1;
         spec += 3;
     } else if (!strncmp(spec, "rw:", 3)) {
@@ -1564,10 +1599,12 @@ static void add_vol(const char *spec) { // "[ro:]guestpath:hostdir" -> a confine
     v->glen = strlen(v->guest);
     while (v->glen > 1 && v->guest[v->glen - 1] == '/')
         v->guest[--v->glen] = 0;
-    if (canonicalize_path(col + 1, v->hcanon, sizeof v->hcanon) != 0) return;
+    if ((preserve_link ? canonicalize_link_path(col + 1, v->hcanon, sizeof v->hcanon)
+                       : canonicalize_path(col + 1, v->hcanon, sizeof v->hcanon)) != 0)
+        return;
     v->hlen = strlen(v->hcanon);
     struct stat hst;
-    if (stat(v->hcanon, &hst) == 0 && !S_ISDIR(hst.st_mode)) {
+    if ((preserve_link ? lstat(v->hcanon, &hst) : stat(v->hcanon, &hst)) == 0 && !S_ISDIR(hst.st_mode)) {
         // Single-file bind (regular file, but ALSO a socket / fifo / device): openat's jail base must be a
         // directory, so pin the source's PARENT dir as `fd` and route the exact mount point straight to
         // `hcanon`. Dropping the O_DIRECTORY requirement here is what lets a non-dir source register at all
@@ -1575,6 +1612,7 @@ static void add_vol(const char *spec) { // "[ro:]guestpath:hostdir" -> a confine
         // is what makes a bind-mounted Unix socket — e.g. the docker daemon socket — resolve so the guest's
         // connect() dials the real host socket instead of ENOENT.
         v->isfile = 1;
+        v->issymlink = preserve_link;
         char par[1024];
         snprintf(par, sizeof par, "%s", v->hcanon);
         char *sl = strrchr(par, '/');
@@ -1668,8 +1706,9 @@ static int jail_match(const char *abs) {
     for (int i = 0; i < nv; i++) {
         if (g_vols[i].dead) continue; // runtime-umounted: no longer routes here
         char b = abs[g_vols[i].glen];
-        // A directory mount owns its children too (b=='/'); a file mount matches ONLY its exact path.
-        int hit = g_vols[i].isfile ? (b == 0) : (b == '/' || b == 0);
+        // A projected symlink owns suffixes through its guest target; ordinary
+        // single-file binds still match only their exact mount point.
+        int hit = g_vols[i].isfile && !g_vols[i].issymlink ? (b == 0) : (b == '/' || b == 0);
         if (g_vols[i].glen > blen && hit && !strncmp(abs, g_vols[i].guest, g_vols[i].glen)) {
             best = i;
             blen = g_vols[i].glen;
@@ -1841,7 +1880,7 @@ static int secure_resolve_probe(const char *guest, char *out, size_t n, int nofo
     // realpath'd file, not a dir to walk). jail_match only matches a file vol on its exact path, so a hit
     // here IS that file -- emit it directly; confine_in would append rel ("/") and ENOTDIR on the file.
     int fvi = jail_match(norm);
-    if (fvi >= 0 && g_vols[fvi].isfile) {
+    if (fvi >= 0 && g_vols[fvi].isfile && (!g_vols[fvi].issymlink || nofollow)) {
         if (isvol) *isvol = 1;
         snprintf(out, n, "%s", g_vols[fvi].hcanon);
         return 1;

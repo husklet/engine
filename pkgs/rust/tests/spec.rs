@@ -369,6 +369,27 @@ fn namespace_extension(bytes: &'static [u8]) -> ExtensionSpec {
                 uid: 0,
                 gid: 0,
             }),
+            NamespaceEntry::Symlink(SymlinkEntry {
+                path: "/opt/husklet/absolute".into(),
+                target: "/opt/husklet/config".into(),
+                uid: 0,
+                gid: 0,
+            }),
+            NamespaceEntry::Symlink(SymlinkEntry {
+                path: "/bin/false".into(),
+                target: "/opt/husklet/run".into(),
+                uid: 0,
+                gid: 0,
+            }),
+            NamespaceEntry::File(FileEntry {
+                path: "/opt/husklet/run".into(),
+                metadata: Metadata {
+                    mode: 0o555,
+                    uid: 0,
+                    gid: 0,
+                },
+                source: FileSource::Immutable(Arc::from(&b"#!/bin/sh\nexit 0\n"[..])),
+            }),
         ],
         services: Vec::new(),
         memory: Vec::new(),
@@ -644,9 +665,15 @@ fn projected_directory_file_and_symlink_share_the_guest_vfs() {
         "test \"$(cat /opt/husklet/config)\" = projected && \
          test \"$(readlink /opt/husklet/link)\" = config && \
          test \"$(cat /opt/husklet/link)\" = projected && \
+         test \"$(readlink /opt/husklet/absolute)\" = /opt/husklet/config && \
+         test \"$(cat /opt/husklet/absolute)\" = projected && \
+         test \"$(readlink /bin/false)\" = /opt/husklet/run && \
+         /bin/false && \
          test \"$(stat -c %a /opt/husklet/config)\" = 440 && \
-         test \"$(ls /opt/husklet)\" = 'config
-link'"
+         test \"$(ls /opt/husklet)\" = 'absolute
+config
+link
+run'"
             .into(),
     ]);
     spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
