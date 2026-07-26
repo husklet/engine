@@ -311,6 +311,10 @@ function(hl_tool name source)
     -Wstrict-prototypes -Wmissing-prototypes
     -Werror=implicit-function-declaration -Werror=implicit-int ${T_FLAGS})
   target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  # Tests run from CMAKE_SOURCE_DIR, so a runner that needs host scratch space
+  # cannot guess where the build tree is: the directory is only named `build`
+  # by convention, and deriving <cwd>/build silently misses every other name.
+  target_compile_definitions(${name} PRIVATE HL_BUILD_DIR="${CMAKE_BINARY_DIR}")
   target_link_options(${name} PRIVATE ${T_LINK})
   set_target_properties(${name} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${T_SUBDIR})

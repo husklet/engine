@@ -804,6 +804,31 @@ static int scratch_remove_entry(const char *path, const struct stat *info, int f
     return 0;
 }
 
+#ifndef HL_BUILD_DIR
+#define HL_BUILD_DIR "." /* CMake passes the real binary dir; this only covers an ad-hoc compile */
+#endif
+
+/* CTest runs this from the source tree, so the scratch root has to come from the build system: the
+ * binary directory is named `build` only by convention, and <cwd>/build is wrong everywhere else. */
+static const char *scratch_root(void) {
+    const char *root = getenv("HL_BUILD_DIR");
+    struct stat info;
+    if (root == NULL || root[0] == '\0') root = HL_BUILD_DIR;
+    if (stat(root, &info) != 0) {
+        fprintf(stderr, "checkpoint runner: build directory %s is unusable (%s)\n", root, strerror(errno));
+        return NULL;
+    }
+    if (!S_ISDIR(info.st_mode)) {
+        fprintf(stderr, "checkpoint runner: build directory %s is not a directory\n", root);
+        return NULL;
+    }
+    if (access(root, W_OK | X_OK) != 0) {
+        fprintf(stderr, "checkpoint runner: build directory %s is not writable (%s)\n", root, strerror(errno));
+        return NULL;
+    }
+    return root;
+}
+
 static void scratch_cleanup(void) {
     if (g_scratch_root[0] == '\0') return;
     (void)nftw(g_scratch_root, scratch_remove_entry, 16, FTW_DEPTH | FTW_PHYS);
@@ -859,15 +884,27 @@ int main(int argc, char **argv) {
          !connected_socket_case && !signal_case && !connecting_refusal_case && !connecting_fallback_case && !corrupt_magic_case &&
          !corrupt_truncated_case && !corrupt_content_case && !corrupt_missing_case && !corrupt_extra_case &&
          !permissive_case && !modified_external_case &&
-         !io_case) ||
-        getcwd(temporary, sizeof temporary) == NULL ||
-        strlen(temporary) + sizeof("/build/hl-checkpoint-tree.XXXXXX") > sizeof temporary)
+         !io_case)) {
+        fprintf(stderr, "usage: checkpoint-tree-runner ENGINE GUEST [SCENARIO]\n");
         return 2;
-    strcat(temporary, "/build/hl-checkpoint-tree.XXXXXX");
-    if (mkdtemp(temporary) == NULL) return 2;
+    }
+    {
+        const char *root = scratch_root();
+        if (root == NULL) return 2;
+        if (snprintf(temporary, sizeof temporary, "%s/hl-checkpoint-tree.XXXXXX", root) >=
+            (int)sizeof temporary) {
+            fprintf(stderr, "checkpoint runner: scratch path under %s does not fit\n", root);
+            return 2;
+        }
+        if (mkdtemp(temporary) == NULL) {
+            fprintf(stderr, "checkpoint runner: cannot create scratch under %s (%s)\n", root,
+                    strerror(errno));
+            return 2;
+        }
+    }
     /* The scratch tree is created here but the runner has ~87 return paths, so
      * cleaning up at each one is unmaintainable -- and skipping it leaked a
-     * build/hl-checkpoint-tree.XXXXXX directory per invocation (hundreds had
+     * hl-checkpoint-tree.XXXXXX directory per invocation (hundreds had
      * accumulated). Register one atexit hook that removes the whole tree. */
     snprintf(g_scratch_root, sizeof g_scratch_root, "%s", temporary);
     atexit(scratch_cleanup);
