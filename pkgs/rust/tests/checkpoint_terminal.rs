@@ -42,6 +42,16 @@ const SYNC_ATTEMPTS: usize = 12;
 /// bash, and the defect is about a job-control shell on a pty, which is what `bash -il` is.
 const SHELL: &str = "/bin/bash";
 
+/// A foreground job for the shell to be parked in `wait(2)` on across the capture: one forked child that
+/// blocks, announcing itself first so the capture is never taken before the shell has a job at all.
+const JOB: &str = "echo JOB-ALIVE; sleep 1000";
+const JOB_MARKER: &str = "JOB-ALIVE";
+
+/// How long the restored machine gets to start before the first Ctrl-C is typed at it. Not a readiness
+/// assumption -- readiness is asserted by the prompt coming back -- but a terminal signal that lands while
+/// the engine process is still starting has no guest to reach and kills the launch instead.
+const INTERRUPT_HEAD_START: Duration = Duration::from_secs(3);
+
 fn io() -> ProcessIo {
     ProcessIo {
         stdin: Stdio::Null,
@@ -259,9 +269,10 @@ fn round_trip(foreground: Option<&str>, interrupt: bool) -> bool {
     synchronise(&session, "A");
     let before = probe_terminal_state(&session, "before capture");
     if let Some(command) = foreground {
-        session.send(format!("{command}\n").as_bytes());
-        // Give the shell time to fork the job and park in wait(2) -- the state the capture must handle.
-        thread::sleep(Duration::from_millis(750));
+        // Wait for the job to announce itself: the shell has then forked it and is parked in wait(2), which
+        // is the state the capture must handle. A fixed delay would let a slow runner capture the shell
+        // before it had a job at all.
+        session.ask(command, JOB_MARKER, "before capture");
     }
 
     machine
@@ -288,11 +299,24 @@ fn round_trip(foreground: Option<&str>, interrupt: bool) -> bool {
     let mut restored = restored;
     let session = Session::attach(restored.take_terminal().expect("a pty was requested"));
     if interrupt {
-        // The restored shell is still waiting on its foreground job; Ctrl-C must end the job and give the
-        // prompt back, exactly as it would have before the capture.
-        thread::sleep(Duration::from_millis(500));
-        session.send(b"\x03");
+        // Ctrl-C must end the foreground job and give the prompt back, exactly as it would have before the
+        // capture -- and the prompt coming back is what asserts it, further down.
+        //
+        // Retyped rather than typed once. An interrupt is a signal, not input: `spawn_with_store` returns as
+        // soon as the restore has been ASKED for, and one that arrives before the job's process group has
+        // been re-created has nothing to be delivered to and is simply gone. The head start is for the
+        // restore's own process startup, the one stretch a terminal signal can still be fatal because the
+        // engine has not reached the code that holds those signals off yet.
+        thread::sleep(INTERRUPT_HEAD_START);
+        for _ in 0..SYNC_ATTEMPTS {
+            session.send(b"\x03");
+            thread::sleep(Duration::from_millis(500));
+        }
     }
+    // The restored shell must serve MORE than one line. Establishing readiness the same way the pre-capture
+    // half does costs one command, so a shell that accepts a single line and then reports EOF fails here
+    // instead of spending its one working line on the probe and looking healthy.
+    synchronise(&session, "B");
     let after = probe_terminal_state(&session, "after restore");
     assert_eq!(
         before.directory, after.directory,
@@ -308,22 +332,18 @@ fn an_idle_interactive_shell_on_a_pty_is_captured_and_restored() {
     round_trip(None, false);
 }
 
-/// KNOWN BAD, reported separately: capture, restore and Ctrl-C all work here -- the restored shell kills
-/// its foreground job and prints a fresh prompt -- but the restored pty then corrupts or ends the input
-/// stream: typed bytes come back duplicated or dropped, and the shell reaches EOF and logs out before the
-/// state probe finishes. That is the pty byte-echo/imported-handle defect being fixed separately, not the
-/// checkpoint path; un-ignore this once it lands.
+/// Ctrl-C at the restored prompt must end the foreground job and hand the terminal back, after which the
+/// shell keeps serving commands. This is the case that proved the restored init never re-created its own
+/// process group: the shell's terminal handoff named a group it was not in, its next read was a background
+/// read, and it saw EOF and logged out.
 #[test]
-#[ignore = "the restored pty corrupts typed input and then reports EOF"]
 fn an_interactive_shell_with_a_foreground_job_is_captured_and_restored() {
-    round_trip(Some("sleep 1000"), true);
+    round_trip(Some(JOB), true);
 }
 
-/// KNOWN BAD, reported separately: everything else about the terminal survives, but the restored shell's
-/// process group reads back as a raw HOST pgid through `/proc/self/stat` instead of the guest pgid it had
-/// (1 for the container init). The restore's pid-translation table covers pids, not the `stat` pgrp field.
+/// The restored shell is still the container init's own process group, so `/proc/self/stat` reports guest
+/// pgid 1 -- the same value it reported before the capture -- and not a raw host pgid.
 #[test]
-#[ignore = "restore does not translate the process group in /proc/<pid>/stat"]
 fn the_restored_shell_keeps_its_guest_process_group() {
     assert!(
         round_trip(None, false),

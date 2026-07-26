@@ -1032,6 +1032,10 @@ int hl_engine_entry(int argc, char **argv);
 static int hl_standalone_run(const char *rootfs, const char *executable_host, uint32_t argc, char *const argv[],
                              const hl_options *options, const char *result_path) {
     (void)executable_host;
+    // Earliest point that knows this launch is a restore: cover the whole rebuild against a terminal signal
+    // typed at the pty before the tree exists (ckpt_restore_hold_tty_signals).
+    if (options == NULL ? hl_option_get("HL_RESTORE") != NULL : hl_options_get(options, "HL_RESTORE") != NULL)
+        ckpt_restore_hold_tty_signals();
     return hl_native_engine_run(HL_GUEST_ISA_X86_64, rootfs, argc, argv, options, result_path);
 }
 #ifndef HL_ENGINE_NO_MAIN

@@ -49,6 +49,7 @@
 // bytes over the socket activation handed the engine; the embedder owns the other end.
 
 #include <sys/wait.h>   // waitid/waitpid: coordinator peer-reap; multi-thread refusal probe
+#include <termios.h>    // the controlling terminal's line discipline is captured and replayed
 
 #include "../host/file.h"
 #include "../host/system.h"
@@ -129,6 +130,15 @@ struct ckpt_manifest {
     // init's own group; 0 == none/unknown). Restore re-points the fresh pty at it (tcsetpgrp) so ^C/^Z reach
     // the foreground job -- without it the resumed tree's fg group defaults to the init and ^C kills the tree.
     int32_t fg_pgid_gpid;
+    // The controlling terminal's LINE DISCIPLINE at checkpoint. Restore attaches a fresh pty, which the host
+    // creates in cooked mode (ICANON|ECHO); a guest that had put its terminal in raw mode -- every readline
+    // shell at a prompt -- does not re-issue tcsetattr after resume, because it believes the terminal is
+    // already prepared. The tty then echoes the typed line itself on top of the shell's own echo (bytes come
+    // back doubled) and hands the shell whole lines instead of characters. 0 == no terminal / unreadable.
+    uint32_t tty_termios;
+    uint32_t tty_iflag, tty_oflag, tty_cflag, tty_lflag;
+    uint32_t tty_ispeed, tty_ospeed;
+    uint8_t tty_cc[32];
 };
 
 struct ckpt_meta {
@@ -1188,6 +1198,43 @@ static int ckpt_is_descendant(int64_t candidate, int64_t root) {
 
 // ================================ CHECKPOINT (per process) ================================
 
+// A descriptor for the container's controlling terminal, or -1. Close it with ckpt_ctty_close.
+//
+// Probing the engine's own 0/1/2 is not enough: they are the launcher's pty only in the launch shapes that
+// leave them inherited. Where the embedder asks for a terminal, the guest's terminal descriptors are hoisted
+// into the engine's private descriptor band and its own 0/1/2 are redirected, so every isatty() there says
+// "no" and the terminal is invisible to the capture. /dev/tty names the controlling terminal however the
+// descriptor table happens to look.
+static int ckpt_ctty_open(void) {
+    if (isatty(0)) return 0;
+    if (isatty(1)) return 1;
+    if (isatty(2)) return 2;
+    int fd = open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (fd < 0) fd = open("/dev/tty", O_RDONLY | O_NOCTTY | O_CLOEXEC);
+    return fd;
+}
+
+static void ckpt_ctty_close(int fd) {
+    if (fd > STDERR_FILENO) (void)close(fd);
+}
+
+// Does `path` name the container's controlling terminal?
+//
+// `isatty(guest_fd)` cannot answer that. The capture runs inside the engine, and the engine's own descriptor
+// table is not the guest's: guest fd numbers index the engine's descriptors, which are the pty only where a
+// guest fd happens to alias the engine's inherited stdin. An interactive shell's stdin, stdout, stderr and
+// its job-control dup (bash's fd 255) therefore looked like ordinary character DEVICES and were recorded by
+// host path -- "/dev/pts/7". Restore then reopened that path, which by then names a recycled, unrelated pty
+// (or nothing at all, refusing the whole image) instead of inheriting the launcher's terminal.
+static int ckpt_path_is_ctty(const char *path) {
+    struct stat device, terminal;
+    int tf = ckpt_ctty_open();
+    int same = tf >= 0 && path != NULL && fstat(tf, &terminal) == 0 && stat(path, &device) == 0 &&
+               S_ISCHR(device.st_mode) && S_ISCHR(terminal.st_mode) && device.st_rdev == terminal.st_rdev;
+    ckpt_ctty_close(tf);
+    return same;
+}
+
 // Snapshot every path-backed / tty guest fd into `recs`; REFUSE (return -1) on any GUEST-owned pathless
 // kernel-object fd (P3). MUST run BEFORE any checkpoint output file is opened, so the writer's own fds are
 // never mistaken for guest fds.
@@ -1318,10 +1365,16 @@ static int ckpt_scan_fds(struct ckpt_fd *recs, int cap, int *out_n) {
                     g_linux_box->host->context, snapshot.host_handle, (hl_host_bytes){fp, sizeof(fp) - 1});
                 if (metadata.type == HL_HOST_FILE_TYPE_CHARACTER && isatty(fd)) {
                     r.kind = CKF_TTY;
+                    r.offset = 0;
                 } else if (device_path.status == HL_STATUS_OK && device_path.value < sizeof fp) {
                     fp[device_path.value] = 0;
-                    r.kind = CKF_DEVICE;
-                    if (path_copy(r.path, sizeof r.path, fp) != 0) return -1;
+                    if (metadata.type == HL_HOST_FILE_TYPE_CHARACTER && ckpt_path_is_ctty(fp)) {
+                        r.kind = CKF_TTY;
+                        r.offset = 0;
+                    } else {
+                        r.kind = CKF_DEVICE;
+                        if (path_copy(r.path, sizeof r.path, fp) != 0) return -1;
+                    }
                 } else {
                     fprintf(stderr, "[ckpt] refuse: device fd %d has no recoverable path\n", fd);
                     return -1;
@@ -1501,8 +1554,13 @@ static int ckpt_scan_fds(struct ckpt_fd *recs, int cap, int *out_n) {
             } else if (S_ISCHR(status.st_mode) || S_ISBLK(status.st_mode)) {
                 if (path_size >= sizeof path) return -1;
                 path[path_size] = '\0';
-                r.kind = CKF_DEVICE;
-                if (path_copy(r.path, sizeof r.path, path) != 0) return -1;
+                if (S_ISCHR(status.st_mode) && ckpt_path_is_ctty(path)) {
+                    r.kind = CKF_TTY;
+                    r.offset = 0;
+                } else {
+                    r.kind = CKF_DEVICE;
+                    if (path_copy(r.path, sizeof r.path, path) != 0) return -1;
+                }
             } else if (S_ISREG(status.st_mode) || S_ISDIR(status.st_mode)) {
                 if (path_size >= sizeof path) return -1;
                 path[path_size] = '\0';
@@ -2102,9 +2160,22 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
     // session leader here, so tcgetpgrp reads the real fg host pgid; child job groups pass through untranslated
     // (guest pgid == host pgid), only the init's own group folds to guest pgid 1.
     {
-        int tf = isatty(0) ? 0 : isatty(1) ? 1 : isatty(2) ? 2 : -1;
+        int tf = ckpt_ctty_open();
         int fgh = (tf >= 0) ? tcgetpgrp(tf) : -1;
+        struct termios tio;
         man.fg_pgid_gpid = (fgh <= 0) ? 0 : (g_init_hostpid && fgh == g_init_hostpid) ? 1 : fgh;
+        if (tf >= 0 && tcgetattr(tf, &tio) == 0) {
+            size_t cc = sizeof tio.c_cc < sizeof man.tty_cc ? sizeof tio.c_cc : sizeof man.tty_cc;
+            man.tty_termios = 1;
+            man.tty_iflag = (uint32_t)tio.c_iflag;
+            man.tty_oflag = (uint32_t)tio.c_oflag;
+            man.tty_cflag = (uint32_t)tio.c_cflag;
+            man.tty_lflag = (uint32_t)tio.c_lflag;
+            man.tty_ispeed = (uint32_t)cfgetispeed(&tio);
+            man.tty_ospeed = (uint32_t)cfgetospeed(&tio);
+            memcpy(man.tty_cc, tio.c_cc, cc);
+        }
+        ckpt_ctty_close(tf);
     }
     // The digest is asked of the sink: the server accumulated it while the bytes went past, so nothing
     // re-reads the embedder's store.
@@ -3348,9 +3419,10 @@ static int ckpt_restore_fds_dir(const char *procdir) {
             // recreate it by duping the ctty onto that number -- else the shell's tcsetattr/tcgetattr on it
             // fails EBADF after restore ("tcsetattr: Bad file descriptor" when a foreground job finishes).
             if (r.gfd > 2) {
-                int ct = isatty(0) ? 0 : isatty(1) ? 1 : isatty(2) ? 2 : -1;
+                int ct = ckpt_ctty_open();
                 if (ct >= 0 && r.gfd != ct && dup2(ct, r.gfd) >= 0 && (r.flags & FD_CLOEXEC))
                     fcntl(r.gfd, F_SETFD, FD_CLOEXEC);
+                ckpt_ctty_close(ct);
             }
             if (r.descriptor_flags & FD_CLOEXEC) fcntl(r.gfd, F_SETFD, FD_CLOEXEC);
             continue;
@@ -3557,6 +3629,19 @@ static void ckpt_reinstall_sigacts(const struct ckpt_meta *m) {
             sigaction(ms, &sa, NULL);
         }
     }
+}
+
+// Survive a terminal signal typed while the tree is still being rebuilt.
+//
+// A restoring process is not the guest yet: until it has replayed the guest's dispositions
+// (ckpt_reinstall_sigacts) it carries the HOST defaults, so a ^C at the pty -- which the embedder's user can
+// type at any moment, and which an acceptance test aims at the restored foreground job -- terminates the
+// restore driver itself and takes the whole machine with it. Ignore the terminal-generated signals for that
+// window; reinstall_sigacts then overwrites every disposition, SIG_DFL included. Each re-forked process does
+// this again on entry, because it inherits the init's already-replayed dispositions.
+static void ckpt_restore_hold_tty_signals(void) {
+    static const int tty[] = {SIGINT, SIGQUIT, SIGHUP, SIGTSTP, SIGTTIN, SIGTTOU};
+    for (size_t i = 0; i < sizeof tty / sizeof tty[0]; ++i) (void)signal(tty[i], SIG_IGN);
 }
 
 // The process table read from the checkpoint (one entry per proc.<gpid>/meta), used to rebuild the tree.
@@ -3993,7 +4078,10 @@ static int ckpt_restore_preflight(int policy) {
         return -1;
     }
     if (!root || !root->viable) {
-        fprintf(stderr, "[restore] container init is not recoverable; see RECOVERY.jsonl\n");
+        // Name the reason here too: RECOVERY.jsonl goes to the embedder's store, which a caller watching the
+        // machine's own terminal cannot read, and "not recoverable" alone says nothing about what was missing.
+        fprintf(stderr, "[restore] container init is not recoverable: %s (see RECOVERY.jsonl)\n",
+                root ? root->reason : "no init image");
         return -1;
     }
     return 0;
@@ -5165,7 +5253,7 @@ static int g_ckpt_fg_gpid = 0;
 // argument names a group that already exists. SIGTTOU is blocked so a background caller isn't stopped by the
 // handoff. Best-effort -- a failure just leaves the (safe) inherited foreground group.
 static void ckpt_claim_tty_fg(void) {
-    int tf = isatty(0) ? 0 : isatty(1) ? 1 : isatty(2) ? 2 : -1;
+    int tf = ckpt_ctty_open();
     if (tf < 0) return;
     sigset_t sv, bl;
     sigemptyset(&bl);
@@ -5173,6 +5261,35 @@ static void ckpt_claim_tty_fg(void) {
     sigprocmask(SIG_BLOCK, &bl, &sv);
     (void)tcsetpgrp(tf, getpgrp());
     sigprocmask(SIG_SETMASK, &sv, NULL);
+    ckpt_ctty_close(tf);
+}
+
+// Replay the captured line discipline onto the fresh pty. The restored guest keeps its in-memory belief about
+// the terminal (readline's "already prepared" flag), so a mode it set before the capture has to be there when
+// it resumes. SIGTTOU is blocked: the init is not yet the foreground group at this point. Best effort -- a
+// non-tty or an unsettable mode just leaves the launcher's default cooked terminal.
+static void ckpt_restore_tty_mode(const struct ckpt_manifest *man) {
+    struct termios tio;
+    int tf = man->tty_termios ? ckpt_ctty_open() : -1;
+    if (tf < 0 || tcgetattr(tf, &tio) != 0) {
+        ckpt_ctty_close(tf);
+        return;
+    }
+    size_t cc = sizeof tio.c_cc < sizeof man->tty_cc ? sizeof tio.c_cc : sizeof man->tty_cc;
+    tio.c_iflag = (tcflag_t)man->tty_iflag;
+    tio.c_oflag = (tcflag_t)man->tty_oflag;
+    tio.c_cflag = (tcflag_t)man->tty_cflag;
+    tio.c_lflag = (tcflag_t)man->tty_lflag;
+    memcpy(tio.c_cc, man->tty_cc, cc);
+    (void)cfsetispeed(&tio, (speed_t)man->tty_ispeed);
+    (void)cfsetospeed(&tio, (speed_t)man->tty_ospeed);
+    sigset_t sv, bl;
+    sigemptyset(&bl);
+    sigaddset(&bl, SIGTTOU);
+    sigprocmask(SIG_BLOCK, &bl, &sv);
+    (void)tcsetattr(tf, TCSANOW, &tio);
+    sigprocmask(SIG_SETMASK, &sv, NULL);
+    ckpt_ctty_close(tf);
 }
 
 // Best-effort reconstruction of this process's group/session relative to the LIVE (re-forked) tree. A
@@ -5213,6 +5330,7 @@ static void ckpt_fork_children(int gpid) {
 // parent) and resume it. Never returns.
 static void ckpt_restore_proc_run(int gpid) {
     char pd[1200];
+    ckpt_restore_hold_tty_signals();
     snprintf(pd, sizeof pd, "proc.%d", gpid);
     struct ckpt_meta m;
     if (ckpt_read_meta_dir(pd, &m) != 0) _exit(70);
@@ -5267,6 +5385,7 @@ static void ckpt_restore_proc_run(int gpid) {
 // RAM FIRST (before engine init, so MAP_FIXED lands on free VAs), then re-forks the tree.
 static int ckpt_restore_tree(const char *rootfs) {
     struct ckpt_manifest man;
+    ckpt_restore_hold_tty_signals();
     // Bind the image source before anything is read; every re-forked child inherits the binding.
     if (ckpt_source_bind() == NULL) {
         fprintf(stderr, "[restore] restore requested without a broker descriptor\n");
@@ -5344,6 +5463,15 @@ static int ckpt_restore_tree(const char *rootfs) {
     char *pubargv[2] = {(char *)(exe[0] ? exe : "guest"), NULL};
     proc_reg_publish(g_exe_path, 1, pubargv);
 
+    // Re-create the init's OWN process group. Restore re-forks the init under the launcher, so it starts in
+    // the launcher's group, while at capture it led its own (an interactive shell's job-control setup does
+    // setpgid(0,1), which it never repeats after resume). Uncorrected, the guest pgid 1 -> g_init_hostpid
+    // translation names a group the shell is not in: its tcsetpgrp handoff after a foreground job puts the
+    // terminal's foreground on that empty group, its next read on the ctty is a background read, and with
+    // SIGTTIN blocked that read fails EIO -- readline reports EOF and the shell logs out after one line.
+    // Only the GROUP is re-created: the session belongs to the launcher, which owns the pty.
+    if (im.pgid_gpid == 1) (void)setpgid(0, 0);
+    ckpt_restore_tty_mode(&man);
     // Publish which guest group owned the tty foreground, so whichever re-forked process is that group's leader
     // claims the controlling terminal AFTER it re-creates its group (see ckpt_claim_tty_fg). Set before the fork
     // so every child inherits it. Without this the resumed tree's fg group defaults to the init's, and a tty
