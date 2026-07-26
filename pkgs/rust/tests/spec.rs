@@ -1932,6 +1932,15 @@ int main(int argc, char **argv) {
 
 #[test]
 fn projected_directory_exposes_a_service_backed_device_to_a_real_guest() {
+    let base = std::env::temp_dir().join(format!(
+        "hl-provider-device-overlay-{}",
+        std::process::id()
+    ));
+    let upper = base.join("upper");
+    let work = base.join("work");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&upper).unwrap();
+    fs::create_dir_all(&work).unwrap();
     let mut extension = handles_extension();
     extension.required_features.extend([
         Feature::new("devices").unwrap(),
@@ -1974,10 +1983,14 @@ fn projected_directory_exposes_a_service_backed_device_to_a_real_guest() {
         environment: Vec::new(),
     };
     let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/sh");
-    spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
+    spec.filesystem.root = Some(TreeSource::Overlay {
+        lower: vec![TreeSource::HostDirectory(rootfs().clone())],
+        upper,
+        work,
+    });
     spec.process.argv.extend([
         "-c".into(),
-        "test -c /dev/dri/renderD128 || exit 11; exec 3</dev/dri/renderD128 || exit 13".into(),
+        "test \"$(ls /dev/dri)\" = renderD128 || exit 10; test -c /dev/dri/renderD128 || exit 11; exec 3</dev/dri/renderD128 || exit 13".into(),
     ]);
     spec.extensions.extend([directory, extension]);
 
@@ -1991,12 +2004,14 @@ fn projected_directory_exposes_a_service_backed_device_to_a_real_guest() {
         )
         .unwrap();
 
+    let exit = Engine::new()
+        .spawn_with_authority(spec, ProcessIo::default(), authority)
+        .unwrap()
+        .wait()
+        .unwrap();
+    let _ = fs::remove_dir_all(&base);
     assert_eq!(
-        Engine::new()
-            .spawn_with_authority(spec, ProcessIo::default(), authority)
-            .unwrap()
-            .wait()
-            .unwrap(),
+        exit,
         Exit::Code(0)
     );
 }

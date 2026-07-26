@@ -3374,7 +3374,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 else
                     snprintf(gdir, sizeof gdir, "%s", gp);
                 struct stat dst;
-                if (r < HL_NFD && !jail_is_vol(gdir) && fstat(r, &dst) == 0 && S_ISDIR(dst.st_mode))
+                uint32_t provider_cursor = 0;
+                int has_provider_children =
+                    hl_provider_namespace_launch_child(gp, strlen(gp), &provider_cursor) != NULL;
+                if (has_provider_children) snprintf(gdir, sizeof gdir, "%s", gp);
+                if (r < HL_NFD && (!jail_is_vol(gdir) || has_provider_children) &&
+                    fstat(r, &dst) == 0 && S_ISDIR(dst.st_mode))
                     if (path_copy(g_ovldir[r], sizeof g_ovldir[r], gdir) != 0) g_ovldir[r][0] = 0;
             }
             G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
@@ -3476,6 +3481,14 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     }
                     if (typed_created && newfile_stamp_wanted()) newfile_stamp_path(typed_host_path, 1);
                 }
+                if (opened >= 0 && opened < 1024 && (lf & G_O_DIRECTORY)) {
+                    uint32_t provider_cursor = 0;
+                    if (hl_provider_namespace_launch_child(
+                            typed_guest_path, strlen(typed_guest_path), &provider_cursor) != NULL &&
+                        path_copy(g_ovldir[(int)opened], sizeof g_ovldir[(int)opened],
+                                  typed_guest_path) != 0)
+                        g_ovldir[(int)opened][0] = 0;
+                }
                 G_RET(c) = (uint64_t)opened;
                 break;
             }
@@ -3562,6 +3575,15 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // getdents64
     case 61: {
         int fd = (int)a0;
+        if (fd >= 0 && fd < 1024 && !g_ovldir[fd][0] && g_fdpath[fd][0]) {
+            char guest_directory[4200];
+            uint32_t provider_cursor = 0;
+            guest_from_host(g_fdpath[fd], guest_directory, sizeof guest_directory);
+            if (hl_provider_namespace_launch_child(
+                    guest_directory, strlen(guest_directory), &provider_cursor) != NULL &&
+                path_copy(g_ovldir[fd], sizeof g_ovldir[fd], guest_directory) != 0)
+                g_ovldir[fd][0] = 0;
+        }
         // OVERLAY: merged listing across layers
         if (g_nlower && fd >= 0 && fd < HL_NFD && g_ovldir[fd][0]) {
             // snapshot cache is indexed directly by guest fd (no slot table -> no eviction thrash)
