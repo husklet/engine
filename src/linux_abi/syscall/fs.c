@@ -296,6 +296,36 @@ static void ptm_apply_to_slave(int ptn, int slavefd) {
     if (g_ptm_wset[ptn]) ioctl(slavefd, TIOCSWINSZ, &g_ptm_win[ptn]);
 }
 
+#if !defined(__linux__)
+// Linux keeps a pty's queued input readable on the MASTER after the last slave closes: the reader drains
+// what is already there and only then sees EIO. macOS tears the tty's line-discipline queues down the
+// instant the last slave fd closes, so the queued bytes vanish and the master reads EOF straight away
+// (observed natively: FIONREAD 1 -> 0 across close, read() 0). Move the pending bytes into the master's
+// read pushback -- the same buffer tee(2) uses, already served ahead of the host read by read/readv --
+// while the tty is still alive, so the master still reads them back in order. Called from fd_reset_emul,
+// which runs before the real close(2).
+static void pts_master_retain_input(int slave) {
+    int index = pts_index_of_fd(slave);
+    if (index < 0 || pts_fd_is_master(slave)) return;
+    for (int other = 0; other < HL_NFD; ++other)
+        if (other != slave && !pts_fd_is_master(other) && pts_index_of_fd(other) == index) return;
+    int master = pts_master_fd(index);
+    if (master < 0 || master >= HL_NFD || g_fd_pb_len[master]) return;
+    uint8_t queued[4096];
+    size_t held = 0;
+    while (held < sizeof queued) {
+        int pending = 0;
+        if (ioctl(master, FIONREAD, &pending) != 0 || pending <= 0) break;
+        size_t want = sizeof queued - held;
+        if ((size_t)pending < want) want = (size_t)pending;
+        ssize_t got = read(master, queued + held, want);
+        if (got <= 0) break;
+        held += (size_t)got;
+    }
+    if (held) pipe_pushback_set(master, queued, held);
+}
+#endif
+
 // Tear down EVERY engine-side emulation-table entry keyed by this fd NUMBER (eventfd peer/counter/sema, timerfd,
 // overlay-dir, the socket/loopback/bridge maps, epoll armed-state, flock, pidfd, RAM-scratch memf, and the
 // getdents/overlay-dents caches + the path map). Shared by close(2) (case 57) AND the emulated
@@ -450,8 +480,11 @@ static void fd_reset_emul(int fd) {
         ep_fd_reset(fd);
         flock_on_close(fd);
         poslk_on_close(fd); // POSIX drops all this process's fcntl record locks when any fd closes
-        ptm_clear(fd);      // drop this fd's cached pty-master termios/winsize (see ptm cache below)
-        pts_on_close(fd);   // free a master's devpts index (+ /dev/pts/N node) / clear a slave's stamp
+        ptm_clear(fd); // drop this fd's cached pty-master termios/winsize (see ptm cache below)
+#if !defined(__linux__)
+        pts_master_retain_input(fd); // last slave: rescue the master's queued input before macOS drops it
+#endif
+        pts_on_close(fd); // free a master's devpts index (+ /dev/pts/N node) / clear a slave's stamp
     }
     pidfd_forget(fd);
     memf_close(fd);
