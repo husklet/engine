@@ -10,6 +10,10 @@ HL_EXTERN_C_BEGIN
 /* The one accepted launch generation. Any other value is rejected with HL_STATUS_ABI_MISMATCH -- that is
  * what catches a prebuilt archive built against different headers. */
 #define HL_CONFIG_ABI 1u
+/* checkpoint_mode: which directions of the store channel this launch uses. Zero disables checkpointing.
+ * The channel itself is a descriptor activation hands the engine; nothing here names a location. */
+#define HL_CONFIG_CHECKPOINT_CAPTURE 1u
+#define HL_CONFIG_CHECKPOINT_RESTORE 2u
 /* Zero is "no policy asked for": restore is permissive, capture keeps refusing what it cannot capture. */
 #define HL_CONFIG_CHECKPOINT_DEFAULT 0u
 #define HL_CONFIG_CHECKPOINT_RECONNECT 1u
@@ -54,27 +58,24 @@ typedef struct hl_launch_config {
     uint32_t translation_cache_disabled;
     uint32_t egress_proxy_offset;
     uint32_t debug_log_offset;
-    uint32_t checkpoint_directory_offset;
-    uint32_t restore_directory_offset;
+    /* HL_CONFIG_CHECKPOINT_CAPTURE|RESTORE. */
+    uint32_t checkpoint_mode;
+    /* HL_CONFIG_CHECKPOINT_*: behavior when a saved external resource cannot be reconstructed. */
+    uint32_t checkpoint_policy;
     /* Existing 0600 result leaf created by the launcher; zero preserves direct CLI exit semantics. */
     uint32_t result_path_offset;
     uint32_t publish_count;
     uint32_t network_interfaces_offset;
     uint32_t file_owners_offset;
+    uint32_t reserved;
     /* Opaque host-generated launch ownership domain. Zero is never valid. */
     uint64_t process_domain[2];
     /* Host path whose authority is granted solely for loading the initial main executable. */
     uint32_t executable_host_offset;
-    uint32_t reserved;
-    /* ABI 11 typed transport. ABI 10 records default to VIRTUAL. */
     uint32_t network_transport;
-    uint32_t reserved_abi11;
-    /* ABI 12: NUL-terminated lower path records starting at lower_layers_offset. */
+    /* NUL-terminated lower path records starting at lower_layers_offset. */
     uint32_t lower_layer_count;
     uint32_t overlay_work_offset;
-    /* ABI 13, values remapped in ABI 14: behavior when a saved external resource cannot be reconstructed. */
-    uint32_t checkpoint_policy;
-    uint32_t reserved_abi13;
 } hl_launch_config;
 
 typedef enum hl_launch_result_kind {

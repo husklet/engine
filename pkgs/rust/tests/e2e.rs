@@ -1,4 +1,7 @@
-use hl_engine::{Engine, Exit, Guest, MachineSpec, ProcessIo, Stdio};
+use hl_engine::{
+    CheckpointStore, Engine, Exit, Guest, MachineSpec, MemoryStore, ProcessIo, Stdio,
+    StoreDirection,
+};
 
 #[path = "support/checkpoint_env.rs"]
 mod checkpoint_env;
@@ -6,9 +9,19 @@ mod checkpoint_env;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
+
+/// One in-memory image, shared by the capture launch and the restore launch that reads it back.
+fn store() -> Arc<MemoryStore> {
+    Arc::new(MemoryStore::new())
+}
+
+fn as_store(store: &Arc<MemoryStore>) -> Arc<dyn CheckpointStore> {
+    Arc::clone(store) as Arc<dyn CheckpointStore>
+}
 
 fn fixture(status: i32, guest: Guest) -> PathBuf {
     let isa = match guest {
@@ -67,7 +80,6 @@ fn rust_api_checkpoints_and_restores_a_three_process_tree() {
 
 fn checkpoints_and_restores_a_three_process_tree(guest: Guest) {
     let root = scratch_root("checkpoint-e2e", guest);
-    let checkpoint = root.join("image");
     let release = root.join("release");
     let output = root.join("release.output");
     let _ = fs::remove_dir_all(&root);
@@ -77,13 +89,15 @@ fn checkpoints_and_restores_a_three_process_tree(guest: Guest) {
     let mut capture = MachineSpec::new(guest, &executable);
     capture.process.argv.push(release.clone().into_os_string());
     capture.checkpoint.enabled = true;
-    capture.checkpoint.capture_directory = Some(checkpoint.clone());
+    let image = store();
     let io = ProcessIo {
         stdin: Stdio::Null,
         stdout: Stdio::Null,
         stderr: Stdio::Null,
     };
-    let machine = Engine::new().spawn(capture, io).unwrap();
+    let machine = Engine::new()
+        .spawn_with_store(capture, io, as_store(&image), StoreDirection::Capture)
+        .unwrap();
     let deadline = Instant::now() + READY_DEADLINE;
     while machine.processes().unwrap().len() != 3 {
         assert!(
@@ -92,13 +106,13 @@ fn checkpoints_and_restores_a_three_process_tree(guest: Guest) {
         );
         thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(machine.checkpoint(CHECKPOINT_DEADLINE).unwrap(), checkpoint);
+    machine.checkpoint_into_store(CHECKPOINT_DEADLINE).unwrap();
     assert_eq!(machine.wait().unwrap(), Exit::Code(0));
     assert_eq!(
-        fs::read_dir(&checkpoint)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("proc."))
+        image
+            .objects()
+            .keys()
+            .filter(|name| name.starts_with("proc.") && name.ends_with("/meta"))
             .count(),
         3
     );
@@ -106,9 +120,12 @@ fn checkpoints_and_restores_a_three_process_tree(guest: Guest) {
     fs::write(&release, []).unwrap();
     let mut restore = MachineSpec::new(guest, &executable);
     restore.checkpoint.enabled = true;
-    restore.checkpoint.restore_directory = Some(checkpoint);
     assert_eq!(
-        Engine::new().spawn(restore, io).unwrap().wait().unwrap(),
+        Engine::new()
+            .spawn_with_store(restore, io, as_store(&image), StoreDirection::Restore)
+            .unwrap()
+            .wait()
+            .unwrap(),
         Exit::Code(0)
     );
     // The exit status alone cannot tell a resumed tree from a relaunched one:
@@ -132,7 +149,6 @@ fn rust_api_restores_buffered_cross_process_pipe_state() {
 
 fn restores_buffered_cross_process_pipe_state(guest: Guest) {
     let root = scratch_root("checkpoint-pipe-e2e", guest);
-    let checkpoint = root.join("image");
     let release = root.join("release");
     let output = root.join("release.output");
     let _ = fs::remove_dir_all(&root);
@@ -142,13 +158,15 @@ fn restores_buffered_cross_process_pipe_state(guest: Guest) {
     let mut capture = MachineSpec::new(guest, &executable);
     capture.process.argv.push(release.clone().into_os_string());
     capture.checkpoint.enabled = true;
-    capture.checkpoint.capture_directory = Some(checkpoint.clone());
+    let image = store();
     let io = ProcessIo {
         stdin: Stdio::Null,
         stdout: Stdio::Null,
         stderr: Stdio::Null,
     };
-    let machine = Engine::new().spawn(capture, io).unwrap();
+    let machine = Engine::new()
+        .spawn_with_store(capture, io, as_store(&image), StoreDirection::Capture)
+        .unwrap();
     let deadline = Instant::now() + READY_DEADLINE;
     loop {
         let ready = fs::read_to_string(&output).unwrap_or_default();
@@ -164,15 +182,18 @@ fn restores_buffered_cross_process_pipe_state(guest: Guest) {
         );
         thread::sleep(Duration::from_millis(2));
     }
-    machine.checkpoint(CHECKPOINT_DEADLINE).unwrap();
+    machine.checkpoint_into_store(CHECKPOINT_DEADLINE).unwrap();
     assert_eq!(machine.wait().unwrap(), Exit::Code(0));
 
     fs::write(&release, []).unwrap();
     let mut restore = MachineSpec::new(guest, &executable);
     restore.checkpoint.enabled = true;
-    restore.checkpoint.restore_directory = Some(checkpoint);
     assert_eq!(
-        Engine::new().spawn(restore, io).unwrap().wait().unwrap(),
+        Engine::new()
+            .spawn_with_store(restore, io, as_store(&image), StoreDirection::Restore)
+            .unwrap()
+            .wait()
+            .unwrap(),
         Exit::Code(0)
     );
     assert!(fs::read_to_string(output)
@@ -196,7 +217,6 @@ fn rust_api_restores_unlinked_regular_file_content_and_offset() {
 
 fn restores_unlinked_regular_file_content_and_offset(guest: Guest) {
     let root = scratch_root("checkpoint-deleted-e2e", guest);
-    let checkpoint = root.join("image");
     let release = root.join("release");
     let output = root.join("release.output");
     let _ = fs::remove_dir_all(&root);
@@ -206,13 +226,15 @@ fn restores_unlinked_regular_file_content_and_offset(guest: Guest) {
     let mut capture = MachineSpec::new(guest, &executable);
     capture.process.argv.push(release.clone().into_os_string());
     capture.checkpoint.enabled = true;
-    capture.checkpoint.capture_directory = Some(checkpoint.clone());
+    let image = store();
     let io = ProcessIo {
         stdin: Stdio::Null,
         stdout: Stdio::Null,
         stderr: Stdio::Null,
     };
-    let machine = Engine::new().spawn(capture, io).unwrap();
+    let machine = Engine::new()
+        .spawn_with_store(capture, io, as_store(&image), StoreDirection::Capture)
+        .unwrap();
     let deadline = Instant::now() + READY_DEADLINE;
     while !fs::read_to_string(&output)
         .unwrap_or_default()
@@ -224,15 +246,18 @@ fn restores_unlinked_regular_file_content_and_offset(guest: Guest) {
         );
         thread::sleep(Duration::from_millis(2));
     }
-    machine.checkpoint(CHECKPOINT_DEADLINE).unwrap();
+    machine.checkpoint_into_store(CHECKPOINT_DEADLINE).unwrap();
     assert_eq!(machine.wait().unwrap(), Exit::Code(0));
 
     fs::write(&release, []).unwrap();
     let mut restore = MachineSpec::new(guest, &executable);
     restore.checkpoint.enabled = true;
-    restore.checkpoint.restore_directory = Some(checkpoint);
     assert_eq!(
-        Engine::new().spawn(restore, io).unwrap().wait().unwrap(),
+        Engine::new()
+            .spawn_with_store(restore, io, as_store(&image), StoreDirection::Restore)
+            .unwrap()
+            .wait()
+            .unwrap(),
         Exit::Code(0)
     );
     assert!(fs::read_to_string(output)
@@ -268,8 +293,6 @@ fn rust_api_restores_while_arming_the_next_capture() {
 
 fn restores_while_arming_the_next_capture(guest: Guest) {
     let root = scratch_root("checkpoint-rearm-e2e", guest);
-    let first = root.join("image.a");
-    let second = root.join("image.b");
     let release = root.join("release");
     let output = root.join("release.output");
     let _ = fs::remove_dir_all(&root);
@@ -279,43 +302,58 @@ fn restores_while_arming_the_next_capture(guest: Guest) {
     let mut capture = MachineSpec::new(guest, &executable);
     capture.process.argv.push(release.clone().into_os_string());
     capture.checkpoint.enabled = true;
-    capture.checkpoint.capture_directory = Some(first.clone());
+    let first = store();
+    let second = store();
     let io = ProcessIo {
         stdin: Stdio::Null,
         stdout: Stdio::Null,
         stderr: Stdio::Null,
     };
-    let machine = Engine::new().spawn(capture, io).unwrap();
+    let machine = Engine::new()
+        .spawn_with_store(capture, io, as_store(&first), StoreDirection::Capture)
+        .unwrap();
     await_output(
         &output,
         "STAGE 1",
         "cycle guest did not reach its first stage",
     );
-    assert_eq!(machine.checkpoint(CHECKPOINT_DEADLINE).unwrap(), first);
+    machine.checkpoint_into_store(CHECKPOINT_DEADLINE).unwrap();
     assert_eq!(machine.wait().unwrap(), Exit::Code(0));
 
-    // Restore the first image and arm the second capture in one spec: the shape
-    // a caller uses to checkpoint the same guest repeatedly.
+    // Restore the first image and arm the second capture in one launch: the shape
+    // a caller uses to checkpoint the same guest repeatedly. One channel carries
+    // both directions, so the store it reads is the store it writes.
     fs::write(root.join("release.go1"), []).unwrap();
     let mut rearm = MachineSpec::new(guest, &executable);
     rearm.checkpoint.enabled = true;
-    rearm.checkpoint.restore_directory = Some(first);
-    rearm.checkpoint.capture_directory = Some(second.clone());
-    let machine = Engine::new().spawn(rearm, io).unwrap();
+    let machine = Engine::new()
+        .spawn_with_store(
+            rearm,
+            io,
+            Arc::new(RestoreInto {
+                source: Arc::clone(&first),
+                destination: Arc::clone(&second),
+            }) as Arc<dyn CheckpointStore>,
+            StoreDirection::Both,
+        )
+        .unwrap();
     await_output(
         &output,
         "STAGE 2",
         "restored guest did not reach its second stage",
     );
-    assert_eq!(machine.checkpoint(CHECKPOINT_DEADLINE).unwrap(), second);
+    machine.checkpoint_into_store(CHECKPOINT_DEADLINE).unwrap();
     assert_eq!(machine.wait().unwrap(), Exit::Code(0));
 
     fs::write(root.join("release.go2"), []).unwrap();
     let mut restore = MachineSpec::new(guest, &executable);
     restore.checkpoint.enabled = true;
-    restore.checkpoint.restore_directory = Some(second);
     assert_eq!(
-        Engine::new().spawn(restore, io).unwrap().wait().unwrap(),
+        Engine::new()
+            .spawn_with_store(restore, io, as_store(&second), StoreDirection::Restore)
+            .unwrap()
+            .wait()
+            .unwrap(),
         Exit::Code(0)
     );
 
@@ -375,4 +413,27 @@ fn fixture_named(name: &str, guest: Guest) -> PathBuf {
         Guest::X86_64 => "x86_64",
     };
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("testdata/{name}-{isa}"))
+}
+
+/// Reads one image and writes the next: the re-arm launch restores from `source` while capturing into
+/// `destination`, which a single store cannot express without the new image overwriting the old one.
+#[derive(Debug)]
+struct RestoreInto {
+    source: Arc<MemoryStore>,
+    destination: Arc<MemoryStore>,
+}
+
+impl CheckpointStore for RestoreInto {
+    fn put(&self, name: &str, data: &[u8]) -> Result<(), hl_engine::StoreError> {
+        self.destination.put(name, data)
+    }
+    fn get(&self, name: &str) -> Result<Vec<u8>, hl_engine::StoreError> {
+        self.source.get(name)
+    }
+    fn list(&self) -> Result<Vec<String>, hl_engine::StoreError> {
+        self.source.list()
+    }
+    fn commit(&self, manifest: &[u8]) -> Result<(), hl_engine::StoreError> {
+        self.destination.commit(manifest)
+    }
 }

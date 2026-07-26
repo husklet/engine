@@ -1200,7 +1200,7 @@ fn meaningful_unsupported_launch_policy_is_never_silently_ignored() {
 
     let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/true");
     spec.checkpoint.enabled = true;
-    spec.checkpoint.capture_directory = Some("/checkpoint".into());
+    spec.checkpoint.capture = true;
     Engine::new().validate(&spec).unwrap();
 
     let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/true");

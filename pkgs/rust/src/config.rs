@@ -36,8 +36,8 @@ pub struct Config {
     pub(crate) sandbox: Sandbox,
     pub(crate) translation_cache: Option<PathBuf>,
     pub(crate) filesystem_generation: Option<PathBuf>,
-    pub(crate) checkpoint_directory: Option<PathBuf>,
-    pub(crate) restore_directory: Option<PathBuf>,
+    /// `HL_CONFIG_CHECKPOINT_CAPTURE|RESTORE`. The image itself travels over the store channel.
+    pub(crate) checkpoint_mode: u32,
     pub(crate) checkpoint_policy: crate::spec::IncompatibleResourcePolicy,
     pub(crate) mounts: Vec<Mount>,
     pub(crate) file_owners: Vec<(PathBuf, u32, u32)>,
@@ -196,17 +196,10 @@ impl Config {
         self
     }
 
-    /// Arm native whole-process-tree checkpoint capture for this launch.
+    /// Arm native whole-process-tree checkpoint capture and/or restore over the store channel.
     #[must_use]
-    pub fn checkpoint_directory(mut self, path: impl Into<PathBuf>) -> Self {
-        self.checkpoint_directory = Some(path.into());
-        self
-    }
-
-    /// Restore a native whole-process-tree checkpoint for this launch.
-    #[must_use]
-    pub fn restore_directory(mut self, path: impl Into<PathBuf>) -> Self {
-        self.restore_directory = Some(path.into());
+    pub(crate) const fn checkpoint_mode(mut self, mode: u32) -> Self {
+        self.checkpoint_mode = mode;
         self
     }
 

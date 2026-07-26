@@ -175,12 +175,17 @@ impl Launch {
         if let Some(coherence) = spec.filesystem.coherence {
             config = config.filesystem_generation(coherence.host_path());
         }
-        if let Some(directory) = spec.checkpoint.capture_directory {
-            config = config.checkpoint_directory(directory);
-        }
-        if let Some(directory) = spec.checkpoint.restore_directory {
-            config = config.restore_directory(directory);
-        }
+        config = config.checkpoint_mode(
+            (if spec.checkpoint.capture {
+                crate::wire::CHECKPOINT_CAPTURE
+            } else {
+                0
+            }) | (if spec.checkpoint.restore {
+                crate::wire::CHECKPOINT_RESTORE
+            } else {
+                0
+            }),
+        );
         config = config.checkpoint_policy(spec.checkpoint.incompatible_resources);
         for (name, value) in spec.process.env {
             config = config.env(name, value);

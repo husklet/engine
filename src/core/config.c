@@ -13,8 +13,9 @@ hl_status hl_launch_config_validate(const void *wire, size_t wire_size, hl_launc
     memcpy(&config, wire, sizeof(config));
     if (config.magic != HL_CONFIG_MAGIC) return HL_STATUS_CORRUPT;
     if (config.abi != HL_CONFIG_ABI) return HL_STATUS_ABI_MISMATCH;
-    if (config.header_size < sizeof(config) || config.reserved != 0 || config.reserved_abi11 != 0 ||
-        config.checkpoint_policy > HL_CONFIG_CHECKPOINT_REFUSE || config.reserved_abi13 != 0 ||
+    if (config.header_size < sizeof(config) || config.reserved != 0 ||
+        config.checkpoint_policy > HL_CONFIG_CHECKPOINT_REFUSE ||
+        (config.checkpoint_mode & ~(HL_CONFIG_CHECKPOINT_CAPTURE | HL_CONFIG_CHECKPOINT_RESTORE)) != 0 ||
         config.network_transport > HL_CONFIG_NETWORK_HOST ||
         config.network_isolated != (config.network_transport == HL_CONFIG_NETWORK_ISOLATED) ||
         config.lower_layer_count > 8 || ((config.lower_layer_count == 0) != (config.lower_layers_offset == 0)) ||

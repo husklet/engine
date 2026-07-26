@@ -83,10 +83,10 @@ static int check_fd_import_rollback(uint32_t invalid_result) {
 }
 
 static const char *const extended_option_names[16] = {
-    "HL_LOWER",      "HL_PUBLISH",        "HL_VOLUMES",        "HL_ULIMITS",
-    "HL_NETNS",      "HL_PCACHE_DIR",     "HL_NETBR",          "HL_IP",
-    "HL_FSGEN_FILE", "HL_EGRESS_SOCKS",   "HL_CHECKPOINT_DIR", "HL_RESTORE_DIR",
-    "HL_PCACHE",     "HL_PUBLISH_DAEMON", "HL_UNTRUSTED",      "HL_SANDBOX"};
+    "HL_LOWER",      "HL_PUBLISH",        "HL_VOLUMES",    "HL_ULIMITS",
+    "HL_NETNS",      "HL_PCACHE_DIR",     "HL_NETBR",      "HL_IP",
+    "HL_FSGEN_FILE", "HL_EGRESS_SOCKS",   "HL_CHECKPOINT", "HL_RESTORE",
+    "HL_PCACHE",     "HL_PUBLISH_DAEMON", "HL_UNTRUSTED",  "HL_SANDBOX"};
 
 static int option_matches(const hl_options *options, const char *name, const char *expected) {
     const char *actual = hl_options_get(options, name);
@@ -416,7 +416,7 @@ int main(void) {
     box.ip = ip;
     box.filesystem_generation = fsgen;
     box.egress_proxy = proxy;
-    box.checkpoint_directory = checkpoint;
+    box.checkpoint_mode = HL_CONFIG_CHECKPOINT_CAPTURE;
     box.flags = HL_ENGINE_BOX_PUBLISH_EXTERNAL | HL_ENGINE_BOX_SENTRY_ONLY;
     config.box = &box;
     HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK);
@@ -450,7 +450,7 @@ int main(void) {
     expected_extended_values[7] = "10.0.0.2";
     expected_extended_values[8] = "/run/fs-generation";
     expected_extended_values[9] = "127.0.0.1:1080";
-    expected_extended_values[10] = "/checkpoints/out";
+    expected_extended_values[10] = "1";
     expected_extended_values[12] = "1";
     expected_extended_values[13] = "1";
     expected_extended_values[14] = "1";
@@ -490,7 +490,7 @@ int main(void) {
     box.size = sizeof(box);
     box.uid = -1;
     box.gid = -1;
-    box.checkpoint_directory = "/checkpoints/policy";
+    box.checkpoint_mode = HL_CONFIG_CHECKPOINT_CAPTURE;
     box.checkpoint_policy = HL_CONFIG_CHECKPOINT_DEFAULT;
     config.box = &box;
     expected_checkpoint_policy = default_policy;
@@ -519,13 +519,13 @@ int main(void) {
     box.flags = HL_ENGINE_BOX_SANDBOX | HL_ENGINE_BOX_SENTRY_ONLY;
     HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
     box.flags = 0;
-    box.checkpoint_directory = "/checkpoint";
-    box.restore_directory = "/restore";
+    box.checkpoint_mode = HL_CONFIG_CHECKPOINT_CAPTURE | HL_CONFIG_CHECKPOINT_RESTORE;
     HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_OK && engine != NULL);
     hl_engine_destroy(engine);
     engine = NULL;
-    box.checkpoint_directory = NULL;
-    box.restore_directory = NULL;
+    box.checkpoint_mode = 4;
+    HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
+    box.checkpoint_mode = 0;
     box.ip = "10.0.0.2";
     HL_CHECK(hl_engine_create(&config, &services, &engine) == HL_STATUS_INVALID_ARGUMENT && engine == NULL);
     box.ip = NULL;

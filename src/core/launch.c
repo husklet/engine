@@ -72,8 +72,6 @@ static int launch_strings_valid(const hl_launch_config *config, const char *pool
         config->filesystem_generation_offset,
         config->egress_proxy_offset,
         config->debug_log_offset,
-        config->checkpoint_directory_offset,
-        config->restore_directory_offset,
         config->result_path_offset,
         config->network_interfaces_offset,
         config->file_owners_offset,
@@ -255,10 +253,8 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     // ambient host env, which the FFI spawn never forwards) — "" leaves it unset so direct egress is unchanged.
     s = launch_string(&cfg, pool, cfg.egress_proxy_offset);
     if (s[0]) APPLY_OPTION("HL_EGRESS_SOCKS", s);
-    s = launch_string(&cfg, pool, cfg.checkpoint_directory_offset);
-    if (s[0]) APPLY_OPTION("HL_CHECKPOINT_DIR", s);
-    s = launch_string(&cfg, pool, cfg.restore_directory_offset);
-    if (s[0]) APPLY_OPTION("HL_RESTORE_DIR", s);
+    if (cfg.checkpoint_mode & HL_CONFIG_CHECKPOINT_CAPTURE) APPLY_OPTION("HL_CHECKPOINT", "1");
+    if (cfg.checkpoint_mode & HL_CONFIG_CHECKPOINT_RESTORE) APPLY_OPTION("HL_RESTORE", "1");
     {
         char checkpoint_policy[2] = {(char)('0' + cfg.checkpoint_policy), 0};
         APPLY_OPTION("HL_CHECKPOINT_POLICY", checkpoint_policy);

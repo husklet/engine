@@ -887,7 +887,7 @@ static int engine_global_init(void) {
     // ptrace tracer/tracee coordination arena -- mmap the shared region ONCE here, BEFORE any guest
     // fork, so every descendant guest process inherits the same physical pages. Inert until a guest ptraces.
     ptrace_arena_init();
-    // Arm the generation-counter checkpoint control channel when HL_CHECKPOINT_DIR is set.
+    // Arm the generation-counter checkpoint control channel when HL_CHECKPOINT is set.
     // Runs in every process (init + forked children) so the whole tree is checkpointable.
     if (ckpt_control_init() != 0) return 70;
     g_engine_inited = 1;
@@ -984,9 +984,9 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
 
 // Rebuild the checkpointed process tree selected by the engine restore option. Guest memory for the init is rebuilt
 // FIRST -- before container_init/engine_global_init allocate anything -- inside ckpt_restore_tree.
-static int hl_restore_checkpoint(const char *rootfs, const char *dir) {
+static int hl_restore_checkpoint(const char *rootfs) {
     g_pcache = hl_option_get("HL_PCACHE") != NULL;
-    return ckpt_restore_tree(rootfs, dir);
+    return ckpt_restore_tree(rootfs);
 }
 
 int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable, const void *executable_image, size_t executable_size, uint32_t argument_count,
@@ -1032,8 +1032,8 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
     }
     // Resume a previously checkpointed workspace instead of launching a program (the embedding host sets this on
     // window reopen; the container config/env is otherwise identical to the original launch).
-    const char *rdir = hl_option_get("HL_RESTORE_DIR");
-    if (rdir && rdir[0]) return hl_restore_checkpoint(rootfs, rdir);
+    const char *rdir = hl_option_get("HL_RESTORE");
+    if (rdir != NULL) return hl_restore_checkpoint(rootfs);
     if (argc < 1 || !argv || !argv[0]) return 2;
     // Persistent cross-process translated-code cache. Opt in with HL_PCACHE=1.
     // Read per invocation so a fork-server cold runner honors its typed launch configuration.
@@ -1203,12 +1203,15 @@ int hl_engine_entry(int argc, char **argv) {
         if (!strcmp(argv[ai], "--rootfs") && ai + 1 < argc) {
             rootfs = argv[ai + 1];
             ai += 2;
-        } else if (!strcmp(argv[ai], "--checkpoint") && ai + 1 < argc) {
-            hl_option_set("HL_CHECKPOINT_DIR", argv[ai + 1], 1);
-            ai += 2;
-        } else if (!strcmp(argv[ai], "--restore") && ai + 1 < argc) {
-            hl_option_set("HL_RESTORE_DIR", argv[ai + 1], 1); // guest entry dispatches to restore without an ELF arg
-            ai += 2;
+        } else if (!strcmp(argv[ai], "--checkpoint")) {
+            hl_option_set("HL_CHECKPOINT", "1", 1);
+            ai += 1;
+        } else if (!strcmp(argv[ai], "--restore")) {
+            hl_option_set("HL_RESTORE", "1", 1); // guest entry dispatches to restore without an ELF arg
+            ai += 1;
+        } else if (!strcmp(argv[ai], "--checkpoint-store") && ai + 2 < argc) {
+            if (hl_ckpt_channel_adopt(argv[ai + 1], argv[ai + 2]) != 0) return 2;
+            ai += 3;
         } else if (!strcmp(argv[ai], "--restore-policy") && ai + 1 < argc) {
             if (ckpt_recovery_policy_set(argv[ai + 1]) != 0) return 2;
             ai += 2;
@@ -1242,16 +1245,16 @@ int hl_engine_entry(int argc, char **argv) {
         } else
             break;
     }
-    if (hl_option_get("HL_RESTORE_DIR"))
+    if (hl_option_get("HL_RESTORE"))
         return hl_standalone_run(rootfs, NULL, 0, NULL, NULL, NULL); // resume without an ELF arg
     if (ai >= argc) {
         fprintf(stderr,
-                "usage: %s [--rootfs DIR] [--checkpoint DIR] [--hostname NAME] [--mem-max BYTES] "
-                "[--pids-max N] [--publish H:C] "
+                "usage: %s [--rootfs DIR] [--checkpoint] [--checkpoint-store BROKER_FD TRIGGER_FD] "
+                "[--hostname NAME] [--mem-max BYTES] [--pids-max N] [--publish H:C] "
                 "<aarch64-elf> [args...]\n"
-                "       %s [--rootfs DIR] --restore <checkpoint-dir>\n"
-                "  checkpoint a running guest: use --checkpoint DIR, increment DIR.trigger, then send the "
-                "engine its reserved interrupt\n",
+                "       %s [--rootfs DIR] --restore --checkpoint-store BROKER_FD TRIGGER_FD\n"
+                "  checkpoint a running guest: bump the trigger word, then send the engine its reserved "
+                "interrupt\n",
                 argv[0], argv[0]);
         return 2;
     }

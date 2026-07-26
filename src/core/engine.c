@@ -38,7 +38,7 @@ struct hl_engine {
     char *owned_working_directory;
     char *owned_hostname;
     char *owned_environment;
-    char *owned_box_strings[13];
+    char *owned_box_strings[11];
     hl_engine_publish_rule *owned_publish;
     hl_host_handle executable;
     hl_engine_executable executable_config;
@@ -305,8 +305,7 @@ static int hl_engine_proxy_valid(const char *value) {
     X(limits, "HL_ULIMITS")                                                                                            \
     X(network_namespace, "HL_NETNS") X(translation_cache, "HL_PCACHE_DIR") X(network_bridge, "HL_NETBR")               \
         X(ip, "HL_IP") X(filesystem_generation, "HL_FSGEN_FILE") X(egress_proxy, "HL_EGRESS_SOCKS")                    \
-            X(checkpoint_directory, "HL_CHECKPOINT_DIR") X(restore_directory, "HL_RESTORE_DIR")                        \
-                X(file_owners, "HL_FILE_OWNERS")
+            X(file_owners, "HL_FILE_OWNERS")
 /* clang-format on */
 
 static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_config *box) {
@@ -319,7 +318,8 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
     /* One accepted generation. An undersized box is rejected rather than partially read. */
     if (box->abi != HL_ENGINE_BOX_ABI || box->size < sizeof(*box)) return HL_STATUS_ABI_MISMATCH;
     if ((box->flags & ~known_flags) != 0 || box->reserved != 0 || box->uid < -1 || box->gid < -1 ||
-        box->checkpoint_policy > HL_CONFIG_CHECKPOINT_REFUSE || box->reserved_checkpoint != 0)
+        box->checkpoint_policy > HL_CONFIG_CHECKPOINT_REFUSE ||
+        (box->checkpoint_mode & ~(HL_CONFIG_CHECKPOINT_CAPTURE | HL_CONFIG_CHECKPOINT_RESTORE)) != 0)
         return HL_STATUS_INVALID_ARGUMENT;
     if (box->working_directory != NULL && box->working_directory[0] != '/') return HL_STATUS_INVALID_ARGUMENT;
     if (!hl_engine_hostname_valid(box->hostname) || !hl_engine_environment_valid(box->environment))
@@ -329,7 +329,6 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
     HL_BOX_STRING_FIELDS(VALIDATE_BOX_STRING)
 #undef VALIDATE_BOX_STRING
     if (!hl_engine_absolute_string(box->translation_cache) || !hl_engine_absolute_string(box->filesystem_generation) ||
-        !hl_engine_absolute_string(box->checkpoint_directory) || !hl_engine_absolute_string(box->restore_directory) ||
         !hl_engine_lower_valid(box->lower_layers) || box->publish_count > 32 ||
         ((box->publish_count == 0) != (box->publish == NULL)) || !hl_engine_volumes_valid(box->volumes) ||
         !hl_engine_limits_valid(box->limits) || !hl_engine_identity_valid(box->network_namespace, 39) ||
@@ -345,10 +344,14 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
     for (uint32_t index = 0; index < box->publish_count; ++index)
         if (box->publish[index].host_port == 0 || box->publish[index].guest_port == 0)
             return HL_STATUS_INVALID_ARGUMENT;
-    if (box->checkpoint_directory != NULL || box->restore_directory != NULL) {
+    if (box->checkpoint_mode != 0) {
         number[0] = (char)('0' + box->checkpoint_policy);
         number[1] = 0;
-        if (hl_options_set(&engine->options, "HL_CHECKPOINT_POLICY", number, 1) != HL_STATUS_OK)
+        if (hl_options_set(&engine->options, "HL_CHECKPOINT_POLICY", number, 1) != HL_STATUS_OK ||
+            ((box->checkpoint_mode & HL_CONFIG_CHECKPOINT_CAPTURE) &&
+             hl_options_set(&engine->options, "HL_CHECKPOINT", "1", 1) != HL_STATUS_OK) ||
+            ((box->checkpoint_mode & HL_CONFIG_CHECKPOINT_RESTORE) &&
+             hl_options_set(&engine->options, "HL_RESTORE", "1", 1) != HL_STATUS_OK))
             return HL_STATUS_OUT_OF_MEMORY;
     }
     engine->owned_working_directory = hl_engine_copy_string(box->working_directory);

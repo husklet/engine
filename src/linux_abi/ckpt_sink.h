@@ -1,23 +1,19 @@
 // hl/linux_abi -- checkpoint SINK: the only way the checkpoint writer is allowed to emit image bytes.
 //
-// WHY: the writer used to call the filesystem directly (open/write/mkdir/rename), which both violates the
-// host-services rule (DOCS.md: the portable engine reaches the outside world only through hl_host_services)
-// and hard-wires "a checkpoint is a directory tree on this machine". Everything the writer emits now goes
-// through this narrow vtable, so a later phase can implement it over a caller-supplied Rust callback (S3,
-// encrypted blob, database) without touching checkpoint.c again.
+// There is exactly one implementation (ckpt_sink_stream.h): every byte leaves the engine over the socket
+// activation handed it, and the embedder decides what it is written to. The vtable stays because the writer
+// is large and this is the seam that keeps "what a checkpoint is" out of it.
 //
 // MODEL
 //   object  : a named byte stream ("MANIFEST", "pipe.00000000deadbeef", "pages", ...). begin -> write* ->
 //             finish. finish is the point at which the object becomes durable and visible under its name.
 //   group   : a set of objects published all-or-nothing under a common prefix -- exactly today's per-process
-//             "proc.<gpid>" image (staged in a temp dir, renamed into place). begin/commit/abort.
-//   claim   : a workspace-wide exclusive marker used to elect ONE writer for a shared object (a pipe, a
+//             "proc.<gpid>" image. begin/commit/abort.
+//   claim   : an image-wide exclusive marker used to elect ONE writer for a shared object (a pipe, a
 //             socketpair queue) that several engine processes can see. Returns "already taken" rather than
 //             failing, because that is the normal race outcome.
-//   commit  : the explicit completion signal. On a filesystem this is "write MANIFEST last, then fsync the
-//             directory" -- its mere presence means the image is complete. A callback sink has no equivalent
-//             of "a file atomically appeared", so completion is an explicit call carrying the manifest bytes.
-//             NOTHING else in the writer may publish the manifest.
+//   commit  : the explicit completion signal carrying the manifest bytes. NOTHING else in the writer may
+//             publish the manifest.
 //
 // RANDOM ACCESS: two writers (the sparse page dump and the socket-queue capture) emit a header, stream a
 // payload whose length is only known afterwards, then patch the header in place. That is expressed as
@@ -35,9 +31,7 @@ struct ckpt_sink;
 
 #define CKPT_SINK_BUFFER 65536u
 
-// One open object. The representation is shared by every implementation (they are all compiled into the same
-// translation unit and the writer holds an opaque pointer) rather than being one struct per sink, so the
-// writer's handle type stays a single concrete type.
+// One open object; the writer holds an opaque pointer to it.
 struct ckpt_sink_stream {
     struct ckpt_sink *sink;
     uint64_t position; // logical end-of-stream (the sequential write cursor)
@@ -45,22 +39,17 @@ struct ckpt_sink_stream {
     int failed;
     size_t buffered; // bytes held in `buffer`, logically at [position - buffered, position)
     unsigned char buffer[CKPT_SINK_BUFFER];
-    // --- directory sink ---
-    hl_host_handle handle;
-    char staging[1500];   // path actually written
-    char published[1500]; // final path; empty when staging == published
-    // --- streaming sink ---
     uint64_t id; // channel-local object handle carried in every request
 };
 
 enum {
-    // finish() must publish the object atomically (stage, then swap into place). Used for workspace-level
-    // objects that a concurrent peer or the coordinator may observe while they are still being written.
+    // finish() must publish the object atomically. Used for image-level objects a concurrent peer or the
+    // coordinator may observe while they are still being written.
     CKPT_SINK_PUBLISH_ATOMIC = 1u << 0,
 };
 
 typedef struct ckpt_sink_vtable {
-    // Objects. `group` is NULL for a workspace-level object, else the name passed to group_begin.
+    // Objects. `group` is NULL for an image-level object, else the name passed to group_begin.
     int (*begin)(struct ckpt_sink *sink, const char *group, const char *name, uint32_t flags,
                  struct ckpt_sink_stream **out);
     int (*write)(struct ckpt_sink_stream *stream, const void *data, size_t size);
@@ -79,8 +68,7 @@ typedef struct ckpt_sink_vtable {
     void (*unclaim)(struct ckpt_sink *sink, const char *name);
 
     // Peer rendezvous. The coordinator waits for every peer's group and then counts what was published.
-    // On the directory sink these are access() and opendir() over the workspace; on a streaming sink they
-    // are answered by the server, which is the one place that observes every group_commit.
+    // Answered by the server, which is the one place that observes every group_commit.
     int (*group_present)(struct ckpt_sink *sink, const char *group); // 1 present, 0 absent, -1 error
     int (*group_count)(struct ckpt_sink *sink, const char *prefix);  // >=0 count, -1 error
 
@@ -94,8 +82,13 @@ typedef struct ckpt_sink_vtable {
 
 struct ckpt_sink {
     const ckpt_sink_vtable *ops;
-    char root[1024]; // filesystem sink: the workspace directory. Unused by other implementations.
 };
+
+static struct ckpt_sink g_ckpt_sink;
+
+static struct ckpt_sink *ckpt_sink_current(void) {
+    return g_ckpt_sink.ops ? &g_ckpt_sink : NULL;
+}
 
 // ---------------------------------------------------------------- generic entry points
 

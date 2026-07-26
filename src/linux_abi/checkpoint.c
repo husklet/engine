@@ -17,14 +17,14 @@
 //
 // MULTI-PROCESS MODEL (the core): a guest process tree == a tree of host engine processes (each guest
 // fork/clone is a real host fork(), proc.c). CHECKPOINT is triggered by advancing a SHARED-MEMORY generation
-// counter (a MAP_SHARED "<dir>.trigger" every engine process maps) -- NOT a signal, because a guest's own
+// counter (a MAP_SHARED anonymous descriptor every engine process maps) -- NOT a signal, because a guest's own
 // rt_sigaction silently remaps every guest-reachable host signal (bash SIG_IGNs SIGUSR1). ckpt_poll reads the
 // generation at each safepoint; the host's guest-clobber-proof engine interrupt is reused only to
 // KICK a process out of a blocking host syscall (EINTR) or a chained in-cache loop (thread_int_handler sets
 // cpu->irq when armed) to its next safepoint. The container init (guest pid 1) is the coordinator: it
 // enumerates the tree (every ENGINE process in its session -- robust vs the lossy pid registry), kicks each
 // peer, waits for each to dump, then dumps itself + writes the MANIFEST (its presence == a complete
-// checkpoint). Each process dumps its OWN private memory + cpu + fds to <dir>/proc.<gpid>/ (memory is
+// checkpoint). Each process dumps its OWN private memory + cpu + fds into its proc.<gpid> group (memory is
 // COW-private per process, so per-process dumps need no cross-process coherency).
 // RESTORE: rebuild the tree in ppid order (CRIU's proven ordering) -- the
 // init restores its own RAM FIRST (before engine allocation, so MAP_FIXED lands on free VAs), then re-forks
@@ -35,25 +35,24 @@
 // (state.c g_pidmap) so guest-visible pids (a blocked wait4's target, a reaped child's pid, bash's job
 // table) stay stable even though the re-forked tree has new host pids.
 //
-// ON-DISK FORMAT (checkpoint dir):
+// IMAGE FORMAT (object names in the embedder's store):
 //   MANIFEST         : struct ckpt_manifest (magic/version/arch, process count, root gpid) -- written LAST
-//   proc.<gpid>/     : one dir per guest process (published temp-dir + rename)
+//   proc.<gpid>/     : one group per guest process (published all-or-nothing)
 //     meta   : struct ckpt_meta (identity: self/ppid/pgid/sid gpid; brk/stack/nonpie bounds; exe path; ...)
 //     pages  : [struct ckpt_region][region's non-zero pages: {u64 va}{pagesz bytes}] ...  (sparse)
 //     cpu    : the whole per-thread struct cpu (host-transient fields zeroed on restore)
 //     fds    : n_fds * struct ckpt_fd (TTY | FILE by host path + seek offset + open flags)
 //
-// Trigger: HL_CHECKPOINT_DIR=<dir> maps <dir>.trigger in every forked guest process. Advancing its
-// generation and sending the reserved host interrupt to init checkpoints the whole tree, then exits it.
-// Restore: HL_RESTORE_DIR=<dir> (or `--restore <dir>`) calls the restore path.
-// The embedding runtime layers checkpoint(dir)/restore(dir) on this explicit lifecycle operation.
+// Trigger: HL_CHECKPOINT arms capture and maps the inherited trigger descriptor in every forked guest
+// process. Advancing its generation and sending the reserved host interrupt to init checkpoints the whole
+// tree, then exits it. Restore: HL_RESTORE (or `--restore`) calls the restore path. Both directions carry
+// bytes over the socket activation handed the engine; the embedder owns the other end.
 
 #include <sys/wait.h>   // waitid/waitpid: coordinator peer-reap; multi-thread refusal probe
 
 #include "../host/file.h"
 #include "../host/system.h"
-#include "ckpt_sink_dir.h"    // the checkpoint writer emits every byte through the sink (docs/checkpoint-sink.md)
-#include "ckpt_sink_stream.h" // ... and that sink can be an embedder callback on the far side of a socket
+#include "ckpt_sink_stream.h" // the writer emits every byte through the sink (docs/checkpoint-sink.md)
 #include "ckpt_source.h"      // restore reads the image back through the symmetric source interface
 #include "logical_vma.h"
 
@@ -262,32 +261,30 @@ static uint64_t ckpt_epoll_identity(int fd);
 static int ckpt_dump_epoll(struct ckpt_sink *sink, const char *group, const struct ckpt_fd *records,
                            int count);
 static int ckpt_restore_epoll_watches(const char *directory, const struct ckpt_fd *record);
-static int ckpt_restore_epoll_marker(const char *base, const struct ckpt_fd *record, uint32_t ordinal);
+static int ckpt_rd_all(FILE *f, void *buf, size_t n);
+static int ckpt_restore_epoll_marker(const struct ckpt_fd *record, uint32_t ordinal);
 
-static int ckpt_restore_epoll_marker(const char *base, const struct ckpt_fd *record, uint32_t ordinal) {
-    char path[1400];
-    snprintf(path, sizeof path, "%s/%s", base, record->path);
-    int image_fd = open(path, O_RDONLY);
+static int ckpt_restore_epoll_marker(const struct ckpt_fd *record, uint32_t ordinal) {
+    FILE *image_file = ckpt_source_fopen(record->path);
     struct ckpt_epoll_header header;
-    if (image_fd < 0 || pread(image_fd, &header, sizeof header, 0) != (ssize_t)sizeof header ||
+    if (image_file == NULL || ckpt_rd_all(image_file, &header, sizeof header) != 0 ||
         header.magic != CKPT_EPOLL_MAGIC ||
         header.count > HL_NFD + EP_PROVIDER_WATCH_LIMIT + EP_OBJECT_WATCH_LIMIT) {
-        if (image_fd >= 0) close(image_fd);
+        if (image_file != NULL) ckpt_source_fclose(image_file);
         return -1;
     }
     size_t size = sizeof(uint32_t) + (size_t)header.count * sizeof(struct hl_cmsg_epoll_watch);
     unsigned char *image = calloc(1, size);
     if (image == NULL) {
-        close(image_fd);
+        ckpt_source_fclose(image_file);
         return -1;
     }
     memcpy(image, &header.count, sizeof header.count);
     for (uint32_t index = 0; index < header.count; ++index) {
         struct ckpt_epoll_watch source;
-        off_t offset = (off_t)sizeof header + (off_t)index * (off_t)sizeof source;
-        if (pread(image_fd, &source, sizeof source, offset) != (ssize_t)sizeof source) {
+        if (ckpt_rd_all(image_file, &source, sizeof source) != 0) {
             free(image);
-            close(image_fd);
+            ckpt_source_fclose(image_file);
             return -1;
         }
         struct hl_cmsg_epoll_watch destination = {
@@ -298,7 +295,7 @@ static int ckpt_restore_epoll_marker(const char *base, const struct ckpt_fd *rec
         };
         memcpy(image + sizeof(uint32_t) + (size_t)index * sizeof destination, &destination, sizeof destination);
     }
-    close(image_fd);
+    ckpt_source_fclose(image_file);
     struct hl_cmsg_kqueue_meta metadata = {
         .magic = UINT32_C(0x484c4b51),
         .ordinal = ordinal,
@@ -426,23 +423,21 @@ struct ckpt_socket_state {
     struct sockaddr_storage local;
 };
 
-// ---- control channel (armed only when HL_CHECKPOINT_DIR / HL_RESTORE_DIR is set) ----
+// ---- control channel (armed only when HL_CHECKPOINT / HL_RESTORE is set) ----
 // The checkpoint request is conveyed by a SHARED-MEMORY generation counter, NOT a signal: a MAP_SHARED
-// mmap of "<checkpoint-dir>.trigger" (a sibling of the checkpoint dir, so the coordinator's rm of the dir
-// never touches it). Every engine process maps it (inherited across fork, remapped after exec). ckpt_poll
+// mmap of an anonymous descriptor activation hands the engine alongside the store channel.
+// Every engine process maps it (inherited across fork, remapped after exec). ckpt_poll
 // reads it each safepoint (a cheap memory load) and checkpoints when the generation advances past the one it
 // last saw. Signals are unusable as the trigger because a guest's own rt_sigaction remaps every guest-
 // reachable host signal (bash sets SIG_IGN on SIGUSR1, silently swallowing it). The generation carries the
 // INTENT; the host process contract selects the reserved engine interrupt used only to kick a blocked or
 // spinning process out to its safepoint (thread_int_handler sets cpu->irq when armed).
-static char g_ckpt_dir[1024];
 // g_ckpt_trigger / g_ckpt_seen_gen live in container/state.c (early include) so signal.c's blocking-syscall
 // restart decision (ckpt_pending) can consult them too.
 
 static int ckpt_dump_self(struct cpu *c, const char *group);
 static void ckpt_coordinate_and_exit(struct cpu *c);
 
-// Map (creating if needed) the shared trigger-generation page for `dir`. Returns the mapping or NULL.
 /* Linux renders an unlinked descriptor as "<path> (deleted)".  A concurrent
  * atomic replacement may already have recreated the pathname, in which case
  * reopening that live path is the only path-backed interpretation available.
@@ -463,29 +458,15 @@ static volatile uint32_t *ckpt_map_trigger_descriptor(int fd) {
     return (m == MAP_FAILED) ? NULL : (volatile uint32_t *)m;
 }
 
-static volatile uint32_t *ckpt_map_trigger(const char *dir) {
-    // With a streaming sink there is no workspace, so the generation counter arrives as an inherited
-    // anonymous shared descriptor instead of a file beside the workspace. Everything downstream is identical:
-    // one shared word, read by ckpt_poll at every safepoint, bumped by the embedder to request a capture.
+// The generation counter is an anonymous shared descriptor inherited from activation: one shared word, read
+// by ckpt_poll at every safepoint, bumped by the embedder to request a capture.
+static volatile uint32_t *ckpt_map_trigger(void) {
     int inherited = hl_ckpt_trigger_descriptor();
-    if (inherited >= 0) return ckpt_map_trigger_descriptor(inherited);
-    char tp[1200];
-    snprintf(tp, sizeof tp, "%s.trigger", dir);
-    int fd = open(tp, O_RDWR | O_CREAT, 0600);
-    if (fd < 0) {
-        fprintf(stderr, "[ckpt] cannot open trigger %s: %s\n", tp, strerror(errno));
+    if (inherited < 0) {
+        fprintf(stderr, "[ckpt] checkpoint requested without a trigger descriptor\n");
         return NULL;
     }
-    if (ftruncate(fd, 4) != 0) {
-        fprintf(stderr, "[ckpt] cannot size trigger %s: %s\n", tp, strerror(errno));
-        close(fd);
-        return NULL;
-    }
-    void *m = mmap(NULL, 4, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (m == MAP_FAILED)
-        fprintf(stderr, "[ckpt] cannot map trigger %s: %s\n", tp, strerror(errno));
-    close(fd);
-    return (m == MAP_FAILED) ? NULL : (volatile uint32_t *)m;
+    return ckpt_map_trigger_descriptor(inherited);
 }
 
 static int ckpt_rd_all(FILE *f, void *buf, size_t n) {
@@ -499,14 +480,6 @@ static int ckpt_close_sync(FILE **file) {
     int failed = fflush(f) != 0 || fsync(fileno(f)) != 0;
     if (fclose(f) != 0) failed = 1;
     return failed ? -1 : 0;
-}
-
-static int ckpt_sync_dir(const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    int result = fsync(fd);
-    close(fd);
-    return result;
 }
 
 static uint64_t ckpt_hash_bytes(uint64_t hash, const void *data, size_t size) {
@@ -548,87 +521,6 @@ static uint64_t ckpt_hash_object(uint64_t hash, const char *name, uint64_t size,
 static uint64_t ckpt_hash_combine(uint64_t image, const char *name, uint64_t object) {
     image = ckpt_hash_bytes(image, name, strlen(name) + 1);
     return ckpt_hash_bytes(image, &object, sizeof object);
-}
-
-static int ckpt_hash_tree(const char *base, const char *relative, uint64_t *hash, uint64_t *files,
-                          uint64_t *bytes) {
-    char directory[1400];
-    snprintf(directory, sizeof directory, "%s%s%s", base, relative[0] ? "/" : "", relative);
-    DIR *dir = opendir(directory);
-    if (!dir) return -1;
-    char **names = NULL;
-    size_t count = 0, capacity = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
-        if (!relative[0] && (!strcmp(entry->d_name, "MANIFEST") ||
-                             !strcmp(entry->d_name, "RECOVERY.jsonl") ||
-                             !strncmp(entry->d_name, ".RECOVERY.jsonl.tmp.", 21)))
-            continue;
-        if (count == capacity) {
-            size_t next = capacity ? capacity * 2 : 16;
-            char **expanded = realloc(names, next * sizeof *expanded);
-            if (!expanded) goto fail;
-            names = expanded;
-            capacity = next;
-        }
-        names[count] = strdup(entry->d_name);
-        if (!names[count]) goto fail;
-        count++;
-    }
-    closedir(dir);
-    dir = NULL;
-    qsort(names, count, sizeof *names, ckpt_name_compare);
-    for (size_t index = 0; index < count; ++index) {
-        char child_relative[1400], path[1400];
-        snprintf(child_relative, sizeof child_relative, "%s%s%s", relative, relative[0] ? "/" : "",
-                 names[index]);
-        snprintf(path, sizeof path, "%s/%s", base, child_relative);
-        struct stat status;
-        if (lstat(path, &status) != 0) goto fail;
-        if (S_ISDIR(status.st_mode)) {
-            if (ckpt_hash_tree(base, child_relative, hash, files, bytes) != 0) goto fail;
-            continue;
-        }
-        if (!S_ISREG(status.st_mode)) goto fail;
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) goto fail;
-        uint64_t size = (uint64_t)status.st_size;
-        uint64_t object = ckpt_hash_object(CKPT_HASH_BASIS, child_relative, size, NULL, 0);
-        unsigned char buffer[65536];
-        for (;;) {
-            ssize_t received = read(fd, buffer, sizeof buffer);
-            if (received > 0) {
-                object = ckpt_hash_bytes(object, buffer, (size_t)received);
-                continue;
-            }
-            if (received < 0 && errno == EINTR) continue;
-            if (received < 0) {
-                close(fd);
-                goto fail;
-            }
-            break;
-        }
-        close(fd);
-        *hash = ckpt_hash_combine(*hash, child_relative, object);
-        (*files)++;
-        *bytes += size;
-    }
-    for (size_t index = 0; index < count; ++index) free(names[index]);
-    free(names);
-    return 0;
-fail:
-    if (dir) closedir(dir);
-    for (size_t index = 0; index < count; ++index) free(names[index]);
-    free(names);
-    return -1;
-}
-
-static int ckpt_image_digest(const char *base, uint64_t *hash, uint64_t *files, uint64_t *bytes) {
-    *hash = CKPT_HASH_BASIS;
-    *files = 0;
-    *bytes = 0;
-    return ckpt_hash_tree(base, "", hash, files, bytes);
 }
 
 static int ckpt_capture_pipe(int fd, uint64_t identity) {
@@ -983,30 +875,25 @@ static void ckpt_poll(struct cpu *c) {
     _exit(rc == 0 ? 0 : 70);
 }
 
-// Arm checkpoint/restore if HL_CHECKPOINT_DIR / HL_RESTORE_DIR is set. Called from engine_global_init
-// (in every process, so a forked child is armed too). Maps the shared trigger and records the CURRENT
-// generation as already-seen, so a stale trigger from a previous run never false-fires on a fresh launch or a
-// restore (only a later increment triggers a checkpoint).
+// Arm checkpoint/restore if HL_CHECKPOINT / HL_RESTORE is set. Called from engine_global_init (in every
+// process, so a forked child is armed too). Maps the shared trigger and records the CURRENT generation as
+// already-seen, so a stale trigger from a previous run never false-fires on a fresh launch or a restore
+// (only a later increment triggers a checkpoint).
 static int ckpt_control_init(void) {
-    const char *rd = hl_option_get("HL_RESTORE_DIR");
-    const char *d = hl_option_get("HL_CHECKPOINT_DIR");
-    if ((d && d[0]) || (rd && rd[0])) {
-        if (!g_init_hostpid) g_init_hostpid = getpid();
-        hl_linux_snapshot_enable(&g_ckpt_snapshot);
+    int restore = hl_option_get("HL_RESTORE") != NULL;
+    int capture = hl_option_get("HL_CHECKPOINT") != NULL;
+    if (!capture && !restore) return 0;
+    if (!g_init_hostpid) g_init_hostpid = getpid();
+    hl_linux_snapshot_enable(&g_ckpt_snapshot);
+    // One channel serves both directions. Restore binds the sink too: the recovery report is an object of
+    // the image like any other, and there is nowhere else for it to go.
+    if (ckpt_sink_bind_stream() == NULL) {
+        fprintf(stderr, "[ckpt] checkpoint requested without a broker descriptor\n");
+        return -1;
     }
-    if (rd && rd[0] && ckpt_source_current() == NULL && ckpt_source_bind(rd) == NULL) return -1;
-    if (!d || !d[0]) return 0;
-    snprintf(g_ckpt_dir, sizeof g_ckpt_dir, "%s", d);
-    // Bind the process-wide checkpoint sink. The sentinel selects the embedder-backed streaming sink; any
-    // other value is a workspace directory. Nothing else in the writer knows which one is installed.
-    if (!strcmp(d, HL_CKPT_STREAM_SENTINEL)) {
-        if (ckpt_sink_bind_stream() == NULL) {
-            fprintf(stderr, "[ckpt] streaming checkpoint requested without a broker descriptor\n");
-            return -1;
-        }
-    } else
-        ckpt_sink_bind_directory(g_ckpt_dir);
-    g_ckpt_trigger = ckpt_map_trigger(d);
+    if (restore && ckpt_source_current() == NULL && ckpt_source_bind() == NULL) return -1;
+    if (!capture) return 0;
+    g_ckpt_trigger = ckpt_map_trigger();
     if (!g_ckpt_trigger) return -1;
     g_ckpt_seen_gen = *g_ckpt_trigger;
     return 0;
@@ -2156,14 +2043,7 @@ done:
 // The container INIT (guest pid 1) coordinates a whole-tree checkpoint at its safepoint: freeze + dump every
 // peer, then itself, then publish the MANIFEST. Never returns (_exit frees init's RAM).
 static void ckpt_coordinate_and_exit(struct cpu *c) {
-    char base[1024];
     struct ckpt_sink *sink = ckpt_sink_current();
-    snprintf(base, sizeof base, "%s", g_ckpt_dir);
-    // The requester prepared a fresh, empty base dir BEFORE advancing the trigger (so peers that see the
-    // shared generation independently can drop their proc.<gpid> straight in). We must NOT rm it here — a
-    // peer may already have dumped into it. Just ensure it exists (idempotent) and proceed. A streaming sink
-    // has no workspace at all; the embedder's store is prepared before the launch.
-    if (sink != NULL && sink->root[0]) mkdir(base, 0700);
 
     size_t peer_capacity = 512;
     hl_host_process_peer *foll = malloc(peer_capacity * sizeof *foll);
@@ -2226,9 +2106,9 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
     // Publish the MANIFEST last: its presence == a complete, restorable checkpoint.
     int nproc = 0;
     // A descendant can observe the shared generation and publish its image even if the host peer snapshot
-    // raced its registration. Do not publish MANIFEST while that independently frozen process is still
-    // assembling its atomic proc.* directory. A fixed quiescence window also covers the registration gap
-    // where neither the peer snapshot nor the workspace contains the child yet.
+    // raced its registration. Do not commit while that independently frozen process is still assembling its
+    // group. A fixed quiescence window also covers the registration gap where neither the peer snapshot nor
+    // the store contains the child yet.
     for (int settle = 0; settle < 200; settle++) {
         int complete = ckpt_sink_group_count(sink, "proc.");
         if (complete >= 0) nproc = complete;
@@ -2254,19 +2134,18 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
         int fgh = (tf >= 0) ? tcgetpgrp(tf) : -1;
         man.fg_pgid_gpid = (fgh <= 0) ? 0 : (g_init_hostpid && fgh == g_init_hostpid) ? 1 : fgh;
     }
-    // The digest is asked of the sink: the directory sink walks the workspace, the streaming sink asks the
-    // server, which accumulated it while the bytes went past. Neither re-reads the embedder's store.
+    // The digest is asked of the sink: the server accumulated it while the bytes went past, so nothing
+    // re-reads the embedder's store.
     if (ckpt_sink_digest(sink, &man.image_hash, &man.image_files, &man.image_bytes) != 0) {
-        fprintf(stderr, "[ckpt] cannot hash workspace image: %s\n", strerror(errno));
+        fprintf(stderr, "[ckpt] cannot hash checkpoint image: %s\n", strerror(errno));
         _exit(70);
     }
-    // Explicit completion. On the directory sink this is still "MANIFEST written last, then fsync the
-    // workspace"; on any other sink it is the only signal that the image is complete.
+    // Explicit completion: the only signal that the image is complete.
     if (ckpt_sink_commit(sink, &man, sizeof man) != 0) {
-        fprintf(stderr, "[ckpt] cannot publish workspace manifest: %s\n", strerror(errno));
+        fprintf(stderr, "[ckpt] cannot publish checkpoint manifest: %s\n", strerror(errno));
         _exit(70);
     }
-    fprintf(stderr, "[ckpt] workspace checkpoint OK: %d process(es) -> %s\n", nproc, base);
+    fprintf(stderr, "[ckpt] checkpoint OK: %d process(es)\n", nproc);
     int st;
     while (waitpid(-1, &st, WNOHANG) > 0) {} // final reap
     hl_engine_child_result_publish(0, HL_STATUS_OK, 0);
@@ -2275,15 +2154,13 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
 
 // ================================= RESTORE =================================
 
-static int ckpt_read_manifest(const char *dir, struct ckpt_manifest *man) {
-    char pf[1200];
-    snprintf(pf, sizeof pf, "%s/MANIFEST", dir);
-    if (ckpt_source_load(pf, man, sizeof *man) != 0) {
-        fprintf(stderr, "[restore] %s has no MANIFEST (not a complete checkpoint)\n", dir);
+static int ckpt_read_manifest(struct ckpt_manifest *man) {
+    if (ckpt_source_load("MANIFEST", man, sizeof *man) != 0) {
+        fprintf(stderr, "[restore] the store has no MANIFEST (not a complete checkpoint)\n");
         return -1;
     }
     if (man->magic != CKPT_MANIFEST_MAGIC) {
-        fprintf(stderr, "[restore] %s: bad manifest magic\n", dir);
+        fprintf(stderr, "[restore] bad manifest magic\n");
         return -1;
     }
     if (!ckpt_version_supported(man->version) || man->arch != G_CKPT_ARCH) {
@@ -2291,7 +2168,6 @@ static int ckpt_read_manifest(const char *dir, struct ckpt_manifest *man) {
         return -1;
     }
     uint64_t image_hash, image_files, image_bytes;
-    (void)dir;
     if (ckpt_source_digest(&image_hash, &image_files, &image_bytes) != 0 ||
         image_hash != man->image_hash || image_files != man->image_files || image_bytes != man->image_bytes) {
         fprintf(stderr, "[restore] checkpoint image integrity mismatch\n");
@@ -2489,7 +2365,7 @@ static int ckpt_restore_backing_seed(const char *procdir, uint64_t object_id, ui
         if (fd < 0) fd = open(record.path, O_RDONLY);
     } else {
         char source_path[1400];
-        snprintf(source_path, sizeof source_path, "%s/../%s", procdir, record.path);
+        snprintf(source_path, sizeof source_path, "%s", record.path);
         int source = open(source_path, O_RDONLY);
         char temporary[] = "/tmp/.hl-restore-mapXXXXXX";
         fd = source >= 0 ? mkstemp(temporary) : -1;
@@ -2865,7 +2741,7 @@ static void ckpt_restore_socket_seeds_close(void) {
 
 static int ckpt_restore_file_blob(const char *procdir, const struct ckpt_fd *record) {
     char source_path[1400], temporary[] = "/tmp/hl-checkpoint-file.XXXXXX";
-    snprintf(source_path, sizeof source_path, "%s/../%s", procdir, record->path);
+    snprintf(source_path, sizeof source_path, "%s", record->path);
     FILE *source = ckpt_source_fopen(source_path);
     if (!source) return -1;
     int staging = mkstemp(temporary);
@@ -3794,9 +3670,8 @@ static int g_nrprocs;
 static int g_rprocs_capacity;
 
 // Enumerate the captured process images. This is the restore-side counterpart of the coordinator's group
-// count: the workspace was the only place that recorded "which processes are in this image", and a stream
-// cannot be listed, so the source answers it (an opendir for the directory source, a server query otherwise).
-static int ckpt_scan_procs(const char *base) {
+// count: "which processes are in this image" is answered by the store, over the same channel.
+static int ckpt_scan_procs(void) {
     char names[64 * 1024];
     g_nrprocs = 0;
     int listed = ckpt_source_list("proc.", names, sizeof names);
@@ -3807,7 +3682,7 @@ static int ckpt_scan_procs(const char *base) {
         int gpid = atoi(cursor + 5);
         if (gpid <= 0) continue;
         char pd[1200];
-        snprintf(pd, sizeof pd, "%s/%.200s", base, cursor);
+        snprintf(pd, sizeof pd, "%.200s", cursor);
         struct ckpt_meta m;
         if (ckpt_read_meta_dir(pd, &m) != 0) continue;
         if (ckpt_vector_reserve((void **)&g_rprocs, &g_rprocs_capacity, sizeof *g_rprocs,
@@ -3922,10 +3797,10 @@ static void ckpt_json_string(FILE *file, const char *value) {
     fputc('"', file);
 }
 
-static int ckpt_recovery_report_queue(FILE *report, const char *base, const struct ckpt_proc *process,
+static int ckpt_recovery_report_queue(FILE *report, const struct ckpt_proc *process,
                                       const struct ckpt_fd *socket_record) {
     char path[1400];
-    snprintf(path, sizeof path, "%s/%s", base, socket_record->path);
+    snprintf(path, sizeof path, "%s", socket_record->path);
     FILE *queue = ckpt_source_fopen(path);
     if (!queue) return -1;
     struct ckpt_socket_queue_header header;
@@ -3972,18 +3847,12 @@ static int ckpt_recovery_report_queue(FILE *report, const char *base, const stru
 }
 
 // The restore-side recovery journal. It is the one thing restore WRITES, and it is written back into the
-// image next to what it describes. With a workspace that is a temp file renamed into place; with a
-// caller-supplied store there is no directory to rename inside, so the report is assembled in memory and
-// handed to the store as the object "RECOVERY.jsonl" -- the same name, the same content, published by the
-// same rule (all at once, or not at all).
-static int ckpt_recovery_report(const char *base, int policy) {
-    int streaming = ckpt_source_current() != NULL && ckpt_source_current()->root[0] == '\0';
-    char temporary[1300], published[1300];
+// image next to what it describes: assembled in memory, then handed to the store as the object
+// "RECOVERY.jsonl" -- all at once, or not at all.
+static int ckpt_recovery_report(int policy) {
     char *buffer = NULL;
     size_t buffered = 0;
-    snprintf(temporary, sizeof temporary, "%s/.RECOVERY.jsonl.tmp.%d", base, (int)getpid());
-    snprintf(published, sizeof published, "%s/RECOVERY.jsonl", base);
-    FILE *file = streaming ? open_memstream(&buffer, &buffered) : fopen(temporary, "wb");
+    FILE *file = open_memstream(&buffer, &buffered);
     if (!file) return -1;
     fprintf(file, "{\"type\":\"summary\",\"format\":1,\"policy\":%d,\"processes\":%d}\n", policy,
             g_nrprocs);
@@ -3994,7 +3863,7 @@ static int ckpt_recovery_report(const char *base, int policy) {
         ckpt_json_string(file, process->reason);
         fputs("}\n", file);
         char fd_path[1300];
-        snprintf(fd_path, sizeof fd_path, "%s/proc.%d/fds", base, process->gpid);
+        snprintf(fd_path, sizeof fd_path, "proc.%d/fds", process->gpid);
         FILE *fds = ckpt_source_fopen(fd_path);
         if (fds) {
             struct ckpt_fd record;
@@ -4008,18 +3877,17 @@ static int ckpt_recovery_report(const char *base, int policy) {
                         process->gpid, record.gfd, record.kind, outcome);
                 ckpt_json_string(file, (record.kind == CKF_FILE || record.kind == CKF_DEVICE) ? record.path : "");
                 fputs("}\n", file);
-                if (record.kind == CKF_SOCKETPAIR && ckpt_recovery_report_queue(file, base, process, &record) != 0) {
+                if (record.kind == CKF_SOCKETPAIR && ckpt_recovery_report_queue(file, process, &record) != 0) {
                     ckpt_source_fclose(fds);
-                    ckpt_source_fclose(file);
+                    fclose(file);
                     free(buffer);
-                    if (!streaming) unlink(temporary);
                     return -1;
                 }
             }
             ckpt_source_fclose(fds);
         }
     }
-    if (streaming) {
+    {
         int failed = fclose(file) != 0;
         if (!failed) {
             struct ckpt_sink_stream *object = NULL;
@@ -4030,18 +3898,12 @@ static int ckpt_recovery_report(const char *base, int policy) {
         free(buffer);
         return failed ? -1 : 0;
     }
-    if (ckpt_close_sync(&file) != 0 || rename(temporary, published) != 0 || ckpt_sync_dir(base) != 0) {
-        if (file) ckpt_source_fclose(file);
-        unlink(temporary);
-        return -1;
-    }
-    return 0;
 }
 
-static int ckpt_validate_process_image(const char *base, const struct ckpt_proc *process,
+static int ckpt_validate_process_image(const struct ckpt_proc *process,
                                        struct ckpt_meta *meta) {
     char procdir[1300], path[1400];
-    snprintf(procdir, sizeof procdir, "%s/proc.%d", base, process->gpid);
+    snprintf(procdir, sizeof procdir, "proc.%d", process->gpid);
     if (ckpt_read_meta_dir(procdir, meta) != 0 || meta->self_gpid != process->gpid ||
         meta->ppid_gpid != process->ppid || meta->pagesz == 0 || meta->pagesz > UINT64_C(1048576) ||
         (meta->pagesz & (meta->pagesz - 1)) != 0 || meta->n_regions > UINT64_C(1048576) ||
@@ -4132,10 +3994,10 @@ static int ckpt_external_unavailable(const struct ckpt_fd *record) {
     return 0;
 }
 
-static int ckpt_preflight_socket_queue(const char *base, const struct ckpt_fd *socket_record,
+static int ckpt_preflight_socket_queue(const struct ckpt_fd *socket_record,
                                        struct ckpt_fd *unavailable) {
     char path[1400];
-    snprintf(path, sizeof path, "%s/%s", base, socket_record->path);
+    snprintf(path, sizeof path, "%s", socket_record->path);
     FILE *file = ckpt_source_fopen(path);
     if (!file) return -1;
     struct ckpt_socket_queue_header header;
@@ -4178,16 +4040,16 @@ static int ckpt_preflight_socket_queue(const char *base, const struct ckpt_fd *s
     return 0;
 }
 
-static int ckpt_restore_preflight(const char *base, int policy) {
+static int ckpt_restore_preflight(int policy) {
     for (int i = 0; i < g_nrprocs; ++i) {
         struct ckpt_proc *process = &g_rprocs[i];
         struct ckpt_meta meta;
-        if (ckpt_validate_process_image(base, process, &meta) != 0) {
+        if (ckpt_validate_process_image(process, &meta) != 0) {
             ckpt_process_stop(process, "checkpoint process image is invalid");
             continue;
         }
         char path[1300];
-        snprintf(path, sizeof path, "%s/proc.%d/fds", base, process->gpid);
+        snprintf(path, sizeof path, "proc.%d/fds", process->gpid);
         FILE *file = ckpt_source_fopen(path);
         if (!file) {
             ckpt_process_stop(process, "descriptor image is missing");
@@ -4205,7 +4067,7 @@ static int ckpt_restore_preflight(const char *base, int policy) {
             }
             if (process->viable && record.kind == CKF_SOCKETPAIR) {
                 struct ckpt_fd unavailable;
-                int queue = ckpt_preflight_socket_queue(base, &record, &unavailable);
+                int queue = ckpt_preflight_socket_queue(&record, &unavailable);
                 if (queue < 0) ckpt_process_stop(process, "socket queue image is corrupt");
                 else if (queue > 0) {
                     char reason[192];
@@ -4221,7 +4083,7 @@ static int ckpt_restore_preflight(const char *base, int policy) {
     struct ckpt_proc *root = ckpt_proc_find(1);
     int stopped = 0;
     for (int i = 0; i < g_nrprocs; ++i) stopped += !g_rprocs[i].viable;
-    if (ckpt_recovery_report(base, policy) != 0) {
+    if (ckpt_recovery_report(policy) != 0) {
         fprintf(stderr, "[restore] cannot publish recovery report\n");
         return -1;
     }
@@ -4236,12 +4098,12 @@ static int ckpt_restore_preflight(const char *base, int policy) {
     return 0;
 }
 
-static int ckpt_prepare_restore_pipes(const char *base) {
+static int ckpt_prepare_restore_pipes(void) {
     g_nrestore_pipes = 0;
     for (int process = 0; process < g_nrprocs; process++) {
         char path[1300];
         if (!g_rprocs[process].viable) continue; // a stopped process must not fail the restore it was pruned from
-        snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
+        snprintf(path, sizeof path, "proc.%d/fds", g_rprocs[process].gpid);
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
@@ -4291,8 +4153,7 @@ static int ckpt_prepare_restore_pipes(const char *base) {
         g_restore_pipes[i].writer = writer;
         int flags = fcntl(writer, F_GETFL);
         if (flags < 0 || fcntl(writer, F_SETFL, flags | O_NONBLOCK) != 0) return -1;
-        snprintf(data_path, sizeof data_path, "%s/pipe.%016llx", base,
-                 (unsigned long long)g_restore_pipes[i].identity);
+        snprintf(data_path, sizeof data_path, "pipe.%016llx", (unsigned long long)g_restore_pipes[i].identity);
         FILE *data = ckpt_source_fopen(data_path);
         if (!data) continue;
         unsigned char buffer[65536];
@@ -4319,7 +4180,7 @@ static int ckpt_prepare_restore_pipes(const char *base) {
     return 0;
 }
 
-static int ckpt_restore_right_prepare(const char *base, const struct ckpt_fd *record) {
+static int ckpt_restore_right_prepare(const struct ckpt_fd *record) {
     struct ckpt_restore_right *existing = ckpt_restore_right_find(record->ofd_id);
     if (existing != NULL) return existing->object_id == record->object_id ? existing->fd : -1;
     if (!record->ofd_id ||
@@ -4344,7 +4205,7 @@ static int ckpt_restore_right_prepare(const char *base, const struct ckpt_fd *re
     }
     if (record->kind == CKF_INOTIFY) {
         char image_path[1400];
-        snprintf(image_path, sizeof image_path, "%s/%s", base, record->path);
+        snprintf(image_path, sizeof image_path, "%s", record->path);
         int64_t stored = ckpt_source_object_size(image_path);
         if (g_linux_box == NULL || stored <= 0 || (uint64_t)stored > 64u * 1024u * 1024u) return -1;
         size_t size = (size_t)stored;
@@ -4413,7 +4274,7 @@ static int ckpt_restore_right_prepare(const char *base, const struct ckpt_fd *re
             object = &g_restore_signalfds[g_nrestore_signalfds++];
             *object = (struct ckpt_restore_signalfd){record->object_id, record->auxiliary, reader, writer};
             char queue_path[1300];
-            snprintf(queue_path, sizeof queue_path, "%s/%s", base, record->path);
+            snprintf(queue_path, sizeof queue_path, "%s", record->path);
             FILE *queue = ckpt_source_fopen(queue_path);
             if (queue != NULL) {
                 unsigned char bytes[4096];
@@ -4479,7 +4340,7 @@ static int ckpt_restore_right_prepare(const char *base, const struct ckpt_fd *re
             int writer_flags = fcntl(pipe_object->writer, F_GETFL);
             if (writer_flags < 0 || fcntl(pipe_object->writer, F_SETFL, writer_flags | O_NONBLOCK) != 0) return -1;
             char data_path[1300];
-            snprintf(data_path, sizeof data_path, "%s/pipe.%016llx", base, (unsigned long long)identity);
+            snprintf(data_path, sizeof data_path, "pipe.%016llx", (unsigned long long)identity);
             FILE *data = ckpt_source_fopen(data_path);
             if (data != NULL) {
                 unsigned char buffer[65536];
@@ -4637,7 +4498,7 @@ static int ckpt_restore_right_prepare(const char *base, const struct ckpt_fd *re
             fd = open(record->path, O_RDONLY);
     } else {
         char source_path[1400];
-        snprintf(source_path, sizeof source_path, "%s/%s", base, record->path);
+        snprintf(source_path, sizeof source_path, "%s", record->path);
         int source = open(source_path, O_RDONLY);
         char temporary[] = "/tmp/.hl-restore-rightXXXXXX";
         fd = source >= 0 ? mkstemp(temporary) : -1;
@@ -4675,9 +4536,9 @@ static int ckpt_restore_right_prepare(const char *base, const struct ckpt_fd *re
     return adopted;
 }
 
-static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_socket_endpoint *endpoint) {
+static int ckpt_restore_socket_queue_load(struct ckpt_restore_socket_endpoint *endpoint) {
     char path[1300];
-    snprintf(path, sizeof path, "%s/socket.%016llx", base, (unsigned long long)endpoint->identity);
+    snprintf(path, sizeof path, "socket.%016llx", (unsigned long long)endpoint->identity);
     FILE *file = ckpt_source_fopen(path);
     if (!file) return errno == ENOENT ? 0 : -1;
     struct ckpt_socket_queue_header header;
@@ -4715,7 +4576,7 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
             return -1;
         }
         for (uint32_t index = 0; index < frame.rights_count; ++index) {
-            right_fds[index] = ckpt_restore_right_prepare(base, &rights[index]);
+            right_fds[index] = ckpt_restore_right_prepare(&rights[index]);
             if (right_fds[index] < 0) {
                 free(payload);
                 ckpt_source_fclose(file);
@@ -4888,7 +4749,7 @@ static int ckpt_restore_socket_queue_load(const char *base, struct ckpt_restore_
                         return -1;
                     }
                     combo[index] = placeholder;
-                    int marker = ckpt_restore_epoll_marker(base, &rights[index], index);
+                    int marker = ckpt_restore_epoll_marker(&rights[index], index);
                     if (marker < 0) {
                         free(payload);
                         ckpt_source_fclose(file);
@@ -4989,13 +4850,13 @@ static int ckpt_restore_socket_options(int fd, const struct ckpt_socket_state *s
     return 0;
 }
 
-static int ckpt_prepare_restore_sockets(const char *base) {
+static int ckpt_prepare_restore_sockets(void) {
     g_nrestore_socket_endpoints = 0;
     g_nrestore_rights = 0;
     for (int process = 0; process < g_nrprocs; ++process) {
         char path[1300];
         if (!g_rprocs[process].viable) continue;
-        snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
+        snprintf(path, sizeof path, "proc.%d/fds", g_rprocs[process].gpid);
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
@@ -5023,8 +4884,7 @@ static int ckpt_prepare_restore_sockets(const char *base) {
                 .type = (int)record.offset, .guest_present = 1,
             };
             char state_path[1400];
-            snprintf(state_path, sizeof state_path, "%s/socket-state.%016llx", base,
-                     (unsigned long long)record.object_id);
+            snprintf(state_path, sizeof state_path, "socket-state.%016llx", (unsigned long long)record.object_id);
             if (ckpt_source_load(state_path, &endpoint->state,
                                   sizeof endpoint->state) != 0 || endpoint->state.magic != CKPT_SOCKET_STATE_MAGIC ||
                 endpoint->state.local_size > sizeof endpoint->state.local) {
@@ -5086,7 +4946,7 @@ static int ckpt_prepare_restore_sockets(const char *base) {
     }
     for (int index = 0; index < g_nrestore_socket_endpoints; ++index)
         if (g_restore_socket_endpoints[index].guest_present &&
-            ckpt_restore_socket_queue_load(base, &g_restore_socket_endpoints[index]) != 0) {
+            ckpt_restore_socket_queue_load(&g_restore_socket_endpoints[index]) != 0) {
             fprintf(stderr, "[restore] socket queue load failed endpoint=%016llx\n",
                     (unsigned long long)g_restore_socket_endpoints[index].identity);
             return -1;
@@ -5120,12 +4980,12 @@ static int ckpt_socket_state_is_bound(const struct ckpt_socket_state *state) {
     return 0;
 }
 
-static int ckpt_prepare_restore_socket_states(const char *base) {
+static int ckpt_prepare_restore_socket_states(void) {
     g_nrestore_sockets = 0;
     for (int process = 0; process < g_nrprocs; ++process) {
         char records_path[1300];
         if (!g_rprocs[process].viable) continue;
-        snprintf(records_path, sizeof records_path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
+        snprintf(records_path, sizeof records_path, "proc.%d/fds", g_rprocs[process].gpid);
         FILE *records = ckpt_source_fopen(records_path);
         if (!records) return -1;
         struct ckpt_fd record;
@@ -5140,7 +5000,7 @@ static int ckpt_prepare_restore_socket_states(const char *base) {
             struct ckpt_restore_socket *socket_state = &g_restore_sockets[g_nrestore_sockets++];
             *socket_state = (struct ckpt_restore_socket){.identity = record.object_id, .fd = -1};
             char state_path[1400];
-            snprintf(state_path, sizeof state_path, "%s/%s", base, record.path);
+            snprintf(state_path, sizeof state_path, "%s", record.path);
             if (ckpt_source_load(state_path, &socket_state->state,
                                   sizeof socket_state->state) != 0 ||
                 socket_state->state.magic != CKPT_SOCKET_STATE_MAGIC ||
@@ -5216,12 +5076,12 @@ static int ckpt_prepare_restore_socket_states(const char *base) {
     return 0;
 }
 
-static int ckpt_prepare_restore_eventfds(const char *base) {
+static int ckpt_prepare_restore_eventfds(void) {
     g_nrestore_eventfds = 0;
     for (int process = 0; process < g_nrprocs; process++) {
         char path[1300];
         if (!g_rprocs[process].viable) continue;
-        snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
+        snprintf(path, sizeof path, "proc.%d/fds", g_rprocs[process].gpid);
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
@@ -5295,18 +5155,18 @@ static int ckpt_prepare_restore_eventfds(const char *base) {
     return 0;
 }
 
-static int ckpt_prepare_restore_signalfds(const char *base) {
+static int ckpt_prepare_restore_signalfds(void) {
     g_nrestore_signalfds = 0;
     for (int process = 0; process < g_nrprocs; ++process) {
         char path[1300];
         if (!g_rprocs[process].viable) continue;
-        snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
+        snprintf(path, sizeof path, "proc.%d/fds", g_rprocs[process].gpid);
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
         while (ckpt_rd_all(file, &record, sizeof record) == 0) {
             if (record.kind != CKF_SIGNALFD || ckpt_restore_signalfd_find(record.object_id)) continue;
-            if (ckpt_restore_right_prepare(base, &record) < 0) {
+            if (ckpt_restore_right_prepare(&record) < 0) {
                 ckpt_source_fclose(file);
                 return -1;
             }
@@ -5321,12 +5181,12 @@ static int ckpt_prepare_restore_signalfds(const char *base) {
     return 0;
 }
 
-static int ckpt_prepare_restore_timerfds(const char *base) {
+static int ckpt_prepare_restore_timerfds(void) {
     g_nrestore_timerfds = 0;
     for (int process = 0; process < g_nrprocs; process++) {
         char path[1300];
         if (!g_rprocs[process].viable) continue;
-        snprintf(path, sizeof path, "%s/proc.%d/fds", base, g_rprocs[process].gpid);
+        snprintf(path, sizeof path, "proc.%d/fds", g_rprocs[process].gpid);
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
@@ -5432,17 +5292,17 @@ static void ckpt_restore_pgrp(int gpid, int pgid_gpid, int sid_gpid) {
     }
 }
 
-static void ckpt_restore_proc_run(const char *base, int gpid); // fwd
+static void ckpt_restore_proc_run(int gpid); // fwd
 
 // Re-fork every child of `gpid` (per the checkpoint ppid table); each child restores its own subtree and
 // resumes. Records the checkpoint-gpid -> live-hostpid mapping so this process's guest pids resolve.
-static void ckpt_fork_children(const char *base, int gpid) {
+static void ckpt_fork_children(int gpid) {
     for (int i = 0; i < g_nrprocs; i++) {
         if (!g_rprocs[i].viable || g_rprocs[i].ppid != gpid || g_rprocs[i].gpid == gpid) continue;
         int cg = g_rprocs[i].gpid;
         pid_t p = fork();
         if (p == 0) {
-            ckpt_restore_proc_run(base, cg); // never returns
+            ckpt_restore_proc_run(cg); // never returns
             _exit(0);
         } else if (p > 0) {
             (void)hl_linux_pidmap_add(&g_pidmap, cg, (int)p);
@@ -5454,9 +5314,9 @@ static void ckpt_fork_children(const char *base, int gpid) {
 
 // Restore a re-forked CHILD process (runs in the fresh fork; the engine is already inited, inherited from the
 // parent) and resume it. Never returns.
-static void ckpt_restore_proc_run(const char *base, int gpid) {
+static void ckpt_restore_proc_run(int gpid) {
     char pd[1200];
-    snprintf(pd, sizeof pd, "%s/proc.%d", base, gpid);
+    snprintf(pd, sizeof pd, "proc.%d", gpid);
     struct ckpt_meta m;
     if (ckpt_read_meta_dir(pd, &m) != 0) _exit(70);
 
@@ -5491,7 +5351,7 @@ static void ckpt_restore_proc_run(const char *base, int gpid) {
     char *pubargv[2] = {(char *)(exe[0] ? exe : "guest"), NULL};
     proc_reg_publish(g_exe_path, 1, pubargv);
 
-    ckpt_fork_children(base, gpid); // re-fork our own children before we resume (so a wait finds them)
+    ckpt_fork_children(gpid); // re-fork our own children before we resume (so a wait finds them)
     if (thread_restore_group(images, (int)m.n_threads, &c) != 0) _exit(70);
     free(images);
     ckpt_restore_backings_close();
@@ -5506,19 +5366,18 @@ static void ckpt_restore_proc_run(const char *base, int gpid) {
     _exit(c.exit_code);
 }
 
-// Full restore driver: rebuild the whole tree from `dir` and resume it. The INIT (gpid 1) restores its RAM
-// FIRST (before engine init, so MAP_FIXED lands on free VAs), then re-forks the tree.
-static int ckpt_restore_tree(const char *rootfs, const char *dir) {
+// Full restore driver: rebuild the whole tree from the store and resume it. The INIT (gpid 1) restores its
+// RAM FIRST (before engine init, so MAP_FIXED lands on free VAs), then re-forks the tree.
+static int ckpt_restore_tree(const char *rootfs) {
     struct ckpt_manifest man;
-    // Bind the image source before anything is read. The sentinel selects the embedder-backed source; every
-    // re-forked child inherits this binding, exactly as it inherited the workspace path.
-    if (ckpt_source_bind(dir) == NULL) {
-        fprintf(stderr, "[restore] streaming restore requested without a broker descriptor\n");
+    // Bind the image source before anything is read; every re-forked child inherits the binding.
+    if (ckpt_source_bind() == NULL) {
+        fprintf(stderr, "[restore] restore requested without a broker descriptor\n");
         return 2;
     }
-    if (ckpt_read_manifest(dir, &man) != 0) return 2;
-    if (ckpt_scan_procs(dir) != 0) {
-        fprintf(stderr, "[restore] no processes found in %s\n", dir);
+    if (ckpt_read_manifest(&man) != 0) return 2;
+    if (ckpt_scan_procs() != 0) {
+        fprintf(stderr, "[restore] the store holds no process images\n");
         return 2;
     }
     if (ckpt_validate_proc_tree(&man) != 0) {
@@ -5526,30 +5385,29 @@ static int ckpt_restore_tree(const char *rootfs, const char *dir) {
         return 2;
     }
     int recovery_policy = ckpt_recovery_policy();
-    if (ckpt_restore_preflight(dir, recovery_policy) != 0) return 2;
-    if (ckpt_prepare_restore_pipes(dir) != 0) {
+    if (ckpt_restore_preflight(recovery_policy) != 0) return 2;
+    if (ckpt_prepare_restore_pipes() != 0) {
         fprintf(stderr, "[restore] cannot rebuild checkpoint pipe objects\n");
         return 2;
     }
-    if (ckpt_prepare_restore_eventfds(dir) != 0) {
+    if (ckpt_prepare_restore_eventfds() != 0) {
         fprintf(stderr, "[restore] cannot rebuild checkpoint eventfd objects\n");
         return 2;
     }
-    if (ckpt_prepare_restore_timerfds(dir) != 0) {
+    if (ckpt_prepare_restore_timerfds() != 0) {
         fprintf(stderr, "[restore] cannot rebuild checkpoint timerfd objects\n");
         return 2;
     }
-    if (ckpt_prepare_restore_signalfds(dir) != 0) {
+    if (ckpt_prepare_restore_signalfds() != 0) {
         fprintf(stderr, "[restore] cannot rebuild checkpoint signalfd objects\n");
         return 2;
     }
-    if (ckpt_prepare_restore_sockets(dir) != 0) {
+    if (ckpt_prepare_restore_sockets() != 0) {
         fprintf(stderr, "[restore] cannot rebuild checkpoint socketpair objects\n");
         return 2;
     }
 
-    char ipd[1200];
-    snprintf(ipd, sizeof ipd, "%s/proc.1", dir);
+    const char *ipd = "proc.1";
     struct ckpt_meta im;
     if (ckpt_read_meta_dir(ipd, &im) != 0) return 2;
     if (ckpt_restore_mem_dir(ipd, &im) != 0) {
@@ -5560,7 +5418,7 @@ static int ckpt_restore_tree(const char *rootfs, const char *dir) {
     container_init(rootfs); // sets g_init_hostpid = getpid() -> this process becomes guest pid 1
     int irc = engine_global_init();
     if (irc) return irc;
-    if (ckpt_prepare_restore_socket_states(dir) != 0) {
+    if (ckpt_prepare_restore_socket_states() != 0) {
         fprintf(stderr, "[restore] cannot rebuild checkpoint standalone sockets\n");
         return 2;
     }
@@ -5594,7 +5452,7 @@ static int ckpt_restore_tree(const char *rootfs, const char *dir) {
     // so every child inherits it. Without this the resumed tree's fg group defaults to the init's, and a tty
     // SIGINT hits the init instead of the foreground job -> the whole tree dies on ^C.
     g_ckpt_fg_gpid = man.fg_pgid_gpid;
-    ckpt_fork_children(dir, 1); // rebuild the tree BEFORE init runs (empty block map -> no stale translation)
+    ckpt_fork_children(1); // rebuild the tree BEFORE init runs (empty block map -> no stale translation)
     if (thread_restore_group(images, (int)im.n_threads, &c) != 0) {
         fprintf(stderr, "[restore] init thread-group restore failed\n");
         return 70;

@@ -110,24 +110,25 @@ impl Engine {
         authorities: Authorities,
     ) -> Result<Machine, SpawnError> {
         self.validate(&spec).map_err(SpawnError::Spec)?;
+        // The image only ever travels over a store channel, and this entry point creates none.
+        if spec.checkpoint.enabled {
+            return Err(SpawnError::Spec(crate::spec::SpecError {
+                category: crate::spec::SpecErrorCategory::Conflict,
+                field: "checkpoint".into(),
+                resource: None,
+                context: "checkpointing requires Engine::spawn_with_store".into(),
+            }));
+        }
         validation::validate_authorities(&spec, &authorities).map_err(SpawnError::Spec)?;
         let resources = lowering::allocate_memory(&spec, &authorities).map_err(SpawnError::Spec)?;
         let launch = lower(spec).map_err(SpawnError::Spec)?;
-        let checkpoint_directory = launch.config.checkpoint_directory.clone();
-        if let Some(parent) = checkpoint_directory
-            .as_deref()
-            .and_then(std::path::Path::parent)
-        {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| SpawnError::Engine(Error::Io(error)))?;
-        }
         launch::start(launch, io, authorities, resources)
-            .map(|child| Machine::new(child, checkpoint_directory))
+            .map(|child| Machine::new(child))
             .map_err(SpawnError::Engine)
     }
 
-    /// Starts a machine whose checkpoint image is carried by a caller-supplied store instead of a
-    /// directory. See [`crate::checkpoint_stream`] for why this needs a server rather than a callback.
+    /// Starts a machine whose checkpoint image is carried by a caller-supplied store.
+    /// See [`crate::checkpoint_stream`] for why this needs a server rather than a callback.
     ///
     /// # Errors
     /// Returns a specification error for an invalid spec, or an engine error when the transport cannot be
@@ -154,13 +155,10 @@ impl Engine {
         direction: StoreDirection,
         authorities: Authorities,
     ) -> Result<Machine, SpawnError> {
-        // The sentinel is not a path and is never opened; it tells the engine to bind the streaming sink
-        // and source instead of a workspace directory. It replaces any directory the spec asked for.
         let mut spec = spec;
-        let sentinel = std::path::PathBuf::from(crate::checkpoint_stream::SENTINEL);
         spec.checkpoint.enabled = true;
-        spec.checkpoint.capture_directory = direction.captures().then(|| sentinel.clone());
-        spec.checkpoint.restore_directory = direction.restores().then_some(sentinel);
+        spec.checkpoint.capture = direction.captures();
+        spec.checkpoint.restore = direction.restores();
         self.validate(&spec).map_err(SpawnError::Spec)?;
         validation::validate_authorities(&spec, &authorities).map_err(SpawnError::Spec)?;
         let resources = lowering::allocate_memory(&spec, &authorities).map_err(SpawnError::Spec)?;

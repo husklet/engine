@@ -12,18 +12,19 @@
 //! asks this module whether capture actually works *here*, once per test binary.
 //!
 //! The probe is a real capture, not an env-var guess: it spawns the smallest
-//! checkpoint fixture and runs the classic directory-based `Machine::checkpoint`
-//! path -- the simplest capture there is, and if it cannot publish a manifest,
-//! neither can the store path. Where capture genuinely works the probe succeeds
+//! checkpoint fixture and captures it into an in-memory store -- the simplest
+//! capture there is. Where capture genuinely works the probe succeeds
 //! and every test RUNS; where it cannot, every test self-skips with a visible
 //! reason. When the underlying cause is fixed the probe starts succeeding and
 //! the tests run again with no code change.
 
-use hl_engine::{Engine, Guest, MachineSpec, ProcessIo, Stdio};
+use hl_engine::{
+    CheckpointStore, Engine, Guest, MachineSpec, MemoryStore, ProcessIo, Stdio, StoreDirection,
+};
 use std::{
     fs,
     path::PathBuf,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -50,7 +51,6 @@ fn probe() -> bool {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join(format!("checkpoint-probe-{}", std::process::id()));
-    let checkpoint = root.join("image");
     let release = root.join("release");
     let output = root.join("release.output");
     let _ = fs::remove_dir_all(&root);
@@ -62,7 +62,7 @@ fn probe() -> bool {
     let mut capture = MachineSpec::new(guest, &executable);
     capture.process.argv.push(release.clone().into_os_string());
     capture.checkpoint.enabled = true;
-    capture.checkpoint.capture_directory = Some(checkpoint.clone());
+    let store = Arc::new(MemoryStore::new());
     let io = ProcessIo {
         stdin: Stdio::Null,
         stdout: Stdio::Null,
@@ -70,7 +70,14 @@ fn probe() -> bool {
     };
 
     let published = (|| {
-        let machine = Engine::new().spawn(capture, io).ok()?;
+        let machine = Engine::new()
+            .spawn_with_store(
+                capture,
+                io,
+                Arc::clone(&store) as Arc<dyn CheckpointStore>,
+                StoreDirection::Capture,
+            )
+            .ok()?;
 
         // Wait for the three-process tree to exist before capturing it.
         let deadline = Instant::now() + PROBE_READY_DEADLINE;
@@ -89,10 +96,10 @@ fn probe() -> bool {
             thread::sleep(Duration::from_millis(5));
         }
 
-        // The go/no-go signal: does the classic directory capture publish a manifest
-        // within the short deadline? Everything else (restore, the guest exit code)
-        // is irrelevant to whether this environment can capture at all.
-        let ok = machine.checkpoint(PROBE_DEADLINE).is_ok();
+        // The go/no-go signal: does capture commit a complete image within the short
+        // deadline? Everything else (restore, the guest exit code) is irrelevant to
+        // whether this environment can capture at all.
+        let ok = machine.checkpoint_into_store(PROBE_DEADLINE).is_ok();
         // Let the guest resume and exit so it does not linger past the probe.
         let _ = fs::write(&release, []);
         let _ = machine.wait();

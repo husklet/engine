@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/mman.h>
@@ -30,6 +31,29 @@ void hl_ckpt_channel_publish(int broker) {
 
 int hl_ckpt_channel_broker(void) {
     return checkpoint_broker;
+}
+
+static int checkpoint_parse_descriptor(const char *text) {
+    long value;
+    char *end;
+    if (text == NULL || text[0] == 0) return -1;
+    value = strtol(text, &end, 10);
+    if (*end != 0 || value < 0 || value > 65535) return -1;
+    return (int)value;
+}
+
+int hl_ckpt_channel_adopt(const char *broker, const char *trigger) {
+    int broker_descriptor = checkpoint_parse_descriptor(broker);
+    int trigger_descriptor = checkpoint_parse_descriptor(trigger);
+    if (broker_descriptor < 0 || trigger_descriptor < 0) return -1;
+    if (fcntl(broker_descriptor, F_GETFD) < 0 || fcntl(trigger_descriptor, F_GETFD) < 0) return -1;
+    hl_host_private_init();
+    if (hl_host_process_fd_private_add(broker_descriptor) != 0 ||
+        hl_host_process_fd_private_add(trigger_descriptor) != 0)
+        return -1;
+    checkpoint_broker = broker_descriptor;
+    checkpoint_trigger = trigger_descriptor;
+    return 0;
 }
 
 void hl_ckpt_trigger_publish(int descriptor) {

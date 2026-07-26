@@ -1,9 +1,9 @@
 //! Checkpoint capture and restore through a caller-supplied store.
 //!
-//! A checkpoint is normally a directory tree written by the engine. That hard-wires *where* a checkpoint
-//! lives. This module lets the embedder decide instead: implement [`CheckpointStore`], hand it to
-//! [`crate::MachineSpec`], and every byte of the image is handed to you as named objects — an S3 bucket, an
-//! encrypted blob, a database row, a pipe. Nothing touches the filesystem.
+//! A checkpoint never touches the filesystem: implement [`CheckpointStore`], hand it to
+//! [`crate::Engine::spawn_with_store`], and every byte of the image is handed to you as named objects — an
+//! S3 bucket, an encrypted blob, a database row, a pipe. The engine holds one end of a UNIX socket and this
+//! crate holds the other.
 //!
 //! # Why there is a server here
 //!
@@ -19,18 +19,17 @@
 //!   process image are buffered until that image is committed. Your store only ever sees complete objects,
 //!   and only ever sees a process image all at once.
 //! * **claim arbitration** — several engine processes can see the same pipe or socketpair and exactly one of
-//!   them must record it. The filesystem elected that writer with `O_EXCL`; here it is a table in the server.
+//!   them must record it; the elected writer is a table in the server.
 //! * **rendezvous** — the coordinator asks "has that peer finished?", which is answered from the set of
-//!   committed images rather than by looking for a directory entry.
+//!   committed images.
 //! * **the image digest** — accumulated as objects are finished, never by re-reading the store.
 //!
 //! # Failure
 //!
 //! Returning an error from any [`CheckpointStore`] method fails the capture. The engine process that was
 //! writing aborts its object and its whole process image, exits non-zero, and the coordinator refuses to
-//! publish a manifest — so [`crate::Machine::checkpoint`] returns an error and **no commit ever happens**.
-//! Nothing is rolled back: whatever partial writes your store accepted are yours to discard. That is the same
-//! contract the directory format has always had.
+//! publish a manifest — so [`crate::Machine::checkpoint_into_store`] returns an error and **no commit ever
+//! happens**. Nothing is rolled back: whatever partial writes your store accepted are yours to discard.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -40,9 +39,6 @@ use std::{
         Arc, Mutex,
     },
 };
-
-/// Selects the streaming sink/source instead of a workspace directory. Mirrors `HL_CKPT_STREAM_SENTINEL`.
-pub(crate) const SENTINEL: &str = "@hl-checkpoint-stream";
 
 const ABI: u32 = 1;
 const MAGIC_REQUEST: u32 = 0x484b_4351;

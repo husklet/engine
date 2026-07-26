@@ -1,18 +1,17 @@
-// hl/linux_abi -- the STREAMING implementation of the checkpoint sink (see ckpt_sink.h).
+// hl/linux_abi -- the implementation of the checkpoint sink (see ckpt_sink.h).
 //
 // Every operation becomes one request/response round trip on this process's private channel
-// (include/hl/checkpoint_stream.h, src/core/checkpoint_channel.c). No filesystem is involved anywhere in
-// this file: where the directory sink creates a staging file and renames it, this sink hands the bytes to
-// the embedder and lets the embedder decide what "durable" and "visible" mean.
+// (include/hl/checkpoint_stream.h, src/core/checkpoint_channel.c). No filesystem is involved anywhere: the
+// sink hands the bytes to the embedder and lets the embedder decide what "durable" and "visible" mean.
 //
 // STAGING AND ATOMICITY are the server's job, not this file's: the ordering contract (an object is complete
 // only after finish, a group is invisible until group_commit) is stated in the protocol and implemented once,
 // on the Rust side, instead of once per engine process. That is deliberate -- the engine processes cannot
 // coordinate with each other, and the server is the only participant that sees all of them.
 //
-// FAILURE: any transport failure poisons the stream exactly like a failed write on the directory sink. The
-// writer then aborts the object and fails its caller, the group is aborted and the process exits non-zero,
-// and the coordinator refuses to publish a manifest. There is no silent truncation.
+// FAILURE: any transport failure poisons the stream. The writer aborts the object and fails its caller, the
+// group is aborted and the process exits non-zero, and the coordinator refuses to publish a manifest. There
+// is no silent truncation.
 
 #ifndef HL_LINUX_ABI_CKPT_SINK_STREAM_H
 #define HL_LINUX_ABI_CKPT_SINK_STREAM_H
@@ -224,7 +223,6 @@ static const ckpt_sink_vtable g_ckpt_sink_stream_ops = {
 static struct ckpt_sink *ckpt_sink_bind_stream(void) {
     if (hl_ckpt_channel_broker() < 0) return NULL;
     g_ckpt_sink.ops = &g_ckpt_sink_stream_ops;
-    g_ckpt_sink.root[0] = '\0';
     return &g_ckpt_sink;
 }
 
