@@ -76,7 +76,7 @@ typedef struct hl_launch_config {
     /* ABI 12: NUL-terminated lower path records starting at lower_layers_offset. */
     uint32_t lower_layer_count;
     uint32_t overlay_work_offset;
-    /* ABI 13: behavior when a saved external resource cannot be reconstructed. */
+    /* ABI 13, values remapped in ABI 14: behavior when a saved external resource cannot be reconstructed. */
     uint32_t checkpoint_policy;
     uint32_t reserved_abi13;
 } hl_launch_config;
