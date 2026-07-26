@@ -977,7 +977,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     }
                     if (next > now_ns) {
                         struct kevent future;
-                        EV_SET(&future, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS, next - now_ns, NULL);
+                        EV_SET(&future, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS | NOTE_CRITICAL, next - now_ns, NULL);
                         (void)kevent(rfd, &future, 1, NULL, 0, NULL);
                     }
                     g_tfd_deadline[tslot] = next;
@@ -1025,7 +1025,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     struct kevent future;
                     int64_t delay = g_tfd_deadline[tslot] - now_ns;
                     if (delay < 0) delay = 0;
-                    EV_SET(&future, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS, delay, NULL);
+                    EV_SET(&future, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS | NOTE_CRITICAL, delay, NULL);
                     (void)kevent(rfd, &future, 1, NULL, 0, NULL);
                     g_tfd_first_oneshot[tslot] = 1;
                 }
@@ -1085,7 +1085,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 int64_t next = g_tfd_deadline[tslot];
                 if (next <= now_ns) next += ((now_ns - next) / g_tfd_interval[tslot] + 1) * g_tfd_interval[tslot];
                 int64_t delay = next - now_ns;
-                EV_SET(&rkv, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS, delay, NULL);
+                EV_SET(&rkv, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS | NOTE_CRITICAL, delay, NULL);
                 kevent(rfd, &rkv, 1, NULL, 0, NULL);
                 g_tfd_deadline[tslot] = next;
             }
