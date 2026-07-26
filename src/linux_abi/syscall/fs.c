@@ -3323,7 +3323,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // reach the opaque jail planner below; treating it as an overlay path bypasses typed directory I/O.
         char overlay_guest[4200];
         abs_guest((int)a0, (const char *)a1, overlay_guest, sizeof overlay_guest);
-        if (g_rootfs && g_nlower && !jail_is_vol(overlay_guest)) {
+        const hl_provider_node *projected =
+            hl_provider_namespace_launch_resolve(overlay_guest, strlen(overlay_guest));
+        if (g_rootfs && g_nlower && !jail_is_vol(overlay_guest) && projected == NULL) {
             const char *gp = overlay_guest;
             char host[4300];
             // O_WRONLY/O_RDWR/O_CREAT -> write
@@ -4408,7 +4410,36 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         const char *xpath = NULL;
         int xfd = -1;
         char ep[1024];
-        if (proc_self_exe(gp, ep, sizeof ep)) {
+        char provider_path[4200];
+        const hl_provider_node *provider;
+        guest_abspath_at((int)a0, raw, provider_path, sizeof provider_path);
+        provider = hl_provider_namespace_launch_resolve(provider_path, strlen(provider_path));
+        if (provider != NULL && provider->kind != HL_PROVIDER_NODE_DIRECTORY &&
+            provider->kind != HL_PROVIDER_NODE_SYMLINK) {
+            hl_host_result opened =
+                hl_provider_files_open_service(provider->service, HL_HOST_FILE_READ);
+            hl_host_file_metadata metadata;
+            if (opened.status != HL_STATUS_OK ||
+                g_host_services->file->metadata(g_host_services->context, opened.value, &metadata).status !=
+                    HL_STATUS_OK) {
+                if (opened.status == HL_STATUS_OK)
+                    (void)g_host_services->file->close(g_host_services->context, opened.value);
+                rc = -EIO;
+            } else {
+                (void)g_host_services->file->close(g_host_services->context, opened.value);
+                memset(&s, 0, sizeof s);
+                s.st_mode = (provider->kind == HL_PROVIDER_NODE_CHARACTER ? S_IFCHR :
+                             provider->kind == HL_PROVIDER_NODE_BLOCK ? S_IFBLK : S_IFREG) |
+                            (mode_t)provider->mode;
+                s.st_uid = (uid_t)provider->uid;
+                s.st_gid = (gid_t)provider->gid;
+                if (provider->kind == HL_PROVIDER_NODE_CHARACTER || provider->kind == HL_PROVIDER_NODE_BLOCK)
+                    s.st_rdev = (dev_t)hl_linux_device_make(provider->major, provider->minor);
+                s.st_size = (off_t)metadata.size;
+                s.st_nlink = 1;
+                rc = 0;
+            }
+        } else if (proc_self_exe(gp, ep, sizeof ep)) {
             // /proc/[self|pid]/exe magic symlink -> the running executable
             if (nofollow) { // the magic symlink itself (Linux: st_size == 0)
                 memset(&s, 0, sizeof s);

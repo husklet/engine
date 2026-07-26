@@ -915,6 +915,35 @@ static int overlay_readdir(const char *gdir, char (**names_out)[256], uint8_t **
             nout++;
         }
     }
+    {
+        uint32_t cursor = 0;
+        const hl_provider_node *node;
+        while ((node = hl_provider_namespace_launch_child(gdir, strlen(gdir), &cursor)) != NULL) {
+            size_t prefix = !strcmp(gdir, "/") ? 1 : strlen(gdir) + 1;
+            size_t child_size = node->path_size - prefix;
+            char child[256];
+            uint8_t type;
+            int duplicate = 0;
+            if (child_size == 0 || child_size >= sizeof child) continue;
+            memcpy(child, node->path + prefix, child_size);
+            child[child_size] = 0;
+            for (int index = 0; index < ns; ++index)
+                if (!strcmp(seen[index], child)) {
+                    duplicate = 1;
+                    break;
+                }
+            if (duplicate) continue;
+            type = node->kind == HL_PROVIDER_NODE_DIRECTORY   ? DT_DIR
+                   : node->kind == HL_PROVIDER_NODE_SYMLINK   ? DT_LNK
+                   : node->kind == HL_PROVIDER_NODE_CHARACTER ? DT_CHR
+                   : node->kind == HL_PROVIDER_NODE_BLOCK     ? DT_BLK
+                                                              : DT_REG;
+            if (ovl_seen(&seen, &scap, ns, child) < 0) break;
+            ns++;
+            if (ovl_push(&names, &types, &cap, nout, child, type) < 0) break;
+            nout++;
+        }
+    }
     free(seen);
     *names_out = names;
     *types_out = types;

@@ -381,14 +381,13 @@ static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, uint32_t 
     }
     request = (hl_open_request){
         absolute, strlen(absolute), HL_HOST_HANDLE_INVALID, intent, g_nlower != 0, jail_ro(absolute), 0};
-    if (hl_open_plan_build(&request, plan) != HL_STATUS_OK) return -EINVAL;
     {
         const hl_provider_node *service = hl_provider_namespace_launch_resolve(absolute, strlen(absolute));
         if (service != NULL) {
             hl_host_result opened;
             int placeholder;
             int reserve_result;
-            if ((intent & (HL_OPEN_CREATE | HL_OPEN_DIRECTORY | HL_OPEN_PATH_ONLY)) != 0) return -EINVAL;
+            if ((intent & (HL_OPEN_DIRECTORY | HL_OPEN_PATH_ONLY)) != 0) return -EINVAL;
             reserve_result = reserve != NULL ? reserve(reserve_opaque) : 0;
             if (reserve_result < 0) return reserve_result;
             opened = hl_provider_files_open_service(service->service, host_access | HL_HOST_FILE_NONBLOCK);
@@ -407,6 +406,7 @@ static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, uint32_t 
             return placeholder;
         }
     }
+    if (hl_open_plan_build(&request, plan) != HL_STATUS_OK) return -EINVAL;
     /* Complete namespace/read-only/overlay validation before open_beneath can
        create or truncate the host object. */
     native_parent = jail_at(dirfd, raw, final, final_size, (intent & HL_OPEN_NOFOLLOW) != 0);

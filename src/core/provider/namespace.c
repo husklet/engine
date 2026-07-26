@@ -179,6 +179,30 @@ const hl_provider_node *hl_provider_namespace_launch_resolve(const char *path, s
     return hl_provider_namespace_resolve(&launch_namespace, path, path_size);
 }
 
+const hl_provider_node *hl_provider_namespace_launch_child(const char *directory, size_t directory_size,
+                                                           uint32_t *cursor) {
+    uint32_t index;
+    if (directory == NULL || cursor == NULL || directory_size == 0) return NULL;
+    for (index = *cursor; index < launch_namespace.count; ++index) {
+        const hl_provider_node *node = &launch_namespace.nodes[index];
+        size_t prefix_size = directory_size;
+        const char *child;
+        size_t child_size;
+        if (directory_size == 1 && directory[0] == '/')
+            prefix_size = 0;
+        else if (node->path_size <= directory_size || node->path[directory_size] != '/')
+            continue;
+        if (prefix_size != 0 && memcmp(node->path, directory, prefix_size) != 0) continue;
+        child = node->path + prefix_size + 1;
+        child_size = node->path_size - prefix_size - 1;
+        if (child_size == 0 || memchr(child, '/', child_size) != NULL) continue;
+        *cursor = index + 1;
+        return node;
+    }
+    *cursor = launch_namespace.count;
+    return NULL;
+}
+
 void hl_provider_namespace_launch_revoke(void) {
     hl_provider_namespace_revoke(&launch_namespace);
 }
