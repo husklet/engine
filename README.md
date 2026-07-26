@@ -6,17 +6,24 @@ HL Engine runs AArch64 and x86-64 Linux programs on AArch64 macOS and Linux host
 | --- | --- | --- |
 | macOS AArch64 | Supported | AArch64, x86-64 |
 | Linux AArch64 | Supported | AArch64, x86-64 |
-| Linux x86-64 | In progress — see below | AArch64 (interpreted) |
+| Linux x86-64 | In progress — see below | AArch64, x86-64 (interpreted) |
 
 "Supported" means the exact-golden compatibility, lifecycle and production matrices pass on that host for **both**
 guest ISAs. Linux x86-64 is not there yet, and the table says only what is proven on it:
 
 - The engine, both guest fixture corpora and `ctest -L unit` (115/115) build and pass, and the published Rust crate
   accepts the host.
-- An **AArch64** Linux guest runs to completion through the production engine. `production.smoke-aarch64`,
-  `compat.isa-aarch64` and `lifecycle.exit-aarch64` pass.
-- An **x86-64** Linux guest reaches glibc's `init_cpu_features` and stops in legacy SSE. `production.smoke-x86_64`
-  is the milestone to watch.
+- **Both** guest ISAs run to completion through the production engine: `production.smoke-aarch64`,
+  `production.smoke-x86_64`, `production.matrix`, both `production.full-*.core-abi` manifests,
+  `production.full-aarch64.signals`, `compat.isa-aarch64` and all ten `lifecycle` cases pass, and
+  `checkpoint` is 77/78.
+- Measured across the whole compatibility corpus — 24 manifests, 1580 active cases, 3013 (case, guest-ISA)
+  runs — **87.4% pass** (aarch64 guest 85.7%, x86-64 guest 89.0%), with zero cross-ISA output divergence
+  among cases passing on both. Most of the remainder is unimplemented named CPU extensions.
+  **None of that is gated by CI yet**: `cmake/CiLanes.cmake` still excludes this host from the compat
+  shards, so `.github/workflows/linux-x86_64.yml` runs only `ctest -L unit`.
+- The engine hosts **itself**: an amd64 host interpreting the AArch64 build of hl-engine, which in turn
+  JIT-compiles an x86-64 guest, runs to completion.
 - Guest execution there is **interpreted**, not JIT-compiled, so it is roughly 10-50× slower than on an AArch64
   host and the `perf-linux` lane is record-only rather than threshold-enforcing. Neither guest ISA has a code
   generator for an x86-64 host: both production frontends emit ARM64 directly.

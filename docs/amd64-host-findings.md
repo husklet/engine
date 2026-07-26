@@ -234,6 +234,51 @@ child's socketpair endpoint — which a later seeds-close then destroyed.
   both must be 1, and `PF` is never written), and **x87 `C1` is not modelled at all** — a stale `C1` left by
   glibc's `fmod` FPREM loop surfaced in an unrelated `FNSTENV` hundreds of instructions later.
 
+## 3.10 What the corpus actually scores, and how the harness hid it
+
+A corpus-wide survey (24 manifests, 1580 active cases, **3013 (case, guest-ISA) runs**, complete coverage —
+nothing skipped for privilege, rootfs or network) measured:
+
+**2632/3013 = 87.4% overall. aarch64 guest 1282/1496 = 85.7%. x86-64 guest 1350/1517 = 89.0%.** Zero
+cross-ISA stdout divergences among cases passing on both. Fully green on both guest ISAs: `syscall-edges`
+(104/104). Green on the x86-64 guest only: `ipc`, `signals`.
+
+Producing that number required **patching the harness**, and the reasons are defects in their own right:
+
+- **`tools/matrix_runner.c:1063` short-circuits the second ISA.**
+  `if (!case_failed && (isa == ISA_X86_64 || isa == ISA_BOTH) && run_one(...))` — an `ISA_BOTH` case that
+  fails on aarch64 never runs the x86-64 leg, and the cross-ISA byte-identity comparison is skipped with it.
+  One lane run therefore cannot produce per-ISA numbers, and the axis it hides is exactly the one that
+  matters on a host where the two backends have diverged.
+- **`tools/linux_matrix.c --suite` is fail-fast** where `matrix_runner` continues. The
+  `production-full-{aarch64,x86_64}` lanes (21 suites each) use it, so each reports only its FIRST failing
+  case — which is why broad `-L production` sweeps were so uninformative. It also silently skips every row
+  with argv/env/rootfs and reports "N active cases passed" without saying how many it skipped.
+- **The hang detector no longer detects hangs.** `matrix_runner`'s base budget is **120 s** (not the 20 s
+  this document previously claimed — that is `linux_matrix`), so scale 30 gives **3600 s per case**, and
+  CI's `compat-soak` override gives **5 hours per case** here; the ctest `TIMEOUT` reaches 30 h per suite.
+  Scaling was the right fix for slow-but-correct being called a hang, but nothing now bounds a real one —
+  and there IS one: **x86-64 futex-across-fork** (`threads/futex-fork-stale-waiter`,
+  `process/{fork-blocked-io,fork-child-futex,shared-key-futex}`), all x86-64-only, all passing on the
+  aarch64 guest, still hung at 300 s with no output. A budget that trips after hours is not a detector.
+- `matrix_runner.c`'s `CASE_MAX = 256` has no bound check while `completeness/manifest.tsv` is at 167 rows;
+  overflow reports *"invalid manifest row"* — a parse error for a file that parses fine.
+- `HL_MATRIX_SCRATCH_DIR` is set only by the workflow, not by CMake, so a local `ctest -L compat-syscall` on
+  an ext4 build tree fails `syscall/memfd-seals` on both ISAs for reasons unrelated to the engine.
+
+**And the claim that gates it all is now false.** `cmake/CiLanes.cmake` omits `Linux-x86_64` from
+`HL_CI_COMPAT_HOSTS` because *"the engine cannot yet EXECUTE guests on an x86_64 host … a compat shard there
+would fail every case rather than measure anything."* It passes 87.4%. That comment is why
+`.github/workflows/linux-x86_64.yml` runs only `ctest -L unit` — so **none of those 3013 runs is gated by CI
+on this host today.** `docs/ci-green.md` repeats the same false premise.
+
+Three correctness bugs the survey flagged loudly were fixed before it reported, because it measured pinned
+binaries from an earlier commit; all three are verified byte-correct against native on current binaries:
+the x86-64 `PACKSSWB`/`PACKUSWB`/`PACKSSDW` high-half corruption (non-deterministic, ~27 runs across 12
+suites), the aarch64 `MOVI Vd.2D` per-bit-to-per-byte expansion, and the `/proc/self/maps` engine SIGSEGV.
+That is a caution about pinning, not about the survey: pinning was correct and necessary, because
+concurrent rebuilds otherwise make a multi-suite sweep measure several different binaries.
+
 ## 4. Documentation that misleads
 
 These cost real time on this task and will cost it again.
