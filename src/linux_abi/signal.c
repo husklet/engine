@@ -19,7 +19,7 @@ static struct {
     uint64_t handler, flags, restorer, mask;
 } g_sigact[65];
 
-// ---------------- Go async-preempt SIGURG suppression for aarch64 Go images (#423) ----------------
+// ---------------- Go async-preempt SIGURG suppression for Go images (#423) ----------------
 // Go's scheduler asynchronously preempts a running goroutine by sending itself SIGURG (23) and injecting a
 // call to runtime.asyncPreempt from the signal handler. Delivering SIGURG into a translated aarch64 Go binary
 // crashes it -- but NOT via a sigframe/SP overlap (that hypothesis was investigated with the
@@ -41,12 +41,18 @@ static struct {
 // (CGO_ENABLED=1 / runtime.iscgo==1) class; it now covers internal-linked Go too, which is exactly the toolchain
 // children that were crashing.
 //
-// Scoped by Go-detection on purpose: g_go_image (set once by the aarch64 load_elf in os/linux/elf.c, keyed on
-// the linker's Go build-info magic) is 1 ONLY for an aarch64 Go main image. It stays 0 for non-Go guests (some
-// legitimately use SIGURG for OOB TCP data -- a Go program never repurposes SIGURG, so dropping it is always
-// safe for a Go image), and for the entire x86 engine (that TU never includes the aarch64 elf.c, and no x86
-// path sets it).
-int g_go_image; // 1 iff the loaded aarch64 main image is a Go binary; owned here, set by load_elf
+// Scoped by Go-detection on purpose: g_go_image (set once by each load_elf, keyed on the linker's Go
+// build-info magic -- elf_is_go_image in goimage.h) is 1 ONLY for a Go main image. It stays 0 for non-Go
+// guests, some of which legitimately use SIGURG for OOB TCP data; a Go program never repurposes SIGURG, so
+// dropping it is always safe for a Go image.
+//
+// BOTH engines latch it. The x86-64 engine did not, and an x86-64 Go guest therefore still received SIGURG:
+// the failure mode there is not the aarch64 crash but a LIVELOCK. sysmon re-sends the preempt signal
+// (getpid+tgkill, ~4k/s) because the block-boundary delivery never reaches an async-safe point, so the GC's
+// stop-the-world never completes and the program runs forever at full CPU. Measured on the
+// go-static-heapgc compat case: 13% of standalone runs hung past the 120s case budget having executed
+// >500M translated blocks, against a 2.4s normal completion.
+int g_go_image; // 1 iff the loaded main image is a Go binary; owned here, set by load_elf
 
 // Should SIGURG (Go async-preempt) delivery be dropped for this process? The detected Go class is fixed
 // before any signal fires.
@@ -559,7 +565,7 @@ static void maybe_deliver_signal(struct cpu *c) {
         // was force-marked by rt_sigsuspend/pause (POSIX: the awaited handler runs during the suspend even
         // though the restored mask blocks it). g_force_deliver overrides the mask for exactly that one bit.
         if (!(p & bit)) continue;
-        // INTERIM: suppress Go's async-preempt SIGURG (23) for a cgo aarch64 Go image (see the note at the
+        // INTERIM: suppress Go's async-preempt SIGURG (23) for a Go image (see the note at the
         // top of this file). Drop the pending instance from both queues so it is never delivered to the guest
         // handler; cooperative preemption keeps the program correct. Scoped to exactly the Go-image class.
         if (sig == 23 && sigurg_drop_enabled()) {
