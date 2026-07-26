@@ -924,18 +924,14 @@ int64_t hl_linux_object_poll(hl_linux_abi *linux_abi, hl_linux_poll_entry *entri
                     uint32_t host_interests = 0;
                     uint32_t ready = 0;
                     hl_host_result observed = {.status = HL_STATUS_NOT_SUPPORTED};
-                    if ((entries[index].interests & HL_LINUX_READY_READ) != 0)
-                        host_interests |= HL_HOST_READY_READ;
-                    if ((entries[index].interests & HL_LINUX_READY_WRITE) != 0)
-                        host_interests |= HL_HOST_READY_WRITE;
-                    if ((entries[index].interests & HL_LINUX_READY_ERROR) != 0)
-                        host_interests |= HL_HOST_READY_ERROR;
-                    if ((entries[index].interests & HL_LINUX_READY_HANGUP) != 0)
-                        host_interests |= HL_HOST_READY_HANGUP;
-                    if ((linux_abi->host->capabilities & HL_HOST_CAP_STREAM) != 0 &&
-                        linux_abi->host->stream != NULL && linux_abi->host->stream->readiness != NULL)
-                        observed = linux_abi->host->stream->readiness(
-                            linux_abi->host->context, snapshot.host_handle, host_interests);
+                    if ((entries[index].interests & HL_LINUX_READY_READ) != 0) host_interests |= HL_HOST_READY_READ;
+                    if ((entries[index].interests & HL_LINUX_READY_WRITE) != 0) host_interests |= HL_HOST_READY_WRITE;
+                    if ((entries[index].interests & HL_LINUX_READY_ERROR) != 0) host_interests |= HL_HOST_READY_ERROR;
+                    if ((entries[index].interests & HL_LINUX_READY_HANGUP) != 0) host_interests |= HL_HOST_READY_HANGUP;
+                    if ((linux_abi->host->capabilities & HL_HOST_CAP_STREAM) != 0 && linux_abi->host->stream != NULL &&
+                        linux_abi->host->stream->readiness != NULL)
+                        observed = linux_abi->host->stream->readiness(linux_abi->host->context, snapshot.host_handle,
+                                                                      host_interests);
                     if (observed.status == HL_STATUS_OK) {
                         if ((observed.value & HL_HOST_READY_READ) != 0) ready |= HL_LINUX_READY_READ;
                         if ((observed.value & HL_HOST_READY_WRITE) != 0) ready |= HL_LINUX_READY_WRITE;
