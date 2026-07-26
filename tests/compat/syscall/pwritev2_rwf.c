@@ -10,7 +10,7 @@
 
 int main(void) {
     char path[64];
-    snprintf(path, sizeof path, "build/compat/syscall/hl_pwritev2_%d", (int)getpid());
+    snprintf(path, sizeof path, "/tmp/hl_pwritev2_%d", (int)getpid());
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { perror("open"); return 1; }
 

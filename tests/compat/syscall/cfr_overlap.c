@@ -10,8 +10,8 @@
 
 int main(void) {
     char sp[64], dp[64];
-    snprintf(sp, sizeof sp, "build/compat/syscall/hl_cfr_s_%d", (int)getpid());
-    snprintf(dp, sizeof dp, "build/compat/syscall/hl_cfr_d_%d", (int)getpid());
+    snprintf(sp, sizeof sp, "/tmp/hl_cfrov_s_%d", (int)getpid());
+    snprintf(dp, sizeof dp, "/tmp/hl_cfrov_d_%d", (int)getpid());
     int fd = open(sp, O_RDWR | O_CREAT | O_TRUNC, 0644);
     write(fd, "ABCDEFGHIJ", 10);
 
