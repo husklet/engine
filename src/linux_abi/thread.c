@@ -665,7 +665,18 @@ static int filemap_source_fd(struct guest_file_mapping *mapping);
  * 16K-offset mmap on Apple silicon.  mmap therefore materializes those VMAs
  * as private snapshots (emulated=1).  MAP_SHARED stores must still update the
  * backing object before a following syscall can notify another process.
+ *
+ * ONLY the snapshot form.  mmap has a second emulated=1 representation: the
+ * logical-VMA ledger, which keeps a real MAP_SHARED window over the same vnode
+ * at an engine-private host address and relocates guest accesses into it
+ * (host = guest + host_delta).  Those stores are already in the vnode -- and
+ * the guest address they name is a reservation holding no data at all, so
+ * writing it back would publish unrelated bytes over the guest's own.
  */
+static int filemap_bytes_live_at_guest_address(uint64_t first, uint64_t last) {
+    return !hl_logical_vma_global_overlap(first, last - first);
+}
+
 static void filemap_flush_emulated(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
     pthread_mutex_lock(&g_filemap_lock);
@@ -675,6 +686,7 @@ static void filemap_flush_emulated(uint64_t lo, uint64_t hi) {
         uint64_t first = lo > mapping->lo ? lo : mapping->lo;
         uint64_t last = hi < mapping->hi ? hi : mapping->hi;
         uint64_t offset = mapping->offset + first - mapping->lo;
+        if (!filemap_bytes_live_at_guest_address(first, last)) continue;
         int fd = filemap_source_fd(mapping);
         if (fd < 0) continue;
         if (filemap_pwrite(fd, (const void *)(uintptr_t)first, (size_t)(last - first), (off_t)offset) ==
@@ -870,6 +882,13 @@ static void filemap_written_identity(uint64_t device, uint64_t inode, int source
         }
         uint64_t lo = offset > map_lo ? offset : map_lo;
         uint64_t hi = end < map_hi ? end : map_hi;
+        /* Same ledger caveat as filemap_flush_emulated: a logical-VMA mapping
+           does not keep its bytes at the guest address, and its window over the
+           vnode never went stale in the first place. */
+        if (hi > lo && mapping->shared &&
+            !filemap_bytes_live_at_guest_address(mapping->lo + lo - mapping->offset,
+                                                 mapping->lo + hi - mapping->offset))
+            continue;
         int fd = source_fd >= 0 ? source_fd : filemap_source_fd(mapping);
         if (hi > lo && fd >= 0) {
             ssize_t loaded;

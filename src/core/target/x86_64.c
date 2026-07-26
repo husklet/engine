@@ -301,6 +301,36 @@ void emit_load_mem(struct insn *insn, uint64_t next, int width, int rt) {
 #include "../../translator/guest/x86_64/cache.c"     // persistent translated-code cache (HL_PCACHE=1)
 #include "../../linux_abi/thread.c"                  // SHARED: clone->pthread, per-thread cpu, futex
 
+/*
+ * Queue the bytes a store actually wrote into an emulated MAP_SHARED mapping,
+ * for jit86_smc_commit to write back before the next syscall can notify a
+ * peer.  Only ever called with the range the guest really stored -- see the
+ * store_ranges comment in cpu.h for why the alias ranges must stay out.
+ */
+static void jit86_store_writeback_record(struct cpu *cpu, uint64_t lo, uint64_t hi) {
+    for (uint64_t index = 0; index < cpu->store_range_count; ++index) {
+        if (hi < cpu->store_ranges[index][0] || lo > cpu->store_ranges[index][1]) continue;
+        if (lo < cpu->store_ranges[index][0]) cpu->store_ranges[index][0] = lo;
+        if (hi > cpu->store_ranges[index][1]) cpu->store_ranges[index][1] = hi;
+        return;
+    }
+    if (cpu->store_range_count == X86_STORE_RANGE_CAP) {
+        /*
+         * Full.  Publish the oldest range now and reuse its slot: the store it
+         * describes has already happened, so writing it back early is sound,
+         * and it keeps the queue EXACT.  Coalescing distant ranges instead
+         * would fabricate a span covering bytes the guest never wrote, which
+         * is the very thing this queue exists to avoid.
+         */
+        filemap_flush_emulated(cpu->store_ranges[0][0], cpu->store_ranges[0][1]);
+        memmove(cpu->store_ranges, cpu->store_ranges + 1, (X86_STORE_RANGE_CAP - 1) * sizeof cpu->store_ranges[0]);
+        cpu->store_range_count--;
+    }
+    cpu->store_ranges[cpu->store_range_count][0] = lo;
+    cpu->store_ranges[cpu->store_range_count][1] = hi;
+    cpu->store_range_count++;
+}
+
 static void jit86_store_alias_changed(uint64_t guest, uint64_t size) {
     if (size == 0 || guest > UINT64_MAX - size) return;
     if (!filemap_shared_filter_maybe(guest, size)) return;
@@ -308,6 +338,7 @@ static void jit86_store_alias_changed(uint64_t guest, uint64_t size) {
     if (cpu == NULL) return;
     uint64_t ranges[GNA_MAX + 1][2];
     uint32_t range_count = 0;
+    int emulated_store = 0;
 
     pthread_mutex_lock(&g_filemap_lock);
     uint64_t device = 0, inode = 0, offset = 0, length = 0;
@@ -320,6 +351,7 @@ static void jit86_store_alias_changed(uint64_t guest, uint64_t size) {
         offset = mapping->offset + (guest - mapping->lo);
         device = mapping->device;
         inode = mapping->inode;
+        emulated_store = mapping->emulated != 0;
         ranges[range_count][0] = guest;
         ranges[range_count][1] = guest + length;
         range_count++;
@@ -344,6 +376,9 @@ static void jit86_store_alias_changed(uint64_t guest, uint64_t size) {
     }
     pthread_mutex_unlock(&g_filemap_lock);
     if (range_count == 0) return;
+    /* ranges[0] is the store itself; ranges[1..] are its aliases, which hold
+       the bytes this store replaced and must never be written back. */
+    if (emulated_store) jit86_store_writeback_record(cpu, ranges[0][0], ranges[0][1]);
     for (uint32_t r = 0; r < range_count; ++r) {
         uint64_t lo = ranges[r][0], hi = ranges[r][1];
         int merged = 0;
@@ -371,11 +406,12 @@ static int jit86_store_alias_observation_active(void) {
 
 static void jit86_smc_commit(struct cpu *cpu) {
     stw_mapping_begin();
-    if (cpu->smc_range_overflow)
-        filemap_flush_emulated(0, UINT64_MAX);
-    else
-        for (uint64_t index = 0; index < cpu->smc_range_count; ++index)
-            filemap_flush_emulated(cpu->smc_ranges[index][0], cpu->smc_ranges[index][1]);
+    /* Writeback is driven by store_ranges, never by smc_ranges: an SMC range
+       overflow means "drop every translation", but there is no matching
+       conservative writeback -- flushing an unwritten range destroys data. */
+    for (uint64_t index = 0; index < cpu->store_range_count; ++index)
+        filemap_flush_emulated(cpu->store_ranges[index][0], cpu->store_ranges[index][1]);
+    cpu->store_range_count = 0;
     uint32_t removed;
     if (cpu->smc_range_overflow) {
         removed = g_live_map_count;
