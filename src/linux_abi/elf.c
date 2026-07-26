@@ -2,6 +2,7 @@
 
 #include "page.h"
 #include "image.h"
+#include "goimage.h"
 
 // ---------------- minimal ELF loader (load segments HIGH; PC-relative stays valid) ----------------
 static uint16_t rd16(const uint8_t *p) {
@@ -730,22 +731,6 @@ static void elf_mprotect_besteffort(const hl_host_memory_mapping *mapping, void 
         if (result.status == HL_STATUS_OK || result.status != HL_STATUS_OUT_OF_MEMORY || t >= ELF_MAP_RETRIES) return;
         usleep(2000u << t); // transient pressure: back off and re-tighten
     }
-}
-
-// INTERIM: is `f` (an aarch64 ELF, size `sz`) a Go image at all? Every Go binary carries a linker-embedded
-// build-info blob (magic "\xff Go buildinf:"); its presence uniquely identifies a Go main image, whose
-// runtime OWNS SIGURG for async preemption. hl cannot yet honor Go's async-safe-point model, so it suppresses
-// that SIGURG for EVERY Go image (see os/linux/signal.c, g_go_image) -- functionally identical to Go's own
-// supported GODEBUG=asyncpreemptoff=1. Originally scoped to the cgo (CGO_ENABLED=1 / runtime.iscgo==1) class,
-// but the internal-linked toolchain children `go build` spawns (compile/asm/link) crash identically when
-// SIGURG is delivered (sysmon usleep SIGSEGV / clone EAGAIN under load), so the gate is the Go magic alone.
-// A non-Go guest is NEVER matched, so a non-Go program that legitimately uses SIGURG for OOB TCP data is
-// unaffected; a Go program never repurposes SIGURG, so dropping it is always safe for a Go image.
-static int elf_is_go_image(const uint8_t *f, size_t sz) {
-    static const char magic[14] = {(char)0xff, ' ', 'G', 'o', ' ', 'b', 'u', 'i', 'l', 'd', 'i', 'n', 'f', ':'};
-    for (size_t i = 0; i + sizeof(magic) <= sz; i++)
-        if (f[i] == (uint8_t)magic[0] && !memcmp(f + i, magic, sizeof(magic))) return 1;
-    return 0; // not a Go binary -> never suppress SIGURG for it
 }
 
 static void load_elf(const char *path, struct loaded *out) {

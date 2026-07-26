@@ -1,5 +1,6 @@
 // hl/linux_abi -- x86-64 ELF loader (load PT_LOAD high; static-PIE + dynamic via ld.so) + stack.
 #include "placement.h"
+#include "goimage.h"
 
 struct elf_host_map_context {
     hl_host_memory_mapping mapping;
@@ -484,6 +485,10 @@ static void load_elf(const char *path, struct loaded *out) {
     if (g_trace || g_diag)
         fprintf(stderr, "[LOADED] %s base=%llx span=%llx end=%llx entry=%llx\n", path, (unsigned long long)base,
                 (unsigned long long)span, (unsigned long long)((uint64_t)base + span), (unsigned long long)out->entry);
+    // Latch a Go main image so signal delivery suppresses Go's async-preempt SIGURG (signal.c, g_go_image),
+    // exactly as the aarch64 loader does. OR, never clear: the interp load must not clobber a main-image
+    // match; execve resets the flag before re-loading.
+    g_go_image |= elf_is_go_image(f, image.size);
     hl_linux_image_release(&image);
 }
 
