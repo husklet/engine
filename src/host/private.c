@@ -250,7 +250,29 @@ int hl_host_process_fd_private_floor(void) {
     const rlim_t reserve = HL_HOST_PRIVATE_DESCRIPTOR_MINIMUM;
     const rlim_t maximum_guest = HL_LINUX_FD_LIMIT;
     if (limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur > INT32_MAX) limit.rlim_cur = INT32_MAX;
-    if (limit.rlim_cur <= HL_HOST_GUEST_DESCRIPTOR_MINIMUM + reserve) return -EMFILE;
+    /* When the soft limit does not clear the generous guest minimum, anchor the private interval just under
+     * the real ceiling instead of refusing. This is the same strategy -- and the same justification -- as the
+     * Darwin branch above: the floor's job is to keep typed host handles ABOVE whatever the enforceable guest
+     * ceiling actually is, and a floor below HL_HOST_GUEST_DESCRIPTOR_MINIMUM is fine when that minimum is
+     * not reachable, because then it is not the true ceiling.
+     *
+     * This is what lets the engine host ITSELF. The engine reports a guest RLIMIT_NOFILE soft limit of 20480
+     * (linux_abi/syscall/proc.c, the docker default the goldens were captured against), and 20480 is at or
+     * under HL_HOST_GUEST_DESCRIPTOR_MINIMUM + reserve == 24576 -- so when a guest IS an hl-engine, every
+     * hl_host_process_fd_private_adopt returned -EMFILE and the nested run died with
+     * HL_STATUS_RESOURCE_LIMIT before executing a single guest instruction. Nested engine-in-engine is the
+     * sharpest test the runtime has, because the inner guest is a JIT: it exercises mmap PROT_EXEC, W^X,
+     * self-modifying code and the icache-maintenance path all at once.
+     *
+     * Deliberately NOT fixed by raising our own soft limit toward the hard one: hl_engine_guest_fd_limit()
+     * below re-reads RLIMIT_NOFILE and derives the GUEST-VISIBLE ceiling from it, and its comment requires
+     * that to stay stable across hosts so goldens match. Raising the process limit would move
+     * /proc/self/limits from 20480 to 61440. The floor is the half that may move; the guest-visible number
+     * is not.
+     *
+     * Hosts whose soft limit already clears 24576 are unaffected -- they take the same arithmetic as before.
+     * Hosts below it previously could not run the engine at all, so there is no prior behaviour to preserve. */
+    if (limit.rlim_cur <= reserve + 1u) return -EMFILE;
     rlim_t guest = limit.rlim_cur - reserve;
     if (guest > maximum_guest) guest = maximum_guest;
     return (int)guest;
