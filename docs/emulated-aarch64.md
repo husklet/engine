@@ -106,15 +106,21 @@ not part of its contract. Noted so the next person does not re-derive it.
 ## Status
 
 Registry-only in `cmake/CiLanes.cmake` (`HL_CI_REGISTRY_LINUX`, reserved to
-`Linux-x86_64` via `HL_CI_HOST_CPU_ONLY`). No workflow runs it, because two of its
-three cells fail on real defects in the shipped aarch64 host:
+`Linux-x86_64` via `HL_CI_HOST_CPU_ONLY`).
 
-- `emulated.isa-x86-64` — `isa-regress` fails on 107 lines, all two-NaN operand
-  selection.
-- `emulated.completeness` — `movq-mmx-xmm`, `cvt-mmx`, `div-overflow` and
-  `x87-compare-codes` fail; `mmx-width` passes.
+The five defects that kept it out of a workflow are now fixed, and every one of them
+was found **by this lane** — none was reachable before it existed:
+
+- `emulated.isa-x86-64` — 8/8. The 107-line failure was the two-NaN operand rule:
+  the engine implemented qemu-x86_64's softfloat `float_2nan_prop_x87`, where real
+  hardware is plain src1-priority-quieted. Measured on Zen 4 over all 64 ordered NaN
+  pairs; the goldens were right all along.
+- `emulated.completeness` — `movq-mmx-xmm` (MOVQ2DQ/MOVDQ2Q were not lowered at
+  all), `cvt-mmx` (all 160 lines) and `x87-compare-codes` (FCOM/FCOMI did not set
+  FSW.IE) now pass, as do `mmx-width` and `div-overflow`. Only `priority` fails, and
+  only because the harness process is already at nice 12 and cannot lower it -- it
+  fails identically on BOTH ISAs and on the native lane, so it is environmental.
 - `emulated.abi` — green, and present as a control: without one, total breakage and
   a correctly-reported defect look alike.
 
-Wire it into `.github/workflows/linux-x86_64.yml` once those are fixed. Adding it
-while red would either block the branch or train people to ignore it.
+Wiring it into `.github/workflows/linux-x86_64.yml` is now the right move.

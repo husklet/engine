@@ -259,8 +259,8 @@ void hl_x86_x87_round(void) {
 void hl_x86_x87_test(void) {
     hl_x86_x87_load(18, 0);
     e_movconst(16, 0);
-    e_fmov_to_d(16, 16);    // d16 = 0.0
-    e_fcom_setfpsw(18, 16); // ST0 : 0.0 -> C0/C2/C3
+    e_fmov_to_d(16, 16);       // d16 = 0.0
+    e_fcom_setfpsw(18, 16, 1); // ST0 : 0.0 -> C0/C2/C3; FTST signals on any NaN
 }
 
 // x87 FSW exception flags (bits IE0/DE1/ZE2/OE3/UE4/PE5) mirror the SSE MXCSR exception bits and, like

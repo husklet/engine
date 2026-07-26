@@ -85,10 +85,10 @@ static void packed_converts(void) {
 }
 
 /* ---------------------------------------------------------------- SSE NaN selection */
-/* x86 selects SRC1 when SRC1 is a QNaN, otherwise SRC2 if that is a NaN, otherwise SRC1. The
- * (QNaN, QNaN) pair -- the common one, since every propagated NaN is quiet -- used to come out
- * as SRC2. Also: horizontal ops add the ODD lane FIRST, and a GENERATED NaN carries x86's
- * negative indefinite sign. */
+/* x86 selects SRC1 whenever SRC1 is a NaN of either kind, else SRC2, and quiets it -- plain src1
+ * priority, measured on Zen 4 over all 64 ordered NaN pairs. The (QNaN, QNaN) pair -- the common
+ * one, since every propagated NaN is quiet -- used to come out as SRC2. Also: horizontal ops add
+ * the EVEN lane FIRST, and a GENERATED NaN carries x86's negative indefinite sign. */
 static void sse_nan(void) {
     static const unsigned int NANS[][2] = {
         {0xffffffffu, 0x7fc00001u}, /* qnan , qnan */
@@ -363,8 +363,9 @@ static void unaligned_atomics(void) {
 }
 
 /* ---------------------------------------------------------------- two-NaN operand selection */
-/* When both inputs of an FP lane are NaN, the operand that survives is chosen by significand and
- * kind, not by ARM's SNaN-first rule (see avx_dnan_f32/f64). The SSE3 horizontal/addsub family
+/* When both inputs of an FP lane are NaN, x86 keeps SRC1 unconditionally (quieted) -- not ARM's
+ * SNaN-first-else-src1 rule, which agrees on 12 of these 16 pairs and diverges on the four with a
+ * QNaN src1 and an SNaN src2 (see avx_dnan_f32/f64). The SSE3 horizontal/addsub family
  * (0F 7C/7D/D0) had NO NaN-input gate at all and so always took ARM's answer. */
 static const unsigned long long NANK[6] = {
     0x7ff0000000000001ULL, /* sNaN + payload 1 */

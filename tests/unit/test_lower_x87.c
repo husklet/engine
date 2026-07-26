@@ -106,9 +106,10 @@ void e_cset(int d, int c, int sf) {
     (void)sf;
 }
 
-void e_fcom_setfpsw(int l, int r) {
+void e_fcom_setfpsw(int l, int r, int signaling) {
     (void)l;
     (void)r;
+    (void)signaling;
 }
 
 void e_fmov_from_d(int d, int s) {

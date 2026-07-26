@@ -734,13 +734,17 @@ void e_fp_push(int vs) {
 
 // fcom-family compare: FCMP dn,dm then set cpu->fpsw bits C0(8)/C2(10)/C3(14) so a
 // following fnstsw ax + sahf reproduces x86 ZF/PF/CF. (clobbers x16/x17/x20)
-void e_fcom_setfpsw(int n, int m) {
-    emit32(0x1E602000u | (m << 16) | (n << 5)); // fcmp dn, dm
-    e_cset(16, 3, 0);                           // less       (LO: C clear)
-    e_cset(20, 6, 0);                           // unordered  (VS)
-    e_rrr(A_ORR, 16, 16, 20, 0, 0);             // C0 = less | unordered
-    e_cset(17, 0, 0);                           // equal      (EQ)
-    e_rrr(A_ORR, 17, 17, 20, 0, 0);             // C3 = equal | unordered
+// `signaling` picks FCMPE over FCMP: FCOM/FCOMP/FCOMPP/FTST raise #IA on ANY NaN, FUCOM* only on an
+// SNaN, which is exactly ARM's FCMPE/FCMP split. FCMP for both left FSW.IE clear where hardware sets it,
+// since the FSW exception bits are projected from the host FPSR (fp_project_exceptions).
+void e_fcom_setfpsw(int n, int m, int signaling) {
+    uint32_t cmp = 0x1E602000u | (signaling ? 0x10u : 0u);
+    emit32(cmp | (m << 16) | (n << 5)); // fcmp/fcmpe dn, dm
+    e_cset(16, 3, 0);                   // less       (LO: C clear)
+    e_cset(20, 6, 0);                   // unordered  (VS)
+    e_rrr(A_ORR, 16, 16, 20, 0, 0);     // C0 = less | unordered
+    e_cset(17, 0, 0);                   // equal      (EQ)
+    e_rrr(A_ORR, 17, 17, 20, 0, 0);     // C3 = equal | unordered
     e_lsl_i(16, 16, 8, 0);
     e_lsl_i(20, 20, 10, 0);
     e_rrr(A_ORR, 16, 16, 20, 0, 0); // | C2<<10
