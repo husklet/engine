@@ -11,22 +11,32 @@ HL Engine runs AArch64 and x86-64 Linux programs on AArch64 macOS and Linux host
 "Supported" means the exact-golden compatibility, lifecycle and production matrices pass on that host for **both**
 guest ISAs. Linux x86-64 is not there yet, and the table says only what is proven on it:
 
-- The engine, both guest fixture corpora and `ctest -L unit` (115/115) build and pass, and the published Rust crate
-  accepts the host.
+- The engine, both guest fixture corpora, `ctest -L unit` and `ctest -L package` build and pass, and the
+  published Rust crate accepts the host.
 - **Both** guest ISAs run to completion through the production engine: `production.smoke-aarch64`,
   `production.smoke-x86_64`, `production.matrix`, both `production.full-*.core-abi` manifests,
   `production.full-aarch64.signals`, `compat.isa-aarch64` and all ten `lifecycle` cases pass, and
   `checkpoint` is 77/78.
 - Measured across the whole compatibility corpus — 24 manifests, 1580 active cases, 3013 (case, guest-ISA)
-  runs — **87.4% pass** (aarch64 guest 85.7%, x86-64 guest 89.0%), with zero cross-ISA output divergence
-  among cases passing on both. Most of the remainder is unimplemented named CPU extensions.
+  runs, per case, nothing sampled, binaries pinned — **99.34% pass** (aarch64 guest 1488/1496, x86-64 guest
+  1505/1517), with zero cross-ISA output divergence among cases passing on both. **20 of the 24 matrix
+  suites are fully green on both guest ISAs.** The remainder is a short list of named defects, each with a
+  reproducer, in [`docs/amd64-host-findings.md`](docs/amd64-host-findings.md) §3.12.
   **None of that is gated by CI yet**: `cmake/CiLanes.cmake` still excludes this host from the compat
   shards, so `.github/workflows/linux-x86_64.yml` runs only `ctest -L unit`.
-- The engine hosts **itself**: an amd64 host interpreting the AArch64 build of hl-engine, which in turn
-  JIT-compiles an x86-64 guest, runs to completion.
-- Guest execution there is **interpreted**, not JIT-compiled, so it is roughly 10-50× slower than on an AArch64
-  host and the `perf-linux` lane is record-only rather than threshold-enforcing. Neither guest ISA has a code
-  generator for an x86-64 host: both production frontends emit ARM64 directly.
+- The engine hosts **itself**, and it is a gate rather than a habit — `nested.*`, five cells. An amd64 host
+  interpreting the AArch64 build of hl-engine, which in turn JIT-compiles an x86-64 guest, runs to
+  completion; so does a three-engine chain. The lane skips loudly, never silently, when the aarch64 cross
+  build is absent.
+- Guest execution there is **interpreted**, not JIT-compiled. Measured overhead is not one number: **3.4×
+  on kernel-bound work, 94–605× on guest-execution-bound work** (median 25.3×), so the `perf-linux` lane is
+  record-only rather than threshold-enforcing. The single largest cost is a host syscall per guest basic
+  block, not the interpretation — see [`docs/amd64-host-performance.md`](docs/amd64-host-performance.md).
+  Neither guest ISA has a code generator for an x86-64 host: both production frontends emit ARM64 directly.
+- The AArch64 host arm can be **executed** on an x86-64 box under `qemu-aarch64`, which is how several
+  defects in the shipped AArch64 JIT were confirmed rather than merely inferred.
+  [`docs/emulated-aarch64.md`](docs/emulated-aarch64.md) states precisely what emulation vouches for and
+  what it does not — notably not weak memory ordering.
 
 [`docs/amd64-host.md`](docs/amd64-host.md) explains the seam, the (host CPU × guest ISA) matrix and the staging;
 [`docs/amd64-host-findings.md`](docs/amd64-host-findings.md) records the defects that work turned up and what a

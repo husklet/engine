@@ -183,7 +183,21 @@ made this change bigger than it needed to be.
 
 ## 6. Status
 
-See the host table in README.md for what is proven. The build, the unit lane and the guest fixtures for
-both guest ISAs are green on an x86-64 Linux host; guest execution is gated on the interpreter backends.
-`ctest -L production` with `production.smoke-x86_64` is the cheapest end-to-end proof and is the milestone
-to watch.
+Both guest ISAs execute on an x86-64 Linux host. The compat corpus scores **2993/3013 = 99.34%** across
+1580 cases and both guest ISAs, measured per case with pinned binaries and nothing sampled — 20 of the 24
+matrix suites fully green on both. `unit` is green, `package` passes all seven steps, and the aarch64 cross
+build is at zero errors, which is the check that keeps the shipped host honest: CI's aarch64 runners never
+compile the x86_64 arms, so this is the inverse of that gap.
+
+Engine-in-engine is a gate rather than a habit (`nested.*`, five cells). The acceptance criterion — an
+aarch64 engine hosting an x86-64 engine hosting a guest — passes, and so does a three-engine chain that
+puts an aarch64 host through engine-in-engine on a machine with no aarch64 hardware.
+
+`qemu-aarch64` is available here, so the AArch64 host arm is no longer unexecutable on this box; see
+`docs/emulated-aarch64.md` for exactly what emulation vouches for and what it does not. That lane is
+registry-only until the defects it found are fixed and qemu is in the devShell.
+
+What remains is in `docs/amd64-host-findings.md` §3.12 onward: a short list of named defects, each with a
+reproducer, plus the Stage 2 transliterator of §3.1 above. Performance is measured, not guessed —
+`docs/amd64-host-performance.md` — and the single largest cost is a host syscall per guest basic block,
+not the interpretation itself.
