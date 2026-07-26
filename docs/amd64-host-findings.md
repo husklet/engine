@@ -248,11 +248,25 @@ child's socketpair endpoint — which a later seeds-close then destroyed.
 ## 3.10 What the corpus actually scores, and how the harness hid it
 
 A corpus-wide survey (24 manifests, 1580 active cases, **3013 (case, guest-ISA) runs**, complete coverage —
-nothing skipped for privilege, rootfs or network) measured:
+nothing skipped for privilege, rootfs or network) measured, on the binaries of the day:
 
 **2632/3013 = 87.4% overall. aarch64 guest 1282/1496 = 85.7%. x86-64 guest 1350/1517 = 89.0%.** Zero
 cross-ISA stdout divergences among cases passing on both. Fully green on both guest ISAs: `syscall-edges`
 (104/104). Green on the x86-64 guest only: `ipc`, `signals`.
+
+**Superseded by a second sweep after the fixes landed.** Same method, same completeness, pinned binaries,
+one `matrix_runner` invocation per case so both legs always run:
+
+**2993/3013 = 99.34%. aarch64 guest 1488/1496. x86-64 guest 1505/1517.** Again zero cross-ISA stdout
+divergences and zero host-resource-restoration failures. **18 of the 24 matrix suites fully green on both
+guest ISAs**; with the five x86-64 encodings of `2b926d2f` it is 20, leaving `completeness`, `core-regress`,
+`process` and `procfs`. The residue is 16 cases / 20 legs: six engine defects (§3.12), three unadvertised
+aarch64 extensions, five encodings since fixed, and two environmental.
+
+**There are no hangs.** The stall detector never fired and no case reached its budget. The slowest correct
+cases are `soak/callgraph` 1095 s, `core-syscall/times` 939 s, `core-workload/allocchurn` 866 s — so a
+triage run capped below ~1100 s manufactures false timeouts. The x86-64 futex-across-fork hangs recorded
+below were the non-PIE `LEA` bug (§3.11) and are gone.
 
 Producing that number required **patching the harness**, and the reasons are defects in their own right:
 
@@ -268,10 +282,10 @@ Producing that number required **patching the harness**, and the reasons are def
 - **The hang detector no longer detects hangs.** `matrix_runner`'s base budget is **120 s** (not the 20 s
   this document previously claimed — that is `linux_matrix`), so scale 30 gives **3600 s per case**, and
   CI's `compat-soak` override gives **5 hours per case** here; the ctest `TIMEOUT` reaches 30 h per suite.
-  Scaling was the right fix for slow-but-correct being called a hang, but nothing now bounds a real one —
-  and there IS one: **x86-64 futex-across-fork** (`threads/futex-fork-stale-waiter`,
-  `process/{fork-blocked-io,fork-child-futex,shared-key-futex}`), all x86-64-only, all passing on the
-  aarch64 guest, still hung at 300 s with no output. A budget that trips after hours is not a detector.
+  Scaling was the right fix for slow-but-correct being called a hang, but nothing now bounds a real one.
+  The x86-64 futex-across-fork cases that motivated this entry (`threads/futex-fork-stale-waiter`,
+  `process/{fork-blocked-io,fork-child-futex,shared-key-futex}`) turned out to be the non-PIE `LEA` bug of
+  §3.11 and now pass; the harness observation stands regardless, since nothing would have caught them.
 - `matrix_runner.c`'s `CASE_MAX = 256` has no bound check while `completeness/manifest.tsv` is at 167 rows;
   overflow reports *"invalid manifest row"* — a parse error for a file that parses fine.
 - `HL_MATRIX_SCRATCH_DIR` is set only by the workflow, not by CMake, so a local `ctest -L compat-syscall` on
@@ -279,7 +293,7 @@ Producing that number required **patching the harness**, and the reasons are def
 
 **And the claim that gates it all is now false.** `cmake/CiLanes.cmake` omits `Linux-x86_64` from
 `HL_CI_COMPAT_HOSTS` because *"the engine cannot yet EXECUTE guests on an x86_64 host … a compat shard there
-would fail every case rather than measure anything."* It passes 87.4%. That comment is why
+would fail every case rather than measure anything."* It passes 99.34%. That comment is why
 `.github/workflows/linux-x86_64.yml` runs only `ctest -L unit` — so **none of those 3013 runs is gated by CI
 on this host today.** `docs/ci-green.md` repeats the same false premise.
 
@@ -326,6 +340,47 @@ For diagnosis: the signature is a process at `State: S`, `/proc/<pid>/wchan` = `
 is what separates "the interpreter is slow" from "the interpreter deadlocked", and no amount of timeout
 scaling addresses the second — which is why the harness now has a progress-based stall detector rather than
 a larger number.
+
+## 3.12 The residue after the second sweep
+
+Every one of these has a minimal reproducer; none is a mystery. Ranked by cases unblocked, except that an
+engine crash outranks a wrong answer.
+
+| # | Defect | ISA | Cases |
+|---|---|---|---|
+| 1 | **`/proc/self/maps` omits the guest ELF image entirely** — no `r-xp` text row, no `r--p` RELRO row, where native shows the full `r--p`/`r-xp`/`r--p`/`rw-p` set with a pathname. Reaches far past the two fixtures: libunwind, `backtrace()`, ASan, V8's free-range scan and jemalloc's arena probe all parse this file. Follow-up to `88d19298`. | both | 2 (4 legs) |
+| 2 | **The x86-64 interpreter SIGSEGVs on repeated async signal delivery** — `sigaction` + a 2 ms repeating `setitimer` + a long arithmetic loop, 10 lines, no inline asm, `wait=0x8b00`, deterministic 3/3. A guest-triggerable engine kill. | x86-64 | 1 |
+| 3 | **Non-PIE `mov r64,imm32` materialisation is not rebased** — `same_half=0`. The exact sibling of §3.11's `LEA` obligation in the opposite direction: `LEA` must un-bias DOWN, this must stay HIGH. The JIT does it in `lower/mov.c`; the interpreter does not. §3.11 predicted this class would recur, and it did. | x86-64 | 1 |
+| 4 | **`CRC32` with a high-byte source** — `crc32 %ah, %r32` gives `968c7e88`, hardware `86d2b9e7`. Every other line of a 14 kB output matches, so it is the `%ah/%ch/%dh/%bh` decode, not CRC32. | x86-64 | 1 |
+| 5 | **`MRS` of an inaccessible ID register does not trap** — HWCAP bit 11 (CPUID emulation) is clear, so `mrs x, id_aa64isar0_el1` must SIGILL; the interpreter returns a value. The same contradiction as §3.13 from the other side: the engine says it does not emulate ID reads, then services one. | aarch64 | 1 |
+| 6 | **BF16 / DotProd / I8MM unimplemented** while advertised — see §3.13. | aarch64 | 3 |
+
+Two failures are **environmental, not engine defects**, and are now documented in `docs/ci-green.md` under
+"Host-environment preconditions the harness does not enforce":
+
+- `completeness/priority` and `process/sched-attr` need **nice ≤ 5**. Verified by running the x86-64
+  fixtures *natively* at nice 12: they fail identically to the engine (`priority set=0 nice=12`,
+  `sched_attr ok=0`), and `RLIMIT_NICE` is 0 here so they cannot recover. One genuine divergence hides
+  underneath and is not fixed: at nice 12 the engine prints `set=1` where native prints `set=0`, i.e.
+  `setpriority` reports success where the kernel returns `EACCES`. Host-neutral, invisible at nice 0.
+- `syscall/memfd-seals` needs `HL_MATRIX_SCRATCH_DIR` on tmpfs, which only the workflow sets. Re-verified
+  both ways.
+
+### 3.13 The engine advertises three aarch64 features it does not implement
+
+`src/linux_abi/elf.c` puts `AT_HWCAP = 0x1fb` on the guest stack, and emits **no `AT_HWCAP2` at all** —
+which on aarch64 is where `HWCAP2_BF16` and `HWCAP2_I8MM` live. Meanwhile `tests/compat/completeness/`
+carries `active` rows for `bf16`, `dotprod` and `i8mm`, and all three execute the instructions
+**unconditionally, with no HWCAP guard**.
+
+The failure mode is the bad one: a guest reads `AT_HWCAP`, sees a bit, dispatches to its optimised path and
+hits an unimplemented-instruction abort. glibc's and musl's ifunc selectors do precisely this.
+
+They pass on an aarch64 **host** only because the transliterator copies the guest instruction word to a host
+CPU that happens to have the features — which is coverage that would be silently deleted by marking the rows
+excluded, because `tests/matrix/matrix_runner.c` understands only `excluded-macos`, keyed on the engine being
+Mach-O. **There is no host-CPU-keyed disposition.** Either the three get implemented, or the bits get
+cleared *and* the harness gains that key first.
 
 ## 4. Documentation that misleads
 
