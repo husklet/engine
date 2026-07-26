@@ -417,6 +417,35 @@ And in `src/linux_abi/container/vfs.c:4998`: **`/proc/cpuinfo` reports `Features
 derived from the CPU model, so it omits the aes/pmull/sha1/sha2/crc32/atomics the engine *does* advertise in
 `AT_HWCAP`. That contradicts `cpu.h`'s claim that every discovery surface derives from one model.
 
+### 3.16 A fifth non-PIE bias defect: `sigaltstack` inside a non-PIE image is not deliverable
+
+Found while adding a checkpoint case that freezes a guest mid-signal-delivery; the case could not even reach
+its capture point. **Not** a checkpoint defect — plain guest signal delivery, no checkpoint involved, and it
+reproduces on the oldest engine pinned in this tree, so it predates this branch's checkpoint work.
+
+30-line reproducer: register an alternate signal stack, install a handler with `SA_ONSTACK`, `raise` it. The
+result depends only on **where the alternate stack lives**:
+
+| guest linkage | `ss_sp` | result |
+|---|---|---|
+| `-static` (non-PIE) | `malloc` | handler runs |
+| `-static` (non-PIE) | `.bss` array | **host SIGSEGV, exit 139**, before the handler's first instruction |
+| `-static-pie` | `.bss` array | handler runs |
+| `-static-pie` | `malloc` | handler runs |
+
+Independent of `SA_SIGINFO`, of `kill` vs `sigqueue`, and of the stack size (8 KiB through 256 KiB all fail).
+Both guest ISAs, so it is not in either frontend. This is §3.11's family again — an address inside a non-PIE
+image is LOW while the image is mapped HIGH — reached this time through `sigaltstack`'s `ss_sp` rather than
+through an instruction that materialises an address: the engine writes the handler frame to the unbiased
+address, which is unmapped.
+
+Why nothing caught it: `tests/compat/signals/sigaltstack_onstack.c` does test `SA_ONSTACK`, and the whole
+signals suite is 67/67 — but every compat fixture is built **static-PIE**, and that fixture `malloc`s its
+alternate stack, so it misses on both axes at once. The non-PIE guests in the tree are the e2e/checkpoint
+fixtures, and none of them used `sigaltstack` until now. `tests/e2e/checkpoint_handler.c` therefore uses a
+heap alternate stack and says why in a comment; move it back to `.bss` once this is fixed, since that shape is
+the stricter test.
+
 ## 4. Documentation that misleads
 
 These cost real time on this task and will cost it again.

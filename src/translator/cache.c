@@ -1447,6 +1447,12 @@ static int stw_checkpoint_cpus(struct cpu **out, int capacity) {
     int count = 0;
     for (int i = 0; i < STW_MAXTHREAD; i++) {
         if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
+        /* A used slot with no cpu is not a guest thread and has no state to capture. stw_after_fork() leaves
+           exactly that behind whenever a process forks BEFORE its own guest thread registers -- which is the
+           shape of every restore refork (ckpt_fork_children runs ahead of run_guest), so the child's later
+           stw_register() takes a SECOND slot and the phantom stays. Counting it made a re-capture of a
+           restored tree dereference NULL and die silently mid-dump. */
+        if (g_stw_threads[i].cpu == NULL) continue;
         if (count < capacity) out[count] = g_stw_threads[i].cpu;
         count++;
     }

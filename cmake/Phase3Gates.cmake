@@ -50,6 +50,7 @@ set(HL_CHECKPOINT_CASES
   tree:checkpoint_tree            signal:checkpoint_signal_state
   pipe:checkpoint_pipe            deleted:checkpoint_deleted
   threads:checkpoint_threads      memfd:checkpoint_memfd
+  cycle:checkpoint_cycle          handler:checkpoint_handler
   eventfd:checkpoint_eventfd      timerfd:checkpoint_timerfd
   inotify:checkpoint_inotify      epoll:checkpoint_epoll
   socketpair:checkpoint_socketpair socket-state:checkpoint_socket_state
@@ -363,6 +364,7 @@ set_tests_properties(remote-supervisor PROPERTIES LABELS "integration" WORKING_D
 set(HL_CHECKPOINT_SCENARIOS
   "tree|"                 "signal|signal-state"     "pipe|pipe"
   "deleted|deleted"       "threads|threads"         "memfd|memfd"
+  "cycle|cycle"           "handler|handler"
   "eventfd|eventfd"       "timerfd|timerfd"         "inotify|inotify"
   "epoll|epoll-checkpoint" "socketpair|socketpair"  "socket-state|socket-state"
   "connected-socket|connected-socket"
@@ -859,6 +861,45 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND HL_HOST_ARCH STREQUAL "x86_64")
   hl_emulated_case(isa-x86-64   ${HL_COMPAT}/isa          tests/compat/isa/x86_64)
   hl_emulated_case(completeness ${HL_COMPAT}/completeness tests/compat/completeness)
   hl_emulated_case(abi          ${HL_COMPAT}/abi          tests/compat/abi)
+
+  # ---- 9c. CROSS-BACKEND checkpoint restore (label: ckpt-cross) -------------
+  # struct cpu IS the checkpoint format (sizeof is written into the image and validated on
+  # restore) and the stated reason is that the interpreter and the JIT must be able to read
+  # each other's guest state. Nothing tested it. These cells do: the image is written by one
+  # backend and read by the other, both directions, both guest ISAs.
+  #
+  # It shares 9b's emulation boundary, but the property under test does not depend on
+  # emulation fidelity -- it is whether one backend's image is the other's image.
+  #
+  # ONE cell is deliberately absent: x86_64 / interp-to-jit / threads. It fails, and not on
+  # cpu-state interchange -- the image pins the guest VAs the CAPTURING host's allocator
+  # chose, and under qemu one of them (a MAP_SHARED guest region) names a range qemu-user
+  # reserves and does not expose, so restore's MAP_FIXED takes it and the next access is
+  # SEGV_ACCERR. Whether a real aarch64 host collides there is unknown, so per
+  # docs/emulated-aarch64.md's own rule the cell is unproven in both directions rather than
+  # a defect to gate on. The underlying engine gap -- restore MAP_FIXEDs saved guest VAs
+  # unconditionally -- is real on every host and recorded in docs/checkpoint-restore-io.md.
+  function(hl_checkpoint_cross isa direction fixture scenario)
+    add_test(NAME checkpoint-cross.${isa}.${direction}-${fixture}
+      COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/checkpoint_cross_gate.sh
+              ${_emu_cross} ${CMAKE_BINARY_DIR}/checkpoint-cross
+              $<TARGET_FILE:checkpoint-tree-runner> ${HL_E2E} ${isa} ${direction} ${fixture}
+              ${scenario})
+    set_tests_properties(checkpoint-cross.${isa}.${direction}-${fixture} PROPERTIES
+      # LABEL is "ckpt-cross", not "checkpoint-cross": ctest -L takes a REGEX, so any label containing
+      # "checkpoint" would drag these eleven skip-gated cells into `-L checkpoint` and `-L checkpoint-io`.
+      LABELS "ckpt-cross" SKIP_RETURN_CODE 77 RESOURCE_LOCK hl-checkpoint
+      TIMEOUT 1800 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  endfunction()
+  foreach(_dir interp-to-jit jit-to-interp)
+    foreach(_isa aarch64 x86_64)
+      hl_checkpoint_cross(${_isa} ${_dir} tree  "")
+      hl_checkpoint_cross(${_isa} ${_dir} cycle cycle)
+      if(NOT (_isa STREQUAL x86_64 AND _dir STREQUAL interp-to-jit))
+        hl_checkpoint_cross(${_isa} ${_dir} threads threads)
+      endif()
+    endforeach()
+  endforeach()
 endif()
 
 # ===========================================================================

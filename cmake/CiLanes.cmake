@@ -51,8 +51,13 @@ set(HL_CI_COMPAT_HOSTS
 # x86_64 host alone: that is where those engines are built and never run. On an
 # aarch64 host the same suites run natively, so registering it there would mean
 # emulating a host to test the host doing the emulating.
+#
+# ckpt-cross belongs to the same host for the same reason: it restores an image
+# across the two host backends, and one of them is the cross-built aarch64 host
+# that only this host builds without running.
 set(HL_CI_HOST_CPU_ONLY
   Linux-x86_64:emulated-aarch64
+  Linux-x86_64:ckpt-cross
 )
 
 # --- sharded compat lanes: the workflow matrices must cover these exactly ----
@@ -168,6 +173,7 @@ set(HL_CI_DIRECT_DARWIN
 set(HL_CI_REGISTRY_LINUX
   checkpoint
   checkpoint-io
+  ckpt-cross
   compat-extended
   compat-native
   dynamic-e2e

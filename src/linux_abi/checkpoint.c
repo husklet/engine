@@ -1185,6 +1185,15 @@ static void ckpt_interrupt_threads(struct cpu *self) {
     pthread_mutex_unlock(&g_threg_m);
 }
 
+// A peer's image group is named proc.<GUEST pid> -- what the peer itself uses (ckpt_poll) -- and its guest
+// pid equals its host pid only until the first restore. A restored tree keeps its guest pids in g_pidmap
+// while every process carries a fresh host pid, so naming the rendezvous group from the host pid made the
+// coordinator wait for proc.<new host pid> while the peer had committed proc.<guest pid>: re-capturing a
+// restored multi-process tree always refused as an incomplete manifest. Identity outside a restore.
+static int ckpt_peer_gpid(int64_t host_pid) {
+    return (int)hl_linux_pidmap_guest(&g_pidmap, (int32_t)host_pid);
+}
+
 static int ckpt_is_descendant(int64_t candidate, int64_t root) {
     for (int depth = 0; depth < 512 && candidate > 1; depth++) {
         hl_host_process_info info;
@@ -2106,7 +2115,7 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
         for (int i = 0; i < nfoll; i++) {
             if (completed[i]) continue;
             char pd[64];
-            snprintf(pd, sizeof pd, "proc.%lld", (long long)foll[i].identity);
+            snprintf(pd, sizeof pd, "proc.%d", ckpt_peer_gpid(foll[i].identity));
             // Rendezvous through the sink, not through the store: "that peer finished" is defined as
             // "its group was committed", which is exactly what group_commit means for every implementation.
             if (ckpt_sink_group_present(sink, pd) == 1) {
@@ -2124,9 +2133,9 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
         for (int i = 0; i < nfoll; i++)
             if (!completed[i])
                 fprintf(stderr,
-                        "[ckpt] participant %lld never committed proc.%lld (it did not reach a checkpoint "
+                        "[ckpt] participant %lld never committed proc.%d (it did not reach a checkpoint "
                         "safepoint, or its dump was refused); refusing incomplete manifest\n",
-                        (long long)foll[i].identity, (long long)foll[i].identity);
+                        (long long)foll[i].identity, ckpt_peer_gpid(foll[i].identity));
         _exit(70);
     }
 
@@ -2388,6 +2397,21 @@ static void ckpt_restore_backings_close(void) {
     g_nrestore_backings = 0;
 }
 
+// Name whatever already holds [lo, hi). Only reached from the collision path below, where "what is in the
+// way" is the whole question and a bare address answers none of it.
+static void ckpt_report_overlap(uint64_t lo, uint64_t hi) {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    char line[512];
+    if (maps == NULL) return;
+    while (fgets(line, sizeof line, maps) != NULL) {
+        unsigned long long start = 0, end = 0;
+        if (sscanf(line, "%llx-%llx", &start, &end) != 2) continue;
+        if (end <= lo || start >= hi) continue;
+        fprintf(stderr, "[restore]   in the way: %s", line);
+    }
+    fclose(maps);
+}
+
 // Rebuild this process's guest memory (MAP_FIXED) + the mapping side-registries from `procdir`. For the init
 // this runs BEFORE engine init (so MAP_FIXED lands on free VAs); a re-forked child calls hl_gmap_reset() +
 // clears the anon/gna counters FIRST (dropping the COW-inherited init mappings) so its own RAM lands clean.
@@ -2471,7 +2495,23 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
                 map_flags = MAP_FIXED | (reg.backing_shared ? MAP_SHARED : MAP_PRIVATE);
                 map_offset = (off_t)reg.backing_offset;
             }
-            void *r = mmap((void *)a, (size_t)reg.len, PROT_READ | PROT_WRITE, map_flags, map_fd, map_offset);
+            // A guest mmap's VA is an ordinary host mmap result, so a saved region can name VA the restoring
+            // process is already using for ENGINE state -- and MAP_FIXED would replace it silently. Probe
+            // with MAP_FIXED_NOREPLACE first so the collision is named; the retry keeps the guest's VA (the
+            // guest's own pointers are unrelocatable), but a corrupted engine is now diagnosed, not silent.
+#ifdef MAP_FIXED_NOREPLACE
+            int probe_flags = map_flags | MAP_FIXED_NOREPLACE;
+#else
+            int probe_flags = map_flags;
+#endif
+            void *r = mmap((void *)a, (size_t)reg.len, PROT_READ | PROT_WRITE, probe_flags, map_fd, map_offset);
+            if (r == MAP_FAILED || (uint64_t)(uintptr_t)r != a) {
+                if (r != MAP_FAILED) munmap(r, (size_t)reg.len);
+                fprintf(stderr, "[restore] guest region %llx+%llx overlaps a live host mapping; reclaiming it\n",
+                        (unsigned long long)a, (unsigned long long)reg.len);
+                ckpt_report_overlap(a, e);
+                r = mmap((void *)a, (size_t)reg.len, PROT_READ | PROT_WRITE, map_flags, map_fd, map_offset);
+            }
             if (r == MAP_FAILED || (uint64_t)(uintptr_t)r != a) {
                 fprintf(stderr, "[restore] cannot map guest region %llx+%llx: %s\n", (unsigned long long)a,
                         (unsigned long long)reg.len, strerror(errno));
@@ -5369,6 +5409,23 @@ static void ckpt_restore_proc_run(int gpid) {
     struct ckpt_meta m;
     if (ckpt_read_meta_dir(pd, &m) != 0) _exit(70);
 
+    // adopt our restored identity BEFORE any pid-reporting syscall or /proc publish
+    g_self_gpid = m.self_gpid;
+    g_self_gppid = m.ppid_gpid;
+
+    // The cpu image is read from the store, not from guest RAM, so it is available before the memory restore
+    // -- which fork_child_hooks needs, and which now has to run FIRST. See below.
+    struct cpu c, *images = NULL;
+    if (ckpt_restore_cpu_dir(pd, &m, &images) != 0 || ckpt_restore_leader(images, m.n_threads, &c) != 0)
+        _exit(70);
+    // BEFORE the memory restore, not after. jit_after_fork() inside this hook rebuilds the translated-code
+    // arena at a fresh VA and UNMAPS the ~64MB pair inherited from the restoring parent -- and a guest
+    // mapping's saved VA is an ordinary host mmap result, so the child's MAP_FIXED regions frequently land
+    // INSIDE that inherited arena. Run after the restore, the release then punched the restored guest pages
+    // back out: x86_64 checkpoint.threads died with a host SIGSEGV on the resumed peer's own stack
+    // (si_addr == sp, pc at glibc's __syscall_cancel_arch_end).
+    fork_child_hooks(&c);       // shared after-fork engine reset (cache re-alias, kqueue rebuild, lock/threg/Mach)
+
     // drop the COW-inherited parent guest memory + registries, then load our own
     /* The forked restorer inherited a COW copy of the parent's typed VMA ledger and
      * host mapping ownership. Release those handles before forgetting the generic
@@ -5380,14 +5437,6 @@ static void ckpt_restore_proc_run(int gpid) {
     gna_reset();
     if (ckpt_restore_mem_dir(pd, &m) != 0) _exit(70);
 
-    // adopt our restored identity BEFORE any pid-reporting syscall or /proc publish
-    g_self_gpid = m.self_gpid;
-    g_self_gppid = m.ppid_gpid;
-
-    struct cpu c, *images = NULL;
-    if (ckpt_restore_cpu_dir(pd, &m, &images) != 0 || ckpt_restore_leader(images, m.n_threads, &c) != 0)
-        _exit(70);
-    fork_child_hooks(&c);       // shared after-fork engine reset (cache re-alias, kqueue rebuild, lock/threg/Mach)
     ckpt_reinstall_sigacts(&m); // restore guest signal dispositions (AFTER the fork hooks reset host state)
 
     if (ckpt_restore_fds_dir(pd) != 0 || ckpt_restore_signal_state(pd) != 0) _exit(70);

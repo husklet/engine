@@ -71,6 +71,44 @@ Ordering is expressed through explicit group and commit calls — see docs/check
   sparse-page bounds, descriptor count/range/kind, external-resource viability, and queued rights.
 - A completed image is reusable; repeated restores do not modify its authenticated contents.
 
+## Guest virtual addresses are pinned by the image, and restore takes them unconditionally
+
+A guest `mmap` result is an ordinary host `mmap` result: guest anonymous and file mappings are not confined to
+a reserved band the way the image, brk heap and initial stack are (`g_force_base` / the checkpoint heap base).
+So the saved VA of a guest mapping is whatever the CAPTURING process's host allocator happened to return, and
+restore reproduces it with `MAP_FIXED` — which silently replaces anything the RESTORING process has there.
+
+Two consequences, one fixed and one open.
+
+- **Fixed.** A re-forked restore child ran the shared after-fork engine reset *after* its memory restore, and
+  that reset rebuilds the translated-code arena at a fresh VA and unmaps the ~64 MiB pair inherited from the
+  restoring parent. The child's `MAP_FIXED` regions routinely land inside that inherited arena, so the release
+  punched the just-restored guest pages back out. `checkpoint.x86_64.threads` died with a host `SIGSEGV` on
+  the resumed peer's own stack (`si_addr == sp`, guest pc at glibc's `__syscall_cancel_arch_end`), 10/10
+  reproducible. The hook now runs *before* the memory restore, so every mapping it is going to drop is dropped
+  while the guest's VA is still free.
+- **Open.** Nothing prevents the residual case. Restore now probes each region with `MAP_FIXED_NOREPLACE`
+  first and, on `EEXIST`, prints `[restore] guest region <a>+<len> overlaps a live host mapping; reclaiming
+  it` plus the `/proc/self/maps` rows in the way, then proceeds with `MAP_FIXED` — the guest's own pointers
+  are unrelocatable, so keeping its VA is the only option that can still work, but the collision is now named
+  instead of corrupting engine state silently. It fires in no case of the `checkpoint` or `checkpoint-io`
+  lanes; it does fire under `ckpt-cross` restoring an x86_64 threads image into the emulated AArch64
+  host, where a `MAP_SHARED` guest region names a range `qemu-user` reserves and does not expose. The real fix
+  is to give guest `mmap` a reserved band under `HL_CHECKPOINT`, exactly as the image/heap/stack already get,
+  so a saved guest VA can never name host or engine memory on any host.
+
+## Cross-backend restore
+
+`struct cpu` **is** the format — `sizeof(struct cpu)` is written into each image and validated on restore —
+and the reason is that the interpreter backend and the JIT backend must be able to read each other's guest
+state. The `ckpt-cross` lane (`tools/checkpoint_cross_gate.sh`, `cmake/Phase3Gates.cmake` section 9c)
+tests that directly: capture with one host backend, restore with the other, both directions, both guest ISAs.
+It is skip-gated on `qemu-aarch64` plus the cross tree, and shares `docs/emulated-aarch64.md`'s boundary.
+
+Measured: 11/11 green, including the `cycle` double round-trip in both directions. The x86_64
+`interp-to-jit` threads cell is deliberately not registered — it fails on the address-space collision above,
+not on CPU-state interchange, and whether a real AArch64 host collides there is unknown.
+
 ## Release gate
 
 Run:
@@ -80,7 +118,21 @@ ctest --test-dir <build-dir> -L checkpoint      # or -L checkpoint-io for the 17
 ```
 
 The target is fail-fast and runs the IO/recovery matrix on AArch64 and x86_64 plus the existing process-tree,
-thread, signal, anonymous-object, epoll, socket, network fallback, strict-refusal, and corruption suites.
+thread, signal, anonymous-object, epoll, socket, network fallback, strict-refusal, and corruption suites, and
+two cases that a single restore cannot cover:
+
+- `cycle` — capture, restore, **capture the restored tree again**, restore that second image. A single restore
+  cannot see a lossy capture, because whatever the image failed to carry the restored process usually still
+  runs; the second image is written from state only the first restore reconstructed, so a drop propagates and
+  the third launch notices. The fixture forks, so the re-forked-child restore path is covered too, and prints
+  one `BOOT` line per genuinely fresh process plus a per-stage counter it only advances while running: two
+  `BOOT` lines for one role means a restore relaunched instead of resumed, and a counter that did not grow
+  means the restored process was not the one that had been running.
+- `handler` — captured with a **signal handler frame live** on an alternate stack. `struct cpu` carries
+  `alt_sp`/`alt_size`/`alt_flags`, `sig_depth`, `sig_defer`, `sig_defer_stack[]` and `sig_frame_sp[]`, and
+  nothing exercised any of them across a restore. The restored handler must still be on the alternate stack,
+  still hold its own locals, still run under the mask delivery installed, and its return must hand control
+  back to the interrupted main flow with that frame intact.
 
 No finite test suite guarantees correctness under every host failure. The current gate does not simulate host
 kernel failure, physical device removal during an individual `open`, network-filesystem server failure during
