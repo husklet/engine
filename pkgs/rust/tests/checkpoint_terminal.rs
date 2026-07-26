@@ -42,6 +42,16 @@ const SYNC_ATTEMPTS: usize = 12;
 /// bash, and the defect is about a job-control shell on a pty, which is what `bash -il` is.
 const SHELL: &str = "/bin/bash";
 
+/// A foreground job for the shell to be parked in `wait(2)` on across the capture: one forked child that
+/// blocks, announcing itself first so the capture is never taken before the shell has a job at all.
+const JOB: &str = "echo JOB-ALIVE; sleep 1000";
+const JOB_MARKER: &str = "JOB-ALIVE";
+
+/// How long the restored machine gets to start before the first Ctrl-C is typed at it. Not a readiness
+/// assumption -- readiness is asserted by the prompt coming back -- but a terminal signal that lands while
+/// the engine process is still starting has no guest to reach and kills the launch instead.
+const INTERRUPT_HEAD_START: Duration = Duration::from_secs(3);
+
 fn io() -> ProcessIo {
     ProcessIo {
         stdin: Stdio::Null,
@@ -259,9 +269,10 @@ fn round_trip(foreground: Option<&str>, interrupt: bool) -> bool {
     synchronise(&session, "A");
     let before = probe_terminal_state(&session, "before capture");
     if let Some(command) = foreground {
-        session.send(format!("{command}\n").as_bytes());
-        // Give the shell time to fork the job and park in wait(2) -- the state the capture must handle.
-        thread::sleep(Duration::from_millis(750));
+        // Wait for the job to announce itself: the shell has then forked it and is parked in wait(2), which
+        // is the state the capture must handle. A fixed delay would let a slow runner capture the shell
+        // before it had a job at all.
+        session.ask(command, JOB_MARKER, "before capture");
     }
 
     machine
@@ -288,17 +299,18 @@ fn round_trip(foreground: Option<&str>, interrupt: bool) -> bool {
     let mut restored = restored;
     let session = Session::attach(restored.take_terminal().expect("a pty was requested"));
     if interrupt {
-        // The restored shell is still waiting on its foreground job; Ctrl-C must end the job and give the
-        // prompt back, exactly as it would have before the capture.
+        // Ctrl-C must end the foreground job and give the prompt back, exactly as it would have before the
+        // capture -- and the prompt coming back is what asserts it, further down.
         //
-        // Retyped rather than typed once: `spawn_with_store` returns as soon as the restore has been asked
-        // for, and a ^C that lands before the job's process group has been re-created cannot reach a group
-        // that does not exist yet. A person hits it again; so does this. (It must never kill the machine
-        // either -- the restore driver ignores terminal signals until it has replayed the guest's own
-        // dispositions -- which is why the early ones are simply discarded instead of fatal.)
+        // Retyped rather than typed once. An interrupt is a signal, not input: `spawn_with_store` returns as
+        // soon as the restore has been ASKED for, and one that arrives before the job's process group has
+        // been re-created has nothing to be delivered to and is simply gone. The head start is for the
+        // restore's own process startup, the one stretch a terminal signal can still be fatal because the
+        // engine has not reached the code that holds those signals off yet.
+        thread::sleep(INTERRUPT_HEAD_START);
         for _ in 0..SYNC_ATTEMPTS {
-            thread::sleep(Duration::from_millis(500));
             session.send(b"\x03");
+            thread::sleep(Duration::from_millis(500));
         }
     }
     // The restored shell must serve MORE than one line. Establishing readiness the same way the pre-capture
@@ -326,7 +338,7 @@ fn an_idle_interactive_shell_on_a_pty_is_captured_and_restored() {
 /// read, and it saw EOF and logged out.
 #[test]
 fn an_interactive_shell_with_a_foreground_job_is_captured_and_restored() {
-    round_trip(Some("sleep 1000"), true);
+    round_trip(Some(JOB), true);
 }
 
 /// The restored shell is still the container init's own process group, so `/proc/self/stat` reports guest
