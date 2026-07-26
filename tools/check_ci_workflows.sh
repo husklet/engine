@@ -251,7 +251,7 @@ invariants)
 
 	full_line=$(grep -nF 'name: Full Rust integration suite' "$wfdir/linux.yml" |
 		cut -d: -f1)
-	fresh_line=$(grep -nF 'name: Check the committed crate archives match the C sources' \
+	fresh_line=$(grep -nF 'name: Check the committed crate archives are intact' \
 		"$wfdir/linux.yml" | cut -d: -f1)
 	if [ -z "$full_line" ] || [ -z "$fresh_line" ] ||
 		[ "$fresh_line" -le "$full_line" ]; then

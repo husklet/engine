@@ -47,6 +47,24 @@ shared with the mac).
 EOF
 }
 
+# --skip-freshness: run every integrity check but report a stale source manifest
+# instead of failing. The archives are a committed build artifact, so any src/
+# commit invalidates the digest and only a dual-host workstation can regenerate
+# it -- making this unsatisfiable on the push lanes, where it was red on every
+# commit. Freshness is enforced where it decides what ships: publish.yml, which
+# runs this script without the flag. Corruption, a replaced archive and a failed
+# link still fail everywhere.
+freshness=enforce
+for argument in "$@"; do
+	case $argument in
+	--skip-freshness) freshness=report ;;
+	*)
+		printf 'usage: %s [--skip-freshness]\n' "$0" >&2
+		exit 2
+		;;
+	esac
+done
+
 status=0
 report_error() {
 	printf '\nERROR: %s\n' "$1" >&2
@@ -61,7 +79,12 @@ actual_manifest=$(tools/crate_archive_manifest.sh)
 if [ "$recorded_manifest" != "$actual_manifest" ]; then
 	printf 'source manifest recorded: %s\n' "$recorded_manifest"
 	printf 'source manifest actual:   %s\n' "$actual_manifest"
-	report_error 'C sources changed since the committed crate archives were built.'
+	if [ "$freshness" = enforce ]; then
+		report_error 'C sources changed since the committed crate archives were built.'
+	else
+		printf '::notice title=Crate archives are stale::regenerate before releasing (source manifest %s, recorded %s)\n' \
+			"$actual_manifest" "$recorded_manifest"
+	fi
 fi
 
 for target in aarch64-unknown-linux-gnu aarch64-apple-darwin; do
@@ -96,4 +119,8 @@ if [ "$status" -ne 0 ]; then
 	exit 1
 fi
 
-printf 'crate archives are current (source manifest %s)\n' "$actual_manifest"
+if [ "$recorded_manifest" != "$actual_manifest" ]; then
+	printf 'crate archives are intact but STALE; the release path enforces freshness\n'
+else
+	printf 'crate archives are current (source manifest %s)\n' "$actual_manifest"
+fi

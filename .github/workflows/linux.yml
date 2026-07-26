@@ -200,9 +200,9 @@ jobs:
       # aarch64 Linux host plus Apple silicon, so this runner can report but
       # cannot remediate staleness. A stale manifest must not prevent the
       # stronger release and integration gates from reporting their results.
-      - name: Check the committed crate archives match the C sources
+      - name: Check the committed crate archives are intact
         timeout-minutes: 15
-        run: tools/ci_run.sh 720 "Check the committed crate archives match the C sources" -- nix develop --command make check-crate-archives
+        run: tools/ci_run.sh 720 "Check the committed crate archives are intact" -- nix develop --command bash tools/check_crate_archives.sh --skip-freshness
 
   # Runtime compatibility, sharded across parallel runners. This used to be one
   # step inside `linux` running `test-linux-production-typed`, i.e. every suite
