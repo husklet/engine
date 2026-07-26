@@ -1,0 +1,149 @@
+# The x86-64 Linux host
+
+How an x86-64 Linux machine becomes a host, and why the shape of the change is what it is. DOCS.md is
+normative; this file records the reasoning behind one addition to it.
+
+## 1. What was actually missing
+
+The obvious reading of "add an x86-64 Linux host" is that `src/host/` gains a backend, the way
+`src/host/windows/` is reserved to. That reading is wrong, and it is worth being precise about why,
+because it determines the size of the work.
+
+`src/host/<os>/` implements `hl_host_services` — files, processes, clocks, memory, sync. That layer was
+already host-CPU-neutral: `src/host/linux/` compiles and passes its provider tests on x86-64 unchanged.
+The host CPU does not appear there at all, apart from one `cntfrq_el0` read.
+
+What is host-CPU-specific is the **translator**, and not in the place the directory layout suggests.
+`src/translator/host/{aarch64,x86_64}/` looks like a per-host-CPU code generator with both members
+present, and `src/translator/codegen.c` dispatches between them on a runtime `host_isa`. That pipeline is
+real, symmetric, and **not what the engine runs**: `hl_codegen_*` has no callers outside
+`tests/unit/test_codegen.c`, and its IR (`include/hl/ir.h`, 17 opcodes, no vectors, no flags, no atomics)
+cannot express either production frontend.
+
+The production frontends emit host machine code directly:
+
+- `src/translator/guest/x86_64/` is a complete x86-64 frontend whose back end is ARM64. `emit.c`'s own
+  header says so: *"arm64 host emitters + NEON/SSE encoders (xmm->v0..15)"*. Its register model is stated
+  at the top of `src/core/target/x86_64.c`: guest `rax..r15` in host `x0..x15`, `cpu` pinned in host `x28`.
+- `src/translator/guest/aarch64/` is not a translator at all. `translate.c`'s header calls it *"the
+  aarch64-Linux -> arm64-host transliterator. Same-ISA: copy most instructions verbatim; MANGLE only
+  stolen-register (x18/x28/x30) users."* Its default case writes the guest instruction word straight into
+  the host code cache. There is no decoder, because on an AArch64 host it does not need one.
+
+So on an x86-64 host, neither guest ISA has a back end. The aarch64 guest does not even have a front end.
+This is new code generation, not a port.
+
+## 2. The seam that makes it additive
+
+The whole of `core/dispatch.c`'s contract with a backend is two calls:
+
+```c
+code = translate_block(G_PC(c));   /* produce something callable for this guest PC */
+run_block(c, code);                /* call it */
+/* on return: c->reason says why it stopped, G_PC(c) is the next guest PC,
+   and every piece of guest architectural state is back in *c */
+```
+
+Nothing in that contract requires `code` to be host machine code, and `G_OWN_TRAMPOLINES` already existed
+as the escape hatch for a backend whose register model differs from the shared one — the x86-64 guest
+frontend uses it today. A backend that *decodes and executes* rather than emits therefore satisfies the
+same contract, and everything on the other side of it is reused verbatim: the dispatcher, the block cache
+and its STW/generation machinery, all of `src/linux_abi` (syscalls, signals, container, VFS, ELF loading),
+and checkpoint/restore.
+
+Both target translation units now fork on the host CPU, and nothing else about them changes:
+
+```c
+#if defined(HL_HOST_CPU_AARCH64)
+#include ".../host/aarch64/asm.h"   /* + the e_* wrappers */
+#include ".../guest/<isa>/cache.c"
+#include ".../guest/<isa>/stubs.c"  /* x86-64 guest: emit.c + address.h */
+#include ".../guest/<isa>/translate.c"
+#else
+#include ".../guest/<isa>/interp.c"
+#endif
+```
+
+`struct cpu` is deliberately shared by both backends rather than being specialised per backend. It is the
+checkpoint format — `sizeof(struct cpu)` is written into the image and validated on restore — so one
+layout is what lets the two backends read each other's guest state. The consequence is that the
+interpreter carries `host_save[12]` and `host_v[16]`, which are AArch64 callee-saved slots it never uses.
+That waste is the price of a stable image format, and it is the right trade.
+
+The same fork applies to the dispatch seam. `guest/<isa>/dispatch.h` belongs to the JIT: it patches ARM64
+branch encodings into the W^X arena and assumes guest registers live in matching host registers.
+`guest/<isa>/interp_dispatch.h` is its interpreter counterpart. `abi.h` above it is pure guest ABI and is
+shared — which is the correct division, and was already almost right: the seam is per
+(guest ISA, host CPU), not per guest ISA alone, and that only became visible once there was a second host
+CPU.
+
+## 3. Why an interpreter first
+
+Two backends were possible for each guest ISA on an x86-64 host:
+
+| guest | option | cost |
+|---|---|---|
+| x86-64 | same-ISA transliterator, the mirror of `guest/aarch64` on an ARM64 host | moderate; fast |
+| x86-64 | interpreter over the existing host-neutral `decode.c` | smaller; slow |
+| aarch64 | full aarch64 -> x86-64 JIT | very large — a new frontend *and* a new backend |
+| aarch64 | interpreter | large; slow |
+
+Correctness comes first, so both start as interpreters. That choice buys one property worth more than the
+speed it costs: an interpreter's `struct cpu` is *always* authoritative. A guest fault lands in ordinary C
+with `cpu->pc` already exact, so `signal_capture` needs no host-register reconstruction and no
+instruction-boundary provenance map — the two most delicate parts of the JIT's fault path
+(`jit_instruction_guest_pc`, the folded-fault `mscratch[4..7]` replay) simply do not arise.
+
+The interpreter's fault model is instead: a thread-local marker around every guest access, `sigsetjmp` at
+the top of `run_block`, and a `siglongjmp` out of the host handler once the guest signal frame is built.
+
+A same-ISA x86-64 transliterator is the obvious next step for performance and is a strictly additive
+third arm of the same fork. It is not a prerequisite for the host being supported.
+
+## 4. Things that were wrong independently of this work
+
+Naming the host-CPU axis surfaced two defects that were latent on the existing hosts:
+
+- **Persistent-cache identity ignored the host CPU.** `hl_identity_configuration(build, guest_isa,
+  host_isa, modes)` takes it as a parameter and DOCS.md documents it as part of the key, but both call
+  sites passed the literal `1`. Two hosts sharing a cache directory would have accepted each other's host
+  code and executed it. Now passes `HL_HOST_CPU_ISA`, with a static assertion tying the preprocessor
+  constants to `hl_host_isa`.
+- **`package/linux-aarch64` was a path literal** in three `.cmake` files and two shell scripts. An x86-64
+  host would have overwritten the aarch64 artifact under its name, and `tools/refresh_crate_archives.sh`
+  would have installed it as the *aarch64* crate asset — where the only thing that would have caught it is
+  a link test with the aarch64 compiler one line later. Derived from `HL_HOST_ARCH` now.
+
+Also corrected: the `__APPLE__` arm of `native_context.h` carried no CPU test and defined the AArch64
+accessors unconditionally, so an Intel Mac compiled `__ss.__pc` against a register file with no such
+member. Intel macOS is not a supported host and this does not make it one; the arm exists so the matrix is
+total and the failure is a diagnostic instead of a miscompile.
+
+## 5. The three axes, named
+
+DOCS.md section 1 lists guest OS, guest ISA, and host platform. "Host platform" is two axes, and only the
+first had a name. Both now do, once per language:
+
+| axis | C | CMake | nix |
+|---|---|---|---|
+| host OS | `src/host/<os>/`, `__APPLE__`/`__linux__` | `CMAKE_SYSTEM_NAME` | `hostBackends` |
+| host CPU | `HL_HOST_CPU_*` (`src/host/host_cpu.h`) | `HL_HOST_ARCH` | `hostCPUs` |
+| guest ISA | `HL_GUEST_ISA_*` | per-lane `hl_linux_production()` | `guestISAs` |
+
+Use `HL_HOST_CPU_*` rather than the compiler predefines. They are spelled differently per compiler
+(`__aarch64__` vs `_M_ARM64`), and a bare `defined(__x86_64__)` says nothing about which OS's context
+layout and calling convention apply — which is exactly how an Apple-shaped `uc_mcontext->__ss.__rip` came
+to sit under a plain `#elif defined(__x86_64__)` in `linux_abi/signal.c`, unable to compile against a
+Linux `ucontext_t`.
+
+A guest ISA equal to the host CPU permits same-ISA transliteration. It is never a reason to conflate the
+two: `HL_GUEST_ISA_X86_64` and `HL_HOST_CPU_X86_64` are independent facts, and `src/core/target/dual.c`'s
+comment calling `hl_aarch64_run_linux_guest` the *"native AArch64 default"* is the kind of elision that
+made this change bigger than it needed to be.
+
+## 6. Status
+
+See the host table in README.md for what is proven. The build, the unit lane and the guest fixtures for
+both guest ISAs are green on an x86-64 Linux host; guest execution is gated on the interpreter backends.
+`ctest -L production` with `production.smoke-x86_64` is the cheapest end-to-end proof and is the milestone
+to watch.
