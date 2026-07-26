@@ -411,6 +411,18 @@ static uint64_t interp_ea(const struct cpu *cpu, const struct insn *insn, uint64
     return address;
 }
 
+// The implicit-operand forms (XLATB's RBX+AL, MASKMOVDQU's RDI) name a base register with no ModRM, so
+// interp_ea cannot serve them. Prefixes apply the same way: 0x67 wraps the guest-computed address at 32
+// bits, and the segment base is added after that wrap.
+static uint64_t interp_implicit_address(const struct cpu *cpu, const struct insn *insn, uint64_t address) {
+    if (insn->addr32) address &= UINT64_C(0xffffffff);
+    if (insn->seg == 1)
+        address += cpu->fs_base;
+    else if (insn->seg == 2)
+        address += cpu->gs_base;
+    return address;
+}
+
 typedef struct interp_operand {
     int is_memory;
     uint64_t address; // valid when is_memory
@@ -1135,6 +1147,27 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
         return STEP_NEXT;
     }
 
+    // MOV r/m16, Sreg (8C) / MOV Sreg, r/m16 (8E). Long-mode userspace selectors are constants -- Linux
+    // starts a process with ES/DS/FS/GS = 0, CS = 0x33, SS = 0x2b -- and the FS/GS state that does vary is
+    // the BASE in cpu->fs_base/gs_base, which no selector move touches. These values must be lower/mov.c's
+    // exactly, or a guest that reads a selector and compares it diverges between the backends; /6 and /7
+    // are reserved and answer 0 there too.
+    case 0x8C: {
+        static const int selector[8] = {0, 0x33, 0x2b, 0, 0, 0, 0, 0}; // ES CS SS DS FS GS
+        interp_operand operand = interp_rm(cpu, insn, next);
+        // A memory destination is always 16-bit; a register one follows the operand size, so a 32/64-bit
+        // register destination zero-extends the selector.
+        interp_rm_write(cpu, insn, &operand, operand.is_memory ? 2 : insn->opsize,
+                        (uint64_t)selector[insn->reg & 7]);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+    // Accepted and discarded: loading a userspace selector has no visible effect without a modify_ldt(2)
+    // descriptor, which this engine does not model.
+    case 0x8E:
+        cpu->rip = next;
+        return STEP_NEXT;
+
     case 0x8D: {
         if (!insn->is_mem) return interp_undefined(cpu, insn, pc, "LEA with a register operand (#UD encoding)");
         // LEA is an ADDRESS computation, never interp_load, and stays in the GUEST's pointer domain: a
@@ -1449,6 +1482,33 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
     case 0xCC:
         return interp_guest_trap(cpu, next, 5 /*SIGTRAP*/, 1 /*TRAP_BRKPT*/);
 
+    // IRETQ (REX.W CF): the long-mode interrupt frame is RIP, CS, RFLAGS, RSP, SS in increasing addresses.
+    // At CPL 3 this is a context restore rather than a return from an interrupt; CS/SS are the fixed
+    // userspace selectors of case 0x8C, so they are consumed for their stack slots and dropped. The whole
+    // frame is read before anything is written: a fault mid-frame must leave RSP and the flags as they
+    // were. IRETD/IRETW (no REX.W) keeps reporting.
+    case 0xCF: {
+        if (!insn->rexW) break;
+        uint64_t target = interp_load(cpu->r[RSP] + 0, 8);
+        uint64_t flags = interp_load(cpu->r[RSP] + 16, 8);
+        uint64_t stack = interp_load(cpu->r[RSP] + 24, 8);
+        interp_write_rflags(cpu, flags);
+        cpu->r[RSP] = stack;
+        cpu->dbg_ibsrc = pc;
+        cpu->rip = target;
+        cpu->reason = R_BRANCH;
+        return STEP_END;
+    }
+
+    // XLATB (D7): AL = [(seg:) RBX + zero-extended AL]. The index is the 8-bit AL alone -- bits 63:8 of
+    // RAX never take part -- so this cannot ride the ModRM index path.
+    case 0xD7: {
+        uint64_t address = interp_implicit_address(cpu, insn, cpu->r[RBX] + (cpu->r[RAX] & 0xff));
+        interp_reg_write(cpu, insn, RAX, 1, interp_load(address, 1));
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
+
     // LOOP / LOOPE / LOOPNE and JRCXZ
     case 0xE0:
     case 0xE1:
@@ -1603,7 +1663,6 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
     }
 
     if (op >= 0xD8 && op <= 0xDF) return interp_step_x87(cpu, insn, pc, next);
-    if (op == 0xD7) return interp_undefined(cpu, insn, pc, "TODO(amd64-host): XLATB");
 
     // Rest of the map, split trap-versus-gap. INTO is invalid in 64-bit mode: #UD, not a gap.
     if (op == 0xCE) return interp_guest_trap(cpu, pc, 4 /*SIGILL*/, 2 /*ILL_ILLOPN*/);
@@ -1613,9 +1672,9 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
         op == 0xEC || op == 0xED || op == 0xEE || op == 0xEF)
         return interp_guest_trap(cpu, pc, 11 /*SIGSEGV*/, 128 /*SI_KERNEL*/);
 
-    // INT imm8/IRET/RETF stay REPORTED: `int $0x80` is Linux's 32-bit syscall gate -- a gap, not a fault.
+    // INT imm8/IRETD/RETF stay REPORTED: `int $0x80` is Linux's 32-bit syscall gate -- a gap, not a fault.
     if (op == 0xCD || op == 0xCF || op == 0xCA || op == 0xCB)
-        return interp_undefined(cpu, insn, pc, "software interrupt / far return (INT/IRET/RETF)");
+        return interp_undefined(cpu, insn, pc, "software interrupt / 32-bit IRETD / far return (INT/IRETD/RETF)");
     return interp_undefined(cpu, insn, pc, "one-byte opcode");
 }
 
@@ -1637,6 +1696,24 @@ static void interp_xmm_get(const struct cpu *cpu, int number, uint8_t out[16]) {
 
 static void interp_xmm_put(struct cpu *cpu, int number, const uint8_t in[16]) {
     memcpy(&cpu->v[2 * number], in, 16); // low 128 bits only -- see the upper-bits rule above
+}
+
+// MM0-7 ALIAS THE LOW 64 BITS OF XMM0-7, which is what the ARM64 JIT does (guest mm and xmm both live in
+// host v0..v7; translate.c's EMMS comment states it). Architecturally they alias the x87 mantissas
+// instead, and that is deliberately NOT modelled: struct cpu is the checkpoint format, so an mm[8] of its
+// own changes sizeof(struct cpu), and hl_x86_fxsave -- which writes cpu->st[] to the x87 area and cpu->v[]
+// to the xmm area -- would then report different guest-visible bytes on the two backends. The cost is a
+// guest that interleaves MMX with the matching XMM register, or reads ST(i) after MMX without FNINIT,
+// which both backends get identically wrong; EMMS is a no-op in both. REX.R/REX.B do not extend an MMX
+// operand, hence the mask.
+static void interp_mm_get(const struct cpu *cpu, int number, uint8_t out[16]) {
+    memset(out, 0, 16); // zero-extended so the 16-byte lane helpers below serve both widths
+    memcpy(out, &cpu->v[2 * (number & 7)], 8);
+}
+
+static void interp_mm_put(struct cpu *cpu, int number, const uint8_t in[16]) {
+    memcpy(&cpu->v[2 * (number & 7)], in, 8);
+    cpu->v[2 * (number & 7) + 1] = 0; // the JIT's 64-bit NEON writes zero the host register's high half
 }
 
 // Lane accessors. memcpy, not a cast: an odd lane offset (PINSRW word 3) stays defined.
@@ -1696,6 +1773,38 @@ static void interp_sse_rm_put(struct cpu *cpu, const struct insn *insn, uint64_t
         interp_store_bytes(interp_ea(cpu, insn, next), in, bytes);
     else
         memcpy(&cpu->v[2 * insn->rm_reg], in, bytes); // register destination: merge, upper lanes preserved
+}
+
+// Integer-SIMD operand access at either width. Only interp_punpck and interp_pack take the width, because
+// they are the cross-lane ones; every other helper is lane-local, so at MMX width it computes on the
+// zero-extension and the write-back drops it.
+static void interp_simd_get(const struct cpu *cpu, int mmx, int number, uint8_t out[16]) {
+    if (mmx)
+        interp_mm_get(cpu, number, out);
+    else
+        interp_xmm_get(cpu, number, out);
+}
+
+static void interp_simd_put(struct cpu *cpu, int mmx, int number, const uint8_t in[16]) {
+    if (mmx)
+        interp_mm_put(cpu, number, in);
+    else
+        interp_xmm_put(cpu, number, in);
+}
+
+static void interp_simd_rm_get(struct cpu *cpu, const struct insn *insn, int mmx, uint64_t next, uint8_t out[16]) {
+    if (mmx && !insn->is_mem)
+        interp_mm_get(cpu, insn->rm_reg, out);
+    else
+        interp_sse_rm_get(cpu, insn, next, mmx ? 8u : 16u, out);
+}
+
+static void interp_simd_rm_put(struct cpu *cpu, const struct insn *insn, int mmx, uint64_t next,
+                               const uint8_t in[16]) {
+    if (mmx && !insn->is_mem)
+        interp_mm_put(cpu, insn->rm_reg, in);
+    else
+        interp_sse_rm_put(cpu, insn, next, mmx ? 8u : 16u, in);
 }
 
 // MOVDQA/MOVAPS/MOVAPD/MOVNTDQ/MOVNTPS need a 16-byte-aligned memory operand and #GP(0) otherwise; honour
@@ -1821,22 +1930,22 @@ static void interp_pshift_bytes(uint8_t *d, unsigned count, int right) {
 }
 
 // PUNPCK*: the destination lane comes first in each pair, which makes PUNPCKLBW with itself a broadcast.
-static void interp_punpck(uint8_t *d, const uint8_t *s, int lane, int high) {
+static void interp_punpck(uint8_t *d, const uint8_t *s, int lane, int high, int bytes) {
     uint8_t out[16];
-    int lanes = 16 / lane;
+    int lanes = bytes / lane;
     int base = high ? lanes / 2 : 0;
     for (int i = 0; i < lanes / 2; i++) {
         memcpy(out + (2 * i) * lane, d + (base + i) * lane, (size_t)lane);
         memcpy(out + (2 * i + 1) * lane, s + (base + i) * lane, (size_t)lane);
     }
-    memcpy(d, out, 16);
+    memcpy(d, out, (size_t)bytes);
 }
 
 // PACKSSWB / PACKUSWB / PACKSSDW: narrow with saturation, destination lanes then source lanes. `per` is
-// 16/source_lane, NOT 8: with 8 the result's high half was left UNINITIALISED (stack garbage).
-static void interp_pack(uint8_t *d, const uint8_t *s, int source_lane, int signed_result) {
+// bytes/source_lane, NOT 8: with a constant 8 the result's high half was left UNINITIALISED (stack garbage).
+static void interp_pack(uint8_t *d, const uint8_t *s, int source_lane, int signed_result, int bytes) {
     uint8_t out[16];
-    int per = 16 / source_lane;
+    int per = bytes / source_lane;
     for (int i = 0; i < per; i++) {
         if (source_lane == 2) {
             int32_t a = (int32_t)(int16_t)interp_lane16(d, i);
@@ -1850,7 +1959,7 @@ static void interp_pack(uint8_t *d, const uint8_t *s, int source_lane, int signe
             interp_put16(out, per + i, (uint16_t)interp_sat_s16(b));
         }
     }
-    memcpy(d, out, 16);
+    memcpy(d, out, (size_t)bytes);
 }
 
 // STEP_SSE_UNHANDLED: not in the 0F SSE space; interp_step_two_byte diagnoses it.
@@ -1988,9 +2097,10 @@ static int interp_step_sse_fp(struct cpu *cpu, struct insn *insn, uint64_t pc, u
     unsigned source_bytes = interp_fp_source_bytes(op, prefix);
     uint8_t d[16], s[16];
 
-    // 0x2A/0x2C/0x2D have MMX siblings; there is no mm[] register file, so report rather than alias to xmm.
+    // 0x2A/0x2C/0x2D name an MMX operand unless the prefix makes them scalar. The mm file exists (see
+    // interp_mm_get) but these are the only MMX forms that also need MXCSR-controlled conversion.
     if ((op == 0x2A || op == 0x2C || op == 0x2D) && !scalar)
-        return interp_undefined(cpu, insn, pc, "TODO(amd64-host): MMX CVTPI2P*/CVTP*2PI (no mm[] register file)");
+        return interp_undefined(cpu, insn, pc, "TODO(amd64-host): MMX CVTPI2P* / CVTP*2PI");
     // RSQRT and RCP are single-precision only; there is no RSQRTPD/RCPSD encoding to reach.
     if ((op == 0x52 || op == 0x53) && dbl) return interp_undefined(cpu, insn, pc, "reserved (no RSQRTPD/RCPPD)");
 
@@ -2893,15 +3003,17 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
     // Native host FP under the guest's MXCSR.
     if (interp_sse_is_float_arithmetic(op)) return interp_step_sse_fp(cpu, insn, pc, next);
 
-    // These have both MMX (no prefix) and SSE2 (0x66, xmm) encodings. No mm[] file is modelled, so MMX
-    // forms are reported, not aliased.
+    // These have both MMX (no prefix, 64-bit) and SSE2 (0x66, 128-bit xmm) encodings. The MMX half of the
+    // opcode is the SAME operation at half the width, so one arm serves both: `mmx` picks the register
+    // file (interp_mm_get) and `wide` the operand width. Getting `wide` wrong is not cosmetic -- a 16-byte
+    // MMX store writes 8 bytes past the destination and corrupts the guest's next object.
     int integer_simd = (op >= 0x60 && op <= 0x6D) || op == 0x6E || op == 0x6F || (op >= 0x71 && op <= 0x76) ||
                        op == 0x7E || op == 0x7F || op == 0xD4 || op == 0xD5 || op == 0xD7 ||
                        (op >= 0xD1 && op <= 0xD3) || (op >= 0xD8 && op <= 0xDF) || (op >= 0xE0 && op <= 0xE5) ||
                        op == 0xE7 || (op >= 0xE8 && op <= 0xEF) || (op >= 0xF1 && op <= 0xFE) || op == 0x70 ||
                        op == 0xC4 || op == 0xC5;
-    if (integer_simd && prefix == SSE_NP && op != 0x6F && op != 0x7E && op != 0x70)
-        return interp_undefined(cpu, insn, pc, "TODO(amd64-host): MMX form (no mm[] register file is modelled)");
+    int mmx = integer_simd && prefix == SSE_NP;
+    int wide = mmx ? 8 : 16;
 
     uint8_t d[16], s[16];
 
@@ -2986,7 +3098,7 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
     case 0x15:
         interp_xmm_get(cpu, destination, d);
         interp_sse_rm_get(cpu, insn, next, 16, s);
-        interp_punpck(d, s, prefix == SSE_66 ? 8 : 4, op == 0x15);
+        interp_punpck(d, s, prefix == SSE_66 ? 8 : 4, op == 0x15, 16); // UNPCKLPS/PD: no MMX form
         interp_xmm_put(cpu, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
@@ -3052,10 +3164,10 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
         // NOT contiguous: the qword pair is at 0x6C (LOW) / 0x6D (HIGH), ABOVE the 0x68..0x6A group,
         // so a naive `op >= 0x68` turns PUNPCKLQDQ into PUNPCKHQDQ.
         int high = (op >= 0x68 && op <= 0x6A) || op == 0x6D;
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_get(cpu, insn, next, 16, s);
-        interp_punpck(d, s, lane, high);
-        interp_xmm_put(cpu, destination, d);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_get(cpu, insn, mmx, next, s);
+        interp_punpck(d, s, lane, high, wide);
+        interp_simd_put(cpu, mmx, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
     }
@@ -3064,10 +3176,10 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
     case 0x63:
     case 0x67:
     case 0x6B:
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_get(cpu, insn, next, 16, s);
-        interp_pack(d, s, op == 0x6B ? 4 : 2, op != 0x67);
-        interp_xmm_put(cpu, destination, d);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_get(cpu, insn, mmx, next, s);
+        interp_pack(d, s, op == 0x6B ? 4 : 2, op != 0x67, wide);
+        interp_simd_put(cpu, mmx, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
 
@@ -3075,10 +3187,10 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
     case 0x64:
     case 0x65:
     case 0x66:
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_get(cpu, insn, mmx, next, s);
         interp_pcmpgt(d, s, op == 0x64 ? 1 : op == 0x65 ? 2 : 4);
-        interp_xmm_put(cpu, destination, d);
+        interp_simd_put(cpu, mmx, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
 
@@ -3089,18 +3201,16 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
         uint64_t value = interp_rm_read(cpu, insn, &operand, width);
         memset(d, 0, 16);
         memcpy(d, &value, (size_t)width);
-        interp_xmm_put(cpu, destination, d);
+        interp_simd_put(cpu, mmx, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
     }
 
-    // MOVDQA (66) / MOVDQU (F3) load
+    // MOVDQA (66) / MOVDQU (F3) / MMX MOVQ (none) load
     case 0x6F:
-        if (prefix == SSE_NP)
-            return interp_undefined(cpu, insn, pc, "TODO(amd64-host): MMX MOVQ (no mm[] register file is modelled)");
         if (prefix == SSE_66 && interp_sse_unaligned(cpu, insn, next)) return interp_guest_trap(cpu, pc, 11, 128);
-        interp_sse_rm_get(cpu, insn, next, 16, d);
-        interp_xmm_put(cpu, destination, d);
+        interp_simd_rm_get(cpu, insn, mmx, next, d);
+        interp_simd_put(cpu, mmx, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
 
@@ -3112,13 +3222,11 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
         cpu->rip = next;
         return STEP_NEXT;
 
-    // MOVDQA (66) / MOVDQU (F3) store
+    // MOVDQA (66) / MOVDQU (F3) / MMX MOVQ (none) store
     case 0x7F:
-        if (prefix == SSE_NP)
-            return interp_undefined(cpu, insn, pc, "TODO(amd64-host): MMX MOVQ (no mm[] register file is modelled)");
         if (prefix == SSE_66 && interp_sse_unaligned(cpu, insn, next)) return interp_guest_trap(cpu, pc, 11, 128);
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_put(cpu, insn, next, 16, d);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_put(cpu, insn, mmx, next, d);
         cpu->rip = next;
         return STEP_NEXT;
 
@@ -3131,21 +3239,21 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
             cpu->rip = next;
             return STEP_NEXT;
         }
-        if (prefix == SSE_66) { // MOVD/MOVQ to a GPR or memory
+        if (prefix == SSE_66 || mmx) { // MOVD/MOVQ to a GPR or memory; no prefix is the MMX source form
             interp_operand operand = interp_rm(cpu, insn, next);
             int width = insn->rexW ? 8 : 4;
             uint64_t value = 0;
-            interp_xmm_get(cpu, destination, d);
+            interp_simd_get(cpu, mmx, destination, d);
             memcpy(&value, d, (size_t)width);
             interp_rm_write(cpu, insn, &operand, width, value);
             cpu->rip = next;
             return STEP_NEXT;
         }
-        return interp_undefined(cpu, insn, pc, "TODO(amd64-host): MMX MOVQ (no mm[] register file is modelled)");
+        return interp_undefined(cpu, insn, pc, "reserved (F2 0F 7E)");
 
-    // PSHUFD (66) / PSHUFHW (F3) / PSHUFLW (F2)
+    // PSHUFD (66) / PSHUFHW (F3) / PSHUFLW (F2) / PSHUFW (none)
     case 0x70: {
-        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_simd_rm_get(cpu, insn, mmx, next, s);
         unsigned control = (unsigned)(insn->imm & 0xff);
         memset(d, 0, 16);
         if (prefix == SSE_66) {
@@ -3155,27 +3263,26 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
             memcpy(d, s, 8);
             for (int i = 0; i < 4; i++)
                 interp_put16(d, 4 + i, interp_lane16(s, 4 + (int)((control >> (2 * i)) & 3)));
-        } else if (prefix == SSE_F2) { // PSHUFLW: the LOW four words
-            memcpy(d + 8, s + 8, 8);
+        } else { // PSHUFLW: the LOW four words, the high qword passed through. PSHUFW is the same
+                 // permutation over an operand that has no high qword.
+            if (prefix == SSE_F2) memcpy(d + 8, s + 8, 8);
             for (int i = 0; i < 4; i++)
                 interp_put16(d, i, interp_lane16(s, (int)((control >> (2 * i)) & 3)));
-        } else {
-            return interp_undefined(cpu, insn, pc, "TODO(amd64-host): MMX PSHUFW (no mm[] register file is modelled)");
         }
-        interp_xmm_put(cpu, destination, d);
+        interp_simd_put(cpu, mmx, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
     }
 
-    // ModRM.reg is the sub-opcode; the operand is the xmm in rm.
+    // ModRM.reg is the sub-opcode; the operand is the mm/xmm in rm.
     case 0x71:
     case 0x72:
     case 0x73: {
         int sub = insn->reg & 7;
         unsigned count = (unsigned)(insn->imm & 0xff);
         int lane = op == 0x71 ? 2 : op == 0x72 ? 4 : 8;
-        interp_xmm_get(cpu, insn->rm_reg, d);
-        if (op == 0x73 && (sub == 3 || sub == 7)) // PSRLDQ / PSLLDQ: whole-register bytes
+        interp_simd_get(cpu, mmx, insn->rm_reg, d);
+        if (op == 0x73 && !mmx && (sub == 3 || sub == 7)) // PSRLDQ / PSLLDQ: whole-register bytes, no MMX form
             interp_pshift_bytes(d, count, sub == 3);
         else if (sub == 2)
             interp_pshift(d, lane, count, 1, 0); // PSRLW/D/Q
@@ -3185,7 +3292,7 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
             interp_pshift(d, lane, count, 0, 0); // PSLLW/D/Q
         else
             return interp_undefined(cpu, insn, pc, "unallocated SSE shift-group sub-opcode");
-        interp_xmm_put(cpu, insn->rm_reg, d);
+        interp_simd_put(cpu, mmx, insn->rm_reg, d);
         cpu->rip = next;
         return STEP_NEXT;
     }
@@ -3194,10 +3301,10 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
     case 0x74:
     case 0x75:
     case 0x76:
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_get(cpu, insn, mmx, next, s);
         interp_pcmpeq(d, s, op == 0x74 ? 1 : op == 0x75 ? 2 : 4);
-        interp_xmm_put(cpu, destination, d);
+        interp_simd_put(cpu, mmx, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
 
@@ -3205,16 +3312,16 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
     case 0xC4: {
         interp_operand operand = interp_rm(cpu, insn, next);
         uint64_t value = interp_rm_read(cpu, insn, &operand, 2); // GPR low 16, or m16
-        interp_xmm_get(cpu, destination, d);
-        interp_put16(d, (int)(insn->imm & 7), (uint16_t)value);
-        interp_xmm_put(cpu, destination, d);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_put16(d, (int)(insn->imm & (mmx ? 3 : 7)), (uint16_t)value);
+        interp_simd_put(cpu, mmx, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
     }
 
     case 0xC5:
-        interp_xmm_get(cpu, insn->rm_reg, s); // always an xmm register here
-        interp_reg_write(cpu, insn, destination, 4, interp_lane16(s, (int)(insn->imm & 7)));
+        interp_simd_get(cpu, mmx, insn->rm_reg, s); // always a register here
+        interp_reg_write(cpu, insn, destination, 4, interp_lane16(s, (int)(insn->imm & (mmx ? 3 : 7))));
         cpu->rip = next;
         return STEP_NEXT;
 
@@ -3246,15 +3353,15 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
     case 0xF1:
     case 0xF2:
     case 0xF3: {
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_get(cpu, insn, mmx, next, s);
         uint64_t raw = interp_lane64(s, 0);
         unsigned count = raw > 255 ? 255u : (unsigned)raw;
         int lane = (op == 0xD1 || op == 0xE1 || op == 0xF1) ? 2 : (op == 0xD2 || op == 0xE2 || op == 0xF2) ? 4 : 8;
         int arithmetic = (op == 0xE1 || op == 0xE2);
         int right = arithmetic || op == 0xD1 || op == 0xD2 || op == 0xD3;
         interp_pshift(d, lane, count, right, arithmetic);
-        interp_xmm_put(cpu, destination, d);
+        interp_simd_put(cpu, mmx, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
     }
@@ -3274,37 +3381,56 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
         return STEP_NEXT;
     }
 
-    // PMOVMSKB: top bit of each of sixteen bytes
+    // PMOVMSKB: top bit of each byte of the operand
     case 0xD7: {
-        interp_xmm_get(cpu, insn->rm_reg, s);
+        interp_simd_get(cpu, mmx, insn->rm_reg, s);
         uint64_t mask = 0;
-        for (int i = 0; i < 16; i++)
+        for (int i = 0; i < wide; i++)
             mask |= (uint64_t)((s[i] >> 7) & 1) << i;
         interp_reg_write(cpu, insn, destination, 4, mask);
         cpu->rip = next;
         return STEP_NEXT;
     }
 
-    // MOVNTDQ: aligned store; the hint has no effect
+    // MOVNTDQ (66) / MOVNTQ (none): the hint has no effect. Only the 128-bit form demands alignment.
     case 0xE7:
-        if (interp_sse_unaligned(cpu, insn, next)) return interp_guest_trap(cpu, pc, 11, 128);
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_put(cpu, insn, next, 16, d);
+        if (!mmx && interp_sse_unaligned(cpu, insn, next)) return interp_guest_trap(cpu, pc, 11, 128);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_put(cpu, insn, mmx, next, d);
         cpu->rip = next;
         return STEP_NEXT;
+
+    // MASKMOVDQU (66) / MASKMOVQ (none): a byte-granular store to DS:[RDI] selected by the per-byte high
+    // bits of the MASK in r/m; the data comes from ModRM.reg. There is no explicit memory operand, so a
+    // memory ModRM is #UD.
+    case 0xF7: {
+        if (prefix != SSE_66 && !mmx) return interp_undefined(cpu, insn, pc, "reserved (F2/F3 0F F7)");
+        if (insn->is_mem) return interp_guest_trap(cpu, pc, 4 /*SIGILL*/, 2 /*ILL_ILLOPN*/);
+        uint64_t address = interp_implicit_address(cpu, insn, cpu->r[RDI]);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_get(cpu, mmx, insn->rm_reg, s);
+        // Per SELECTED byte rather than a read-modify-write blend of the whole operand: an unselected byte
+        // is architecturally not stored, and rewriting it would lose a concurrent store through a shared
+        // mapping. Each store carries its own fault-marker bracket, which is also the architectural
+        // granularity -- an unselected byte on an unmapped page must not fault.
+        for (int i = 0; i < wide; i++)
+            if (s[i] & 0x80) interp_store(address + (uint64_t)i, 1, d[i]);
+        cpu->rip = next;
+        return STEP_NEXT;
+    }
 
     case 0xDB: // PAND
     case 0xDF: // PANDN
     case 0xEB: // POR
     case 0xEF: // PXOR
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_get(cpu, insn, next, 16, s);
-        for (int i = 0; i < 16; i++)
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_get(cpu, insn, mmx, next, s);
+        for (int i = 0; i < wide; i++)
             d[i] = op == 0xDB ? (uint8_t)(d[i] & s[i])
                    : op == 0xDF ? (uint8_t)(~d[i] & s[i]) // PANDN: NOT dest, then AND
                    : op == 0xEB ? (uint8_t)(d[i] | s[i])
                                 : (uint8_t)(d[i] ^ s[i]);
-        interp_xmm_put(cpu, destination, d);
+        interp_simd_put(cpu, mmx, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
 
@@ -3324,8 +3450,8 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
     case 0xE9: // PSUBSW
     case 0xD8: // PSUBUSB
     case 0xD9: // PSUBUSW
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_get(cpu, insn, mmx, next, s);
         switch (op) {
         case 0xFC: interp_padd(d, s, 1); break;
         case 0xFD: interp_padd(d, s, 2); break;
@@ -3344,7 +3470,7 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
         case 0xD8: interp_padds(d, s, 1, 1, 0); break;
         default: interp_padds(d, s, 2, 1, 0); break; // 0xD9 PSUBUSW
         }
-        interp_xmm_put(cpu, destination, d);
+        interp_simd_put(cpu, mmx, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
 
@@ -3352,27 +3478,27 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
     case 0xDE: // PMAXUB
     case 0xEA: // PMINSW
     case 0xEE: // PMAXSW
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_get(cpu, insn, mmx, next, s);
         if (op == 0xDA || op == 0xDE) {
-            for (int i = 0; i < 16; i++)
+            for (int i = 0; i < wide; i++)
                 d[i] = (op == 0xDA) == (d[i] < s[i]) ? d[i] : s[i];
         } else {
-            for (int i = 0; i < 8; i++) {
+            for (int i = 0; i < wide / 2; i++) {
                 int16_t a = (int16_t)interp_lane16(d, i), b = (int16_t)interp_lane16(s, i);
                 interp_put16(d, i, (uint16_t)(((op == 0xEA) == (a < b)) ? a : b));
             }
         }
-        interp_xmm_put(cpu, destination, d);
+        interp_simd_put(cpu, mmx, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
 
     case 0xD5: // PMULLW: low 16 of each product
     case 0xE4: // PMULHUW: high 16, unsigned
     case 0xE5: // PMULHW: high 16, signed
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_get(cpu, insn, next, 16, s);
-        for (int i = 0; i < 8; i++) {
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_get(cpu, insn, mmx, next, s);
+        for (int i = 0; i < wide / 2; i++) {
             uint32_t product;
             if (op == 0xE5)
                 product = (uint32_t)(int32_t)((int16_t)interp_lane16(d, i) * (int32_t)(int16_t)interp_lane16(s, i));
@@ -3380,40 +3506,40 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
                 product = (uint32_t)interp_lane16(d, i) * (uint32_t)interp_lane16(s, i);
             interp_put16(d, i, (uint16_t)(op == 0xD5 ? (product & 0xffff) : (product >> 16)));
         }
-        interp_xmm_put(cpu, destination, d);
+        interp_simd_put(cpu, mmx, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
 
     case 0xF4: { // PMULUDQ: unsigned 32x32 -> 64
         uint8_t out[16];
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_get(cpu, insn, mmx, next, s);
         interp_put64(out, 0, (uint64_t)interp_lane32(d, 0) * (uint64_t)interp_lane32(s, 0));
         interp_put64(out, 1, (uint64_t)interp_lane32(d, 2) * (uint64_t)interp_lane32(s, 2));
-        interp_xmm_put(cpu, destination, out);
+        interp_simd_put(cpu, mmx, destination, out);
         cpu->rip = next;
         return STEP_NEXT;
     }
 
     case 0xF5: { // PMADDWD: 16x16 products summed in pairs
         uint8_t out[16];
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_get(cpu, insn, mmx, next, s);
         for (int i = 0; i < 4; i++) {
             int32_t low = (int32_t)(int16_t)interp_lane16(d, 2 * i) * (int32_t)(int16_t)interp_lane16(s, 2 * i);
             int32_t high =
                 (int32_t)(int16_t)interp_lane16(d, 2 * i + 1) * (int32_t)(int16_t)interp_lane16(s, 2 * i + 1);
             interp_put32(out, i, (uint32_t)(low + high));
         }
-        interp_xmm_put(cpu, destination, out);
+        interp_simd_put(cpu, mmx, destination, out);
         cpu->rip = next;
         return STEP_NEXT;
     }
 
     case 0xF6: { // PSADBW: |differences| summed per half
         uint8_t out[16] = {0};
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_get(cpu, insn, mmx, next, s);
         for (int half = 0; half < 2; half++) {
             uint32_t total = 0;
             for (int i = 0; i < 8; i++) {
@@ -3422,25 +3548,25 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
             }
             interp_put16(out, 4 * half, (uint16_t)total);
         }
-        interp_xmm_put(cpu, destination, out);
+        interp_simd_put(cpu, mmx, destination, out);
         cpu->rip = next;
         return STEP_NEXT;
     }
 
     case 0xE0: // PAVGB
     case 0xE3: // PAVGW
-        interp_xmm_get(cpu, destination, d);
-        interp_sse_rm_get(cpu, insn, next, 16, s);
+        interp_simd_get(cpu, mmx, destination, d);
+        interp_simd_rm_get(cpu, insn, mmx, next, s);
         if (op == 0xE0) {
-            for (int i = 0; i < 16; i++)
+            for (int i = 0; i < wide; i++)
                 d[i] = (uint8_t)(((uint32_t)d[i] + (uint32_t)s[i] + 1u) >> 1);
         } else {
-            for (int i = 0; i < 8; i++) {
+            for (int i = 0; i < wide / 2; i++) {
                 uint32_t sum = (uint32_t)interp_lane16(d, i) + (uint32_t)interp_lane16(s, i) + 1u;
                 interp_put16(d, i, (uint16_t)(sum >> 1));
             }
         }
-        interp_xmm_put(cpu, destination, d);
+        interp_simd_put(cpu, mmx, destination, d);
         cpu->rip = next;
         return STEP_NEXT;
 
