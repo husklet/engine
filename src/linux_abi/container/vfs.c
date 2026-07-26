@@ -2555,31 +2555,155 @@ struct maprow {
 };
 
 static int maprow_cmp(const void *a, const void *b) {
-    uint64_t x = ((const struct maprow *)a)->lo, y = ((const struct maprow *)b)->lo;
-    return x < y ? -1 : x > y ? 1 : 0;
+    const struct maprow *p = (const struct maprow *)a, *q = (const struct maprow *)b;
+    if (p->lo != q->lo) return p->lo < q->lo ? -1 : 1;
+    // Equal starts: the NARROWER row first. A MAP_FIXED sub-mapping shares its start with the reservation
+    // it replaced, and the overlap trim below keeps whichever row comes first -- which must be the
+    // sub-mapping, exactly as the kernel's VMA split leaves it.
+    return p->hi < q->hi ? -1 : p->hi > q->hi ? 1 : 0;
 }
 
-// Synthesize /proc/[pid]/maps (smaps=0) or /proc/[pid]/smaps (smaps=1) from the tracked guest mappings
-// from the guest-map registry, the published main-stack bounds, and the brk arena ([heap]). Rows are sorted by
-// ascending start address (the kernel invariant), then emitted. The [stack] line (with a guard line
-// below it, as the kernel shows) is what glibc's pthread_getattr_np scans for; [heap] is what jemalloc/
-// glibc-malloc/redis/pmap look for. Returns an anonymous fd holding the content, or -1 on error.
-static int proc_maps_fd(int smaps) {
-    char tn[] = "/tmp/.hl-procXXXXXX";
-    int fd = mkstemp(tn);
-    if (fd < 0) return -1;
-    if (fd < HL_NFD) g_proc_text_ro[fd] = 1;
-    unlink(tn);
-    char b[5120]; // one row: the header line (a PATH_MAX pathname) plus a full smaps field block, whole --
-                  // a truncated row would lose its newline and merge into the next one.
-    // Collect every row on the heap (the registry can hold thousands) so the file can be address-sorted before
-    // emit. Capacity: main-exe PT_LOAD segs + stack + guard + heap split + one row per gmap entry.
+static void proc_fd_rebase(char *tgt, size_t capacity); // defined below; maps naming reuses /proc/self/fd's
+static int synth_names_dir_open(const char *guestpath, const char *const *names, int kind);
+
+// The maps rows for one read, plus the arena the file-backed rows' pathnames live in (`name` points into
+// it). One table serves maps, smaps, numa_maps, smaps_rollup and map_files, so the five files cannot
+// disagree about the guest's address space.
+struct maptable {
+    struct maprow *row;
+    char *names;
+    int n;
+};
+
+#define MAPTABLE_NAME_MAX 512 // per file-backed mapping; longer guest paths are dropped, never truncated
+
+// The guest-visible path a file-backed mapping was created from. thread.c's g_filemap keeps a retained
+// dup of the backing descriptor alive for the mapping's lifetime, so this resolves even after the guest
+// closed its own fd. Rebased out of the rootfs/volume table exactly as /proc/self/fd is: an unrebasable
+// host path is REFUSED (0), because an unnamed anon row is a loss of detail while a host path is a
+// containment failure. Returns 1 on success.
+static int filemap_guest_path(int fd, char *out, size_t n) {
+    char hp[4200], raw[4200];
+    if (fd < 0 || hl_native_fd_path(fd, hp, sizeof hp) != 0 || hp[0] != '/') return 0;
+    snprintf(raw, sizeof raw, "%s", hp);
+    proc_fd_rebase(hp, sizeof hp);
+    // Jailed and unrebased means the path lies outside every layer: refuse it. In bare mode the guest
+    // namespace IS the host's, so the path is already the guest's own (same rule /proc/self/exe follows).
+    if (g_rootfs && !strcmp(hp, raw)) return 0;
+    if (strlen(hp) >= n) return 0;
+    snprintf(out, n, "%s", hp);
+    return 1;
+}
+
+// The g_filemap entry whose span contains [lo,hi), or -1. mmap registers one entry per file-backed
+// mapping and filemap_unmap splits them on munmap/MAP_FIXED, so a containing entry names exactly one file.
+static int filemap_row_index(uint64_t lo, uint64_t hi) {
+    for (int i = 0; i < g_nfilemap; i++)
+        if (lo >= g_filemap[i].lo && hi <= g_filemap[i].hi) return i;
+    return -1;
+}
+
+// The guest protection registries thread.c keeps and mem.c maintains from mmap/mprotect: g_gna is the
+// PROT_NONE intervals, g_gro the read-only (no PROT_WRITE) ones. They are the only live record of a guest's
+// CURRENT protection -- the image rows are derived from the program headers, so without consulting these a
+// guest that mprotects its own text keeps seeing the link-time permissions, and a mapping is rarely
+// uniformly protected anyway (a glibc pthread stack is one mmap whose first page is the guard).
+//
+// Returns the intervals of `reg` overlapping [lo,hi), clipped and sorted ascending (insertion sort: the
+// registries hold at most GNA_MAX entries and are not kept in order).
+static int maps_prot_spans(const void *reg, int count, uint64_t lo, uint64_t hi, uint64_t *out, int maxn) {
+    const struct {
+        uint64_t lo, hi;
+    } *iv = reg;
+    int n = 0;
+    for (int i = 0; i < count && n < maxn; i++) {
+        uint64_t a = iv[i].lo > lo ? iv[i].lo : lo, b = iv[i].hi < hi ? iv[i].hi : hi;
+        if (b <= a) continue;
+        int at = n;
+        while (at > 0 && out[2 * at - 2] > a) {
+            out[2 * at] = out[2 * at - 2];
+            out[2 * at + 1] = out[2 * at - 1];
+            at--;
+        }
+        out[2 * at] = a;
+        out[2 * at + 1] = b;
+        n++;
+    }
+    return n;
+}
+
+// Whether `lo` sits inside one of `reg`'s intervals within [lo,hi), and how far the answer holds.
+static int maps_prot_at(const void *reg, int count, uint64_t lo, uint64_t hi, uint64_t *edge) {
+    uint64_t iv[64];
+    int n = maps_prot_spans(reg, count, lo, hi, iv, 32), in = 0;
+    for (int i = 0; i < n; i++) {
+        if (iv[2 * i] <= lo && lo < iv[2 * i + 1]) {
+            in = 1;
+            if (iv[2 * i + 1] < *edge) *edge = iv[2 * i + 1];
+        } else if (iv[2 * i] > lo && iv[2 * i] < *edge)
+            *edge = iv[2 * i];
+    }
+    return in;
+}
+
+// The perms a row's [lo,hi) currently carries: `natural` (phdr-derived for the image, the mapping's own for
+// a registry row) with the live protection registries applied. *until reports how far the answer holds, so
+// the caller can split the row where the protection changes inside it.
+static void maps_live_perms(uint64_t lo, uint64_t hi, const char *natural, char *out, uint64_t *until) {
+    // The registries are written in TWO coordinate systems: the ELF loader (x86.c, elf.c) registers a
+    // non-PIE image's segments at the HOST addresses its bytes occupy (+g_nonpie_bias), while mprotect
+    // registers the GUEST address the guest passed. So query both and take the union -- reading only the
+    // host fold missed the guest's own RELRO mprotect, reading only the guest address missed the loader's
+    // whole image. (The mixed keying is itself a defect; see the non-PIE bias family.)
+    uint64_t bias = maps_image_host(lo) - lo;
+    uint64_t edge = hi, hedge = hi + bias;
+    int in_none = maps_prot_at(g_gna, g_ngna, lo, hi, &edge);
+    int in_ro = maps_prot_at(g_gro, g_ngro, lo, hi, &edge);
+    if (bias) {
+        in_none |= maps_prot_at(g_gna, g_ngna, lo + bias, hi + bias, &hedge);
+        in_ro |= maps_prot_at(g_gro, g_ngro, lo + bias, hi + bias, &hedge);
+        if (hedge - bias < edge) edge = hedge - bias;
+    }
+    snprintf(out, 5, "%s", natural);
+    if (in_none) {
+        out[0] = out[1] = out[2] = '-';
+    } else if (in_ro) {
+        out[1] = '-'; // read-only: keep whatever R/X the row already claims, drop W
+        if (out[0] == '-') out[0] = 'r';
+    } else if (out[0] == 'r') {
+        // Readable and NOT in the read-only registry. The ELF loader registers every non-writable PT_LOAD
+        // there at load time, so a phdr-derived row that has left it can only have been mprotect'd writable
+        // by the guest -- which is the case a W^X audit or a JIT's own RW/RX toggle asks about, and which a
+        // purely phdr-derived row answers with the stale link-time permission forever.
+        out[1] = 'w';
+    }
+    *until = edge;
+}
+
+static void maptable_free(struct maptable *t) {
+    free(t->row);
+    free(t->names);
+    t->row = NULL;
+    t->names = NULL;
+    t->n = 0;
+}
+
+// Collect the guest's address space as maps rows: the main image's PT_LOAD segments, the stack + its
+// guard, the brk arena as [heap], and one row per remaining guest-map registry entry -- file-backed ones
+// named from g_filemap. Sorted ascending and trimmed to be non-overlapping, the two invariants every
+// consumer of this file (pmap, gdb, libunwind, jemalloc, glibc) assumes. Returns 0 on allocation failure.
+static int maptable_build(struct maptable *t) {
+    memset(t, 0, sizeof *t);
+    // Capacity: main-exe PT_LOAD segs + stack + guard + heap split + one row per gmap entry, plus two per
+    // protection-registry interval (a row splits at each). Dropping a row would truncate the file.
     size_t mapping_count = hl_gmap_count();
-    int cap = (int)mapping_count + 32;
+    int cap = (int)mapping_count + 4 * GNA_MAX + 32;
     struct maprow *rows = (struct maprow *)calloc((size_t)cap, sizeof *rows);
-    if (!rows) {
-        close(fd);
-        return -1;
+    char *names = (char *)calloc((size_t)(g_nfilemap > 0 ? g_nfilemap : 1), MAPTABLE_NAME_MAX);
+    if (!rows || !names) {
+        free(rows);
+        free(names);
+        return 0;
     }
     int nrow = 0;
     // An anonymous row: file offset 0, dev 00:00, inode 0 -- the tuple every maps parser uses to tell an
@@ -2669,19 +2793,231 @@ static int proc_maps_fd(int smaps) {
                 }
         }
         if (covered) continue;
-        MAPROW_ADD(lo, hi, "rw-p", "");
+        // A file-backed mapping is named from g_filemap, which records the backing dev/inode/offset and
+        // keeps a dup of the descriptor open. Without this every shared library -- ld.so included -- showed
+        // as an unnamed anon rw-p row, so dladdr-alikes, libunwind and any W^X audit saw no objects at all.
+        int fm = filemap_row_index(lo, hi);
+        if (fm >= 0) {
+            char *nm = names + (size_t)fm * MAPTABLE_NAME_MAX;
+            if (!nm[0] && !filemap_guest_path(g_filemap[fm].fd, nm, MAPTABLE_NAME_MAX)) nm[0] = 0;
+            MAPROW_ADD_F(lo, hi, "rw-p", g_filemap[fm].offset + (lo - g_filemap[fm].lo),
+                         (unsigned)major((dev_t)g_filemap[fm].device), (unsigned)minor((dev_t)g_filemap[fm].device),
+                         g_filemap[fm].inode, nm);
+        } else
+            MAPROW_ADD(lo, hi, "rw-p", "");
+    }
+    // Apply the live protection registries to every row, splitting where the protection changes inside one.
+    // Image rows come from the program headers, so this is what makes a guest's own mprotect visible; the
+    // registry rows have no protection of their own at all and would otherwise every one claim rw-p.
+    for (int i = 0, collected = nrow; i < collected; i++) {
+        uint64_t at = rows[i].lo, end = rows[i].hi;
+        char natural[5];
+        snprintf(natural, sizeof natural, "%s", rows[i].perms);
+        int first = 1;
+        while (at < end) {
+            char perms[5];
+            uint64_t until = end;
+            maps_live_perms(at, end, natural, perms, &until);
+            if (first) {
+                rows[i].hi = until;
+                snprintf(rows[i].perms, sizeof rows[i].perms, "%s", perms);
+                first = 0;
+            } else {
+                MAPROW_ADD_F(at, until, perms, rows[i].ino ? rows[i].off + (at - rows[i].lo) : 0, rows[i].dev_major,
+                             rows[i].dev_minor, rows[i].ino, rows[i].name);
+            }
+            at = until;
+        }
     }
 #undef MAPROW_ADD_F
 #undef MAPROW_ADD
     qsort(rows, (size_t)nrow, sizeof *rows, maprow_cmp);
+    // Ascending AND non-overlapping is the invariant every sequential parser relies on, and the two
+    // sources (phdr segments, guest-map registry) can still collide -- a whole-span loader reservation
+    // that a MAP_FIXED replaced in part, most of all. Clip each row to what the rows before it left free;
+    // the narrower row sorted first, so the MAP_FIXED sub-mapping survives and the reservation yields, as
+    // the kernel's VMA split leaves it.
+    int keep = 0;
+    uint64_t watermark = 0;
     for (int i = 0; i < nrow; i++) {
-        int m = proc_map_region_p(b, sizeof b, rows[i].lo, rows[i].hi, rows[i].perms, rows[i].off, rows[i].dev_major,
-                                  rows[i].dev_minor, rows[i].ino, rows[i].name, smaps);
+        if (rows[i].lo < watermark) {
+            uint64_t shift = watermark - rows[i].lo;
+            if (rows[i].hi <= watermark) continue; // fully swallowed
+            rows[i].lo = watermark;
+            if (rows[i].ino) rows[i].off += shift; // a file-backed row's offset tracks its start
+        }
+        watermark = rows[i].hi;
+        rows[keep++] = rows[i];
+    }
+    t->row = rows;
+    t->names = names;
+    t->n = keep;
+    return 1;
+}
+
+// Synthesize /proc/[pid]/maps (smaps=0) or /proc/[pid]/smaps (smaps=1). The [stack] line (with a guard
+// line below it, as the kernel shows) is what glibc's pthread_getattr_np scans for; [heap] is what
+// jemalloc/glibc-malloc/redis/pmap look for. Returns an anonymous fd holding the content, or -1 on error.
+static int proc_maps_fd(int smaps) {
+    struct maptable t;
+    if (!maptable_build(&t)) return -1;
+    char tn[] = "/tmp/.hl-procXXXXXX";
+    int fd = mkstemp(tn);
+    if (fd < 0) {
+        maptable_free(&t);
+        return -1;
+    }
+    if (fd < HL_NFD) g_proc_text_ro[fd] = 1;
+    unlink(tn);
+    char b[5120]; // one row: the header line (a PATH_MAX pathname) plus a full smaps field block, whole --
+                  // a truncated row would lose its newline and merge into the next one.
+    for (int i = 0; i < t.n; i++) {
+        int m = proc_map_region_p(b, sizeof b, t.row[i].lo, t.row[i].hi, t.row[i].perms, t.row[i].off,
+                                  t.row[i].dev_major, t.row[i].dev_minor, t.row[i].ino, t.row[i].name, smaps);
         if (write(fd, b, (size_t)m) < 0) {}
     }
-    free(rows);
+    maptable_free(&t);
     lseek(fd, 0, SEEK_SET);
     return fd;
+}
+
+// /proc/[pid]/numa_maps -- one line per VMA, ascending, "<start> <policy> [tag] <counters>". Unintercepted
+// this fell through to the host and handed the guest the ENGINE's mappings: the engine binary's absolute
+// host path, its load address, and every library the host process had open. A containment failure, not a
+// completeness gap, so it is synthesized from the same row set maps/smaps use. The kernel prints a bare
+// "<start> default" for a VMA with no resident pages, so a PROT_NONE guard needs no counters.
+static int proc_numa_maps_fd(void) {
+    struct maptable t;
+    if (!maptable_build(&t)) return -1;
+    char b[5120];
+    char *out = NULL;
+    int len = 0;
+    for (int i = 0; i < t.n; i++) {
+        const struct maprow *r = &t.row[i];
+        unsigned long pages = (unsigned long)((r->hi - r->lo) / 4096);
+        int resident = (r->perms[0] != '-' || r->perms[1] != '-' || r->perms[2] != '-');
+        int m = snprintf(b, sizeof b, "%08lx default", (unsigned long)r->lo);
+        if (r->name && !strcmp(r->name, "[heap]"))
+            m += snprintf(b + m, sizeof b - (size_t)m, " heap");
+        else if (r->name && !strcmp(r->name, "[stack]"))
+            m += snprintf(b + m, sizeof b - (size_t)m, " stack");
+        else if (r->ino && r->name && r->name[0]) {
+            // The kernel escapes whitespace in the pathname as \040 here (numa_maps is space-delimited).
+            m += snprintf(b + m, sizeof b - (size_t)m, " file=");
+            for (const char *p = r->name; *p && m < (int)sizeof b - 8; p++) {
+                if (*p == ' ')
+                    m += snprintf(b + m, sizeof b - (size_t)m, "\\040");
+                else
+                    b[m++] = *p;
+            }
+            b[m] = 0;
+        }
+        if (resident && pages) {
+            // Attribution matches smaps: a file-backed region's resident pages are page-cache (mapped=),
+            // an anonymous one's are private dirty (anon=/dirty=). A summing reader must see both agree.
+            if (r->ino)
+                m += snprintf(b + m, sizeof b - (size_t)m, " mapped=%lu", pages);
+            else
+                m += snprintf(b + m, sizeof b - (size_t)m, " anon=%lu dirty=%lu", pages, pages);
+            m += snprintf(b + m, sizeof b - (size_t)m, " active=0 N0=%lu kernelpagesize_kB=4", pages);
+        }
+        m += snprintf(b + m, sizeof b - (size_t)m, "\n");
+        char *grown = (char *)realloc(out, (size_t)(len + m + 1));
+        if (!grown) break;
+        out = grown;
+        memcpy(out + len, b, (size_t)m);
+        len += m;
+    }
+    maptable_free(&t);
+    int fd = proc_text_fd(out ? out : "", len);
+    free(out);
+    return fd;
+}
+
+// /proc/[pid]/smaps_rollup -- the whole-address-space totals, one "<first>-<last> ---p ... [rollup]" header
+// plus the aggregate field block. Same leak as numa_maps unintercepted: the header alone published the
+// engine's lowest and highest mapping. The fields are the per-region sums of what smaps already reports, so
+// a reader that cross-checks rollup against smaps sees the two agree.
+static int proc_smaps_rollup_fd(void) {
+    struct maptable t;
+    if (!maptable_build(&t)) return -1;
+    unsigned long rss = 0, pclean = 0, sdirty = 0, locked = 0;
+    for (int i = 0; i < t.n; i++) {
+        const struct maprow *r = &t.row[i];
+        if (r->perms[0] == '-' && r->perms[1] == '-' && r->perms[2] == '-') continue; // PROT_NONE: not resident
+        unsigned long kb = (unsigned long)((r->hi - r->lo) / 1024);
+        rss += kb;
+        if (r->ino)
+            pclean += kb;
+        else
+            sdirty += kb;
+        locked += (unsigned long)(hl_gmap_lock_region_bytes(r->lo, r->hi) / 1024);
+    }
+    unsigned long lo = t.n ? t.row[0].lo : 0, hi = t.n ? t.row[t.n - 1].hi : 0;
+    maptable_free(&t);
+    char b[2048];
+    int m = snprintf(b, sizeof b, "%08lx-%08lx ---p 00000000 00:00 0", lo, hi);
+    if (m < 72) m += snprintf(b + m, sizeof b - (size_t)m, "%*s", 72 - m, ""); // seq_pad: name at column 73
+    m += snprintf(b + m, sizeof b - (size_t)m,
+                  " [rollup]\nRss:%20lu kB\nPss:%20lu kB\nPss_Dirty:%14lu kB\nPss_Anon:%15lu kB\n"
+                  "Pss_File:%15lu kB\nPss_Shmem:%14d kB\nShared_Clean:%11d kB\nShared_Dirty:%11lu kB\n"
+                  "Private_Clean:%10lu kB\nPrivate_Dirty:%10d kB\nReferenced:%13lu kB\nAnonymous:%14lu kB\n"
+                  "KSM:%20d kB\nLazyFree:%15d kB\nAnonHugePages:%10d kB\nShmemPmdMapped:%9d kB\n"
+                  "FilePmdMapped:%10d kB\nShared_Hugetlb:%9d kB\nPrivate_Hugetlb:%8d kB\nSwap:%19d kB\n"
+                  "SwapPss:%16d kB\nLocked:%17lu kB\n",
+                  rss, rss, sdirty, sdirty, pclean, 0, 0, sdirty, pclean, 0, rss, sdirty, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                  locked);
+    return proc_text_fd(b, m);
+}
+
+// The map_files/ entry name for a row: "<start>-<end>" in lowercase hex, unpadded -- the kernel's own
+// naming. Only FILE-backed rows have one, which is what makes the directory a list of the objects the
+// process has mapped. Returns 0 for an anonymous row.
+static int map_files_name(const struct maprow *r, char *out, size_t n) {
+    if (!r->ino || !r->name || !r->name[0]) return 0;
+    snprintf(out, n, "%llx-%llx", (unsigned long long)r->lo, (unsigned long long)r->hi);
+    return 1;
+}
+
+#define MAP_FILES_MAX 256
+
+// /proc/[pid]/map_files/ -- a directory of "<start>-<end>" symlinks, one per file-backed VMA, each
+// readlink'ing to the mapped path. Unintercepted this listed the ENGINE's own file mappings: its binary,
+// the host loader and every host library, by absolute host path. Materialized as symlink placeholders;
+// the targets are served by the readlink synth in fs.c (map_files_target).
+static int proc_map_files_dir_open(void) {
+    struct maptable t;
+    if (!maptable_build(&t)) return -1;
+    char (*names)[48] = (char (*)[48])calloc(MAP_FILES_MAX, 48);
+    const char *ptr[MAP_FILES_MAX + 1];
+    int n = 0;
+    if (names)
+        for (int i = 0; i < t.n && n < MAP_FILES_MAX; i++)
+            if (map_files_name(&t.row[i], names[n], 48)) {
+                ptr[n] = names[n];
+                n++;
+            }
+    ptr[n] = NULL;
+    maptable_free(&t);
+    int fd = names ? synth_names_dir_open("/proc/self/map_files", ptr, 1) : -1;
+    free(names);
+    return fd;
+}
+
+// The readlink target of /proc/[pid]/map_files/<start>-<end>: the mapped path, or 0 if no file-backed row
+// spans exactly that range (the kernel's names are exact VMA bounds, so a stale name must ENOENT).
+static int map_files_target(const char *entry, char *out, size_t n) {
+    struct maptable t;
+    if (!entry || !entry[0] || !maptable_build(&t)) return 0;
+    char nm[48];
+    int found = 0;
+    for (int i = 0; i < t.n && !found; i++)
+        if (map_files_name(&t.row[i], nm, sizeof nm) && !strcmp(nm, entry)) {
+            snprintf(out, n, "%s", t.row[i].name);
+            found = 1;
+        }
+    maptable_free(&t);
+    return found;
 }
 
 // /proc/[pid]/status -- the Name:/State:/VmRSS: key:value format (NOT the stat one-liner). VmRSS/VmSize
@@ -3075,6 +3411,33 @@ static int proc_mountinfo_text(char *b, size_t n) {
                  "30 25 0:31 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=65536k\n");
     if (len < 0 || (size_t)len >= n) return len;
     return (int)mount_binds_append(b, n, (size_t)len, 0);
+}
+
+// /proc/[pid]/mountstats -- the NFS-oriented per-mount statistics file. It fell through to the host, which
+// published the entire HOST mount table (block-device names, docker overlay2 hashes, /run/user paths) to
+// any guest that read it, while mounts and mountinfo next to it were both intercepted. Only the
+// "device X mounted on Y with fstype Z" header lines apply to a container with no NFS mount; derive them
+// from the same table mountinfo emits so the three files agree.
+static int proc_mountstats_text(char *b, size_t n) {
+    char mi[8192];
+    int len = proc_mountinfo_text(mi, sizeof mi);
+    if (len < 0) return -1;
+    int o = 0;
+    for (char *line = mi, *end = mi + len; line < end;) {
+        char *nl = memchr(line, '\n', (size_t)(end - line));
+        if (!nl) break;
+        *nl = 0;
+        // mountinfo fields: id parent maj:min root MOUNTPOINT opts - FSTYPE SRC superopts.
+        char *f[11];
+        int nf = 0;
+        for (char *tok = strtok(line, " "); tok && nf < 11; tok = strtok(NULL, " "))
+            f[nf++] = tok;
+        if (nf >= 10)
+            o += snprintf(b + o, n - (size_t)o, "device %s mounted on %s with fstype %s\n", f[8], f[4], f[7]);
+        line = nl + 1;
+        if ((size_t)o + 128 >= n) break;
+    }
+    return o;
 }
 
 // ================= REAL /proc process table (top/htop/ps) =====================================
@@ -3760,6 +4123,18 @@ static int proc_pid_member(int gp, int *hostout) {
     return kill(host, 0) == 0 && getsid(host) == getsid(0); // registry may lag; accept a live session peer
 }
 
+// Does `rp` name a /proc/<pid>/... path for a pid other than this process? Such a path must never reach the
+// host /proc, whether or not the pid is a container member: a bare run read the HOST's pid 1 (systemd)
+// through /proc/1/{cmdline,status,stat} because the peer synthesis declined those leaves and the open fell
+// through, and a MEMBER peer's host /proc describes the engine process running that guest, not the guest.
+// Every leaf the peer synthesis does serve is answered before this. fs.c calls it after the /proc synth.
+static int proc_pid_not_self(const char *rp) {
+    if (!rp) return 0;
+    int pid = 0;
+    if (!proc_any_leaf(rp, &pid) || pid <= 0) return 0;
+    return pid != (int)getpid() && pid != container_pid();
+}
+
 // The container's namespace magic-link target for <name> ("net" -> "net:[<inode>]"), or -1 if <name>
 // is not a known namespace. A container is a SINGLE namespace set, so self and every peer process share
 // one inode per namespace. The inode MUST equal the one a stat() of the same ns file reports (synth_stat
@@ -4100,9 +4475,11 @@ static int proc_leaf_dir_open(const char *guestpath, int with_task) {
     // The per-pid file set. Direct open/stat serve every name here (proc_open), so listing them makes
     // readdir-based discovery agree with direct probing (mountinfo/limits/environ/smaps/pagemap/io were
     // openable but hidden from `ls /proc/self`).
-    static const char *const files[] = {"stat",          "statm",   "status",    "cmdline",   "comm",   "maps",
-                                        "oom_score_adj", "oom_adj", "oom_score", "mountinfo", "limits", "environ",
-                                        "smaps",         "pagemap", "io",        "mounts",    "cgroup", 0};
+    static const char *const files[] = {"stat",       "statm",         "status",  "cmdline",   "comm",
+                                        "maps",       "oom_score_adj", "oom_adj", "oom_score", "mountinfo",
+                                        "limits",     "environ",       "smaps",   "pagemap",   "io",
+                                        "mounts",     "cgroup",        "auxv",    "numa_maps", "smaps_rollup",
+                                        "mountstats", "syscall",       0};
     for (int i = 0; files[i]; i++) {
         char p[64];
         snprintf(p, sizeof p, "%s/%s", tmpl, files[i]);
@@ -4115,6 +4492,8 @@ static int proc_leaf_dir_open(const char *guestpath, int with_task) {
         mkdir(p, 0555);
         snprintf(p, sizeof p, "%s/fd", tmpl);
         mkdir(p, 0555); // placeholder: an open of /proc/<pid>/fd re-enters the synthesis (proc_fd_dir_open)
+        snprintf(p, sizeof p, "%s/map_files", tmpl);
+        mkdir(p, 0555); // ditto -> proc_map_files_dir_open
     }
     // Magic-link placeholders (exe/cwd/root) so getdents lists them with d_type DT_LNK, like Linux. Every
     // ACCESS to them goes by path or by (tagged dirfd, relative) and is intercepted -- readlink/stat/open
@@ -4218,6 +4597,10 @@ static int proc_dir_try_open(const char *rp) {
     }
     if (!strncmp(rest, "/task", 5) && (rest[5] == 0 || (rest[5] == '/' && rest[6] == 0)))
         return proc_task_dir_open(pid);
+    // map_files/ for OUR OWN pid: one "<start>-<end>" symlink per file-backed VMA. A peer's is left
+    // unsynthesized rather than passed through -- the host directory is the ENGINE's mapping list.
+    if (!strncmp(rest, "/map_files", 10) && (rest[10] == 0 || (rest[10] == '/' && rest[11] == 0)))
+        return (pid == (int)getpid() || pid == container_pid()) ? proc_map_files_dir_open() : -1;
     if (!strncmp(rest, "/task/", 6)) {
         const char *t = rest + 6;
         int j = 0;
@@ -4981,6 +5364,26 @@ static int proc_open(const char *rp) {
         }
         if (!strcmp(leaf, "maps") || !strcmp(leaf, "task/1/maps")) return proc_maps_fd(0);
         if (!strcmp(leaf, "smaps")) return proc_maps_fd(1);
+        if (!strcmp(leaf, "numa_maps")) return proc_numa_maps_fd();
+        if (!strcmp(leaf, "smaps_rollup")) return proc_smaps_rollup_fd();
+        // /proc/self/mem is the process's OWN address space. Unintercepted it was the host open, i.e. the
+        // ENGINE's address space: a guest could pread the engine's text and pwrite it back (pwrite there
+        // bypasses page protection), which is an escape, not a leak. The guest's memory is the engine's
+        // memory at a different address, so there is no correct pass-through -- deny it. EACCES is what a
+        // reader without PTRACE_MODE_ATTACH already gets, so callers have the path.
+        if (!strcmp(leaf, "mem")) {
+            errno = EACCES;
+            return -1;
+        }
+        // /proc/self/syscall published the ENGINE's stack pointer and program counter -- its ASLR slide.
+        // The guest is never mid-syscall when it reads its own, so the kernel's "running" form is right.
+        if (!strcmp(leaf, "syscall"))
+            n = snprintf(buf, sizeof buf, "running\n");
+        else if (!strcmp(leaf, "mountstats"))
+            // The host's whole mount table, device names included, came through here while mounts/mountinfo
+            // were intercepted. Same view as those two, in mountstats' "device X mounted on Y" form.
+            n = proc_mountstats_text(buf, sizeof buf);
+        else
         if (!strcmp(leaf, "status"))
             n = proc_status_text(buf, sizeof buf);
         else if (!strcmp(leaf, "stat"))
@@ -5003,6 +5406,8 @@ static int proc_open(const char *rp) {
             n = snprintf(buf, sizeof buf, "0\n");
         else if (!strcmp(leaf, "loginuid"))
             n = snprintf(buf, sizeof buf, "4294967295\n"); // unset (pam)
+        else if (!strcmp(leaf, "cgroup"))
+            n = snprintf(buf, sizeof buf, "0::/\n"); // cgroup v2 unified; also reached as /proc/<ourpid>/cgroup
         else if (!strcmp(leaf, "io"))
             // Per-process IO accounting. Monitoring agents (cAdvisor, language runtimes) read it
             // opportunistically; hl tracks no real per-process byte counters, so present the canonical
@@ -5047,6 +5452,11 @@ static int proc_open(const char *rp) {
                     n = proc_comm_pid_text(buf, sizeof buf, host);
                 else if (!strcmp(fl, "oom_score_adj") || !strcmp(fl, "oom_adj") || !strcmp(fl, "oom_score"))
                     n = snprintf(buf, sizeof buf, "0\n");
+                else if (!strcmp(fl, "cgroup"))
+                    // A container is ONE cgroup, so a peer's line is our own. Previously unserved, so it fell
+                    // through to the host and published the engine's real cgroup path (a user@1000.service
+                    // scope under a desktop session) as the guest's.
+                    n = snprintf(buf, sizeof buf, "0::/\n");
                 if (n >= 0) {
                     char desc[64];
                     snprintf(desc, sizeof desc, "pid:%d:%s", gp2, fl);

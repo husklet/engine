@@ -154,18 +154,46 @@ int hl_gmap_find_physical(uint64_t address, uint64_t *physical_address, uint64_t
     return 0;
 }
 
+/* Is every page of [address, address+length) mapped?  The UNION of the entries answers this, not any single
+   one: mprotect, mlock, mremap and mincore all operate across adjacent VMAs on Linux, and the registry
+   splits an entry whenever a MAP_FIXED or a partial munmap divides it -- so a single-entry test rejected a
+   range the guest had mapped in two pieces (mincore over a region MAP_FIXED'd in the middle returned
+   ENOMEM).  Strictly wider than the old test, so nothing a single entry covered stops being covered. */
 int hl_gmap_contains(uint64_t address, uint64_t length) {
-    uint64_t end = address + length;
+    uint64_t end = address + length, at = address;
     if (end < address) return 0;
-    for (size_t index = 0; index < g_gmap.mapping_count; index++) {
-        const hl_gmap_entry *entry = &g_gmap.mappings[index];
-        if (entry->address <= address && end <= entry->address + entry->length) return 1;
+    for (int extended = 1; at < end && extended;) {
+        extended = 0;
+        for (size_t index = 0; index < g_gmap.mapping_count; index++) {
+            const hl_gmap_entry *entry = &g_gmap.mappings[index];
+            if (entry->address <= at && at < entry->address + entry->length) {
+                at = entry->address + entry->length;
+                extended = 1;
+                break;
+            }
+        }
     }
-    return 0;
+    return at >= end;
+}
+
+static void hl_gmap_split_range(uint64_t start, uint64_t end);
+
+/* MAP_FIXED replaces whatever the range held, so the registry entries it overlapped must be split the way
+   the kernel splits the VMAs -- otherwise the superseded reservation stays whole and /proc/[pid]/maps emits
+   overlapping rows (ld.so's whole-span reservation plus every segment it MAP_FIXED inside it), violating the
+   ascending non-overlapping invariant the file's readers assume.  Ledger only: the host mapping was replaced
+   in place by the caller's own mmap, so the exec-mapping handles must NOT be discarded here. */
+void hl_gmap_supersede_range(uint64_t start, uint64_t end) {
+    if (end <= start) return;
+    hl_gmap_split_range(start, end);
 }
 
 void hl_gmap_unmap_range(uint64_t start, uint64_t end) {
     if (end > start) hl_exec_mapping_discard_range(start, end - start);
+    hl_gmap_split_range(start, end);
+}
+
+static void hl_gmap_split_range(uint64_t start, uint64_t end) {
     for (size_t index = 0; index < g_gmap.mapping_count;) {
         hl_gmap_entry *entry = &g_gmap.mappings[index];
         uint64_t base = entry->address;

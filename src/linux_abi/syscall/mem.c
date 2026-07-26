@@ -887,7 +887,13 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             acct_publish_mem(); // publish the refunded charge into this process's cross-process slot
         }
         if (r != MAP_FAILED) {
-            if (a3 & 0x10) filemap_unmap((uint64_t)r, (uint64_t)r + (uint64_t)a1);
+            if (a3 & 0x10) {
+                filemap_unmap((uint64_t)r, (uint64_t)r + (uint64_t)a1);
+                // The guest-map registry must split around the replaced range too, or a whole-span
+                // reservation MAP_FIXED'd into (every ld.so does this) stays whole and /proc/[pid]/maps
+                // emits rows that overlap the segments mapped inside it.
+                hl_gmap_supersede_range((uint64_t)r, (uint64_t)r + (uint64_t)a1);
+            }
             if (!bus_prepared && !mapping_prepared) gbus_clear((uint64_t)r, (uint64_t)r + (uint64_t)a1 + guard);
             if (physical_mapping != NULL)
                 hl_gmap_add_physical((uint64_t)r, (uint64_t)a1 + guard, (uint64_t)physical_mapping,

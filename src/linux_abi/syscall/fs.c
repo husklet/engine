@@ -3055,6 +3055,23 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     G_RET(c) = ef < 0 ? (uint64_t)(-errno) : (uint64_t)ef;
                     break;
                 }
+                // /proc/[self|pid]/map_files/<start>-<end> -> the mapped file itself (the kernel opens the
+                // VMA's file through this link). Falling through opened the HOST /proc entry, i.e. one of
+                // the engine's own mappings.
+                {
+                    const char *mfl = proc_self_leaf(rp);
+                    if (mfl && !strncmp(mfl, "map_files/", 10) && mfl[10]) {
+                        char tgt[4200], hb2[4200];
+                        if (!map_files_target(mfl + 10, tgt, sizeof tgt)) {
+                            G_RET(c) = (uint64_t)(-ENOENT);
+                            break;
+                        }
+                        int mf2 = open(xresolve_overlay(tgt, hb2, sizeof hb2), O_RDONLY);
+                        if (mf2 >= 0 && (lf & 0x80000)) fcntl(mf2, F_SETFD, FD_CLOEXEC);
+                        G_RET(c) = mf2 < 0 ? (uint64_t)(-errno) : (uint64_t)mf2;
+                        break;
+                    }
+                }
                 // /proc/[self|pid]/auxv (rustix/libc read it)
                 if (strstr(rp, "/auxv")) {
                     char tn[] = "/tmp/.hl-auxvXXXXXX";
@@ -3071,6 +3088,13 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 int pf = proc_open(rp);
                 if (pf != -2) {
                     G_RET(c) = pf < 0 ? (uint64_t)(-errno) : (uint64_t)pf;
+                    break;
+                }
+                // Any other pid's /proc must not fall through to the host's: a non-member is a host process
+                // the guest cannot see (a bare run reached the host's systemd), and a member peer's host
+                // /proc describes the engine process running it.
+                if (proc_pid_not_self(rp)) {
+                    G_RET(c) = (uint64_t)(-ENOENT);
                     break;
                 }
             }
@@ -3932,6 +3956,21 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                         tgt = guest_from_host_volume(cwb, cwg, sizeof cwg) ? cwg : cwb;
                     else
                         tgt = g_cwd[0] ? g_cwd : "/";
+                }
+                size_t l = strlen(tgt);
+                if (l > bs) l = bs;
+                memcpy(buf, tgt, l);
+                G_RET(c) = (uint64_t)l;
+                break;
+            }
+            // /proc/[self|pid]/map_files/<start>-<end> -> the path of the file-backed VMA with exactly those
+            // bounds. Unintercepted this resolved against the HOST directory and named the engine's own
+            // binary and libraries by absolute host path. A name with no matching VMA is ENOENT, as in Linux.
+            if (leaf && !strncmp(leaf, "map_files/", 10) && leaf[10]) {
+                char tgt[4200];
+                if (!map_files_target(leaf + 10, tgt, sizeof tgt)) {
+                    G_RET(c) = (uint64_t)(-ENOENT);
+                    break;
                 }
                 size_t l = strlen(tgt);
                 if (l > bs) l = bs;
