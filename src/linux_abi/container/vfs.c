@@ -2370,6 +2370,19 @@ static int maps_phdr_segs(struct mseg *seg, int maxn) {
             phnum = v;
     }
     if (!phdr || phent < 56 || phnum == 0 || phnum > 256) return 0;
+    /* AT_PHDR is a GUEST address and everything below reads phnum * phent bytes through it. That is only
+     * safe while the guest's program headers happen to be mapped at the same address in the host, which is
+     * the common case but not a guarantee: a non-PIE ET_EXEC is mapped high with a bias, and a guest is free
+     * to unmap or overwrite the page. When it does not hold, this function faulted and took the ENGINE down
+     * with SIGSEGV -- and it is reachable by any guest that reads /proc/self/maps or /proc/self/smaps, which
+     * makes it a guest-triggerable engine kill rather than a guest crash. It was reproducible on BOTH guest
+     * ISAs (compat/procfs/{aarch64,x86_64}/maps exited 139 with no output), which is what places it here in
+     * the shared VFS rather than in either frontend.
+     *
+     * Probe the whole array once through the fault-guarded host-range check before dereferencing any of it.
+     * Bailing out degrades /proc/self/maps to its non-phdr rows -- stack, heap and the gmap ranges below --
+     * which is a worse answer than the truth but an enormously better one than killing the engine. */
+    if (!hl_host_range_mapped((uintptr_t)phdr, (size_t)(phnum * phent))) return 0;
     const uint8_t *ph = (const uint8_t *)(uintptr_t)phdr;
     // load bias: PT_PHDR's runtime address (AT_PHDR) minus its link vaddr; 0 for a non-PIE.
     uint64_t bias = 0;

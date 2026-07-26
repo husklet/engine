@@ -622,10 +622,11 @@ static int interp_bit_masks(unsigned sf, unsigned immn, unsigned imms, unsigned 
 // disposition and kills the process (force_sig_info_to_task), while here step 3 drops the signal and the
 // instruction re-executes forever. Closing it needs a raise_guest_sync_signal(c, sig, code, addr) beside
 // raise_guest_bus() in linux_abi/signal.c -- which would also collapse steps 1-4 into one call.
-static void interp_raise_sync_signal(struct cpu *cpu, int signo, int si_code, uint64_t si_addr) {
+// (`si_code`/`si_addr` are glibc macros over siginfo_t's union, so the parameters cannot carry those names.)
+static void interp_raise_sync_signal(struct cpu *cpu, int signo, int signal_code, uint64_t fault_address) {
     cpu->sync_signal = signo;
-    cpu->sync_code = si_code;
-    cpu->sync_address = si_addr;
+    cpu->sync_code = signal_code;
+    cpu->sync_address = fault_address;
     cpu->sigmask &= ~(1ull << (signo - 1)); // forced: a sync fault is delivered even if the guest blocked it
     raise_guest_signal(cpu, signo);         // owns the disposition; does not return for SIG_DFL
     sigq_flush(signo);                      // drop the process-directed instance it queued (see 4 above)
@@ -1298,18 +1299,24 @@ static int interp_exec_branch_system(struct cpu *cpu, uint32_t insn) {
         //   HVC / SMC (opc == 000, LL 10/11) and DCPS1/2/3 (opc == 101) -- EL2/EL3 and debug-state
         //     instructions, all UNDEFINED at EL0, so SIGILL as well.
         //
-        // raise_guest_signal() is the right delivery route rather than a hand-built frame: it already applies
-        // the guest's disposition (a handler runs, SIG_IGN drops it, and SIG_DFL for these two fatal-default
-        // signals goes through guest_group_fatal so the container reports 128+signo with the core-dump flag).
-        // It is declared just above -- it lives in linux_abi/signal.c, later in this same unity translation
-        // unit. The one fidelity gap is si_code: it comes out as SI_USER rather than TRAP_BRKPT/ILL_ILLOPC and
-        // si_addr is 0, because the queued route carries no fault address. Closing that needs a
-        // raise_guest_debug_trap() beside raise_guest_bus() in linux_abi/signal.c, which is not this file's to
-        // add; see the findings doc.
+        // interp_raise_sync_signal() is the delivery route: it carries the siginfo Linux stamps for these
+        // (si_code and si_addr, which a debugger or crash reporter in the guest reads), forces delivery past
+        // a blocked mask the way force_sig_fault does, and still lets linux_abi/signal.c apply the guest's
+        // disposition -- a handler runs, SIG_IGN drops it, and SIG_DFL goes through guest_group_fatal so the
+        // container reports 128+signo with the core-dump flag. See its header for the composition and for
+        // the one residual gap.
+        //
+        // si_code: Linux/arm64 reports TRAP_BRKPT(1) for a user BRK (arm64_notify_die from brk_handler) and
+        // ILL_ILLOPC(1) for anything the undefined-instruction path injects. They are the same number, but
+        // they are written separately below because they are different constants that only happen to agree.
         int signo = opc == 1 ? 5 /* SIGTRAP */ : 4 /* SIGILL */;
+        int signal_code = opc == 1 ? 1 /* TRAP_BRKPT */ : 1 /* ILL_ILLOPC */;
         cpu->pc = gpc; // the faulting instruction, which is what the guest's frame must name
-        raise_guest_signal(cpu, signo);
-        cpu->reason = R_BRANCH;
+        // si_addr is pcrel_base(gpc), not gpc: the frame's own pc field is canonicalized through
+        // signal_canonicalize_pc (core/target/aarch64.c), which IS pcrel_base, so a handler comparing
+        // si_addr against uc_mcontext.pc -- the obvious thing to do with a trap -- must see the same
+        // number. They differ for a biased ET_EXEC, which is every -no-pie fixture in the corpus.
+        interp_raise_sync_signal(cpu, signo, signal_code, pcrel_base(gpc));
         return INTERP_END;
     }
 
@@ -3312,6 +3319,122 @@ static void interp_poly_mul(uint64_t a, uint64_t b, unsigned bits, uint64_t *low
     *high = result_high;
 }
 
+// ---------------------------------------------------------------------------
+// The cryptographic extension: AES, SHA1 and SHA256.
+// ---------------------------------------------------------------------------
+// These are here because the engine ADVERTISES them. g_aarch64_cpu_model.hwcap is 0x1fb, whose bits 3, 4, 5
+// and 6 are HWCAP_AES, HWCAP_PMULL, HWCAP_SHA1 and HWCAP_SHA2 -- so every guest that asks what the CPU can do
+// is told these instructions exist, and an ifunc resolver in OpenSSL, libcrypto, Go's crypto or a checksumming
+// library will select exactly the code paths that use them. Reporting them as an unimplemented class would
+// therefore not be a gap a guest could avoid: it would abort a run that the engine itself invited.
+//
+// The tables are GENERATED (by the multiplicative inverse in GF(2^8) followed by the FIPS-197 affine
+// transform, checked against the published S(0x53) == 0xED and S(0x00) == 0x63) rather than transcribed,
+// because a 256-entry table typed by hand is exactly the kind of thing that is wrong in one entry and passes
+// every test that does not happen to hit it.
+static const uint8_t interp_aes_sbox[256] = {
+    0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76,
+    0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0,
+    0xB7, 0xFD, 0x93, 0x26, 0x36, 0x3F, 0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15,
+    0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07, 0x12, 0x80, 0xE2, 0xEB, 0x27, 0xB2, 0x75,
+    0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0, 0x52, 0x3B, 0xD6, 0xB3, 0x29, 0xE3, 0x2F, 0x84,
+    0x53, 0xD1, 0x00, 0xED, 0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58, 0xCF,
+    0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F, 0x50, 0x3C, 0x9F, 0xA8,
+    0x51, 0xA3, 0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5, 0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2,
+    0xCD, 0x0C, 0x13, 0xEC, 0x5F, 0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73,
+    0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88, 0x46, 0xEE, 0xB8, 0x14, 0xDE, 0x5E, 0x0B, 0xDB,
+    0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C, 0xC2, 0xD3, 0xAC, 0x62, 0x91, 0x95, 0xE4, 0x79,
+    0xE7, 0xC8, 0x37, 0x6D, 0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A, 0xAE, 0x08,
+    0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F, 0x4B, 0xBD, 0x8B, 0x8A,
+    0x70, 0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E, 0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E,
+    0xE1, 0xF8, 0x98, 0x11, 0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF,
+    0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16,
+};
+
+static const uint8_t interp_aes_inv_sbox[256] = {
+    0x52, 0x09, 0x6A, 0xD5, 0x30, 0x36, 0xA5, 0x38, 0xBF, 0x40, 0xA3, 0x9E, 0x81, 0xF3, 0xD7, 0xFB,
+    0x7C, 0xE3, 0x39, 0x82, 0x9B, 0x2F, 0xFF, 0x87, 0x34, 0x8E, 0x43, 0x44, 0xC4, 0xDE, 0xE9, 0xCB,
+    0x54, 0x7B, 0x94, 0x32, 0xA6, 0xC2, 0x23, 0x3D, 0xEE, 0x4C, 0x95, 0x0B, 0x42, 0xFA, 0xC3, 0x4E,
+    0x08, 0x2E, 0xA1, 0x66, 0x28, 0xD9, 0x24, 0xB2, 0x76, 0x5B, 0xA2, 0x49, 0x6D, 0x8B, 0xD1, 0x25,
+    0x72, 0xF8, 0xF6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xD4, 0xA4, 0x5C, 0xCC, 0x5D, 0x65, 0xB6, 0x92,
+    0x6C, 0x70, 0x48, 0x50, 0xFD, 0xED, 0xB9, 0xDA, 0x5E, 0x15, 0x46, 0x57, 0xA7, 0x8D, 0x9D, 0x84,
+    0x90, 0xD8, 0xAB, 0x00, 0x8C, 0xBC, 0xD3, 0x0A, 0xF7, 0xE4, 0x58, 0x05, 0xB8, 0xB3, 0x45, 0x06,
+    0xD0, 0x2C, 0x1E, 0x8F, 0xCA, 0x3F, 0x0F, 0x02, 0xC1, 0xAF, 0xBD, 0x03, 0x01, 0x13, 0x8A, 0x6B,
+    0x3A, 0x91, 0x11, 0x41, 0x4F, 0x67, 0xDC, 0xEA, 0x97, 0xF2, 0xCF, 0xCE, 0xF0, 0xB4, 0xE6, 0x73,
+    0x96, 0xAC, 0x74, 0x22, 0xE7, 0xAD, 0x35, 0x85, 0xE2, 0xF9, 0x37, 0xE8, 0x1C, 0x75, 0xDF, 0x6E,
+    0x47, 0xF1, 0x1A, 0x71, 0x1D, 0x29, 0xC5, 0x89, 0x6F, 0xB7, 0x62, 0x0E, 0xAA, 0x18, 0xBE, 0x1B,
+    0xFC, 0x56, 0x3E, 0x4B, 0xC6, 0xD2, 0x79, 0x20, 0x9A, 0xDB, 0xC0, 0xFE, 0x78, 0xCD, 0x5A, 0xF4,
+    0x1F, 0xDD, 0xA8, 0x33, 0x88, 0x07, 0xC7, 0x31, 0xB1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xEC, 0x5F,
+    0x60, 0x51, 0x7F, 0xA9, 0x19, 0xB5, 0x4A, 0x0D, 0x2D, 0xE5, 0x7A, 0x9F, 0x93, 0xC9, 0x9C, 0xEF,
+    0xA0, 0xE0, 0x3B, 0x4D, 0xAE, 0x2A, 0xF5, 0xB0, 0xC8, 0xEB, 0xBB, 0x3C, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2B, 0x04, 0x7E, 0xBA, 0x77, 0xD6, 0x26, 0xE1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0C, 0x7D,
+};
+
+// GF(2^8) multiply by x, modulo the AES polynomial 0x11B. Every MixColumns coefficient is built from this.
+static uint8_t interp_aes_xtime(uint8_t a) {
+    return (uint8_t)((a & 0x80u) ? (uint8_t)((a << 1) ^ 0x1Bu) : (uint8_t)(a << 1));
+}
+
+static uint8_t interp_aes_mul(uint8_t a, uint8_t b) {
+    uint8_t result = 0;
+    for (unsigned bit = 0; bit < 8u; bit++) {
+        if (b & 1u) result ^= a;
+        b = (uint8_t)(b >> 1);
+        a = interp_aes_xtime(a);
+    }
+    return result;
+}
+
+// ShiftRows and its inverse. The state is column-major -- byte 4*column + row -- and ShiftRows moves each row
+// left by its own index, so the byte written at (column, row) is read from (column + row) mod 4. Getting the
+// direction backwards still round-trips through AESE/AESD and so still passes a naive encrypt-then-decrypt
+// test; only a published test vector catches it, which is why the fixture goldens are the oracle here.
+static void interp_aes_shift_rows(const uint8_t *in, uint8_t *out, int inverse) {
+    for (unsigned column = 0; column < 4u; column++)
+        for (unsigned row = 0; row < 4u; row++) {
+            unsigned source = 4u * ((column + row) & 3u) + row, destination = 4u * column + row;
+            if (inverse)
+                out[source] = in[destination];
+            else
+                out[destination] = in[source];
+        }
+}
+
+// MixColumns / InvMixColumns: each column is multiplied by a fixed polynomial over GF(2^8).
+static void interp_aes_mix_columns(const uint8_t *in, uint8_t *out, int inverse) {
+    static const uint8_t forward[4] = {2, 3, 1, 1}, backward[4] = {14, 11, 13, 9};
+    const uint8_t *coefficient = inverse ? backward : forward;
+    for (unsigned column = 0; column < 4u; column++)
+        for (unsigned row = 0; row < 4u; row++) {
+            uint8_t value = 0;
+            for (unsigned term = 0; term < 4u; term++)
+                value ^= interp_aes_mul(in[4u * column + ((row + term) & 3u)], coefficient[term]);
+            out[4u * column + row] = value;
+        }
+}
+
+// ---- SHA helpers, named as the architecture names them ----
+static uint32_t interp_ror32_bits(uint32_t value, unsigned amount) {
+    amount &= 31u;
+    return amount ? ((value >> amount) | (value << (32u - amount))) : value;
+}
+
+static uint32_t interp_rol32_bits(uint32_t value, unsigned amount) {
+    return interp_ror32_bits(value, (32u - (amount & 31u)) & 31u);
+}
+
+static uint32_t interp_sha_choose(uint32_t x, uint32_t y, uint32_t z) {
+    return (((y ^ z) & x) ^ z);
+}
+
+static uint32_t interp_sha_majority(uint32_t x, uint32_t y, uint32_t z) {
+    return ((x & y) | ((x | y) & z));
+}
+
+static uint32_t interp_sha_parity(uint32_t x, uint32_t y, uint32_t z) {
+    return (x ^ y ^ z);
+}
+
 // Read/write the low element of a vector register as a scalar of `fmt`. A scalar FP write ZEROES bits
 // [127:N] of the destination, which is what interp_vec_write's q == 0 does.
 static uint64_t interp_fp_read(const struct cpu *cpu, int reg, unsigned fmt) {
@@ -3654,8 +3777,179 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     // Named rather than left to the catch-all: a guest reaching here is asking for a feature this engine does
     // not advertise, which is a different fact from a decoder gap, and the S-boxes and round functions are a
     // self-contained block that should be added deliberately if a guest ever needs them.
-    if ((insn & 0xFF3E0C00u) == 0x4E280800u || (insn & 0xFF3E0C00u) == 0x5E280800u)
-        return interp_undefined(cpu, insn, "AdvSIMD cryptographic extension (AES/SHA)");
+    // AES (0x4E28xxxx) and the two-register SHA forms (0x5E28xxxx) both pin bits[21:17] to 10100, which no
+    // other AdvSIMD box uses (two-register-misc is 10000 and pairwise is 11000).
+    if ((insn & 0xFF3E0C00u) == 0x4E280800u || (insn & 0xFF3E0C00u) == 0x5E280800u) {
+        unsigned opcode = (insn >> 12) & 0x1Fu, size = (insn >> 22) & 3u;
+        interp_vec source = interp_vec_read(cpu, rn), destination = interp_vec_read(cpu, rd), result;
+        if ((insn & 0xFF000000u) == 0x4E000000u) { // ---- AES ----
+            if (size != 0) return interp_undefined(cpu, insn, "AdvSIMD AES -- size must be 00");
+            uint8_t stage[16], mixed[16];
+            switch (opcode) {
+            case 0x04:   // AESE: AddRoundKey, then ShiftRows, then SubBytes
+            case 0x05: { // AESD: the same with the inverse permutation and box
+                int inverse = opcode == 0x05;
+                uint8_t combined[16];
+                for (unsigned index = 0; index < 16u; index++)
+                    combined[index] = (uint8_t)(destination.byte[index] ^ source.byte[index]);
+                interp_aes_shift_rows(combined, stage, inverse);
+                for (unsigned index = 0; index < 16u; index++)
+                    stage[index] = inverse ? interp_aes_inv_sbox[stage[index]] : interp_aes_sbox[stage[index]];
+                memcpy(result.byte, stage, 16);
+                break;
+            }
+            case 0x06:   // AESMC
+            case 0x07:   // AESIMC
+                interp_aes_mix_columns(source.byte, mixed, opcode == 0x07);
+                memcpy(result.byte, mixed, 16);
+                break;
+            default: return interp_undefined(cpu, insn, "AdvSIMD AES -- unallocated opcode");
+            }
+            interp_vec_write(cpu, rd, result, 1);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        // ---- the two-register SHA forms: SHA1H, SHA1SU1, SHA256SU0 ----
+        if (size != 0) return interp_undefined(cpu, insn, "AdvSIMD SHA -- size must be 00");
+        uint32_t d[4], n[4];
+        for (unsigned index = 0; index < 4u; index++) {
+            d[index] = (uint32_t)interp_vec_element(&destination, 2, index);
+            n[index] = (uint32_t)interp_vec_element(&source, 2, index);
+        }
+        uint32_t out[4] = {0, 0, 0, 0};
+        switch (opcode) {
+        case 0x00: // SHA1H Sd, Sn -- the standalone "rotate a by 30" that SHA-1 needs between rounds
+            out[0] = interp_rol32_bits(n[0], 30);
+            break;
+        case 0x01: { // SHA1SU1 Vd.4S, Vn.4S: message-schedule update, second half
+            uint32_t t[4];
+            // T = Vd EOR (Vn >> 32), i.e. Vn shifted down by one 32-bit element with zero fill.
+            for (unsigned index = 0; index < 4u; index++)
+                t[index] = d[index] ^ (index < 3u ? n[index + 1u] : 0u);
+            for (unsigned index = 0; index < 4u; index++)
+                out[index] = interp_rol32_bits(t[index], 1);
+            out[3] ^= interp_rol32_bits(t[0], 2);
+            break;
+        }
+        case 0x02: { // SHA256SU0 Vd.4S, Vn.4S: sigma0 applied across the rolling schedule window
+            uint32_t t[4];
+            for (unsigned index = 0; index < 4u; index++)
+                t[index] = index < 3u ? d[index + 1u] : n[0];
+            for (unsigned index = 0; index < 4u; index++) {
+                uint32_t element = t[index];
+                element = interp_ror32_bits(element, 7) ^ interp_ror32_bits(element, 18) ^ (element >> 3);
+                out[index] = element + d[index];
+            }
+            break;
+        }
+        default: return interp_undefined(cpu, insn, "AdvSIMD SHA -- unallocated two-register opcode");
+        }
+        memset(result.byte, 0, sizeof result.byte);
+        for (unsigned index = 0; index < 4u; index++) interp_vec_set_element(&result, 2, index, out[index]);
+        interp_vec_write(cpu, rd, result, 1);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // ---- The three-register SHA forms: SHA1C/P/M, SHA1SU0, SHA256H/H2, SHA256SU1 ----
+    //   0101 1110 000 Rm 0 opcode(14:12) 00 Rn Rd
+    // Tested here, before the scalar normalisation, for the same reason as the two-register group: bits[31:30]
+    // are 01 and the rewrite would turn this into a vector encoding that means something else entirely.
+    // The fixed bits are 31:24, 21, 15 and 11:10 ONLY -- bits 14:12 are the opcode. Masking 15:10 as one field
+    // (as an earlier version did) pins the opcode to zero, so SHA1C decoded and every other member of the group
+    // fell through to be mis-executed by a later box.
+    if ((insn & 0xFF208C00u) == 0x5E000000u) {
+        unsigned opcode = (insn >> 12) & 7u;
+        interp_vec vd = interp_vec_read(cpu, rd), vn = interp_vec_read(cpu, rn), vm = interp_vec_read(cpu, rm);
+        uint32_t x[4], y[4], w[4], result_words[4];
+        for (unsigned index = 0; index < 4u; index++) {
+            x[index] = (uint32_t)interp_vec_element(&vd, 2, index);
+            y[index] = (uint32_t)interp_vec_element(&vn, 2, index);
+            w[index] = (uint32_t)interp_vec_element(&vm, 2, index);
+        }
+        if (opcode <= 2u) {
+            // SHA1C (choose), SHA1P (parity), SHA1M (majority). One instruction is FOUR SHA-1 rounds: the
+            // round constant is NOT applied here -- the caller folds K into Vm -- and the 160-bit state is
+            // (e : a,b,c,d) rotated left by one word each round, which is exactly the classic
+            // (a,b,c,d,e) <- (T, a, ROL(b,30), c, d) shuffle.
+            uint32_t e = y[0];
+            for (unsigned round = 0; round < 4u; round++) {
+                uint32_t t = opcode == 0 ? interp_sha_choose(x[1], x[2], x[3])
+                             : opcode == 1 ? interp_sha_parity(x[1], x[2], x[3])
+                                           : interp_sha_majority(x[1], x[2], x[3]);
+                uint32_t next = e + interp_rol32_bits(x[0], 5) + t + w[round];
+                x[1] = interp_rol32_bits(x[1], 30);
+                e = x[3];
+                x[3] = x[2];
+                x[2] = x[1];
+                x[1] = x[0];
+                x[0] = next;
+            }
+            memcpy(result_words, x, sizeof result_words);
+        } else if (opcode == 3u) {
+            // SHA1SU0: build {Vd<127:64>, Vn<63:0>} and fold in Vd and Vm.
+            uint32_t t[4] = {x[2], x[3], y[0], y[1]};
+            for (unsigned index = 0; index < 4u; index++) result_words[index] = t[index] ^ x[index] ^ w[index];
+        } else if (opcode == 4u || opcode == 5u) {
+            // SHA256H (part 1, returns the updated x) and SHA256H2 (part 2, returns the updated y, and takes
+            // its two state halves the other way round). Four SHA-256 rounds per instruction.
+            int part1 = opcode == 4u;
+            uint32_t a[4], b[4];
+            if (part1) {
+                memcpy(a, x, sizeof a);
+                memcpy(b, y, sizeof b);
+            } else {
+                memcpy(a, y, sizeof a);
+                memcpy(b, x, sizeof b);
+            }
+            for (unsigned round = 0; round < 4u; round++) {
+                uint32_t chs = interp_sha_choose(b[0], b[1], b[2]);
+                uint32_t maj = interp_sha_majority(a[0], a[1], a[2]);
+                uint32_t sigma1 = interp_ror32_bits(b[0], 6) ^ interp_ror32_bits(b[0], 11) ^
+                                  interp_ror32_bits(b[0], 25);
+                uint32_t sigma0 = interp_ror32_bits(a[0], 2) ^ interp_ror32_bits(a[0], 13) ^
+                                  interp_ror32_bits(a[0], 22);
+                uint32_t t = b[3] + sigma1 + chs + w[round];
+                uint32_t new_a3 = t + a[3];
+                uint32_t new_b3 = t + sigma0 + maj;
+                // <y, x> = ROL(y : x, 32): the top word of each half moves down, and the new words enter at
+                // the top of x and the bottom of y respectively.
+                uint32_t carry = new_a3;
+                a[3] = a[2];
+                a[2] = a[1];
+                a[1] = a[0];
+                a[0] = new_b3;
+                b[3] = b[2];
+                b[2] = b[1];
+                b[1] = b[0];
+                b[0] = carry;
+            }
+            memcpy(result_words, part1 ? a : b, sizeof result_words);
+        } else if (opcode == 6u) {
+            // SHA256SU1: sigma1 over the rolling window, added to Vd and to {Vm<31:0>, Vn<127:32>}.
+            uint32_t t0[4] = {y[1], y[2], y[3], w[0]};
+            uint32_t t1[2] = {w[2], w[3]};
+            for (unsigned index = 0; index < 2u; index++) {
+                uint32_t element = t1[index];
+                element = interp_ror32_bits(element, 17) ^ interp_ror32_bits(element, 19) ^ (element >> 10);
+                result_words[index] = element + x[index] + t0[index];
+            }
+            for (unsigned index = 2; index < 4u; index++) {
+                uint32_t element = result_words[index - 2u];
+                element = interp_ror32_bits(element, 17) ^ interp_ror32_bits(element, 19) ^ (element >> 10);
+                result_words[index] = element + x[index] + t0[index];
+            }
+        } else {
+            return interp_undefined(cpu, insn, "AdvSIMD SHA -- unallocated three-register opcode");
+        }
+        interp_vec result;
+        memset(result.byte, 0, sizeof result.byte);
+        for (unsigned index = 0; index < 4u; index++)
+            interp_vec_set_element(&result, 2, index, result_words[index]);
+        interp_vec_write(cpu, rd, result, 1);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
 
     // ---- The scalar floating-point space ----
     // Tested first because it is exactly disjoint from every AdvSIMD box below and the test is one mask: the
@@ -5109,8 +5403,12 @@ static int interp_step(struct cpu *cpu) {
         // cpu->pc stays ON the undefined instruction, which is what Linux gives the handler and what makes the
         // handler's `pc += 4` the documented way to step over it. A handler that returns without advancing
         // re-executes it and traps again -- again, exactly real behaviour.
-        raise_guest_signal(cpu, 4); // Linux SIGILL
-        cpu->reason = R_BRANCH;
+        //
+        // si_code is ILL_ILLOPC (1): Linux/arm64's do_undefinstr injects exactly that, with si_addr = the
+        // faulting PC. A guest that probes for an optional instruction reads both. si_addr goes through
+        // pcrel_base for the same reason as the exception-generation group above: the frame's pc field is
+        // canonicalized the same way, and a handler compares the two.
+        interp_raise_sync_signal(cpu, 4 /* SIGILL */, 1 /* ILL_ILLOPC */, pcrel_base(cpu->pc));
         return INTERP_END;
     case 0x1:
         return interp_undefined(cpu, insn, "unallocated (SME)");
