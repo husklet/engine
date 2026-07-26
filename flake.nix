@@ -225,6 +225,21 @@
             installPhase = "touch $out";
           };
 
+          lint = cmakeDrv pkgs {
+            name = "hl-engine-lint";
+            # CMake does the dependency collection and file scans.
+            extraNativeBuildInputs = [ pkgs.clang-tools pkgs.cppcheck ];
+            cmakeFlags = [
+              "-DHL_BUILD_TESTS=OFF"
+              "-DHL_LINT=ON"
+              "-DHL_LINT_STRICT=OFF"
+            ];
+            # Keep it fast: only run the lint target. Warnings are useful,
+            # but non-fatal unless strict mode is explicitly enabled.
+            ninjaFlags = [ "hl-lint" ];
+            installPhase = "touch $out";
+          };
+
           # Host-side unit suite via CTest. Guest fixtures auto-disable when the
           # Linux cross compilers are absent (cmake/GuestFixtures.cmake), which
           # is the case in this sandbox, so this stays a pure host-unit check.

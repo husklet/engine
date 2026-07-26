@@ -27,6 +27,17 @@ project(hl_engine_phase1 LANGUAGES C)
 
 find_program(HL_BASH_EXECUTABLE NAMES bash REQUIRED)
 
+# ---------------------------------------------------------------------------
+# Static-analysis target family (lint, format checks, CI-quality gates).
+# ---------------------------------------------------------------------------
+option(HL_LINT "Run the C lint pipeline (clang-format, clang-tidy, cppcheck, custom C heuristics)" OFF)
+option(HL_LINT_STRICT "Treat lint findings as hard errors" OFF)
+
+# clang-tidy and check-based tooling need a compile DB for reliable parsing.
+if(HL_LINT)
+  set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Generate compile_commands.json for clang-tidy" FORCE)
+endif()
+
 # --- sanitizers -------------------------------------------------------------
 # The Makefile's `sanitize` target re-invokes make into a second BUILD dir with
 # ASan+UBSan CFLAGS and runs the unit suite. The CMake equivalent is a separate
@@ -234,3 +245,6 @@ endforeach()
 
 # --- clang-format targets ---------------------------------------------------
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Format.cmake)
+
+# --- lint target -------------------------------------------------------------
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Lint.cmake)
