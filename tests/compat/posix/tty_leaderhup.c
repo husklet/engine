@@ -41,6 +41,9 @@ int main(void) {
             sa.sa_handler = on_cont; sigaction(SIGCONT, &sa, 0);
             char r; read(rdy[0], &r, 1);   // wait until we are the foreground group
             for (int i=0;i<3000 && !got_hup;i++) usleep(1000);
+            // SIGHUP and SIGCONT are queued together; reporting the instant SIGHUP lands races the
+            // second delivery. Give SIGCONT a bounded settle window so the verdict is load-independent.
+            for (int i=0;i<1000 && got_hup && !got_cont;i++) usleep(1000);
             unsigned char res = (got_hup?1:0)|(got_cont?2:0);
             write(out[1], &res, 1);
             _exit(0);
