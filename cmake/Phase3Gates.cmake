@@ -816,6 +816,52 @@ hl_nested_case(${_nest_foreign}-${_nest_foreign}-${HL_HOST_ARCH}
         ${_nest_cross}-${HL_HOST_ARCH} ${_nest_hello}/${HL_HOST_ARCH}/hello)
 
 # ===========================================================================
+# 9b. the compat corpus against an EMULATED aarch64 host (qemu-user)
+# ===========================================================================
+# The aarch64 host arm is compiled on this x86_64 host by the cross tree above and
+# then never executed, so every JIT change ships unrun -- which is how a 107-line
+# NaN-selection defect and four unimplemented-encoding defects reached HEAD. These
+# cells run the SAME compat suites against the cross tree's engines under
+# qemu-aarch64, on the host that builds them.
+#
+# EMULATION, NOT HARDWARE, and the name says so. docs/emulated-aarch64.md records
+# what the fidelity probes established: instruction semantics, the dual-alias W^X
+# arena, signal delivery and uc_mcontext are vouched for; weak memory ordering and
+# timing are NOT, because qemu-user inherits the x86 host's stronger model. A green
+# cell here is evidence, not proof, and never a substitute for an aarch64 runner.
+#
+# x86_64 Linux hosts only: on an aarch64 host these suites run natively and better,
+# so cmake/CiLanes.cmake reserves the lane with HL_CI_HOST_CPU_ONLY.
+#
+# REGISTRY-ONLY today (cmake/CiLanes.cmake, HL_CI_REGISTRY_LINUX): two of the three
+# cells FAIL, on real defects in the shipped aarch64 host. Wiring this into
+# linux-x86_64.yml is the right move once those are fixed, and not before.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND HL_HOST_ARCH STREQUAL "x86_64")
+  set(_emu_cross ${HL_NESTED_FOREIGN_TREE}/linux-production)
+  set(_emu_shim ${CMAKE_BINARY_DIR}/emulated-aarch64)
+  # hl_emulated_case(<label> <bin-subdir> <suite-source-dir>)
+  function(hl_emulated_case label bindir suitedir)
+    add_test(NAME emulated.${label}
+      COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/emulated_aarch64_gate.sh
+              ${_emu_cross} ${_emu_shim}/${label} $<TARGET_FILE:matrix-runner>
+              ${bindir} ${CMAKE_SOURCE_DIR}/${suitedir})
+    # Same RESOURCE_LOCK as the compat suites: these ARE those suites, and the
+    # guests still bind ports and share /tmp scratch.
+    set_tests_properties(emulated.${label} PROPERTIES
+      LABELS "emulated-aarch64" SKIP_RETURN_CODE 77 RESOURCE_LOCK hl-guest
+      TIMEOUT 3600 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  endfunction()
+
+  # isa-x86-64 and completeness are the two that earn the lane: the first is the
+  # ISA regression corpus that exposed the NaN defect, the second the per-encoding
+  # sweep that exposed the MMX ones. abi is a currently-green control -- without
+  # one, a total breakage and a correctly-reported defect look alike.
+  hl_emulated_case(isa-x86-64   ${HL_COMPAT}/isa          tests/compat/isa/x86_64)
+  hl_emulated_case(completeness ${HL_COMPAT}/completeness tests/compat/completeness)
+  hl_emulated_case(abi          ${HL_COMPAT}/abi          tests/compat/abi)
+endif()
+
+# ===========================================================================
 # 10. the host-backend timeout scale, for the lanes not driven by matrix-runner
 # ===========================================================================
 # hl_matrix_timeout_scale() (cmake/Phase3Compat.cmake) covers the compat suites

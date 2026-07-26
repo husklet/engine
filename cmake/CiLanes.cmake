@@ -45,7 +45,14 @@ set(HL_CI_COMPAT_HOSTS
 
 # Lanes applying to only SOME of a host OS's CPUs, as `<host-token>:<lane>`, so
 # gate.ci-lane-parity checks a CPU-guarded lane only where it can be non-empty.
+#
+# emulated-aarch64 runs the compat suites against the cross-built aarch64-host
+# engines under qemu-user (cmake/Phase3Gates.cmake section 9b). It belongs to the
+# x86_64 host alone: that is where those engines are built and never run. On an
+# aarch64 host the same suites run natively, so registering it there would mean
+# emulating a host to test the host doing the emulating.
 set(HL_CI_HOST_CPU_ONLY
+  Linux-x86_64:emulated-aarch64
 )
 
 # --- sharded compat lanes: the workflow matrices must cover these exactly ----
@@ -152,6 +159,12 @@ set(HL_CI_DIRECT_DARWIN
 # isa-fuzz and perf-native are non-empty on both Linux host CPUs without carrying
 # the same coverage, which gate.ci-lane-parity cannot see -- it counts tests, it
 # does not compare them.
+#
+# emulated-aarch64 is registry-only for a reason of its own: two of its three
+# cells FAIL today, on genuine defects in the shipped aarch64 host that nothing
+# else on this host can see. It is declared so the label cannot rot, and left
+# unwired until those are fixed -- see cmake/Phase3Gates.cmake section 9b and
+# docs/emulated-aarch64.md for what emulation does and does not vouch for.
 set(HL_CI_REGISTRY_LINUX
   checkpoint
   checkpoint-io
@@ -160,6 +173,7 @@ set(HL_CI_REGISTRY_LINUX
   dynamic-e2e
   e2e-oracle
   embedding
+  emulated-aarch64
   integration
   isa-fuzz
   lifecycle
