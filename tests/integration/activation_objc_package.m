@@ -49,20 +49,28 @@ static int config(const char *guest, uint64_t sequence, char path[64]) {
     return 0;
 }
 
+// Every failure path names itself: this consumer's only channel to CI is a log
+// tail, where a bare exit status says nothing about which of the 50 spawns broke.
+static int fail(int code, const char *what) {
+    fprintf(stderr, "activation-objc-package: %s (exit %d)\n", what, code);
+    return code;
+}
+
 int main(int argc, char **argv) {
-    if (argc != 2) return 64;
+    if (argc != 2) return fail(64, "usage: activation-objc-package <aarch64-guest>");
     @autoreleasepool {
         NSString *consumer = [NSString stringWithUTF8String:"activation-package"];
-        if (consumer.length != 18) return 65;
+        if (consumer.length != 18) return fail(65, "Foundation is not initialised: NSString length is wrong");
         for (uint64_t attempt = 1; attempt <= 50; ++attempt) {
             hl_engine_exit result = {.abi = HL_ENGINE_ABI, .size = sizeof(result)};
             char config_path[64];
-            if (config(argv[1], attempt, config_path) != 0) return 66;
+            if (config(argv[1], attempt, config_path) != 0)
+                return fail(66, "could not write the launch config to /tmp");
             hl_status status = hl_activation_spawn(argv[0], HL_GUEST_ISA_AARCH64, config_path, &result);
             if (status != HL_STATUS_OK || result.kind != HL_ENGINE_EXIT_CODE || result.guest_status != 42) {
-                fprintf(stderr, "activation objc attempt=%llu status=%d kind=%u guest=%d\n",
+                fprintf(stderr, "activation-objc-package: attempt=%llu of 50 status=%d kind=%u guest=%d\n",
                         (unsigned long long)attempt, status, result.kind, result.guest_status);
-                return 67;
+                return fail(67, "a post-Foundation-init guest spawn did not exit 42");
             }
         }
     }
