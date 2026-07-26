@@ -2168,7 +2168,8 @@ e2e-checkpoint-recovery-aarch64: $(BUILD)/tools/checkpoint-tree-runner \
 		$(abspath $(BUILD)/e2e/checkpoint-tree-aarch64) corrupt-extra
 
 CHECKPOINT_IO_CASES := io-replace io-recreate io-directory io-duplicate io-device io-type-change io-permission \
-	io-missing-root io-append io-shortened io-repeat io-directory-change io-missing-child-strict io-fifo-refusal \
+	io-missing-root io-append io-shortened io-repeat io-directory-change io-missing-child-strict \
+	io-missing-child-default io-fifo-refusal \
 	io-queued-device io-queued-missing
 
 e2e-checkpoint-io-x86_64: $(BUILD)/tools/checkpoint-tree-runner $(BUILD)/e2e/checkpoint-io-recovery-x86_64 \

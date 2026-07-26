@@ -7,14 +7,18 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_CONFIG_MAGIC UINT32_C(0x484c4346)
-#define HL_CONFIG_ABI 13u
+#define HL_CONFIG_ABI 14u
 #define HL_CONFIG_ABI_LEGACY 10u
 #define HL_CONFIG_ABI_NETWORK_TRANSPORT 11u
 #define HL_CONFIG_ABI_OVERLAY 12u
 #define HL_CONFIG_ABI_CHECKPOINT_POLICY 13u
-#define HL_CONFIG_CHECKPOINT_REFUSE 0u
+/* 13 carries checkpoint_policy with the retired meaning (0 == refuse) and is rejected, not reinterpreted. */
+#define HL_CONFIG_ABI_CHECKPOINT_DEFAULT 14u
+/* Zero is "no policy asked for": restore is permissive, capture keeps refusing what it cannot capture. */
+#define HL_CONFIG_CHECKPOINT_DEFAULT 0u
 #define HL_CONFIG_CHECKPOINT_RECONNECT 1u
 #define HL_CONFIG_CHECKPOINT_DISCARD_OPTIONAL 2u
+#define HL_CONFIG_CHECKPOINT_REFUSE 3u
 #define HL_CONFIG_NETWORK_VIRTUAL 0u
 #define HL_CONFIG_NETWORK_ISOLATED 1u
 #define HL_CONFIG_NETWORK_HOST 2u
@@ -72,7 +76,7 @@ typedef struct hl_launch_config {
     /* ABI 12: NUL-terminated lower path records starting at lower_layers_offset. */
     uint32_t lower_layer_count;
     uint32_t overlay_work_offset;
-    /* ABI 13: behavior when a saved external resource cannot be reconstructed. */
+    /* ABI 13, values remapped in ABI 14: behavior when a saved external resource cannot be reconstructed. */
     uint32_t checkpoint_policy;
     uint32_t reserved_abi13;
 } hl_launch_config;

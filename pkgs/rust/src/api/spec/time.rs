@@ -90,7 +90,9 @@ pub enum CheckpointMode {
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum IncompatibleResourcePolicy {
+    /// No policy requested: restore keeps every process it can and stops the rest.
     #[default]
+    Unspecified,
     Refuse,
     Reconnect,
     DiscardOptional,

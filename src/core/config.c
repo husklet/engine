@@ -27,7 +27,7 @@ hl_status hl_launch_config_validate(const void *wire, size_t wire_size, hl_launc
     } else if (config.header_size < sizeof(config) || config.reserved != 0 || config.reserved_abi11 != 0 ||
                (config.abi == HL_CONFIG_ABI_OVERLAY && (config.checkpoint_policy != 0 || config.reserved_abi13 != 0)) ||
                (config.abi == HL_CONFIG_ABI &&
-                (config.checkpoint_policy > HL_CONFIG_CHECKPOINT_DISCARD_OPTIONAL || config.reserved_abi13 != 0)) ||
+                (config.checkpoint_policy > HL_CONFIG_CHECKPOINT_REFUSE || config.reserved_abi13 != 0)) ||
                config.network_transport > HL_CONFIG_NETWORK_HOST ||
                config.network_isolated != (config.network_transport == HL_CONFIG_NETWORK_ISOLATED) ||
                config.lower_layer_count > 8 || ((config.lower_layer_count == 0) != (config.lower_layers_offset == 0)) ||

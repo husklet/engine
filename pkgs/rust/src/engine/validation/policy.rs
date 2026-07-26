@@ -162,7 +162,7 @@ pub(super) fn validate_checkpoint(
             || checkpoint.restore_directory.is_some()
             || checkpoint.maximum_pause_ms.is_some()
             || checkpoint.mode != crate::spec::CheckpointMode::Full
-            || checkpoint.incompatible_resources != crate::spec::IncompatibleResourcePolicy::Refuse)
+            || checkpoint.incompatible_resources != crate::spec::IncompatibleResourcePolicy::default())
     {
         return Err(spec_error(
             SpecErrorCategory::Conflict,

@@ -395,10 +395,10 @@ foreach(_arch aarch64 x86_64)
       LABELS "checkpoint;checkpoint-${_arch}" RESOURCE_LOCK hl-checkpoint WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endforeach()
 
-  # The 16 IO-recovery scenarios all share one fixture binary.
+  # The 17 IO-recovery scenarios all share one fixture binary.
   foreach(_s io-replace io-recreate io-directory io-duplicate io-device
              io-type-change io-permission io-missing-root io-append io-shortened
-             io-repeat io-directory-change io-missing-child-strict io-fifo-refusal
+             io-repeat io-directory-change io-missing-child-strict io-missing-child-default io-fifo-refusal
              io-queued-device io-queued-missing)
     add_test(NAME checkpoint.${_arch}.${_s}
       COMMAND $<TARGET_FILE:checkpoint-tree-runner>

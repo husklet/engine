@@ -6,11 +6,12 @@ then reconnects external resources to their current host state.
 
 ## Recovery policies
 
-Selected by `HL_CHECKPOINT_POLICY` (`ckpt_recovery_policy`, `src/linux_abi/checkpoint.c`). `refuse` is the
-default. Under the two permissive policies a restore deliberately restores everything it can and stops what it
-cannot; a stopped subtree is the designed outcome, not a failure or a gap to be closed later.
+Selected by `HL_CHECKPOINT_POLICY` (`ckpt_recovery_policy`, `src/linux_abi/checkpoint.c`). An unset policy
+restores as `discard-optional`: a restore deliberately restores everything it can and stops what it cannot; a
+stopped subtree is the designed outcome, not a failure or a gap to be closed later. Capture is unaffected by
+the default — capture only relaxes when a permissive policy is asked for explicitly.
 
-- `refuse`: any nonviable process or required resource refuses the whole restore.
+- `refuse` (explicit only): any nonviable process or required resource refuses the whole restore.
 - `reconnect`: reconnect path-backed resources where possible and stop nonviable process subtrees.
 - `discard-optional`: reconnect reconstructible resources and stop nonviable process subtrees.
 - Container init is mandatory under every policy. If init is nonviable, restore is refused.
@@ -54,8 +55,9 @@ The release gate covers:
 - Unix stream and seqpacket socket pairs, unread frames, EOF, and queued descriptor graphs;
 - standalone UDP, Unix listeners, socket options, connected internal sockets, and connection fallback.
 
-Established or in-progress connections that cannot be transferred are refused under `refuse`. Under permissive
-capture they restore as disconnected sockets with pending `ECONNRESET`, allowing application retry logic.
+Established or in-progress connections that cannot be transferred are refused at capture time unless a
+permissive policy was requested explicitly. Under permissive capture they restore as disconnected sockets with
+pending `ECONNRESET`, allowing application retry logic.
 
 ## Image durability
 
@@ -75,7 +77,7 @@ commit calls — see docs/checkpoint-sink.md.
 Run:
 
 ```sh
-ctest --test-dir <build-dir> -L checkpoint      # or -L checkpoint-io for the 16 IO/recovery scenarios
+ctest --test-dir <build-dir> -L checkpoint      # or -L checkpoint-io for the 17 IO/recovery scenarios
 make e2e-checkpoint-io-full                     # the Makefile equivalent
 ```
 

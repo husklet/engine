@@ -102,7 +102,7 @@ typedef struct hl_engine_box_config {
     const char *restore_directory;
     /* Newline-separated normalized-relative-path<TAB>uid<TAB>gid records. */
     const char *file_owners;
-    /* HL_CONFIG_CHECKPOINT_*; zero preserves strict refusal. */
+    /* HL_CONFIG_CHECKPOINT_*; zero asks for no policy (permissive restore). */
     uint32_t checkpoint_policy;
     uint32_t reserved_checkpoint;
 } hl_engine_box_config;

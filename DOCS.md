@@ -133,10 +133,11 @@ no recoverable path, and guest descriptor tables that exceed the checkpoint limi
 that daemonizes out of the init descendant tree is not captured. These cases are refused, not silently omitted from
 an otherwise successful image.
 
-**Restore is policy-driven, and the permissive policies restore what can be restored.** `HL_CHECKPOINT_POLICY`
-selects `refuse` (the default), `reconnect`, or `discard-optional`. Under the two permissive policies a process
-that cannot be reconstructed is stopped along with its descendants and the rest of the tree resumes; that is the
-intended contract, not a degraded mode. Container init is mandatory under every policy. Every restore records the
+**Restore is permissive by default and restores what can be restored.** `HL_CHECKPOINT_POLICY` selects
+`reconnect`, `discard-optional`, or `refuse`; leaving it unset restores as `discard-optional`. Under the
+permissive policies a process that cannot be reconstructed is stopped along with its descendants and the rest of
+the tree resumes; that is the intended contract, not a degraded mode. Capture is unaffected by the default: it
+only relaxes for an explicitly permissive policy. Container init is mandatory under every policy. Every restore records the
 per-process outcome in `RECOVERY.jsonl`. Detail: docs/checkpoint-restore-io.md. Where the bytes live is an
 embedder decision: docs/checkpoint-sink.md.
 
