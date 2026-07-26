@@ -198,22 +198,31 @@ __attribute__((naked)) static void block_return(void) {
 // whose stack we do not own. It would also mean this shared file reaching for the translator's g_jit_fatal,
 // which is cache.c's TU-local state, purely to reuse a logging shape. write(2) to stderr via fprintf plus
 // abort() is the honest primitive: it names the missing backend and leaves a core at the exact frame.
+// Note on reachability: a backend that brings its OWN entry boundary defines G_OWN_TRAMPOLINES and never
+// compiles this arm -- guest/x86_64/dispatch.h does that for the ARM64-host JIT, and both interp_dispatch.h
+// files do it for the interpreter backends, which are the amd64 host's answer. So these two are the arm for a
+// host CPU that has been given a name (src/host/host_cpu.h) but not yet a backend, which is exactly the state
+// the tree was in before the interpreters landed and exactly the state a future host will pass through. The
+// diagnostics therefore name the seam a new backend has to fill rather than any one architecture's plan.
 static void run_block(struct cpu *cpu, void *code) {
     (void)cpu;
     (void)code;
     fprintf(stderr,
-            "hl: run_block() entered on a " HL_HOST_CPU_NAME " host, which has no code generator.\n"
-            "    Both guest frontends emit ARM64 (src/translator/host/aarch64), so there is no host code to\n"
-            "    enter and no ARM64 entry trampoline to enter it with. A " HL_HOST_CPU_NAME " host backend\n"
-            "    under src/translator/host/ is the missing piece.\n");
+            "hl: run_block() entered on a " HL_HOST_CPU_NAME " host with no execution backend.\n"
+            "    A backend supplies translate_block() plus its own run_block()/block_return() and declares\n"
+            "    G_OWN_TRAMPOLINES so this placeholder is not compiled -- see the host-CPU fork in\n"
+            "    src/core/target/<guest isa>.c and docs/amd64-host.md. Reaching this means that fork selected\n"
+            "    an arm that defines neither an ARM64 boundary nor a backend of its own.\n");
     abort();
 }
 
 static void block_return(void) {
     fprintf(stderr,
-            "hl: block_return() entered on a " HL_HOST_CPU_NAME " host. Only translated ARM64 blocks branch\n"
-            "    here, and none can exist on this host -- so its address was baked into something that then\n"
-            "    ran, which means a stale persistent-cache image or a mis-relocated exit was executed.\n");
+            "hl: block_return() entered on a " HL_HOST_CPU_NAME " host. Only a translated ARM64 block branches\n"
+            "    here, and none can exist on this host -- so its address was baked into something that then ran,\n"
+            "    which means a stale persistent-cache image or a mis-relocated exit was executed. Cache identity\n"
+            "    includes the host ISA (src/translator/identity.c) precisely to make that impossible, so this is\n"
+            "    a bug in the identity key, not a stale directory.\n");
     abort();
 }
 #endif
