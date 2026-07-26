@@ -11,6 +11,8 @@
 #include <sys/prctl.h> // host PR_SET_NAME: mirror the guest comm onto this host task so a PEER's
                        // /proc/<pid>/{stat,status,comm} read (hl_host_process_read) reports the guest
                        // program name, not the engine binary "hl-engine-linux".
+#include <sys/sysmacros.h> // glibc keeps major()/minor() here, not in <sys/types.h>: the dev field of a
+                           // file-backed /proc/<pid>/maps row.
 #endif
 
 // Set when a followed path resolution exceeds the symlink-traversal limit (Linux caps at 40 -> ELOOP). The
@@ -2324,8 +2326,9 @@ static const char *proc_self_leaf(const char *rp) {
 // Shared_Dirty on real Linux (parent+child map it until COW breaks), so reporting the dirty bytes there
 // both matches Linux for that query and clears the false positive. Rss stays == Shared_Clean +
 // Shared_Dirty + Private_Clean + Private_Dirty (the kernel's invariant), so a summing parser is consistent.
-static int proc_map_region_p(char *b, size_t n, unsigned long lo, unsigned long hi, const char *perms, const char *name,
-                             int smaps) {
+static int proc_map_region_p(char *b, size_t n, unsigned long lo, unsigned long hi, const char *perms,
+                             unsigned long long pgoff, unsigned dev_major, unsigned dev_minor, unsigned long long ino,
+                             const char *name, int smaps) {
     unsigned long kb = (hi - lo) / 1024;
     // "Locked:" reports the mlock/mlockall'd bytes of THIS region (LTP mlock05 mlock()s a whole mapping
     // and reads its Locked back == the mapping size).
@@ -2335,28 +2338,70 @@ static int proc_map_region_p(char *b, size_t n, unsigned long lo, unsigned long 
     int resident = (perms[0] != '-' || perms[1] != '-' || perms[2] != '-');
     unsigned long rkb = resident ? kb : 0;
     // Addresses use the kernel's own %08lx field width (min 8, NOT zero-padded to 12) so pmap/gdb and a
-    // strict structural diff see the exact byte layout real Linux emits for the same address.
-    int m = snprintf(b, n, "%08lx-%08lx %s 00000000 00:00 0 %*s%s\n", lo, hi, perms, name[0] ? 20 : 0, "", name);
-    if (smaps)
+    // strict structural diff see the exact byte layout real Linux emits for the same address. A named row
+    // reproduces seq_pad(): the name starts at offset 73 whatever the field widths, with at least one
+    // separating space (measured against this host's kernel, every row type).
+    int m = snprintf(b, n, "%08lx-%08lx %s %08llx %02x:%02x %llu ", lo, hi, perms, pgoff, dev_major, dev_minor, ino);
+    if (name[0]) {
+        if (m < 72) m += snprintf(b + m, (size_t)n - (size_t)m, "%*s", 72 - m, "");
+        m += snprintf(b + m, (size_t)n - (size_t)m, " %s", name);
+    }
+    m += snprintf(b + m, (size_t)n - (size_t)m, "\n");
+    if (smaps) {
+        // The kernel's full per-region field set, in its order and its layout (name padded to 16, value
+        // right-aligned at column 24). The set was short of Pss_Dirty/KSM/LazyFree/{Shmem,File}PmdMapped/
+        // {Shared,Private}_Hugetlb/SwapPss/THPeligible/ProtectionKey, and a profiler that requires a field
+        // it cannot find treats the region as unparsable rather than as a zero.
+        // A FILE-backed region's resident pages are clean page-cache and carry no anonymous bytes -- report
+        // them under Private_Clean with Anonymous 0, as the kernel does. The Shared_Dirty attribution above
+        // is specific to private-anon COW and must not be extended to the image, or a parser summing
+        // Anonymous over the regions counts the executable as anonymous memory.
+        int fileback = ino != 0;
+        unsigned long pclean = fileback ? rkb : 0, sdirty = fileback ? 0 : rkb, anon = fileback ? 0 : rkb;
         m += snprintf(b + m, (size_t)n - (size_t)m,
-                      "Size:%15lu kB\nKernelPageSize:%6d kB\nMMUPageSize:%9d kB\n"
-                      "Rss:%16lu kB\nPss:%16lu kB\nShared_Clean:%7d kB\nShared_Dirty:%7lu kB\n"
-                      "Private_Clean:%6d kB\nPrivate_Dirty:%6lu kB\nReferenced:%9lu kB\n"
-                      "Anonymous:%10lu kB\nAnonHugePages:%6d kB\nSwap:%15d kB\nLocked:%13lu kB\n"
-                      "VmFlags: rd wr mr mw me ac\n",
-                      kb, 4, 4, rkb, rkb, 0, rkb, 0, 0UL, rkb, rkb, 0, 0, lockkb);
+                      "Size:%19lu kB\nKernelPageSize:%9d kB\nMMUPageSize:%12d kB\n"
+                      "Rss:%20lu kB\nPss:%20lu kB\nPss_Dirty:%14lu kB\n"
+                      "Shared_Clean:%11d kB\nShared_Dirty:%11lu kB\n"
+                      "Private_Clean:%10lu kB\nPrivate_Dirty:%10lu kB\nReferenced:%13lu kB\n"
+                      "Anonymous:%14lu kB\nKSM:%20d kB\nLazyFree:%15d kB\nAnonHugePages:%10d kB\n"
+                      "ShmemPmdMapped:%9d kB\nFilePmdMapped:%10d kB\n"
+                      "Shared_Hugetlb:%9d kB\nPrivate_Hugetlb:%8d kB\n"
+                      "Swap:%19d kB\nSwapPss:%16d kB\nLocked:%17lu kB\nTHPeligible:%12d\nProtectionKey:%10d\n",
+                      kb, 4, 4, rkb, rkb, sdirty, 0, sdirty, pclean, 0UL, rkb, anon, 0, 0, 0, 0, 0, 0, 0, 0, 0, lockkb,
+                      0, 0);
+        // VmFlags follows the region's real protection (rd/wr/ex), not a fixed string: a PROT_NONE guard
+        // claiming "rd wr" contradicts its own perms column. mr/mw/me are the may- bits, ac accountable.
+        m += snprintf(b + m, (size_t)n - (size_t)m, "VmFlags:%s%s%s mr mw me ac \n", perms[0] == 'r' ? " rd" : "",
+                      perms[1] == 'w' ? " wr" : "", perms[2] == 'x' ? " ex" : "");
+    }
     return m;
 }
 
 // PT_LOAD segments of the main executable, read from the auxv the loader planted (AT_PHDR/AT_PHENT/
 // AT_PHNUM) so /proc/self/maps shows the text as r-xp, rodata r--p, data rw-p -- the real per-segment
 // protection, not a single flat rw-p span. Cross-arch (the Elf64_Phdr layout is arch-independent).
+//
+// Row geometry follows the kernel's ELF loader exactly, because that is what the file's readers model:
+// a PT_LOAD is FILE-backed over [pgdown(vaddr), pgup(vaddr+filesz)) at file offset pgdown(p_offset), and
+// the .bss remainder up to pgup(vaddr+memsz) is a separate ANONYMOUS row (offset 0, dev 00:00, no path).
 struct mseg {
-    uint64_t lo, hi;
+    uint64_t lo, hi, off;
     int prot;
+    int file; // 1 -> carries the exe path + its dev:inode; 0 -> the anonymous .bss tail
 };
 
-static int maps_phdr_segs(struct mseg *seg, int maxn) {
+// Guest -> host for a main-image address. A non-PIE ET_EXEC is linked low but mapped high (see
+// g_nonpie_bias): every guest-visible image address, AT_PHDR included, is the LOW link value, and the bytes
+// live at +bias. Dereferencing the guest value raw is what made this synthesis bail out entirely.
+static uint64_t maps_image_host(uint64_t guest) {
+    return (g_nonpie_lo && guest >= g_nonpie_lo && guest < g_nonpie_hi) ? guest + g_nonpie_bias : guest;
+}
+
+// The main image's program headers at their HOST location, with `phnum`/`phent` and the load bias that maps
+// a link-time vaddr to the guest-visible one (0 for a non-PIE, whose guest addresses stay at the link
+// values). NULL when the auxv is absent or the headers are no longer mapped -- callers then degrade rather
+// than fault the engine.
+static const uint8_t *maps_phdr_table(uint64_t *phnum_out, uint64_t *phent_out, uint64_t *bias_out) {
     uint64_t phdr = 0, phent = 0, phnum = 0;
     for (int i = 0; i + 16 <= g_auxv_len; i += 16) {
         uint64_t t, v;
@@ -2369,12 +2414,12 @@ static int maps_phdr_segs(struct mseg *seg, int maxn) {
         else if (t == 5)
             phnum = v;
     }
-    if (!phdr || phent < 56 || phnum == 0 || phnum > 256) return 0;
-    /* AT_PHDR is a GUEST address: reading through it is safe only while the guest's program headers are
-     * mapped at the same HOST address (a non-PIE bias or a guest unmap breaks that, and unprobed, any guest
-     * reading /proc/self/maps could SIGSEGV the engine). Bailing out only drops rows. */
-    if (!hl_host_range_mapped((uintptr_t)phdr, (size_t)(phnum * phent))) return 0;
-    const uint8_t *ph = (const uint8_t *)(uintptr_t)phdr;
+    if (!phdr || phent < 56 || phnum == 0 || phnum > 256) return NULL;
+    /* Probe the HOST location of the headers: unprobed, a guest unmap would let any guest reading
+     * /proc/self/maps SIGSEGV the engine. Bailing out only drops rows. */
+    uint64_t hostphdr = maps_image_host(phdr);
+    if (!hl_host_range_mapped((uintptr_t)hostphdr, (size_t)(phnum * phent))) return NULL;
+    const uint8_t *ph = (const uint8_t *)(uintptr_t)hostphdr;
     // load bias: PT_PHDR's runtime address (AT_PHDR) minus its link vaddr; 0 for a non-PIE.
     uint64_t bias = 0;
     for (uint64_t i = 0; i < phnum; i++) {
@@ -2388,6 +2433,16 @@ static int maps_phdr_segs(struct mseg *seg, int maxn) {
             break;
         } // PT_PHDR
     }
+    *phnum_out = phnum;
+    *phent_out = phent;
+    *bias_out = bias;
+    return ph;
+}
+
+static int maps_phdr_segs(struct mseg *seg, int maxn) {
+    uint64_t phent = 0, phnum = 0, bias = 0;
+    const uint8_t *ph = maps_phdr_table(&phnum, &phent, &bias);
+    if (!ph) return 0;
     // PT_GNU_RELRO (0x6474e552): the prefix of the data segment the loader RE-PROTECTS read-only after
     // relocation. The kernel splits the writable load VMA there, so /proc/self/maps shows that prefix as
     // r--p then the rest rw-p. Toolchains that fold rodata into the r-xp text segment (aarch64 gcc default,
@@ -2407,44 +2462,74 @@ static int maps_phdr_segs(struct mseg *seg, int maxn) {
         }
     }
     int nseg = 0;
+#define MSEG_PUSH(LO, HI, PROT, OFF, FILE)                                                                             \
+    do {                                                                                                               \
+        if (nseg < maxn && (HI) > (LO)) {                                                                              \
+            seg[nseg].lo = (LO);                                                                                       \
+            seg[nseg].hi = (HI);                                                                                       \
+            seg[nseg].prot = (PROT);                                                                                   \
+            seg[nseg].off = (OFF);                                                                                     \
+            seg[nseg].file = (FILE);                                                                                   \
+            nseg++;                                                                                                    \
+        }                                                                                                              \
+    } while (0)
     for (uint64_t i = 0; i < phnum && nseg < maxn; i++) {
         const uint8_t *e = ph + i * phent;
         uint32_t type, flags;
-        uint64_t vaddr, memsz;
+        uint64_t poff, vaddr, filesz, memsz;
+        memcpy(&type, e, 4);
+        memcpy(&flags, e + 4, 4);
+        memcpy(&poff, e + 8, 8);
+        memcpy(&vaddr, e + 16, 8);
+        memcpy(&filesz, e + 32, 8);
+        memcpy(&memsz, e + 40, 8);
+        if (type != 1 || memsz == 0) continue; // PT_LOAD only
+        uint64_t start = bias + vaddr;
+        uint64_t lo = start & ~0xfffULL;
+        uint64_t fhi = filesz ? ((start + filesz + 0xfffULL) & ~0xfffULL) : lo; // end of the file-backed part
+        uint64_t hi = (start + memsz + 0xfffULL) & ~0xfffULL;
+        uint64_t foff = poff - (start - lo); // the file offset the row's first page maps
+        int prot = ((flags & 4) ? 4 : 0) | ((flags & 2) ? 2 : 0) | ((flags & 1) ? 1 : 0); // R|W|X
+        // A writable segment whose start is covered by relro: emit the relro prefix as r--p, the rest rw-p.
+        uint64_t rhi = relro_hi < fhi ? relro_hi : fhi;
+        if ((prot & 2) && rhi > relro_lo && relro_lo >= lo && rhi > lo) {
+            uint64_t rlo = relro_lo > lo ? relro_lo : lo;
+            MSEG_PUSH(lo, rlo, prot, foff, 1);
+            MSEG_PUSH(rlo, rhi, 4, foff + (rlo - lo), 1); // r--p (read-only after relocation)
+            MSEG_PUSH(rhi, fhi, prot, foff + (rhi - lo), 1);
+        } else {
+            MSEG_PUSH(lo, fhi, prot, foff, 1);
+        }
+        MSEG_PUSH(fhi, hi, prot, 0, 0); // the .bss remainder: anonymous, like the kernel's set_brk()
+    }
+#undef MSEG_PUSH
+    return nseg;
+}
+
+// mm->{start_code,end_code,start_data,end_data} as /proc/[pid]/stat fields 26/27/45/46, derived the way
+// load_elf_binary derives them: the text bounds are the executable PT_LOAD's [vaddr, vaddr+filesz) and the
+// data bounds the HIGHEST PT_LOAD's -- both un-rounded, unlike the maps rows. A backtrace/dladdr-alike asks
+// "is this pc in the text?" here, so leaving them zero says the program has no code.
+static void maps_code_data_bounds(uint64_t *sc, uint64_t *ec, uint64_t *sd, uint64_t *ed) {
+    *sc = *ec = *sd = *ed = 0;
+    uint64_t phent = 0, phnum = 0, bias = 0;
+    const uint8_t *ph = maps_phdr_table(&phnum, &phent, &bias);
+    if (!ph) return;
+    for (uint64_t i = 0; i < phnum; i++) {
+        const uint8_t *e = ph + i * phent;
+        uint32_t type, flags;
+        uint64_t vaddr, filesz;
         memcpy(&type, e, 4);
         memcpy(&flags, e + 4, 4);
         memcpy(&vaddr, e + 16, 8);
-        memcpy(&memsz, e + 40, 8);
-        if (type != 1 || memsz == 0) continue; // PT_LOAD only
-        uint64_t lo = (bias + vaddr) & ~0xfffULL;
-        uint64_t hi = (bias + vaddr + memsz + 0xfff) & ~0xfffULL;
-        int prot = ((flags & 4) ? 4 : 0) | ((flags & 2) ? 2 : 0) | ((flags & 1) ? 1 : 0); // R|W|X
-        // A writable segment whose start is covered by relro: emit the relro prefix as r--p, the rest rw-p.
-        if ((prot & 2) && relro_hi > relro_lo && relro_lo >= lo && relro_hi <= hi && relro_hi > lo && nseg + 1 < maxn) {
-            if (relro_lo > lo) {
-                seg[nseg].lo = lo;
-                seg[nseg].hi = relro_lo;
-                seg[nseg].prot = prot;
-                nseg++;
-            }
-            seg[nseg].lo = relro_lo > lo ? relro_lo : lo;
-            seg[nseg].hi = relro_hi;
-            seg[nseg].prot = 4; // r--p (read-only after relocation)
-            nseg++;
-            if (relro_hi < hi) {
-                seg[nseg].lo = relro_hi;
-                seg[nseg].hi = hi;
-                seg[nseg].prot = prot;
-                nseg++;
-            }
-            continue;
-        }
-        seg[nseg].lo = lo;
-        seg[nseg].hi = hi;
-        seg[nseg].prot = prot;
-        nseg++;
+        memcpy(&filesz, e + 32, 8);
+        if (type != 1) continue; // PT_LOAD only
+        uint64_t lo = bias + vaddr, hi = lo + filesz;
+        if ((flags & 1) && (!*sc || lo < *sc)) *sc = lo;
+        if ((flags & 1) && hi > *ec) *ec = hi;
+        if (lo > *sd) *sd = lo;
+        if (hi > *ed) *ed = hi;
     }
-    return nseg;
 }
 
 static void maps_perms_str(int prot, char *out) { // prot bits: 4=R 2=W 1=X
@@ -2463,7 +2548,8 @@ static uint64_t brk_lo, brk_cur, brk_hi;
 // One /proc/maps row, collected before emit so the whole file can be address-sorted (the kernel ALWAYS
 // emits VMAs in ascending start order; pmap/gdb and jemalloc/glibc's sequential parse rely on it).
 struct maprow {
-    uint64_t lo, hi;
+    uint64_t lo, hi, off, ino;
+    unsigned dev_major, dev_minor;
     char perms[5];
     const char *name;
 };
@@ -2484,7 +2570,8 @@ static int proc_maps_fd(int smaps) {
     if (fd < 0) return -1;
     if (fd < HL_NFD) g_proc_text_ro[fd] = 1;
     unlink(tn);
-    char b[768];
+    char b[5120]; // one row: the header line (a PATH_MAX pathname) plus a full smaps field block, whole --
+                  // a truncated row would lose its newline and merge into the next one.
     // Collect every row on the heap (the registry can hold thousands) so the file can be address-sorted before
     // emit. Capacity: main-exe PT_LOAD segs + stack + guard + heap split + one row per gmap entry.
     size_t mapping_count = hl_gmap_count();
@@ -2495,11 +2582,18 @@ static int proc_maps_fd(int smaps) {
         return -1;
     }
     int nrow = 0;
-#define MAPROW_ADD(LO, HI, PERMS, NAME)                                                                                \
+    // An anonymous row: file offset 0, dev 00:00, inode 0 -- the tuple every maps parser uses to tell an
+    // anonymous VMA from a file-backed one.
+#define MAPROW_ADD(LO, HI, PERMS, NAME) MAPROW_ADD_F(LO, HI, PERMS, 0, 0, 0, 0, NAME)
+#define MAPROW_ADD_F(LO, HI, PERMS, OFF, DMAJ, DMIN, INO, NAME)                                                        \
     do {                                                                                                               \
         if (nrow < cap && (HI) > (LO)) {                                                                               \
             rows[nrow].lo = (LO);                                                                                      \
             rows[nrow].hi = (HI);                                                                                      \
+            rows[nrow].off = (OFF);                                                                                    \
+            rows[nrow].dev_major = (DMAJ);                                                                             \
+            rows[nrow].dev_minor = (DMIN);                                                                             \
+            rows[nrow].ino = (INO);                                                                                    \
             snprintf(rows[nrow].perms, sizeof rows[nrow].perms, "%s", (PERMS));                                        \
             rows[nrow].name = (NAME);                                                                                  \
             nrow++;                                                                                                    \
@@ -2507,13 +2601,34 @@ static int proc_maps_fd(int smaps) {
     } while (0)
     // The main executable's PT_LOAD segments, with their real per-segment protection (text r-xp, rodata
     // r--p, data rw-p) and the exe path as the mapping name -- read from the auxv program headers.
-    struct mseg seg[16];
-    int nseg = maps_phdr_segs(seg, 16);
-    const char *exe = (g_exe_path && g_exe_path[0]) ? g_exe_path : "";
+    struct mseg seg[32];
+    int nseg = maps_phdr_segs(seg, 32);
+    const char *hostexe = (g_exe_path && g_exe_path[0]) ? g_exe_path : "";
+    // The pathname column is the path the GUEST knows: strip the rootfs prefix exactly as /proc/self/exe
+    // does, else the two files disagree and the host's rootfs location leaks into the container.
+    const char *exe = hostexe;
+    if (g_rootfs && !strncmp(exe, g_rootfs_canon, g_rootfs_canon_len)) exe += g_rootfs_canon_len;
+    if (!exe[0]) exe = hostexe;
+    // dev:inode of the image, stat'd through the HOST path. A file-backed row must carry a non-zero pair:
+    // that -- not the pathname, which the kernel also prints for [heap]/[stack] -- is how libunwind/ASan/
+    // dladdr-alikes decide a row names an object on disk. Unstattable -> the anonymous tuple, not a lie.
+    unsigned exe_dmaj = 0, exe_dmin = 0;
+    unsigned long long exe_ino = 0;
+    {
+        struct stat es;
+        if (hostexe[0] && stat(hostexe, &es) == 0) {
+            exe_dmaj = (unsigned)major(es.st_dev);
+            exe_dmin = (unsigned)minor(es.st_dev);
+            exe_ino = (unsigned long long)es.st_ino;
+        }
+    }
     for (int i = 0; i < nseg; i++) {
         char perms[5];
         maps_perms_str(seg[i].prot, perms);
-        MAPROW_ADD(seg[i].lo, seg[i].hi, perms, exe);
+        if (seg[i].file)
+            MAPROW_ADD_F(seg[i].lo, seg[i].hi, perms, seg[i].off, exe_dmaj, exe_dmin, exe_ino, exe);
+        else
+            MAPROW_ADD(seg[i].lo, seg[i].hi, perms, ""); // the .bss tail is anonymous
     }
     if (g_stack_hi) {
         unsigned long lo = (unsigned long)g_stack_lo, hi = (unsigned long)g_stack_hi;
@@ -2531,25 +2646,37 @@ static int proc_maps_fd(int smaps) {
         if (!hl_gmap_get(i, &mapping)) continue;
         // report the guest-VISIBLE length (glen) so a mapping's Size/Rss matches the guest's mmap length,
         // not hl's full extent including the 64 KB guard tail it reserves past anon maps (LTP mlock05 Rss).
-        unsigned long lo = (unsigned long)mapping.address, hi = lo + (unsigned long)mapping.guest_length;
+        // Page-round the end as the kernel does: a VMA spans PAGE_ALIGN(len), so a guest that mmap'd a
+        // non-multiple length must still see a page-granular row -- parsers divide the span by the page size.
+        unsigned long lo = (unsigned long)mapping.address;
+        unsigned long hi = (lo + (unsigned long)mapping.guest_length + 0xffful) & ~0xffful;
         if (g_stack_hi && lo >= (unsigned long)g_stack_lo && hi <= (unsigned long)g_stack_hi)
             continue; // already emitted as [stack]
         if (brk_hi && lo == (unsigned long)brk_lo)
             continue; // the brk arena -- rendered as [heap] above (tail beyond brk is not guest-visible)
-        // skip a region already rendered as PT_LOAD segments (the image span the loader tracks as one entry)
+        // skip a region already rendered as PT_LOAD segments (the image span the loader tracks as one entry).
+        // For a non-PIE the loader's entry sits at the HIGH host address while the rows are at the guest link
+        // addresses, so fold the entry back through the bias before comparing.
         int covered = 0;
-        for (int s = 0; s < nseg; s++)
-            if (lo >= seg[s].lo && lo < seg[s].hi) {
-                covered = 1;
-                break;
-            }
+        if (nseg > 0) {
+            unsigned long glo = lo;
+            if (g_nonpie_bias && lo >= g_nonpie_lo + g_nonpie_bias && lo < g_nonpie_hi + g_nonpie_bias)
+                glo = lo - g_nonpie_bias;
+            for (int s = 0; s < nseg; s++)
+                if (glo >= seg[s].lo && glo < seg[s].hi) {
+                    covered = 1;
+                    break;
+                }
+        }
         if (covered) continue;
         MAPROW_ADD(lo, hi, "rw-p", "");
     }
+#undef MAPROW_ADD_F
 #undef MAPROW_ADD
     qsort(rows, (size_t)nrow, sizeof *rows, maprow_cmp);
     for (int i = 0; i < nrow; i++) {
-        int m = proc_map_region_p(b, sizeof b, rows[i].lo, rows[i].hi, rows[i].perms, rows[i].name, smaps);
+        int m = proc_map_region_p(b, sizeof b, rows[i].lo, rows[i].hi, rows[i].perms, rows[i].off, rows[i].dev_major,
+                                  rows[i].dev_minor, rows[i].ino, rows[i].name, smaps);
         if (write(fd, b, (size_t)m) < 0) {}
     }
     free(rows);
@@ -2663,10 +2790,16 @@ static int proc_stat_text(char *b, size_t n) {
     self_vm_bytes(&vm_rss, &vm_vsize);
     unsigned long rss_pg = (unsigned long)(vm_rss / pgsz);
     unsigned long vsize = (unsigned long)vm_vsize;
+    // 26/27 startcode/endcode, 45/46 start_data/end_data, 47 start_brk. Field 38 (exit_signal, SIGCHLD=17)
+    // used to sit at 39: one zero too many followed it field 25, which shifted every field from 26 up by
+    // one, so a reader indexing by position got the wrong column for all of them.
+    uint64_t sc, ec, sd, ed;
+    maps_code_data_bounds(&sc, &ec, &sd, &ed);
     return snprintf(b, n,
                     "%d (%s) R %d %d %d 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 100 %lu %lu 18446744073709551615 "
-                    "0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-                    pid, comm, ppid, gpgrp, gsid, vsize, rss_pg);
+                    "%llu %llu 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 %llu %llu %llu 0 0 0 0 0\n",
+                    pid, comm, ppid, gpgrp, gsid, vsize, rss_pg, (unsigned long long)sc, (unsigned long long)ec,
+                    (unsigned long long)sd, (unsigned long long)ed, (unsigned long long)brk_lo);
 }
 
 // /proc/[pid]/environ -- the guest environment as NUL-separated KEY=VALUE. The authoritative source is
@@ -3130,13 +3263,25 @@ static int proc_maps_pid_fd(int gp, int host) {
     char exe[4200];
     if (!proc_reg_exe_read(host, exe, sizeof exe)) snprintf(exe, sizeof exe, "/proc/%d/exe", host);
 
-    char buf[2048];
+    char buf[24576]; // 5 rows, each able to carry the full 4 KB exe path without being truncated mid-row
     int n = 0;
-    n += proc_map_region_p(buf + n, sizeof buf - (size_t)n, 0x400000, 0x500000, "r-xp", exe, 0);
-    n += proc_map_region_p(buf + n, sizeof buf - (size_t)n, 0x500000, 0x510000, "r--p", exe, 0);
-    n += proc_map_region_p(buf + n, sizeof buf - (size_t)n, 0x510000, 0x520000, "rw-p", exe, 0);
-    n += proc_map_region_p(buf + n, sizeof buf - (size_t)n, 0x70000000, 0x70100000, "rw-p", "[heap]", 0);
-    n += proc_map_region_p(buf + n, sizeof buf - (size_t)n, 0x7ffde000, 0x7ffff000, "rw-p", "[stack]", 0);
+    // The peer's image rows carry its own dev:inode when the path is stattable, so a reader that keys on the
+    // pair (rather than the pathname) classifies them as file-backed exactly as it would on Linux.
+    unsigned dmaj = 0, dmin = 0;
+    unsigned long long ino = 0;
+    struct stat es;
+    if (stat(exe, &es) == 0) {
+        dmaj = (unsigned)major(es.st_dev);
+        dmin = (unsigned)minor(es.st_dev);
+        ino = (unsigned long long)es.st_ino;
+    }
+    n += proc_map_region_p(buf + n, sizeof buf - (size_t)n, 0x400000, 0x500000, "r-xp", 0, dmaj, dmin, ino, exe, 0);
+    n += proc_map_region_p(buf + n, sizeof buf - (size_t)n, 0x500000, 0x510000, "r--p", 0x100000, dmaj, dmin, ino, exe,
+                           0);
+    n += proc_map_region_p(buf + n, sizeof buf - (size_t)n, 0x510000, 0x520000, "rw-p", 0x110000, dmaj, dmin, ino, exe,
+                           0);
+    n += proc_map_region_p(buf + n, sizeof buf - (size_t)n, 0x70000000, 0x70100000, "rw-p", 0, 0, 0, 0, "[heap]", 0);
+    n += proc_map_region_p(buf + n, sizeof buf - (size_t)n, 0x7ffde000, 0x7ffff000, "rw-p", 0, 0, 0, 0, "[stack]", 0);
     char desc[64];
     snprintf(desc, sizeof desc, "pid:%d:maps", gp);
     return proc_text_fd_tagged(buf, n, desc);
