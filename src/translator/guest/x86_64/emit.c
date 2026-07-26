@@ -14,11 +14,12 @@
 // fixup (ldapr_align_fixup) is wired solely into the Linux SIGBUS run path (jit86_lazyguard), so on any
 // other host the fast path stays OFF (== baseline behavior, no unhandled BUS_ADRALN).
 // It stays 0 on any host CPU that is not AArch64, and the probe is not even compiled there: AT_HWCAP is a
-// PER-ARCHITECTURE bit vector, so bit 15 is FEAT_LRCPC only on AArch64 -- on x86-64 Linux the same word
-// carries the legacy x86 capability flags, where bit 15 is unrelated and usually set. Probing it would flip
-// g_host_lrcpc on for a reason that has nothing to do with LDAPR. 0 selects the LDR + DMB ISHLD fallback in
-// every consumer (e_load / e_load_uoff / e_ldur here, and linux_abi/x86.c's ldapr_align_fixup, which is inert
-// unless an LDAPR was emitted), which is the byte-identical pre-LDAPR behavior.
+// PER-ARCHITECTURE bit vector, so bit 15 means FEAT_LRCPC only on AArch64. On x86-64 Linux the same word is
+// the CPUID.1:EDX feature mask, whose bit 15 is CMOV -- set on every x86-64 CPU in existence. Probing it
+// would therefore turn the LDAPR fast path ON, permanently, for a reason with nothing to do with LDAPR.
+// 0 selects the LDR + DMB ISHLD fallback in every consumer (e_load / e_load_uoff / e_ldur here, and
+// linux_abi/x86.c's ldapr_align_fixup, which is inert unless an LDAPR was emitted): the byte-identical
+// pre-LDAPR behavior.
 int g_host_lrcpc = 0;
 #if defined(__linux__) && defined(HL_HOST_CPU_AARCH64)
 #include <sys/auxv.h>
@@ -1202,9 +1203,9 @@ static void s1_calibrate(void) {
 #if !defined(HL_HOST_CPU_AARCH64)
     // The inline time fast path is inseparable from the AArch64 generic timer: the calibration below reads
     // CNTFRQ_EL0/CNTVCT_EL0, and the code emit_fast_syscall plants at the guest `syscall` site reads
-    // CNTVCT_EL0 again. Neither register exists on another host CPU, and there is no substitute a MOVe of a
-    // different clock could stand in for -- a wrong tick rate would not fail loudly, it would hand the guest
-    // a plausible but wrong CLOCK_REALTIME/MONOTONIC forever. So turn BOTH gates off, which is the same
+    // CNTVCT_EL0 again. Neither register exists on another host CPU, and substituting a different counter
+    // would not fail loudly -- it would hand the guest a plausible but wrong CLOCK_REALTIME/MONOTONIC
+    // forever. So turn BOTH gates off rather than mis-calibrate, which is the same
     // "safe fallback" state an AArch64 host with an unreadable counter frequency lands in: every
     // clock_gettime/gettimeofday takes the real R_SYSCALL exit through service(), and g_fastsys == 0 also
     // stops translate.c from emitting the W4F rt_sigprocmask/sched_yield arms.

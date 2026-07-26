@@ -31,6 +31,98 @@ on the Linux engine and to fail on macOS only for Linux-only kernel behaviour:
 | `socketpair-peek` (`ipc_socketpair_peek.c`) | `MSG_PEEK\|MSG_TRUNC` on an AF_UNIX datagram: Linux reports the full datagram length (40) into a short buffer, macOS reports the copied length (16). Everything else matches. |
 | `fork-fd-locks` (`ipc_fork_fd_locks.c`) | macOS has no OFD locks, so `F_OFD_SETLK` fails. |
 
+## Host-conditional dispositions: an x86_64 Linux host
+
+Every disposition above is keyed on the **engine** under test. These two are keyed on the
+**host CPU**, which only became a second axis when x86-64 Linux became a host. Neither guest
+frontend has an amd64 back end — both emit ARM64 — so that host's execution backend
+interprets rather than emits, at roughly 10-50x the cost of the ARM64-host JIT
+(`docs/amd64-host.md` sections 2-3). Two gates were calibrated against a JIT and cannot be
+read there the way they are read on an ARM64 host.
+
+Neither is disabled. One is rescaled and says so; the other measures instead of judging and
+says so. `HL_HOST_ARCH` (derived once in `CMakeLists.txt`) is the only test either makes, so
+an aarch64 host takes neither branch: with the scale at 1 and thresholds enforced, the
+generated `build/CTestTestfile.cmake` is byte-for-byte the file it was before these existed,
+which is a property of the build rather than a claim about it (`hl_matrix_timeout_scale()`
+writes nothing at 1, and the enforced perf command line is unchanged).
+
+| Gate | aarch64 host | x86_64 host | What names it in the output |
+|---|---|---|---|
+| per-case guest timeout (`tools/matrix_runner.c` 120s, `tools/linux_matrix.c` 20s) | unchanged | multiplied by `HL_MATRIX_TIMEOUT_SCALE` (30), and so is the CTest `TIMEOUT` of the 73 tests those two runners drive | `per-case timeout scaled x30 ...` on stdout at the start of the run, repeated after the pass/fail summary; a timeout diagnostic names the budget that expired |
+| tracked cold/p99 perf thresholds (`PERF_LIMIT_*`, `cmake/Phase3Gates.cmake`) | enforced, 26 cases | recorded, not enforced (`HL_PERF_ENFORCE=OFF`) | the case is *named* `perf.linux-<case>-<arch>.record-only`, and echoes `RECORD-ONLY ...: measured but NOT gated` with the thresholds that were not applied |
+
+### Why the timeout is scaled rather than raised for everyone
+
+20s and 120s are hang detectors, and on an ARM64 host they are unambiguous: every case in
+every suite these runners drive is milliseconds of guest work, so "did not finish" could only
+mean hung. Interpreted, a correct case can outrun the budget and be killed by the
+process-group kill — reporting a hang, which is both false and indistinguishable from the
+real thing, and destroying the stdout that would have told them apart. Raising the constants
+for every host would blunt the detector where it still works.
+
+The scale is set once where the lanes are registered (`cmake/Phase3Compat.cmake`) and passed
+in the environment; it is deliberately not detected inside the runners. Whether the engine a
+runner execs interprets is a property of that binary, and inferring it inside the harness
+would couple the harness to backend internals and silently re-tune itself whenever they
+changed. A malformed or out-of-range value is a hard refusal in both the runners and the
+configure, never a fallback to 1, because a silent fallback presents as a suite full of
+unexplained timeouts — exactly the diagnostic this exists to prevent. It multiplies
+`HL_MATRIX_CASE_TIMEOUT_MS` rather than replacing it: that variable says how much work *this
+suite* does (`.github/workflows/linux.yml` gives `compat-soak` 600s), the scale says how much
+slower *this host* executes any of it.
+
+30 is the middle of the range `docs/amd64-host.md` predicts, not a measurement — the
+interpreters are being written. It is a `-D` cache variable so it can be corrected once there
+are numbers; what must not happen is that it silently stays at 1.
+
+### Why the perf thresholds are recorded rather than re-set or skipped
+
+`PERF_LIMIT_*` are tracked JIT numbers, and DOCS.md's "Performance and release" roadmap item
+commits to enforcing them. Enforced on an interpreter, all thirteen cases per guest ISA fail
+for the one reason already known and written down, which measures nothing. Three dispositions
+were possible:
+
+* **a second, host-conditional set of thresholds** — rejected. Nobody has measured them. Any
+  number written today blesses whatever a half-written interpreter happens to do, and the
+  first real optimisation would "regress" against it.
+* **not-applicable, skip the lane** — rejected. It stops exercising the path: `perf-runner`
+  drives one cold launch plus warmups plus samples — 29 real guest launches for a normal case
+  — through the production engine, the densest execution coverage in the tree outside the
+  compat matrix. It would also empty `perf-linux`, a lane
+  `cmake/CiLanes.cmake` declares for Linux, so `gate.ci-lane-parity` would have to be taught
+  an exemption for a lane that can in fact run.
+* **record-only** — chosen. The Stage-2 same-ISA transliterator (`docs/amd64-host.md` §3)
+  needs a number to beat, and an interpreter baseline taken by the same runner, on the same
+  fixtures, in the same format as the aarch64-host numbers is exactly that. The measurement
+  is the deliverable; only the verdict is what cannot be honest yet.
+
+Record-only cases are **renamed**, not merely relabelled, because a CTest summary line is
+often all anyone reads and `Passed perf.linux-startup-x86_64` would imply a threshold was
+met. The `--label` `perf-runner` records is *not* renamed: `metric=linux-startup-x86_64` has
+to stay comparable across hosts and across Stage 2, and being record-only is a property of
+the run, not of the metric — the `host_arch=` field on the same line already identifies which
+host produced it.
+
+What still enforces on an x86_64 host, and must: `perf.linux-resource-<arch>`. Its assertions
+live inside `tests/perf/resource.c` and bound retained RSS growth (2048 pages) plus a return
+to the descriptor and thread baseline after teardown. Those are leak bounds, and a leak is not
+a function of how fast the backend executes — an interpreter with no code cache should retain
+less, not more. `--expect` still checks every guest's exit status in the record-only cases
+too, so a case that stops producing the right answer still fails; only the timing verdict is
+suspended.
+
+### What a green x86_64 lane therefore does not prove
+
+It does not prove comparable speed, and it does not prove threshold compliance. Two other
+per-case budgets are *not* covered by the scale, because they live in runners outside the
+matrix pair and will need the same knob before their lanes can run interpreted:
+`tools/e2e_runner.c`, `tools/config_e2e_runner.c` and `tools/rootfs_e2e_runner.c` (30s, so
+`e2e-oracle`, `production.config-*`, `dynamic-e2e` and the `warm-cache` perf case) and
+`tests/integration/checkpoint_tree_runner.c` (15s, every `checkpoint.*` case). Those lanes are
+absent from `.github/workflows/linux-x86_64.yml` today for a different reason — the engine
+cannot execute a guest there yet — so nothing is currently hidden by it.
+
 ## Runtime self-skips
 
 Detected, printed, and applicable-environment-only.

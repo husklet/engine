@@ -207,12 +207,11 @@ __attribute__((naked)) static void block_return(void) {
 static void run_block(struct cpu *cpu, void *code) {
     (void)cpu;
     (void)code;
-    fprintf(stderr,
-            "hl: run_block() entered on a " HL_HOST_CPU_NAME " host with no execution backend.\n"
-            "    A backend supplies translate_block() plus its own run_block()/block_return() and declares\n"
-            "    G_OWN_TRAMPOLINES so this placeholder is not compiled -- see the host-CPU fork in\n"
-            "    src/core/target/<guest isa>.c and docs/amd64-host.md. Reaching this means that fork selected\n"
-            "    an arm that defines neither an ARM64 boundary nor a backend of its own.\n");
+    fprintf(stderr, "hl: run_block() entered on a " HL_HOST_CPU_NAME " host with no execution backend.\n"
+                    "    A backend supplies translate_block() plus its own run_block()/block_return() and declares\n"
+                    "    G_OWN_TRAMPOLINES so this placeholder is not compiled -- see the host-CPU fork in\n"
+                    "    src/core/target/<guest isa>.c and docs/amd64-host.md. Reaching this means that fork selected\n"
+                    "    an arm that defines neither an ARM64 boundary nor a backend of its own.\n");
     abort();
 }
 

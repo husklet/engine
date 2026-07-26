@@ -156,7 +156,7 @@ int hl_x86_signal_capture(struct cpu *c, void *ucv, hl_x86_signal_cache_fn cache
     // the SAME 0 the in-cache path returns for a host PC outside the code cache, because both callers treat
     // 0 as "this fault is not a guest CPU fault taken inside a translated block": linux_abi/signal.c's
     // deliver_guest_fault_hint falls through to re-raising it (or, inside a syscall, queues it as an ordinary
-    // async signal), and the fatal-fault path at signal.c:1068 returns 0 so the host guard re-raises. That is
+    // async signal), and deliver_guest_fatal_fault likewise returns 0 so the host guard re-raises. That is
     // exactly what a genuine engine fault must do here -- reach the crash report -- and it is the only honest
     // answer on a host CPU whose registers hold no guest state, since the emitters in this directory produce
     // ARM64 code and no translated block can be running at all.

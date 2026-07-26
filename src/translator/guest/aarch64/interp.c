@@ -293,6 +293,12 @@ static void interp_store_bits(uint64_t address, uint64_t value, unsigned bytes) 
 // an unaligned address is a guest fault (SP alignment and atomicity both require natural alignment), so
 // refusing to proceed is correct rather than conservative. Returning NULL lets the caller raise it as such
 // instead of invoking a misaligned host atomic, which on some hosts silently loses atomicity.
+// A vector load/store of `bytes` (1, 2, 4, 8 or 16). Split into 64-bit chunks so it reuses the same
+// unaligned-safe, fault-marked path as an integer access. A load of fewer than 16 bytes zeroes the rest of the
+// destination register, which interp_vec_write handles via the q argument.
+static void interp_vec_load(struct cpu *cpu, int reg, uint64_t address, unsigned bytes);
+static void interp_vec_store(struct cpu *cpu, int reg, uint64_t address, unsigned bytes);
+
 static void *interp_atomic_pointer(uint64_t address, unsigned bytes) {
     uint64_t host = interp_guest_pointer(address);
     if (host & (bytes - 1u)) return NULL;
@@ -1272,6 +1278,40 @@ static int interp_imm5_element(unsigned imm5, unsigned *size_out, unsigned *inde
     return 1;
 }
 
+static void interp_vec_load(struct cpu *cpu, int reg, uint64_t address, unsigned bytes) {
+    interp_vec value;
+    memset(value.byte, 0, sizeof value.byte);
+    if (bytes <= 8) {
+        uint64_t chunk = interp_load_bits(address, bytes);
+        memcpy(value.byte, &chunk, bytes);
+    } else {
+        uint64_t low = interp_load_bits(address, 8), high = interp_load_bits(address + 8, 8);
+        memcpy(value.byte, &low, 8);
+        memcpy(value.byte + 8, &high, 8);
+    }
+    interp_vec_write(cpu, reg, value, bytes > 8);
+}
+
+static void interp_vec_store(struct cpu *cpu, int reg, uint64_t address, unsigned bytes) {
+    interp_vec value = interp_vec_read(cpu, reg);
+    uint64_t low, high;
+    memcpy(&low, value.byte, 8);
+    memcpy(&high, value.byte + 8, 8);
+    if (bytes <= 8) {
+        interp_store_bits(address, low, bytes);
+    } else {
+        interp_store_bits(address, low, 8);
+        interp_store_bits(address + 8, high, 8);
+    }
+}
+
+// The access width of a SIMD&FP load/store, which is spelled opc<1>:size rather than plain size: 0b0_00..0b0_11
+// select B/H/S/D and 0b1_00 selects the 16-byte Q form. Returns 0 for an unallocated combination.
+static unsigned interp_simd_access_bytes(unsigned size, unsigned opc) {
+    if (opc & 2u) return size == 0 ? 16u : 0u;
+    return 1u << size;
+}
+
 // ---------------------------------------------------------------------------
 // Loads and stores.
 // ---------------------------------------------------------------------------
@@ -1331,6 +1371,60 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
     int rt = (int)(insn & 31), rn = (int)((insn >> 5) & 31);
     int rt2 = (int)((insn >> 10) & 31), rm = (int)((insn >> 16) & 31);
     unsigned vector = (insn >> 26) & 1;
+    // Q here is the AdvSIMD structure forms' vector-length bit; the scalar addressing modes below do not use it.
+    unsigned q = (insn >> 30) & 1;
+
+    // ---- AdvSIMD load/store multiple structures: LD1/ST1 (and the LD2/LD3/LD4 de-interleaving forms) ----
+    // A different top-level encoding from the scalar loads, which is why it is tested here explicitly rather
+    // than falling out of the size/opc decode below. Only the CONTIGUOUS forms (LD1/ST1, opcode 0b0111 for one
+    // register and 0b1010/0b0110/0b0010 for two/three/four) are implemented: they are what memcpy and the
+    // string routines use, and the de-interleaving LD2/LD3/LD4 forms are a separate shuffle problem.
+    if ((insn & 0xBFBF0000u) == 0x0C000000u || (insn & 0xBFA00000u) == 0x0C800000u) {
+        unsigned load = (insn >> 22) & 1u, opcode = (insn >> 12) & 0xFu, size = (insn >> 10) & 3u;
+        int post_index = (insn & 0x00800000u) != 0;
+        unsigned registers;
+        switch (opcode) {
+        case 0x7: registers = 1; break; // LD1/ST1, one register
+        case 0xA: registers = 2; break; // LD1/ST1, two registers
+        case 0x6: registers = 3; break; // LD1/ST1, three registers
+        case 0x2: registers = 4; break; // LD1/ST1, four registers
+        default:
+            return interp_undefined(cpu, insn,
+                                    "AdvSIMD load/store -- de-interleaving multi-structure form (LD2/LD3/LD4)");
+        }
+        unsigned bytes = q ? 16u : 8u;
+        uint64_t base = interp_gpr_sp(cpu, rn);
+        uint64_t address = base;
+        for (unsigned index = 0; index < registers; index++) {
+            int reg = (rt + (int)index) % 32; // the register list wraps at V31
+            if (load) {
+                interp_vec value;
+                memset(value.byte, 0, sizeof value.byte);
+                for (unsigned offset = 0; offset < bytes; offset += 8) {
+                    uint64_t chunk = interp_load_bits(address + offset, 8);
+                    memcpy(value.byte + offset, &chunk, 8);
+                }
+                interp_vec_write(cpu, reg, value, q);
+            } else {
+                interp_vec value = interp_vec_read(cpu, reg);
+                for (unsigned offset = 0; offset < bytes; offset += 8) {
+                    uint64_t chunk;
+                    memcpy(&chunk, value.byte + offset, 8);
+                    interp_store_bits(address + offset, chunk, 8);
+                }
+            }
+            address += bytes;
+        }
+        (void)size;
+        if (post_index) {
+            // Rm == 31 means the immediate form, whose increment is the whole transfer size; otherwise the
+            // increment is the register Rm.
+            uint64_t increment = rm == 31 ? (uint64_t)registers * bytes : interp_gpr(cpu, rm);
+            interp_set_gpr_sp(cpu, rn, base + increment);
+        }
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
 
     // ---- Load register (literal): LDR/LDRSW/PRFM, PC-relative ----
     if ((insn & 0x3B000000u) == 0x18000000u) {
@@ -1340,7 +1434,12 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         // its low link address, and interp_guest_pointer re-biases the resulting low address to the real high
         // mapping. Using it here also means a faulting literal load reports the address the guest expects.
         uint64_t address = pcrel_base(gpc) + (uint64_t)offset;
-        if (vector) return interp_undefined(cpu, insn, "loads and stores -- SIMD/FP literal load");
+        if (vector) { // LDR St/Dt/Qt, literal: opc selects 4, 8 or 16 bytes
+            if (opc == 3) return interp_undefined(cpu, insn, "loads and stores -- unallocated SIMD literal size");
+            interp_vec_load(cpu, rt, address, 4u << opc);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
         if (opc == 3) { // PRFM (literal): a hint, and a translator has no cache to prefetch into
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
@@ -1358,7 +1457,24 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
     // ---- Load/store pair: STP/LDP/LDPSW/STNP/LDNP, in all four addressing modes ----
     if ((insn & 0x3A000000u) == 0x28000000u) {
         unsigned opc = (insn >> 30) & 3, load = (insn >> 22) & 1, mode = (insn >> 23) & 3;
-        if (vector) return interp_undefined(cpu, insn, "loads and stores -- SIMD/FP load/store pair");
+        if (vector) { // STP/LDP of two S, D or Q registers -- glibc's memcpy moves 32 bytes at a time this way
+            if (opc == 3) return interp_undefined(cpu, insn, "loads and stores -- unallocated SIMD pair opc");
+            unsigned element = 4u << opc; // opc 0/1/2 -> 4, 8, 16 bytes per register
+            int64_t vector_offset = interp_sext((insn >> 15) & 0x7Fu, 7) * (int64_t)element;
+            uint64_t vector_base = interp_gpr_sp(cpu, rn);
+            int vector_writeback = mode == 1 || mode == 3;
+            uint64_t vector_address = mode == 1 ? vector_base : vector_base + (uint64_t)vector_offset;
+            if (load) {
+                interp_vec_load(cpu, rt, vector_address, element);
+                interp_vec_load(cpu, rt2, vector_address + element, element);
+            } else {
+                interp_vec_store(cpu, rt, vector_address, element);
+                interp_vec_store(cpu, rt2, vector_address + element, element);
+            }
+            if (vector_writeback) interp_set_gpr_sp(cpu, rn, vector_base + (uint64_t)vector_offset);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
         if (opc == 3) return interp_undefined(cpu, insn, "loads and stores -- unallocated pair opc");
         if (opc == 1 && !load) return interp_undefined(cpu, insn, "loads and stores -- STGP (memory tagging)");
         unsigned bytes = opc == 2 ? 8u : 4u;
@@ -1680,24 +1796,28 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
     int unscaled = (insn & 0x3B200000u) == 0x38000000u;
     if (!scaled && !register_offset && !unscaled)
         return interp_undefined(cpu, insn, "loads and stores -- AdvSIMD structure or unallocated encoding");
-    if (vector) return interp_undefined(cpu, insn, "loads and stores -- SIMD/FP single register");
-    if ((insn & 0x3B200C00u) == 0x38200400u || (insn & 0x3B200C00u) == 0x38200C00u)
+    if (!vector && ((insn & 0x3B200C00u) == 0x38200400u || (insn & 0x3B200C00u) == 0x38200C00u))
         return interp_undefined(cpu, insn, "loads and stores -- LDRAA/LDRAB (pointer authentication)");
 
-    unsigned bytes = 1u << size;
+    // A SIMD&FP access shares all three addressing modes with the integer one; only the transfer width and the
+    // load/store test differ (opc<1>:size gives the width, opc<0> selects load).
+    unsigned bytes = vector ? interp_simd_access_bytes(size, opc) : (1u << size);
+    if (vector && bytes == 0)
+        return interp_undefined(cpu, insn, "loads and stores -- unallocated SIMD/FP access size");
+    unsigned scale = vector ? (opc & 2u ? 4u : size) : size;
     uint64_t base = interp_gpr_sp(cpu, rn);
     uint64_t address;
     int writeback = 0;
     uint64_t writeback_value = 0;
     if (scaled) {
-        address = base + (((uint64_t)((insn >> 10) & 0xFFFu)) << size);
+        address = base + (((uint64_t)((insn >> 10) & 0xFFFu)) << scale);
     } else if (register_offset) {
         unsigned option = (insn >> 13) & 7, s = (insn >> 12) & 1;
         // S selects whether the index is scaled by the access size; option selects the index width and
         // signedness. Only 010/011/110/111 (UXTW/LSL/SXTW/SXTX) are allocated here.
         if ((option & 3u) < 2u)
             return interp_undefined(cpu, insn, "loads and stores -- unallocated register-offset extend option");
-        address = base + interp_extend_operand(cpu, rm, option, s ? size : 0u, 1);
+        address = base + interp_extend_operand(cpu, rm, option, s ? scale : 0u, 1);
     } else {
         unsigned mode = (insn >> 10) & 3;
         int64_t offset = interp_sext((insn >> 12) & 0x1FFu, 9);
@@ -1708,7 +1828,12 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         address = mode == 1 ? base : base + (uint64_t)offset;
     }
 
-    if (opc == 0) { // store
+    if (vector) {
+        if (opc & 1u)
+            interp_vec_load(cpu, rt, address, bytes);
+        else
+            interp_vec_store(cpu, rt, address, bytes);
+    } else if (opc == 0) { // store
         uint64_t value = interp_gpr(cpu, rt); // read the source before the access; see the ordering note above
         interp_store_bits(address, value, bytes);
     } else if (opc == 2 && size == 3) { // PRFM / PRFUM: a hint with no architectural effect here
@@ -1731,6 +1856,563 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
     if (writeback) interp_set_gpr_sp(cpu, rn, writeback_value);
     cpu->pc = gpc + 4;
     return INTERP_NEXT;
+}
+
+// ---------------------------------------------------------------------------
+// Scalar floating-point and Advanced SIMD.
+// ---------------------------------------------------------------------------
+// Scope note, because this group is enormous and most of it will never execute here. What a static glibc
+// guest actually needs is the integer-vector subset that its string and memory routines are written in:
+// memset broadcasts a byte with DUP and stores with vector ST1/STR; strlen compares 16 bytes at a time with
+// CMEQ and finds the first hit with a horizontal reduction; memcpy is vector LDR/STR pairs. That subset is
+// what is implemented, and it was chosen by running the guest and reading interp_undefined's report rather
+// than by working down the ARM ARM.
+//
+// Deliberately still absent, and each still reported by name: floating-point ARITHMETIC (FADD/FMUL/FDIV/
+// FCVT/FCMP and the whole scalar-FP box beyond the FMOV register moves below), the saturating and widening
+// integer forms, the pairwise-widening and long multiplies, the crypto and CRC blocks, and SVE. A guest that
+// needs those will say so precisely.
+static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
+    uint64_t gpc = cpu->pc;
+    int rd = (int)(insn & 31), rn = (int)((insn >> 5) & 31), rm = (int)((insn >> 16) & 31);
+    unsigned q = (insn >> 30) & 1, u = (insn >> 29) & 1;
+
+    // ---- AdvSIMD copy: DUP (element/general), INS (element/general), SMOV, UMOV ----
+    if ((insn & 0x9F208400u) == 0x0E000400u) {
+        unsigned op = (insn >> 29) & 1, imm4 = (insn >> 11) & 0xFu, imm5 = (insn >> 16) & 0x1Fu;
+        unsigned size, index;
+        if (op) { // INS (element): copy one lane of Rn to one lane of Rd
+            if (!interp_imm5_element(imm5, &size, &index))
+                return interp_undefined(cpu, insn, "AdvSIMD copy -- reserved imm5");
+            unsigned source_index = imm4 >> size; // imm4 is the source lane, scaled by the element size
+            interp_vec source = interp_vec_read(cpu, rn), destination = interp_vec_read(cpu, rd);
+            interp_vec_set_element(&destination, size, index, interp_vec_element(&source, size, source_index));
+            // INS writes a single lane of an existing 128-bit register, so it must NOT zero the upper half.
+            interp_vec_write(cpu, rd, destination, 1);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        switch (imm4) {
+        case 0: { // DUP (element): broadcast one lane of Rn across Rd
+            if (!interp_imm5_element(imm5, &size, &index))
+                return interp_undefined(cpu, insn, "AdvSIMD copy -- reserved imm5");
+            if (size == 3 && !q) return interp_undefined(cpu, insn, "AdvSIMD copy -- DUP 1D is reserved");
+            interp_vec source = interp_vec_read(cpu, rn), result;
+            uint64_t element = interp_vec_element(&source, size, index);
+            memset(result.byte, 0, sizeof result.byte);
+            for (unsigned lane = 0; lane < interp_vec_lanes(size, q); lane++)
+                interp_vec_set_element(&result, size, lane, element);
+            interp_vec_write(cpu, rd, result, q);
+            break;
+        }
+        case 1: { // DUP (general): broadcast a general-purpose register across Rd
+            if (!interp_imm5_element(imm5, &size, &index))
+                return interp_undefined(cpu, insn, "AdvSIMD copy -- reserved imm5");
+            if (size == 3 && !q) return interp_undefined(cpu, insn, "AdvSIMD copy -- DUP 1D is reserved");
+            uint64_t element = interp_gpr(cpu, rn) & interp_element_mask(size);
+            interp_vec result;
+            memset(result.byte, 0, sizeof result.byte);
+            for (unsigned lane = 0; lane < interp_vec_lanes(size, q); lane++)
+                interp_vec_set_element(&result, size, lane, element);
+            interp_vec_write(cpu, rd, result, q);
+            break;
+        }
+        case 3: { // INS (general): one general-purpose register into one lane of Rd
+            if (!interp_imm5_element(imm5, &size, &index))
+                return interp_undefined(cpu, insn, "AdvSIMD copy -- reserved imm5");
+            interp_vec destination = interp_vec_read(cpu, rd);
+            interp_vec_set_element(&destination, size, index, interp_gpr(cpu, rn) & interp_element_mask(size));
+            interp_vec_write(cpu, rd, destination, 1); // single-lane write: preserve the upper half
+            break;
+        }
+        case 5:   // SMOV: one lane to a general register, sign-extended
+        case 7: { // UMOV: one lane to a general register, zero-extended
+            if (!interp_imm5_element(imm5, &size, &index))
+                return interp_undefined(cpu, insn, "AdvSIMD copy -- reserved imm5");
+            interp_vec source = interp_vec_read(cpu, rn);
+            uint64_t element = interp_vec_element(&source, size, index);
+            if (imm4 == 5) element = interp_element_sext(element, size);
+            // Q selects the destination register width, not the vector length, in this one form.
+            if (q)
+                interp_set_gpr(cpu, rd, element);
+            else
+                interp_set_gpr32(cpu, rd, (uint32_t)element);
+            break;
+        }
+        default: return interp_undefined(cpu, insn, "AdvSIMD copy -- unallocated imm4");
+        }
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // ---- AdvSIMD modified immediate: MOVI / MVNI / ORR (imm) / BIC (imm) ----
+    // Must be tested BEFORE shift-by-immediate: the two share an encoding box and are separated only by immh
+    // (bits 22:19) being zero here and non-zero there.
+    if ((insn & 0x9FF80400u) == 0x0F000400u) {
+        unsigned op = (insn >> 29) & 1, cmode = (insn >> 12) & 0xFu, o2 = (insn >> 11) & 1;
+        uint64_t imm8 = (uint64_t)(((insn >> 16) & 7u) << 5) | ((insn >> 5) & 0x1Fu);
+        uint64_t pattern;
+        if (!interp_advsimd_expand_imm(op, cmode, o2, q, imm8, &pattern))
+            return interp_undefined(cpu, insn, "AdvSIMD modified immediate -- reserved cmode");
+        // cmode<0> == 1 with cmode<3:1> != 111 selects the read-modify-write forms ORR/BIC rather than a
+        // plain move, and `op` then chooses between them.
+        int read_modify = (cmode & 1u) && ((cmode >> 1) & 7u) != 7u;
+        interp_vec result = interp_vec_read(cpu, rd);
+        uint64_t low, high;
+        memcpy(&low, result.byte, 8);
+        memcpy(&high, result.byte + 8, 8);
+        if (read_modify) {
+            if (op) { // BIC (immediate)
+                low &= ~pattern;
+                high &= ~pattern;
+            } else { // ORR (immediate)
+                low |= pattern;
+                high |= pattern;
+            }
+        } else if (op && ((cmode >> 1) & 7u) != 7u) { // MVNI
+            low = high = ~pattern;
+        } else { // MOVI
+            low = high = pattern;
+        }
+        memcpy(result.byte, &low, 8);
+        memcpy(result.byte + 8, &high, 8);
+        interp_vec_write(cpu, rd, result, q);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // ---- AdvSIMD shift by immediate: SSHR / USHR / SSRA / USRA / SHL ----
+    if ((insn & 0x9F800400u) == 0x0F000400u) {
+        unsigned immh = (insn >> 19) & 0xFu, immb = (insn >> 16) & 7u, opcode = (insn >> 11) & 0x1Fu;
+        unsigned size;
+        if (immh & 8u)
+            size = 3;
+        else if (immh & 4u)
+            size = 2;
+        else if (immh & 2u)
+            size = 1;
+        else
+            size = 0;
+        if (size == 3 && !q) return interp_undefined(cpu, insn, "AdvSIMD shift -- 64-bit element requires Q");
+        unsigned esize = 8u << size;
+        unsigned combined = (immh << 3) | immb;
+        interp_vec source = interp_vec_read(cpu, rn), result;
+        memset(result.byte, 0, sizeof result.byte);
+        unsigned lanes = interp_vec_lanes(size, q);
+        uint64_t mask = interp_element_mask(size);
+        if (opcode == 0x0A) { // SHL: shift left by (combined - esize)
+            unsigned shift = combined - esize;
+            for (unsigned lane = 0; lane < lanes; lane++)
+                interp_vec_set_element(&result, size, lane,
+                                       (interp_vec_element(&source, size, lane) << shift) & mask);
+        } else if (opcode == 0x00 || opcode == 0x02) { // SSHR/USHR and the accumulating SSRA/USRA
+            unsigned shift = 2u * esize - combined;
+            interp_vec accumulate = interp_vec_read(cpu, rd);
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t element = interp_vec_element(&source, size, lane);
+                // A right shift of the FULL element width is defined for these instructions (the result is 0,
+                // or the replicated sign bit) but is undefined behaviour in C, so it is handled explicitly.
+                uint64_t shifted;
+                if (u)
+                    shifted = shift >= esize ? 0 : (element >> shift);
+                else {
+                    int64_t signed_element = (int64_t)interp_element_sext(element, size);
+                    shifted = (uint64_t)(shift >= esize ? (signed_element >> (esize - 1)) : (signed_element >> shift));
+                }
+                shifted &= mask;
+                if (opcode == 0x02) shifted = (shifted + interp_vec_element(&accumulate, size, lane)) & mask;
+                interp_vec_set_element(&result, size, lane, shifted);
+            }
+        } else {
+            return interp_undefined(cpu, insn, "AdvSIMD shift by immediate -- unimplemented opcode");
+        }
+        interp_vec_write(cpu, rd, result, q);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // ---- AdvSIMD EXT: concatenate Rn:Rm and extract a byte-aligned window ----
+    if ((insn & 0xBFE08400u) == 0x2E000000u) {
+        unsigned position = (insn >> 11) & 0xFu;
+        unsigned bytes = q ? 16u : 8u;
+        if (!q && (position & 8u)) return interp_undefined(cpu, insn, "AdvSIMD EXT -- imm4 out of range for 8B");
+        interp_vec first = interp_vec_read(cpu, rn), second = interp_vec_read(cpu, rm), result;
+        memset(result.byte, 0, sizeof result.byte);
+        for (unsigned index = 0; index < bytes; index++) {
+            unsigned source = position + index;
+            result.byte[index] = source < bytes ? first.byte[source] : second.byte[source - bytes];
+        }
+        interp_vec_write(cpu, rd, result, q);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // ---- AdvSIMD table lookup: TBL / TBX ----
+    if ((insn & 0xBF208C00u) == 0x0E000000u) {
+        unsigned length = (insn >> 13) & 3u, extend = (insn >> 12) & 1u;
+        unsigned bytes = q ? 16u : 8u;
+        interp_vec index_vector = interp_vec_read(cpu, rm), result = interp_vec_read(cpu, rd);
+        interp_vec table[4];
+        for (unsigned entry = 0; entry <= length; entry++)
+            table[entry] = interp_vec_read(cpu, (rn + (int)entry) % 32); // the table registers wrap at V31
+        for (unsigned index = 0; index < bytes; index++) {
+            unsigned selector = index_vector.byte[index];
+            if (selector < (length + 1u) * 16u)
+                result.byte[index] = table[selector / 16u].byte[selector % 16u];
+            else if (!extend)
+                result.byte[index] = 0; // TBL zeroes an out-of-range index; TBX leaves the destination byte
+        }
+        interp_vec_write(cpu, rd, result, q);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // ---- AdvSIMD across lanes: ADDV / UADDLV / SADDLV / UMAXV / SMAXV / UMINV / SMINV ----
+    // Tested before two-register-misc: both live at bits[21:17] == 10000/11000 and differ only in bit 20.
+    if ((insn & 0x9F3E0C00u) == 0x0E300800u) {
+        unsigned size = (insn >> 22) & 3u, opcode = (insn >> 12) & 0x1Fu;
+        if (size == 3 || (size == 2 && !q))
+            return interp_undefined(cpu, insn, "AdvSIMD across lanes -- reserved size/Q combination");
+        interp_vec source = interp_vec_read(cpu, rn), result;
+        memset(result.byte, 0, sizeof result.byte);
+        unsigned lanes = interp_vec_lanes(size, q);
+        uint64_t accumulator = interp_vec_element(&source, size, 0);
+        switch (opcode) {
+        case 0x03: { // SADDLV / UADDLV: sum every lane into an element of TWICE the width
+            uint64_t total = 0;
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t element = interp_vec_element(&source, size, lane);
+                total += u ? element : interp_element_sext(element, size);
+            }
+            interp_vec_set_element(&result, size + 1u, 0, total & interp_element_mask(size + 1u));
+            break;
+        }
+        case 0x0A: // SMAXV / UMAXV
+        case 0x1A: // SMINV / UMINV
+        case 0x1B: // ADDV
+            for (unsigned lane = 1; lane < lanes; lane++) {
+                uint64_t element = interp_vec_element(&source, size, lane);
+                if (opcode == 0x1B) {
+                    accumulator = (accumulator + element) & interp_element_mask(size);
+                } else if (u) {
+                    int greater = element > accumulator;
+                    if (opcode == 0x0A ? greater : !greater && element != accumulator) accumulator = element;
+                } else {
+                    int64_t left = (int64_t)interp_element_sext(accumulator, size);
+                    int64_t right = (int64_t)interp_element_sext(element, size);
+                    if (opcode == 0x0A ? right > left : right < left) accumulator = element;
+                }
+            }
+            interp_vec_set_element(&result, size, 0, accumulator);
+            break;
+        default: return interp_undefined(cpu, insn, "AdvSIMD across lanes -- unimplemented opcode");
+        }
+        // A reduction produces a SCALAR, so only the low element is defined and the rest of the register is
+        // zero -- hence the zeroed `result` above and the Q=0 write here.
+        interp_vec_write(cpu, rd, result, 0);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // ---- AdvSIMD two-register misc: NOT / RBIT / CNT / REV16 / REV32 / REV64 / CMEQ-zero / ABS / NEG ----
+    if ((insn & 0x9F3E0C00u) == 0x0E200800u) {
+        unsigned size = (insn >> 22) & 3u, opcode = (insn >> 12) & 0x1Fu;
+        interp_vec source = interp_vec_read(cpu, rn), result;
+        memset(result.byte, 0, sizeof result.byte);
+        unsigned bytes = q ? 16u : 8u;
+        switch (opcode) {
+        case 0x00:   // REV64 (U=0) / REV32 (U=1)
+        case 0x01: { // REV16 (U=0)
+            // Reverse the byte order within each container. The container is 8, 4 or 2 bytes wide depending on
+            // the opcode; `size` gives the element width being reversed, which must be smaller.
+            unsigned container = opcode == 0x01 ? 2u : (u ? 4u : 8u);
+            unsigned element = 1u << size;
+            if (element >= container)
+                return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- REV element wider than container");
+            for (unsigned base = 0; base < bytes; base += container)
+                for (unsigned offset = 0; offset < container; offset += element)
+                    memcpy(result.byte + base + (container - element - offset), source.byte + base + offset,
+                           element);
+            break;
+        }
+        case 0x05: { // CNT (U=0) / NOT i.e. MVN (U=1, size=00) / RBIT (U=1, size=01)
+            if (!u) { // CNT: per-byte population count
+                if (size != 0) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- CNT requires 8B/16B");
+                for (unsigned index = 0; index < bytes; index++)
+                    result.byte[index] = (uint8_t)__builtin_popcount(source.byte[index]);
+            } else if (size == 0) { // NOT / MVN
+                for (unsigned index = 0; index < bytes; index++)
+                    result.byte[index] = (uint8_t)~source.byte[index];
+            } else if (size == 1) { // RBIT: reverse the bits within each byte
+                for (unsigned index = 0; index < bytes; index++) {
+                    uint8_t value = source.byte[index];
+                    value = (uint8_t)(((value & 0x55u) << 1) | ((value >> 1) & 0x55u));
+                    value = (uint8_t)(((value & 0x33u) << 2) | ((value >> 2) & 0x33u));
+                    value = (uint8_t)(((value & 0x0Fu) << 4) | ((value >> 4) & 0x0Fu));
+                    result.byte[index] = value;
+                }
+            } else {
+                return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated CNT/NOT/RBIT size");
+            }
+            break;
+        }
+        case 0x08:   // CMGT (zero, U=0) / CMGE (zero, U=1)
+        case 0x09:   // CMEQ (zero, U=0) / CMLE (zero, U=1)
+        case 0x0A: { // CMLT (zero, U=0)
+            if (size == 3 && !q)
+                return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- 1D compare is reserved");
+            uint64_t mask = interp_element_mask(size);
+            for (unsigned lane = 0; lane < interp_vec_lanes(size, q); lane++) {
+                int64_t element = (int64_t)interp_element_sext(interp_vec_element(&source, size, lane), size);
+                int holds;
+                if (opcode == 0x08)
+                    holds = u ? element >= 0 : element > 0;
+                else if (opcode == 0x09)
+                    holds = u ? element <= 0 : element == 0;
+                else {
+                    if (u) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated compare-zero");
+                    holds = element < 0;
+                }
+                // A vector compare produces an all-ones element for true and all-zeroes for false, which is
+                // what makes the following horizontal reduction a "was there a hit" test.
+                interp_vec_set_element(&result, size, lane, holds ? mask : UINT64_C(0));
+            }
+            break;
+        }
+        case 0x0B: { // ABS (U=0) / NEG (U=1)
+            if (size == 3 && !q) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- 1D ABS/NEG reserved");
+            uint64_t mask = interp_element_mask(size);
+            for (unsigned lane = 0; lane < interp_vec_lanes(size, q); lane++) {
+                int64_t element = (int64_t)interp_element_sext(interp_vec_element(&source, size, lane), size);
+                uint64_t value = u ? (uint64_t)(-element) : (uint64_t)(element < 0 ? -element : element);
+                interp_vec_set_element(&result, size, lane, value & mask);
+            }
+            break;
+        }
+        default: return interp_undefined(cpu, insn, "AdvSIMD two-register misc -- unimplemented opcode");
+        }
+        interp_vec_write(cpu, rd, result, q);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // ---- AdvSIMD three same: the bitwise group, the compares, ADD/SUB, MIN/MAX, ADDP, shifts ----
+    if ((insn & 0x9F200400u) == 0x0E200400u) {
+        unsigned size = (insn >> 22) & 3u, opcode = (insn >> 11) & 0x1Fu;
+        interp_vec left = interp_vec_read(cpu, rn), right = interp_vec_read(cpu, rm), result;
+        memset(result.byte, 0, sizeof result.byte);
+        unsigned bytes = q ? 16u : 8u;
+        unsigned lanes = interp_vec_lanes(size, q);
+        uint64_t mask = interp_element_mask(size);
+
+        if (opcode == 0x03) { // the purely bitwise group: size is a sub-opcode here, not an element width
+            interp_vec destination = interp_vec_read(cpu, rd);
+            for (unsigned index = 0; index < bytes; index++) {
+                uint8_t a = left.byte[index], b = right.byte[index], d = destination.byte[index];
+                uint8_t value;
+                if (!u) {
+                    switch (size) {
+                    case 0: value = (uint8_t)(a & b); break;         // AND
+                    case 1: value = (uint8_t)(a & ~b); break;        // BIC
+                    case 2: value = (uint8_t)(a | b); break;         // ORR (and the MOV alias when Rn == Rm)
+                    default: value = (uint8_t)(a | (uint8_t)~b); break; // ORN
+                    }
+                } else {
+                    switch (size) {
+                    case 0: value = (uint8_t)(a ^ b); break;                        // EOR
+                    case 1: value = (uint8_t)((b & d) | (a & (uint8_t)~d)); break;   // BSL
+                    case 2: value = (uint8_t)(d ^ ((d ^ a) & b)); break;             // BIT
+                    default: value = (uint8_t)(d ^ ((d ^ a) & (uint8_t)~b)); break;  // BIF
+                    }
+                }
+                result.byte[index] = value;
+            }
+            interp_vec_write(cpu, rd, result, q);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+
+        if (size == 3 && !q && opcode != 0x10)
+            return interp_undefined(cpu, insn, "AdvSIMD three same -- reserved 1D form");
+
+        switch (opcode) {
+        case 0x06:   // CMGT (U=0) / CMHI (U=1)
+        case 0x07:   // CMGE (U=0) / CMHS (U=1)
+        case 0x11: { // CMTST (U=0) / CMEQ (U=1)
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t a = interp_vec_element(&left, size, lane), b = interp_vec_element(&right, size, lane);
+                int holds;
+                if (opcode == 0x11)
+                    holds = u ? a == b : (a & b) != 0;
+                else if (u)
+                    holds = opcode == 0x06 ? a > b : a >= b;
+                else {
+                    int64_t x = (int64_t)interp_element_sext(a, size), y = (int64_t)interp_element_sext(b, size);
+                    holds = opcode == 0x06 ? x > y : x >= y;
+                }
+                interp_vec_set_element(&result, size, lane, holds ? mask : UINT64_C(0));
+            }
+            break;
+        }
+        case 0x08: { // SSHL / USHL: element-wise shift by the LOW BYTE of the corresponding lane of Rm
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t a = interp_vec_element(&left, size, lane);
+                int8_t amount = (int8_t)(interp_vec_element(&right, size, lane) & 0xFFu);
+                unsigned esize = 8u << size;
+                uint64_t value;
+                if (amount >= 0) {
+                    value = (unsigned)amount >= esize ? 0 : (a << amount);
+                } else {
+                    unsigned shift = (unsigned)(-amount);
+                    if (u)
+                        value = shift >= esize ? 0 : (a >> shift);
+                    else {
+                        int64_t signed_a = (int64_t)interp_element_sext(a, size);
+                        value = (uint64_t)(shift >= esize ? (signed_a >> (esize - 1)) : (signed_a >> shift));
+                    }
+                }
+                interp_vec_set_element(&result, size, lane, value & mask);
+            }
+            break;
+        }
+        case 0x0C:   // SMAX / UMAX
+        case 0x0D: { // SMIN / UMIN
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t a = interp_vec_element(&left, size, lane), b = interp_vec_element(&right, size, lane);
+                uint64_t chosen;
+                if (u)
+                    chosen = opcode == 0x0C ? (a > b ? a : b) : (a < b ? a : b);
+                else {
+                    int64_t x = (int64_t)interp_element_sext(a, size), y = (int64_t)interp_element_sext(b, size);
+                    chosen = (opcode == 0x0C ? (x > y) : (x < y)) ? a : b;
+                }
+                interp_vec_set_element(&result, size, lane, chosen);
+            }
+            break;
+        }
+        case 0x10: { // ADD (U=0) / SUB (U=1)
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t a = interp_vec_element(&left, size, lane), b = interp_vec_element(&right, size, lane);
+                interp_vec_set_element(&result, size, lane, (u ? a - b : a + b) & mask);
+            }
+            break;
+        }
+        case 0x17: { // ADDP: pairwise add across the CONCATENATION of Rn and Rm
+            if (u) return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated ADDP U bit");
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                const interp_vec *source = lane < lanes / 2 ? &left : &right;
+                unsigned base = (lane < lanes / 2 ? lane : lane - lanes / 2) * 2u;
+                uint64_t a = interp_vec_element(source, size, base);
+                uint64_t b = interp_vec_element(source, size, base + 1u);
+                interp_vec_set_element(&result, size, lane, (a + b) & mask);
+            }
+            break;
+        }
+        case 0x1A: { // SMAXP/UMAXP (U bit selects signedness) -- pairwise, same shape as ADDP
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                const interp_vec *source = lane < lanes / 2 ? &left : &right;
+                unsigned base = (lane < lanes / 2 ? lane : lane - lanes / 2) * 2u;
+                uint64_t a = interp_vec_element(source, size, base);
+                uint64_t b = interp_vec_element(source, size, base + 1u);
+                uint64_t chosen;
+                if (u)
+                    chosen = a > b ? a : b;
+                else {
+                    int64_t x = (int64_t)interp_element_sext(a, size), y = (int64_t)interp_element_sext(b, size);
+                    chosen = x > y ? a : b;
+                }
+                interp_vec_set_element(&result, size, lane, chosen);
+            }
+            break;
+        }
+        case 0x1B: { // SMINP / UMINP
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                const interp_vec *source = lane < lanes / 2 ? &left : &right;
+                unsigned base = (lane < lanes / 2 ? lane : lane - lanes / 2) * 2u;
+                uint64_t a = interp_vec_element(source, size, base);
+                uint64_t b = interp_vec_element(source, size, base + 1u);
+                uint64_t chosen;
+                if (u)
+                    chosen = a < b ? a : b;
+                else {
+                    int64_t x = (int64_t)interp_element_sext(a, size), y = (int64_t)interp_element_sext(b, size);
+                    chosen = x < y ? a : b;
+                }
+                interp_vec_set_element(&result, size, lane, chosen);
+            }
+            break;
+        }
+        default: return interp_undefined(cpu, insn, "AdvSIMD three same -- unimplemented opcode");
+        }
+        interp_vec_write(cpu, rd, result, q);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // ---- Scalar FP <-> general register moves: FMOV only ----
+    // The rest of the scalar-FP box needs an actual floating-point model (rounding modes, FPCR/FPSR, the NaN
+    // rules) and is deliberately left out until a guest asks for it. The register moves are here because they
+    // are how an integer routine gets a value into and out of the vector world, and they involve no arithmetic
+    // at all -- they are pure bit copies, so implementing them costs nothing and risks nothing.
+    if ((insn & 0x5F200000u) == 0x1E200000u && ((insn >> 10) & 0x3Fu) == 0) {
+        unsigned type = (insn >> 22) & 3u, rmode = (insn >> 19) & 3u, opcode = (insn >> 16) & 7u;
+        unsigned sf = (insn >> 31) & 1;
+        if (rmode == 0 && opcode == 6) { // FMOV to a general register (Vn's low element -> Rd)
+            interp_vec source = interp_vec_read(cpu, rn);
+            if (type == 0 && !sf) // FMOV Wd, Sn
+                interp_set_gpr32(cpu, rd, (uint32_t)interp_vec_element(&source, 2, 0));
+            else if (type == 1 && sf) // FMOV Xd, Dn
+                interp_set_gpr(cpu, rd, interp_vec_element(&source, 3, 0));
+            else
+                return interp_undefined(cpu, insn, "scalar FP -- unallocated FMOV to general register");
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        if (rmode == 0 && opcode == 7) { // FMOV from a general register (Rn -> Vd's low element)
+            interp_vec result;
+            memset(result.byte, 0, sizeof result.byte);
+            if (type == 0 && !sf) { // FMOV Sd, Wn
+                interp_vec_set_element(&result, 2, 0, interp_gpr(cpu, rn) & 0xFFFFFFFFu);
+            } else if (type == 1 && sf) { // FMOV Dd, Xn
+                interp_vec_set_element(&result, 3, 0, interp_gpr(cpu, rn));
+            } else {
+                return interp_undefined(cpu, insn, "scalar FP -- unallocated FMOV from general register");
+            }
+            interp_vec_write(cpu, rd, result, 0); // a scalar write zeroes the upper 64 bits
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        if (rmode == 1 && opcode == 6 && type == 2 && sf) { // FMOV Xd, Vn.D[1]
+            interp_vec source = interp_vec_read(cpu, rn);
+            interp_set_gpr(cpu, rd, interp_vec_element(&source, 3, 1));
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        if (rmode == 1 && opcode == 7 && type == 2 && sf) { // FMOV Vd.D[1], Xn
+            interp_vec destination = interp_vec_read(cpu, rd);
+            interp_vec_set_element(&destination, 3, 1, interp_gpr(cpu, rn));
+            interp_vec_write(cpu, rd, destination, 1); // single-lane write: keep the low half
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        return interp_undefined(cpu, insn, "scalar FP -- integer/FP conversion (FCVT/SCVTF/UCVTF)");
+    }
+
+    // ---- Scalar FP register-to-register move, which is also a pure bit copy ----
+    // FMOV (register): 0 0 0 11110 type 1 000000 10000 Rn Rd
+    if ((insn & 0x5FFFFC00u) == 0x1E204000u) {
+        unsigned type = (insn >> 22) & 3u;
+        unsigned size = type == 0 ? 2u : (type == 1 ? 3u : 4u);
+        if (size > 3) return interp_undefined(cpu, insn, "scalar FP -- FMOV of a half or quad precision value");
+        interp_vec source = interp_vec_read(cpu, rn), result;
+        memset(result.byte, 0, sizeof result.byte);
+        interp_vec_set_element(&result, size, 0, interp_vec_element(&source, size, 0));
+        interp_vec_write(cpu, rd, result, 0);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    return interp_undefined(cpu, insn, "scalar floating-point and Advanced SIMD");
 }
 
 // One guest instruction. Fetches, decodes, executes, and leaves cpu->pc naming the NEXT instruction (or the
@@ -1775,10 +2457,7 @@ static int interp_step(struct cpu *cpu) {
     case 0xD:
         return interp_exec_dp_register(cpu, insn);
     default:
-        // TODO(amd64-host): scalar floating-point and AdvSIMD. Needs a software FP model (or host FP with
-        // careful FPCR/FPSR emulation) writing cpu->v[], and must set cpu->vdirty so a syscall exit spills
-        // the vector state -- see the vdirty note in cpu.h.
-        return interp_undefined(cpu, insn, "scalar floating-point and Advanced SIMD");
+        return interp_exec_simd(cpu, insn);
     }
 }
 
