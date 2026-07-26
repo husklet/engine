@@ -875,7 +875,6 @@ static int engine_global_init(void) {
     g_fwdskip = 8;
     g_guestfold = 1;
     g_mtibtc = 1;
-    g_futexq = 1;
     // Untrusted-guest isolation (the sentry process-split). OFF by default -> trusted path unchanged.
     g_untrusted = hl_option_get("HL_UNTRUSTED") != NULL;
     g_sentry_sandbox = hl_option_get("HL_SANDBOX") != NULL;
