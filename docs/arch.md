@@ -21,11 +21,12 @@ normative; this file is a navigation aid.
   `src/host/linux` and `src/host/macos` are complete backends; `src/host/fake` is the
   deterministic unit-test backend; `src/host/windows/` is README-only. This layer is keyed on
   the host **OS** only; it is host-CPU-neutral and compiled on x86-64 unchanged.
-- **Translator** (`src/translator/*`) — two code paths, and only one runs guests. The
-  production frontends `src/translator/guest/{aarch64,x86_64}/` emit host machine code
-  directly. `src/translator/host/{aarch64,x86_64}/` and `src/translator/codegen.c` are the
-  lowerers for the published IR (`include/hl/ir.h`), which has no caller in `src/`; they are
-  *not* the host backend a new host CPU selects. DOCS.md 3.3 states which is which.
+- **Translator** (`src/translator/*`) — the production frontends
+  `src/translator/guest/{aarch64,x86_64}/` emit host machine code directly; there is no
+  intermediate representation and no host-neutral lowering seam a new host CPU could select.
+  `src/translator/host/aarch64/asm.{c,h}` is the ARM64 instruction assembler they emit through.
+  DOCS.md 3.3 has the detail. (An unused IR + per-host-CPU lowering pipeline used to sit under
+  `src/translator/host/<cpu>/codegen.c`; it was deleted — docs/amd64-host-findings.md 3.1.)
 - **Activation** (`src/core/activation.c`) — the config-file/embedded supervisor launch
   path; initializes subsystems and delegates into the core runtime.
 

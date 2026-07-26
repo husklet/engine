@@ -13,12 +13,12 @@ because it determines the size of the work.
 already host-CPU-neutral: `src/host/linux/` compiles and passes its provider tests on x86-64 unchanged.
 The host CPU does not appear there at all, apart from one `cntfrq_el0` read.
 
-What is host-CPU-specific is the **translator**, and not in the place the directory layout suggests.
-`src/translator/host/{aarch64,x86_64}/` looks like a per-host-CPU code generator with both members
-present, and `src/translator/codegen.c` dispatches between them on a runtime `host_isa`. That pipeline is
-real, symmetric, and **not what the engine runs**: `hl_codegen_*` has no callers outside
-`tests/unit/test_codegen.c`, and its IR (`include/hl/ir.h`, 17 opcodes, no vectors, no flags, no atomics)
-cannot express either production frontend.
+What is host-CPU-specific is the **translator**. `src/translator/host/{aarch64,x86_64}/` used to look like a
+per-host-CPU code generator with both members present, dispatched by `src/translator/codegen.c` on a runtime
+`host_isa`. That pipeline was real, symmetric, and **not what the engine runs** — `hl_codegen_*` had no callers
+outside `tests/unit/test_codegen.c`, and its IR (17 opcodes, no vectors, no flags, no atomics) could express
+neither production frontend — so it was deleted, precisely because the layout kept suggesting otherwise
+(docs/amd64-host-findings.md 3.1). What is left under `host/` is `aarch64/asm.{c,h}`, the ARM64 assembler.
 
 The production frontends emit host machine code directly:
 

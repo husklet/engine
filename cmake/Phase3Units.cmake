@@ -177,10 +177,10 @@ hl_unit(system       SOURCES src/host/linux/system.c src/host/private.c)
 
 # --- the generic sweep (UNIT_NAMES) ----------------------------------------
 set(HL_UNIT_NAMES
-  a64_asm address affinity arena avx bus child ckptinoq cli clock codegen config cpuid
+  a64_asm address affinity arena avx bus child ckptinoq cli clock config cpuid
   cmpxchg decoder device digest directory directory_services emit epoll eventfd
   environment eventfd_fork fatal fdcache file flags fork_wire glue gmap guest_fetch host_services
-  guest_naked identity image inotify ir key launch legacy lifecycle_identity linux_abi
+  guest_naked identity image inotify key launch legacy lifecycle_identity linux_abi
   linux_fork logical_vma lower_alu lower_crypto lower_mov lower_repstr lower_shift
   lower_sse4x lower_trace lower_x87 misc native open_plan operand options_environment owner persist
   pidmap pipe pipe_linux placement ports private process provider_client provider_demux

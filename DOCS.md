@@ -169,42 +169,40 @@ Core invariants:
 
 ### 3.3 Translator (`src/translator`)
 
-The translator has four responsibilities:
+The translator has three responsibilities:
 
 1. Decode a supported guest ISA.
-2. Produce validated, private IR.
-3. Optimize without changing guest-visible behavior.
-4. Lower IR to the selected host CPU.
+2. Emit host machine code for it without changing guest-visible behavior.
+3. Cache, relocate, invalidate and persist that code.
 
 It does not implement Linux syscalls and does not access paths, native files, processes, clocks, signals, or sockets.
 Executable-memory allocation and instruction-cache publication are host services.
 
-**Two code paths live here, and only one of them executes guests today. State which is which before reading the
-directory layout, because the layout suggests otherwise.**
+**There is no intermediate representation. Decode and host code generation are one step.** The guest frontends under
+`src/translator/guest/{aarch64,x86_64}/` are the only thing that executes guests, and they emit host machine code
+**directly**. `guest/x86_64/emit.c` is a set of ARM64 host emitters (its own header says so, NEON/SSE included);
+`guest/aarch64/translate.c` is a same-ISA transliterator that copies most guest instructions verbatim and mangles only
+stolen-register users. Both therefore presuppose an ARM64 host CPU. Bringing up a new host CPU is new code generation
+in these directories; there is no host-neutral lowering seam to reuse. `docs/amd64-host.md` is the detail.
 
-- **The IR / codegen pipeline** — `include/hl/ir.h`, `include/hl/codegen.h`, `src/translator/codegen.c` and the
-  per-host-CPU lowerers under `src/translator/host/{aarch64,x86_64}/` — is the pipeline responsibilities 2-4 describe.
-  It is real, symmetric across both host CPUs, validated and unit-tested (`unit.codegen`), and it is **published API**:
-  `codegen.h` and `ir.h` ship through `hl-engine.pc`. It is **not on the production execution path**. `hl_codegen_block`
-  and `hl_codegen_function` have no caller in `src/`; the only caller in the tree is `tests/unit/test_codegen.c`. The IR
-  it lowers has 17 opcodes with no flags, no vector values, no atomics and no syscalls, so it cannot express either
-  production frontend as those frontends exist. Read `src/translator/host/x86_64/` as "an x86-64 lowerer for this IR",
-  not as "the x86-64 host backend the engine needs".
-- **The production frontends** — `src/translator/guest/{aarch64,x86_64}/` — are what actually runs guests, and they
-  emit host machine code **directly**, bypassing the IR. `guest/x86_64/emit.c` is a set of ARM64 host emitters (its own
-  header says so, NEON/SSE included); `guest/aarch64/translate.c` is a same-ISA transliterator that copies most guest
-  instructions verbatim and mangles only stolen-register users. Both therefore presuppose an ARM64 host CPU. Bringing up
-  a new host CPU is new code generation in these directories, not a matter of selecting an existing lowerer.
-  `docs/amd64-host.md` is the detail.
+A separate IR and per-host-CPU lowering pipeline (`include/hl/ir.h`, `include/hl/codegen.h`,
+`src/translator/codegen.c`, `src/translator/ir/`, and `codegen.c` under each `src/translator/host/<cpu>/`) used to
+live here. It was clean-room bootstrap scaffolding that the transferred production frontends superseded within a day;
+its 17-opcode IR could express neither frontend, and `hl_codegen_*`/`hl_ir_*` had no caller anywhere in `src/`. It was
+deleted, because the shape of the tree — a symmetric `host/<cpu>/codegen.c` per host CPU — read like the production
+lowering path and repeatedly cost readers time. `docs/amd64-host-findings.md` §3 keeps the history.
 
-`src/translator/reloc.c`, in the same area, IS live on the production path: `guest/*/cache.c` calls `hl_reloc_slide`
-when it loads a persistent-cache artifact at a different base.
+What remains under `src/translator/host/` is `aarch64/asm.{c,h}`, the ARM64 instruction assembler (`hl_a64_*`) the
+production JIT actually uses, covered by `unit.a64_asm`.
 
-IR blocks end with explicit terminators. Values refer only to valid prior definitions. Validation runs before lowering.
-Persistent cache identity includes every code-changing input: guest ISA, host CPU, IR ABI, codegen ABI, translator
-features, page assumptions, and relevant execution modes. A cache mismatch is a miss, never a best-effort load. The
-host CPU is part of that key because two hosts sharing a cache directory would otherwise accept and execute each
-other's host code.
+`src/translator/reloc.c`, in the same area, is also live: `guest/*/cache.c` calls `hl_reloc_slide` when it loads a
+persistent-cache artifact at a different base.
+
+Persistent cache identity includes every code-changing input: guest ISA, host CPU, engine build, translator features,
+page assumptions, and relevant execution modes. A cache mismatch is a miss, never a best-effort load. The host CPU is
+part of that key because two hosts sharing a cache directory would otherwise accept and execute each other's host
+code; the value hashed in is `HL_HOST_ISA_*` from `src/translator/identity.h`, pinned by `_Static_assert` to the
+preprocessor-time `HL_HOST_CPU_ISA_*` in `src/host/host_cpu.h`.
 
 Persistent artifacts use the typed File service only. The engine creates or opens the configured private cache
 directory once, validates it without following a final symlink, and pins that directory handle for the run. Every
@@ -520,12 +518,10 @@ ninja -C build format-check
 Architectural ownership is enforced by the library build and link graph, not by tests that inspect
 source text. The `macos` lane builds the mac host tests and executes them on a real mac host.
 
-A few unit cases are host-CPU-conditional in a way the pass count does not show. `unit.codegen` builds IR for both
-host-CPU lowerers on every host but only *executes* the emitted bytes on a matching host
-(`#if defined(__aarch64__)` / `#elif defined(__x86_64__)`), and every CI runner was ARM64 — so the x86-64 lowerer's
-output had never been executed on any machine. Running the lane on an x86-64 Linux host executes it, and it passes.
-That is a real coverage gain from the host itself rather than from any new test, and it is the kind of gain a
-second host CPU is worth having for.
+Some unit cases are host-CPU-conditional in a way the pass count does not show: they assemble host bytes on every
+host but only *execute* them under a matching `#if defined(__aarch64__)` / `#elif defined(__x86_64__)`. Running the
+lane on a second host CPU therefore buys real coverage without adding a test — worth remembering when reading a lane
+that is green on one host and untried on the other.
 
 **Always pass `--no-tests=error`.** `ctest -L <label>` exits 0 when the label matches nothing, so a
 typo or a renamed label reports success. Invariant I15 (`tools/check_ci_workflows.sh`) rejects any

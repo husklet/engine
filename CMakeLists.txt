@@ -8,7 +8,7 @@
 #
 # Layout:
 #     libhl-engine.a       <- CORE_SOURCES
-#     libhl-translator.a   <- IR_SOURCES        (incl. aarch64 host codegen)
+#     libhl-translator.a   <- IR_SOURCES        (incl. the ARM64 host assembler)
 #     libhl-linux-abi.a    <- LINUX_ABI_SOURCES
 #     libhl-host-fake.a    <- FAKE_HOST_SOURCES
 #     libhl-host-linux.a   <- LINUX_HOST_SOURCES (Linux host only)
@@ -26,20 +26,9 @@ project(hl_engine LANGUAGES C)
 
 find_program(HL_BASH_EXECUTABLE NAMES bash REQUIRED)
 
-# ---------------------------------------------------------------------------
-# The host-CPU axis.
-#
-# DOCS.md section 1 names guest OS, guest ISA and host platform as the three
-# independent axes. "Host platform" is really two axes -- host OS and host CPU
-# -- and only the first ever had a name in this build: CMAKE_SYSTEM_NAME, and
-# src/host/<os>/ beside it. Everything that actually depended on the host CPU
-# either spelled `aarch64` inline as a path literal or did not test for it at
-# all, because until now there was only ever one answer.
-#
-# Name it once, here, and normalise the spelling: Darwin says arm64 where Linux
-# says aarch64, and amd64 and x86_64 are the same CPU. The values match
-# HL_HOST_CPU_* in src/host/host_cpu.h, which is the same axis on the C side.
-# ---------------------------------------------------------------------------
+# The host-CPU axis. DOCS.md section 1's "host platform" is really two axes, host
+# OS and host CPU, and only the first ever had a name here. Name it once and
+# normalise the spelling. Values match HL_HOST_CPU_* in src/host/host_cpu.h.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
   set(HL_HOST_ARCH aarch64)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
@@ -50,12 +39,9 @@ else()
     "Supported host CPUs are aarch64 and x86_64.")
 endif()
 
-# Where the packaged host archives land. This directory name encodes the HOST
-# platform, not a guest ISA, and it used to be the literal `package/linux-aarch64`
-# in three .cmake files and two shell scripts -- so an x86_64 host would have
-# overwritten the aarch64 artifact under its name, and
-# tools/refresh_crate_archives.sh would have published it as the aarch64 crate
-# asset. Derive it once so the two host CPUs can never collide.
+# Where the packaged host archives land. The name encodes the HOST platform, not
+# a guest ISA: spelled inline, an x86_64 host overwrites the aarch64 artifact and
+# gets published as the aarch64 crate asset.
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   set(HL_PACKAGE_ARCH_DIR ${CMAKE_BINARY_DIR}/package/macos-${HL_HOST_ARCH})
 else()
@@ -118,10 +104,10 @@ set(CORE_SOURCES
   src/core/target/run.c src/core/target/services.c ${PROVIDER_SOURCES})
 
 set(IR_SOURCES
-  src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/guest_fetch.c
+  src/translator/arena.c src/translator/digest.c src/translator/guest_fetch.c
   src/translator/identity.c src/translator/persist.c src/translator/reloc.c
   src/translator/window.c src/translator/guest/x86_64/decode.c
-  src/translator/guest/x86_64/address.c src/translator/host/aarch64/codegen.c
+  src/translator/guest/x86_64/address.c
   src/translator/guest/x86_64/glue.c src/translator/guest/x86_64/avx.c
   src/translator/host/aarch64/asm.c
   src/translator/guest/x86_64/cpuid.c src/translator/guest/x86_64/cmpxchg.c
@@ -142,9 +128,7 @@ set(IR_SOURCES
   src/translator/guest/aarch64/signal.c
   src/translator/guest/x86_64/signal.c
   src/translator/guest/x86_64/operand.c
-  src/translator/guest/x86_64/flags.c
-  src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c
-  src/translator/ir/ir.c)
+  src/translator/guest/x86_64/flags.c)
 
 set(LINUX_ABI_SOURCES
   src/linux_abi/affinity.c src/linux_abi/container/key.c src/linux_abi/container/pidmap.c

@@ -58,6 +58,16 @@ cannot test.
 
 ### 3.1 The IR and the per-host-CPU codegen backends
 
+> **Resolved on this branch: all of it was deleted.** `include/hl/{ir,codegen}.h`, `src/translator/codegen.c`,
+> `src/translator/ir/`, both `src/translator/host/<cpu>/codegen.c` + `<cpu>_codegen.h`, and the two unit tests
+> that were its only callers (`unit.codegen`, `unit.ir`; 115 unit tests → 113). The "do not delete it" reasoning
+> below was an ABI argument, and this library has never been published, so there is no ABI to preserve — while the
+> misdirection the rest of this section documents was a recurring, measurable cost. `HL_HOST_ISA_*` survived the
+> deletion and moved to `src/translator/identity.h`, cache identity being its only live consumer; the
+> `_Static_assert` pinning it to `src/host/host_cpu.h` moved with it. `src/translator/reloc.c` and
+> `src/translator/host/aarch64/asm.{c,h}` were untouched — both are live. **The analysis below is retained as
+> written, because why the code existed and why it read as load-bearing is the part still worth knowing.**
+
 `include/hl/ir.h`, `src/translator/ir/`, `src/translator/codegen.c`, and the symmetric
 `src/translator/host/{aarch64,x86_64}/codegen.c` pair read exactly as "lower guest code to IR, then select a
 host-CPU backend". **They are on no execution path.** `hl_codegen_block` / `hl_codegen_function` have no
@@ -93,7 +103,8 @@ first time during this work, and passed.
 
 - `src/translator/host/x86_64/README.md` says *"Reserved for the x86-64 host-code backend"*. The directory
   contains a 623-line backend at full IR-opcode parity with the aarch64 one. The README is the single most
-  misleading file in the tree for this task.
+  misleading file in the tree for this task. (Resolved with 3.1: the backend is gone and the directory now
+  holds only a README saying it is deliberately empty and why.)
 - `src/host/windows/` is genuinely README-only, and `flake.nix`'s `hostBackends.windows.supported = false`
   correctly reflects that. This one is honest.
 
