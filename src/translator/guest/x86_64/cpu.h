@@ -127,6 +127,16 @@ struct cpu {
     uint64_t smc_ranges[X86_SMC_RANGE_CAP][2];
     uint64_t smc_range_count;
     uint64_t smc_range_overflow;
+    /*
+     * Emulated MAP_SHARED store writeback, deliberately NOT smc_ranges.  Those
+     * name every executable alias of a stored file extent so translated code
+     * can be dropped; an alias page still holds the PRE-store bytes.  Writing
+     * an alias back to the backing file would publish exactly the stale data
+     * the store replaced, so writeback tracks only bytes the guest wrote.
+     */
+#define X86_STORE_RANGE_CAP 32
+    uint64_t store_ranges[X86_STORE_RANGE_CAP][2];
+    uint64_t store_range_count;
 };
 
 #define OFF_FCPTR ((int)__builtin_offsetof(struct cpu, fastclk_ptr))
@@ -239,6 +249,7 @@ _Static_assert(__builtin_offsetof(struct cpu, mmscratch) == OFF_MM, "OFF_MM drif
     do {                                                                                                               \
         (c)->smc_range_count = 0;                                                                                      \
         (c)->smc_range_overflow = 0;                                                                                   \
+        (c)->store_range_count = 0;                                                                                    \
     } while (0)
 #define OFF_FAULT_ADDR ((int)__builtin_offsetof(struct cpu, fault_addr))
 #define OFF_BUS_EA ((int)__builtin_offsetof(struct cpu, bus_ea))
