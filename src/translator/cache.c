@@ -1237,10 +1237,15 @@ static int stw_before_translated(uint64_t selected_epoch) {
     for (;;) {
         stw_dispatch_safepoint();
         if (atomic_load_explicit(&g_dispatch_request, memory_order_acquire) != selected_epoch) return 0;
-        atomic_store_explicit(&g_stw_threads[g_my_stw_slot].in_translated, 1, memory_order_release);
+        /* seq_cst, not release/acquire: this store and the gate load below form a
+           StoreLoad handshake with a quiescing peer's store-gate-then-load-
+           in_translated.  Under release/acquire BOTH sides may miss -- we enter
+           translated code believing there is no gate while the quiesce believes we
+           are not translated, so it never interrupts us and waits forever. */
+        atomic_store_explicit(&g_stw_threads[g_my_stw_slot].in_translated, 1, memory_order_seq_cst);
         /* Close activation's phase-transition race: once the gate is visible we
            withdraw from translated execution and acknowledge at the dispatcher. */
-        if (!atomic_load_explicit(&g_dispatch_gate, memory_order_acquire) &&
+        if (!atomic_load_explicit(&g_dispatch_gate, memory_order_seq_cst) &&
             atomic_load_explicit(&g_dispatch_request, memory_order_acquire) == selected_epoch)
             return 1;
         atomic_store_explicit(&g_stw_threads[g_my_stw_slot].in_translated, 0, memory_order_release);
@@ -1258,6 +1263,27 @@ static void stw_after_translated(void) {
     stw_dispatch_safepoint();
 }
 
+/* Wait until every peer still executing translated code has acknowledged `request`
+   at a dispatcher boundary.  irq is re-asserted every round, not once by the
+   arming scan: a peer that entered translated code after that scan was never
+   interrupted, and a guest loop leaves the cache only on an irq poll -- so the
+   one-shot form waits forever on it.  No deadline: proceeding while a peer still
+   runs a translation this window is about to invalidate is memory corruption. */
+static void stw_wait_translated_acks(uint64_t request) {
+    for (;;) {
+        int pending = 0;
+        for (int i = 0; i < STW_MAXTHREAD; i++) {
+            if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
+            if (!atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_seq_cst)) continue;
+            if (atomic_load_explicit(&g_stw_threads[i].dispatch_ack, memory_order_acquire) >= request) continue;
+            if (g_stw_threads[i].cpu) __atomic_store_n(&g_stw_threads[i].cpu->irq, 1, __ATOMIC_SEQ_CST);
+            pending = 1;
+        }
+        if (!pending) break;
+        jit_backoff_ns(UINT64_C(50000));
+    }
+}
+
 static int stw_force_dispatch_flush(void) {
     pthread_t me = pthread_self();
     /* Serialize activation ownership before publishing its epoch/gate.  If two
@@ -1266,14 +1292,15 @@ static int stw_force_dispatch_flush(void) {
        acknowledges the newer epoch. */
     pthread_mutex_lock(&g_jit_lock);
     uint64_t request = atomic_fetch_add_explicit(&g_dispatch_request, 1, memory_order_acq_rel) + 1;
-    atomic_store_explicit(&g_dispatch_gate, 1, memory_order_release);
+    /* seq_cst: pairs with stw_before_translated's in_translated publication. */
+    atomic_store_explicit(&g_dispatch_gate, 1, memory_order_seq_cst);
     /* Preserve the global lock order used by ordinary STW: jit -> registry. */
     pthread_mutex_lock(&g_stw_reg_lock);
     for (int i = 0; i < STW_MAXTHREAD; i++) {
         if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
         if (pthread_equal(g_stw_threads[i].th, me)) {
             atomic_store_explicit(&g_stw_threads[i].dispatch_ack, request, memory_order_release);
-        } else if (atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire)) {
+        } else if (atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_seq_cst)) {
             /* The emitted poll observes this aligned word directly.  The
                thread-directed signal path uses the same atomic publication;
                avoiding a host signal also avoids constructing an asynchronous
@@ -1281,18 +1308,7 @@ static int stw_force_dispatch_flush(void) {
             if (g_stw_threads[i].cpu) __atomic_store_n(&g_stw_threads[i].cpu->irq, 1, __ATOMIC_SEQ_CST);
         }
     }
-    for (;;) {
-        int pending = 0;
-        for (int i = 0; i < STW_MAXTHREAD; i++)
-            if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) &&
-                atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire) &&
-                atomic_load_explicit(&g_stw_threads[i].dispatch_ack, memory_order_acquire) < request) {
-                pending = 1;
-                break;
-            }
-        if (!pending) break;
-        jit_backoff_ns(UINT64_C(50000));
-    }
+    stw_wait_translated_acks(request);
     for (int i = 0; i < STW_MAXTHREAD; i++)
         if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) && g_stw_threads[i].cpu)
             G_ACTIVATION_CLEAR_CPU(g_stw_threads[i].cpu);
@@ -1314,28 +1330,18 @@ static void stw_mapping_begin(void) {
     pthread_t me = pthread_self();
     pthread_mutex_lock(&g_jit_lock);
     uint64_t request = atomic_fetch_add_explicit(&g_dispatch_request, 1, memory_order_acq_rel) + 1;
-    atomic_store_explicit(&g_dispatch_gate, 1, memory_order_release);
+    /* seq_cst: pairs with stw_before_translated's in_translated publication. */
+    atomic_store_explicit(&g_dispatch_gate, 1, memory_order_seq_cst);
     pthread_mutex_lock(&g_stw_reg_lock);
     for (int i = 0; i < STW_MAXTHREAD; i++) {
         if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
         if (pthread_equal(g_stw_threads[i].th, me))
             atomic_store_explicit(&g_stw_threads[i].dispatch_ack, request, memory_order_release);
-        else if (atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire) &&
+        else if (atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_seq_cst) &&
                  g_stw_threads[i].cpu)
             __atomic_store_n(&g_stw_threads[i].cpu->irq, 1, __ATOMIC_SEQ_CST);
     }
-    for (;;) {
-        int pending = 0;
-        for (int i = 0; i < STW_MAXTHREAD; i++)
-            if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) &&
-                atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire) &&
-                atomic_load_explicit(&g_stw_threads[i].dispatch_ack, memory_order_acquire) < request) {
-                pending = 1;
-                break;
-            }
-        if (!pending) break;
-        jit_backoff_ns(UINT64_C(50000));
-    }
+    stw_wait_translated_acks(request);
     /* Mapping publication may retire canonical soft-page backing as soon as
        this quiescent section ends.  Invalidate every registered per-thread
        translated-data TLB while the registry is pinned and no peer can run. */
