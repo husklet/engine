@@ -686,10 +686,8 @@ static void ibtc_drop_target(uint64_t target) {
 // ---- W5C: race-free threaded IBTC fill ----
 // g_mtibtc: enable threaded shared-hash IBTC fill (NOMTIBTC=1 disables -> revert to the
 // locked-dispatcher path where threaded indirect branches always miss to the C dispatcher).
-// g_mtfill: PROF count of threaded shared-hash publishes. g_futexq: per-address futex
-// wait queues (NOFUTEXQ=1 -> the legacy single global mutex + broadcast in thread.c).
+// g_mtfill: PROF count of threaded shared-hash publishes.
 static int g_mtibtc = 1;
-static int g_futexq = 1;
 static uint64_t g_mtfill;
 
 // Atomic 128-bit RELEASE publish of a {target, body} pair into a 16-byte-aligned IBTC slot.

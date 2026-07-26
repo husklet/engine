@@ -2,8 +2,6 @@
 
 use std::collections::BTreeSet;
 
-use crate::api::extension::ProviderId;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SignalTarget {
     InitialProcess,
@@ -33,9 +31,4 @@ pub enum AttachmentKind {
     Stdout,
     Stderr,
     Terminal,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExtensionHandle {
-    pub provider: ProviderId,
 }

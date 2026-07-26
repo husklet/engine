@@ -45,14 +45,3 @@ function(hl_codesign)
       VERBATIM)
   endforeach()
 endfunction()
-
-# hl_codesign_file(<path>) — same, for artefacts produced by a custom command
-# rather than by a CMake target (returns the COMMAND fragment to append).
-function(hl_codesign_file out path)
-  if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
-    set(${out} COMMAND ${HL_CODESIGN} -s - --entitlements ${HL_JIT_ENTITLEMENTS} -f "${path}"
-        PARENT_SCOPE)
-  else()
-    set(${out} "" PARENT_SCOPE)
-  endif()
-endfunction()

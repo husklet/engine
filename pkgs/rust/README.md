@@ -41,8 +41,8 @@ the process domain, polling, waiting, and forced shutdown. The legacy `Config`/`
 a compatibility adapter while consumers migrate. Both launch paths serialize through the C engine's versioned
 `hl_launch_config` wire format; ambient `HL_*` variables are not used.
 
-The `extension` module defines versioned, domain-neutral `Namespace`, `Handles`, `Memory`, `Events`, `Lifecycle`, and
-`Extensions` ports. Capability discovery reports only contracts implemented by the current backend. The
+The `extension` module defines versioned, domain-neutral `Handles`, `Memory`, and `Lifecycle` ports.
+Capability discovery reports only contracts implemented by the current backend. The
 `engine.namespace` version 1.0 advertises exactly `directories`, `host-bind-read-only`, `immutable-files`,
 `mutable-files`, and `symlinks`. It projects their atomic trees at absolute guest paths. Mutable files have bounded
 initial bytes and one launch-private backing object, preserving normal open, fork, truncate, and shared-mapping

@@ -1,6 +1,5 @@
 //! Stable observability schemas. Native emission/control is not implemented.
 
-use std::collections::VecDeque;
 const MAGIC: u32 = 0x484c_4f42;
 const VERSION: u16 = 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,44 +212,6 @@ impl Event {
             registers,
             fields,
         })
-    }
-}
-pub struct EventQueue {
-    values: VecDeque<Event>,
-    maximum: usize,
-    lost: u64,
-}
-impl EventQueue {
-    #[must_use]
-    pub fn new(maximum: u32) -> Self {
-        Self {
-            values: VecDeque::new(),
-            maximum: maximum as usize,
-            lost: 0,
-        }
-    }
-    /// Adds an event, accounting for any evicted event.
-    ///
-    /// # Errors
-    /// Returns [`Error::Backpressure`] when the queue has zero capacity.
-    pub fn push(&mut self, mut event: Event) -> Result<(), Error> {
-        if self.maximum == 0 {
-            return Err(Error::Backpressure);
-        }
-        if self.values.len() == self.maximum {
-            self.values.pop_front();
-            self.lost = self.lost.saturating_add(1);
-        }
-        event.lost_before = self.lost;
-        self.values.push_back(event);
-        Ok(())
-    }
-    pub fn pop(&mut self) -> Option<Event> {
-        self.values.pop_front()
-    }
-    #[must_use]
-    pub const fn lost(&self) -> u64 {
-        self.lost
     }
 }
 fn u16p(o: &mut Vec<u8>, v: u16) {

@@ -592,7 +592,6 @@ mod tests {
         assert_eq!(word(&wire, NETWORK_ISOLATED_OFFSET), 0);
         assert_eq!(word(&wire, NETWORK_TRANSPORT_OFFSET), 2);
         assert_eq!(word(&wire, RESERVED_OFFSET), 0);
-        assert_eq!(word(&wire, RESERVED_OFFSET), 0);
         assert_eq!(string(&wire, NETWORK_NAMESPACE_OFFSET), None);
     }
 

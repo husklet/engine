@@ -257,8 +257,8 @@ static uint64_t pcache_engine_id(void) {
     build = hl_digest_bytes(build, &(uint64_t){pcache_id_of(g_self_path)}, sizeof(uint64_t));
     uint64_t modes = (uint64_t)(g_guestfold != 0) | ((uint64_t)(g_steal1617 != 0) << 1) |
                      ((uint64_t)(g_noibslim != 0) << 2) | ((uint64_t)(g_mtibtc != 0) << 3) |
-                     ((uint64_t)(g_futexq != 0) << 4) | ((uint64_t)(g_no_stw_reclaim != 0) << 5) |
-                     ((uint64_t)(g_prof != 0) << 6) | ((uint64_t)(uint32_t)g_fwdskip << 32);
+                     ((uint64_t)(g_no_stw_reclaim != 0) << 4) | ((uint64_t)(g_prof != 0) << 5) |
+                     ((uint64_t)(uint32_t)g_fwdskip << 32);
     return hl_identity_configuration(build, 1, 1, modes);
 }
 

@@ -201,7 +201,7 @@ impl Engine {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        launch::start_legacy(
+        launch::start_full(
             guest,
             config,
             program,
@@ -211,6 +211,7 @@ impl Engine {
             projections,
             services.map(|(launch, authority)| (launch, authority.into())),
             Vec::new(),
+            None,
         )
     }
 }

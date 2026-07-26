@@ -704,9 +704,8 @@ static int container_init(const char *rootfs) {
             char tmp[4096];
             snprintf(tmp, sizeof tmp, "%s", ls);
             char *sv;
-            // ABI 12 uses newline records so host paths may contain ':'. Legacy launchers use ':'.
-            const char *separator = strchr(tmp, '\n') ? "\n" : ":";
-            for (char *t = strtok_r(tmp, separator, &sv); t; t = strtok_r(NULL, separator, &sv))
+            // HL_LOWER is a newline-record option, so host paths may contain ':'.
+            for (char *t = strtok_r(tmp, "\n", &sv); t; t = strtok_r(NULL, "\n", &sv))
                 add_lower(t);
         }
     }

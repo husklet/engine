@@ -59,7 +59,6 @@
 #define CKPT_MAGIC UINT64_C(0x373054504b434c48)          // "HLCKPT07" (LE) -- per-process meta
 #define CKPT_MANIFEST_MAGIC UINT64_C(0x3730304e414d4c48) // "HLMAN007" (LE) -- workspace manifest
 #define CKPT_VERSION 1 // current checkpoint images are advertised and written as v1
-#define CKPT_RESTORE_VERSION_MAX 3
 #define CKPT_ARCH_X86_64 1
 #define CKPT_ARCH_AARCH64 2
 #define CKPT_CPU_MAGIC UINT64_C(0x31305550434c4848) // "HHLCPU01" (LE)
@@ -165,46 +164,10 @@ struct ckpt_region {
 
 #define CKPT_REGION_VERSION 1
 
-/* Published v2 pages files ended each region header at backing_emulated. */
-struct ckpt_region_v2 {
-    uint64_t addr, len, glen;
-    int32_t prot;
-    int32_t is_gna;
-    uint64_t npages;
-    uint64_t backing_object;
-    uint64_t backing_offset;
-    uint32_t backing_shared;
-    uint32_t backing_emulated;
-};
-
 static int ckpt_rd_all(FILE *f, void *buf, size_t n);
 
-static int ckpt_version_supported(uint64_t version) {
-    return version >= CKPT_VERSION && version <= CKPT_RESTORE_VERSION_MAX;
-}
-
-static int ckpt_read_region(FILE *file, uint64_t checkpoint_version, struct ckpt_region *region) {
-    memset(region, 0, sizeof *region);
-    if (checkpoint_version == 2) {
-        struct ckpt_region_v2 old;
-        if (ckpt_rd_all(file, &old, sizeof old) != 0) return -1;
-        region->addr = old.addr;
-        region->len = old.len;
-        region->glen = old.glen;
-        region->prot = old.prot;
-        region->is_gna = old.is_gna;
-        region->npages = old.npages;
-        region->backing_object = old.backing_object;
-        region->backing_offset = old.backing_offset;
-        region->backing_shared = old.backing_shared;
-        region->backing_emulated = old.backing_emulated;
-        region->format_version = CKPT_REGION_VERSION;
-        region->logical = 0;
-        return 0;
-    }
-    return (checkpoint_version == CKPT_VERSION || checkpoint_version == 3)
-               ? ckpt_rd_all(file, region, sizeof *region)
-               : -1;
+static int ckpt_read_region(FILE *file, struct ckpt_region *region) {
+    return ckpt_rd_all(file, region, sizeof *region);
 }
 
 struct ckpt_fd {
@@ -2147,7 +2110,7 @@ static int ckpt_read_manifest(struct ckpt_manifest *man) {
         fprintf(stderr, "[restore] bad manifest magic\n");
         return -1;
     }
-    if (!ckpt_version_supported(man->version) || man->arch != G_CKPT_ARCH) {
+    if (man->version != CKPT_VERSION || man->arch != G_CKPT_ARCH) {
         fprintf(stderr, "[restore] manifest version/arch mismatch\n");
         return -1;
     }
@@ -2175,77 +2138,20 @@ static int ckpt_read_meta_dir(const char *procdir, struct ckpt_meta *m) {
         fprintf(stderr, "[restore] %s is not a checkpoint (bad magic/short read)\n", procdir);
         return -1;
     }
-    if (!ckpt_version_supported(m->version) || m->arch != G_CKPT_ARCH) {
+    if (m->version != CKPT_VERSION || m->arch != G_CKPT_ARCH) {
         fprintf(stderr, "[restore] version/arch mismatch (file v%llu arch %llu)\n", (unsigned long long)m->version,
                 (unsigned long long)m->arch);
         return -1;
     }
-    size_t expected_cpu_size = sizeof(struct cpu);
-    if (m->version == 2) {
-#if G_CKPT_ARCH == CKPT_ARCH_AARCH64
-        expected_cpu_size = 26512;
-#elif G_CKPT_ARCH == CKPT_ARCH_X86_64
-        expected_cpu_size = offsetof(struct cpu, soft_snapshot) + sizeof(uint64_t);
-#else
-#error "unsupported checkpoint architecture"
-#endif
-    }
-    if (m->cpu_sz != expected_cpu_size) {
-        fprintf(stderr, "[restore] cpu-struct size mismatch (file %llu, expected %zu for v%llu)\n",
-                (unsigned long long)m->cpu_sz, expected_cpu_size, (unsigned long long)m->version);
+    if (m->cpu_sz != sizeof(struct cpu)) {
+        fprintf(stderr, "[restore] cpu-struct size mismatch (file %llu, expected %zu)\n",
+                (unsigned long long)m->cpu_sz, sizeof(struct cpu));
         return -1;
     }
     if (m->n_threads < 1 || m->n_threads > THREAD_REG_MAX) {
         fprintf(stderr, "[restore] invalid checkpoint thread count %llu\n", (unsigned long long)m->n_threads);
         return -1;
     }
-    return 0;
-}
-
-static size_t ckpt_cpu_payload_size(uint64_t version) {
-    if (version != 2) return sizeof(struct cpu);
-#if G_CKPT_ARCH == CKPT_ARCH_AARCH64
-    return 26512;
-#elif G_CKPT_ARCH == CKPT_ARCH_X86_64
-    return offsetof(struct cpu, soft_snapshot) + sizeof(uint64_t);
-#else
-#error "unsupported checkpoint architecture"
-#endif
-}
-
-static int ckpt_cpu_migrate_v2(struct cpu *current, const unsigned char *legacy, size_t legacy_size) {
-    memset(current, 0, sizeof *current);
-#if G_CKPT_ARCH == CKPT_ARCH_AARCH64
-    /*
-     * Published v2 had eight SMC ranges.  v3 enlarged that in-place to 64
-     * and inserted the logical-VMA soft state immediately before
-     * in_service.  Preserve the unchanged prefix and tail explicitly;
-     * copying the old object as a prefix would shift every field after the
-     * SMC queue by 896 bytes.
-     */
-    const size_t prefix = offsetof(struct cpu, smc_ranges);
-    const size_t old_ranges = 8 * 2 * sizeof(uint64_t);
-    const size_t new_ranges = sizeof current->smc_ranges;
-    const size_t old_tail = prefix + old_ranges;
-    const size_t new_tail = prefix + new_ranges;
-    const size_t stable_tail = offsetof(struct cpu, soft_page) - new_tail;
-    const size_t expected = old_tail + stable_tail + sizeof(uint64_t);
-    if (legacy_size != expected || expected != 26512) return -1;
-    memcpy(current, legacy, prefix);
-    memcpy(current->smc_ranges, legacy + prefix, old_ranges);
-    memcpy((unsigned char *)current + new_tail, legacy + old_tail, stable_tail);
-#elif G_CKPT_ARCH == CKPT_ARCH_X86_64
-    /*
-     * v3 inserted the software-TLB words immediately before in_service.
-     * Everything preceding them is byte-for-byte the published v2 layout.
-     */
-    const size_t stable = offsetof(struct cpu, soft_snapshot);
-    const size_t expected = stable + sizeof(uint64_t);
-    if (legacy_size != expected) return -1;
-    memcpy(current, legacy, stable);
-#else
-#error "unsupported checkpoint architecture"
-#endif
     return 0;
 }
 
@@ -2418,7 +2324,7 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
     mapped_e = mapped != NULL ? mapped + (size_t)m->n_regions : NULL;
     for (uint64_t i = 0; i < m->n_regions; i++) {
         struct ckpt_region reg;
-        if (ckpt_read_region(f, m->version, &reg) != 0) {
+        if (ckpt_read_region(f, &reg) != 0) {
             goto fail;
         }
         if (reg.format_version != CKPT_REGION_VERSION || reg.logical > 1) {
@@ -3541,12 +3447,10 @@ static int ckpt_restore_fds_dir(const char *procdir) {
 static int ckpt_restore_cpu_dir(const char *procdir, const struct ckpt_meta *m, struct cpu **out) {
     char pf[1300];
     snprintf(pf, sizeof pf, "%s/cpu", procdir);
-    size_t payload_size = ckpt_cpu_payload_size(m->version);
-    if (m->n_threads > SIZE_MAX / payload_size) return -1;
-    size_t payload_bytes = (size_t)m->n_threads * payload_size;
+    if (m->n_threads > SIZE_MAX / sizeof(struct cpu)) return -1;
     size_t bytes = (size_t)m->n_threads * sizeof(struct cpu);
-    if (payload_bytes > SIZE_MAX - sizeof(struct ckpt_cpu_header)) return -1;
-    size_t file_bytes = sizeof(struct ckpt_cpu_header) + payload_bytes;
+    if (bytes > SIZE_MAX - sizeof(struct ckpt_cpu_header)) return -1;
+    size_t file_bytes = sizeof(struct ckpt_cpu_header) + bytes;
     struct ckpt_cpu_header *cpu_file = malloc(file_bytes);
     if (!cpu_file || ckpt_source_load(pf, cpu_file, file_bytes) != 0) {
         free(cpu_file);
@@ -3554,7 +3458,7 @@ static int ckpt_restore_cpu_dir(const char *procdir, const struct ckpt_meta *m, 
         return -1;
     }
     if (cpu_file->magic != CKPT_CPU_MAGIC || cpu_file->version != m->version || cpu_file->arch != G_CKPT_ARCH ||
-        cpu_file->count != m->n_threads || cpu_file->payload_size != payload_size) {
+        cpu_file->count != m->n_threads || cpu_file->payload_size != sizeof(struct cpu)) {
         fprintf(stderr, "[restore] cpu image version/architecture/layout mismatch\n");
         free(cpu_file);
         return -1;
@@ -3564,18 +3468,7 @@ static int ckpt_restore_cpu_dir(const char *procdir, const struct ckpt_meta *m, 
         free(cpu_file);
         return -1;
     }
-    if (m->version == 2) {
-        const unsigned char *legacy = (const unsigned char *)(cpu_file + 1);
-        for (uint64_t i = 0; i < m->n_threads; i++)
-            if (ckpt_cpu_migrate_v2(&images[i], legacy + (size_t)i * payload_size, payload_size) != 0) {
-                fprintf(stderr, "[restore] unsupported v2 cpu layout\n");
-                free(images);
-                free(cpu_file);
-                return -1;
-            }
-    } else {
-        memcpy(images, cpu_file + 1, bytes);
-    }
+    memcpy(images, cpu_file + 1, bytes);
     free(cpu_file);
     // Zero host-transient fields (meaningful only WHILE a block runs; run_block re-populates them). The
     // architectural state (x[],sp,pc,tls,nzcv,v[],sigmask,tpending,alt_*,tid,ctid) + shadow stack are verbatim.
@@ -3897,7 +3790,7 @@ static int ckpt_validate_process_image(const struct ckpt_proc *process,
     if (!pages) return -1;
     for (uint64_t index = 0; index < meta->n_regions; ++index) {
         struct ckpt_region region;
-        if (ckpt_read_region(pages, meta->version, &region) != 0 || region.addr == 0 || region.len == 0 ||
+        if (ckpt_read_region(pages, &region) != 0 || region.addr == 0 || region.len == 0 ||
             region.addr > UINT64_MAX - region.len || region.glen > region.len ||
             region.npages > (region.len - 1) / meta->pagesz + 1 ||
             region.format_version != CKPT_REGION_VERSION || region.logical > 1 ||

@@ -144,17 +144,7 @@ static int64_t hl_linux_error(hl_status status) {
 static const hl_host_file_services *hl_linux_files(const hl_linux_abi *linux_abi) {
     const hl_host_services *host;
     if (linux_abi == NULL || (host = linux_abi->host) == NULL || (host->capabilities & HL_HOST_CAP_FILE) == 0 ||
-        host->file == NULL ||
-        !((host->file->abi == HL_HOST_FILE_ABI_13 &&
-           host->file->size >= offsetof(hl_host_file_services, allocate_range)) ||
-          ((host->file->abi == HL_HOST_FILE_ABI_14 || host->file->abi == HL_HOST_FILE_ABI_15 ||
-            host->file->abi == HL_HOST_FILE_ABI_16) &&
-           host->file->size >= offsetof(hl_host_file_services, set_permissions)) ||
-          (host->file->abi == HL_HOST_FILE_ABI_17 &&
-           host->file->size >= offsetof(hl_host_file_services, read_directory)) ||
-          (host->file->abi == HL_HOST_FILE_ABI_22 &&
-           host->file->size >= offsetof(hl_host_file_services, remove_directory)) ||
-          (host->file->abi == HL_HOST_FILE_ABI && host->file->size >= sizeof(*host->file))))
+        host->file == NULL || host->file->abi != HL_HOST_FILE_ABI || host->file->size < sizeof(*host->file))
         return NULL;
     return host->file;
 }

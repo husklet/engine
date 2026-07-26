@@ -142,8 +142,6 @@ add_test(NAME dual-backend.mac-link
           ${CMAKE_BINARY_DIR}/e2e/guest-output-aarch64)
 set_tests_properties(dual-backend.mac-link PROPERTIES
   LABELS "embedding" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-add_custom_target(embedding-macos-build DEPENDS mac-dual-backend-link-test)
-
 # --- mac host-service unit tests -------------------------------------------
 # These open "/", "/tmp" and resolve localhost DNS, so they are NOT part of the
 # sandboxed `unit` lane; they get their own label and a per-test timeout so a
@@ -158,7 +156,6 @@ function(hl_mac_test name)
   set_target_properties(${name} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
   hl_codesign(${name})
-  set_property(GLOBAL APPEND PROPERTY HL_MACOS_TEST_TARGETS ${name})
   add_test(NAME macos.${name} COMMAND ${name})
   set_tests_properties(macos.${name} PROPERTIES
     LABELS "macos" TIMEOUT ${HL_MACOS_TEST_TIMEOUT}
@@ -196,10 +193,6 @@ hl_codesign(dns-objc-fork-macos)
 add_test(NAME macos.dns-objc-fork COMMAND dns-objc-fork-macos)
 set_tests_properties(macos.dns-objc-fork PROPERTIES
   LABELS "macos" TIMEOUT ${HL_MACOS_TEST_TIMEOUT})
-get_property(_HL_MACOS_TEST_TARGETS GLOBAL PROPERTY HL_MACOS_TEST_TARGETS)
-add_custom_target(macos-build
-  DEPENDS ${_HL_MACOS_TEST_TARGETS} dns-objc-fork-macos)
-
 # --- the six mac e2e gates --------------------------------------------------
 # FIREWALL CONSTRAINT (Makefile comment at line 1846): the host firewall
 # reliably admits at most FOUR signed launches from one launching process, so
@@ -259,27 +252,6 @@ add_test(NAME e2e.bridge-jobserver
 set_tests_properties(e2e.bridge-jobserver PROPERTIES
   LABELS "e2e;e2e-mac" RESOURCE_LOCK hl-mac-bridge
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-set(_HL_E2E_MAC_DEPS
-  test_lifecycle_identity bridge-runner bridge-jobserver-test
-  lifecycle-exit-aarch64 lifecycle-exit-x86_64
-  lifecycle-signal-aarch64 lifecycle-signal-x86_64
-  lifecycle-clock-aarch64 lifecycle-clock-x86_64
-  lifecycle-force-aarch64 lifecycle-force-x86_64
-  binding-aarch64 binding-x86_64
-  stdio-aarch64 stdio-x86_64
-  dir-aarch64 dir-x86_64)
-foreach(_arch aarch64 x86_64)
-  list(APPEND _HL_E2E_MAC_DEPS
-    ${_E2E}/guest-exit139-${_arch}
-    ${_E2E}/guest-fault-${_arch}
-    ${_E2E}/clock-injected-${_arch}
-    ${_E2E}/guest-spin-${_arch}
-    ${_E2E}/fd-binding-${_arch}
-    ${_E2E}/stdio-binding-${_arch}
-    ${_E2E}/dir-binding-${_arch})
-endforeach()
-add_custom_target(e2e-macos-build DEPENDS ${_HL_E2E_MAC_DEPS})
 
 # --- direct production/config launches formerly hidden in e2e-compat -------
 # These six checks are distinct from the embedding gates above: they launch

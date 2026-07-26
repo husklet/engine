@@ -12,11 +12,7 @@
 static void run_guest(struct cpu *c);
 
 // ---------------- futex: per-address hashed wait queues ----------------
-// Legacy (NOFUTEXQ=1): ONE global mutex + condvar. Correct but a WAKE on ANY address takes
-// the global lock and broadcasts EVERY waiter on EVERY address (thundering herd) -> the real
-// multi-thread DB bottleneck. The S3 uncontended fast path helped only the no-sleeper case.
-//
-// W5C (default): a fixed table of per-address buckets {mutex, condvar, waiter-count}, keyed by
+// W5C: a fixed table of per-address buckets {mutex, condvar, waiter-count}, keyed by
 // hash(uaddr). A WAKE touches only the bucket for that address, so a wake never broadcasts waiters
 // on unrelated addresses (no cross-address thundering herd). Addresses that collide in a bucket
 // share its lock (occasional extra spurious wakeups, never a missed wakeup). Correctness:
@@ -331,13 +327,6 @@ static inline struct futex_bucket *fbk_of(const void *uaddr) {
     return &(g_fbk_active ? g_fbk_active : g_fbk)[h];
 }
 
-// legacy global queue (NOFUTEXQ=1)
-static pthread_mutex_t g_futex_m = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_futex_c = PTHREAD_COND_INITIALIZER;
-// Aggregate parked count for the legacy single-queue path, so its FUTEX_WAKE can report a woken count
-// (min(val, parked)) instead of the requested `val`. Approximate (one global queue, no per-address split)
-// but correct for the common single-futex case; the default W5C path counts per-address exactly.
-static int g_futex_parked;
 // PROF: fast (no-lock) wakes, slow (locked) wakes, eagain pre-checks
 static uint64_t g_futex_wake_fast, g_futex_wake_slow, g_futex_wait_n;
 
@@ -1877,63 +1866,6 @@ static long futex_op(struct cpu *c, int *uaddr, const void *key, int op, int pri
         long budget = (long)(val < 1 ? 1 : val) + (nr_wake2 > 0 ? nr_wake2 : 0);
         return futex_wake_bucket(key, budget > 0x7fffffff ? 0x7fffffff : (int)budget, ~0u, 1);
     }
-    if (!g_futexq) {
-        // ---- legacy single global queue ----
-        if (op == 0 || op == 9) {
-            pthread_mutex_lock(&g_futex_m);
-            if (__atomic_load_n(uaddr, __ATOMIC_SEQ_CST) != val) {
-                pthread_mutex_unlock(&g_futex_m);
-                return -EAGAIN;
-            }
-            // Publish, then re-check tpending (the StoreLoad handshake with thread_target_signal), so a
-            // thread-directed signal that arrives right before we sleep interrupts the wait, not deadlocks.
-            thread_wait_publish(&g_futex_m, &g_futex_c);
-            if (cpu_wait_interrupted(c)) {
-                thread_wait_clear();
-                pthread_mutex_unlock(&g_futex_m);
-                return -EINTR;
-            }
-            g_futex_parked++;
-            ts_wait_enter(); // 'S' while parked in FUTEX_WAIT (legacy single-queue mode)
-            int rc = 0;
-            if (ts) {
-                struct timespec abs, rel;
-                // op 9 (FUTEX_WAIT_BITSET): ts is an absolute deadline; op 0: it is relative.
-                if (op == 9) futex_rel_from_abs(&rel, ts);
-                abs_from_rel(&abs, op == 9 ? &rel : ts);
-                rc = pthread_cond_timedwait(&g_futex_c, &g_futex_m, &abs);
-            } else
-                pthread_cond_wait(&g_futex_c, &g_futex_m);
-            ts_wait_leave();
-            thread_wait_clear();
-            g_futex_parked--;
-            int intr = cpu_wait_interrupted(c);
-            pthread_mutex_unlock(&g_futex_m);
-            if (intr) return -EINTR; // woken by a cross-thread signal -> guest retries; dispatcher delivers it
-            return rc == ETIMEDOUT ? -ETIMEDOUT : 0;
-        }
-        if (op == 1 || op == 10 || op == 3 || op == 4) { // WAKE / WAKE_BITSET / REQUEUE / CMP_REQUEUE
-            pthread_mutex_lock(&g_futex_m);
-            int woke = g_futex_parked < val ? g_futex_parked : val; // report woken count, not the request
-            pthread_cond_broadcast(&g_futex_c);
-            pthread_mutex_unlock(&g_futex_m);
-            return woke;
-        }
-        if (op == 5) { // FUTEX_WAKE_OP on the legacy single global queue
-            int do_wake2 = 0;
-            int rc = futex_wake_op_apply(uaddr2, val3, &do_wake2);
-            if (rc < 0) return rc;
-            pthread_mutex_lock(&g_futex_m);
-            // One global queue can't split by address: broadcast wakes waiters on both uaddr and uaddr2, so
-            // report min(parked, val) as the uaddr count (+ the requested nr_wake2 when the cmp fires).
-            int woke = g_futex_parked < val ? g_futex_parked : val;
-            if (do_wake2) woke += nr_wake2 < 0 ? 0 : nr_wake2;
-            pthread_cond_broadcast(&g_futex_c);
-            pthread_mutex_unlock(&g_futex_m);
-            return woke;
-        }
-        return 0;
-    }
     // ---- W5C per-address buckets ----
     struct futex_bucket *b = fbk_of(key);
     // FUTEX_WAIT / WAIT_BITSET: sleep while *uaddr == val
@@ -2059,12 +1991,6 @@ static void futex_wake_addr(uint64_t uaddr) {
     // wake, and a joinable thread never unmaps its own stack so its ctid is always still live.
     if (!host_addr_mapped((uintptr_t)uaddr)) return;
     *(int *)uaddr = 0;
-    if (!g_futexq) {
-        pthread_mutex_lock(&g_futex_m);
-        pthread_cond_broadcast(&g_futex_c);
-        pthread_mutex_unlock(&g_futex_m);
-        return;
-    }
     // libc implementations use both private and shared futex operations for
     // thread joins.  The kernel-generated clear-child-tid wake is not tagged
     // by the exiting guest syscall, so notify both key spaces.  The word is
@@ -2122,8 +2048,6 @@ static pthread_mutex_t g_threg_m = PTHREAD_MUTEX_INITIALIZER;
 // semaphores). Called from the fork child path in proc.c.
 static void thread_after_fork(void) {
     pthread_mutex_init(&g_threg_m, NULL); // thread registry (tkill/tgkill lookup, thread_register)
-    pthread_mutex_init(&g_futex_m, NULL); // legacy global futex lock (NOFUTEXQ path)
-    pthread_cond_init(&g_futex_c, NULL);
     // SINGLE-THREADED-PARENT FAST PATH: with no peer thread at fork, no private-futex bucket lock could have
     // been held (bucket locks are taken only transiently by the holder, never across a guest fork) and no
     // waiter could be parked, and the tid registry already lists only the calling thread. The entire reset

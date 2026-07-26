@@ -36,7 +36,7 @@ pub(super) fn start_channels(
             Some((checkpoint, trigger)),
         );
     }
-    start_legacy(
+    start_full(
         launch.guest,
         &launch.config,
         launch.program,
@@ -46,41 +46,12 @@ pub(super) fn start_channels(
         launch.projections,
         launch.services.map(|services| (services, authorities)),
         resources,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn start_legacy<I, S>(
-    guest: Guest,
-    config: &Config,
-    program: impl AsRef<OsStr>,
-    arguments: I,
-    streams: (Stdio, Stdio, Stdio),
-    terminal: Option<Size>,
-    projections: Vec<crate::projection::Projection>,
-    services: Option<(ServiceLaunch, crate::extension::Authorities)>,
-    resources: Vec<super::lowering::AllocatedResource>,
-) -> Result<Child, Error>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    start_full(
-        guest,
-        config,
-        program,
-        arguments,
-        streams,
-        terminal,
-        projections,
-        services,
-        resources,
         None,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn start_full<I, S>(
+pub(super) fn start_full<I, S>(
     guest: Guest,
     config: &Config,
     program: impl AsRef<OsStr>,

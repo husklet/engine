@@ -744,11 +744,10 @@ static int container_init(const char *rootfs) {
         const char *low = hl_option_get("HL_LOWER");
         if (low && !g_nlower) {
             char tb[8192];
-            // ABI 12 uses newline records so host paths may contain ':'. Legacy launchers use ':'.
+            // HL_LOWER is a newline-record option, so host paths may contain ':'.
             snprintf(tb, sizeof tb, "%s", low);
             char *sv = NULL;
-            const char *separator = strchr(tb, '\n') ? "\n" : ":";
-            for (char *t = strtok_r(tb, separator, &sv); t; t = strtok_r(NULL, separator, &sv))
+            for (char *t = strtok_r(tb, "\n", &sv); t; t = strtok_r(NULL, "\n", &sv))
                 add_lower(t);
         }
         // Private-loopback netns: derive g_netns from the HL_NETNS key (set per-container by the
@@ -876,7 +875,6 @@ static int engine_global_init(void) {
     g_fwdskip = 8;
     g_guestfold = 1;
     g_mtibtc = 1;
-    g_futexq = 1;
     // Untrusted-guest isolation (the sentry process-split). OFF by default -> trusted path unchanged.
     g_untrusted = hl_option_get("HL_UNTRUSTED") != NULL;
     g_sentry_sandbox = hl_option_get("HL_SANDBOX") != NULL;

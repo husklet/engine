@@ -6,9 +6,8 @@ use std::{
 
 use crate::{
     control::{
-        decrement, AttachRequest, Attachment, AttachmentKind, ControlError, EventStream,
-        ExtensionHandle, NetworkUpdate, PauseGuard, ProcessInfo, ResourceUpdate, ShutdownPolicy,
-        Signal, SignalTarget,
+        decrement, AttachRequest, Attachment, AttachmentKind, ControlError, PauseGuard,
+        ProcessInfo, ResourceUpdate, ShutdownPolicy, Signal, SignalTarget,
     },
     Child, Domain, Error, Exit, Terminal,
 };
@@ -299,33 +298,6 @@ impl Machine {
     /// Returns [`crate::ControlErrorCategory::Unsupported`] with the current backend.
     pub fn update_resources(&self, _update: ResourceUpdate) -> Result<(), ControlError> {
         Err(ControlError::unsupported("update_resources"))
-    }
-
-    /// Live network mutation requires the forthcoming native control channel.
-    ///
-    /// # Errors
-    /// Returns [`crate::ControlErrorCategory::Unsupported`] with the current backend.
-    pub fn update_network(&self, _update: NetworkUpdate) -> Result<(), ControlError> {
-        Err(ControlError::unsupported("update_network"))
-    }
-
-    /// Provider hotplug requires negotiated extension transport support.
-    ///
-    /// # Errors
-    /// Returns [`crate::ControlErrorCategory::Unsupported`] with the current backend.
-    pub fn hotplug(
-        &self,
-        _extension: crate::extension::ExtensionSpec,
-    ) -> Result<ExtensionHandle, ControlError> {
-        Err(ControlError::unsupported("hotplug"))
-    }
-
-    /// Structured live events require the forthcoming native control channel.
-    ///
-    /// # Errors
-    /// Returns [`crate::ControlErrorCategory::Unsupported`] with the current backend.
-    pub fn events(&self) -> Result<EventStream, ControlError> {
-        Err(ControlError::unsupported("events"))
     }
 
     /// Force-stops the initial process and its engine-owned process domain.

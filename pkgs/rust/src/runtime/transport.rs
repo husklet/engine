@@ -1,14 +1,11 @@
 //! Frozen provider transport foundation. This is not a discovered runtime capability yet.
 
-use crate::api::extension::ProviderId;
-use crate::provider::Handles;
 use std::{
-    collections::BTreeMap,
     io::{Read, Write},
     os::unix::net::UnixStream,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Mutex,
     },
     time::{Duration, Instant},
 };
@@ -235,48 +232,6 @@ impl Channel {
     }
 }
 
-/// Launch-scoped mapping from opaque provider identity to handle authority.
-#[derive(Default)]
-
-pub struct ProviderRegistry {
-    providers: BTreeMap<ProviderId, Arc<dyn Handles>>,
-    maximum: u32,
-}
-
-impl ProviderRegistry {
-    #[must_use]
-    pub fn new(maximum: u32) -> Self {
-        Self {
-            providers: BTreeMap::new(),
-            maximum,
-        }
-    }
-
-    /// Installs one provider authority for this launch.
-    ///
-    /// # Errors
-    /// Returns duplicate-provider or launch-quota errors.
-    pub fn register(
-        &mut self,
-        id: ProviderId,
-        handles: Arc<dyn Handles>,
-    ) -> Result<(), TransportError> {
-        if self.providers.contains_key(&id) {
-            return Err(TransportError::DuplicateProvider);
-        }
-        if self.providers.len() >= self.maximum as usize {
-            return Err(TransportError::Quota);
-        }
-        self.providers.insert(id, handles);
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn get(&self, id: &ProviderId) -> Option<&Arc<dyn Handles>> {
-        self.providers.get(id)
-    }
-}
-
 fn remaining(deadline: Instant) -> Result<Duration, TransportError> {
     deadline
         .checked_duration_since(Instant::now())
@@ -313,7 +268,6 @@ fn io_error(error: std::io::Error) -> TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{LinuxError, OpenRequest};
 
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(1)
@@ -452,36 +406,5 @@ mod tests {
             b"two"
         );
         server.join().unwrap();
-    }
-
-    struct HandlesStub;
-    impl Handles for HandlesStub {
-        fn open(
-            &self,
-            _request: OpenRequest,
-        ) -> Result<Box<dyn crate::provider::OpenHandle>, LinuxError> {
-            Err(LinuxError {
-                errno: 95,
-                context: "not wired".into(),
-            })
-        }
-    }
-
-    #[test]
-    fn provider_registry_enforces_identity_and_launch_quota() {
-        let first = ProviderId::new("first").unwrap();
-        let second = ProviderId::new("second").unwrap();
-        let handles: Arc<dyn Handles> = Arc::new(HandlesStub);
-        let mut registry = ProviderRegistry::new(1);
-        registry.register(first.clone(), handles.clone()).unwrap();
-        assert!(registry.get(&first).is_some());
-        assert_eq!(
-            registry.register(first, handles.clone()).unwrap_err(),
-            TransportError::DuplicateProvider
-        );
-        assert_eq!(
-            registry.register(second, handles).unwrap_err(),
-            TransportError::Quota
-        );
     }
 }
