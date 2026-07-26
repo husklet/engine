@@ -214,7 +214,10 @@ hl_status hl_codegen_aarch64_function(const hl_ir_function *function, hl_code_bu
                 }
                 status = hl_aarch64_load_value(output, instruction->operands[operand], 16u + operand,
                                                &operand_registers[operand]);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
             }
             switch (instruction->opcode) {
             case HL_IR_OP_CONSTANT:
@@ -293,46 +296,94 @@ hl_status hl_codegen_aarch64_function(const hl_ir_function *function, hl_code_bu
                 /* Preserve original address and STORE value in dedicated temporary slots. */
                 status =
                     hl_aarch64_emit(output, UINT32_C(0xf90003e0) | (original_slot / 8u) << 10 | operand_registers[0]);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 if (instruction->opcode == HL_IR_OP_STORE) {
                     status =
                         hl_aarch64_emit(output, UINT32_C(0xf90003e0) | (value_slot / 8u) << 10 | operand_registers[1]);
-                    if (status != HL_STATUS_OK) return status;
+                    if (status != HL_STATUS_OK) {
+                        final_status = status;
+                        goto done;
+                    }
                 }
                 status = hl_aarch64_emit(output, UINT32_C(0xaa0003f0) | operand_registers[0] << 16);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 if (instruction->immediate != 0) {
                     status = hl_aarch64_constant(output, 17, instruction->immediate, 1);
-                    if (status != HL_STATUS_OK) return status;
+                    if (status != HL_STATUS_OK) {
+                        final_status = status;
+                        goto done;
+                    }
                     status = hl_aarch64_emit(output, UINT32_C(0x8b110210)); /* add x16,x16,x17 */
-                    if (status != HL_STATUS_OK) return status;
+                    if (status != HL_STATUS_OK) {
+                        final_status = status;
+                        goto done;
+                    }
                     status = hl_aarch64_emit(output, UINT32_C(0xf94003f1) | (original_slot / 8u) << 10);
-                    if (status != HL_STATUS_OK) return status;
+                    if (status != HL_STATUS_OK) {
+                        final_status = status;
+                        goto done;
+                    }
                     status = hl_aarch64_emit(output, UINT32_C(0xeb00001f) | 17u << 16 | 16u << 5);
-                    if (status != HL_STATUS_OK) return status;
+                    if (status != HL_STATUS_OK) {
+                        final_status = status;
+                        goto done;
+                    }
                     status = hl_aarch64_success_or_fault(output, UINT32_C(0x54000002), frame_size); /* b.hs */
-                    if (status != HL_STATUS_OK) return status;
+                    if (status != HL_STATUS_OK) {
+                        final_status = status;
+                        goto done;
+                    }
                 }
                 status = hl_aarch64_emit(output, UINT32_C(0xf9400811)); /* ldr x17,[x0,#16] */
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_aarch64_emit(output, UINT32_C(0xf100001f) | width << 10 | 17u << 5);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_aarch64_success_or_fault(output, UINT32_C(0x54000002), frame_size); /* b.hs */
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_aarch64_emit(output, UINT32_C(0xd1000000) | width << 10 | 17u << 5 | 17u);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_aarch64_emit(output, UINT32_C(0xeb00001f) | 17u << 16 | 16u << 5);
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_aarch64_success_or_fault(output, UINT32_C(0x54000009), frame_size); /* b.ls */
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 status = hl_aarch64_emit(output, UINT32_C(0xf9400411)); /* ldr x17,[x0,#8] */
-                if (status != HL_STATUS_OK) return status;
+                if (status != HL_STATUS_OK) {
+                    final_status = status;
+                    goto done;
+                }
                 if (instruction->opcode == HL_IR_OP_LOAD) {
                     status = hl_aarch64_emit(output, (width == 4 ? UINT32_C(0xb8606800) : UINT32_C(0xf8606800)) |
                                                          16u << 16 | 17u << 5 | destination);
                 } else {
                     status = hl_aarch64_emit(output, UINT32_C(0xf94003ef) | (value_slot / 8u) << 10);
-                    if (status != HL_STATUS_OK) return status;
+                    if (status != HL_STATUS_OK) {
+                        final_status = status;
+                        goto done;
+                    }
                     status = hl_aarch64_emit(output, (width == 4 ? UINT32_C(0xb8206800) : UINT32_C(0xf8206800)) |
                                                          16u << 16 | 17u << 5 | 15u);
                 }
