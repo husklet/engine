@@ -214,28 +214,6 @@ static void interp_signal_resume(struct cpu *c, void *ucontext) {
     siglongjmp(g_interp_marker_jmp, 1);
 }
 
-// The guestbase-fold fault-reconstruction pair, which exists here only to keep an existing call site
-// compiling. core/target/aarch64.c's sigframe_capture_fault replays the JIT emitter's scratch-register
-// spill mapping after a fault on a "folded" memory instruction -- an instruction whose base register the
-// emitter rewrote to reach a non-PIE image's high mapping, leaving the guest's real register values parked in
-// cpu->mscratch[4..7]. That is an emitter concept end to end: this backend performs the fold arithmetically
-// inside interp_guest_pointer and never displaces a guest register to do it, so there is nothing to replay.
-//
-// Answering 0/0 makes the replay a no-op, and it is already unreachable: the block is gated on
-// hl_aarch64_signal_capture(), which returns 0 by design on a non-AArch64 host. Both facts are why that call
-// site needs to be re-routed to interp_signal_capture() -- see this file's report; until it is, these two
-// definitions are what let the translation unit link.
-static int is_foldable_mem(uint32_t insn) {
-    (void)insn;
-    return 0;
-}
-
-static int fold_mem_scratch(uint32_t insn, int slots[4]) {
-    (void)insn;
-    (void)slots;
-    return 0;
-}
-
 // ---------------------------------------------------------------------------
 // Guest memory. Not yet used by any implemented instruction -- the integer core touches no memory -- but
 // written now because it is the framework the load/store group plugs into, and because getting the fault
@@ -356,6 +334,15 @@ static void interp_set_flags(struct cpu *cpu, unsigned n, unsigned z, unsigned c
     cpu->nzcv = (n ? INTERP_NZCV_N : 0) | (z ? INTERP_NZCV_Z : 0) | (c ? INTERP_NZCV_C : 0) |
                 (v ? INTERP_NZCV_V : 0);
 }
+
+// FPCR/FPSR. Per-thread, and deliberately NOT added to struct cpu -- that layout is the checkpoint format and
+// is shared with the JIT, which does not model these fields either (emitted code uses the host's real FPCR,
+// which is only meaningful when the host is AArch64). Held here so a read-modify-write round-trips, which is
+// what glibc's fegetround/fesetround do, but NOT ACTED ON: no floating-point arithmetic is implemented in this
+// backend yet, so there is no rounding mode or exception trap for them to control. Whoever implements scalar FP
+// must consume these rather than adding a second copy.
+static __thread uint64_t g_interp_fpcr;
+static __thread uint64_t g_interp_fpsr;
 
 static unsigned interp_flag_n(const struct cpu *cpu) { return (cpu->nzcv & INTERP_NZCV_N) != 0; }
 
@@ -1465,14 +1452,6 @@ static void interp_monitor_clear(void) {
     g_interp_monitor_valid = 0;
 }
 
-// FPCR/FPSR. Per-thread, and deliberately NOT in struct cpu -- that layout is the checkpoint format and is
-// shared with the JIT, which does not model these fields either (it lets emitted code use the host's real
-// FPCR, which is only meaningful when the host is AArch64). Held here so a read-modify-write round-trips,
-// which is what glibc's fesetround/fegetround do, but NOT ACTED ON: no floating-point arithmetic is
-// implemented in this backend yet, so there is no rounding mode or exception trap for them to control.
-// Whoever implements scalar FP must start by consuming these rather than adding a second copy.
-static __thread uint64_t g_interp_fpcr;
-static __thread uint64_t g_interp_fpsr;
 
 // A guest data fault this backend detects itself, rather than by taking a host signal: a misaligned atomic,
 // which the architecture defines as an alignment fault. Routed through the same reason the JIT's inline
@@ -2112,13 +2091,63 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             size = 1;
         else
             size = 0;
-        if (size == 3 && !q) return interp_undefined(cpu, insn, "AdvSIMD shift -- 64-bit element requires Q");
         unsigned esize = 8u << size;
         unsigned combined = (immh << 3) | immb;
         interp_vec source = interp_vec_read(cpu, rn), result;
         memset(result.byte, 0, sizeof result.byte);
         unsigned lanes = interp_vec_lanes(size, q);
         uint64_t mask = interp_element_mask(size);
+
+        if (opcode == 0x10 || opcode == 0x11) {
+            // SHRN / RSHRN (and their "2" variants when Q == 1). Read elements of TWICE the destination width,
+            // shift right, and truncate -- this is how a 16-byte vector compare mask gets packed into 8 bytes so
+            // that a single FMOV can carry it into a general register, which is the core of glibc's strlen and
+            // memchr. There is no 128-bit source element, so immh's top bit is unallocated here.
+            if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD shift -- SHRN with a 64-bit result element");
+            unsigned shift = 2u * esize - combined;
+            unsigned narrow_lanes = 64u / esize; // the result is always 64 bits wide; Q selects WHICH half
+            uint64_t wide_mask = interp_element_mask(size + 1u);
+            interp_vec packed;
+            memset(packed.byte, 0, sizeof packed.byte);
+            for (unsigned lane = 0; lane < narrow_lanes; lane++) {
+                uint64_t element = interp_vec_element(&source, size + 1u, lane) & wide_mask;
+                // RSHRN rounds rather than truncates, by adding half of the discarded field first.
+                if (opcode == 0x11 && shift > 0) element += UINT64_C(1) << (shift - 1u);
+                interp_vec_set_element(&packed, size, lane, (element >> shift) & mask);
+            }
+            if (!q) {
+                // SHRN writes the low 64 bits and zeroes the upper half.
+                interp_vec_write(cpu, rd, packed, 0);
+            } else {
+                // SHRN2 writes the UPPER 64 bits and must leave the lower half untouched.
+                interp_vec destination = interp_vec_read(cpu, rd);
+                memcpy(destination.byte + 8, packed.byte, 8);
+                interp_vec_write(cpu, rd, destination, 1);
+            }
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+
+        if (opcode == 0x14) {
+            // SSHLL / USHLL (and SXTL/UXTL, which are these with a zero shift). The counterpart of SHRN: widen
+            // each element to twice its size and shift left. Q selects which half of the source is consumed.
+            if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD shift -- SSHLL/USHLL with a 64-bit source");
+            unsigned shift = combined - esize;
+            unsigned wide_lanes = 64u / esize;
+            uint64_t wide_mask = interp_element_mask(size + 1u);
+            for (unsigned lane = 0; lane < wide_lanes; lane++) {
+                // Q == 1 takes the source elements from the upper half of Vn.
+                uint64_t element = interp_vec_element(&source, size, q ? lane + wide_lanes : lane);
+                if (!u) element = interp_element_sext(element, size);
+                interp_vec_set_element(&result, size + 1u, lane, (element << shift) & wide_mask);
+            }
+            // The destination is a full 128-bit register in both variants.
+            interp_vec_write(cpu, rd, result, 1);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+
+        if (size == 3 && !q) return interp_undefined(cpu, insn, "AdvSIMD shift -- 64-bit element requires Q");
         if (opcode == 0x0A) { // SHL: shift left by (combined - esize)
             unsigned shift = combined - esize;
             for (unsigned lane = 0; lane < lanes; lane++)
@@ -2427,7 +2456,26 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             break;
         }
-        case 0x1A: { // SMAXP/UMAXP (U bit selects signedness) -- pairwise, same shape as ADDP
+        case 0x12: { // MLA (U=0) / MLS (U=1): multiply-accumulate into the destination
+            if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD three same -- 64-bit element MLA/MLS");
+            interp_vec accumulate = interp_vec_read(cpu, rd);
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t product = interp_vec_element(&left, size, lane) * interp_vec_element(&right, size, lane);
+                uint64_t base = interp_vec_element(&accumulate, size, lane);
+                interp_vec_set_element(&result, size, lane, (u ? base - product : base + product) & mask);
+            }
+            break;
+        }
+        case 0x13: { // MUL (U=0). PMUL (U=1) is polynomial multiply, which is a different operation.
+            if (u) return interp_undefined(cpu, insn, "AdvSIMD three same -- PMUL (polynomial multiply)");
+            if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD three same -- 64-bit element MUL");
+            for (unsigned lane = 0; lane < lanes; lane++)
+                interp_vec_set_element(&result, size, lane,
+                                       (interp_vec_element(&left, size, lane) *
+                                        interp_vec_element(&right, size, lane)) & mask);
+            break;
+        }
+        case 0x14: { // SMAXP/UMAXP (U selects signedness) -- pairwise, the same shape as ADDP
             for (unsigned lane = 0; lane < lanes; lane++) {
                 const interp_vec *source = lane < lanes / 2 ? &left : &right;
                 unsigned base = (lane < lanes / 2 ? lane : lane - lanes / 2) * 2u;
@@ -2444,7 +2492,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             break;
         }
-        case 0x1B: { // SMINP / UMINP
+        case 0x15: { // SMINP / UMINP
             for (unsigned lane = 0; lane < lanes; lane++) {
                 const interp_vec *source = lane < lanes / 2 ? &left : &right;
                 unsigned base = (lane < lanes / 2 ? lane : lane - lanes / 2) * 2u;
