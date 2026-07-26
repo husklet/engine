@@ -435,9 +435,10 @@ pub(crate) fn encode(
     header.u32(
         CHECKPOINT_POLICY_OFFSET,
         match config.checkpoint_policy {
-            crate::spec::IncompatibleResourcePolicy::Refuse => 0,
+            crate::spec::IncompatibleResourcePolicy::Unspecified => 0,
             crate::spec::IncompatibleResourcePolicy::Reconnect => 1,
             crate::spec::IncompatibleResourcePolicy::DiscardOptional => 2,
+            crate::spec::IncompatibleResourcePolicy::Refuse => 3,
         },
     );
     header.u32(RESULT_OFFSET, result);
