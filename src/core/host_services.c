@@ -12,21 +12,7 @@ static int hl_valid_group(const void *group, uint32_t abi, size_t size) {
 }
 
 static int hl_valid_file_group(const hl_host_file_services *file) {
-    const size_t abi13_size = offsetof(hl_host_file_services, allocate_range);
-    return file != NULL &&
-           ((file->abi == HL_HOST_FILE_ABI_13 && file->size >= abi13_size) ||
-            ((file->abi == HL_HOST_FILE_ABI_14 || file->abi == HL_HOST_FILE_ABI_15 ||
-              file->abi == HL_HOST_FILE_ABI_16) &&
-             file->size >= offsetof(hl_host_file_services, set_permissions)) ||
-            (file->abi == HL_HOST_FILE_ABI_17 && file->size >= offsetof(hl_host_file_services, read_directory)) ||
-            (file->abi == HL_HOST_FILE_ABI_18 && file->size >= offsetof(hl_host_file_services, make_directory)) ||
-            (file->abi == HL_HOST_FILE_ABI_19 && file->size >= offsetof(hl_host_file_services, make_fifo)) ||
-            (file->abi == HL_HOST_FILE_ABI_20 &&
-             file->size >= offsetof(hl_host_file_services, validate_private_regular)) ||
-            (file->abi == HL_HOST_FILE_ABI_21 &&
-             file->size >= offsetof(hl_host_file_services, validate_private_directory)) ||
-            (file->abi == HL_HOST_FILE_ABI_22 && file->size >= offsetof(hl_host_file_services, remove_directory)) ||
-            (file->abi == HL_HOST_FILE_ABI && file->size >= sizeof(*file)));
+    return file != NULL && file->abi == HL_HOST_FILE_ABI && file->size >= sizeof(*file);
 }
 
 hl_status hl_host_services_validate(const hl_host_services *services, uint64_t required_capabilities) {
