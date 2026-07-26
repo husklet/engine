@@ -1,0 +1,2 @@
+epoll_fork_multiple first=1 second=1
+epoll_fork_multiple child=0
