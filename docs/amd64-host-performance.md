@@ -462,7 +462,7 @@ themselves are measured.
 | # | change | estimated win | effort | risk |
 |---|---|---|---|---|
 | 1 | ~~`sigsetjmp(pad, 0)` + explicit mask restore on the fault path~~ **DONE `583ae490`** | predicted compute 1.80x; **measured 1.85x x86-64 guest, 3.46x aarch64 guest**. `rt_sigprocmask` 3,035,853 → 8 per 3M blocks | small | **medium-high** |
-| 2 | per-page memo for `hl_guest_fetch_exec` / `hl_logical_vma_resolve_exec` / `host_range_mapped` | compute **~1.2-1.3x** | small-medium | low-medium |
+| 2 | ~~per-page memo for `hl_guest_fetch_exec` / `hl_logical_vma_resolve_exec`~~ **DONE `021c7fe2`** | predicted 1.2-1.3x; **measured 1.282x x86-64 guest, 1.329x aarch64 guest**. The `host_range_mapped` half is NOT done — see below | small-medium | low-medium |
 | 3 | cache decoded `struct insn` in the block descriptor | compute **~1.15-1.2x** after #1+#2 | medium-large | **high** |
 | 4 | shrink `struct insn` (184 bytes) and the decode tables | ~1.02-1.05x | small | low |
 | 5 | block chaining / real `G_IBTC_FILL` | ~1.03-1.05x after #1 | medium | medium |
@@ -504,18 +504,37 @@ had deliberately unblocked.
 `hl_logical_vma_resolve_exec()` calls plus one `host_range_mapped()` (with `gna_hit`,
 `hl_linux_bus_hit`, a `sigsetjmp` and a volatile probe load) per guest instruction.
 
-**Shape:** a single-entry memo — last guest page → host base, validity, and the logical-VMA snapshot
-pointer it was resolved against. Hit test is a shift-and-compare. `hl_logical_vma_ledger.current` is
-already an atomic snapshot pointer that rotates at STW, so it is a ready-made generation key. Collapse
-the two passes into one for the common single-page case while preserving the straddle logic, which
-exists for a real reason (a logical VMA followed by an unmapped hole).
+**Done in `021c7fe2`: 1.282x on the x86-64 guest, 1.329x on the aarch64 guest.** The shape proposed here
+was keyed on `hl_logical_vma_ledger.current`, the snapshot pointer, and that is **unsafe**: retired
+snapshots are `free()`d at the next quiescent reclaim, and `malloc` can hand the same address to the next
+publication — an ABA that makes a stale entry look *fresh*. It uses a new monotonic ledger generation
+instead.
 
-**Win (estimated):** removing ~80% of a 21%-of-total centre gives ~1.2x on compute; more once #1 has
-removed the kernel share and the user side is a bigger fraction of a smaller total.
+The invalidation obligation named here was also the wrong frame. The memo is **revalidated on every use**
+rather than notified, so the set has exactly one element: equal generation implies equal snapshot implies
+a hit returns bit-for-bit what a fresh resolve would. The memo cannot be stale, only absent.
 
-**Risk: low-medium.** It caches a *mapping*, not guest bytes, so SMC coherence is untouched — the
-instruction bytes are still read from guest memory on every execution. The invalidation obligation is
-the snapshot pointer and `filemap_refresh_emulated`.
+**Only the ledger-derived interval is cached; the ordinary/direct verdict is not**, and
+`host_range_mapped` still runs per fetch. That is what makes `munmap`/`MAP_FIXED`/`mremap`/`mprotect`/
+`G_SMC_UNMAP` hook-free — and it is the half still on the table, worth a further **1.137x** measured.
+Taking it needs a generation over `g_gna`, the bus registry and host unmap, because
+**`mprotect(PROT_NONE)` over an ordinary exec page calls `gna_add` without touching the ledger or firing
+`G_SMC_UNMAP`** (which fires only for `PROT_WRITE`). A memo built on the obligation this document
+originally stated would have executed a page the guest had made inaccessible.
+
+`host_range_mapped`'s own `sigsetjmp` stays. It is disjoint from the block pad by construction — the pad
+is claimed only when `g_interp_pad_armed && g_interp_guest_access`, and a probe load is not a marked guest
+access — and the two exist for opposite purposes: the probe must turn a fault into `EFAULT`, the pad must
+deliver it to the guest. After #1 it costs 2.57 ns rather than 271.7, so there is nothing left to win.
+
+Note the baseline moved underneath this: measured before #1 landed, the same patch gave only **1.132x**.
+Removing the kernel share made the fetch path a larger fraction of a smaller total. Cumulative on the
+same fixture, 12.55 s → 4.88 s = **2.57x**.
+
+**The compat suite cannot cover this path at all.** `logical_candidate` in `mem.c` requires
+`host_page > guest_page`, so on an x86-64 Linux host the ledger is always empty and the indirect path is
+unit-test-only; it is live on the 16 KiB-page AArch64/macOS lane. `tests/unit/test_guest_fetch.c` carries
+the invalidation cases instead.
 
 ### 3. Cache decoded instructions in the block descriptor
 
