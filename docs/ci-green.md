@@ -197,6 +197,37 @@ rejects a second compat host on an OS whose sharded lane list cannot say which h
 describes, and declaring the token first would switch I20 off and leave that workflow with no
 structural guard at all.
 
+## Host-environment preconditions the harness does not enforce
+
+Two properties of the environment that invokes `ctest` are *inputs* to the corpus, and
+neither is checked. Both produce failures that read as engine defects and are not. Both are
+cheap to confirm on an x86-64 host: run the case's own x86-64 fixture binary
+(`build-*/compat/<suite>/x86_64/<case>`) natively and diff it against the golden — on that
+host it is an exact oracle for the x86-64 guest leg, and a native binary that fails the
+golden the same way the engine does is proof the cause is the environment.
+
+* **The scheduling nice level.** Two cases lower their own nice and assert the result:
+  `completeness/priority` (`syscall/priority.c`, `setpriority(PRIO_PROCESS, 0, 5)`, golden
+  `priority set=1 nice=5`) and `process/sched-attr` (`sched_attr.c`, whose
+  `sched_getattr().sched_nice` check does the same). Lowering nice needs `CAP_SYS_NICE` or
+  `RLIMIT_NICE` headroom, and the default `RLIMIT_NICE` is 0 — so from a shell already at
+  nice > 5 the call returns `EACCES`, the golden is unreachable, and both cases fail on
+  **both** guest ISAs. Measured from a nice-12 shell the native binaries fail identically
+  (`priority set=0 nice=12`, `sched_attr ok=0`). The CI lanes run at nice 0, where both
+  cases are green. Run `ctest` at nice ≤ 5, or read those two failures as environmental.
+
+  One real divergence hides behind the first: at nice 12 the engine prints `set=1` where
+  native prints `set=0`, i.e. the engine's `setpriority` reports success where the kernel
+  refuses with `EACCES`. It is host-neutral and invisible wherever the call would have
+  succeeded anyway, which is why no lane sees it.
+
+* **The filesystem under the guest's `/tmp`.** `HL_MATRIX_SCRATCH_DIR`, covered by the
+  comment block in `cmake/Phase3Compat.cmake` and by `matrix_runner.c`'s `scratch_note()`,
+  which names the filesystem on any failing run. `.github/workflows/linux.yml` sets it per
+  suite and deliberately unsets it for `compat-core-syscall`. A local `ctest -L compat-*`
+  sets it for no suite at all, so on an ext4 build tree `syscall/memfd-seals` fails on both
+  ISAs for that reason alone.
+
 ## Runtime self-skips
 
 Detected, printed, and applicable-environment-only.

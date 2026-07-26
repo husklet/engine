@@ -168,6 +168,47 @@ if(HL_HAVE_ACTIVATION AND HL_ACTIVATION_TARGET)
           DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 endif()
 
+# --- gate.archive-closure ---------------------------------------------------
+# Derived from HL_INSTALL_LIBS above, not from a second hand-written list, so
+# what is checked cannot drift from what is installed. Runs in the `unit` lane
+# because it is two nm sweeps and one link.
+#
+# Linux host only: Apple's nm spells the selectors differently and a Mach-O
+# probe takes another system-library set. The macOS artefact is Phase4Mac's
+# hl-engine-dual, which mac-dual-backend-link-test already force-loads whole.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND HL_BUILD_TESTS)
+  if(DEFINED CMAKE_NM AND NOT CMAKE_NM STREQUAL "")
+    set(HL_NM_EXECUTABLE ${CMAKE_NM})
+  else()
+    find_program(HL_NM_EXECUTABLE NAMES nm REQUIRED)
+  endif()
+
+  set(_closure_archives "")
+  foreach(_lib IN LISTS HL_INSTALL_LIBS)
+    list(APPEND _closure_archives $<TARGET_FILE:${_lib}>)
+  endforeach()
+  if(HL_HAVE_ACTIVATION AND HL_ACTIVATION_TARGET)
+    list(APPEND _closure_archives $<TARGET_FILE:${HL_ACTIVATION_TARGET}>)
+  endif()
+
+  # The installed binaries an archive is a component of. Without them every
+  # per-guest-ISA entry point the target unity TU owns (hl_run_linux_guest, the
+  # ARM64 emitters) would read as dangling.
+  set(_closure_binaries $<TARGET_FILE:hl-engine-runner>)
+  foreach(_engine_arch aarch64 x86_64)
+    if(TARGET hl-engine-linux-${_engine_arch})
+      list(APPEND _closure_binaries $<TARGET_FILE:hl-engine-linux-${_engine_arch}>)
+    endif()
+  endforeach()
+
+  add_test(NAME gate.archive-closure
+    COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_archive_closure.sh
+            ${HL_NM_EXECUTABLE} ${CMAKE_C_COMPILER}
+            ${_closure_archives} -- ${_closure_binaries})
+  set_tests_properties(gate.archive-closure PROPERTIES
+    LABELS "unit;gate" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
+
 # --- package-test: install into a staging root, link a consumer, run it -----
 # The Makefile does this by re-invoking itself with DESTDIR; the CMake form
 # runs `cmake --install` into a staging prefix from a driver script so the

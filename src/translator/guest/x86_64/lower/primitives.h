@@ -3,7 +3,21 @@
 
 #include <stdint.h>
 
+#include "../../../../host/host_cpu.h"
 #include "../decoder.h"
+#include "../rep_runtime.h" // X86_SOFT_*, shared with the run-time half of the string ops
+
+/*
+ * Everything declared below emits ARM64, and is defined by emit.c + translate.c
+ * -- which core/target/x86_64.c includes only on an AArch64 host. Compiled into
+ * the engine anywhere else a lower/*.c is an object nothing can resolve, and a
+ * linker that pulls archive members on demand hides that until some unrelated
+ * symbol in the same object is referenced. Fail here instead. Unit tests supply
+ * their own emitters and set HL_X86_LOWER_STANDALONE.
+ */
+#if !defined(HL_HOST_CPU_AARCH64) && !defined(HL_X86_LOWER_STANDALONE)
+#error "guest/x86_64/lower/ emits ARM64: build it only on an AArch64 host (see docs/amd64-host.md)"
+#endif
 
 enum hl_x86_translate_result {
     TX_FALL = 0,
@@ -32,9 +46,6 @@ void hl_x86_emit_host_pointer(int destination, uint64_t pointer);
 void hl_x86_emit_vector_reset(void);
 void hl_x86_emit_flags_load(void);
 uint32_t *hl_x86_emit_cursor(void);
-uint64_t hl_x86_guest_pointer(uint64_t address);
-void hl_x86_count_rep_movs(void);
-void hl_x86_count_rep_stos(void);
 
 void emit_ea(struct insn *insn, uint64_t next);
 int ea_reg_fold(struct insn *insn, int width, int *rn, int *rm, int *shift);
@@ -42,8 +53,6 @@ void emit_ea_core(struct insn *insn, uint64_t next, int bias);
 void emit_load_mem(struct insn *insn, uint64_t next, int width, int destination);
 int ea_imm_fold(struct insn *insn, int width, int *base, int *offset);
 void emit_bus_guard(int address_register, uint64_t size, uint64_t rip);
-
-enum { X86_SOFT_READ = 1u, X86_SOFT_WRITE = 2u };
 
 void emit_memory_guard(int address_register, uint64_t size, uint64_t rip, uint32_t required);
 int emit_soft_memory_active(void);

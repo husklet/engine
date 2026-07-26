@@ -97,6 +97,12 @@ static void filemap_refresh_emulated(uint64_t lo, uint64_t hi);
 
 // code cache + block map + chaining
 #include "../../translator/cache.c"
+#include "../../translator/guest_memory.h"
+#include "../../linux_abi/logical_vma.h"
+
+// The translator may not link the Linux ABI (DOCS.md 3), so the engine hands it the ledger lookup the
+// instruction fetch needs. The data/non-PIE entries are x86-only; an aarch64 guest never uses them.
+static const hl_guest_memory_ops g_guest_memory_ops = {hl_logical_vma_resolve_exec, NULL, NULL, NULL, NULL};
 
 static const hl_host_services *effective_host_services(void) {
     return hl_target_services_effective(&g_target_services);
@@ -851,6 +857,7 @@ static int guest_fetch_direct_valid(uint64_t address, size_t length) {
 }
 
 static int engine_global_init(void) {
+    hl_guest_memory_bind(&g_guest_memory_ops);
     hl_guest_fetch_set_direct_validator(guest_fetch_direct_valid);
     if (hl_target_services_bind(&g_target_services) != 0) return 1;
     if (g_engine_inited) return 0;

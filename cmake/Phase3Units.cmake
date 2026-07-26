@@ -159,12 +159,25 @@ hl_unit(resolve      SOURCES src/host/resolve.c)
 hl_unit(reloc        SOURCES src/translator/reloc.c)
 hl_unit(digest       SOURCES src/translator/digest.c)
 hl_unit(x87_stack    SOURCES src/translator/guest/x86_64/lower/x87_stack.c)
-hl_unit(lower_x87    SOURCES src/translator/guest/x86_64/lower/x87.c
+# The lower_* cases supply their own ARM64 emitters and assert the encodings the
+# real ones would produce, so they compile these files on ANY host -- the one
+# legitimate use of lower/primitives.h's HL_X86_LOWER_STANDALONE escape. They
+# also have to name the .c explicitly rather than fish it out of
+# libhl-translator.a, which no longer carries it off an AArch64 host.
+set(_lower_flags -DHL_X86_LOWER_STANDALONE=1)
+hl_unit(lower_x87    FLAGS ${_lower_flags}
+                     SOURCES src/translator/guest/x86_64/lower/x87.c
                              src/translator/guest/x86_64/lower/x87_stack.c)
-hl_unit(lower_sse4x  SOURCES src/translator/guest/x86_64/lower/sse4x.c)
-hl_unit(lower_repstr SOURCES src/translator/guest/x86_64/lower/repstr.c)
-hl_unit(lower_crypto SOURCES src/translator/guest/x86_64/lower/crypto.c)
-hl_unit(lower_trace  SOURCES src/translator/guest/x86_64/lower/trace.c)
+hl_unit(lower_sse4x  FLAGS ${_lower_flags} SOURCES src/translator/guest/x86_64/lower/sse4x.c)
+hl_unit(lower_alu    FLAGS ${_lower_flags} SOURCES src/translator/guest/x86_64/lower/alu.c)
+hl_unit(lower_mov    FLAGS ${_lower_flags} SOURCES src/translator/guest/x86_64/lower/mov.c)
+hl_unit(lower_shift  FLAGS ${_lower_flags} SOURCES src/translator/guest/x86_64/lower/shift.c)
+hl_unit(lower_repstr FLAGS ${_lower_flags}
+                     SOURCES src/translator/guest/x86_64/lower/repstr.c
+                             src/translator/guest/x86_64/rep_runtime.c
+                             src/translator/guest_memory.c)
+hl_unit(lower_crypto FLAGS ${_lower_flags} SOURCES src/translator/guest/x86_64/lower/crypto.c)
+hl_unit(lower_trace  FLAGS ${_lower_flags} SOURCES src/translator/guest/x86_64/lower/trace.c)
 hl_unit(window       SOURCES src/translator/window.c)
 hl_unit(identity     SOURCES src/translator/identity.c)
 hl_unit(clock        SOURCES src/host/clock.c src/host/fake/host.c)

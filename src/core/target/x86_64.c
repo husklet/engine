@@ -127,7 +127,9 @@ static const hl_x86_avx_state g_avx_state = {&g_nonpie_lo, &g_nonpie_hi, &g_nonp
                                              jit86_avx_memory_write};
 #include "../../translator/guest/x86_64/glue.h" // independently compiled x86 target state
 #include "../../translator/guest_fetch.h"
-#include "../../translator/cache.c" // SHARED translator: code cache + block map
+#include "../../translator/guest_memory.h"
+#include "../../translator/guest/x86_64/rep_runtime.h" // string-op helpers + the hooks engine_global_init sets
+#include "../../translator/cache.c"                    // SHARED translator: code cache + block map
 
 uint64_t hl_x86_guest_pointer(uint64_t address) {
     return g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi ? address + g_nonpie_bias : address;
@@ -175,6 +177,48 @@ static int jit86_avx_memory_write(uint64_t guest, const void *source, size_t len
     jit86_store_alias_changed(guest, length);
     return 1;
 }
+
+/*
+ * The translator's guest-memory seam (translator/guest_memory.h): the ledger
+ * and the non-PIE window are engine knowledge, so the engine hands them over
+ * rather than letting the translator archive link the Linux ABI.
+ *
+ * These are not the AVX pair above: an ORDINARY address is reported as 0 with
+ * nothing copied, because the string-op caller must run its own direct-access
+ * validator first, and an ordinary span that reaches into a logical VMA before
+ * `length` is a fault rather than a raw host copy.
+ */
+static int jit86_guest_memory_read(uint64_t guest, void *destination, size_t length) {
+    hl_logical_vma_pin pin = {0};
+    int logical = hl_logical_vma_pin_data(guest, length, HL_LOGICAL_VMA_READ, &pin);
+    if (logical < 0) return -1;
+    if (pin.contiguous < length) {
+        hl_logical_vma_unpin(&pin);
+        return -1;
+    }
+    if (logical == 0) return 0;
+    memcpy(destination, pin.host, length);
+    hl_logical_vma_unpin(&pin);
+    return 1;
+}
+
+static int jit86_guest_memory_write(uint64_t guest, const void *source, size_t length) {
+    hl_logical_vma_pin pin = {0};
+    int logical = hl_logical_vma_pin_data(guest, length, HL_LOGICAL_VMA_WRITE, &pin);
+    if (logical < 0) return -1;
+    if (pin.contiguous < length) {
+        hl_logical_vma_unpin(&pin);
+        return -1;
+    }
+    if (logical == 0) return 0;
+    memcpy(pin.host, source, length);
+    hl_logical_vma_unpin(&pin);
+    return 1;
+}
+
+static const hl_guest_memory_ops g_guest_memory_ops = {hl_logical_vma_resolve_exec, jit86_guest_memory_read,
+                                                       jit86_guest_memory_write, hl_logical_vma_global_active,
+                                                       hl_x86_guest_pointer};
 
 // Host-CPU fork: an AArch64 host takes the x86-64 -> ARM64 translator below (register model at the top of
 // this file); any other takes interp.c, which decodes x86-64 directly. Both share struct cpu: it is the
@@ -817,6 +861,7 @@ static int guest_rep_access_special(uint64_t address, size_t length, int write) 
 
 static int engine_global_init(void) {
     hl_x86_decode_set_instruction_fetch(hl_guest_fetch_exec);
+    hl_guest_memory_bind(&g_guest_memory_ops);
     hl_guest_fetch_set_direct_validator(guest_fetch_direct_valid);
     hl_x86_rep_set_store_commit(jit86_store_alias_changed, jit86_store_alias_observation_active);
     hl_x86_rep_set_access_validators(guest_fetch_direct_valid, guest_store_direct_valid, guest_rep_access_special);

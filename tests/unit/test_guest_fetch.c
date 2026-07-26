@@ -4,6 +4,7 @@
 
 #include "../../src/linux_abi/logical_vma.h"
 #include "../../src/translator/guest_fetch.h"
+#include "../../src/translator/guest_memory.h"
 
 #include <fcntl.h>
 #include <stdint.h>
@@ -27,6 +28,9 @@ static int direct_fetch_valid(uint64_t address, size_t length) {
            address + length <= g_direct_last;
 }
 
+// What core/target/*.c binds; the translator itself never names the ledger.
+static const hl_guest_memory_ops g_ledger_ops = {hl_logical_vma_resolve_exec, NULL, NULL, NULL, NULL};
+
 int main(void) {
     int descriptor = scratch_fd();
     HL_CHECK(descriptor >= 0);
@@ -46,6 +50,7 @@ int main(void) {
     g_direct_last = g_direct_first + 4 * 4096;
     g_direct_enabled = 1;
     hl_guest_fetch_set_direct_validator(direct_fetch_valid);
+    hl_guest_memory_bind(&g_ledger_ops);
     hl_logical_vma_global_reset_quiescent();
     HL_CHECK(hl_logical_vma_global_map_shared(guest, sizeof source, HL_LOGICAL_VMA_READ, descriptor, 4096, 16384) == 0);
 

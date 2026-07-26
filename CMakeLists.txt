@@ -105,6 +105,7 @@ set(CORE_SOURCES
 
 set(IR_SOURCES
   src/translator/arena.c src/translator/digest.c src/translator/guest_fetch.c
+  src/translator/guest_memory.c
   src/translator/identity.c src/translator/persist.c src/translator/reloc.c
   src/translator/window.c src/translator/guest/x86_64/decode.c
   src/translator/guest/x86_64/address.c
@@ -112,15 +113,7 @@ set(IR_SOURCES
   src/translator/host/aarch64/asm.c
   src/translator/guest/x86_64/cpuid.c src/translator/guest/x86_64/cmpxchg.c
   src/translator/guest/x86_64/legacy.c
-  src/translator/guest/x86_64/lower/alu.c
-  src/translator/guest/x86_64/lower/crypto.c
-  src/translator/guest/x86_64/lower/mov.c
-  src/translator/guest/x86_64/lower/repstr.c
-  src/translator/guest/x86_64/lower/shift.c
-  src/translator/guest/x86_64/lower/sse4x.c
-  src/translator/guest/x86_64/lower/trace.c
-  src/translator/guest/x86_64/lower/x87.c
-  src/translator/guest/x86_64/lower/x87_stack.c
+  src/translator/guest/x86_64/rep_runtime.c
   src/translator/guest/x86_64/rep.c
   src/translator/guest/x86_64/rotate.c
   src/translator/guest/x86_64/x87math.c
@@ -129,6 +122,24 @@ set(IR_SOURCES
   src/translator/guest/x86_64/signal.c
   src/translator/guest/x86_64/operand.c
   src/translator/guest/x86_64/flags.c)
+
+# guest/x86_64/lower/ emits ARM64 and calls emit.c's emitters, which only
+# core/target/x86_64.c's AArch64 arm defines. Compiled anywhere else these
+# objects are unresolvable, and a linker pulls archive members on demand, so
+# nothing said so until a link happened to reference one. Host-gated here and
+# again by the #error in lower/primitives.h.
+if(HL_HOST_ARCH STREQUAL "aarch64")
+  list(APPEND IR_SOURCES
+    src/translator/guest/x86_64/lower/alu.c
+    src/translator/guest/x86_64/lower/crypto.c
+    src/translator/guest/x86_64/lower/mov.c
+    src/translator/guest/x86_64/lower/repstr.c
+    src/translator/guest/x86_64/lower/shift.c
+    src/translator/guest/x86_64/lower/sse4x.c
+    src/translator/guest/x86_64/lower/trace.c
+    src/translator/guest/x86_64/lower/x87.c
+    src/translator/guest/x86_64/lower/x87_stack.c)
+endif()
 
 set(LINUX_ABI_SOURCES
   src/linux_abi/affinity.c src/linux_abi/container/key.c src/linux_abi/container/pidmap.c

@@ -1,6 +1,6 @@
 #include "guest_fetch.h"
 
-#include "../linux_abi/logical_vma.h"
+#include "guest_memory.h"
 
 #include <errno.h>
 #include <string.h>
@@ -27,7 +27,7 @@ int hl_guest_fetch_exec(uint64_t guest, void *destination, size_t length) {
         size_t chunk = remaining < page_left ? remaining : page_left;
         const void *host = NULL;
         size_t contiguous = 0;
-        int resolution = hl_logical_vma_resolve_exec(probe, chunk, &host, &contiguous);
+        int resolution = hl_guest_memory_resolve_exec(probe, chunk, &host, &contiguous);
         if (resolution < 0) return -1;
         int current = resolution > 0;
         if (!current && g_direct_validator != NULL && !g_direct_validator(probe, chunk)) {
@@ -48,7 +48,7 @@ int hl_guest_fetch_exec(uint64_t guest, void *destination, size_t length) {
         size_t chunk = length < page_left ? length : page_left;
         const void *host = NULL;
         size_t contiguous = 0;
-        int resolution = hl_logical_vma_resolve_exec(guest, chunk, &host, &contiguous);
+        int resolution = hl_guest_memory_resolve_exec(guest, chunk, &host, &contiguous);
         if (resolution < 0) return -1; /* snapshot changed only at STW */
         if (resolution == 0) host = (const void *)(uintptr_t)guest;
         if (resolution > 0 && contiguous < chunk) {
