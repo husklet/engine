@@ -219,7 +219,8 @@ static void *gtimer_loop(void *arg) {
         // SIGEV_NONE: pollable only (timer_gettime/_getoverrun) -- the bookkeeping above is enough.
         if (notify == 1) continue;
         if (signo >= 1 && signo <= 64) {
-            // carry SI_TIMER + sigev_value into the handler's siginfo (consumed on delivery)
+            // carry SI_TIMER + sigev_value into the handler's siginfo (consumed on delivery). The
+            // thread-directed path below has no per-signal queue, so it still reads these single slots.
             g_sigcode[signo] = HL_SI_TIMER;
             g_sigval[signo] = sv;
             // SIGEV_THREAD_ID(4): deliver to EXACTLY the addressed thread (Linux delivers a THREAD-directed
@@ -231,8 +232,15 @@ static void *gtimer_loop(void *arg) {
             // thread's tpending (which rt_sigtimedwait also scans) and wakes it. Fall back to the
             // process-directed path if the tid is unknown/dead so no expiry is silently lost.
             if (notify == 4 && target_tid > 0 && thread_target_signal(target_tid, signo)) continue;
-            __atomic_or_fetch(&g_pending, 1ull << signo, __ATOMIC_SEQ_CST);
-            sfd_deliver(signo); // wake signalfd/epoll (per-OFD mask)
+            // Queue ONE instance per timer id rather than OR-ing a bare pending bit: a bit cannot tell two
+            // distinct timers sharing a signo apart, so the second expiry used to be swallowed (and its
+            // sigval clobbered the first's) whenever the guest had not consumed the first yet -- a race the
+            // guest wins on a fast host and loses on a slow/coalescing one. Linux queues per timer, with
+            // repeat expirations of the SAME timer folded into timer_getoverrun (which is derived from the
+            // first_ns anchor above, independent of this queue).
+            if (sigq_tag_queued(signo, id + 1)) continue;
+            if (sigq_push(signo, id + 1, HL_SI_TIMER, sv, 0, 0, 0))
+                sfd_deliver(signo); // wake signalfd/epoll (per-OFD mask)
         }
     }
     return NULL;
@@ -887,6 +895,9 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         gtimer_disarm(id);
+        // Linux drops the timer's still-queued expiry signal at timer_delete. Ids are reused slots, so a
+        // stale entry would coalesce away the next timer's first expiry.
+        if (t->notify != 1) sigq_drop_tag(t->signo, id + 1);
         t->used = 0;
         pthread_mutex_unlock(&g_gtimer_lk);
         G_RET(c) = 0;
