@@ -285,6 +285,7 @@ static uint64_t call_return_pc(uint64_t pc) {
 
 // r/m operand: mem -> EA to x17, load value to x16 (returns 16); reg -> value reg.
 void emit_ea(struct insn *I, uint64_t next_rip);
+
 /*
  * Architectural continuation of the instruction currently being emitted.
  * Store helpers several layers below the decoder use this only when a
@@ -317,8 +318,7 @@ static void g_ldr_q_ea(int t, struct insn *I, uint64_t next) {
 
 static void g_ldr_d_ea(int t, struct insn *I, uint64_t next) {
     emit_ea(I, next);
-    if (emit_soft_memory_active())
-        emit_memory_guard(17, 8, next - (uint64_t)I->len, X86_SOFT_READ);
+    if (emit_soft_memory_active()) emit_memory_guard(17, 8, next - (uint64_t)I->len, X86_SOFT_READ);
     g_ldr_d(t, 17);
 }
 
@@ -1562,11 +1562,11 @@ static void emit_div64_fast(uint64_t next, uint64_t gpc, int idiv, int rmv) {
 }
 
 // UD1/UD2: explicitly-undefined opcodes that real software (e.g. Chrome feature probes, ruby's
-// unreachable/trap paths, libc CPU-feature probes) uses as deliberate traps. On x86 they raise #UD -> SIGILL; with a guest
-// handler that runs, otherwise the process dies with status 128+SIGILL = 132. Route through the dispatcher
-// so the guest handler receives it (or the default disposition terminates), instead of aborting translation.
-// This is distinct from report_unimpl's "engine aborted" path (status 70), which would mislabel a legitimate
-// guest fault as an unimplemented-opcode bug of ours.
+// unreachable/trap paths, libc CPU-feature probes) uses as deliberate traps. On x86 they raise #UD -> SIGILL; with a
+// guest handler that runs, otherwise the process dies with status 128+SIGILL = 132. Route through the dispatcher so the
+// guest handler receives it (or the default disposition terminates), instead of aborting translation. This is distinct
+// from report_unimpl's "engine aborted" path (status 70), which would mislabel a legitimate guest fault as an
+// unimplemented-opcode bug of ours.
 static void emit_sigill(uint64_t pc) {
     // Quiet by default: undefined instructions frequently sit on never-taken paths (compiler
     // trap/unreachable slots) that get
@@ -4604,6 +4604,10 @@ static void *translate_block(uint64_t gpc) {
                         if (emit_soft_memory_active()) emit_soft_store_commit(8);
                     } else
                         e_vmov8(vm, vd);
+                } else if (op == 0xF0 && I.repne && I.is_mem) { // F2 0F F0: lddqu xmm, m128
+                    // LDDQU has the same architectural result as an unaligned 128-bit load. Its
+                    // historical cache-line hint does not require distinct lowering on AArch64.
+                    g_ldr_q_ea(vd, &I, next);
                 } else if (op == 0x6F || op == 0x28 || (op == 0x10 && !I.rep && !I.repne)) { // load 128 -> xmm
                     if (I.is_mem) {
                         g_ldr_q_ea(vd, &I, next);
@@ -4749,9 +4753,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0x54 || op == 0x55 || op == 0x56 ||
                            op == 0x57) { // andps/andnps/orps/xorps (FP bitwise)
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     if (op == 0x54)
                         e_v3(0x4E201C00u, vd, vd, s); // and
                     else if (op == 0x55)
@@ -4762,9 +4764,7 @@ static void *translate_block(uint64_t gpc) {
                         e_v3(0x6E201C00u, vd, vd, s); // xor
                 } else if (op == 0xC6 && I.p66) {     // shufpd: 64-bit lanes (d[0]<-dst, d[1]<-src)
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     unsigned im = (unsigned)I.imm;
                     e_vmov(18, vd);
                     e_ins_d(17, 0, 18, im & 1);
@@ -4772,9 +4772,7 @@ static void *translate_block(uint64_t gpc) {
                     e_vmov(vd, 17);
                 } else if (op == 0xC6) { // shufps xmm,xmm/m,imm8 (lanes 0,1 from dst; 2,3 from src)
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     unsigned im = (unsigned)I.imm;
                     e_vmov(18, vd);
                     e_ins_s(17, 0, 18, im & 3);
@@ -4812,9 +4810,7 @@ static void *translate_block(uint64_t gpc) {
                     }
                 } else if (op == 0x70 && I.p66) { // pshufd xmm, xmm/m, imm8
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     unsigned im = (unsigned)I.imm & 0xff;
                     // AES-endgame perf: single-insn forms for the shuffles crypto/ghash loops actually use.
                     if (im == 0xE4) { // identity {0,1,2,3}
@@ -4835,9 +4831,7 @@ static void *translate_block(uint64_t gpc) {
                     }
                 } else if (op == 0x70 && (I.rep || I.repne)) { // pshufhw(F3=high) / pshuflw(F2=low): shuffle 4 words
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     unsigned im = (unsigned)I.imm;
                     int hi = I.rep; // F3 shuffles the HIGH 4 words, F2 the LOW 4
                     e_vmov(17, s);  // v17 = src (the un-shuffled half is preserved)
@@ -4851,15 +4845,11 @@ static void *translate_block(uint64_t gpc) {
                     e_vmov(vd, 17);
                 } else if (op == 0xEF) { // pxor
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     e_v3(0x6E201C00u, vd, vd, s);
                 } else if (op == 0xDB || op == 0xEB || op == 0xDF) { // pand / por / pandn
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     if (op == 0xDB)
                         e_v3(0x4E201C00u, vd, vd, s);
                     else if (op == 0xEB)
@@ -4868,23 +4858,17 @@ static void *translate_block(uint64_t gpc) {
                         e_v3(0x4E601C00u, vd, s, vd);                // pandn: vd = ~vd & s  -> BIC vd, s, vd
                 } else if (op == 0x74 || op == 0x75 || op == 0x76) { // pcmpeqb/w/d
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     uint32_t b = op == 0x74 ? 0x6E208C00u : op == 0x75 ? 0x6E608C00u : 0x6EA08C00u;
                     e_v3(b, vd, vd, s);
                 } else if (op == 0x64 || op == 0x65 || op == 0x66) { // pcmpgtb/w/d -> CMGT (signed)
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     uint32_t b = op == 0x64 ? 0x4E203400u : op == 0x65 ? 0x4E603400u : 0x4EA03400u;
                     e_v3(b, vd, vd, s);
                 } else if (op == 0xDE || op == 0xDA || op == 0xEE || op == 0xEA) { // pmaxub/pminub/pmaxsw/pminsw
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     uint32_t b = op == 0xDE   ? 0x6E206400u  // pmaxub -> UMAX  .16B (lane-wise, NOT UMAXP)
                                  : op == 0xDA ? 0x6E206C00u  // pminub -> UMIN  .16B (lane-wise, NOT UMINP)
                                  : op == 0xEE ? 0x4E606400u  // pmaxsw -> SMAX  .8H  (lane-wise, NOT SMAXP)
@@ -4892,9 +4876,7 @@ static void *translate_block(uint64_t gpc) {
                     e_v3(b, vd, vd, s);
                 } else if (op == 0xFC || op == 0xFD || op == 0xFE || op == 0xD4) { // paddb/w/d/q
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     uint32_t b = op == 0xFC   ? 0x4E208400u
                                  : op == 0xFD ? 0x4E608400u
                                  : op == 0xFE ? 0x4EA08400u
@@ -4902,9 +4884,7 @@ static void *translate_block(uint64_t gpc) {
                     e_v3(b, vd, vd, s);
                 } else if (op == 0xF8 || op == 0xF9 || op == 0xFA || op == 0xFB) { // psubb/w/d/q
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     uint32_t b = op == 0xF8   ? 0x6E208400u
                                  : op == 0xF9 ? 0x6E608400u
                                  : op == 0xFA ? 0x6EA08400u
@@ -4913,9 +4893,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0xDC || op == 0xDD || op == 0xEC || op == 0xED || op == 0xD8 || op == 0xD9 ||
                            op == 0xE8 || op == 0xE9) { // saturating add/sub: paddus/padds/psubus/psubs b/w
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     uint32_t b = op == 0xDC   ? 0x6E200C00u  // paddusb -> UQADD .16b
                                  : op == 0xDD ? 0x6E600C00u  // paddusw -> UQADD .8h
                                  : op == 0xEC ? 0x4E200C00u  // paddsb  -> SQADD .16b
@@ -4927,21 +4905,15 @@ static void *translate_block(uint64_t gpc) {
                     e_v3(b, vd, vd, s);
                 } else if (op == 0xE0 || op == 0xE3) { // pavgb/pavgw: unsigned rounding average -> URHADD
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     e_v3(op == 0xE0 ? 0x6E201400u : 0x6E601400u, vd, vd, s); // .16b : .8h
                 } else if (op == 0xD5) { // pmullw: packed signed 16x16 -> low 16 bits -> MUL .8h
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     e_v3(0x4E609C00u, vd, vd, s);
                 } else if (op == 0xE5 || op == 0xE4) { // pmulhw(signed)/pmulhuw(unsigned): 16x16 -> high 16 bits
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     // widen-multiply the low/high 4 lanes to 32-bit products, then UZP2 picks the high 16 of each.
                     uint32_t lo = op == 0xE5 ? 0x0E60C000u : 0x2E60C000u; // SMULL/UMULL  v18.4s, vd.4h, s.4h
                     uint32_t hi = op == 0xE5 ? 0x4E60C000u : 0x6E60C000u; // SMULL2/UMULL2 v19.4s, vd.8h, s.8h
@@ -4950,18 +4922,14 @@ static void *translate_block(uint64_t gpc) {
                     emit32(0x4E405800u | (19 << 16) | (18 << 5) | vd); // uzp2 vd.8h, v18.8h, v19.8h
                 } else if (op == 0xF5) { // pmaddwd: signed 16x16, add adjacent pairs -> 32-bit lanes
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     emit32(0x0E60C000u | (s << 16) | (vd << 5) | 18);  // smull  v18.4s, vd.4h, s.4h
                     emit32(0x4E60C000u | (s << 16) | (vd << 5) | 19);  // smull2 v19.4s, vd.8h, s.8h
                     emit32(0x4EA0BC00u | (19 << 16) | (18 << 5) | vd); // addp  vd.4s, v18.4s, v19.4s
                 } else if (op == 0xF1 || op == 0xF2 || op == 0xF3 || op == 0xD1 || op == 0xD2 || op == 0xD3 ||
                            op == 0xE1 || op == 0xE2) { // psll/psrl/psra w/d/q by xmm/m (variable count)
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     int left = (op == 0xF1 || op == 0xF2 || op == 0xF3);
                     int arith = (op == 0xE1 || op == 0xE2);
                     int esize = (op == 0xF1 || op == 0xD1 || op == 0xE1)   ? 16
@@ -4970,9 +4938,7 @@ static void *translate_block(uint64_t gpc) {
                     e_sse_var_shift(vd, vd, s, esize, left, arith);
                 } else if (op == 0x14 || op == 0x15) { // unpckl/hp{s,d}: interleave float lanes -> ZIP1/ZIP2
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     int hi = (op == 0x15);  // unpckh* -> ZIP2
                     int sz = I.p66 ? 3 : 2; // 66=pd (64-bit lanes, .2d); none=ps (32-bit lanes, .4s)
                     uint32_t b = (hi ? 0x4E007800u : 0x4E003800u) | ((uint32_t)sz << 22);
@@ -5017,9 +4983,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0x60 || op == 0x61 || op == 0x62 || op == 0x6C || op == 0x68 || op == 0x69 ||
                            op == 0x6A || op == 0x6D) { // punpck l/h bw/wd/dq/qdq -> ZIP1/ZIP2
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     int hi = (op == 0x68 || op == 0x69 || op == 0x6A || op == 0x6D); // punpckh*; 0x6C(lqdq) is LOW
                     int sz = (op == 0x60 || op == 0x68)   ? 0
                              : (op == 0x61 || op == 0x69) ? 1
@@ -5031,9 +4995,7 @@ static void *translate_block(uint64_t gpc) {
                     // pack with saturation: 0x67 PACKUSWB (16->u8), 0x63 PACKSSWB (16->s8),
                     // 0x6B PACKSSDW (32->s16). dst.low half from dst's lanes, dst.high half from src's.
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     uint32_t sz = (op == 0x6B) ? 1u : 0u;     // source element: 0x6B = 16-bit, else 8-bit dest
                     uint32_t lo = (op == 0x67) ? 0x2E212800u  // SQXTUN  (signed->unsigned narrow)
                                                : 0x0E214800u; // SQXTN   (signed->signed narrow)
@@ -5074,8 +5036,7 @@ static void *translate_block(uint64_t gpc) {
                     int src;
                     if (I.is_mem) {
                         emit_ea(&I, next);
-                        if (emit_soft_memory_active())
-                            emit_memory_guard(17, I.rexW ? 8u : 4u, gpc, X86_SOFT_READ);
+                        if (emit_soft_memory_active()) emit_memory_guard(17, I.rexW ? 8u : 4u, gpc, X86_SOFT_READ);
                         e_load(I.rexW ? 8 : 4, 16, 17);
                         src = 16;
                     } else
@@ -5092,8 +5053,7 @@ static void *translate_block(uint64_t gpc) {
                     int s = vm;
                     if (I.is_mem) {
                         emit_ea(&I, next);
-                        if (emit_soft_memory_active())
-                            emit_memory_guard(17, I.repne ? 8u : 4u, gpc, X86_SOFT_READ);
+                        if (emit_soft_memory_active()) emit_memory_guard(17, I.repne ? 8u : 4u, gpc, X86_SOFT_READ);
                         if (I.repne)
                             g_ldr_d(16, 17);
                         else
@@ -5148,8 +5108,7 @@ static void *translate_block(uint64_t gpc) {
                             g_ldr_q_ea(16, &I, next);
                         } else {
                             emit_ea(&I, next);
-                            if (emit_soft_memory_active())
-                                emit_memory_guard(17, I.repne ? 8u : 4u, gpc, X86_SOFT_READ);
+                            if (emit_soft_memory_active()) emit_memory_guard(17, I.repne ? 8u : 4u, gpc, X86_SOFT_READ);
                             if (I.repne)
                                 g_ldr_d(16, 17);
                             else
@@ -5186,8 +5145,7 @@ static void *translate_block(uint64_t gpc) {
                             g_ldr_q_ea(16, &I, next);
                         } else {
                             emit_ea(&I, next);
-                            if (emit_soft_memory_active())
-                                emit_memory_guard(17, I.repne ? 8u : 4u, gpc, X86_SOFT_READ);
+                            if (emit_soft_memory_active()) emit_memory_guard(17, I.repne ? 8u : 4u, gpc, X86_SOFT_READ);
                             if (I.repne)
                                 g_ldr_d(16, 17);
                             else
@@ -5320,8 +5278,7 @@ static void *translate_block(uint64_t gpc) {
                     if (I.is_mem) {
                         emit_ea(&I, next);
                         if (emit_soft_memory_active())
-                            emit_memory_guard(17, I.rep ? 4u : (packed && I.p66) ? 16u : 8u, gpc,
-                                              X86_SOFT_READ);
+                            emit_memory_guard(17, I.rep ? 4u : (packed && I.p66) ? 16u : 8u, gpc, X86_SOFT_READ);
                         if (I.rep)
                             g_ldr_s(16, 17); // cvtss2sd: m32
                         else if (packed && I.p66)
@@ -5349,8 +5306,7 @@ static void *translate_block(uint64_t gpc) {
                     int src;
                     if (I.is_mem) {
                         emit_ea(&I, next);
-                        if (emit_soft_memory_active())
-                            emit_memory_guard(17, 2, gpc, X86_SOFT_READ);
+                        if (emit_soft_memory_active()) emit_memory_guard(17, 2, gpc, X86_SOFT_READ);
                         e_load(2, 16, 17); // w16 = [addr] (16-bit)
                         src = 16;
                     } else {
@@ -5370,8 +5326,7 @@ static void *translate_block(uint64_t gpc) {
                             g_ldr_q_ea(16, &I, next);
                         } else {
                             emit_ea(&I, next);
-                            if (emit_soft_memory_active())
-                                emit_memory_guard(17, I.repne ? 8u : 4u, gpc, X86_SOFT_READ);
+                            if (emit_soft_memory_active()) emit_memory_guard(17, I.repne ? 8u : 4u, gpc, X86_SOFT_READ);
                             if (I.repne)
                                 g_ldr_d(16, 17);
                             else
@@ -5420,8 +5375,7 @@ static void *translate_block(uint64_t gpc) {
                     int s = vm;
                     if (I.is_mem) {
                         emit_ea(&I, next);
-                        if (emit_soft_memory_active())
-                            emit_memory_guard(17, I.p66 ? 8u : 4u, gpc, X86_SOFT_READ);
+                        if (emit_soft_memory_active()) emit_memory_guard(17, I.p66 ? 8u : 4u, gpc, X86_SOFT_READ);
                         if (I.p66)
                             g_ldr_d(16, 17);
                         else
@@ -5440,9 +5394,7 @@ static void *translate_block(uint64_t gpc) {
                     // Gather the even (0,2) 32-bit lanes of each operand into the low 2 lanes (UZP1),
                     // then widening multiply -> two 64-bit products. Bit-exact, 3 NEON insns.
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     emit32(0x4E801800u | (vd << 16) | (vd << 5) | 17); // uzp1 v17.4s, vd.4s, vd.4s -> [d0,d2,..]
                     emit32(0x4E801800u | (s << 16) | (s << 5) | 18);   // uzp1 v18.4s, s.4s,  s.4s  -> [s0,s2,..]
                     emit32(0x2EA0C000u | (18 << 16) | (17 << 5) | vd); // umull vd.2d, v17.2s, v18.2s
@@ -5497,9 +5449,7 @@ static void *translate_block(uint64_t gpc) {
                     }
                 } else if (op == 0xF6) { // psadbw (66): sum of abs byte diffs per 64-bit half
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) {
-                        g_ldr_q_ea(16, &I, next);
-                    }
+                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
                     emit32(0x6E207400u | (s << 16) | (vd << 5) | 17); // uabd   v17.16b, vd.16b, s.16b
                     emit32(0x6E202800u | (17 << 5) | 17);             // uaddlp v17.8h,  v17.16b
                     emit32(0x6E602800u | (17 << 5) | 17);             // uaddlp v17.4s,  v17.8h
