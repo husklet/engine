@@ -361,13 +361,17 @@ endif()
 # ===========================================================================
 # 11. the compat suites as CTest cases
 # ===========================================================================
-# Linux host: BRIDGE=env + the native linux-production engines.
-# macOS host: BRIDGE=mac + the build/production engines (Phase 4).
+# The bridge is always `env`: the runner launches the engine on the host it is
+# running on. `mac` is OrbStack's Linux->macOS FORWARDER and is meaningful only
+# when a Linux host drives the mac, which is what tools/run_remote_macos_ctest.sh
+# does -- and that configures CMake ON the mac, so it is `env` there too.
+# Makefile: MAC ?= $(if $(filter Darwin,$(shell uname -s)),env,mac).
+# Only the engine directory differs: Phase 4 builds build/production on Darwin,
+# Phase 2 builds build/linux-production on Linux.
+set(HL_MATRIX_BRIDGE env)
 if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
-  set(HL_MATRIX_BRIDGE mac)
   set(HL_MATRIX_ENGINE_DIR ${CMAKE_BINARY_DIR}/production)
 else()
-  set(HL_MATRIX_BRIDGE env)
   set(HL_MATRIX_ENGINE_DIR ${CMAKE_BINARY_DIR}/linux-production)
 endif()
 set(HL_ENGINE_AARCH64 ${HL_MATRIX_ENGINE_DIR}/hl-engine-linux-aarch64)

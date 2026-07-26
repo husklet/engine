@@ -85,15 +85,21 @@ if(NOT HL_HAVE_GUEST_CC)
   return()
 endif()
 
-# Dynamic loader/libc paths, mirroring the Makefile defaults (lines 76-79).
-set(HL_AARCH64_DYNAMIC_LOADER "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1"
-    CACHE STRING "aarch64 guest dynamic loader")
-set(HL_AARCH64_DYNAMIC_LIBC "/usr/lib/aarch64-linux-gnu/libc.so.6"
-    CACHE STRING "aarch64 guest libc")
-set(HL_X86_64_DYNAMIC_LOADER "/usr/x86_64-linux-gnu/lib/ld-linux-x86-64.so.2"
-    CACHE STRING "x86_64 guest dynamic loader")
-set(HL_X86_64_DYNAMIC_LIBC "/usr/x86_64-linux-gnu/lib/libc.so.6"
-    CACHE STRING "x86_64 guest libc")
+# Dynamic loader/libc paths. The nix devShell EXPORTS all four; the Makefile
+# picks them up because it declares them with `?=` (lines 76-79). Do the same,
+# or the rootfs-staging cases (e.g. compat/process nonpie-dladdr) get baked
+# /usr/... paths that exist on no host in this project.
+function(hl_dyn name fallback)
+  set(_v "${fallback}")
+  if(NOT "$ENV{${name}}" STREQUAL "")
+    set(_v "$ENV{${name}}")
+  endif()
+  set(HL_${name} "${_v}" CACHE STRING "guest ${name}")
+endfunction()
+hl_dyn(AARCH64_DYNAMIC_LOADER /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1)
+hl_dyn(AARCH64_DYNAMIC_LIBC   /usr/lib/aarch64-linux-gnu/libc.so.6)
+hl_dyn(X86_64_DYNAMIC_LOADER  /usr/x86_64-linux-gnu/lib/ld-linux-x86-64.so.2)
+hl_dyn(X86_64_DYNAMIC_LIBC    /usr/x86_64-linux-gnu/lib/libc.so.6)
 # In-guest loader path (the rootfs view), distinct from the host path above.
 set(HL_GUEST_LOADER_aarch64 /lib/ld-linux-aarch64.so.1)
 set(HL_GUEST_LOADER_x86_64  /lib64/ld-linux-x86-64.so.2)
