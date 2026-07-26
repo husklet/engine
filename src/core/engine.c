@@ -367,7 +367,11 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
                 return HL_STATUS_INVALID_ARGUMENT;
     }
     if (has_checkpoint_directories && (box->checkpoint_directory != NULL || box->restore_directory != NULL)) {
-        number[0] = (char)('0' + (has_checkpoint_policy ? box->checkpoint_policy : 0));
+        /* The one place the box's policy word acquires meaning. A box ABI without the field was compiled
+         * against headers where 0 meant refuse and observed exactly that, so give it refuse; only the
+         * current ABI's 0 means "no policy requested" and selects the permissive restore default. */
+        uint32_t policy = has_checkpoint_policy ? box->checkpoint_policy : HL_CONFIG_CHECKPOINT_REFUSE;
+        number[0] = (char)('0' + policy);
         number[1] = 0;
         if (hl_options_set(&engine->options, "HL_CHECKPOINT_POLICY", number, 1) != HL_STATUS_OK)
             return HL_STATUS_OUT_OF_MEMORY;
