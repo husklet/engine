@@ -448,6 +448,7 @@ static void fd_reset_emul(int fd) {
         g_sock_conn[fd] = 0;
         g_sock_connecting[fd] = 0;
         g_sock_host_backed[fd] = 0;
+        g_sock_native_peer[fd] = 0;
         g_sock_fam[fd] = 0;
         g_sock_dgram[fd] = 0;
         udp_ref_drop(fd);

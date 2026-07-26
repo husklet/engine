@@ -945,7 +945,7 @@ static void cmsg_note_recv_sock_fd(int fd);
 // guest(Linux) control buf -> host(macOS) control buf. Returns host bytes written (<=cap), 0/none,
 // or -1 with *errp set. A partial ancillary conversion must never be sent: silently dropping SCM_RIGHTS
 // fds leaves higher-level protocols with a successful data message but missing handles.
-static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, int *errp) {
+static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, int engine_metadata, int *errp) {
     if (errp) *errp = 0;
     cmsg_tmpfds_close();
     cmsg_seq_finish(0);
@@ -979,7 +979,7 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
             struct hl_cmsg_kqueue_meta kqueue_metadata[253];
             memset(kqueue_metadata, 0, sizeof kqueue_metadata);
             for (int i = 0; i < nfds; i++) {
-                if (kqueue_scm_export(fds[i], &kqueue_metadata[i]) > 0) {
+                if (engine_metadata && kqueue_scm_export(fds[i], &kqueue_metadata[i]) > 0) {
                     int placeholder = cmsg_kqueue_placeholder();
                     if (placeholder < 0) {
                         free(combo);
@@ -1004,7 +1004,8 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                 }
                 combo[combo_n++] = native;
                 (void)ofd_identity_ensure(fds[i]);
-                if (fds[i] >= 0 && fds[i] < HL_NFD && g_seq_ref[fds[i]] && g_cmsg_nseq < 253) {
+                if (engine_metadata && fds[i] >= 0 && fds[i] < HL_NFD && g_seq_ref[fds[i]] &&
+                    g_cmsg_nseq < 253) {
                     uint32_t slot = g_seq_ref[fds[i]] - 1;
                     uint32_t end = g_seq_end[fds[i]];
                     __atomic_add_fetch(&g_seq_refs[slot].refs[end], 1, __ATOMIC_ACQ_REL);
@@ -1013,6 +1014,7 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                     g_cmsg_seq_end[g_cmsg_nseq++] = (uint8_t)end;
                 }
             }
+            if (!engine_metadata) goto cmsg_visible_only;
             for (int i = 0; i < nfds; i++) {
                 int fd = fds[i];
                 if (fd >= 0 && fd < HL_NFD && g_seq_ref[fd]) {
@@ -1223,6 +1225,7 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                 }
                 combo[combo_n++] = marker;
             }
+cmsg_visible_only:
             dlen = (size_t)combo_n * sizeof(int);
         }
         size_t need = CMSG_SPACE(dlen);
@@ -1426,6 +1429,9 @@ static uint8_t g_sock_stream[HL_NFD];
 // getpeername must query the rehydrated host INET socket instead of mistaking the local virtual address
 // for its peer. Carried across dup and cleared when the descriptor is reused.
 static uint8_t g_sock_host_backed[HL_NFD];
+// Connected to an exact host-projected AF_UNIX socket. Native peers do not understand engine-private
+// SCM_RIGHTS trailer descriptors; sending one would poison the peer's descriptor queue.
+static uint8_t g_sock_native_peer[HL_NFD];
 // fd -> 1 once a stream connect() SUCCEEDED on it. Linux keeps a connected stream socket in SS_CONNECTED
 // (a second connect -> EISCONN) until close, even after the peer sends FIN; macOS drops the peer
 // association after FIN so getpeername() there returns ENOTCONN. This sticky flag lets connect(203) report
@@ -2064,6 +2070,7 @@ static void fd_carry_sock(int dst, int src) {
     g_sock_conn[dst] = g_sock_conn[src];
     g_sock_connecting[dst] = g_sock_connecting[src];
     g_sock_host_backed[dst] = g_sock_host_backed[src];
+    g_sock_native_peer[dst] = g_sock_native_peer[src];
     g_so_error[dst] = g_so_error[src];
     g_so_reuseport[dst] = g_so_reuseport[src];
     memcpy(g_tcp_optval[dst], g_tcp_optval[src], sizeof g_tcp_optval[dst]);

@@ -1415,6 +1415,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if ((r == 0 || errno == EINPROGRESS) && (int)a0 >= 0 && (int)a0 < HL_NFD) {
                 g_sock_conn[(int)a0] = r == 0;
                 g_sock_connecting[(int)a0] = r < 0;
+                g_sock_native_peer[(int)a0] = (uint8_t)jail_is_projected_socket(gp);
             }
             break;
         }
@@ -2429,7 +2430,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // passed fd (and any other) is a coherent host file on the receiving side.
             if (gc && gcl) memf_materialize_all();
             int cerr = 0;
-            ssize_t hn = (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, hcap, &cerr) : 0;
+            int engine_metadata =
+                (int)a0 < 0 || (int)a0 >= HL_NFD || !g_sock_native_peer[(int)a0];
+            ssize_t hn =
+                (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, hcap, engine_metadata, &cerr) : 0;
             if (hn < 0) {
                 cmsg_tmpfds_close();
                 cmsg_seq_finish(0);
@@ -2745,7 +2749,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             }
             if (nr == 269) { // sendmmsg: translate guest -> host
                 int cerr = 0;
-                ssize_t hn = (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, hcap, &cerr) : 0;
+                int engine_metadata =
+                    (int)a0 < 0 || (int)a0 >= HL_NFD || !g_sock_native_peer[(int)a0];
+                ssize_t hn =
+                    (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, hcap, engine_metadata, &cerr) : 0;
                 if (hn < 0) {
                     cmsg_tmpfds_close();
                     cmsg_seq_finish(0);

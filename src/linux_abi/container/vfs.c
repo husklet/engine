@@ -1678,6 +1678,17 @@ static int jail_match(const char *abs) {
     return best;
 }
 
+// Whether `abs` is an exact single-socket bind mount supplied by the host. Connections to these endpoints
+// leave the engine process (Wayland, Docker, provider services, ...), so their SCM_RIGHTS records must contain
+// only the descriptors requested by the public protocol. Engine-private descriptor metadata trailers are
+// meaningful only when another engine endpoint receives and removes them.
+static int jail_is_projected_socket(const char *abs) {
+    int index = jail_match(abs);
+    if (index < 0 || !g_vols[index].isfile || strcmp(abs, g_vols[index].guest) != 0) return 0;
+    struct stat status;
+    return stat(g_vols[index].hcanon, &status) == 0 && S_ISSOCK(status.st_mode);
+}
+
 // Basename of a file bind-mount's host source: the leaf to openat under the pinned parent-dir `fd`.
 static const char *vol_fbase(int vi) {
     const char *sl = strrchr(g_vols[vi].hcanon, '/');
