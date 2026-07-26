@@ -201,33 +201,33 @@ jobs:
         timeout-minutes: 25
         run: tools/ci_run.sh 1320 "Test Rust crate against the committed archive" -- nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml --test packaged_archive
 
-  # Runtime compatibility suites, split across parallel runners so wall-clock is the
-  # slowest bucket (~20-25min) instead of the ~70min sequential `make e2e-compat`.
-  # Each bucket builds compat-engines (a prereq of every compat-* target) then its suites.
+  # Runtime compatibility suites. TWO buckets, not five: a capacity decision,
+  # not a speed one. This lane is admission-bound, not compute-bound. Measured
+  # on runs 30077011935 and 30163475795, a shard spends ~2.5min on nix install
+  # plus cache restore and 0.7-4.3min on suites, yet each job waited 7-10min
+  # for a macos-26 runner, and the backlog reached 23 pending runs -- the
+  # oldest 2h05m without starting, a release tag behind it. Six jobs per push
+  # is what the queue cannot serve, so halve it: the slowest bucket grows to
+  # ~8.4min of suite time, far less than the queue delay removed, and the
+  # fixed ~2.5min is paid twice instead of five times.
+  #
+  # Coverage is untouched: the goal lists below are the same 21 goals the five
+  # buckets named, redistributed, balanced on measured per-suite wall clock
+  # (328s vs 326s of 654s, Apple silicon). I13 fails if one is dropped or
+  # duplicated.
   mac-compat:
     name: compat / ${{ matrix.name }}
     runs-on: macos-26
-    timeout-minutes: 50
+    timeout-minutes: 95
     strategy:
       fail-fast: false
       # `name` is what shows up in the checks list; `targets` is the make goal list.
-      # Previously the raw goal list WAS the job name, producing entries like
-      # "mac-compat (compat-abi compat-core compat-isa-x86-64 compat-completeness)".
       matrix:
         include:
-          - name: abi-corpus
-            targets: compat-abi-corpus
-          # compat-isa-aarch64 belongs here: the sharded buckets must cover
-          # every compat suite `make e2e-compat` runs, and it was the one
-          # omission -- the aarch64 ISA corpus went unrun on every push.
-          - name: core
-            targets: compat-abi compat-core compat-isa-x86-64 compat-isa-aarch64 compat-completeness
-          - name: net-ipc
-            targets: compat-network compat-ipc compat-syscall compat-syscall-edges compat-libc
-          - name: fs-proc
-            targets: compat-filesystem compat-threads compat-memory compat-process compat-procfs
-          - name: posix-signals
-            targets: compat-isolation compat-posix compat-signals compat-soak compat-time
+          - name: abi-isa-ipc
+            targets: compat-abi-corpus compat-abi compat-core compat-isa-x86-64 compat-isa-aarch64 compat-completeness compat-network compat-ipc compat-syscall compat-syscall-edges compat-libc
+          - name: fs-mem-posix
+            targets: compat-filesystem compat-threads compat-memory compat-process compat-procfs compat-isolation compat-posix compat-signals compat-soak compat-time
     steps:
       - uses: actions/checkout@v5
       - uses: DeterminateSystems/nix-installer-action@v22
@@ -248,17 +248,10 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Compat suites
-        timeout-minutes: 45
+        timeout-minutes: 90
         shell: bash
         run: |
           set -o pipefail
-          # The compat cases run under `-j ncpu`; a few load-sensitive stress gates (e.g. the IPC
-          # pump-primary-channel epoll->kqueue bring-up gate: 12000 jittered rounds + a liveness
-          # watchdog) can exceed their timing bound on a heavily-contended macos-26 runner even though
-          # they pass deterministically on a real host. Retry ONCE on failure so transient runner
-          # contention self-heals; a genuine/consistent break still fails both attempts. The first-try
-          # failure is surfaced as a ::warning (never silently swallowed) so a real intermittent bug
-          # stays visible for follow-up even when the retry greens the job.
           # Portable bound: macOS runners ship no GNU `timeout` (and no gtimeout), so this replaces it.
           # Output goes to a FILE, never a pipe. The compat suite deliberately leaves processes alive
           # (pc-forkoutlive has a child outlive its parent; the fork-server/supervisor are long-lived) and
@@ -277,64 +270,82 @@ jobs:
             done
             wait "$pid"
           }
-          # One make invocation PER SUITE -- see the note in linux.yml. `make -j N goal1 goal2` runs
-          # the goals' recipes concurrently, so a bucket's suites competed with each other; the
-          # symptom is a case timing out after the runner's full 120s per-case budget with ZERO
-          # bytes of output. Building stays parallel; suites run one at a time.
-          # Bound the STEP, not just one suite: five suites plus the retry can
-          # outlast the 45min step timeout, and a step GitHub kills emits no
+          # Bound the STEP, not just one suite: eleven suites plus retries can
+          # outlast the 90min step timeout, and a step GitHub kills emits no
           # ::error, so the failure lands with no diagnostic tail. Stop 60s short
-          # of the deadline so the reporting tail below always runs.
-          deadline=$((SECONDS + 2580))
+          # of the deadline so the reporting tail below always runs. Raising the
+          # step timeout above must raise this with it -- I18 enforces that.
+          deadline=$((SECONDS + 5280))
           budget() {
             local left=$((deadline - SECONDS - 60))
             if [ "$left" -gt 0 ]; then echo "$left"; else echo 0; fi
           }
-          run_bucket() {
-            local st=0 suite_st=0 cap=0 t=
-            : > "$1"
-            for t in ${{ matrix.targets }}; do
-              suite_st=0
-              cap=$(budget)
-              if [ "$cap" -le 0 ]; then st=124; break; fi
-              if [ "$cap" -gt 2400 ]; then cap=2400; fi
-              run_bounded "$cap" "$1.part" \
-                nix develop --command sh -c "make -sk -j\"\$(sysctl -n hw.ncpu)\" CC=\"\$NATIVE_CC\" $t" || suite_st=$?
-              cat "$1.part" >> "$1"
-              if [ "$suite_st" -ne 0 ]; then
-                # Preserve timeout as the most informative aggregate status,
-                # but continue so one broken suite cannot hide its siblings.
-                if [ "$suite_st" -eq 124 ]; then
-                  st=124
-                elif [ "$st" -eq 0 ]; then
-                  st="$suite_st"
-                fi
-              fi
-            done
-            tail -c 200000 "$1" >> "$GITHUB_STEP_SUMMARY" || true
-            tail -n 60 "$1"
+          # One make invocation PER SUITE -- see the note in linux.yml. `make -j N goal1 goal2` runs
+          # the goals' recipes concurrently, so a bucket's suites competed with each other; the
+          # symptom is a case timing out after the runner's full 120s per-case budget with ZERO
+          # bytes of output. Building stays parallel; suites run one at a time.
+          run_suite() {
+            local st=0 cap=
+            cap=$(budget)
+            if [ "$cap" -gt 2400 ]; then cap=2400; fi
+            run_bounded "$cap" "$2" \
+              nix develop --command sh -c "make -sk -j\"\$(sysctl -n hw.ncpu)\" CC=\"\$NATIVE_CC\" $1" || st=$?
             return $st
           }
+          annotate() {
+            local text=
+            text=$(tail -c 1500 "$3")
+            text=${text//'%'/'%25'}; text=${text//$'\n'/'%0A'}; text=${text//$'\r'/'%0D'}
+            echo "::$1 title=$2::$text"
+          }
+          # A few load-sensitive stress gates (e.g. the IPC pump-primary-channel epoll->kqueue
+          # bring-up gate: 12000 jittered rounds + a liveness watchdog) can exceed their timing
+          # bound on a heavily-contended macos-26 runner even though they pass deterministically
+          # on a real host. Retry ONCE so that self-heals; a genuine break fails both attempts and
+          # the first failure is surfaced as a ::warning, never silently swallowed. The retry is
+          # PER SUITE, not per bucket: with eleven suites in a bucket, re-running ten that passed
+          # to recheck one would spend the whole step deadline.
           status=0
-          verdict='step budget exhausted before a retry'
-          run_bucket runtime.log || status=$?
-          # Retry only with enough budget left to finish and still report.
-          if [ "$status" -ne 0 ] && [ "$(budget)" -ge 600 ]; then
-            verdict='both attempts'
-            warn=$(tail -c 1200 runtime.log); warn=${warn//'%'/'%25'}; warn=${warn//$'\n'/'%0A'}; warn=${warn//$'\r'/'%0D'}
-            echo "::warning title=macOS compat (${{ matrix.name }}) failed attempt 1 — retrying::$warn"
-            status=0
-            run_bucket runtime.log || status=$?
-          fi
+          failed=
+          exhausted=
+          : > runtime.log
+          for t in ${{ matrix.targets }}; do
+            if [ "$(budget)" -le 0 ]; then
+              exhausted="$exhausted $t"
+              status=124
+              continue
+            fi
+            st=0
+            run_suite "$t" part.log || st=$?
+            if [ "$st" -ne 0 ] && [ "$(budget)" -ge 600 ]; then
+              annotate warning "macOS compat ($t) failed attempt 1 — retrying" part.log
+              cat part.log >> runtime.log
+              st=0
+              run_suite "$t" part.log || st=$?
+            fi
+            cat part.log >> runtime.log
+            # Continue past a failure so one broken suite cannot hide its
+            # siblings, but keep a timeout as the aggregate status: it is the
+            # more informative verdict.
+            if [ "$st" -ne 0 ]; then
+              failed="$failed $t"
+              if [ "$st" -eq 124 ]; then status=124; elif [ "$status" -eq 0 ]; then status="$st"; fi
+            fi
+          done
+          tail -c 200000 runtime.log >> "$GITHUB_STEP_SUMMARY" || true
+          tail -n 60 runtime.log
           if [ "$status" -ne 0 ]; then
-            message=$(tail -c 1500 runtime.log)
-            message=${message//'%'/'%25'}
-            message=${message//$'\n'/'%0A'}
-            message=${message//$'\r'/'%0D'}
+            verdict=
+            if [ -n "$failed" ]; then
+              verdict="both attempts of:$failed"
+            fi
+            if [ -n "$exhausted" ]; then
+              verdict="${verdict:+$verdict; }step budget exhausted before:$exhausted"
+            fi
             if [ "$status" -eq 124 ]; then
-              echo "::error title=macOS compat (${{ matrix.name }}) TIMED OUT ($verdict)::$message"
+              annotate error "macOS compat (${{ matrix.name }}) TIMED OUT ($verdict)" runtime.log
             else
-              echo "::error title=macOS compat (${{ matrix.name }}) failed ($verdict)::$message"
+              annotate error "macOS compat (${{ matrix.name }}) failed ($verdict)" runtime.log
             fi
             exit 1
           fi
