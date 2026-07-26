@@ -5,6 +5,7 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{mpsc, Mutex, OnceLock},
+    time::Duration,
 };
 
 fn rootfs() -> &'static PathBuf {
@@ -121,6 +122,65 @@ fn terminal_is_controlling_merged_resizable_and_reaped() {
         files,
         "terminal launch leaked a host descriptor"
     );
+}
+
+#[test]
+fn interactive_terminal_echoes_before_newline() {
+    let _terminal_lock = terminal_lock();
+    let mut child = Engine::new()
+        .command(Guest::Aarch64, "/bin/sh")
+        .config(Config::new().root(rootfs()).env("TERM", "xterm"))
+        .args([
+            "-c",
+            "stty -icanon -echo min 1 time 0; printf 'READY# '; byte=$(dd bs=1 count=1 2>/dev/null); read -t 0 pending || printf '%s' \"$byte\"",
+        ])
+        .terminal(Size::new(24, 80).unwrap())
+        .spawn()
+        .unwrap();
+    let mut terminal = child.take_terminal().unwrap();
+    let mut reader = terminal.try_clone().unwrap();
+    let (output, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 512];
+        while let Ok(count) = reader.read(&mut buffer) {
+            if count == 0 || output.send(buffer[..count].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut prompt = Vec::new();
+    while !prompt.contains(&b'#') {
+        prompt.extend(
+            received
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("interactive shell did not produce a prompt"),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&prompt).contains('#'),
+        "interactive shell did not produce a prompt: {}",
+        String::from_utf8_lossy(&prompt)
+    );
+
+    terminal.write_all(b"x").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let mut echo = Vec::new();
+    while !echo.contains(&b'x') {
+        echo.extend(
+            received
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .expect("interactive terminal buffered a typed byte until newline"),
+        );
+    }
+    assert!(
+        echo.contains(&b'x'),
+        "interactive terminal returned output without the typed byte: {:?}",
+        String::from_utf8_lossy(&echo)
+    );
+
+    assert_eq!(child.wait().unwrap(), Exit::Code(0));
 }
 
 #[test]

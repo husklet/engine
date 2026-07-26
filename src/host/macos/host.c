@@ -1750,7 +1750,6 @@ static hl_host_result hl_macos_stream_close(void *context, hl_host_handle stream
 static hl_host_result hl_macos_stream_readiness(void *context, hl_host_handle stream, uint32_t interests) {
     int descriptor;
     struct pollfd probe;
-    if (!hl_macos_stream_handle(context, stream)) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     descriptor = hl_macos_file_descriptor(context, stream, 0);
     if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     probe = (struct pollfd){descriptor, 0, 0};
