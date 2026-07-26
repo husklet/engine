@@ -313,12 +313,15 @@ static void pts_master_retain_input(int slave) {
     if (master < 0 || master >= HL_NFD || g_fd_pb_len[master]) return;
     uint8_t queued[4096];
     size_t held = 0;
-    while (held < sizeof queued) {
-        int pending = 0;
-        if (ioctl(master, FIONREAD, &pending) != 0 || pending <= 0) break;
-        size_t want = sizeof queued - held;
-        if ((size_t)pending < want) want = (size_t)pending;
-        ssize_t got = read(master, queued + held, want);
+    // poll(), not FIONREAD: on macOS FIONREAD on a MASTER reports the SLAVE's input queue, so it counts
+    // bytes the master WROTE and can never read back (verified natively: after write(master,5) with the
+    // slave idle, Darwin FIONREAD(master)=5 while poll says nothing readable and a non-blocking read gives
+    // EAGAIN; Linux correctly reports 0). Reading on that count blocked forever inside fd_reset_emul.
+    // Only a positive POLLIN sanctions a read, so the drain can never block; the cap bounds it anyway.
+    for (int round = 0; round < 8 && held < sizeof queued; ++round) {
+        struct pollfd ready = {.fd = master, .events = POLLIN};
+        if (poll(&ready, 1, 0) <= 0 || !(ready.revents & POLLIN)) break;
+        ssize_t got = read(master, queued + held, sizeof queued - held);
         if (got <= 0) break;
         held += (size_t)got;
     }
