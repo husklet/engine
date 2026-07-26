@@ -443,8 +443,11 @@ The two interpreters cost about the same. The aarch64 guest is 26% faster on `co
 with fixed-width 32-bit decode being cheaper than `decode_bytes`' prefix/ModRM/SIB walk — the one place
 the ISAs genuinely differ in interpreter cost.
 
-The aarch64 interpreter has the **same** per-block `rt_sigprocmask` (measured above), so fix #1 applies
-to both quadrants unchanged. Its `run_block` does have an inner loop bounded by the pre-scanned block
+The aarch64 interpreter has the **same** per-block `rt_sigprocmask` (measured above), so fix #1 applies to
+both quadrants — but **not "unchanged", as this section originally claimed.** Measured after the fix landed
+(`583ae490`): the x86-64 guest gains 1.85x and the **aarch64 guest gains 3.46x**. A fixed ~290 ns is a
+larger fraction of a smaller per-block cost, so the quadrant this document treated as the lesser prize was
+the greater one. Its `run_block` does have an inner loop bounded by the pre-scanned block
 extent, which the x86-64 side lacks — but measurement shows it does not self-chain a backward branch in
 practice (1,697,570 `rt_sigprocmask` in a 25 s busyloop sample), so that structural difference is not
 currently buying anything.
@@ -458,7 +461,7 @@ themselves are measured.
 
 | # | change | estimated win | effort | risk |
 |---|---|---|---|---|
-| 1 | `sigsetjmp(pad, 0)` + explicit mask restore on the fault path, both interpreters | compute **1.80x**, syscall-startup **1.36x**, translation **1.12x**, syscall-1m ~1.05x | small | **medium-high** |
+| 1 | ~~`sigsetjmp(pad, 0)` + explicit mask restore on the fault path~~ **DONE `583ae490`** | predicted compute 1.80x; **measured 1.85x x86-64 guest, 3.46x aarch64 guest**. `rt_sigprocmask` 3,035,853 → 8 per 3M blocks | small | **medium-high** |
 | 2 | per-page memo for `hl_guest_fetch_exec` / `hl_logical_vma_resolve_exec` / `host_range_mapped` | compute **~1.2-1.3x** | small-medium | low-medium |
 | 3 | cache decoded `struct insn` in the block descriptor | compute **~1.15-1.2x** after #1+#2 | medium-large | **high** |
 | 4 | shrink `struct insn` (184 bytes) and the decode tables | ~1.02-1.05x | small | low |
@@ -476,13 +479,24 @@ Applies to `src/translator/guest/x86_64/interp.c:900` and
 the case, ~1.47x on the guest-execution part. translation: 10,850 x 271.7 ns = 2.95 ms of 27.8 ms,
 1.12x. syscall-1m gains little because that case is dominated by the service layer.
 
-**Risk: medium-high, and it is the reason this is a proposal and not a patch.** It is the guest fault
-path. The mask that `savemask=1` restores is real; it is just knowable. The argument to be re-derived
-is that `interp_signal_resume()` is the only route into the pad, so the restore can be explicit and
-one-sided. Alternative with the same win and a different risk profile: hoist the pad out of
-`run_block()` into `run_guest()`'s loop, arming it once per dispatcher entry — that removes the
-register save too, but requires proving the pad's frame stays live, which `G_OWN_TRAMPOLINES` makes
-non-obvious. Gate on `compat-signals`, the SIGSEGV/SIGBUS fixtures and `tests/compat/signals/`.
+**Done in `583ae490`, and the design proposed here was wrong.** This section suggested snapshotting the
+mask on the theory that it is knowable and invariant across the run loop. **It is not invariant**, and two
+sites prove it: `syscall/signal.c:779` mirrors the guest's SIGTSTP/TTIN/TTOU onto the *real* host mask for
+job control — persistent and guest-driven, between blocks — and `thread.c:1559`'s `hrm_fault_hook` unblocks
+SEGV+BUS from *inside* `run_block`, since the interpreter's fetch validates through `host_range_mapped`. A
+restored snapshot would have silently un-blocked the stop signals bash blocks around `tcsetpgrp`.
+
+The design that works needs no invariance: **the interpreter's `siglongjmp` is a hand-rolled
+`rt_sigreturn`.** Leaving a handler by long jump means the kernel never runs sigreturn, so the mask restore
+is a debt — and `ucontext->uc_sigmask` is by definition the value sigreturn would install, recorded by the
+kernel on the faulting thread at the instant of the fault. Restore that, once, immediately before the jump.
+The JIT owes nothing, because it rewrites `uc_mcontext.pc` and *returns*.
+
+`siglongjmp` had to stay: on Darwin `setjmp`/`longjmp` are the mask-**saving** pair, so `sigsetjmp(pad, 0)`
++ `siglongjmp` is the only portable spelling of "this pad does not touch the mask".
+
+The old code was also slightly **wrong** at `thread.c:1559` — `savemask=1` re-blocked what the fault hook
+had deliberately unblocked.
 
 ### 2. Memoise the fetch and validation path
 
