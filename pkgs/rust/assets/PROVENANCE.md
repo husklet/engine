@@ -12,11 +12,11 @@ verified by `check-crate-archives` in CI. Do not edit it by hand.
 <!-- BEGIN GENERATED ARCHIVE PROVENANCE -->
 
 ```
-source-commit: f8e47b9f1d6cdc72d06d426ce9f55f4aa932c5cb
+source-commit: 64f5182d064dfb0a5832fb330cadf24ec8aa428a (with uncommitted changes under src/ or include/)
 config-abi: 1
-source-manifest: 8e97ba51fd3ee24d3c162aa987dd9f18fd56e298029d0c1b9bc6143039bd86d8
-aarch64-unknown-linux-gnu: 408832a667895c26bc5825937a8417d51465a58baa39ac4a778704daabbdc99e
-aarch64-apple-darwin: acef9a4ee78231687396577161d17a18ba51d59ad37b584705d0054bd038b6bf
+source-manifest: 24c77bcaa85a676d09a8da3daf3917c315277dd1030a7334ae312af52369d5d4
+aarch64-unknown-linux-gnu: d0ec921105ac17a8cbff9024e385ea5bb659cb52c4f518fc8611172d891b9879
+aarch64-apple-darwin: 238c2537ac35ded94530001801df58eaa0652f15614e1641df60057aff97355f
 ```
 
 <!-- END GENERATED ARCHIVE PROVENANCE -->
