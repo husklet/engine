@@ -14,7 +14,7 @@ fn checked_bytes(value: &OsStr) -> Result<&[u8], Error> {
 }
 
 const MAGIC: u32 = 0x484c_4346;
-const ABI: u32 = 13;
+const ABI: u32 = 14;
 
 /// The launch ABI this crate encodes, as declared by `include/hl/config.h`.
 ///
@@ -607,10 +607,11 @@ mod tests {
         );
         let wire = encode(&config, &[OsString::from("/bin/true")], None).unwrap();
         // Overlay arrived in HL_CONFIG_ABI_OVERLAY (12), but the encoder only ever emits the
-        // current HL_CONFIG_ABI. That constant moved to 13 when checkpoint_policy was added, and
-        // the overlay layout is unchanged by it: lower_layer_count/overlay_work_offset keep their
-        // offsets and the checkpoint words are appended after them. src/core/config.c accepts 12
-        // and 13 alike, so pinning 12 here only asserted "nothing newer was ever added".
+        // current HL_CONFIG_ABI. That constant moved to 13 when checkpoint_policy was added and to
+        // 14 when policy value 0 stopped meaning refuse; the overlay layout is unchanged by both:
+        // lower_layer_count/overlay_work_offset keep their offsets and the checkpoint words are
+        // appended after them. src/core/config.c accepts 12 and 14 (13 is rejected outright), so
+        // pinning 12 here only asserted "nothing newer was ever added".
         assert_eq!(word(&wire, ABI_OFFSET), ABI);
         assert_eq!(word(&wire, HEADER_SIZE_OFFSET), HEADER_SIZE_U32);
         assert_eq!(word(&wire, LOWER_COUNT_OFFSET), 2);

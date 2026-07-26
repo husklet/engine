@@ -44,6 +44,9 @@ int main(void) {
     wire.config.magic = HL_CONFIG_MAGIC;
     wire.config.abi = HL_CONFIG_ABI + 1;
     HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_ABI_MISMATCH);
+    // 13 encoded checkpoint_policy 0 as "refuse"; reject it instead of silently restoring permissively.
+    wire.config.abi = HL_CONFIG_ABI_CHECKPOINT_POLICY;
+    HL_CHECK(hl_launch_config_validate(&wire, sizeof(wire), NULL, NULL) == HL_STATUS_ABI_MISMATCH);
     wire.config.abi = HL_CONFIG_ABI;
     wire.config.pool_size = sizeof(wire.pool);
     wire.config.header_size = sizeof(wire.config);
