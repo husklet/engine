@@ -42,6 +42,8 @@ const hl_provider_node *hl_provider_namespace_resolve(const hl_provider_namespac
 void hl_provider_namespace_revoke(hl_provider_namespace *namespace);
 int hl_provider_namespace_launch_install(const void *bytes, size_t size);
 const hl_provider_node *hl_provider_namespace_launch_resolve(const char *path, size_t path_size);
+const hl_provider_node *hl_provider_namespace_launch_child(const char *directory, size_t directory_size,
+                                                           uint32_t *cursor);
 void hl_provider_namespace_launch_revoke(void);
 
 #endif

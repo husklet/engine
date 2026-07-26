@@ -286,7 +286,7 @@ static hl_host_result provider_metadata(void *context, hl_host_handle file, hl_h
     if (output == NULL || remote(file, &id) != 0) return failure(EINVAL);
     put64(payload + 1, id);
     result = request(payload, sizeof(payload), &reply);
-    if (result.status == HL_STATUS_OK && (reply.size != 25 || reply.bytes[0] != OP_STAT)) result = failure(EPROTO);
+    if (result.status == HL_STATUS_OK && (reply.size != 21 || reply.bytes[0] != OP_STAT)) result = failure(EPROTO);
     if (result.status == HL_STATUS_OK) {
         memset(output, 0, sizeof(*output));
         output->type = HL_HOST_FILE_TYPE_REGULAR;

@@ -1580,6 +1580,15 @@ impl OpenHandle for BasicHandle {
         Ok(request.bytes.len())
     }
 
+    fn metadata(&self) -> Result<hl_engine::extension::HandleMetadata, LinuxError> {
+        Ok(hl_engine::extension::HandleMetadata {
+            mode: 0o666,
+            uid: 0,
+            gid: 0,
+            size: 0,
+        })
+    }
+
     fn readiness(&self, _interest: Interest) -> Result<Readiness, LinuxError> {
         Ok(Readiness {
             states: BTreeSet::from([ReadyState::Readable, ReadyState::Writable]),
@@ -1919,6 +1928,77 @@ int main(int argc, char **argv) {
         std::thread::yield_now();
     }
     assert_eq!(closes.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn projected_directory_exposes_a_service_backed_device_to_a_real_guest() {
+    let mut extension = handles_extension();
+    extension.required_features.extend([
+        Feature::new("devices").unwrap(),
+        Feature::new("metadata").unwrap(),
+    ]);
+    extension.namespace = vec![NamespaceEntry::Device(DeviceEntry {
+        path: "/dev/dri/renderD128".into(),
+        metadata: Metadata {
+            mode: 0o666,
+            uid: 0,
+            gid: 0,
+        },
+        kind: DeviceKind::Character,
+        major: 226,
+        minor: 128,
+        service: Some(ServiceId(77)),
+    })];
+    extension.services[0]
+        .operations
+        .insert(HandleOperation::Metadata);
+    let directory = ExtensionSpec {
+        provider: ProviderId::new("engine.namespace").unwrap(),
+        version: Version::new(1, 0),
+        required: true,
+        required_features: BTreeSet::from([Feature::new("directories").unwrap()]),
+        optional_features: BTreeSet::new(),
+        config: ExtensionConfig::empty("engine.namespace/v1"),
+        namespace: vec![NamespaceEntry::Directory(
+            hl_engine::extension::DirectoryEntry {
+                path: "/dev/dri".into(),
+                metadata: Metadata {
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                },
+            },
+        )],
+        services: Vec::new(),
+        memory: Vec::new(),
+        environment: Vec::new(),
+    };
+    let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/sh");
+    spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
+    spec.process.argv.extend([
+        "-c".into(),
+        "test -c /dev/dri/renderD128 || exit 11; exec 3</dev/dri/renderD128 || exit 13".into(),
+    ]);
+    spec.extensions.extend([directory, extension]);
+
+    let mut authority = HandlesAuthority::new();
+    authority
+        .grant(
+            ProviderId::new("engine.handles").unwrap(),
+            Arc::new(BasicHandles {
+                closes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(
+        Engine::new()
+            .spawn_with_authority(spec, ProcessIo::default(), authority)
+            .unwrap()
+            .wait()
+            .unwrap(),
+        Exit::Code(0)
+    );
 }
 
 #[test]

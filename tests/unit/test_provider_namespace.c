@@ -97,6 +97,14 @@ int main(void) {
     node = hl_provider_namespace_resolve(&namespace, "/dev/provider", 13);
     HL_CHECK(node != NULL && node->kind == HL_PROVIDER_NODE_CHARACTER && node->service == 55 && node->major == 226 &&
              node->minor == 128);
+    {
+        uint32_t child = 0;
+        HL_CHECK(hl_provider_namespace_launch_install(wire, (size_t)(cursor - wire)) == 0);
+        node = hl_provider_namespace_launch_child("/dev", 4, &child);
+        HL_CHECK(node != NULL && node->path_size == 13 && memcmp(node->path, "/dev/provider", 13) == 0);
+        HL_CHECK(hl_provider_namespace_launch_child("/dev", 4, &child) == NULL);
+        hl_provider_namespace_launch_revoke();
+    }
     hl_provider_namespace_revoke(&namespace);
     HL_CHECK(namespace.count == 0 && namespace.generation != generation);
     return 0;

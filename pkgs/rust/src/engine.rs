@@ -230,6 +230,7 @@ fn handles_features() -> BTreeSet<crate::extension::Feature> {
     [
         "read",
         "write",
+        "metadata",
         "poll",
         "ofd-lifecycle",
         "memory-allocation",

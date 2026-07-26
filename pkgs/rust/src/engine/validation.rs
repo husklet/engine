@@ -472,6 +472,7 @@ fn validate_selected_runtime(
             let supported = BTreeSet::from([
                 crate::extension::HandleOperation::Read,
                 crate::extension::HandleOperation::Write,
+                crate::extension::HandleOperation::Metadata,
                 crate::extension::HandleOperation::Poll,
             ]);
             if extension
@@ -483,7 +484,7 @@ fn validate_selected_runtime(
                     SpecErrorCategory::Unsupported,
                     "extensions.services.operations",
                     crate::spec::SpecResource::Provider(extension.provider.clone()),
-                    "handles contract v1 advertises only read, write, poll, and engine-owned OFD lifecycle",
+                    "handles contract v1 advertises only read, write, metadata, poll, and engine-owned OFD lifecycle",
                 ));
             }
             for entry in &extension.namespace {
