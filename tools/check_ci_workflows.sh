@@ -18,12 +18,19 @@ invariants)
 	function flush_step() {
 		if (step_name == "" && step_run == "" && step_uses == "") return
 		steps++
-		step_files[steps] = FILENAME
+		# last_file, not FILENAME: the final step of a file is flushed at
+		# FNR==1 of the next one, which would name the wrong workflow.
+		step_files[steps] = last_file
 		step_jobs[steps] = job
 		step_names[steps] = step_name
 		step_runs[steps] = step_run
 		step_timeouts[steps] = step_timeout
+		step_jobidx[steps] = jobs
 		step_name = ""; step_run = ""; step_uses = ""; step_timeout = 0
+	}
+	function number(value) {
+		match(value, /[0-9]+/)
+		return substr(value, RSTART, RLENGTH) + 0
 	}
 	function indentation(value) {
 		match(value, /^ */)
@@ -37,6 +44,7 @@ invariants)
 	{
 		line = $0
 		sub(/\r$/, "", line)
+		last_file = FILENAME
 	}
 	line ~ /^[ \t]*continue-on-error[ \t]*:/ {
 		bad("I1 " FILENAME ": continue-on-error masks failures")
@@ -62,7 +70,7 @@ invariants)
 		next
 	}
 	line ~ /^    timeout-minutes:/ && !in_steps {
-		job_timeouts[jobs] = 1
+		job_timeouts[jobs] = number(line)
 		next
 	}
 	line ~ /^    uses:/ && !in_steps {
@@ -94,7 +102,7 @@ invariants)
 		next
 	}
 	in_steps && line ~ /^        timeout-minutes:/ {
-		step_timeout = 1
+		step_timeout = number(line)
 		next
 	}
 	in_steps && line ~ /^        run:/ {
@@ -136,6 +144,20 @@ invariants)
 			    step_runs[i] !~ /ci_run\.sh/ && step_runs[i] !~ /::error/ &&
 			    step_runs[i] !~ /for attempt in/)
 				bad("I17 " step_files[i] " step `" step_names[i] "` reports no ::error on failure")
+			# Raising a bucket timeout must raise the arithmetic with it: the
+			# deadline plus its 60s reporting margin has to fit the step
+			# timeout, and the step timeout has to fit the job timeout.
+			if (match(step_runs[i], /SECONDS \+ [0-9]+/)) {
+				secs = substr(step_runs[i], RSTART + 10, RLENGTH - 10) + 0
+				limit = step_timeouts[i] * 60
+				if (limit <= 0 || secs + 60 > limit)
+					bad("I18 " step_files[i] " step `" step_names[i] "` deadline " \
+					    secs "s+60s exceeds its " step_timeouts[i] "min timeout")
+			}
+			jt = job_timeouts[step_jobidx[i]]
+			if (jt > 0 && step_timeouts[i] > jt)
+				bad("I18 " step_files[i] " step `" step_names[i] "` timeout exceeds job `" \
+				    step_jobs[i] "` timeout")
 		}
 		if (jobs < 7)
 			bad("I7 parsed only " jobs " jobs; expected at least 7")
@@ -197,8 +219,15 @@ invariants)
 		compat-*) ;;
 		*) continue ;;
 		esac
-		if ! printf '%s\n' "$shards" | grep -Fqx -- "$suite"; then
+		count=$(printf '%s\n' "$shards" | grep -Fxc -- "$suite" || true)
+		if [ "$count" -eq 0 ]; then
 			printf 'VIOLATION: I13 mac.yml runs no shard for `%s`\n' "$suite" >&2
+			exit 1
+		fi
+		# Consolidating buckets must move a suite, not copy it: a suite named
+		# twice burns a scarce macOS runner on work already covered.
+		if [ "$count" -gt 1 ]; then
+			printf 'VIOLATION: I13 mac.yml runs `%s` in %s shards\n' "$suite" "$count" >&2
 			exit 1
 		fi
 	done
