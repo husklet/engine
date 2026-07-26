@@ -1108,10 +1108,20 @@ static void interp_execute(struct cpu *cpu) {
 // rather than returning into a stack it does not own.
 // ---------------------------------------------------------------------------------------------------
 
-void run_block(struct cpu *cpu, void *code);
-void block_return(void);
+// STATIC, and that is load-bearing rather than tidiness. The dual activation archive links BOTH target
+// objects into one binary (cmake/Phase2Production.cmake builds hl-engine-activation from dual_aarch64_target
+// and dual_x86_64_target), and src/core/target/namespace.h -- which renames the per-ISA symbols so the two
+// can coexist -- does not cover run_block/block_return. The JIT gets away with that because its trampolines
+// come from a file-scope __asm__ block with `.hidden`, which GCC emits as a LOCAL symbol: `nm` on either
+// aarch64 object shows a lowercase `t`. A non-static C definition here is a GLOBAL, so both interpreters
+// defining one collides at link time and takes dual-backend-link-test with it -- 300-odd cascading undefined
+// references, because the linker then rejects the whole object. Local linkage matches what the JIT already
+// does, and it costs nothing: interp.c is #included into the target translation unit, so every caller --
+// core/dispatch.c's run_block(c, rxcode), and the code that takes &block_return -- is in this same TU.
+static void run_block(struct cpu *cpu, void *code);
+static void block_return(void);
 
-void run_block(struct cpu *cpu, void *code) {
+static void run_block(struct cpu *cpu, void *code) {
     struct interp_block *block = (struct interp_block *)code;
     // Validate the descriptor. A mismatch means the cache handed us something that is not one of ours -- a
     // host-code pointer restored from a JIT-written persistent cache, or a descriptor from an arena that
@@ -1141,7 +1151,7 @@ void run_block(struct cpu *cpu, void *code) {
     g_interp_pad_armed = previous;
 }
 
-void block_return(void) {
+static void block_return(void) {
     fprintf(stderr, "[hl] interp: block_return() entered on a " HL_HOST_CPU_NAME " host. Only translated ARM64\n"
                     "     blocks branch here and this backend emits none -- so its address was baked into\n"
                     "     something that then ran (a stale persistent-cache image or a mis-relocated exit).\n");
