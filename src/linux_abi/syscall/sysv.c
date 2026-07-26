@@ -38,6 +38,11 @@
 // svc_done() does the macOS->Linux boundary translation at the tail (e.g. ENOMSG 91->42, EIDRM 90->43,
 // EAGAIN 35->11), same as every other svc_<family>().
 
+// The Linux guest page (an ABI constant) and the host VM granule (a runtime property) are distinct and
+// both needed here: shm sizes are rounded to the host granule, reported limits are in guest pages.
+#include "../page.h"
+#include "../../host/range.h"
+
 // ---- Linux control-command numbers ---------------------------------------------------------------
 #ifndef IPC_INFO
 #define IPC_INFO 3
@@ -290,9 +295,19 @@ static int64_t hl_ipc_now(void) {
     return (int64_t)time(NULL);
 }
 
+// Round a SysV shm segment size up to a whole HOST mapping unit: the result sizes both the POSIX shm
+// object (ftruncate) and the mapping of it (mmap), so the two only have to agree with each other and be
+// at least segsz. hl_host_page_size() is the authority -- it validates that the host answered with a
+// power of two (the mask arithmetic below is undefined otherwise) and reports 0 when it did not, which the
+// bare `(size_t)sysconf(_SC_PAGESIZE)` this replaced could not: sysconf signals failure with -1, not 0, so
+// the old `pg == 0` guard let SIZE_MAX through and the mask degenerated to `& 1`. The fallback is the Linux
+// guest page, not a hardcoded 16 KB: 16 KB is merely Apple silicon's granule and is plain wrong on a
+// 4 KB-page host, whereas the guest page is the ABI floor on every host. Under-aligning relative to a larger
+// host page is harmless here because both call sites round identically and the kernel rounds the mapping
+// itself; guessing 16 KB on a 4 KB host would instead quadruple every segment.
 static size_t hl_ipc_pground(size_t n) {
-    size_t pg = (size_t)sysconf(_SC_PAGESIZE);
-    if (pg == 0) pg = 16384;
+    size_t pg = hl_host_page_size();
+    if (pg == 0) pg = HL_LINUX_GUEST_PAGE_SIZE;
     return (n + pg - 1) & ~(pg - 1);
 }
 

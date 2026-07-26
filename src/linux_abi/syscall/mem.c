@@ -93,10 +93,12 @@ static void anon_split_unmap(uint64_t ustart, uint64_t uend) {
 
 // emulate a MAP_FIXED mapping of [a0, a0+a1) -- anon-zero when `anon`, else the file bytes at
 // fd@off -- that lands inside one of the guest's OWN existing (writable private-anon) reservations,
-// WITHOUT clobbering a live 4 KB neighbour that shares a partial 16 KB host page. The guest uses 4 KB
-// pages; Apple Silicon uses 16 KB, and macOS MAP_FIXED replaces WHOLE host pages -- so a fixed map of a
-// sub-host-page range zeros/relays the neighbour occupying the rest of the edge host page (same class as
-// MADV_DONTNEED). Fix (mirrors that split): MAP_FIXED-remap only the fully-covered INTERIOR host
+// WITHOUT clobbering a live 4 KB neighbour that shares a partial host page. The guest always uses 4 KB
+// pages while the host granule is whatever getpagesize() reports (16 KB on Apple silicon), and MAP_FIXED
+// replaces WHOLE host pages -- so a fixed map of a sub-host-page range zeros/relays the neighbour occupying
+// the rest of the edge host page (same class as MADV_DONTNEED). A host whose page IS the guest page has no
+// such partial edge, and both call sites test for one before coming here, so this never runs there.
+// Fix (mirrors that split): MAP_FIXED-remap only the fully-covered INTERIOR host
 // pages (fresh pages; load the file bytes there for a file map); write the partial head/tail edges IN
 // PLACE over EXACTLY the requested bytes (memset 0 for anon, pread for file) so the neighbour survives.
 // The caller gates this on the range being contained in a writable private-anon region, so the edge host
@@ -245,9 +247,9 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     case 215: {
         // munmap error checks (Linux returns before touching anything): a zero length, an addr that is
         // not a multiple of the (guest) page size, or a range that wraps / lies outside the address space
-        // is EINVAL. Aligning against guest_pagesz() (4 KB x86 / 16 KB arm) -- not the 16 KB host page --
-        // is what lets a legitimate 4 KB-granular x86 unmap through while still rejecting a truly
-        // mis-aligned start (LTP munmap03: len 0, addr+1, and an out-of-range rlim_max address).
+        // is EINVAL. Aligning against guest_pagesz() (the 4 KB AT_PAGESZ both guest ISAs publish) -- never the
+        // host page, which may be coarser -- is what lets a legitimate 4 KB-granular unmap through while still
+        // rejecting a truly mis-aligned start (LTP munmap03: len 0, addr+1, and an out-of-range rlim_max address).
         {
             size_t gpg = guest_pagesz();
             if (a1 == 0 || (a0 & (gpg - 1)) || a0 + a1 < a0) {
@@ -283,19 +285,21 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // full == a1) and untracked mappings (full == 0) keep the plain a1 unmap unchanged.
         size_t len = (size_t)a1;
         uint64_t full = hl_gmap_find_length(a0);
-        // Page-size mismatch: guest pages are 4 KB (AT_PAGESZ) but the macOS host uses 16 KB pages, and
-        // macOS munmap rounds the LENGTH up to a whole host page. macOS also gives every distinct mmap
-        // its own host-page-aligned base + host-page-rounded extent, so two SEPARATE guest mappings never
-        // share a 16 KB host page -- a host page is only ever shared by 4 KB sub-regions of ONE mapping.
+        // Page-size mismatch: guest pages are always 4 KB (AT_PAGESZ) while the host granule is whatever
+        // getpagesize() reports, and munmap rounds the LENGTH up to a whole host page. The host also gives
+        // every distinct mmap its own host-page-aligned base + host-page-rounded extent, so two SEPARATE guest
+        // mappings never share a host page -- a host page is only ever shared by 4 KB sub-regions of ONE
+        // mapping. On a host whose page IS the guest page (x86_64 Linux) there are no sub-page-shared edges at
+        // all and the arithmetic below simply degenerates to the requested range.
         //   * COMPLETE unmap of a whole tracked mapping (a0 is its base and a1 is its logical length, with
         //     or without the 64 KB guard tail): the whole host-page-rounded extent is ours, no neighbour
         //     sits in the edge pages, so releasing it -- rounding the length UP, which also frees the guard
         //     tail (else ~64 KB leaks per map/unmap cycle) -- is safe.
         //   * Any OTHER unmap may be a 4 KB-granular SUB-RANGE of a larger mapping (V8's page allocator
         //     freeing an interior chunk, ZendMM trimming an aligned over-allocation), whose partial edge
-        //     host pages still back a LIVE 4 KB neighbour the guest keeps. (same 16 KB-vs-4 KB
-        //     class as): a plain munmap there rounds a partial edge page OUT to the full 16 KB and
-        //     unmaps the neighbour -- and an unaligned start is outright EINVAL'd by host munmap (V8 then
+        //     host pages still back a LIVE 4 KB neighbour the guest keeps (only possible while the host page
+        //     is coarser than 4 KB): a plain munmap there rounds a partial edge page OUT to the full host page
+        //     and unmaps the neighbour -- and an unaligned start is outright EINVAL'd by host munmap (V8 then
         //     aborts on CHECK(0 == munmap)). So release only the whole HOST pages lying ENTIRELY inside
         //     [a0, a0+len); the partial edge pages stay mapped. The guest's logical unmap still succeeds
         //     (return 0) -- matching Linux, which never faults an unmap of a partial/already-unmapped range.
@@ -335,10 +339,10 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // fault -- growth budget for an adjacent live mapping, small budget otherwise -- and the guest
             // would silently read fresh zero memory instead of faulting. Mark the released range inaccessible
             // so the fault handler delivers the guest SIGSEGV; a later mmap over it clears the coverage.
-            // (16 KB host-page granularity residual: a 4 KB sub-page whose 16 KB host page still backs a LIVE
+            // (Coarse-host-page granularity residual: a 4 KB sub-page whose host page still backs a LIVE
             // neighbour is NOT released above -> not marked here -> stays readable. That mixed-page case needs
             // per-4 KB software fault checks the JIT deliberately avoids; the common aligned/whole-page case is
-            // now correct.)
+            // now correct. A host page == guest page host has no mixed pages, so the residual is empty there.)
             gna_add(u_lo, u_hi);
         }
         if (r == 0 && g_mem_max) {
@@ -764,7 +768,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
 #endif
         // a MAP_FIXED map that REPLACES a 4 KB-granular sub-range of one of the guest's own
         // reservations (V8/Go committing fresh pages, or ld.so laying a segment inside its reserved span)
-        // has a partial 16 KB host-page edge shared with a LIVE 4 KB neighbour. A direct host MAP_FIXED
+        // has a partial host-page edge shared with a LIVE 4 KB neighbour -- which requires a host page coarser
+        // than the guest's, hence the hp > guest_pagesz() gate below. A direct host MAP_FIXED
         // there replaces WHOLE host pages -> the neighbour is zeroed/relaid (the heap-corruption
         // class; the likely victoria-metrics SIGBUS). When the range is fully contained in a tracked
         // WRITABLE private-anon region (so its edge host pages are mapped+writable), emulate the fixed map
@@ -785,14 +790,19 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (fixed286 && r != MAP_FAILED && !(a3 & 0x20) && (a3 & 0x01)) off_emul = 2;
         if (!fixed286 && !logical_prepare_failed)
             r = mmap((void *)a0, (size_t)a1 + guard, prot, mmap_flags((int)a3), (a3 & 0x20) ? -1 : (int)a4, (off_t)a5);
-        // Host-page-unaligned file offset. macOS uses 16 KB pages and its mmap requires the FILE OFFSET to
-        // be a multiple of the host page size, but a Linux guest (4 KB pages) may legitimately map a file at
-        // any 4 KB-granular offset. A non-MAP_FIXED file map whose offset is 4 KB- but not 16 KB-aligned is
-        // therefore rejected with EINVAL. Map from the preceding host-page-aligned file offset and return
-        // the Linux-page-aligned subrange. The physical head remains tracked for complete munmap/exec cleanup.
+        // Host-page-unaligned file offset. mmap requires the FILE OFFSET to be a multiple of the HOST page
+        // size, but a Linux guest (4 KB pages) may legitimately map a file at any 4 KB-granular offset, so on
+        // a 16 KB-page host (macOS arm64) a non-MAP_FIXED file map whose offset is 4 KB- but not 16 KB-aligned
+        // is rejected with EINVAL. Map from the preceding host-page-aligned file offset and return the
+        // Linux-page-aligned subrange. The physical head remains tracked for complete munmap/exec cleanup.
         // Keeping the real vnode mapping is essential for MAP_SHARED aliases: runtimes such as CoreCLR map
         // one memfd RW and RX, then initialize executable stubs through the writable alias.
-        if (r == MAP_FAILED && !(a3 & 0x10) && !(a3 & 0x20) && (int)a4 >= 0 && ((off_t)a5 & (off_t)(hp - 1))) {
+        // Gated on the host page being LARGER than the guest page, like the MAP_FIXED reconciliation below:
+        // when they match, a guest-legal offset is already host-legal, so the only way the offset test can fire
+        // is a guest offset that Linux itself would EINVAL -- and this fallback would answer it with a working
+        // mapping instead of the error.
+        if (r == MAP_FAILED && !(a3 & 0x10) && !(a3 & 0x20) && (int)a4 >= 0 && hp > (size_t)guest_pagesz() &&
+            ((off_t)a5 & (off_t)(hp - 1))) {
             size_t head = (size_t)((off_t)a5 & (off_t)(hp - 1));
             off_t aligned_offset = (off_t)a5 - (off_t)head;
             size_t mapped_size = (size_t)a1 + head;
@@ -805,14 +815,15 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             }
         }
         // Past-EOF tail zero-fill. A file mmap whose length runs past the file's end leaves the trailing
-        // WHOLE pages with no backing: macOS SIGBUSes on any read of them. ld.so does exactly this -- it maps
+        // WHOLE pages with no backing: every host SIGBUSes on a read of them. ld.so does exactly this -- it maps
         // a .so's WHOLE vaddr span from the FIRST segment, so the inter-segment bytes become such past-EOF
-        // pages. On Linux they are equally unbacked, but ld.so PROT_NONEs / replaces that region and never
-        // reads it; with macOS's 16 KB pages, though, a later 4 KB-granular segment map (x86_64 .so p_align
-        // 0x1000) shares its low host page with one of those past-EOF pages, so a stray access SIGBUSes where
-        // Linux stayed quiet (julia's libdl/libjulia abort here). Re-map the genuinely-past-EOF whole-page
+        // pages. The real guest never reads them (ld.so PROT_NONEs / replaces that region), so the engine only
+        // has to keep a STRAY access quiet; the guest-visible SIGBUS is delivered by the gbus ledger above, not
+        // by the host. On a host page coarser than the guest's the stray access is not even hypothetical: a
+        // later 4 KB-granular segment map (x86_64 .so p_align 0x1000) shares its low host page with one of
+        // those past-EOF pages (julia's libdl/libjulia abort here). Re-map the genuinely-past-EOF whole-page
         // tail as anonymous zero -- the inaccessible-but-quiet region Linux effectively presents -- so such a
-        // shared host page reads back zero instead of faulting. The partial page straddling EOF keeps macOS's
+        // page reads back zero instead of faulting the engine. The partial page straddling EOF keeps the host's
         // file bytes + zero-fill, a later MAP_FIXED segment map overwrites whatever it needs, and a fully
         // file-backed mapping (valid_end >= a1) is left byte-identical. RW only (an ANON PROT_EXEC map hits
         // macOS W^X EPERM; the JIT never executes guest pages anyway). MAP_PRIVATE only: a MAP_SHARED file
@@ -828,21 +839,30 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                          MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
             }
         }
-        // 16 KB-vs-4 KB MAP_FIXED reconciliation. macOS arm64 mmap REQUIRES a 16 KB-aligned address for
-        // MAP_FIXED, but x86_64 .so PT_LOAD segments are only p_align=0x1000 (4 KB), so ld.so's MAP_FIXED
-        // mapping of e.g. libc's text segment at a 4 KB- (not 16 KB-) aligned guest address returns EINVAL
-        // -> "failed to map segment from shared object" (file-backed) / "cannot map zero-fill pages" (the
-        // anon BSS tail). (aarch64 .so segments use p_align 0x10000, a multiple of 16 KB, so they never hit
-        // this.) ld.so has ALREADY reserved this whole .so address range with an earlier (kernel-placed,
-        // 16 KB-aligned) mmap, so the range is ours -- emulate the failing fixed map with a private ANON
-        // map at the 16 KB-rounded base, then pread the file bytes (file-backed) or leave it zero (anon
-        // BSS): a private, writable copy, exactly what MAP_PRIVATE promises. Gated on the DIRECT mmap having
-        // FAILED for a MAP_FIXED request, so every working case (non-fixed maps, and 16 KB-aligned aarch64
-        // file/anon maps) takes the unchanged direct path above and is byte-identical.
-        if (r == MAP_FAILED && (a3 & 0x10)) {
-            uint64_t lo = a0 & ~(uint64_t)0x3fff; // round the start DOWN to a 16 KB host page
-            size_t head = (size_t)(a0 - lo);      // bytes in the low page that belong to the PREVIOUS segment
-            // The low page may also hold the tail of the previous PT_LOAD (a0 sits mid-16 KB-page). The ANON
+        // Host-page-vs-guest-page MAP_FIXED reconciliation. macOS arm64 mmap REQUIRES a 16 KB- (host-page-)
+        // aligned address for MAP_FIXED, but x86_64 .so PT_LOAD segments are only p_align=0x1000 (4 KB), so
+        // ld.so's MAP_FIXED mapping of e.g. libc's text segment at a 4 KB- (not host-page-) aligned guest
+        // address returns EINVAL -> "failed to map segment from shared object" (file-backed) / "cannot map
+        // zero-fill pages" (the anon BSS tail). (aarch64 .so segments use p_align 0x10000, a multiple of
+        // 16 KB, so they never hit this.) ld.so has ALREADY reserved this whole .so address range with an
+        // earlier (kernel-placed, host-page-aligned) mmap, so the range is ours -- emulate the failing fixed
+        // map with a private ANON map at the host-page-rounded base, then pread the file bytes (file-backed)
+        // or leave it zero (anon BSS): a private, writable copy, exactly what MAP_PRIVATE promises. Gated on
+        // the DIRECT mmap having FAILED for a MAP_FIXED request, so every working case (non-fixed maps, and
+        // host-page-aligned aarch64 file/anon maps) takes the unchanged direct path above and is byte-identical.
+        // Also gated on the host page being LARGER than the guest page -- the only configuration in which the
+        // alignment mismatch this emulates can exist. a0 was already EINVAL'd above unless it is guest-page
+        // aligned, so once host page <= guest page (an x86_64 / 4 KB-page Linux host) it is host-page aligned
+        // too and the host can never refuse a MAP_FIXED for alignment; every MAP_FAILED reaching here is then a
+        // GENUINE kernel verdict the guest must see (ENOMEM, EACCES, a MAP_FIXED_NOREPLACE EEXIST, an
+        // unaligned-offset EINVAL), which this block would convert into a bogus success -- in the NOREPLACE
+        // case by overwriting the very mapping the kernel just refused to replace. Skipping it also drops the
+        // head save/restore, whose whole reason to exist (bytes of the PREVIOUS segment sharing a0's host page)
+        // is equally impossible when a host page holds exactly one guest page.
+        if (r == MAP_FAILED && (a3 & 0x10) && hp > (size_t)guest_pagesz()) {
+            uint64_t lo = a0 & ~((uint64_t)hp - 1); // round the start DOWN to a host page
+            size_t head = (size_t)(a0 - lo);        // bytes in the low page that belong to the PREVIOUS segment
+            // The low page may also hold the tail of the previous PT_LOAD (a0 sits mid-host-page). The ANON
             // MAP_FIXED below zeros that whole page, so snapshot the neighbour's bytes FIRST and restore them
             // after -- they were already written (prev segment / ld.so's reservation) and must survive. (The
             // past-EOF tail fill above guarantees the head is now readable -- a real neighbour byte or quiet
@@ -1221,15 +1241,16 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     // real boundary, and a faked namespace grants no actual privilege (program still runs as our uid).
     // mincore: report page residency. The host mincore(2) fills one status byte per HOST page; Linux
     // wants one byte per page with bit0 = resident. macOS sets MINCORE_INCORE(0x1) in bit0 already, so
-    // masking each byte to bit0 yields the Linux convention. (Host pages are 16 KB vs the guest's 4 KB,
-    // so sub-host-page granularity is coarser than a real 4 KB kernel, but residency of the covering
-    // page is faithful.) Untouched trailing bytes (the guest zero-filled its vector) stay 0 = absent.
+    // masking each byte to bit0 yields the Linux convention. (Where the host page is coarser than the guest's
+    // 4 KB -- 16 KB on Apple silicon -- sub-host-page granularity is coarser than a real 4 KB kernel, but
+    // residency of the covering page is faithful; on a 4 KB-page host the answer is exact.) Untouched trailing
+    // bytes (the guest zero-filled its vector) stay 0 = absent.
     case 232: {
-        size_t hps = (size_t)getpagesize(); // host mmap granularity (16 KB on Apple Silicon)
-        size_t gps = guest_pagesz();        // page size the GUEST believes in (4 KB x86 / 16 KB arm)
+        size_t hps = (size_t)getpagesize(); // host mmap granularity (16 KB on Apple Silicon, 4 KB on x86_64)
+        size_t gps = guest_pagesz();        // page size the GUEST believes in (AT_PAGESZ: 4 KB on both ISAs)
         size_t len = (size_t)a1;
         // Linux mincore requires a page-aligned start address -> EINVAL otherwise (align to the GUEST page
-        // so a valid 4 KB-granular x86 start is not rejected on the 16 KB host).
+        // so a valid 4 KB-granular start is not rejected on a host whose page is coarser).
         if (a0 & (gps - 1)) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
@@ -1256,7 +1277,9 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
         }
-        // Fast path: guest page == host page (aarch64) -- the host vec is already one byte per guest page.
+        // Fast path: guest page == host page -- the host vec is already one byte per guest page, so hand it
+        // straight to the guest. AT_PAGESZ is 4 KB for both guest ISAs, so this is exactly the 4 KB-page host
+        // (x86_64 Linux, and aarch64 Linux configured with 4 KB pages); a 16 KB host takes the projection below.
         if (gps == hps || gps == 0 || len == 0) {
             size_t npages = len ? (len + hps - 1) / hps : 0;
             unsigned char stackvec[1024], *vec = stackvec;
@@ -1280,14 +1303,14 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             G_RET(c) = (r < 0) ? (uint64_t)(-errno) : 0;
             break;
         }
-        // Guest pages SMALLER than host pages (x86_64: 4 KB guest vs 16 KB host). The host mincore fills
-        // one status byte per 16 KB page, but the guest allocated ceil(len/4KB) bytes and indexes them at
+        // Guest pages SMALLER than host pages (4 KB guest vs a 16 KB Apple-silicon host). The host mincore
+        // fills one status byte per HOST page, but the guest allocated ceil(len/4KB) bytes and indexes them at
         // 4 KB granularity -- so writing the host-granular vector directly leaves 3 of every 4 guest-page
-        // slots at 0 (the x86 under-report). Run mincore into a host-granular scratch buffer, then
+        // slots at 0 (the under-report). Run mincore into a host-granular scratch buffer, then
         // project each guest page's residency from the host page that physically covers it.
         size_t hpages = (len + hps - 1) / hps;
         size_t gpages = (len + gps - 1) / gps;
-        size_t per = hps / gps; // guest pages per host page (== 4)
+        size_t per = hps / gps; // guest pages per host page (4 on a 16 KB host; >1 by the gate above)
         unsigned char stackbuf[1024], *hv = stackbuf;
         if (hpages > sizeof stackbuf) {
             hv = (unsigned char *)malloc(hpages);
@@ -1400,13 +1423,16 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             int aprot = anon_prot_if_contained(a0, (size_t)a1);
             if (aprot >= 0) {
                 // emulate Linux MADV_DONTNEED (range reads back ZERO) WITHOUT corrupting a live
-                // neighbour that shares a host page. The guest uses 4 KB pages; Apple Silicon uses 16 KB.
-                // A plain `mmap(a0, a1, MAP_FIXED|ANON)` rounds a partial head/tail host page OUT to the full
-                // 16 KB, so a guest DONTNEED of a free 4/8 KB span silently unmaps+zeros a LIVE object in the
-                // rest of that host page (Go's scavenger DONTNEEDs a free 8 KB span whose 16 KB host page also
-                // holds a live tiny string span -> the "heap corruption"). Fix: MAP_FIXED-remap only the
-                // host-page-aligned INTERIOR (safe physical release + zero); zero the partial edge host pages
-                // with memset over EXACTLY the requested bytes, never remapping a page shared with a neighbour.
+                // neighbour that shares a host page. The guest uses 4 KB pages; the host granule is whatever
+                // getpagesize() reports (16 KB on Apple silicon). A plain `mmap(a0, a1, MAP_FIXED|ANON)` rounds
+                // a partial head/tail host page OUT to the whole host page, so a guest DONTNEED of a free
+                // 4/8 KB span silently unmaps+zeros a LIVE object in the rest of that host page (Go's scavenger
+                // DONTNEEDs a free 8 KB span whose 16 KB host page also holds a live tiny string span -> the
+                // "heap corruption"). Fix: MAP_FIXED-remap only the host-page-aligned INTERIOR (safe physical
+                // release + zero); zero the partial edge host pages with memset over EXACTLY the requested
+                // bytes, never remapping a page shared with a neighbour. When a host page IS a guest page the
+                // interior is the whole page-aligned range and the edge memsets cover nothing, so a page-length
+                // DONTNEED is a single exact remap -- the same physical release Linux performs.
                 size_t hp = (size_t)getpagesize();
                 uint64_t lo = a0, hi = a0 + a1;
                 uint64_t ilo = (lo + hp - 1) & ~((uint64_t)hp - 1); // first fully-covered host page
