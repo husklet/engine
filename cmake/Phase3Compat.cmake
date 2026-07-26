@@ -211,7 +211,11 @@ foreach(_c dbserver sqlite)
     ${HL_TESTS}/compat/core/workload/${_c}.c LINKAGE static-pie FLAGS ${_o2}
     LIBS -pthread -lsqlite3 -lm -ldl)
 endforeach()
-foreach(_c ${CORE_WORKLOAD_BOTH} luajit_trace soak_smc smc_threads smc_selfflush)
+# smc_precise was dropped from this list while the case was `excluded-macos`; the
+# manifest re-activated it but the fixture was never registered, so on Linux the
+# runner launched a path that does not exist -> `execution failed status=6`
+# (HL_STATUS_NOT_FOUND from opening argv[0]), not the engine abort it was blamed on.
+foreach(_c ${CORE_WORKLOAD_BOTH} luajit_trace soak_smc smc_threads smc_selfflush smc_precise)
   if(EXISTS ${HL_TESTS}/compat/core/workload/${_c}.c)
     hl_guest_binary(aarch64 ${HL_COMPAT}/core/workload/aarch64/${_c}
       ${HL_TESTS}/compat/core/workload/${_c}.c LINKAGE static-pie FLAGS ${_o2} LIBS ${_ptm})
