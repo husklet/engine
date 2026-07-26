@@ -10,6 +10,14 @@
 #define G_FORK_PRESERVE(c) ((void)0)
 #endif
 
+// e_machine this engine can translate; execve rejects any other ELF with ENOEXEC. R_REPSTR is defined only
+// by the x86-64 frontend's cpu.h (the same discriminator the execve body already uses further down).
+#ifdef R_REPSTR
+#define HL_EXEC_ELF_MACHINE 0x3Eu // EM_X86_64
+#else
+#define HL_EXEC_ELF_MACHINE 0xB7u // EM_AARCH64
+#endif
+
 // execve env forwarding: serialize the guest's envp array into HL_GUEST_ENV (the "K=V\nK=V..." string
 // build_stack reads when laying out the new process stack), so the guest's actual environment crosses the
 // re-exec. A guest-initiated exec makes the guest's envp AUTHORITATIVE (like Linux): whatever the guest
@@ -2006,11 +2014,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             // not the host cwd. The old xresolve_overlay bailed on any non-'/' path and returned it raw,
             // so `./x` was access()'d against the host process cwd (never the mounted guest cwd) -> ENOENT.
             atpath(-100, (const char *)a0, pb, sizeof pb, 0);
-        // execve(2) error classification, matching Linux binfmt semantics, applied to the resolved target
-        // BEFORE the bare-mode authorized-executable gate below (which otherwise collapses every non-image
-        // target to a blanket ENOENT): a directory is EACCES, and a regular file that is neither an ELF nor
-        // a #! script is ENOEXEC. A missing path stat()s ENOENT and falls through to the existing paths.
-        // This only reclassifies the error the guest receives; it never authorizes running the target.
+        // execve(2) error classification, matching Linux binfmt semantics, applied to the resolved target:
+        // a directory is EACCES, and a regular file that is neither an ELF this engine can translate nor a
+        // #! script is ENOEXEC. A missing path stat()s ENOENT and falls through to the access() check below.
+        // A bare-mode (no-rootfs) launch used to additionally require the target to BE the launched image,
+        // collapsing every other target to ENOENT -- `sh -c 'exec bash'` reported "not found" while the same
+        // binary launched directly ran. The engine reads the target through the same host services either
+        // way, so the gate isolated nothing; an unreadable or unloadable image still fails right here.
         {
             struct stat xst;
             if (stat(p, &xst) == 0) {
@@ -2021,32 +2031,25 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                 if (S_ISREG(xst.st_mode)) {
                     FILE *xf = fopen(p, "rb");
                     if (xf) {
-                        unsigned char mag[4] = {0};
-                        size_t got = fread(mag, 1, sizeof mag, xf);
+                        unsigned char hdr[20] = {0};
+                        size_t got = fread(hdr, 1, sizeof hdr, xf);
                         fclose(xf);
-                        int is_elf = got >= 4 && mag[0] == 0x7f && mag[1] == 'E' && mag[2] == 'L' && mag[3] == 'F';
-                        int is_script = got >= 2 && mag[0] == '#' && mag[1] == '!';
+                        int is_elf = got >= 4 && hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F';
+                        int is_script = got >= 2 && hdr[0] == '#' && hdr[1] == '!';
                         if (!is_elf && !is_script) {
+                            G_RET(c) = (uint64_t)(int64_t)(-ENOEXEC);
+                            break;
+                        }
+                        // An ELF this engine cannot translate (32-bit, or a foreign e_machine) is ENOEXEC --
+                        // Linux reports that for an image no binfmt handler accepts. load_elf() would instead
+                        // exit(1) the whole engine, and the exec commit point below is past every return.
+                        if (is_elf && (got < 20 || hdr[4] != 2 ||
+                                       (unsigned)(hdr[18] | (hdr[19] << 8)) != HL_EXEC_ELF_MACHINE)) {
                             G_RET(c) = (uint64_t)(int64_t)(-ENOEXEC);
                             break;
                         }
                     }
                 }
-            }
-        }
-        if (!g_rootfs) {
-            char candidate[4200];
-            int authorized = g_authorized_executable_path[0] && realpath(p, candidate) != NULL &&
-                             strcmp(candidate, g_authorized_executable_path) == 0;
-            if (!authorized && !g_untrusted) {
-                char interpreter[4200], option[256], canonical[4200];
-                authorized = parse_shebang(p, interpreter, sizeof interpreter, option, sizeof option) == 1 &&
-                             realpath(interpreter, canonical) != NULL &&
-                             strcmp(canonical, g_authorized_executable_path) == 0;
-            }
-            if (!authorized) {
-                G_RET(c) = (uint64_t)(-2);
-                break;
             }
         }
         if (access(p, F_OK) != 0) {
