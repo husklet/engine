@@ -350,6 +350,8 @@ static int smc_on_write(uint64_t a) {
         if ((c)->smc_range_count || (c)->smc_range_overflow) jit86_smc_commit(c);                                     \
         service(c);                                                                                                    \
         if ((c)->exited) break;                                                                                        \
+        /* And after: the syscall's own copyout (G_SMC_COPYOUT) may have written an executable alias. */               \
+        if ((c)->smc_range_count || (c)->smc_range_overflow) jit86_smc_commit(c);                                     \
         if ((c)->redirect) (c)->redirect = 0; /* else rip already = next (set at exit) */                              \
     }                                                                                                                  \
     /* R_BRANCH: c->rip already holds the target */
