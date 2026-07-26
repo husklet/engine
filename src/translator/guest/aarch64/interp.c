@@ -1304,6 +1304,31 @@ static int interp_imm5_element(unsigned imm5, unsigned *size_out, unsigned *inde
     return 1;
 }
 
+// The by-element operand of the "vector x indexed element" box, keyed on the ELEMENT size (log2), not on the
+// encoding's `size` field -- half-precision FP spells H as size 00 but indexes like any 16-bit element.
+// THE PART THAT IS SILENT WHEN WRONG: the index field GROWS as the element shrinks, at Rm's expense.
+//   16-bit: index = H:L:M, so Rm is 4 bits -- only V0..V15 are addressable.
+//   32-bit: index = H:L,   Rm = M:Rm.
+//   64-bit: index = H,     Rm = M:Rm, and L must be 0.
+// Reading H:L for a 16-bit element takes the right value from the wrong lane, which most tests never see.
+static int interp_elem_index(uint32_t decode, unsigned size, unsigned *index_out, int *reg_out) {
+    unsigned l = (decode >> 21) & 1u, m = (decode >> 20) & 1u, h = (decode >> 11) & 1u;
+    unsigned low = (decode >> 16) & 0xFu;
+    if (size == 1u) {
+        *index_out = (h << 2) | (l << 1) | m;
+        *reg_out = (int)low;
+        return 1;
+    }
+    *reg_out = (int)(low | (m << 4));
+    if (size == 2u) {
+        *index_out = (h << 1) | l;
+        return 1;
+    }
+    if (size != 3u || l) return 0;
+    *index_out = h;
+    return 1;
+}
+
 static void interp_vec_load(struct cpu *cpu, int reg, uint64_t address, unsigned bytes) {
     interp_vec value;
     memset(value.byte, 0, sizeof value.byte);
@@ -2411,6 +2436,21 @@ static uint64_t interp_fp_muladd(unsigned fmt, uint64_t addend, uint64_t a, uint
     return interp_fp_postprocess(fmt, out, raised);
 }
 
+// FMULX is FMUL except at 0 * inf, which is the ONLY reason the instruction exists: it yields +-2.0 with no
+// Invalid, so a reciprocal-estimate refinement step stays finite at the extremes instead of turning into a NaN.
+static uint64_t interp_fp_mulx(unsigned fmt, uint64_t a, uint64_t b) {
+    a = interp_fp_flush_input(a, fmt);
+    b = interp_fp_flush_input(b, fmt);
+    uint64_t operands[2] = {a, b}, nan;
+    if (interp_fp_process_nans(fmt, 2, operands, &nan)) return nan;
+    unsigned class_a = interp_fp_class(a, fmt), class_b = interp_fp_class(b, fmt);
+    if ((class_a == INTERP_FPC_INF && class_b == INTERP_FPC_ZERO) ||
+        (class_a == INTERP_FPC_ZERO && class_b == INTERP_FPC_INF))
+        return ((a ^ b) & interp_fp_sign_mask(fmt)) |
+               ((uint64_t)(interp_fp_bias(fmt) + 1) << interp_fp_mant(fmt));
+    return interp_fp_arith(fmt, INTERP_FPOP_MUL, a, b);
+}
+
 // The NM forms swap a QUIET NaN for the losing infinity; a SIGNALLING NaN still propagates with Invalid.
 static uint64_t interp_fp_minmax(unsigned fmt, uint64_t a, uint64_t b, int want_max, int numeric) {
     a = interp_fp_flush_input(a, fmt);
@@ -2720,6 +2760,50 @@ static uint64_t interp_sat_narrow(uint64_t element, unsigned size, int source_si
         return mask;
     }
     return value;
+}
+
+// Saturating DOUBLING multiply. All three forms compute 2*a*b and differ only in what they keep, so they
+// share one 128-bit product: at esize 32 the doubling itself overflows int64 for INT32_MIN * INT32_MIN
+// (2 * 2^62 == 2^63), which is exactly the input that must saturate rather than wrap.
+static __int128 interp_sqdmul_wide(uint64_t a, uint64_t b, unsigned size) {
+    return (__int128)2 * (int64_t)interp_element_sext(a, size) * (int64_t)interp_element_sext(b, size);
+}
+
+static uint64_t interp_signed_sat(__int128 value, unsigned size) {
+    __int128 max = ((__int128)1 << ((8u << size) - 1u)) - 1, min = -max - 1;
+    if (value > max) {
+        interp_fpsr_raise(INTERP_FPSR_QC);
+        value = max;
+    } else if (value < min) {
+        interp_fpsr_raise(INTERP_FPSR_QC);
+        value = min;
+    }
+    return (uint64_t)value & interp_element_mask(size);
+}
+
+// SQDMULL: the doubled product kept at DOUBLE width. SQDMLAL/SQDMLSL saturate this, then saturate the
+// accumulate separately -- two independent chances to set QC.
+static uint64_t interp_sqdmull_element(uint64_t a, uint64_t b, unsigned size) {
+    return interp_signed_sat(interp_sqdmul_wide(a, b, size), size + 1u);
+}
+
+// SQDMULH keeps the HIGH half; SQRDMULH adds half an element first, so its tie rounds away from zero.
+static uint64_t interp_sqdmulh_element(uint64_t a, uint64_t b, unsigned size, int rounding) {
+    unsigned esize = 8u << size;
+    __int128 product = interp_sqdmul_wide(a, b, size);
+    if (rounding) product += (__int128)1 << (esize - 1u);
+    return interp_signed_sat(product >> esize, size);
+}
+
+// SQRDMLAH/SQRDMLSH (FEAT_RDM): the accumulator joins the doubled product SHIFTED UP by esize, so the
+// rounding constant and the single saturation see the whole expression -- not a saturated product plus a
+// saturated add, which is what SQDMLAL does and what gives the two forms different results.
+static uint64_t interp_sqrdmlah_element(uint64_t accumulator, uint64_t a, uint64_t b, unsigned size, int subtract) {
+    unsigned esize = 8u << size;
+    __int128 product = interp_sqdmul_wide(a, b, size);
+    __int128 total = ((__int128)(int64_t)interp_element_sext(accumulator, size) << esize) +
+                     (subtract ? -product : product) + ((__int128)1 << (esize - 1u));
+    return interp_signed_sat(total >> esize, size);
 }
 
 static void interp_poly_mul(uint64_t a, uint64_t b, unsigned bits, uint64_t *low, uint64_t *high) {
@@ -4116,7 +4200,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         }
         if (size == 3)
             return interp_undefined(cpu, insn, "AdvSIMD three different -- 64-bit narrow element is reserved");
-        unsigned wide = size + 1u, lanes = 64u / (8u << size);
+        unsigned wide = size + 1u, lanes = scalar ? 1u : 64u / (8u << size);
         uint64_t narrow_mask = interp_element_mask(size), wide_mask = interp_element_mask(wide);
         interp_vec result;
         memset(result.byte, 0, sizeof result.byte);
@@ -4174,6 +4258,19 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 value = opcode == 0x8 ? base + product : (opcode == 0xA ? base - product : product);
                 break;
             }
+            case 0x9:   // SQDMLAL / SQDMLAL2
+            case 0xB:   // SQDMLSL / SQDMLSL2
+            case 0xD: { // SQDMULL / SQDMULL2
+                // Signed only; U=1 is unallocated. Two saturations for the accumulating forms: the doubled
+                // product first, then the accumulate -- either can set QC.
+                if (u || size == 0)
+                    return interp_undefined(cpu, insn, "AdvSIMD three different -- unallocated doubling form");
+                uint64_t product = interp_sqdmull_element(a, b, size);
+                value = opcode == 0xD ? product
+                                      : interp_sqadd_element(interp_vec_element(&destination, wide, lane), product,
+                                                             wide, opcode == 0xB);
+                break;
+            }
             case 0xE: { // PMULL 8x8 -> 16
                 if (u || size != 0)
                     return interp_undefined(cpu, insn, "AdvSIMD three different -- unallocated PMULL form");
@@ -4182,10 +4279,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 value = low;
                 break;
             }
-            default:
-                return interp_undefined(cpu, insn,
-                                        "AdvSIMD three different -- saturating doubling form (SQDMULL/SQDMLAL/"
-                                        "SQDMLSL)");
+            default: return interp_undefined(cpu, insn, "AdvSIMD three different -- unallocated opcode");
             }
             interp_vec_set_element(&result, wide, lane, value & wide_mask);
         }
@@ -4248,8 +4342,9 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                         value = interp_fp_arith(fmt, high ? INTERP_FPOP_SUB : INTERP_FPOP_ADD, a, b);
                         break; // FADD / FSUB
                     case 0x1B:
-                        // FMULX: one step of a reciprocal iteration whose other steps are declined too.
-                        return interp_undefined(cpu, insn, "AdvSIMD three same -- FMULX");
+                        if (high) return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated FP opcode");
+                        value = interp_fp_mulx(fmt, a, b);
+                        break;   // FMULX
                     case 0x1C: { // FCMEQ (register)
                         if (high) return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated FP opcode");
                         interp_fp_compare(cpu, fmt, a, b, 0);
@@ -4457,24 +4552,10 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         case 0x16: { // SQDMULH / SQRDMULH
             if (size == 0 || size == 3)
                 return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated SQDMULH element size");
-            unsigned esize = 8u << size;
-            for (unsigned lane = 0; lane < lanes; lane++) {
-                int64_t x = (int64_t)interp_element_sext(interp_vec_element(&left, size, lane), size);
-                int64_t y = (int64_t)interp_element_sext(interp_vec_element(&right, size, lane), size);
-                // esize is 16 or 32: 2*x*y fits in int64.
-                int64_t product = 2 * x * y;
-                if (u) product += (int64_t)(UINT64_C(1) << (esize - 1u)); // SQRDMULH rounds
-                int64_t narrowed = product >> esize;
-                int64_t max = (int64_t)((UINT64_C(1) << (esize - 1u)) - 1u), min = -max - 1;
-                if (narrowed > max) {
-                    interp_fpsr_raise(INTERP_FPSR_QC);
-                    narrowed = max;
-                } else if (narrowed < min) {
-                    interp_fpsr_raise(INTERP_FPSR_QC);
-                    narrowed = min;
-                }
-                interp_vec_set_element(&result, size, lane, (uint64_t)narrowed & mask);
-            }
+            for (unsigned lane = 0; lane < lanes; lane++)
+                interp_vec_set_element(&result, size, lane,
+                                       interp_sqdmulh_element(interp_vec_element(&left, size, lane),
+                                                              interp_vec_element(&right, size, lane), size, u));
             break;
         }
         case 0x06:   // CMGT (U=0) / CMHI (U=1)
@@ -4647,14 +4728,29 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
         }
-        // SQRDMLAH/SQRDMLSH (FEAT_RDM), FCMLA/FCADD (FEAT_FCMA) and the BF16 forms share this box; none of
-        // the three is advertised in the CPU model, so they keep the honest gap report.
-        return interp_undefined(cpu, insn,
-                               "AdvSIMD three-same-extra (SQRDMLAH, FCMLA/FCADD, BFDOT/BFMMLA)");
+        // SQRDMLAH / SQRDMLSH (FEAT_RDM): opcode 0000/0001 at U=1, 16- or 32-bit elements, scalar forms too.
+        if (u && opcode <= 1u && (size == 1u || size == 2u)) {
+            interp_vec left = interp_vec_read(cpu, rn), right = interp_vec_read(cpu, rm);
+            interp_vec accumulate = interp_vec_read(cpu, rd), result;
+            memset(result.byte, 0, sizeof result.byte);
+            for (unsigned lane = 0; lane < (scalar ? 1u : interp_vec_lanes(size, q)); lane++)
+                interp_vec_set_element(&result, size, lane,
+                                       interp_sqrdmlah_element(interp_vec_element(&accumulate, size, lane),
+                                                               interp_vec_element(&left, size, lane),
+                                                               interp_vec_element(&right, size, lane), size, opcode));
+            interp_vec_write(cpu, rd, result, q);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        // FCMLA/FCADD (FEAT_FCMA) and the BF16/FP8 forms share this box and stay an honest gap report.
+        return interp_undefined(cpu, insn, "AdvSIMD three-same-extra (FCMLA/FCADD, BFDOT/BFMMLA, FP8)");
     }
 
-    // AdvSIMD vector x indexed element. Only the FEAT_DotProd / FEAT_I8MM byte dot products are decoded here;
-    // the rest of the box (indexed FMLA/MLA/MUL/SQDMULL ...) is still a gap and reports as one.
+    // AdvSIMD vector x indexed element -- the box every compiled `*_lane` intrinsic lands in. `size` names the
+    // integer element (01 = H, 10 = S) but the FP FORMAT for FMLA/FMLS/FMUL/FMULX (00 = H, 10 = S, 11 = D);
+    // interp_elem_index() is keyed on the resulting element size, which is what the index split follows.
+    // Still reported: FEAT_FHM (FMLAL/FMLSL, opcode 0000/0100/1000/1100 at size 10), FEAT_FCMA (FCMLA, U=1 odd
+    // opcodes), FEAT_BF16 (BFDOT/BFMLAL at opcode 1111, size 01/11) and the FEAT_FP8 forms at size 11.
     if ((decode & 0x9F000400u) == 0x0F000000u) {
         unsigned opcode = (decode >> 12) & 0xFu, size = (decode >> 22) & 3u;
         // The by-element spelling shifts the vector opcodes one nibble up: 1110 is SDOT/UDOT, and 1111 is
@@ -4675,7 +4771,101 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
         }
-        return interp_undefined(cpu, insn, "AdvSIMD vector x indexed element");
+
+        // FMLA / FMLS / FMUL (U=0, opcode 0001/0101/1001) and FMULX (U=1, opcode 1001). size 01 is the FEAT_FP8
+        // FDOT/FMLALL box, not these.
+        if (size != 1u && ((!u && (opcode == 0x1u || opcode == 0x5u || opcode == 0x9u)) || (u && opcode == 0x9u))) {
+            unsigned fmt = size == 0u ? INTERP_FP_H : (size == 2u ? INTERP_FP_S : INTERP_FP_D);
+            unsigned element = fmt + 1u, index;
+            int vm;
+            if (!interp_elem_index(decode, element, &index, &vm))
+                return interp_undefined(cpu, insn, "AdvSIMD by element -- a 64-bit index needs L == 0");
+            if (fmt == INTERP_FP_D && !q && !scalar)
+                return interp_undefined(cpu, insn, "AdvSIMD by element -- 2D form requires Q");
+            interp_vec left = interp_vec_read(cpu, rn), right = interp_vec_read(cpu, vm), result;
+            interp_vec accumulate = interp_vec_read(cpu, rd);
+            memset(result.byte, 0, sizeof result.byte);
+            uint64_t b = interp_vec_element(&right, element, index);
+            for (unsigned lane = 0; lane < (scalar ? 1u : interp_vec_lanes(element, q)); lane++) {
+                uint64_t a = interp_vec_element(&left, element, lane), value;
+                if (opcode == 0x9u)
+                    value = u ? interp_fp_mulx(fmt, a, b) : interp_fp_arith(fmt, INTERP_FPOP_MUL, a, b);
+                else
+                    // FUSED: one rounding of Vd + (+-Vn[lane])*Vm[index]. Multiply-then-add is wrong in the
+                    // last bit and a fixture that only checks a few digits will not notice.
+                    value = interp_fp_muladd(fmt, interp_vec_element(&accumulate, element, lane),
+                                             opcode == 0x5u ? (a ^ interp_fp_sign_mask(fmt)) : a, b);
+                interp_vec_set_element(&result, element, lane, value);
+            }
+            interp_vec_write(cpu, rd, result, q);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+
+        // The integer forms, all of them 16- or 32-bit elements only.
+        int mla = u && opcode == 0x0u, mls = u && opcode == 0x4u, mul = !u && opcode == 0x8u;
+        int mulh = !u && (opcode == 0xCu || opcode == 0xDu);                       // SQDMULH / SQRDMULH
+        int rdm = u && (opcode == 0xDu || opcode == 0xFu);                         // SQRDMLAH / SQRDMLSH (FEAT_RDM)
+        int wide_acc = opcode == 0x2u || opcode == 0x6u;                           // S/UMLAL, S/UMLSL
+        int wide_mul = opcode == 0xAu;                                             // S/UMULL
+        int wide_sat = !u && (opcode == 0x3u || opcode == 0x7u || opcode == 0xBu); // SQDML{A,S}L, SQDMULL
+        if ((size == 1u || size == 2u) && (mla || mls || mul || mulh || rdm || wide_acc || wide_mul || wide_sat)) {
+            // Only the SATURATING forms have scalar spellings; a scalar MUL/MLA/MLAL encoding is unallocated
+            // and must not fall through the scalar normalisation into the vector one.
+            if (scalar && !(mulh || rdm || wide_sat))
+                return interp_undefined(cpu, insn, "AdvSIMD by element -- no scalar form for this opcode");
+            unsigned index;
+            int vm;
+            interp_elem_index(decode, size, &index, &vm);
+            interp_vec left = interp_vec_read(cpu, rn), right = interp_vec_read(cpu, vm), result;
+            interp_vec accumulate = interp_vec_read(cpu, rd);
+            memset(result.byte, 0, sizeof result.byte);
+            uint64_t b = interp_vec_element(&right, size, index), mask = interp_element_mask(size);
+            int widening = wide_acc || wide_mul || wide_sat;
+            unsigned wide = size + 1u,
+                     lanes = scalar ? 1u : (widening ? 64u / (8u << size) : interp_vec_lanes(size, q));
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                // The "2" mnemonics: Q picks WHICH half of Vn the narrow operands come from.
+                uint64_t a = interp_vec_element(&left, size, widening && q ? lane + lanes : lane);
+                if (!widening) {
+                    uint64_t value;
+                    if (mulh)
+                        value = interp_sqdmulh_element(a, b, size, opcode == 0xDu);
+                    else if (rdm)
+                        value = interp_sqrdmlah_element(interp_vec_element(&accumulate, size, lane), a, b, size,
+                                                        opcode == 0xFu);
+                    else {
+                        uint64_t product = (uint64_t)((int64_t)interp_element_sext(a, size) *
+                                                      (int64_t)interp_element_sext(b, size));
+                        uint64_t base = interp_vec_element(&accumulate, size, lane);
+                        value = mla ? base + product : (mls ? base - product : product);
+                    }
+                    interp_vec_set_element(&result, size, lane, value & mask);
+                    continue;
+                }
+                uint64_t value;
+                if (wide_sat) {
+                    uint64_t product = interp_sqdmull_element(a, b, size);
+                    value = opcode == 0xBu ? product
+                                           : interp_sqadd_element(interp_vec_element(&accumulate, wide, lane),
+                                                                  product, wide, opcode == 0x7u);
+                } else {
+                    uint64_t product = u ? (a & mask) * (b & mask)
+                                         : (uint64_t)((int64_t)interp_element_sext(a, size) *
+                                                      (int64_t)interp_element_sext(b, size));
+                    uint64_t base = interp_vec_element(&accumulate, wide, lane);
+                    value = opcode == 0x2u ? base + product : (opcode == 0x6u ? base - product : product);
+                }
+                interp_vec_set_element(&result, wide, lane, value & interp_element_mask(wide));
+            }
+            // A widening result is always 128-bit; the scalar spelling zeroes above its one element either way.
+            interp_vec_write(cpu, rd, result, widening ? 1u : q);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        return interp_undefined(cpu, insn,
+                                "AdvSIMD vector x indexed element -- FMLAL/FMLSL, FCMLA, BFDOT/BFMLAL, FP8, "
+                                "or unallocated");
     }
 
     return interp_undefined(cpu, insn, "scalar floating-point and Advanced SIMD");
