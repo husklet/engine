@@ -185,8 +185,15 @@ if(HL_BUILD_TESTS)
       -DCODESIGN=${HL_CODESIGN}
       -DJIT_ENTITLEMENTS=${HL_JIT_ENTITLEMENTS}
       -P ${CMAKE_SOURCE_DIR}/cmake/PackageTest.cmake)
+  # TIMEOUT well under the CI step's own bound (tools/ci_run.sh gives the lane
+  # 1320s). CTest's 1500s default is larger than that bound, so a hung guest
+  # launch in the activation leg expired the STEP first: the annotation said
+  # "TIMED OUT" with no test named, and the driver's progress output was lost.
+  # Expiring here instead makes ctest print "package.consumer-link (Timeout)"
+  # plus everything the driver had printed up to the step that hung.
   set_tests_properties(package.consumer-link PROPERTIES
-    LABELS "package" RESOURCE_LOCK hl-package WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    LABELS "package" RESOURCE_LOCK hl-package TIMEOUT 900
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
   # package-activation: the installed activation library, self-test plus the
   # guest-execution leg (posix_spawn-self path).

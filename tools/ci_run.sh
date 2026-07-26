@@ -51,8 +51,16 @@ fi
 # cargo that is the assertion, its left/right values, and the note. `---- x ----`
 # and `test result: FAILED` carry the failing test's name and the pass/fail
 # counts; SKIP lines say which runtime self-skips fired on this host.
+#
+# `CMake Error` and its indented continuation carry the ONLY statement of why a
+# script-mode CTest driver (cmake/PackageTest.cmake) stopped -- the failing argv
+# and its exit status. Without them a ctest lane annotated only "N - <test>
+# (Failed)" plus ctest's own exit 8, which names the test but not one fact about
+# the failure. Keep the eight lines after the header: CMake wraps the message
+# text and then prints the `Call Stack` frame that locates the step.
 detail=$(awk '
 	/^(test .+ (FAILED|panicked)|test result: FAILED|failures:|---- .+ ----|error(\[|:)|ERROR:|The following tests FAILED|VIOLATION:)/ { print; next }
+	/^CMake Error/          { print; window = 8; next }
 	/^[[:space:]]*(SKIP|assertion) /                                                                                              { print; next }
 	/^[[:space:]]+[0-9]+ - .+(Failed|Timeout)/                                                                                    { print; next }
 	/^make(\[[0-9]+\])?: \*\*\*/                                                                                            { print; next }
