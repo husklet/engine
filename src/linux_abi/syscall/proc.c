@@ -814,12 +814,8 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         const uintptr_t private_tag = UINT64_C(0x8000000000000000);
         const void *primary_key = is_private ? (const void *)(uintptr_t)(a0 ^ private_tag) : primary;
         const void *secondary_key = is_private ? (const void *)(uintptr_t)(a4 ^ private_tag) : secondary;
-        long hl_dbg_futex = futex_op(c, primary, primary_key, operation, is_private, (int)a2, timeout, (int)a3,
+        G_RET(c) = (uint64_t)futex_op(c, primary, primary_key, operation, is_private, (int)a2, timeout, (int)a3,
                                       secondary, secondary_key, (uint32_t)a5);
-        if (getenv("HL_DBG_FUTEX"))
-            fprintf(stderr, "[dbg] futex tid=%d op=%d priv=%d val=%d ts=%p ret=%ld\n", (int)c->tid, operation,
-                    is_private, (int)a2, (void *)timeout, hl_dbg_futex);
-        G_RET(c) = (uint64_t)hl_dbg_futex;
         hl_logical_vma_unpin(&timeout_pin);
         hl_logical_vma_unpin(&secondary_pin);
         hl_logical_vma_unpin(&primary_pin);

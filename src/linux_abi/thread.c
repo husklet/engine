@@ -1313,6 +1313,21 @@ static int gna_hit(uint64_t a, uint64_t len) {
     return 0;
 }
 
+// True iff EVERY guest page of [a,a+len) lies in a tracked guest PROT_NONE region -- the whole-mapping
+// question, which gna_hit ("any byte") cannot answer and must not be used for. The distinction matters
+// wherever a decision is taken about a MAPPING rather than about one access: glibc's pthread stack is a
+// single mmap whose FIRST page is the PROT_NONE guard and whose remaining megabytes are ordinary readable
+// stack, so gna_hit is true for a mapping that is almost entirely accessible. Walks pages rather than
+// looking for one covering interval, because a PROT_NONE reservation the guest mprotect'd in pieces is
+// tracked as several adjacent intervals that gna_add does not coalesce.
+static int gna_all(uint64_t a, uint64_t len) {
+    if (!len || __atomic_load_n(&g_ngna, __ATOMIC_ACQUIRE) == 0) return 0;
+    uint64_t end = a + len;
+    for (uint64_t page = a & ~(uint64_t)0xfff; page < end; page += 0x1000)
+        if (!gna_hit(page, 1)) return 0;
+    return 1;
+}
+
 // How many LEADING bytes of [a,a+len) are outside every tracked guest PROT_NONE region. Linux's
 // copy_to_user is byte-granular: a read(2) whose destination straddles a PROT_NONE page copies the good
 // prefix and returns that SHORT count, reporting EFAULT only when the prefix is empty. gna_hit alone

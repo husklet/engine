@@ -1810,7 +1810,15 @@ static int ckpt_dump_pages(struct ckpt_sink *sink, struct ckpt_sink_stream *f, s
         reg.len = len;
         reg.glen = glen;
         reg.prot = ckpt_region_prot(addr, glen);
-        reg.is_gna = gna_hit(addr, 1);
+        // is_gna is a WHOLE-REGION claim -- restore answers it with gna_add over [addr, addr+glen) -- so it
+        // must be asked as one. The old gna_hit(addr, 1) asked whether the region's FIRST PAGE is guest-
+        // PROT_NONE, which is true of every glibc pthread stack: allocate_stack mmaps the block readable and
+        // then mprotects its lowest page into the guard, so the mapping begins PROT_NONE and continues as
+        // megabytes of ordinary stack. Restore then poisoned the entire stack, and every syscall handing the
+        // kernel a pointer into that thread's stack came back -EFAULT: pthread_join's futex on &pd->tid (the
+        // thread descriptor lives at the TOP of the block) returned EFAULT, which glibc treats as a fatal
+        // "futex facility returned an unexpected error code" and aborts on. That is checkpoint.*.threads.
+        reg.is_gna = gna_all(addr, glen ? glen : 1);
         pthread_mutex_lock(&g_filemap_lock);
         for (int map_index = 0; map_index < g_nfilemap; map_index++) {
             struct guest_file_mapping *filemap = &g_filemap[map_index];
@@ -2500,6 +2508,12 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
         hl_linux_snapshot_advance(&g_ckpt_snapshot, reg.addr + reg.len);
         hl_gmap_add(reg.addr, reg.len);
         hl_gmap_set_guest_length(reg.addr, reg.glen);
+        // The record carries ONE protection verdict per gmap region, so a region the guest mprotect'd in
+        // pieces cannot round-trip its PROT_NONE sub-intervals: they are dropped here, and a syscall buffer
+        // landing on a restored guard page reads as accessible instead of -EFAULT. That is a small, bounded
+        // loss of fidelity in the EFAULT oracle; recovering it needs the region record to carry the
+        // sub-intervals, which is a format change. Do NOT "fix" it by widening the claim back to any-page
+        // (see the gna_all call in ckpt_dump_pages): whole-region poisoning is far worse than under-reporting.
         if (reg.is_gna)
             gna_add(reg.addr & ~(uint64_t)0xfff, (reg.addr + reg.glen + 0xfff) & ~(uint64_t)0xfff);
         else
@@ -4193,8 +4207,21 @@ static int ckpt_restore_right_prepare(const struct ckpt_fd *record) {
                        (unsigned long long)record->ofd_id), -1;
     int fd = -1;
     if (record->kind == CKF_EPOLL) {
-        fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
-        if (fd < 0) return -1;
+        // A queued epoll right travels as a placeholder descriptor plus a marker the receiver expands, so any
+        // open descriptor will do. It must NOT be left where open(2) put it: this runs in the init before
+        // ckpt_fork_children, every re-forked process inherits the number, and ckpt_restore_socket_seeds_close
+        // closes it AFTER ckpt_restore_fds_dir has dup2'd the guest's own descriptors into place -- so a
+        // placeholder sitting on a low number silently destroys whichever guest descriptor now owns it.
+        // (checkpoint.*.socketpair: the placeholder landed on 4, which is the child's socketpair endpoint;
+        // recv() then reported ENOTSOCK on the eventfd the guest received into the freed slot.) Every other
+        // queued right is already hoisted into the private high band; this one was the exception.
+        int placeholder = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (placeholder < 0) return -1;
+        fd = hl_host_process_fd_private_adopt(placeholder);
+        if (fd < 0) {
+            close(placeholder);
+            return -1;
+        }
         g_restore_rights[g_nrestore_rights++] =
             (struct ckpt_restore_right){record->ofd_id, record->object_id, fd, 1};
         return fd;

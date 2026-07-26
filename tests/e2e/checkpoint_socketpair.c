@@ -53,18 +53,9 @@ static int receive_exact(int fd, const char *expected, int message) {
             usleep(10000);
             continue;
         }
-        if (count < 0) { dprintf(STDERR_FILENO, "DBG recv fd=%d err=%d\n", fd, errno); return -1; }
-        if (message) {
-            if ((size_t)count == wanted && memcmp(buffer, expected, wanted) == 0) return 0;
-            dprintf(STDERR_FILENO, "DBG msg fd=%d want=%s got=%d[%.*s]\n", fd, expected, (int)count, (int)count,
-                    buffer);
-            return -1;
-        }
-        if ((size_t)count != wanted || memcmp(buffer, expected, wanted) != 0) {
-            dprintf(STDERR_FILENO, "DBG str fd=%d want=%s got=%d[%.*s]\n", fd, expected, (int)count, (int)count,
-                    buffer);
-            return -1;
-        }
+        if (count < 0) return -1;
+        if (message) return (size_t)count == wanted && memcmp(buffer, expected, wanted) == 0 ? 0 : -1;
+        if ((size_t)count != wanted || memcmp(buffer, expected, wanted) != 0) return -1;
         return 0;
     }
     return -1;
