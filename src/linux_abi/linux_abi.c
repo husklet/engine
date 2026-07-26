@@ -2034,6 +2034,13 @@ int64_t hl_linux_lseek(hl_linux_abi *linux_abi, hl_linux_fd fd, int64_t offset, 
         host_result = files->seek(linux_abi->host->context, ofd->host_handle, offset, (uint32_t)whence);
         result = host_result.status == HL_STATUS_OK ? (int64_t)host_result.value
                                                     : hl_linux_error((hl_status)host_result.status);
+        /* Linux reports an out-of-range SEEK_DATA/SEEK_HOLE offset -- negative, or at/past EOF -- as
+           ENXIO. No hl_status models ENXIO, so hl_linux_status_from_errno collapsed it to
+           HL_STATUS_IO and the guest saw EIO instead (core/syscall/lseekhole `negative`). The host
+           services carry the raw errno in `detail`, and ENXIO is 6 on both hosts. */
+        if (host_result.status == HL_STATUS_IO && host_result.detail == (uint64_t)HL_LINUX_ENXIO &&
+            (whence == HL_LINUX_SEEK_DATA || whence == HL_LINUX_SEEK_HOLE))
+            result = -HL_LINUX_ENXIO;
         if (host_result.status == HL_STATUS_OK && host_result.value > INT64_MAX) result = -HL_LINUX_EOVERFLOW;
         if (host_result.status == HL_STATUS_OK && host_result.value <= INT64_MAX) ofd->offset = host_result.value;
     }
