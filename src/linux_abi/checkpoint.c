@@ -3239,7 +3239,11 @@ static int ckpt_restore_fds_dir(const char *procdir) {
                     close(timer);
                     return -1;
                 }
-                if (source >= 0) hl_native_kqueue_duplicate(source, r.gfd);
+                // dup2 moved the timer onto the guest's fd number. On a host whose kqueue is a shim over
+                // epoll the queue's identity is keyed by the descriptor NUMBER, so the shim has to be told:
+                // otherwise the arming kevent() below addresses an unknown descriptor and fails EBADF. That
+                // is exactly what broke checkpoint.*.timerfd on an x86-64 Linux host.
+                hl_native_kqueue_relocate(timer, r.gfd);
                 close(timer);
             }
             if (fcntl(r.gfd, F_SETFD, (r.descriptor_flags & FD_CLOEXEC) ? FD_CLOEXEC : 0) != 0) {
@@ -3514,7 +3518,10 @@ static int ckpt_restore_fds_dir(const char *procdir) {
                 close(instance);
                 return -1;
             }
-            if (source >= 0) hl_native_kqueue_duplicate(source, r.gfd);
+            // Same descriptor-number identity as the timerfd path above: tell a shim kqueue that its queue
+            // now answers to the guest's fd number, or ckpt_restore_epoll_watches's kevent() sees an unknown
+            // descriptor and the whole restore fails with "init descriptor restore failed".
+            hl_native_kqueue_relocate(instance, r.gfd);
             close(instance);
         }
         if (fcntl(r.gfd, F_SETFD, (r.descriptor_flags & FD_CLOEXEC) ? FD_CLOEXEC : 0) != 0) return -1;
@@ -4458,9 +4465,15 @@ static int ckpt_restore_right_prepare(const struct ckpt_fd *record) {
             if (timer < 0) return -1;
             timerfd->fd = hl_host_process_fd_private_adopt(timer);
             if (timerfd->fd < 0) {
+                hl_native_kqueue_close(timer);
                 close(timer);
                 return -1;
             }
+            // adopt() hoists the descriptor into the engine's private high band with F_DUPFD_CLOEXEC and
+            // closes the original, so a shim kqueue (keyed by descriptor number) has to be moved with it --
+            // otherwise the arming kevent() below fails EBADF and the queued SCM_RIGHTS timerfd cannot be
+            // rebuilt (checkpoint.*.socketpair on an x86-64 Linux host).
+            hl_native_kqueue_relocate(timer, timerfd->fd);
             timerfd->slot = timerfd->fd;
             struct timespec now;
             hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
@@ -4819,13 +4832,30 @@ static int ckpt_restore_socket_queue_load(struct ckpt_restore_socket_endpoint *e
     return 0;
 }
 
+// SO_RCVBUF/SO_SNDBUF do not round-trip through get/setsockopt on Linux: the kernel stores twice what
+// setsockopt is given (the doubling covers sk_buff bookkeeping, see socket(7)) and getsockopt reports the
+// stored, doubled value. Capture reads with getsockopt, so feeding that number straight back to setsockopt
+// doubles the buffer on every checkpoint generation -- checkpoint.*.connected-socket set 196608, saw the
+// captured 393216, and after restore observed 786432. Halve on the way in so the kernel's doubling
+// reproduces the captured value. The kernel clamps at SOCK_MIN_{RCV,SND}BUF exactly as it did when the guest
+// first set the option, so a small buffer still lands where it landed before. macOS stores what it is given,
+// so the value must NOT be halved there.
+static int ckpt_restore_socket_buffer(int fd, int name, int32_t captured) {
+    int value = captured;
+#if defined(__linux__)
+    value = captured / 2;
+#endif
+    return setsockopt(fd, SOL_SOCKET, name, &value, sizeof value);
+}
+
 static int ckpt_restore_socket_options(int fd, const struct ckpt_socket_state *state) {
 #define CKPT_RESTORE_SOCKET_OPTION(name, field)                                                                       \
     do {                                                                                                               \
         if (setsockopt(fd, SOL_SOCKET, name, &state->field, sizeof state->field) != 0) return -1;                     \
     } while (0)
-    CKPT_RESTORE_SOCKET_OPTION(SO_RCVBUF, receive_buffer);
-    CKPT_RESTORE_SOCKET_OPTION(SO_SNDBUF, send_buffer);
+    if (ckpt_restore_socket_buffer(fd, SO_RCVBUF, state->receive_buffer) != 0 ||
+        ckpt_restore_socket_buffer(fd, SO_SNDBUF, state->send_buffer) != 0)
+        return -1;
     CKPT_RESTORE_SOCKET_OPTION(SO_REUSEADDR, reuse_address);
     CKPT_RESTORE_SOCKET_OPTION(SO_REUSEPORT, reuse_port);
     CKPT_RESTORE_SOCKET_OPTION(SO_KEEPALIVE, keepalive);

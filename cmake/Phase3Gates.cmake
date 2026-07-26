@@ -747,5 +747,61 @@ add_custom_target(bench
   DEPENDS bench-runner
   COMMENT "fair combined self-timing bench (see tools/bench/README.md)")
 
+# ===========================================================================
+# 9. the host-backend timeout scale, for the lanes not driven by matrix-runner
+# ===========================================================================
+# hl_matrix_timeout_scale() (cmake/Phase3Compat.cmake, where HL_MATRIX_TIMEOUT_SCALE
+# and the reasoning behind the factor live) already covers the compat suites and
+# the production-full lanes. The four runners registered ABOVE carry per-case
+# budgets of their own -- e2e-runner 30s, config-e2e-runner 30s, rootfs-e2e-runner
+# 30s, checkpoint-tree-runner 15s -- and were left out of that change, which on an
+# x86_64 host leaves ~150 tests killing correct-but-interpreted guests and
+# reporting a hang. They now read the SAME variable: one knob for the whole
+# harness, because four would let the lanes drift out of step, and a guest is
+# allowed exactly one answer to "how long may this take on this host".
+#
+# BOTH layers move together or neither is fixed. The runner's own budget fires
+# first, so scaling only the CTest TIMEOUT changes nothing; scaling only the
+# runner's lets CTest kill the whole test before any case names itself, which is
+# strictly worse than the bug. hl_matrix_timeout_scale() is the single place that
+# does both, which is why it is reused verbatim rather than reimplemented here.
+#
+# Selected by name from the directory's TESTS property, the same idiom the
+# isa-fuzz block above uses, rather than by repeating the four case lists:
+# a scenario added to section 5 or a case added to HL_E2E_CASES must not be able
+# to become the one test in its lane that still has an unscaled budget. Each
+# pattern is asserted non-empty so a rename cannot silently empty the sweep.
+#
+#   e2e-oracle.*             68 cases  -> tools/e2e_runner.c            (30s)
+#   production.config-*       3 cases  -> tools/config_e2e_runner.c     (30s)
+#   perf.linux-warm-cache-*   2 cases  -> the same runner as its payload, so the
+#                                         same budget; matches the .record-only
+#                                         spelling this host uses as well
+#   dynamic-e2e.*             2 cases  -> tools/rootfs_e2e_runner.c     (30s)
+#   checkpoint.*             78 cases  -> tests/integration/checkpoint_tree_runner.c (15s)
+#
+# At scale 1 hl_matrix_timeout_scale() writes nothing, so the aarch64 lanes'
+# generated CTestTestfile.cmake is byte-identical with this block present.
+set(_hl_scaled_patterns
+  "^e2e-oracle\\."
+  "^production\\.config-"
+  "^perf\\.linux-warm-cache-"
+  "^dynamic-e2e\\."
+  "^checkpoint\\.")
+get_property(_hl_lane_tests DIRECTORY PROPERTY TESTS)
+foreach(_pattern IN LISTS _hl_scaled_patterns)
+  set(_hl_matched "")
+  foreach(_t IN LISTS _hl_lane_tests)
+    if(_t MATCHES "${_pattern}")
+      list(APPEND _hl_matched ${_t})
+    endif()
+  endforeach()
+  if(NOT _hl_matched)
+    message(FATAL_ERROR
+      "HL_MATRIX_TIMEOUT_SCALE: no registered test matches '${_pattern}'. The lane was renamed or moved; "
+      "fix the pattern rather than leaving its per-case timeout unscaled on an interpreting host.")
+  endif()
+  hl_matrix_timeout_scale(${_hl_matched})
+endforeach()
 
 endif() # native Linux lane

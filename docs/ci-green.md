@@ -49,7 +49,7 @@ writes nothing at 1, and the enforced perf command line is unchanged).
 
 | Gate | aarch64 host | x86_64 host | What names it in the output |
 |---|---|---|---|
-| per-case guest timeout (`tools/matrix_runner.c` 120s, `tools/linux_matrix.c` 20s) | unchanged | multiplied by `HL_MATRIX_TIMEOUT_SCALE` (30), and so is the CTest `TIMEOUT` of the 73 tests those two runners drive | `per-case timeout scaled x30 ...` on stdout at the start of the run, repeated after the pass/fail summary; a timeout diagnostic names the budget that expired |
+| per-case guest timeout (`matrix_runner.c` 120s, `linux_matrix.c` 20s, `e2e_runner.c`/`config_e2e_runner.c`/`rootfs_e2e_runner.c` 30s, `checkpoint_tree_runner.c` 15s) | unchanged | multiplied by `HL_MATRIX_TIMEOUT_SCALE` (30), and so is the CTest `TIMEOUT` of the 226 tests the six runners drive | `per-case timeout scaled x30 ...` on stdout at the start of the run, repeated after the pass/fail summary; a timeout diagnostic names the budget that expired |
 | tracked cold/p99 perf thresholds (`PERF_LIMIT_*`, `cmake/Phase3Gates.cmake`) | enforced, 26 cases | recorded, not enforced (`HL_PERF_ENFORCE=OFF`) | the case is *named* `perf.linux-<case>-<arch>.record-only`, and echoes `RECORD-ONLY ...: measured but NOT gated` with the thresholds that were not applied |
 
 ### Why the timeout is scaled rather than raised for everyone

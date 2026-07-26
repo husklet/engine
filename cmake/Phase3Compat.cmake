@@ -441,11 +441,11 @@ if(NOT HL_MATRIX_TIMEOUT_SCALE MATCHES "^[1-9][0-9]*$" OR HL_MATRIX_TIMEOUT_SCAL
 endif()
 
 # hl_matrix_timeout_scale(<test> ...)
-#   Scales the CTest budget of tests driven by matrix-runner / linux-matrix and
-#   hands them the factor. Both layers have to move together: a per-case budget
-#   of 20s x 30 buys nothing if CTest kills the whole suite at its own TIMEOUT
-#   first, and that failure is worse than the one being fixed -- CTest reports
-#   the suite, so no case is named at all.
+#   Scales the CTest budget of every runner-driven lane -- matrix-runner and
+#   linux-matrix here, the four e2e/checkpoint runners registered in
+#   Phase3Gates.cmake -- and hands it the factor. Both layers have to move
+#   together: a per-case budget of 20s x 30 buys nothing if CTest kills the whole
+#   test at its own TIMEOUT first, and that is worse -- no case is named at all.
 #
 #   At scale 1 this function writes NOTHING. That is the point: the aarch64
 #   lanes' generated CTestTestfile.cmake is byte-identical to what it was before

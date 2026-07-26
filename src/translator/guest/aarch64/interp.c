@@ -61,6 +61,13 @@
 // descriptor is the obvious later optimisation and is discussed at translate_block(). Correctness first.
 
 #include <setjmp.h>
+// The guest's floating point is computed by the HOST's floating-point unit with the guest's FPCR.RMode
+// projected onto the host's rounding control; see the long note at "Floating point" below for why that is the
+// design and where it is not enough. <fenv.h> is the portable spelling of that projection (glibc implements it
+// over MXCSR on x86-64) and <math.h> supplies the two operations C has no operator for -- fma, which is the
+// only correctly-rounded spelling of FMADD, and sqrt.
+#include <fenv.h>
+#include <math.h>
 
 #include "../../guest_fetch.h"
 #include "../../identity.h"
@@ -93,6 +100,13 @@ static const char *g_exe_path = "";
 // with that single later definition and lets the code below un-bias a PC. All three are 0 for PIE and
 // static-PIE images, which is every image the test matrix loads, so every use is inert there.
 static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
+
+// Guest-signal delivery, really defined in linux_abi/signal.c -- which is compiled LATER in this same unity TU,
+// so it is declared (not defined) here. Only BRK/HLT need it: they are the one instruction class whose whole
+// architectural meaning is "raise a synchronous exception", and every other guest signal this backend produces
+// travels the dispatcher's reason codes instead. Declaring a static before its definition is ordinary C and is
+// the same technique translate.c uses for the tentative definitions above.
+static void raise_guest_signal(struct cpu *c, int sig);
 
 // PC-relative base for ADR/ADRP and for the return address a BL/BLR writes to x30.
 //
@@ -337,12 +351,46 @@ static void interp_set_flags(struct cpu *cpu, unsigned n, unsigned z, unsigned c
 
 // FPCR/FPSR. Per-thread, and deliberately NOT added to struct cpu -- that layout is the checkpoint format and
 // is shared with the JIT, which does not model these fields either (emitted code uses the host's real FPCR,
-// which is only meaningful when the host is AArch64). Held here so a read-modify-write round-trips, which is
-// what glibc's fegetround/fesetround do, but NOT ACTED ON: no floating-point arithmetic is implemented in this
-// backend yet, so there is no rounding mode or exception trap for them to control. Whoever implements scalar FP
-// must consume these rather than adding a second copy.
+// which is only meaningful when the host is AArch64). These two words ARE this backend's floating-point
+// control and status: FPCR.RMode selects the rounding of every FP result, FPCR.FZ/FZ16/DN change what the
+// arithmetic does with denormals and NaNs, and FPSR accumulates the five IEEE exception bits plus the AdvSIMD
+// saturation bit. See the "Floating point" section below for how they are consumed.
+//
+// They are guest-visible by two routes and must agree on both: MRS/MSR (the cases in interp_exec_branch_system
+// above), and the FPSIMD record guest/aarch64/signal.c writes into a signal frame, which carries FPSR and FPCR
+// as the two words following V31 -- so a guest handler that inspects uc_mcontext's fpsimd_context reads exactly
+// these.
 static __thread uint64_t g_interp_fpcr;
 static __thread uint64_t g_interp_fpsr;
+
+// FPCR fields. Only these are modelled; everything else a guest writes is dropped by INTERP_FPCR_WRITABLE,
+// which is itself a deliberate, guest-visible answer (see the MSR FPCR case).
+#define INTERP_FPCR_FZ16(f) (((f) >> 19) & 1u)  // flush-to-zero for HALF-precision operations
+#define INTERP_FPCR_RMODE(f) (((f) >> 22) & 3u) // 00 nearest-even, 01 +inf, 10 -inf, 11 zero
+#define INTERP_FPCR_FZ(f) (((f) >> 24) & 1u)    // flush-to-zero for single/double
+#define INTERP_FPCR_DN(f) (((f) >> 25) & 1u)    // default-NaN mode
+#define INTERP_FPCR_AHP(f) (((f) >> 26) & 1u)   // alternative (non-IEEE) half-precision format
+
+// The bits MSR FPCR may set. Everything else -- notably the six exception TRAP-ENABLE bits IDE/IXE/UFE/OFE/
+// DZE/IOE at [15:8] -- reads back as zero, which is how the architecture spells "this implementation does not
+// support trapped floating-point exceptions", and is the truth here: nothing below ever traps.
+#define INTERP_FPCR_WRITABLE                                                                                           \
+    ((UINT64_C(1) << 19) | (UINT64_C(3) << 22) | (UINT64_C(1) << 24) | (UINT64_C(1) << 25) | (UINT64_C(1) << 26))
+
+// FPSR cumulative-exception bits, at their architectural positions. QC is the AdvSIMD saturation flag; it is
+// not an IEEE exception and is set by the saturating integer instructions rather than by the FP core.
+#define INTERP_FPSR_IOC 0x01u      // invalid operation
+#define INTERP_FPSR_DZC 0x02u      // divide by zero
+#define INTERP_FPSR_OFC 0x04u      // overflow
+#define INTERP_FPSR_UFC 0x08u      // underflow
+#define INTERP_FPSR_IXC 0x10u      // inexact
+#define INTERP_FPSR_IDC 0x80u      // input denormal (set only when FPCR.FZ actually flushed one)
+#define INTERP_FPSR_QC 0x08000000u // AdvSIMD cumulative saturation
+#define INTERP_FPSR_WRITABLE (0x9Fu | INTERP_FPSR_QC)
+
+static void interp_fpsr_raise(unsigned bits) {
+    g_interp_fpsr |= bits;
+}
 
 static unsigned interp_flag_n(const struct cpu *cpu) { return (cpu->nzcv & INTERP_NZCV_N) != 0; }
 
@@ -1079,9 +1127,35 @@ static int interp_exec_branch_system(struct cpu *cpu, uint32_t insn) {
             cpu->reason = R_SYSCALL;
             return INTERP_END;
         }
-        // TODO(amd64-host): BRK/HLT should raise a guest SIGTRAP through the same synchronous-fault path the
-        // JIT reaches via the host debug trap; HVC/SMC are EL1/EL2 and must stay undefined at EL0.
-        return interp_undefined(cpu, insn, "exception generation -- BRK/HLT/HVC/SMC");
+        // Everything else in this box is a GUEST event, not an engine limitation, so none of it belongs in
+        // interp_undefined -- which latches a fatal engine status and stops the run with exit code 70. What
+        // Linux/AArch64 does with each:
+        //
+        //   BRK #imm (opc == 001)  -- brk_handler() -> SIGTRAP/TRAP_BRKPT with si_addr and the PC left ON the
+        //     BRK. The kernel does not advance past it, so a handler that returns re-executes it and traps
+        //     again; that is real Linux behaviour and is reproduced here by leaving cpu->pc == gpc. This is the
+        //     common case by far: __builtin_trap(), UBSan's trap-on-undefined, and a compiled `assert` that
+        //     the compiler decided to fold into a trap all reach it.
+        //   HLT #imm (opc == 010)  -- an EXTERNAL-debug halting instruction. With halting debug disabled, which
+        //     it always is for an emulated EL0 process, the architecture leaves HLT UNDEFINED, so Linux
+        //     delivers SIGILL. That is also what the JIT produces on an AArch64 host, where the guest's HLT is
+        //     copied verbatim and executed: matching it keeps the two backends' guest-visible behaviour equal.
+        //   HVC / SMC (opc == 000, LL 10/11) and DCPS1/2/3 (opc == 101) -- EL2/EL3 and debug-state
+        //     instructions, all UNDEFINED at EL0, so SIGILL as well.
+        //
+        // raise_guest_signal() is the right delivery route rather than a hand-built frame: it already applies
+        // the guest's disposition (a handler runs, SIG_IGN drops it, and SIG_DFL for these two fatal-default
+        // signals goes through guest_group_fatal so the container reports 128+signo with the core-dump flag).
+        // It is declared just above -- it lives in linux_abi/signal.c, later in this same unity translation
+        // unit. The one fidelity gap is si_code: it comes out as SI_USER rather than TRAP_BRKPT/ILL_ILLOPC and
+        // si_addr is 0, because the queued route carries no fault address. Closing that needs a
+        // raise_guest_debug_trap() beside raise_guest_bus() in linux_abi/signal.c, which is not this file's to
+        // add; see the findings doc.
+        int signo = opc == 1 ? 5 /* SIGTRAP */ : 4 /* SIGILL */;
+        cpu->pc = gpc; // the faulting instruction, which is what the guest's frame must name
+        raise_guest_signal(cpu, signo);
+        cpu->reason = R_BRANCH;
+        return INTERP_END;
     }
 
     // Hints (the NOP space): 1101 0101 0000 0011 0010 CRm op2 11111. Every member is architecturally a no-op
@@ -1214,17 +1288,23 @@ static int interp_exec_branch_system(struct cpu *cpu, uint32_t insn) {
         case 0xD53B4400u: // MRS FPCR
             interp_set_gpr(cpu, rt, g_interp_fpcr);
             break;
-        case 0xD51B4400u: // MSR FPCR
-            // Stored so a read-modify-write round-trips (glibc's fesetround does exactly that), but it does not
-            // yet CHANGE anything: no floating-point arithmetic is implemented, so there is no rounding mode or
-            // exception trap for it to control. Whoever implements scalar FP must consume this.
-            g_interp_fpcr = interp_gpr(cpu, rt);
+        case 0xD51B4400u: // MSR FPCR -- authoritative: RMode selects the rounding of every FP result below,
+                          // and FZ/FZ16/DN change what the arithmetic does with denormals and NaNs.
+            // Masked to the fields this backend models, which is a GUEST-VISIBLE answer and the correct one:
+            // the six exception trap-enable bits read back as zero, which is how the architecture says
+            // "trapped floating-point exceptions are not implemented", and it is exactly what glibc's
+            // feenableexcept() tests for (it writes the bit, reads FPCR back, and reports failure when it did
+            // not stick). Every common AArch64 implementation answers the same way, so a guest sees here what
+            // it would see on the hardware the JIT runs on.
+            g_interp_fpcr = interp_gpr(cpu, rt) & INTERP_FPCR_WRITABLE;
             break;
         case 0xD53B4420u: // MRS FPSR
             interp_set_gpr(cpu, rt, g_interp_fpsr);
             break;
-        case 0xD51B4420u: // MSR FPSR
-            g_interp_fpsr = interp_gpr(cpu, rt);
+        case 0xD51B4420u: // MSR FPSR -- the guest clearing or presetting the cumulative exception bits, which
+                          // is what feclearexcept/fesetexceptflag compile to. Only the six IEEE sticky bits
+                          // and the AdvSIMD saturation bit QC are writable; the rest are RES0.
+            g_interp_fpsr = interp_gpr(cpu, rt) & INTERP_FPSR_WRITABLE;
             break;
         case 0xD53BE000u: // MRS CNTFRQ_EL0 -- the counter frequency the guest should assume
             // 1 GHz, chosen so that the counter below IS a nanosecond count. Any other frequency would force a
@@ -1693,8 +1773,57 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             return INTERP_NEXT;
         }
 
-        // The genuine exclusive pair. o1 selects the single-register forms from the pair (LDXP/STXP) forms.
         uint64_t address = interp_gpr_sp(cpu, rn);
+
+        // CASP / CASPA / CASPL / CASPAL. These share o1 == 1 with LDXP/STXP and are separated from them by
+        // BIT 31, not by the size field: LDXP/STXP always have bit31 == 1 (their size is 0b10 or 0b11), while
+        // CASP encodes bit31 == 0 with bit30 as its lone size bit. Testing only `size < 2` therefore rejects
+        // every CASP as an unallocated pair size, which is what the ISA regression guest caught.
+        if (o1 && !(insn & 0x80000000u)) {
+            if (rt2 != 31) return interp_undefined(cpu, insn, "loads and stores -- unallocated CASP encoding");
+            // Rs and Rt must both be even: each names the first of a register PAIR.
+            if ((rs & 1) || (rt & 1))
+                return interp_undefined(cpu, insn, "loads and stores -- CASP with an odd register pair");
+            unsigned element = ((insn >> 30) & 1u) ? 8u : 4u; // bit30 selects a 32-bit or 64-bit pair
+            unsigned total = element * 2u;
+            void *pointer = interp_atomic_pointer(address, total);
+            if (pointer == NULL) return interp_alignment_fault(cpu, address);
+            uint64_t compare_low = interp_gpr(cpu, rs), compare_high = interp_gpr(cpu, rs + 1);
+            uint64_t swap_low = interp_gpr(cpu, rt), swap_high = interp_gpr(cpu, rt + 1);
+            uint64_t observed_low, observed_high;
+            interp_access_begin(address, total, 1);
+            if (element == 4) {
+                // A 32-bit pair is one naturally-aligned 64-bit location; low-order register first, because the
+                // guest is little-endian.
+                uint64_t expected = (compare_low & 0xFFFFFFFFu) | ((compare_high & 0xFFFFFFFFu) << 32);
+                uint64_t replacement = (swap_low & 0xFFFFFFFFu) | ((swap_high & 0xFFFFFFFFu) << 32);
+                __atomic_compare_exchange_n((uint64_t *)pointer, &expected, replacement, 0, __ATOMIC_SEQ_CST,
+                                            __ATOMIC_SEQ_CST);
+                observed_low = expected & 0xFFFFFFFFu;
+                observed_high = expected >> 32;
+            } else {
+                unsigned __int128 expected =
+                    (unsigned __int128)compare_low | ((unsigned __int128)compare_high << 64);
+                unsigned __int128 replacement = (unsigned __int128)swap_low | ((unsigned __int128)swap_high << 64);
+                __atomic_compare_exchange_n((unsigned __int128 *)pointer, &expected, replacement, 0,
+                                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                observed_low = (uint64_t)expected;
+                observed_high = (uint64_t)(expected >> 64);
+            }
+            interp_access_end();
+            // Like CAS, CASP returns the PRE-EXISTING pair in the comparand registers whether or not it swapped.
+            if (element == 8) {
+                interp_set_gpr(cpu, rs, observed_low);
+                interp_set_gpr(cpu, rs + 1, observed_high);
+            } else {
+                interp_set_gpr32(cpu, rs, (uint32_t)observed_low);
+                interp_set_gpr32(cpu, rs + 1, (uint32_t)observed_high);
+            }
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+
+        // The genuine exclusive pair (LDXP/STXP), whose only allocated sizes are the 32-bit and 64-bit pairs.
         if (o1 && size < 2)
             return interp_undefined(cpu, insn, "loads and stores -- unallocated exclusive-pair size");
         unsigned access_bytes = o1 ? bytes * 2u : bytes;
@@ -1861,12 +1990,46 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
                                   __atomic_fetch_or(slot, argument, __ATOMIC_SEQ_CST),
                                   __atomic_fetch_or(slot, argument, __ATOMIC_SEQ_CST));
                 break;
+            case 4: // LDSMAX
+            case 5: // LDSMIN
+            case 6: // LDUMAX
+            case 7: { // LDUMIN
+                // There is no __atomic_fetch_max, so these are a compare-and-swap retry loop. The loop is what
+                // makes them atomic against a peer guest thread: a load-compare-store would let another thread's
+                // update land in between and be lost, which is precisely the bug these instructions exist to
+                // avoid. The comparison happens at the ACCESS width and in the right signedness, so the sign
+                // extension for the signed forms is part of the type the macro instantiates.
+                unsigned want_max = opc == 4 || opc == 6;
+                unsigned is_signed = opc < 6;
+#define INTERP_LSE_MINMAX(type, signed_type)                                                                     \
+    do {                                                                                                        \
+        type *slot = (type *)pointer;                                                                            \
+        type argument = (type)operand;                                                                           \
+        type current = __atomic_load_n(slot, __ATOMIC_SEQ_CST);                                                  \
+        for (;;) {                                                                                              \
+            int argument_greater = is_signed ? ((signed_type)argument > (signed_type)current)                     \
+                                             : (argument > current);                                             \
+            type chosen = (argument_greater == (int)(want_max != 0)) ? argument : current;                        \
+            /* Already correct: nothing to store, and `current` is still the pre-existing value to return. */    \
+            if (chosen == current) break;                                                                       \
+            if (__atomic_compare_exchange_n(slot, &current, chosen, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))       \
+                break;                                                                                          \
+            /* A peer won the race; `current` now holds its value, so re-decide against that. */                 \
+        }                                                                                                       \
+        old = (uint64_t)current;                                                                                 \
+    } while (0)
+                switch (bytes) {
+                case 1: INTERP_LSE_MINMAX(uint8_t, int8_t); break;
+                case 2: INTERP_LSE_MINMAX(uint16_t, int16_t); break;
+                case 4: INTERP_LSE_MINMAX(uint32_t, int32_t); break;
+                default: INTERP_LSE_MINMAX(uint64_t, int64_t); break;
+                }
+#undef INTERP_LSE_MINMAX
+                break;
+            }
             default:
-                // LDSMAX/LDSMIN/LDUMAX/LDUMIN (opc 4..7). No __atomic_fetch_max exists, so these need an
-                // explicit compare-and-swap retry loop; they are rare enough (no libc fast path uses them)
-                // that reporting is better than a hurried implementation.
                 interp_access_end();
-                return interp_undefined(cpu, insn, "loads and stores -- LSE LDSMAX/LDSMIN/LDUMAX/LDUMIN");
+                return interp_undefined(cpu, insn, "loads and stores -- unallocated LSE atomic opcode");
             }
         }
 #undef INTERP_LSE_WIDTHS
@@ -1957,6 +2120,1088 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
 }
 
 // ---------------------------------------------------------------------------
+// Floating point: FPCR/FPSR, and how a guest FP result is actually computed.
+// ---------------------------------------------------------------------------
+// THE DECISION, AND WHY: PROJECT FPCR ONTO THE HOST FP ENVIRONMENT AND LET THE HOST FP UNIT COMPUTE.
+//
+// Two designs were available, and the choice is not obvious enough to leave implicit.
+//   (a) Model IEEE-754 in software: unpack, compute on integers, round, repack. Host-independent by
+//       construction, and about a thousand lines whose every rounding decision is mine to get wrong.
+//   (b) Observe that the host FP unit is ALSO IEEE-754, with the same four rounding modes and the same five
+//       exceptions, install the guest's FPCR.RMode into the host's rounding control around each operation,
+//       let the hardware compute, and harvest the raised exceptions back into FPSR.
+//
+// This file does (b), for three reasons:
+//
+//   * For FADD/FSUB/FMUL/FDIV/FSQRT/FMADD and the conversions between single and double, an x86-64 SSE
+//     operation and an AArch64 FP operation ARE THE SAME FUNCTION: both are defined as the correctly-rounded
+//     IEEE-754 result under the active rounding mode, so they agree bit for bit. Bit-exactness then comes
+//     from silicon rather than from my arithmetic, which matters because a rounding bug in a hand-written
+//     soft-float surfaces as a one-digit difference in printf output arbitrarily far from its cause -- the
+//     single hardest class of defect to localise in this corpus.
+//   * The engine already does this projection in the mirror direction and it is proven there.
+//     guest/x86_64/x87state.c maps a guest MXCSR onto the host AArch64 FPCR/FPSR field by field, including
+//     the rounding-mode permutation and the five exception bits. This is that same map read right to left.
+//   * It is far less code, and the code it does still need (interp_fp_pack below) is code a soft-float would
+//     have needed anyway.
+//
+// The projection is spelled with <fenv.h> rather than with STMXCSR/LDMXCSR. fenv is the portable name for
+// exactly the register this needs -- glibc implements fesetround/fetestexcept on x86-64 over MXCSR and on
+// AArch64 over FPCR/FPSR -- and this file is the AArch64 frontend for EVERY non-AArch64 host, so an
+// x86-specific spelling would have to be paired with a fallback that no build compiles and nothing tests.
+// guest/x86_64/avx.c already reaches for fegetround() in its own non-AArch64 arm for the same reason.
+//
+// WHERE THE TWO ISAs GENUINELY DISAGREE, AND SO WHERE THE HOST IS NOT ASKED.
+// The projection is sound only for the parts that agree. These do not, and each is computed here instead:
+//
+//   * NaN propagation. AArch64's FPProcessNaNs prefers a SIGNALLING operand over a quiet one regardless of
+//     position (op1 SNaN, then op2 SNaN, then op1 QNaN, then op2 QNaN); x86 SSE prefers the FIRST operand
+//     regardless of whether it signals. So (QNaN_a op SNaN_b) differs. Every operation below therefore
+//     screens its operands for NaN FIRST and produces the result itself; the host only ever sees non-NaNs.
+//   * The default NaN. When an invalid operation has no NaN operand at all (0/0, inf-inf, 0*inf, sqrt of a
+//     negative), AArch64 produces FPDefaultNaN, whose SIGN BIT IS CLEAR (0x7ff8000000000000 for a double).
+//     x86 produces the "QNaN indefinite", whose sign bit is SET. interp_fp_postprocess replaces any NaN the
+//     host manufactured out of non-NaN inputs rather than forwarding it.
+//   * FPCR.DN (default-NaN mode) and FPCR.FZ (flush-to-zero) have no portable host spelling at all -- x86
+//     has no DN, and splits FZ into separate output (FZ) and input (DAZ) bits -- so both are modelled here.
+//     Linux leaves both clear, which is why nothing in the corpus notices either way.
+//   * FMIN/FMAX and FMINNM/FMAXNM. AArch64's FMAX propagates NaNs and defines max(+0,-0) = +0 by ANDing the
+//     operand signs; x86's MAXSD returns its SECOND operand for any NaN and for either zero. Different
+//     functions, so computed here.
+//   * The integer conversions. FCVTZS/FCVTZU SATURATE to the destination range and raise Invalid; x86's
+//     CVTTSD2SI produces the integer indefinite instead. And x86-64 has no baseline instruction for
+//     unsigned-64 <-> floating point in either direction (the compiler's open-coded sequence for it is only
+//     correctly rounded in round-to-nearest). Both directions therefore go through interp_fp_pack /
+//     interp_fp_to_int, which also yields the fixed-point forms (a scale is just an addend on the exponent)
+//     and all five rounding variants FCVT{N,A,P,M,Z} for free.
+//   * Half precision. F16C is not baseline on x86-64 and a `_Float16` cast is round-to-nearest whatever the
+//     FP environment says -- the same conclusion guest/x86_64/avx.c reached from the other side, see
+//     avx_f32_to_f16_software. Software here too, sharing interp_fp_pack.
+//
+// ONE KNOWN, BOUNDED DIVERGENCE, stated rather than hidden. Tininess detection: AArch64 decides "underflow"
+// from the magnitude of the value BEFORE rounding, x86-64 decides it AFTER. IEEE-754 explicitly permits
+// either, so the two disagree for exactly one class of value -- one whose exact magnitude lies below the
+// smallest normal but which rounds up to exactly the smallest normal. The RESULT is identical either way;
+// only FPSR.UFC differs, and only for that value, and only for a host-computed operation (interp_fp_pack,
+// which does the conversions, implements AArch64's rule). Closing it would need a third format wider than
+// double, which is not available portably.
+//
+// PERFORMANCE. Each guest FP instruction costs an fegetround/fesetround/feclearexcept/fetestexcept bracket
+// on top of the decode. That is several times the cost of the arithmetic and it is the right trade for a
+// backend whose stated goal is correctness; the bracket also RESTORES the host rounding mode on the way out,
+// so the guest's FP environment can never leak into the engine's own C.
+
+// The three formats, ordered so that (fmt + 1) is the AdvSIMD element-size code the vector accessors take.
+#define INTERP_FP_H 0u
+#define INTERP_FP_S 1u
+#define INTERP_FP_D 2u
+
+static unsigned interp_fp_width(unsigned fmt) {
+    return fmt == INTERP_FP_H ? 16u : (fmt == INTERP_FP_S ? 32u : 64u);
+}
+
+static unsigned interp_fp_mant(unsigned fmt) {
+    return fmt == INTERP_FP_H ? 10u : (fmt == INTERP_FP_S ? 23u : 52u);
+}
+
+static int interp_fp_bias(unsigned fmt) {
+    return fmt == INTERP_FP_H ? 15 : (fmt == INTERP_FP_S ? 127 : 1023);
+}
+
+static unsigned interp_fp_inf_exp(unsigned fmt) {
+    return fmt == INTERP_FP_H ? 0x1Fu : (fmt == INTERP_FP_S ? 0xFFu : 0x7FFu);
+}
+
+static uint64_t interp_fp_mant_mask(unsigned fmt) {
+    return (UINT64_C(1) << interp_fp_mant(fmt)) - 1u;
+}
+
+static uint64_t interp_fp_sign_mask(unsigned fmt) {
+    return UINT64_C(1) << (interp_fp_width(fmt) - 1u);
+}
+
+// The ptype field of the scalar-FP encodings. 10 is unallocated in every box that uses it as a format (the
+// one encoding that spells 10 there is FMOV to/from Vn.D[1], which is not a format-carrying form).
+static int interp_fp_type_fmt(unsigned type, unsigned *fmt) {
+    switch (type) {
+    case 0: *fmt = INTERP_FP_S; return 1;
+    case 1: *fmt = INTERP_FP_D; return 1;
+    case 3: *fmt = INTERP_FP_H; return 1;
+    default: return 0;
+    }
+}
+
+// FPUnpack's classification. QNAN/SNAN are last so a "is this a NaN" test is one comparison.
+#define INTERP_FPC_ZERO 0u
+#define INTERP_FPC_DENORM 1u
+#define INTERP_FPC_NORM 2u
+#define INTERP_FPC_INF 3u
+#define INTERP_FPC_QNAN 4u
+#define INTERP_FPC_SNAN 5u
+
+static unsigned interp_fp_class(uint64_t bits, unsigned fmt) {
+    unsigned mant = interp_fp_mant(fmt);
+    uint64_t frac = bits & interp_fp_mant_mask(fmt);
+    unsigned biased = (unsigned)((bits >> mant) & (uint64_t)interp_fp_inf_exp(fmt));
+    if (biased == 0) return frac == 0 ? INTERP_FPC_ZERO : INTERP_FPC_DENORM;
+    if (biased != interp_fp_inf_exp(fmt)) return INTERP_FPC_NORM;
+    if (frac == 0) return INTERP_FPC_INF;
+    // The quiet bit is the MOST significant fraction bit. Its being set is what makes a NaN quiet, and it is
+    // also what a signalling NaN must have OR-ed in when the architecture "quiets" it.
+    return ((frac >> (mant - 1u)) & 1u) ? INTERP_FPC_QNAN : INTERP_FPC_SNAN;
+}
+
+// Rounding modes. The first four are FPCR.RMode verbatim; RA (ties away from zero) is not an FPCR encoding at
+// all -- it is the mode FCVTA*/FRINTA name directly -- so it lives beyond the 2-bit field.
+#define INTERP_RM_RN 0u // to nearest, ties to even
+#define INTERP_RM_RP 1u // toward +infinity
+#define INTERP_RM_RM 2u // toward -infinity
+#define INTERP_RM_RZ 3u // toward zero
+#define INTERP_RM_RA 4u // to nearest, ties away from zero
+
+static int interp_fp_host_round(unsigned rmode) {
+    switch (rmode) {
+    case INTERP_RM_RP: return FE_UPWARD;
+    case INTERP_RM_RM: return FE_DOWNWARD;
+    case INTERP_RM_RZ: return FE_TOWARDZERO;
+    default: return FE_TONEAREST;
+    }
+}
+
+// Given the bits a rounding step is about to discard, does `rmode` move the magnitude away from zero?
+// `lsb` is the least significant retained bit, which only round-to-nearest-even consults.
+static int interp_fp_round_away(unsigned rmode, unsigned sign, int round_bit, int sticky, unsigned lsb) {
+    switch (rmode) {
+    case INTERP_RM_RN: return round_bit && (sticky || lsb);
+    case INTERP_RM_RA: return round_bit != 0;
+    case INTERP_RM_RP: return !sign && (round_bit || sticky);
+    case INTERP_RM_RM: return sign && (round_bit || sticky);
+    default: return 0; // RZ truncates
+    }
+}
+
+// The host FP-environment bracket. Enter installs the guest's rounding mode and clears the host's cumulative
+// exception flags; leave reads them back, maps them onto FPSR bit positions and RESTORES the host's mode.
+//
+// Restoring matters: the engine's own C runs between guest instructions (the dispatcher, syscall service, the
+// whole of linux_abi) and must not silently inherit a guest's round-toward-zero. Clearing the host's sticky
+// flags is safe because nothing in this tree reads fetestexcept outside this bracket.
+//
+// The empty asm memory barriers and the volatile operands in the callers below exist because GCC compiles
+// with FENV_ACCESS effectively OFF: it does not know that fesetround changes the meaning of a subsequent FP
+// operation and is free to hoist one out of the bracket. avx.c states the same hazard for the same reason.
+typedef struct {
+    int host_round;
+} interp_fpenv;
+
+static void interp_fp_env_enter(interp_fpenv *env) {
+    int want = interp_fp_host_round(INTERP_FPCR_RMODE(g_interp_fpcr));
+    env->host_round = fegetround();
+    if (env->host_round != want) (void)fesetround(want);
+    (void)feclearexcept(FE_ALL_EXCEPT);
+    __asm__ __volatile__("" ::: "memory");
+}
+
+static unsigned interp_fp_env_leave(interp_fpenv *env) {
+    __asm__ __volatile__("" ::: "memory");
+    int raised = fetestexcept(FE_ALL_EXCEPT);
+    if (env->host_round != interp_fp_host_round(INTERP_FPCR_RMODE(g_interp_fpcr)))
+        (void)fesetround(env->host_round);
+    unsigned bits = 0;
+    if (raised & FE_INVALID) bits |= INTERP_FPSR_IOC;
+    if (raised & FE_DIVBYZERO) bits |= INTERP_FPSR_DZC;
+    if (raised & FE_OVERFLOW) bits |= INTERP_FPSR_OFC;
+    if (raised & FE_UNDERFLOW) bits |= INTERP_FPSR_UFC;
+    if (raised & FE_INEXACT) bits |= INTERP_FPSR_IXC;
+    return bits;
+}
+
+// Raw bits <-> host types. memcpy rather than a union or a cast for the same reason the guest memory
+// accessors use it: type-punning through a pointer is undefined behaviour the compiler may assume away.
+static double interp_fp_to_double(uint64_t bits) {
+    double value;
+    memcpy(&value, &bits, sizeof value);
+    return value;
+}
+
+static uint64_t interp_fp_from_double(double value) {
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    return bits;
+}
+
+static float interp_fp_to_float(uint32_t bits) {
+    float value;
+    memcpy(&value, &bits, sizeof value);
+    return value;
+}
+
+static uint64_t interp_fp_from_float(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    return (uint64_t)bits;
+}
+
+// Half -> double, exactly, by re-encoding rather than by arithmetic (so it raises nothing and needs no
+// bracket). A half denormal becomes a double NORMAL, which is why the leading one has to be found and the
+// exponent walked down -- the same renormalisation FPUnpack does.
+static double interp_fp_half_to_double(uint64_t bits) {
+    uint64_t sign = (bits & 0x8000u) ? (UINT64_C(1) << 63) : 0;
+    unsigned biased = (unsigned)((bits >> 10) & 0x1Fu);
+    uint64_t frac = bits & 0x3FFu;
+    if (biased == 0x1Fu) return interp_fp_to_double(sign | (UINT64_C(0x7FF) << 52) | (frac << 42));
+    if (biased == 0) {
+        if (frac == 0) return interp_fp_to_double(sign);
+        int exponent = 1 - 15;
+        while (!(frac & 0x400u)) {
+            frac <<= 1;
+            exponent--;
+        }
+        frac &= 0x3FFu;
+        return interp_fp_to_double(sign | ((uint64_t)(exponent + 1023) << 52) | (frac << 42));
+    }
+    return interp_fp_to_double(sign | ((uint64_t)((int)biased - 15 + 1023) << 52) | (frac << 42));
+}
+
+// Every value of every format handled here widens to a host double EXACTLY: binary16 and binary32 are
+// subsets of binary64 in both precision and exponent range. That is what lets the comparisons -- and the
+// half-precision arithmetic -- borrow the host's double unit without adding a rounding step of their own.
+// Callers must have screened NaNs first: a float -> double conversion of a signalling NaN quiets it.
+static double interp_fp_widen(uint64_t bits, unsigned fmt) {
+    if (fmt == INTERP_FP_D) return interp_fp_to_double(bits);
+    if (fmt == INTERP_FP_S) return (double)interp_fp_to_float((uint32_t)bits);
+    return interp_fp_half_to_double(bits);
+}
+
+static uint64_t interp_fp_default_nan(unsigned fmt) {
+    unsigned mant = interp_fp_mant(fmt);
+    return ((uint64_t)interp_fp_inf_exp(fmt) << mant) | (UINT64_C(1) << (mant - 1u));
+}
+
+// FPProcessNaN: quiet the operand (or answer the default NaN under FPCR.DN), raising Invalid if it signalled.
+static uint64_t interp_fp_process_nan(uint64_t bits, unsigned fmt) {
+    if (interp_fp_class(bits, fmt) == INTERP_FPC_SNAN) interp_fpsr_raise(INTERP_FPSR_IOC);
+    if (INTERP_FPCR_DN(g_interp_fpcr)) return interp_fp_default_nan(fmt);
+    return bits | (UINT64_C(1) << (interp_fp_mant(fmt) - 1u));
+}
+
+// FPProcessNaNs / FPProcessNaNs3, as one loop. The architectural order is every SIGNALLING operand first, in
+// operand order, and only then every quiet one -- which is where AArch64 parts company with x86, whose binary
+// operations simply prefer the first source. Returns 1 (and *result) when an operand was a NaN.
+static int interp_fp_process_nans(unsigned fmt, unsigned count, const uint64_t *operands, uint64_t *result) {
+    for (unsigned pass = 0; pass < 2; pass++)
+        for (unsigned index = 0; index < count; index++) {
+            unsigned cls = interp_fp_class(operands[index], fmt);
+            if (cls == (pass == 0 ? INTERP_FPC_SNAN : INTERP_FPC_QNAN)) {
+                *result = interp_fp_process_nan(operands[index], fmt);
+                return 1;
+            }
+        }
+    return 0;
+}
+
+// FPUnpack's flush-to-zero step, applied to an INPUT operand. FPCR.FZ governs single and double; half has its
+// own FPCR.FZ16, because a half denormal is representable in every wider format and flushing it is a separate
+// decision. A flush is what sets FPSR.IDC -- the bit means "an input was denormal AND was discarded", not
+// merely "an input was denormal", which is why nothing sets it when FZ is clear.
+static uint64_t interp_fp_flush_input(uint64_t bits, unsigned fmt) {
+    unsigned flush = fmt == INTERP_FP_H ? INTERP_FPCR_FZ16(g_interp_fpcr) : INTERP_FPCR_FZ(g_interp_fpcr);
+    if (!flush || interp_fp_class(bits, fmt) != INTERP_FPC_DENORM) return bits;
+    interp_fpsr_raise(INTERP_FPSR_IDC);
+    return bits & interp_fp_sign_mask(fmt);
+}
+
+// The common tail of every FP result, whether the host computed it or interp_fp_pack did. Two jobs:
+// substitute the architectural default NaN for whatever NaN encoding the host invented, and apply FPCR.FZ to
+// a denormal result. Then commit the accumulated exception bits to FPSR.
+static uint64_t interp_fp_postprocess(unsigned fmt, uint64_t bits, unsigned raised) {
+    unsigned cls = interp_fp_class(bits, fmt);
+    if (cls >= INTERP_FPC_QNAN) {
+        // Reachable only when the operands held no NaN (they are screened before the host is asked), i.e. this
+        // is an invalid operation: 0/0, inf-inf, 0*inf, sqrt of a negative. AArch64 answers FPDefaultNaN;
+        // x86-64's QNaN indefinite has the sign bit set and another host could pick a third encoding, so the
+        // value is replaced rather than forwarded. The Invalid flag itself came back from the host in `raised`.
+        bits = interp_fp_default_nan(fmt);
+    } else if (cls == INTERP_FPC_DENORM) {
+        unsigned flush = fmt == INTERP_FP_H ? INTERP_FPCR_FZ16(g_interp_fpcr) : INTERP_FPCR_FZ(g_interp_fpcr);
+        if (flush) {
+            bits &= interp_fp_sign_mask(fmt);
+            raised |= INTERP_FPSR_UFC;
+        }
+    }
+    interp_fpsr_raise(raised);
+    return bits;
+}
+
+// Round the exact value (-1)^sign * significand * 2^exponent into `fmt` under `rmode`, and return its
+// encoding. OFC/UFC/IXC are OR-ed into *raised, which is never cleared, so a caller can accumulate.
+//
+// This is the file's only soft-float rounder, and it exists because three things cannot be delegated to the
+// host: an unsigned 64-bit integer -> floating point conversion (x86-64 has no baseline instruction and the
+// compiler's open-coded sequence is only correct in round-to-nearest); a conversion to half precision (F16C
+// is not baseline and a _Float16 cast ignores the rounding mode); and the fixed-point conversion forms, whose
+// scale factor is an exponent addend that no host instruction can apply without a second rounding.
+//
+// Unlike the host-computed paths it implements AArch64's BEFORE-rounding tininess rule exactly: `lsb_exp` is
+// clamped to the subnormal ulp using the value's own exponent, so a quantity that is tiny before rounding
+// raises Underflow even when it rounds up to the smallest normal.
+static uint64_t interp_fp_pack(unsigned sign, uint64_t significand, int exponent, unsigned fmt, unsigned rmode,
+                               unsigned *raised) {
+    unsigned mant = interp_fp_mant(fmt);
+    uint64_t sign_bit = sign ? interp_fp_sign_mask(fmt) : 0;
+    if (significand == 0) return sign_bit; // an exact zero keeps its sign and raises nothing
+
+    // The exponent of the value's leading one, then the exponent of the least significant bit the result can
+    // hold: one ulp of a normal result at this magnitude, or the fixed ulp of the subnormal range if coarser.
+    int value_exp = exponent + (63 - __builtin_clzll(significand));
+    int min_exp = 1 - interp_fp_bias(fmt) - (int)mant; // exponent of the smallest subnormal's last bit
+    int lsb_exp = value_exp - (int)mant;
+    int tiny = lsb_exp < min_exp;
+    if (tiny) lsb_exp = min_exp;
+
+    // Shift the significand down onto that ulp, keeping the round bit and a sticky bit. A shift of 64 or more
+    // is reachable only in the clamped (tiny) case, where the whole significand is below the result's ulp.
+    int shift = lsb_exp - exponent;
+    uint64_t quotient;
+    int round_bit = 0, sticky = 0;
+    if (shift <= 0) {
+        // A left shift here cannot overflow: shift is (leading-one position - mant) when unclamped, so the
+        // leading one lands exactly at bit `mant`, and in the clamped case it lands strictly below it.
+        quotient = significand << (unsigned)(-shift);
+    } else if (shift >= 64) {
+        quotient = 0;
+        round_bit = shift == 64 ? (int)((significand >> 63) & 1u) : 0;
+        sticky = (significand & (shift == 64 ? ~(UINT64_C(1) << 63) : UINT64_MAX)) != 0;
+    } else {
+        quotient = significand >> (unsigned)shift;
+        round_bit = (int)((significand >> (unsigned)(shift - 1)) & 1u);
+        sticky = shift > 1 && (significand & ((UINT64_C(1) << (unsigned)(shift - 1)) - 1u)) != 0;
+    }
+    int inexact = round_bit | sticky;
+    if (interp_fp_round_away(rmode, sign, round_bit, sticky, (unsigned)(quotient & 1u))) quotient++;
+    if (inexact) *raised |= INTERP_FPSR_IXC;
+
+    if ((quotient >> mant) == 0) {
+        // Subnormal (or zero): the biased exponent is 0 and the stored fraction IS the quotient, so nothing
+        // has to be assembled. Underflow is raised on the architecture's before-rounding test.
+        if (tiny && inexact) *raised |= INTERP_FPSR_UFC;
+        return sign_bit | quotient;
+    }
+    // A round-up can carry out of the significand (1.111..1 -> 10.000..0), moving the result into the next
+    // binade. Note that the subnormal branch above needs no equivalent: there, a carry into bit `mant` lands
+    // exactly on the encoding of the smallest normal (biased exponent 1, zero fraction) all by itself.
+    if (quotient >> (mant + 1u)) {
+        quotient >>= 1;
+        lsb_exp++;
+    }
+    if (tiny && inexact) *raised |= INTERP_FPSR_UFC; // tiny before rounding, normal after: still Underflow
+    int biased = lsb_exp + (int)mant + interp_fp_bias(fmt);
+    if (biased >= (int)interp_fp_inf_exp(fmt)) {
+        // Overflow. IEEE-754 gives an infinity when the active mode rounds AWAY from zero at this sign and the
+        // largest finite otherwise, and always raises Inexact alongside Overflow.
+        *raised |= INTERP_FPSR_OFC | INTERP_FPSR_IXC;
+        int away = rmode == INTERP_RM_RN || rmode == INTERP_RM_RA || (rmode == INTERP_RM_RP && !sign) ||
+                   (rmode == INTERP_RM_RM && sign);
+        if (away) return sign_bit | ((uint64_t)interp_fp_inf_exp(fmt) << mant);
+        return sign_bit | ((uint64_t)(interp_fp_inf_exp(fmt) - 1u) << mant) | interp_fp_mant_mask(fmt);
+    }
+    return sign_bit | ((uint64_t)(unsigned)biased << mant) | (quotient & interp_fp_mant_mask(fmt));
+}
+
+// A host double narrowed to half. NaNs are handled by the callers (they never reach here through the
+// arithmetic paths); an infinity converts exactly.
+static uint64_t interp_fp_half_from_double(double value, unsigned rmode, unsigned *raised) {
+    uint64_t bits = interp_fp_from_double(value);
+    unsigned sign = (unsigned)(bits >> 63);
+    unsigned biased = (unsigned)((bits >> 52) & 0x7FFu);
+    uint64_t frac = bits & ((UINT64_C(1) << 52) - 1u);
+    if (biased == 0x7FFu)
+        return frac == 0 ? (sign ? 0xFC00u : 0x7C00u) : 0x7E00u; // postprocess substitutes the default NaN
+    if (biased == 0 && frac == 0) return sign ? 0x8000u : 0u;
+    uint64_t significand = biased == 0 ? frac : (frac | (UINT64_C(1) << 52));
+    int exponent = (int)(biased == 0 ? 1u : biased) - 1023 - 52;
+    return interp_fp_pack(sign, significand, exponent, INTERP_FP_H, rmode, raised);
+}
+
+// ---- the arithmetic ----
+#define INTERP_FPOP_ADD 0u
+#define INTERP_FPOP_SUB 1u
+#define INTERP_FPOP_MUL 2u
+#define INTERP_FPOP_DIV 3u
+
+// FADD/FSUB/FMUL/FDIV. Half precision is computed in the host's DOUBLE unit and then rounded to half, which
+// is exact rather than a double-rounding hazard: binary64 carries 53 bits of significand and the classical
+// bound for a single arithmetic operation to survive a second rounding is 2p+2 == 24 bits, with binary16's
+// whole exponent range sitting far inside binary64's.
+static uint64_t interp_fp_arith(unsigned fmt, unsigned op, uint64_t a, uint64_t b) {
+    a = interp_fp_flush_input(a, fmt);
+    b = interp_fp_flush_input(b, fmt);
+    uint64_t operands[2] = {a, b}, nan;
+    if (interp_fp_process_nans(fmt, 2, operands, &nan)) return nan;
+    interp_fpenv env;
+    unsigned raised;
+    uint64_t out;
+    if (fmt == INTERP_FP_S) {
+        float left = interp_fp_to_float((uint32_t)a), right = interp_fp_to_float((uint32_t)b);
+        interp_fp_env_enter(&env);
+        volatile float x = left, y = right, r = 0;
+        switch (op) {
+        case INTERP_FPOP_ADD: r = x + y; break;
+        case INTERP_FPOP_SUB: r = x - y; break;
+        case INTERP_FPOP_MUL: r = x * y; break;
+        default: r = x / y; break;
+        }
+        raised = interp_fp_env_leave(&env);
+        out = interp_fp_from_float(r);
+    } else {
+        double left = interp_fp_widen(a, fmt), right = interp_fp_widen(b, fmt);
+        interp_fp_env_enter(&env);
+        volatile double x = left, y = right, r = 0;
+        switch (op) {
+        case INTERP_FPOP_ADD: r = x + y; break;
+        case INTERP_FPOP_SUB: r = x - y; break;
+        case INTERP_FPOP_MUL: r = x * y; break;
+        default: r = x / y; break;
+        }
+        raised = interp_fp_env_leave(&env);
+        out = fmt == INTERP_FP_D ? interp_fp_from_double(r)
+                                 : interp_fp_half_from_double(r, INTERP_FPCR_RMODE(g_interp_fpcr), &raised);
+    }
+    return interp_fp_postprocess(fmt, out, raised);
+}
+
+static uint64_t interp_fp_sqrt(unsigned fmt, uint64_t a) {
+    a = interp_fp_flush_input(a, fmt);
+    uint64_t nan;
+    if (interp_fp_process_nans(fmt, 1, &a, &nan)) return nan;
+    interp_fpenv env;
+    unsigned raised;
+    uint64_t out;
+    if (fmt == INTERP_FP_S) {
+        float operand = interp_fp_to_float((uint32_t)a);
+        interp_fp_env_enter(&env);
+        volatile float x = operand, r;
+        r = sqrtf(x);
+        raised = interp_fp_env_leave(&env);
+        out = interp_fp_from_float(r);
+    } else {
+        double operand = interp_fp_widen(a, fmt);
+        interp_fp_env_enter(&env);
+        volatile double x = operand, r;
+        r = sqrt(x);
+        raised = interp_fp_env_leave(&env);
+        out = fmt == INTERP_FP_D ? interp_fp_from_double(r)
+                                 : interp_fp_half_from_double(r, INTERP_FPCR_RMODE(g_interp_fpcr), &raised);
+    }
+    return interp_fp_postprocess(fmt, out, raised);
+}
+
+// FPMulAdd: addend + a*b with a SINGLE rounding, which is what C's fma() is defined to be. On a host with
+// FMA3 glibc's ifunc resolves to the hardware instruction and the projection is exact; on a host without it,
+// glibc's software path is still correctly rounded under the active mode. Using `x*y + z` instead would round
+// twice and is a different function.
+static uint64_t interp_fp_muladd(unsigned fmt, uint64_t addend, uint64_t a, uint64_t b) {
+    addend = interp_fp_flush_input(addend, fmt);
+    a = interp_fp_flush_input(a, fmt);
+    b = interp_fp_flush_input(b, fmt);
+    unsigned class_a = interp_fp_class(a, fmt), class_b = interp_fp_class(b, fmt);
+    int zero_times_inf = (class_a == INTERP_FPC_INF && class_b == INTERP_FPC_ZERO) ||
+                         (class_a == INTERP_FPC_ZERO && class_b == INTERP_FPC_INF);
+    uint64_t operands[3] = {addend, a, b}, nan;
+    int have_nan = interp_fp_process_nans(fmt, 3, operands, &nan);
+    // FPMulAdd's one asymmetry, and it is deliberate in the architecture: a QUIET NaN addend does NOT win over
+    // an invalid multiply. inf*0 with a quiet-NaN addend is Invalid and answers the default NaN, where plain
+    // NaN propagation would have forwarded the addend's payload. A SIGNALLING addend still wins, which is why
+    // this is tested after the propagation rule rather than before it.
+    if (zero_times_inf && interp_fp_class(addend, fmt) == INTERP_FPC_QNAN) {
+        interp_fpsr_raise(INTERP_FPSR_IOC);
+        return interp_fp_default_nan(fmt);
+    }
+    if (have_nan) return nan;
+    interp_fpenv env;
+    unsigned raised;
+    uint64_t out;
+    if (fmt == INTERP_FP_S) {
+        float left = interp_fp_to_float((uint32_t)a), right = interp_fp_to_float((uint32_t)b),
+              extra = interp_fp_to_float((uint32_t)addend);
+        interp_fp_env_enter(&env);
+        volatile float x = left, y = right, z = extra, r;
+        r = fmaf(x, y, z);
+        raised = interp_fp_env_leave(&env);
+        out = interp_fp_from_float(r);
+    } else {
+        double left = interp_fp_widen(a, fmt), right = interp_fp_widen(b, fmt), extra = interp_fp_widen(addend, fmt);
+        interp_fp_env_enter(&env);
+        volatile double x = left, y = right, z = extra, r;
+        r = fma(x, y, z);
+        raised = interp_fp_env_leave(&env);
+        out = fmt == INTERP_FP_D ? interp_fp_from_double(r)
+                                 : interp_fp_half_from_double(r, INTERP_FPCR_RMODE(g_interp_fpcr), &raised);
+    }
+    return interp_fp_postprocess(fmt, out, raised);
+}
+
+// FPMax/FPMin and FPMaxNum/FPMinNum. The NM forms are the IEEE-754 minNum/maxNum: a QUIET NaN operand is
+// replaced by the infinity that loses, so the other operand is returned -- and note that a SIGNALLING NaN is
+// NOT substituted, so it still propagates (with Invalid) through the plain form underneath.
+static uint64_t interp_fp_minmax(unsigned fmt, uint64_t a, uint64_t b, int want_max, int numeric) {
+    a = interp_fp_flush_input(a, fmt);
+    b = interp_fp_flush_input(b, fmt);
+    if (numeric) {
+        uint64_t losing = ((uint64_t)interp_fp_inf_exp(fmt) << interp_fp_mant(fmt)) |
+                          (want_max ? interp_fp_sign_mask(fmt) : UINT64_C(0));
+        int a_quiet = interp_fp_class(a, fmt) == INTERP_FPC_QNAN, b_quiet = interp_fp_class(b, fmt) == INTERP_FPC_QNAN;
+        if (a_quiet && !b_quiet)
+            a = losing;
+        else if (b_quiet && !a_quiet)
+            b = losing;
+    }
+    uint64_t operands[2] = {a, b}, nan;
+    if (interp_fp_process_nans(fmt, 2, operands, &nan)) return nan;
+    double x = interp_fp_widen(a, fmt), y = interp_fp_widen(b, fmt);
+    uint64_t chosen = (want_max ? (x > y) : (x < y)) ? a : b;
+    if (interp_fp_class(chosen, fmt) == INTERP_FPC_ZERO) {
+        // +0 and -0 compare EQUAL, so the numeric comparison above cannot separate them. The architecture
+        // combines the operand signs instead: FPMax ANDs them (so +0 wins) and FPMin ORs them (so -0 does).
+        unsigned sign_a = (a & interp_fp_sign_mask(fmt)) != 0, sign_b = (b & interp_fp_sign_mask(fmt)) != 0;
+        unsigned sign = want_max ? (sign_a & sign_b) : (sign_a | sign_b);
+        return sign ? interp_fp_sign_mask(fmt) : UINT64_C(0);
+    }
+    return chosen;
+}
+
+// FPCompare, writing NZCV. `quiet_signals` selects the FCMPE/FCCMPE forms, which raise Invalid for a QUIET
+// NaN as well as a signalling one. No host arithmetic: the operands widen to double exactly, and comparing
+// two non-NaN doubles raises nothing, so there is nothing to bracket or harvest.
+static void interp_fp_compare(struct cpu *cpu, unsigned fmt, uint64_t a, uint64_t b, int quiet_signals) {
+    a = interp_fp_flush_input(a, fmt);
+    b = interp_fp_flush_input(b, fmt);
+    unsigned class_a = interp_fp_class(a, fmt), class_b = interp_fp_class(b, fmt);
+    if (class_a >= INTERP_FPC_QNAN || class_b >= INTERP_FPC_QNAN) {
+        if (quiet_signals || class_a == INTERP_FPC_SNAN || class_b == INTERP_FPC_SNAN)
+            interp_fpsr_raise(INTERP_FPSR_IOC);
+        interp_set_flags(cpu, 0, 0, 1, 1); // unordered
+        return;
+    }
+    double x = interp_fp_widen(a, fmt), y = interp_fp_widen(b, fmt);
+    if (x == y)
+        interp_set_flags(cpu, 0, 1, 1, 0);
+    else if (x < y)
+        interp_set_flags(cpu, 1, 0, 0, 0);
+    else
+        interp_set_flags(cpu, 0, 0, 1, 0);
+}
+
+// FPRoundInt: round to an integral value in the SAME format. `exact` is what distinguishes FRINTX (which
+// raises Inexact when it changes the value) from FRINTI and the five explicitly-moded FRINTs (which do not).
+static uint64_t interp_fp_round_integral(unsigned fmt, uint64_t bits, unsigned rmode, int exact) {
+    bits = interp_fp_flush_input(bits, fmt);
+    uint64_t nan;
+    if (interp_fp_process_nans(fmt, 1, &bits, &nan)) return nan;
+    unsigned cls = interp_fp_class(bits, fmt);
+    if (cls == INTERP_FPC_INF || cls == INTERP_FPC_ZERO) return bits;
+
+    unsigned mant = interp_fp_mant(fmt);
+    unsigned sign = (bits & interp_fp_sign_mask(fmt)) != 0;
+    uint64_t frac = bits & interp_fp_mant_mask(fmt);
+    unsigned biased = (unsigned)((bits >> mant) & (uint64_t)interp_fp_inf_exp(fmt));
+    uint64_t significand = biased == 0 ? frac : (frac | (UINT64_C(1) << mant));
+    int exponent = (int)(biased == 0 ? 1u : biased) - interp_fp_bias(fmt) - (int)mant;
+    if (exponent >= 0) return bits; // already integral: every retained bit is at or above the units place
+
+    unsigned shift = (unsigned)(-exponent);
+    uint64_t magnitude;
+    int round_bit, sticky;
+    if (shift >= 64) {
+        // |value| < 1 and smaller than the significand can express against the units place. The integer part
+        // is 0 and the whole value is the discarded fraction, so only the rounding direction decides.
+        magnitude = 0;
+        round_bit = shift == 64 ? (int)((significand >> 63) & 1u) : 0;
+        sticky = (significand & (shift == 64 ? ~(UINT64_C(1) << 63) : UINT64_MAX)) != 0;
+    } else {
+        magnitude = significand >> shift;
+        round_bit = (int)((significand >> (shift - 1u)) & 1u);
+        sticky = shift > 1 && (significand & ((UINT64_C(1) << (shift - 1u)) - 1u)) != 0;
+    }
+    if (interp_fp_round_away(rmode, sign, round_bit, sticky, (unsigned)(magnitude & 1u))) magnitude++;
+    if (exact && (round_bit || sticky)) interp_fpsr_raise(INTERP_FPSR_IXC);
+    // The result is an integer no larger than 2^mant (we only got here because the value had a fraction), so
+    // repacking it is exact and the mode is irrelevant. A zero result keeps the operand's sign: FRINTM of
+    // -0.4 is -1.0 but FRINTZ of -0.4 is -0.0, and interp_fp_pack preserves that by construction.
+    unsigned raised = 0;
+    return interp_fp_pack(sign, magnitude, 0, fmt, INTERP_RM_RZ, &raised);
+}
+
+// FPConvertNaN: a NaN crossing formats keeps its sign and the TOP bits of its payload, is always quiet on the
+// way out, and raises Invalid if the source signalled.
+static uint64_t interp_fp_convert_nan(uint64_t bits, unsigned from, unsigned to) {
+    if (interp_fp_class(bits, from) == INTERP_FPC_SNAN) interp_fpsr_raise(INTERP_FPSR_IOC);
+    if (INTERP_FPCR_DN(g_interp_fpcr)) return interp_fp_default_nan(to);
+    unsigned from_mant = interp_fp_mant(from), to_mant = interp_fp_mant(to);
+    uint64_t payload = bits & interp_fp_mant_mask(from);
+    payload = to_mant >= from_mant ? payload << (to_mant - from_mant) : payload >> (from_mant - to_mant);
+    uint64_t sign = (bits & interp_fp_sign_mask(from)) ? interp_fp_sign_mask(to) : 0;
+    return sign | ((uint64_t)interp_fp_inf_exp(to) << to_mant) | payload | (UINT64_C(1) << (to_mant - 1u));
+}
+
+// FCVT between formats. Widening is exact; narrowing rounds, and double -> single is the one narrowing the
+// host does natively and identically (cvtsd2ss is the correctly-rounded IEEE result under MXCSR, exactly as
+// AArch64's FCVT is under FPCR).
+static uint64_t interp_fp_convert(unsigned from, unsigned to, uint64_t bits) {
+    if (interp_fp_class(bits, from) >= INTERP_FPC_QNAN) return interp_fp_convert_nan(bits, from, to);
+    bits = interp_fp_flush_input(bits, from);
+    if (interp_fp_width(to) > interp_fp_width(from)) {
+        // Exact in every direction: a wider format holds every value of a narrower one, including its
+        // denormals (which become normals) and its infinities.
+        double wide = interp_fp_widen(bits, from);
+        if (to == INTERP_FP_D) return interp_fp_postprocess(to, interp_fp_from_double(wide), 0);
+        return interp_fp_postprocess(to, interp_fp_from_float((float)wide), 0);
+    }
+    unsigned raised = 0;
+    uint64_t out;
+    if (to == INTERP_FP_H) {
+        out = interp_fp_half_from_double(interp_fp_widen(bits, from), INTERP_FPCR_RMODE(g_interp_fpcr), &raised);
+    } else {
+        double wide = interp_fp_to_double(bits); // from == INTERP_FP_D, to == INTERP_FP_S
+        interp_fpenv env;
+        interp_fp_env_enter(&env);
+        volatile double x = wide;
+        volatile float r = (float)x;
+        raised = interp_fp_env_leave(&env);
+        out = interp_fp_from_float(r);
+    }
+    return interp_fp_postprocess(to, out, raised);
+}
+
+// The value SatQ() produces for an out-of-range conversion, per destination width and signedness. A 32-bit
+// destination is returned sign-extended into 64 bits; the caller narrows it when it writes a W register.
+static uint64_t interp_fp_int_saturate(unsigned sign, unsigned dest_bits, int is_signed) {
+    if (!is_signed) return sign ? UINT64_C(0) : (dest_bits == 64 ? UINT64_MAX : ((UINT64_C(1) << dest_bits) - 1u));
+    uint64_t limit = UINT64_C(1) << (dest_bits - 1u);
+    return sign ? (UINT64_C(0) - limit) : (limit - 1u);
+}
+
+// FPToFixed: floating point to a `dest_bits`-wide integer, rounding per `rmode`, keeping `fbits` fractional
+// bits (0 for the plain FCVT* forms, 64-scale for the fixed-point ones -- a scale is nothing but an addend on
+// the exponent, which is why one function serves both).
+//
+// The architectural ORDER of the two exceptions matters and is easy to get wrong: the value is rounded to an
+// integer FIRST (raising Inexact if that changed it), and only then range-checked (raising Invalid and
+// saturating). So FCVTZU of -0.5 is 0 with Inexact and NO Invalid -- it rounds to zero, which is in range --
+// while FCVTZU of -1.5 saturates to 0 with both. And a NaN is replaced by the value 0 BEFORE the range check,
+// so it yields 0 with Invalid alone, no Inexact and no saturation.
+static uint64_t interp_fp_to_int(unsigned fmt, uint64_t bits, unsigned dest_bits, int is_signed, unsigned rmode,
+                                unsigned fbits) {
+    bits = interp_fp_flush_input(bits, fmt);
+    unsigned cls = interp_fp_class(bits, fmt);
+    unsigned sign = (bits & interp_fp_sign_mask(fmt)) != 0;
+    if (cls >= INTERP_FPC_QNAN) {
+        interp_fpsr_raise(INTERP_FPSR_IOC);
+        return 0;
+    }
+    if (cls == INTERP_FPC_INF) {
+        interp_fpsr_raise(INTERP_FPSR_IOC);
+        return interp_fp_int_saturate(sign, dest_bits, is_signed);
+    }
+    if (cls == INTERP_FPC_ZERO) return 0;
+
+    unsigned mant = interp_fp_mant(fmt);
+    uint64_t frac = bits & interp_fp_mant_mask(fmt);
+    unsigned biased = (unsigned)((bits >> mant) & (uint64_t)interp_fp_inf_exp(fmt));
+    uint64_t significand = biased == 0 ? frac : (frac | (UINT64_C(1) << mant));
+    int exponent = (int)(biased == 0 ? 1u : biased) - interp_fp_bias(fmt) - (int)mant + (int)fbits;
+
+    uint64_t magnitude = 0;
+    int inexact = 0, too_large = 0;
+    if (exponent >= 0) {
+        // Already an integer, so nothing is inexact -- but it may not fit in the 64-bit magnitude below, let
+        // alone in the destination, and shifting it there first would lose the very bits that prove it.
+        too_large = exponent >= 64 || (significand >> (64 - (unsigned)exponent)) != 0;
+        if (!too_large) magnitude = significand << (unsigned)exponent;
+    } else {
+        unsigned shift = (unsigned)(-exponent);
+        int round_bit, sticky;
+        if (shift >= 64) {
+            round_bit = shift == 64 ? (int)((significand >> 63) & 1u) : 0;
+            sticky = (significand & (shift == 64 ? ~(UINT64_C(1) << 63) : UINT64_MAX)) != 0;
+        } else {
+            magnitude = significand >> shift;
+            round_bit = (int)((significand >> (shift - 1u)) & 1u);
+            sticky = shift > 1 && (significand & ((UINT64_C(1) << (shift - 1u)) - 1u)) != 0;
+        }
+        inexact = round_bit | sticky;
+        if (interp_fp_round_away(rmode, sign, round_bit, sticky, (unsigned)(magnitude & 1u))) magnitude++;
+    }
+    if (inexact) interp_fpsr_raise(INTERP_FPSR_IXC);
+    if (too_large) {
+        interp_fpsr_raise(INTERP_FPSR_IOC);
+        return interp_fp_int_saturate(sign, dest_bits, is_signed);
+    }
+    if (!is_signed) {
+        if (sign && magnitude != 0) {
+            interp_fpsr_raise(INTERP_FPSR_IOC);
+            return 0;
+        }
+        if (!sign && dest_bits < 64 && magnitude > ((UINT64_C(1) << dest_bits) - 1u)) {
+            interp_fpsr_raise(INTERP_FPSR_IOC);
+            return interp_fp_int_saturate(0, dest_bits, 0);
+        }
+        return sign ? UINT64_C(0) : magnitude;
+    }
+    uint64_t limit = UINT64_C(1) << (dest_bits - 1u);
+    if (sign) {
+        if (magnitude > limit) {
+            interp_fpsr_raise(INTERP_FPSR_IOC);
+            return interp_fp_int_saturate(1, dest_bits, 1);
+        }
+        return UINT64_C(0) - magnitude;
+    }
+    if (magnitude >= limit) {
+        interp_fpsr_raise(INTERP_FPSR_IOC);
+        return interp_fp_int_saturate(0, dest_bits, 1);
+    }
+    return magnitude;
+}
+
+// FixedToFP: an integer (optionally scaled down by 2^fbits) to floating point.
+static uint64_t interp_fp_from_int(unsigned fmt, uint64_t value, unsigned source_bits, int is_signed, unsigned rmode,
+                                  unsigned fbits) {
+    unsigned sign = 0;
+    uint64_t magnitude;
+    if (is_signed) {
+        int64_t signed_value = source_bits == 32 ? (int64_t)(int32_t)(uint32_t)value : (int64_t)value;
+        sign = signed_value < 0;
+        magnitude = sign ? (UINT64_C(0) - (uint64_t)signed_value) : (uint64_t)signed_value;
+    } else {
+        magnitude = source_bits == 32 ? (uint64_t)(uint32_t)value : value;
+    }
+    unsigned raised = 0;
+    return interp_fp_postprocess(fmt, interp_fp_pack(sign, magnitude, -(int)fbits, fmt, rmode, &raised), raised);
+}
+
+// VFPExpandImm: the 8-bit FMOV-immediate encoding. One sign bit, then an exponent built as NOT(b) followed by
+// (E-3) copies of b and then imm8<5:4>, then imm8<3:0> as the top of the fraction. The point of the odd
+// exponent construction is that it spans a small window around 1.0 in every format with the same 8 bits.
+static uint64_t interp_fp_expand_imm(unsigned fmt, uint64_t imm8) {
+    unsigned exp_bits = interp_fp_width(fmt) - interp_fp_mant(fmt) - 1u;
+    unsigned mant = interp_fp_mant(fmt);
+    uint64_t sign = (imm8 >> 7) & 1u;
+    uint64_t b = (imm8 >> 6) & 1u;
+    uint64_t exponent = (b ? 0u : 1u) << (exp_bits - 1u);
+    if (b)
+        exponent |= (((UINT64_C(1) << (exp_bits - 3u)) - 1u) << 2);
+    exponent |= (imm8 >> 4) & 3u;
+    return (sign << (interp_fp_width(fmt) - 1u)) | (exponent << mant) | ((imm8 & 0xFu) << (mant - 4u));
+}
+
+// Read/write the low element of a vector register as a scalar of `fmt`. A scalar FP write ZEROES bits
+// [127:N] of the destination, which is what interp_vec_write's q == 0 does.
+static uint64_t interp_fp_read(const struct cpu *cpu, int reg, unsigned fmt) {
+    interp_vec value = interp_vec_read(cpu, reg);
+    return interp_vec_element(&value, fmt + 1u, 0);
+}
+
+static void interp_fp_write(struct cpu *cpu, int reg, unsigned fmt, uint64_t bits) {
+    interp_vec result;
+    memset(result.byte, 0, sizeof result.byte);
+    interp_vec_set_element(&result, fmt + 1u, 0, bits);
+    interp_vec_write(cpu, reg, result, 0);
+}
+
+// ---------------------------------------------------------------------------
+// The scalar floating-point encoding space.
+// ---------------------------------------------------------------------------
+// Every member has bits[30:29] == 00 and bits[28:24] == 11110, or 11111 for the three-source multiply-adds.
+// bit30 is what separates this from the AdvSIMD SCALAR boxes, which share op0 == 1111 but pin bits[31:30] to
+// 01; bit29 (S) must be 0 because the architecture allocates no S == 1 form here. bit31 is free only because
+// the two conversion boxes use it as `sf` (the general-register width); every other form requires M == 0.
+static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
+    uint64_t gpc = cpu->pc;
+    int rd = (int)(insn & 31), rn = (int)((insn >> 5) & 31), rm = (int)((insn >> 16) & 31);
+    unsigned type = (insn >> 22) & 3u, sf = (insn >> 31) & 1u;
+    unsigned fmt = INTERP_FP_S;
+
+    // ---- Floating-point data-processing (3 source): FMADD / FMSUB / FNMADD / FNMSUB ----
+    if ((insn & 0x7F000000u) == 0x1F000000u) {
+        if (sf) return interp_undefined(cpu, insn, "scalar FP -- 3-source with M set");
+        if (!interp_fp_type_fmt(type, &fmt))
+            return interp_undefined(cpu, insn, "scalar FP -- 3-source unallocated ptype");
+        unsigned o1 = (insn >> 21) & 1u, o0 = (insn >> 15) & 1u;
+        int ra = (int)((insn >> 10) & 31);
+        uint64_t addend = interp_fp_read(cpu, ra, fmt);
+        uint64_t left = interp_fp_read(cpu, rn, fmt), right = interp_fp_read(cpu, rm, fmt);
+        // The architecture spells all four as ONE FPMulAdd with sign-flipped operands:
+        //   FMADD =  Ra + Rn*Rm    FMSUB  =  Ra - Rn*Rm    FNMADD = -Ra - Rn*Rm    FNMSUB = -Ra + Rn*Rm
+        // and the flip is a literal sign-bit toggle (FPNeg), which matters for a NaN operand: the sign of its
+        // payload flips too, and that sign is observable in the propagated result.
+        uint64_t sign = interp_fp_sign_mask(fmt);
+        if (o1) addend ^= sign;
+        if (o1 != o0) left ^= sign;
+        interp_fp_write(cpu, rd, fmt, interp_fp_muladd(fmt, addend, left, right));
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    if (!((insn >> 21) & 1u)) {
+        // ---- Conversion between floating-point and FIXED-point ----
+        // fbits = 64 - scale, and a 32-bit general register cannot name more than 32 fractional bits.
+        unsigned rmode = (insn >> 19) & 3u, opcode = (insn >> 16) & 7u, scale = (insn >> 10) & 0x3Fu;
+        unsigned fbits = 64u - scale;
+        if (!interp_fp_type_fmt(type, &fmt))
+            return interp_undefined(cpu, insn, "scalar FP -- fixed-point conversion unallocated ptype");
+        if (!sf && scale < 32u)
+            return interp_undefined(cpu, insn, "scalar FP -- 32-bit fixed-point conversion with scale < 32");
+        if (rmode == 0 && (opcode == 2 || opcode == 3)) { // SCVTF / UCVTF (fixed-point)
+            uint64_t value = interp_gpr(cpu, rn);
+            interp_fp_write(cpu, rd, fmt,
+                            interp_fp_from_int(fmt, value, sf ? 64u : 32u, opcode == 2,
+                                               INTERP_FPCR_RMODE(g_interp_fpcr), fbits));
+        } else if (rmode == 3 && opcode <= 1) { // FCVTZS / FCVTZU (fixed-point)
+            uint64_t out = interp_fp_to_int(fmt, interp_fp_read(cpu, rn, fmt), sf ? 64u : 32u, opcode == 0,
+                                           INTERP_RM_RZ, fbits);
+            if (sf)
+                interp_set_gpr(cpu, rd, out);
+            else
+                interp_set_gpr32(cpu, rd, (uint32_t)out);
+        } else {
+            return interp_undefined(cpu, insn, "scalar FP -- unallocated fixed-point conversion");
+        }
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // bit21 == 1. The remaining boxes are selected by bits[11:10], with the four bits[11:10] == 00 boxes
+    // separated further by how far up bits[15:10] the fixed field reaches -- most specific first.
+    unsigned op_low = (insn >> 10) & 3u;
+
+    if (op_low == 1) { // ---- Floating-point conditional compare: FCCMP / FCCMPE ----
+        if (sf) return interp_undefined(cpu, insn, "scalar FP -- FCCMP with M set");
+        if (!interp_fp_type_fmt(type, &fmt)) return interp_undefined(cpu, insn, "scalar FP -- FCCMP ptype");
+        unsigned cond = (insn >> 12) & 0xFu, quiet_signals = (insn >> 4) & 1u;
+        if (interp_cond_holds(cpu, cond))
+            interp_fp_compare(cpu, fmt, interp_fp_read(cpu, rn, fmt), interp_fp_read(cpu, rm, fmt),
+                              (int)quiet_signals);
+        else
+            // The condition failed, so NO comparison happens and no exception can be raised; NZCV is loaded
+            // from the instruction's own nzcv field instead. This is how a short-circuiting `&&` over FP
+            // comparisons is compiled, which is why it is common in libm.
+            cpu->nzcv = ((uint64_t)(insn & 0xFu)) << 28;
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    if (op_low == 2) { // ---- Floating-point data-processing (2 source) ----
+        if (sf) return interp_undefined(cpu, insn, "scalar FP -- 2-source with M set");
+        if (!interp_fp_type_fmt(type, &fmt))
+            return interp_undefined(cpu, insn, "scalar FP -- 2-source unallocated ptype");
+        unsigned opcode = (insn >> 12) & 0xFu;
+        uint64_t a = interp_fp_read(cpu, rn, fmt), b = interp_fp_read(cpu, rm, fmt), out;
+        switch (opcode) {
+        case 0: out = interp_fp_arith(fmt, INTERP_FPOP_MUL, a, b); break; // FMUL
+        case 1: out = interp_fp_arith(fmt, INTERP_FPOP_DIV, a, b); break; // FDIV
+        case 2: out = interp_fp_arith(fmt, INTERP_FPOP_ADD, a, b); break; // FADD
+        case 3: out = interp_fp_arith(fmt, INTERP_FPOP_SUB, a, b); break; // FSUB
+        case 4: out = interp_fp_minmax(fmt, a, b, 1, 0); break;           // FMAX
+        case 5: out = interp_fp_minmax(fmt, a, b, 0, 0); break;           // FMIN
+        case 6: out = interp_fp_minmax(fmt, a, b, 1, 1); break;           // FMAXNM
+        case 7: out = interp_fp_minmax(fmt, a, b, 0, 1); break;           // FMINNM
+        case 8:
+            // FNMUL is FPNeg(FPMul(...)) -- the sign flip is applied to the PRODUCT, after rounding and after
+            // NaN propagation, so it flips the sign of a propagated NaN too.
+            out = interp_fp_arith(fmt, INTERP_FPOP_MUL, a, b) ^ interp_fp_sign_mask(fmt);
+            break;
+        default: return interp_undefined(cpu, insn, "scalar FP -- unallocated 2-source opcode");
+        }
+        interp_fp_write(cpu, rd, fmt, out);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    if (op_low == 3) { // ---- Floating-point conditional select: FCSEL ----
+        if (sf) return interp_undefined(cpu, insn, "scalar FP -- FCSEL with M set");
+        if (!interp_fp_type_fmt(type, &fmt)) return interp_undefined(cpu, insn, "scalar FP -- FCSEL ptype");
+        unsigned cond = (insn >> 12) & 0xFu;
+        // A pure register copy: no unpacking, no flushing, no exceptions -- a signalling NaN passes through
+        // unchanged and unreported, exactly as FMOV does.
+        interp_fp_write(cpu, rd, fmt,
+                        interp_cond_holds(cpu, cond) ? interp_fp_read(cpu, rn, fmt) : interp_fp_read(cpu, rm, fmt));
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    if ((insn & 0x0000FC00u) == 0) { // ---- Conversion between floating-point and INTEGER ----
+        unsigned rmode = (insn >> 19) & 3u, opcode = (insn >> 16) & 7u;
+        if (rmode == 0 && opcode == 6) { // FMOV to a general register (Vn's low element -> Rd)
+            interp_vec source = interp_vec_read(cpu, rn);
+            if (type == 0 && !sf) // FMOV Wd, Sn
+                interp_set_gpr32(cpu, rd, (uint32_t)interp_vec_element(&source, 2, 0));
+            else if (type == 1 && sf) // FMOV Xd, Dn
+                interp_set_gpr(cpu, rd, interp_vec_element(&source, 3, 0));
+            else if (type == 3 && !sf) // FMOV Wd, Hn
+                interp_set_gpr32(cpu, rd, (uint32_t)interp_vec_element(&source, 1, 0));
+            else
+                return interp_undefined(cpu, insn, "scalar FP -- unallocated FMOV to general register");
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        if (rmode == 0 && opcode == 7) { // FMOV from a general register (Rn -> Vd's low element)
+            if (type == 0 && !sf) // FMOV Sd, Wn
+                interp_fp_write(cpu, rd, INTERP_FP_S, interp_gpr(cpu, rn) & 0xFFFFFFFFu);
+            else if (type == 1 && sf) // FMOV Dd, Xn
+                interp_fp_write(cpu, rd, INTERP_FP_D, interp_gpr(cpu, rn));
+            else if (type == 3 && !sf) // FMOV Hd, Wn
+                interp_fp_write(cpu, rd, INTERP_FP_H, interp_gpr(cpu, rn) & 0xFFFFu);
+            else
+                return interp_undefined(cpu, insn, "scalar FP -- unallocated FMOV from general register");
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        if (rmode == 1 && opcode == 6 && type == 2 && sf) { // FMOV Xd, Vn.D[1]
+            interp_vec source = interp_vec_read(cpu, rn);
+            interp_set_gpr(cpu, rd, interp_vec_element(&source, 3, 1));
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        if (rmode == 1 && opcode == 7 && type == 2 && sf) { // FMOV Vd.D[1], Xn
+            interp_vec destination = interp_vec_read(cpu, rd);
+            interp_vec_set_element(&destination, 3, 1, interp_gpr(cpu, rn));
+            interp_vec_write(cpu, rd, destination, 1); // single-lane write: keep the low half
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        if (rmode == 3 && opcode == 6 && type == 1 && !sf) {
+            // ---- FJCVTZS: double -> int32 with JavaScript's ToInt32 semantics ----
+            // Two things distinguish it from FCVTZS. It WRAPS modulo 2^32 instead of saturating (that is the
+            // ToInt32 rule), and it reports exactness in Z so a JIT can branch on "this double really was a
+            // small integer" without a second compare. Z is 1 only when the conversion lost nothing at all.
+            uint64_t bits = interp_fp_flush_input(interp_fp_read(cpu, rn, INTERP_FP_D), INTERP_FP_D);
+            unsigned cls = interp_fp_class(bits, INTERP_FP_D);
+            unsigned exact = 1;
+            uint64_t result = 0;
+            if (cls >= INTERP_FPC_INF) { // NaN or infinity: Invalid, result 0, not exact
+                interp_fpsr_raise(INTERP_FPSR_IOC);
+                exact = 0;
+            } else if (cls != INTERP_FPC_ZERO) {
+                // Reuse the exact-integer machinery, but ask for a 64-bit signed destination so nothing
+                // saturates, then take the low 32 bits and decide exactness from the flags it raised.
+                uint64_t before = g_interp_fpsr;
+                uint64_t wide = interp_fp_to_int(INTERP_FP_D, bits, 64u, 1, INTERP_RM_RZ, 0);
+                unsigned raised = (unsigned)((g_interp_fpsr & ~before) & (INTERP_FPSR_IXC | INTERP_FPSR_IOC));
+                if (raised) exact = 0;
+                if ((int64_t)wide != (int64_t)(int32_t)(uint32_t)wide) {
+                    interp_fpsr_raise(INTERP_FPSR_IOC);
+                    exact = 0;
+                }
+                result = (uint64_t)(uint32_t)wide;
+            } else if (bits & interp_fp_sign_mask(INTERP_FP_D)) {
+                exact = 0; // -0.0 converts to +0, which ToInt32 does not consider exact
+            }
+            interp_set_gpr32(cpu, rd, (uint32_t)result);
+            interp_set_flags(cpu, 0, exact, 0, 0);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        if (!interp_fp_type_fmt(type, &fmt))
+            return interp_undefined(cpu, insn, "scalar FP -- integer conversion unallocated ptype");
+        if (opcode == 2 || opcode == 3) { // SCVTF / UCVTF
+            if (rmode != 0) return interp_undefined(cpu, insn, "scalar FP -- unallocated SCVTF/UCVTF rmode");
+            interp_fp_write(cpu, rd, fmt,
+                            interp_fp_from_int(fmt, interp_gpr(cpu, rn), sf ? 64u : 32u, opcode == 2,
+                                               INTERP_FPCR_RMODE(g_interp_fpcr), 0));
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        if (opcode <= 1 || opcode == 4 || opcode == 5) {
+            // FCVT{N,A,P,M,Z}{S,U}: rmode picks the rounding for opcode 0/1, and opcode 4/5 is the FCVTA pair
+            // whose ties-away mode has no FPCR encoding at all.
+            unsigned convert_mode;
+            if (opcode >= 4) {
+                if (rmode != 0) return interp_undefined(cpu, insn, "scalar FP -- unallocated FCVTA rmode");
+                convert_mode = INTERP_RM_RA;
+            } else {
+                static const unsigned by_rmode[4] = {INTERP_RM_RN, INTERP_RM_RP, INTERP_RM_RM, INTERP_RM_RZ};
+                convert_mode = by_rmode[rmode];
+            }
+            uint64_t out = interp_fp_to_int(fmt, interp_fp_read(cpu, rn, fmt), sf ? 64u : 32u, (opcode & 1u) == 0,
+                                           convert_mode, 0);
+            if (sf)
+                interp_set_gpr(cpu, rd, out);
+            else
+                interp_set_gpr32(cpu, rd, (uint32_t)out);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        return interp_undefined(cpu, insn, "scalar FP -- unallocated integer conversion");
+    }
+
+    if ((insn & 0x00007C00u) == 0x00004000u) { // ---- Floating-point data-processing (1 source) ----
+        if (sf) return interp_undefined(cpu, insn, "scalar FP -- 1-source with M set");
+        unsigned opcode = (insn >> 15) & 0x3Fu;
+        if (!interp_fp_type_fmt(type, &fmt))
+            return interp_undefined(cpu, insn, "scalar FP -- 1-source unallocated ptype");
+        // FCVT names its DESTINATION in the low two bits of the opcode and its source in ptype, so it has to
+        // be split out before the single-format cases below.
+        if ((opcode & 0x3Cu) == 0x04u) {
+            unsigned to;
+            if (!interp_fp_type_fmt(opcode & 3u, &to) || to == fmt)
+                return interp_undefined(cpu, insn, "scalar FP -- unallocated FCVT destination");
+            if ((to == INTERP_FP_H || fmt == INTERP_FP_H) && INTERP_FPCR_AHP(g_interp_fpcr))
+                return interp_undefined(cpu, insn, "scalar FP -- FCVT with FPCR.AHP (alternative half format)");
+            interp_fp_write(cpu, rd, to, interp_fp_convert(fmt, to, interp_fp_read(cpu, rn, fmt)));
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        uint64_t a = interp_fp_read(cpu, rn, fmt), out;
+        switch (opcode) {
+        case 0x00: out = a; break;                              // FMOV (register): a pure bit copy
+        case 0x01: out = a & ~interp_fp_sign_mask(fmt); break;   // FABS: FPAbs clears the sign bit and nothing else
+        case 0x02: out = a ^ interp_fp_sign_mask(fmt); break;    // FNEG: likewise a sign-bit toggle
+        case 0x03: out = interp_fp_sqrt(fmt, a); break;          // FSQRT
+        // The FRINT family. All round to an integral value in the same format; they differ only in the mode
+        // and in whether the result being different from the operand is reported as Inexact. FRINTX is the
+        // only one that reports it (its whole purpose is IEEE roundToIntegralExact); FRINTI and FRINTX share
+        // FPCR.RMode and differ by nothing else.
+        case 0x08: out = interp_fp_round_integral(fmt, a, INTERP_RM_RN, 0); break; // FRINTN
+        case 0x09: out = interp_fp_round_integral(fmt, a, INTERP_RM_RP, 0); break; // FRINTP
+        case 0x0A: out = interp_fp_round_integral(fmt, a, INTERP_RM_RM, 0); break; // FRINTM
+        case 0x0B: out = interp_fp_round_integral(fmt, a, INTERP_RM_RZ, 0); break; // FRINTZ
+        case 0x0C: out = interp_fp_round_integral(fmt, a, INTERP_RM_RA, 0); break; // FRINTA
+        case 0x0E: out = interp_fp_round_integral(fmt, a, INTERP_FPCR_RMODE(g_interp_fpcr), 1); break; // FRINTX
+        case 0x0F: out = interp_fp_round_integral(fmt, a, INTERP_FPCR_RMODE(g_interp_fpcr), 0); break; // FRINTI
+        default: return interp_undefined(cpu, insn, "scalar FP -- unimplemented 1-source opcode");
+        }
+        interp_fp_write(cpu, rd, fmt, out);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    if ((insn & 0x00003C00u) == 0x00002000u) { // ---- Floating-point compare: FCMP / FCMPE ----
+        if (sf || ((insn >> 14) & 3u) != 0) return interp_undefined(cpu, insn, "scalar FP -- unallocated compare");
+        if (!interp_fp_type_fmt(type, &fmt)) return interp_undefined(cpu, insn, "scalar FP -- compare ptype");
+        unsigned opcode2 = insn & 0x1Fu;
+        if (opcode2 & 7u) return interp_undefined(cpu, insn, "scalar FP -- unallocated compare opcode2");
+        // opcode2<4> is E (raise Invalid for a quiet NaN too) and opcode2<3> selects the compare-with-zero
+        // form, in which Rm is not a register operand at all.
+        int quiet_signals = (opcode2 >> 4) & 1;
+        uint64_t b = (opcode2 & 8u) ? UINT64_C(0) : interp_fp_read(cpu, rm, fmt);
+        interp_fp_compare(cpu, fmt, interp_fp_read(cpu, rn, fmt), b, quiet_signals);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    if ((insn & 0x00001C00u) == 0x00001000u) { // ---- FMOV (immediate) ----
+        if (sf || ((insn >> 5) & 0x1Fu) != 0)
+            return interp_undefined(cpu, insn, "scalar FP -- unallocated FMOV immediate");
+        if (!interp_fp_type_fmt(type, &fmt)) return interp_undefined(cpu, insn, "scalar FP -- FMOV immediate ptype");
+        interp_fp_write(cpu, rd, fmt, interp_fp_expand_imm(fmt, (insn >> 13) & 0xFFu));
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    return interp_undefined(cpu, insn, "scalar FP -- unallocated encoding");
+}
+
+// ---------------------------------------------------------------------------
 // Scalar floating-point and Advanced SIMD.
 // ---------------------------------------------------------------------------
 // Scope note, because this group is enormous and most of it will never execute here. What a static glibc
@@ -1974,6 +3219,13 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     uint64_t gpc = cpu->pc;
     int rd = (int)(insn & 31), rn = (int)((insn >> 5) & 31), rm = (int)((insn >> 16) & 31);
     unsigned q = (insn >> 30) & 1, u = (insn >> 29) & 1;
+
+    // ---- The scalar floating-point space ----
+    // Tested first because it is exactly disjoint from every AdvSIMD box below and the test is one mask: the
+    // AdvSIMD VECTOR boxes all have bit28 == 0 (op0 == 0111) and the AdvSIMD SCALAR boxes all have bit30 == 1,
+    // while every scalar-FP encoding has bit28 == 1 and bit30 == 0. See interp_exec_fp_scalar's header.
+    if ((insn & 0x7F000000u) == 0x1E000000u || (insn & 0x7F000000u) == 0x1F000000u)
+        return interp_exec_fp_scalar(cpu, insn);
 
     // ---- AdvSIMD copy: DUP (element/general), INS (element/general), SMOV, UMOV ----
     if ((insn & 0x9F208400u) == 0x0E000400u) {
@@ -2209,6 +3461,53 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 result.byte[index] = table[selector / 16u].byte[selector % 16u];
             else if (!extend)
                 result.byte[index] = 0; // TBL zeroes an out-of-range index; TBX leaves the destination byte
+        }
+        interp_vec_write(cpu, rd, result, q);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
+    // ---- AdvSIMD permute: ZIP1 / ZIP2 / UZP1 / UZP2 / TRN1 / TRN2 ----
+    // Same mask as TBL/TBX above and separated from it only by bits[11:10] (00 there, 10 here), which is why
+    // the two sit together. All six are pure lane shuffles -- no arithmetic, no flags, no FP -- so the whole
+    // group is one indexing rule per opcode. They matter far more than their size suggests: a compiler emits
+    // UZP1/ZIP1 for every de-interleaving struct-of-arrays copy, and `uzp1 v31.2d, v30.2d, v31.2d` is what a
+    // 128-bit-pair spill in another hl-engine build reduces to, i.e. it is on the path of running this engine
+    // under itself.
+    if ((insn & 0xBF208C00u) == 0x0E000800u) {
+        unsigned size = (insn >> 22) & 3u, opcode = (insn >> 12) & 7u;
+        if (size == 3 && !q) return interp_undefined(cpu, insn, "AdvSIMD permute -- 1D form is reserved");
+        interp_vec left = interp_vec_read(cpu, rn), right = interp_vec_read(cpu, rm), result;
+        memset(result.byte, 0, sizeof result.byte);
+        unsigned lanes = interp_vec_lanes(size, q), half = lanes / 2u;
+        for (unsigned lane = 0; lane < lanes; lane++) {
+            uint64_t element;
+            switch (opcode) {
+            case 1: // UZP1: the EVEN-indexed elements of the concatenation Vn:Vm, in order
+            case 5: { // UZP2: the ODD-indexed ones
+                unsigned offset = opcode == 5 ? 1u : 0u;
+                const interp_vec *source = lane < half ? &left : &right;
+                unsigned index = (lane < half ? lane : lane - half) * 2u + offset;
+                element = interp_vec_element(source, size, index);
+                break;
+            }
+            case 2:   // TRN1: even lanes of Vn interleaved with the even lanes of Vm
+            case 6: { // TRN2: the odd lanes of each
+                unsigned offset = opcode == 6 ? 1u : 0u;
+                const interp_vec *source = (lane & 1u) ? &right : &left;
+                element = interp_vec_element(source, size, (lane & ~1u) + offset);
+                break;
+            }
+            case 3:   // ZIP1: interleave the LOWER halves of Vn and Vm
+            case 7: { // ZIP2: interleave the UPPER halves
+                unsigned base = opcode == 7 ? half : 0u;
+                const interp_vec *source = (lane & 1u) ? &right : &left;
+                element = interp_vec_element(source, size, base + lane / 2u);
+                break;
+            }
+            default: return interp_undefined(cpu, insn, "AdvSIMD permute -- unallocated opcode");
+            }
+            interp_vec_set_element(&result, size, lane, element);
         }
         interp_vec_write(cpu, rd, result, q);
         cpu->pc = gpc + 4;
@@ -2512,69 +3811,6 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         default: return interp_undefined(cpu, insn, "AdvSIMD three same -- unimplemented opcode");
         }
         interp_vec_write(cpu, rd, result, q);
-        cpu->pc = gpc + 4;
-        return INTERP_NEXT;
-    }
-
-    // ---- Scalar FP <-> general register moves: FMOV only ----
-    // The rest of the scalar-FP box needs an actual floating-point model (rounding modes, FPCR/FPSR, the NaN
-    // rules) and is deliberately left out until a guest asks for it. The register moves are here because they
-    // are how an integer routine gets a value into and out of the vector world, and they involve no arithmetic
-    // at all -- they are pure bit copies, so implementing them costs nothing and risks nothing.
-    if ((insn & 0x5F200000u) == 0x1E200000u && ((insn >> 10) & 0x3Fu) == 0) {
-        unsigned type = (insn >> 22) & 3u, rmode = (insn >> 19) & 3u, opcode = (insn >> 16) & 7u;
-        unsigned sf = (insn >> 31) & 1;
-        if (rmode == 0 && opcode == 6) { // FMOV to a general register (Vn's low element -> Rd)
-            interp_vec source = interp_vec_read(cpu, rn);
-            if (type == 0 && !sf) // FMOV Wd, Sn
-                interp_set_gpr32(cpu, rd, (uint32_t)interp_vec_element(&source, 2, 0));
-            else if (type == 1 && sf) // FMOV Xd, Dn
-                interp_set_gpr(cpu, rd, interp_vec_element(&source, 3, 0));
-            else
-                return interp_undefined(cpu, insn, "scalar FP -- unallocated FMOV to general register");
-            cpu->pc = gpc + 4;
-            return INTERP_NEXT;
-        }
-        if (rmode == 0 && opcode == 7) { // FMOV from a general register (Rn -> Vd's low element)
-            interp_vec result;
-            memset(result.byte, 0, sizeof result.byte);
-            if (type == 0 && !sf) { // FMOV Sd, Wn
-                interp_vec_set_element(&result, 2, 0, interp_gpr(cpu, rn) & 0xFFFFFFFFu);
-            } else if (type == 1 && sf) { // FMOV Dd, Xn
-                interp_vec_set_element(&result, 3, 0, interp_gpr(cpu, rn));
-            } else {
-                return interp_undefined(cpu, insn, "scalar FP -- unallocated FMOV from general register");
-            }
-            interp_vec_write(cpu, rd, result, 0); // a scalar write zeroes the upper 64 bits
-            cpu->pc = gpc + 4;
-            return INTERP_NEXT;
-        }
-        if (rmode == 1 && opcode == 6 && type == 2 && sf) { // FMOV Xd, Vn.D[1]
-            interp_vec source = interp_vec_read(cpu, rn);
-            interp_set_gpr(cpu, rd, interp_vec_element(&source, 3, 1));
-            cpu->pc = gpc + 4;
-            return INTERP_NEXT;
-        }
-        if (rmode == 1 && opcode == 7 && type == 2 && sf) { // FMOV Vd.D[1], Xn
-            interp_vec destination = interp_vec_read(cpu, rd);
-            interp_vec_set_element(&destination, 3, 1, interp_gpr(cpu, rn));
-            interp_vec_write(cpu, rd, destination, 1); // single-lane write: keep the low half
-            cpu->pc = gpc + 4;
-            return INTERP_NEXT;
-        }
-        return interp_undefined(cpu, insn, "scalar FP -- integer/FP conversion (FCVT/SCVTF/UCVTF)");
-    }
-
-    // ---- Scalar FP register-to-register move, which is also a pure bit copy ----
-    // FMOV (register): 0 0 0 11110 type 1 000000 10000 Rn Rd
-    if ((insn & 0x5FFFFC00u) == 0x1E204000u) {
-        unsigned type = (insn >> 22) & 3u;
-        unsigned size = type == 0 ? 2u : (type == 1 ? 3u : 4u);
-        if (size > 3) return interp_undefined(cpu, insn, "scalar FP -- FMOV of a half or quad precision value");
-        interp_vec source = interp_vec_read(cpu, rn), result;
-        memset(result.byte, 0, sizeof result.byte);
-        interp_vec_set_element(&result, size, 0, interp_vec_element(&source, size, 0));
-        interp_vec_write(cpu, rd, result, 0);
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }

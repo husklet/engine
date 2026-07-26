@@ -16,7 +16,69 @@
 #include <time.h>
 #include <unistd.h>
 
-enum { TIMEOUT_SECONDS = 15 };
+enum { TIMEOUT_SECONDS = 15, TIMEOUT_SCALE_MAX = 100 };
+
+/*
+ * Per-wait guest budget and its host-backend scale. tools/matrix_runner.c is the reference implementation and
+ * carries the full reasoning; this is the same knob, reading the same variable, validated the same way, because
+ * every runner in this harness drives the same guests and they must not disagree about how long a guest may
+ * take. (One shared helper would be better than six copies of this; there is no header these four runners and
+ * the two matrix runners all include, so the duplication is deliberate rather than accidental.)
+ *
+ * The short version: 15s was calibrated against a JIT, because until now every supported host CPU had one. An
+ * x86_64 host has none -- neither guest frontend has an amd64 back end, both emit ARM64, so that host's backend
+ * decodes and executes at roughly 10-50x the cost (docs/amd64-host.md section 3). Every deadline below then
+ * expires on a correct guest, and the failures are especially misleading here: wait_child() returns 124, which
+ * several scenarios read as "the engine refused", and wait_for_ready() reports a readiness timeout naming
+ * markers the guest simply had not reached yet. Slow must not be spelled the same way as wrong.
+ *
+ * 15s is also the SMALLEST budget in the harness and it is spent twice per case (capture, then restore) plus
+ * once per marker wait, so this runner is the first to need the scale, not the last.
+ *
+ * The factor is supplied by whoever registers the lane (cmake/Phase3Gates.cmake, through the helper declared in
+ * cmake/Phase3Compat.cmake, which moves this budget and the lane's CTest TIMEOUT together), never inferred here.
+ * It MULTIPLIES the constant rather than replacing it: the constant is how much work a wait covers, the scale is
+ * how much slower this host executes any of it.
+ *
+ * Unset, empty or 1 is bit-for-bit the unscaled runner, diagnostics included. Anything else must be decimal
+ * digits naming a factor in [1, TIMEOUT_SCALE_MAX], and a bad value is refused rather than rounded back to 1: a
+ * silent fallback presents as a lane full of unexplained timeouts, which is exactly what this prevents.
+ */
+static unsigned long timeout_scale = 1;
+
+/* Every deadline in this runner is `now + one budget`, so the budget is only ever needed as a deadline. */
+static time_t case_deadline(void) {
+    return time(NULL) + (time_t)((unsigned long)TIMEOUT_SECONDS * timeout_scale);
+}
+
+static int load_timeout_scale(void) {
+    const char *value = getenv("HL_MATRIX_TIMEOUT_SCALE");
+    char *end = NULL;
+    unsigned long parsed;
+    if (value == NULL || *value == 0) return 0;
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    /* strtoul() skips leading blanks and accepts a sign, wrapping "-1" into ULONG_MAX, so the first character
+       is inspected directly: a negative or padded scale has to be a rejection, not a huge budget. */
+    if (value[0] < '0' || value[0] > '9' || errno != 0 || end == value || *end != 0 || parsed < 1 ||
+        parsed > TIMEOUT_SCALE_MAX) {
+        fprintf(stderr,
+                "checkpoint runner: HL_MATRIX_TIMEOUT_SCALE=\"%s\" is not a decimal factor in [1, %d]; refusing "
+                "to run rather than silently using the unscaled per-case timeout\n",
+                value, TIMEOUT_SCALE_MAX);
+        return 1;
+    }
+    timeout_scale = parsed;
+    /* On stdout, in the output of a PASSING case: a green lane with a scaled budget must not read as evidence
+       that guest execution is comparably fast. An explicit x1 announces nothing, because it IS the unscaled
+       run. */
+    if (timeout_scale == 1) return 0;
+    printf("checkpoint runner: per-wait timeout scaled x%lu to %lus (HL_MATRIX_TIMEOUT_SCALE); this run "
+           "tolerates slow-but-correct guest execution and is NOT evidence of speed comparable to an unscaled "
+           "lane\n",
+           timeout_scale, (unsigned long)TIMEOUT_SECONDS * timeout_scale);
+    return 0;
+}
 
 /* ---------------------------------------------------------------- checkpoint store server
  *
@@ -888,6 +950,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: checkpoint-tree-runner ENGINE GUEST [SCENARIO]\n");
         return 2;
     }
+    /* Before the first launch, so a malformed scale is one line at the top of the log rather than a verdict on a
+       scenario that was measured against a budget nobody chose. */
+    if (load_timeout_scale() != 0) return 2;
     {
         const char *root = scratch_root();
         if (root == NULL) return 2;
@@ -925,7 +990,7 @@ int main(int argc, char **argv) {
                                    (socketpair_case || connected_socket_case) ? 2 : socket_state_case ? 1 :
                                    (pipe_case || eventfd_case || timerfd_case || permissive_case || io_strict_restore ||
                                     io_default_restore) ? 2 : 3,
-                       time(NULL) + TIMEOUT_SECONDS) != 0) {
+                       case_deadline()) != 0) {
         fprintf(stderr, "checkpoint runner: readiness timeout one=%d two=%d three=%d\n",
                 output_has(output, "READY 1"), output_has(output, "READY 2"), output_has(output, "READY 3"));
         kill(child, SIGKILL);
@@ -938,7 +1003,7 @@ int main(int argc, char **argv) {
 #else
     if (kill(child, SIGURG) != 0) return 5;
 #endif
-    result = wait_child(child, time(NULL) + TIMEOUT_SECONDS);
+    result = wait_child(child, case_deadline());
     if (io_capture_refusal) {
         if (result != 70 || g_store_committed || !output_has(output, "incomplete")) return 6;
         printf("checkpoint io named-fifo refusal: ok\n");
@@ -953,7 +1018,7 @@ int main(int argc, char **argv) {
         printf("checkpoint connecting-socket refusal: ok\n");
         return 0;
     }
-    if (result != 0 || wait_for_commit(time(NULL) + TIMEOUT_SECONDS) != 0) return 6;
+    if (result != 0 || wait_for_commit(case_deadline()) != 0) return 6;
 
     if (permissive_case && !connecting_fallback_case && !io_case) {
         char external[640];
@@ -1022,9 +1087,9 @@ int main(int argc, char **argv) {
     child = launch(argv[1], argv[2], release, output, 1,
                    io_strict_restore ? "refuse" : permissive_case ? "discard-optional" : NULL, NULL);
     if (child < 0) return 8;
-    result = wait_child(child, time(NULL) + TIMEOUT_SECONDS);
+    result = wait_child(child, case_deadline());
     if (io_default_restore) {
-        if (result != 0 || wait_for_output(output, "IO-PARENT-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
+        if (result != 0 || wait_for_output(output, "IO-PARENT-RESTORED", case_deadline()) != 0 ||
             output_has(output, "IO-CHILD-RESTORED") || !store_has("RECOVERY.jsonl", "\"outcome\":\"stopped\"") ||
             !store_has("RECOVERY.jsonl", "required external")) {
             fprintf(stderr,
@@ -1071,7 +1136,7 @@ int main(int argc, char **argv) {
         char marker[128];
         if (!strcmp(guest_mode, "type-change") || !strcmp(guest_mode, "permission") ||
             !strcmp(guest_mode, "directory-change")) {
-            if (wait_for_output(output, "IO-PARENT-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
+            if (wait_for_output(output, "IO-PARENT-RESTORED", case_deadline()) != 0 ||
                 output_has(output, "IO-CHILD-RESTORED") ||
                 !store_has("RECOVERY.jsonl", "\"outcome\":\"stopped\""))
                 return 9;
@@ -1079,7 +1144,7 @@ int main(int argc, char **argv) {
             snprintf(marker, sizeof marker, "IO-%s-RESTORED", guest_mode);
             for (char *p = marker; *p; ++p)
                 if (*p >= 'a' && *p <= 'z') *p = (char)(*p - 'a' + 'A');
-            if (wait_for_output(output, marker, time(NULL) + TIMEOUT_SECONDS) != 0 ||
+            if (wait_for_output(output, marker, case_deadline()) != 0 ||
                 !store_has("RECOVERY.jsonl", "\"outcome\":\"reconnected\""))
                 return 9;
         }
@@ -1087,22 +1152,22 @@ int main(int argc, char **argv) {
             store_reset_channels();
             child = launch(argv[1], argv[2], release, output, 1,
                            permissive_case ? "discard-optional" : NULL, NULL);
-            if (child < 0 || wait_child(child, time(NULL) + TIMEOUT_SECONDS) != 0 ||
-                wait_for_output_count(output, "IO-REPEAT-RESTORED", 2, time(NULL) + TIMEOUT_SECONDS) != 0)
+            if (child < 0 || wait_child(child, case_deadline()) != 0 ||
+                wait_for_output_count(output, "IO-REPEAT-RESTORED", 2, case_deadline()) != 0)
                 return 9;
         }
         printf("checkpoint io %s: ok\n", guest_mode);
         return 0;
     }
     if (connecting_fallback_case) {
-        if (wait_for_output(output, "CONNECTING-FALLBACK-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
+        if (wait_for_output(output, "CONNECTING-FALLBACK-RESTORED", case_deadline()) != 0 ||
             !store_has("RECOVERY.jsonl", "\"outcome\":\"reconnected\""))
             return 9;
         printf("checkpoint connecting-socket fallback: ok\n");
         return 0;
     }
     if (permissive_case) {
-        if (wait_for_output(output, "PARENT-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
+        if (wait_for_output(output, "PARENT-RESTORED", case_deadline()) != 0 ||
             output_has(output, "CHILD-RESTORED") ||
             !store_has("RECOVERY.jsonl", "\"outcome\":\"stopped\"") || !store_has("RECOVERY.jsonl", "required external path"))
             return 9;
@@ -1110,7 +1175,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (modified_external_case) {
-        if (wait_for_output(output, "MODIFIED-EXTERNAL-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
+        if (wait_for_output(output, "MODIFIED-EXTERNAL-RESTORED", case_deadline()) != 0 ||
             !store_has("RECOVERY.jsonl", "\"outcome\":\"reconnected\""))
             return 9;
         printf("checkpoint modified-external current-state restore: ok\n");
@@ -1119,7 +1184,7 @@ int main(int argc, char **argv) {
     if (wait_for_restored(output, pipe_case, deleted_case, threads_case, memfd_case, eventfd_case, timerfd_case,
                           signal_case ? 6 : connected_socket_case ? 5 : socket_state_case ? 4 : socketpair_case ? 3 :
                           epoll_case ? 2 : inotify_case,
-                          time(NULL) + TIMEOUT_SECONDS) != 0)
+                          case_deadline()) != 0)
         return 9;
     printf("checkpoint %s restore: ok\n",
            signal_case ? "signal" : connected_socket_case ? "connected-socket" : socket_state_case ? "socket-state" :

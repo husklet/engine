@@ -25,6 +25,11 @@ static inline void hl_native_kqueue_duplicate(int source, int destination) {
     (void)source;
     (void)destination;
 }
+/* A kqueue() descriptor here is a real kernel object, so dup2()/F_DUPFD move it with no bookkeeping. */
+static inline void hl_native_kqueue_relocate(int source, int destination) {
+    (void)source;
+    (void)destination;
+}
 
 static inline int hl_native_fd_path(int descriptor, char *path, size_t capacity) {
     (void)capacity;
@@ -221,6 +226,19 @@ static inline void hl_native_kqueue_duplicate(int source, int destination) {
         }
     }
     pthread_mutex_unlock(&hl_native_klock);
+}
+
+/* Move a shim kqueue's identity from one descriptor number to another.  On macOS a kqueue is a real kernel
+   object, so dup2()/F_DUPFD_CLOEXEC relocate it for free and this is a no-op.  Here the queue exists only in
+   the alias table above, keyed by descriptor NUMBER, so a relocation the shim is not told about leaves the
+   new number unknown -- every subsequent kevent() on it fails EBADF while the old number keeps a stale entry
+   that a later, unrelated descriptor could inherit.  Both halves matter, hence one call rather than a
+   duplicate/close pair at every site: register `destination` first (it keeps the queue's registrations alive
+   as a surviving alias) and only then drop `source`. */
+static inline void hl_native_kqueue_relocate(int source, int destination) {
+    if (source < 0 || destination < 0 || source == destination) return;
+    hl_native_kqueue_duplicate(source, destination);
+    hl_native_kqueue_close(source);
 }
 
 static inline int hl_native_kevent_rehome(int descriptor, int old_target, int new_target) {
