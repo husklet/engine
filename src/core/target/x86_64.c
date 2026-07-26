@@ -1065,7 +1065,11 @@ int hl_engine_entry(int argc, char **argv) {
             rootfs = argv[ai + 1];
             ai += 2;
         } else if (strcmp(argv[ai], "--checkpoint-store") == 0 && ai + 2 < argc) {
-            if (hl_ckpt_channel_adopt(argv[ai + 1], argv[ai + 2]) != 0) return 2;
+            if (hl_ckpt_channel_adopt(argv[ai + 1], argv[ai + 2]) != 0) {
+                fprintf(stderr, "hl-engine: --checkpoint-store %s %s is not an inherited descriptor pair\n",
+                        argv[ai + 1], argv[ai + 2]);
+                return 2;
+            }
             ai += 3;
         } else if (strcmp(argv[ai], "--restore-policy") == 0) {
             if (ckpt_recovery_policy_set(argv[ai + 1]) != 0) return 2;

@@ -1210,7 +1210,11 @@ int hl_engine_entry(int argc, char **argv) {
             hl_option_set("HL_RESTORE", "1", 1); // guest entry dispatches to restore without an ELF arg
             ai += 1;
         } else if (!strcmp(argv[ai], "--checkpoint-store") && ai + 2 < argc) {
-            if (hl_ckpt_channel_adopt(argv[ai + 1], argv[ai + 2]) != 0) return 2;
+            if (hl_ckpt_channel_adopt(argv[ai + 1], argv[ai + 2]) != 0) {
+                fprintf(stderr, "hl-engine: --checkpoint-store %s %s is not an inherited descriptor pair\n",
+                        argv[ai + 1], argv[ai + 2]);
+                return 2;
+            }
             ai += 3;
         } else if (!strcmp(argv[ai], "--restore-policy") && ai + 1 < argc) {
             if (ckpt_recovery_policy_set(argv[ai + 1]) != 0) return 2;

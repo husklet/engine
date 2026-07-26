@@ -2289,27 +2289,30 @@ static int ckpt_vector_reserve(void **items, int *capacity, size_t item_size, in
     return 0;
 }
 
-static int ckpt_copy_fd_all(int source, int destination) {
+// Materialize an image object into `destination`. The blob and memfd seeds need a real descriptor, and the
+// object only exists in the embedder's store.
+static int ckpt_source_copy_to_fd(const char *name, int destination) {
+    FILE *source = ckpt_source_fopen(name);
     unsigned char buffer[65536];
-    for (;;) {
-        ssize_t count = read(source, buffer, sizeof buffer);
-        if (count == 0) return 0;
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        ssize_t offset = 0;
+    size_t count;
+    int failed = 0;
+    if (source == NULL) return -1;
+    while (!failed && (count = fread(buffer, 1, sizeof buffer, source)) != 0) {
+        size_t offset = 0;
         while (offset < count) {
-            ssize_t written = write(destination, buffer + offset, (size_t)(count - offset));
+            ssize_t written = write(destination, buffer + offset, count - offset);
             if (written > 0) {
-                offset += written;
-            } else if (written < 0 && errno == EINTR) {
+                offset += (size_t)written;
                 continue;
-            } else {
-                return -1;
             }
+            if (written < 0 && errno == EINTR) continue;
+            failed = 1;
+            break;
         }
     }
+    if (ferror(source)) failed = 1;
+    ckpt_source_fclose(source);
+    return failed ? -1 : 0;
 }
 
 static int ckpt_restore_backing_seed(const char *procdir, uint64_t object_id, uint64_t minimum_size) {
@@ -2364,18 +2367,13 @@ static int ckpt_restore_backing_seed(const char *procdir, uint64_t object_id, ui
         fd = open(record.path, O_RDWR);
         if (fd < 0) fd = open(record.path, O_RDONLY);
     } else {
-        char source_path[1400];
-        snprintf(source_path, sizeof source_path, "%s", record.path);
-        int source = open(source_path, O_RDONLY);
         char temporary[] = "/tmp/.hl-restore-mapXXXXXX";
-        fd = source >= 0 ? mkstemp(temporary) : -1;
+        fd = mkstemp(temporary);
         if (fd >= 0) unlink(temporary);
-        if (source < 0 || fd < 0 || ckpt_copy_fd_all(source, fd) != 0 || lseek(fd, 0, SEEK_SET) < 0) {
-            if (source >= 0) close(source);
+        if (fd < 0 || ckpt_source_copy_to_fd(record.path, fd) != 0 || lseek(fd, 0, SEEK_SET) < 0) {
             if (fd >= 0) close(fd);
             return -1;
         }
-        close(source);
     }
     int private_fd = fd >= 0 ? hl_host_process_fd_private_adopt(fd) : -1;
     if (private_fd < 0) {
@@ -4497,19 +4495,14 @@ static int ckpt_restore_right_prepare(const struct ckpt_fd *record) {
         if (record->kind == CKF_FILE && fd < 0 && (open_flags & O_ACCMODE) == O_RDWR)
             fd = open(record->path, O_RDONLY);
     } else {
-        char source_path[1400];
-        snprintf(source_path, sizeof source_path, "%s", record->path);
-        int source = open(source_path, O_RDONLY);
         char temporary[] = "/tmp/.hl-restore-rightXXXXXX";
-        fd = source >= 0 ? mkstemp(temporary) : -1;
+        fd = mkstemp(temporary);
         if (fd >= 0) unlink(temporary);
-        if (source < 0 || fd < 0 || ckpt_copy_fd_all(source, fd) != 0) {
-            if (source >= 0) close(source);
+        if (fd < 0 || ckpt_source_copy_to_fd(record->path, fd) != 0) {
             if (fd >= 0) close(fd);
-            return fprintf(stderr, "[restore] queued right blob %s copy failed: %s\n", source_path,
+            return fprintf(stderr, "[restore] queued right blob %s copy failed: %s\n", record->path,
                            strerror(errno)), -1;
         }
-        close(source);
         int live_flags = fcntl(fd, F_GETFL);
         if (live_flags < 0 || fcntl(fd, F_SETFL, (live_flags & O_ACCMODE) | (record->flags & ~O_ACCMODE)) != 0) {
             close(fd);
