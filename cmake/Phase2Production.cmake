@@ -43,10 +43,6 @@ endforeach()
 string(REPLACE ";" "\n" _HL_ARCHIVE_SOURCES_TEXT "${_HL_ARCHIVE_SOURCES}")
 file(WRITE "${CMAKE_BINARY_DIR}/archive-sources.txt"
   "${_HL_ARCHIVE_SOURCES_TEXT}\n")
-add_custom_target(print-archive-sources
-  COMMAND ${CMAKE_COMMAND} -E cat "${CMAKE_BINARY_DIR}/archive-sources.txt"
-  VERBATIM)
-
 # Helper: one .c -> OBJECT library with an exact flag list (CPPFLAGS via the
 # hl_cpp_flags interface + the caller's FLAGS), optionally with the unity dep
 # closure. All the bespoke production flag combos live in ONE place.

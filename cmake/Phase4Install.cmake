@@ -156,25 +156,6 @@ elseif(TARGET hl-engine-dual)
   set(HL_ACTIVATION_TARGET hl-engine-dual)
 endif()
 
-set(_HL_PACKAGE_TEST_DEPS hl-engine-runner ${HL_INSTALL_LIBS})
-foreach(_engine_arch aarch64 x86_64)
-  if(TARGET hl-engine-linux-${_engine_arch})
-    list(APPEND _HL_PACKAGE_TEST_DEPS hl-engine-linux-${_engine_arch})
-  endif()
-endforeach()
-if(HL_ACTIVATION_TARGET)
-  list(APPEND _HL_PACKAGE_TEST_DEPS ${HL_ACTIVATION_TARGET})
-endif()
-if(HL_HAVE_GUEST_CC)
-  list(APPEND _HL_PACKAGE_TEST_DEPS
-    ${CMAKE_BINARY_DIR}/e2e/guest-exit-aarch64
-    ${CMAKE_BINARY_DIR}/e2e/guest-descendant-aarch64
-    ${CMAKE_BINARY_DIR}/e2e/guest-external-term-aarch64
-    ${CMAKE_BINARY_DIR}/e2e/guest-domain-aarch64
-    ${CMAKE_BINARY_DIR}/e2e/guest-domain-x86_64)
-endif()
-add_custom_target(package-test-build DEPENDS ${_HL_PACKAGE_TEST_DEPS})
-
 if(HL_HAVE_ACTIVATION AND HL_ACTIVATION_TARGET)
   # Installed under the activation name; in the build tree it is the
   # package/<host>-aarch64/libhl-engine.a artefact (Makefile 481).

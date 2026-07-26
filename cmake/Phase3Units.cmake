@@ -115,7 +115,6 @@ function(hl_unit name)
     # working directory is part of the contract, not an implementation detail.
     set_tests_properties(unit.${name} PROPERTIES
       LABELS "unit" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-    set_property(GLOBAL APPEND PROPERTY HL_UNIT_TARGETS ${U_BINARY})
   endif()
 endfunction()
 
@@ -205,13 +204,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
           LIBS hl-engine ${_hostl} SINGLE LINK -pthread NO_TEST)
   add_test(NAME unit.linux COMMAND tests_linux)
   set_tests_properties(unit.linux PROPERTIES LABELS "unit" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-  set_property(GLOBAL APPEND PROPERTY HL_UNIT_TARGETS tests_linux)
 
   hl_unit(native_capacity BINARY native-capacity SOURCE tests/unit/test_native_capacity.c
           LIBS hl-engine ${_hostl} SINGLE LINK -pthread NO_TEST)
   add_test(NAME unit.native-capacity COMMAND native-capacity)
   set_tests_properties(unit.native-capacity PROPERTIES LABELS "unit" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-  set_property(GLOBAL APPEND PROPERTY HL_UNIT_TARGETS native-capacity)
 endif()
 
 # Debug-logging variants: same TU with HL_ENABLE_LOGGING forced to 1.
@@ -229,8 +226,4 @@ foreach(_d log fatal)
   hl_codesign(test-${_d}-debug)
   add_test(NAME unit.debug-${_d} COMMAND test-${_d}-debug)
   set_tests_properties(unit.debug-${_d} PROPERTIES LABELS "unit" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-  set_property(GLOBAL APPEND PROPERTY HL_UNIT_TARGETS test-${_d}-debug)
 endforeach()
-
-get_property(_HL_UNIT_TARGETS GLOBAL PROPERTY HL_UNIT_TARGETS)
-add_custom_target(unit-tests DEPENDS ${_HL_UNIT_TARGETS})
