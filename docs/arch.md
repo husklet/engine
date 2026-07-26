@@ -19,7 +19,13 @@ normative; this file is a navigation aid.
   image expects. Host-OS-neutral at the call site, Linux-semantic throughout.
 - **Host services** (`src/host/*`) — portable service interfaces mapped to OS primitives.
   `src/host/linux` and `src/host/macos` are complete backends; `src/host/fake` is the
-  deterministic unit-test backend; `src/host/windows/` is README-only.
+  deterministic unit-test backend; `src/host/windows/` is README-only. This layer is keyed on
+  the host **OS** only; it is host-CPU-neutral and compiled on x86-64 unchanged.
+- **Translator** (`src/translator/*`) — two code paths, and only one runs guests. The
+  production frontends `src/translator/guest/{aarch64,x86_64}/` emit host machine code
+  directly. `src/translator/host/{aarch64,x86_64}/` and `src/translator/codegen.c` are the
+  lowerers for the published IR (`include/hl/ir.h`), which has no caller in `src/`; they are
+  *not* the host backend a new host CPU selects. DOCS.md 3.3 states which is which.
 - **Activation** (`src/core/activation.c`) — the config-file/embedded supervisor launch
   path; initializes subsystems and delegates into the core runtime.
 
@@ -76,16 +82,80 @@ stdin/stdout/stderr as transferred file handles, delegates into
 - **Linux ABI** (`src/linux_abi/`) — `hl_linux_abi_spawn` owns namespace/container setup,
   translation-cache interaction, and fd-table wiring.
 
-## 4. Seams that gate a new host platform
+## 4. Seams that gate a new host
 
-1. **Host selection.** `src/core/target/native.h` defines `HL_NATIVE_HOST_NAME` only for
-   `__APPLE__`/`__linux__` and errors elsewhere; `src/core/target/native.c` dispatches only
-   to `hl_host_macos_create`/`hl_host_linux_create`; `src/core/activation.c` repeats the
-   same split with matching `#error` guards.
-2. **Compat shims.** `src/host/native_context.h` (signal-context extraction) and
-   `src/host/native_compat.h` (BSD/Linux primitive aliasing) are Apple/Linux only.
-3. **Legacy ISA routing.** `src/core/target/dual.c` routes `hl_run_linux_guest` to
-   `hl_aarch64_run_linux_guest`.
-4. **Build.** `flake.nix` carries `hostBackends` and `guestISAs` as data tables, so a new
-   host backend is an entry there plus source; the Makefile's `HOST` gate is `linux|macos`
-   (see docs/makefile-retirement.md).
+"Host platform" is two independent axes, and the seams do not overlap — decide which one you
+are adding before reading further. DOCS.md section 11 keeps the two checklists apart. The host
+OS is `src/host/<os>/`, `__APPLE__`/`__linux__`, `CMAKE_SYSTEM_NAME`, `hostBackends`; the host
+CPU is `HL_HOST_CPU_*` (`src/host/host_cpu.h`), `HL_HOST_ARCH` (CMakeLists.txt), `hostCPUs`
+(flake.nix). Branch on `HL_HOST_CPU_*`, never on a bare `__aarch64__`/`__x86_64__`.
+
+### 4.1 A new host OS
+
+1. **Service backend.** `src/host/<os>/` implementing `hl_host_services`.
+2. **Host selection.** `src/core/target/native.h` (`HL_NATIVE_HOST_NAME`),
+   `src/core/target/native.c` (`hl_host_macos_create`/`hl_host_linux_create`) and
+   `src/core/activation.c` each split on `__APPLE__`/`__linux__` with an `#error` default.
+3. **Compat shim.** `src/host/native_compat.h` — BSD/Linux primitive aliasing, OS-only.
+4. **Build.** `hostBackends` in `flake.nix`.
+
+None of these gated x86-64 Linux: they are all OS-axis, and `src/host/linux` plus all three
+selection sites compiled on a new host CPU unchanged.
+
+### 4.2 A new host CPU
+
+This is the axis that costs, and it is code generation, not selection: both production frontends
+emit ARM64 directly, so on any other host CPU **each guest ISA needs a new back end**.
+`guest/x86_64/emit.c`'s own header says "arm64 host emitters"; `guest/aarch64/translate.c` is a
+same-ISA transliterator that copies guest instruction words verbatim and has no decoder at all.
+The composition point is a `HL_HOST_CPU_AARCH64` fork near the top of `src/core/target/aarch64.c`
+and `src/core/target/x86_64.c`, selecting the JIT files or `guest/<isa>/interp.c`.
+
+1. **The entry trampolines.** `run_block` / `block_return` — hand-written ARM64 with `struct cpu`
+   byte offsets baked in as decimal literals, in four copies: `src/core/dispatch.c` (GCC
+   file-scope `__asm__` vs clang `naked`) and `src/translator/guest/x86_64/translate.c` (the same
+   pair at different offsets, because `struct cpu` differs per guest ISA). A backend supplies its
+   own pair and defines `G_OWN_TRAMPOLINES` to suppress the shared ones; the `#else` arms exist
+   only to abort with a diagnostic. `dispatch.c`'s whole contract with a backend is
+   `translate_block()` + `run_block()`, so `code` need not be host machine code.
+2. **The register model** — whether guest registers live in host registers at all.
+   `src/core/target/x86_64.c`'s header states the x86-64 JIT's (guest `rax..r15` in host
+   `x0..x15`, `cpu` pinned in `x28`); the aarch64 transliterator keeps 31 guest GPRs in the
+   matching host GPRs and steals `x18`/`x28`/`x30`. The assumption reaches past codegen:
+   `sigframe_capture_fault` / `sigframe_resume_dispatch` (`src/core/target/{aarch64,x86_64}.c`)
+   fork on the host CPU because a JIT must reconstruct guest state from the host mcontext
+   (`hl_aarch64_signal_capture`, `hl_x86_signal_capture`, `jit_instruction_guest_pc`) while an
+   interpreter's `struct cpu` is already current; `mach_resolve_fault`
+   (`src/core/target/aarch64.c`) types on `arm_thread_state64_t` under a bare `__APPLE__`; and
+   `install_host_sigaltstack` (`src/linux_abi/thread.c`) exists only because the aarch64 frontend
+   runs with host SP == guest SP.
+3. **`ibtc_publish`** (`src/translator/cache.c`) — a 16-byte single-copy-atomic pair store paired
+   with a lock-free reader in emitted code. The correctness argument is per host CPU: `stp` under
+   FEAT_LSE2 on AArch64, `movdqa` on x86-64. A new backend's indirect-branch reader must be an
+   aligned 16-byte load, not two 8-byte ones.
+4. **Per-backend obligations with nothing enforcing them.** Non-PIE address *materialisation* must
+   be un-biased to the LOW link address while accesses stay biased — `pcrel_base`
+   (`guest/aarch64/translate.c`), the rip-relative `lea` rewrite (`guest/x86_64/lower/mov.c`),
+   `interp_lea_value` (`guest/x86_64/interp.c`) — and `call_return_pc` / `interp_call_return_pc`
+   is the sibling rule for pushed return addresses. Omitting either fails as a hang inside glibc,
+   several frames from the cause: docs/amd64-host-findings.md 3.11.
+5. **Signal-context extraction.** `src/host/native_context.h` is an (OS × CPU) matrix.
+   `HL_HOST_UC_PC`/`HL_HOST_UC_SP` are total; everything else sits behind
+   `HL_HOST_HAS_A64_CONTEXT` or `HL_HOST_HAS_X64_CONTEXT` and needs a host-neutral counterpart.
+6. **Build and CI.** `HL_HOST_ARCH`, `hostCPUs`, and `HL_CI_HOSTS` / `HL_CI_COMPAT_HOSTS` in
+   `cmake/CiLanes.cmake`. DOCS.md section 11 gives the order to touch them in.
+
+Not a seam, despite appearances: `src/core/target/dual.c` routes the legacy launcher's untyped
+`hl_run_linux_guest` to `hl_aarch64_run_linux_guest`. That is **guest**-ISA routing and it needed
+nothing here — but its comment calls that the "native AArch64 default", and reading "native" as
+the host CPU rather than the default guest ISA is exactly the conflation this section exists to
+prevent.
+
+### 4.3 Where the detail lives
+
+- `docs/amd64-host.md` — the host-CPU seam, the (host CPU × guest ISA) matrix, and why each cell
+  starts as an interpreter before a transliterator.
+- `docs/amd64-host-findings.md` — the defects and the traps. 3.11 (the non-PIE
+  address-materialisation obligation) and 3.7 (`visibility("hidden")` is not local linkage) are
+  the two that bite a new backend first.
+- `docs/amd64-host-architecture.md` — the proposed cleanups, with risk and sequencing.
