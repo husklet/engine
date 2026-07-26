@@ -69,15 +69,21 @@ static int recv_fd(int sock) {
 
 static _Atomic long g_rounds = 0;
 
+// Backstop only. A lost readiness edge is already caught DETERMINISTICALLY by the child's 4s
+// epoll_wait timeout (exit 24); this thread exists purely so a park that outlives even that can never
+// hang the suite. Its stall window must therefore stay comfortably longer than that timeout -- a 400ms
+// no-progress window turned "the child was descheduled on a busy host" into a spurious exit 7.
 static void *child_watchdog(void *arg) {
     (void)arg;
     long last = -1;
+    int idle = 0;
     for (;;) {
-        struct timespec ts = {0, 400 * 1000 * 1000};
+        struct timespec ts = {1, 0};
         nanosleep(&ts, NULL);
         long s = atomic_load(&g_rounds);
         if (s >= ROUNDS) return NULL;
-        if (s == last) {
+        if (s != last) idle = 0;
+        if (s == last && ++idle >= 8) {
             fprintf(stderr, "STALL rounds=%ld/%d (received-socket epoll never woke)\n", s, ROUNDS);
             fflush(stderr);
             _exit(7); // lost wake: child parked in epoll_wait with a message pending on the received fd
