@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Assert that every historical Makefile CI lane has a non-empty CTest label on
-# the current host. This is intentionally registry-based: it catches the
-# dangerous CTest behaviour where `ctest -L missing` exits successfully.
+# Assert that every CI lane declared in cmake/CiLanes.cmake selects at least one
+# test on this host. Registry-only by design: it catches the dangerous CTest
+# behaviour where `ctest -L missing` exits 0, which would turn a converted
+# workflow step silently green.
 set -euo pipefail
 
 if [ "$#" -ne 3 ]; then
@@ -12,33 +13,28 @@ fi
 ctest=$1
 build=$2
 host=$3
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+lanes_file=$root/cmake/CiLanes.cmake
 
-both=(
-	unit
-	compat-abi compat-completeness compat-filesystem compat-ipc
-	compat-isolation compat-libc compat-memory compat-network compat-posix
-	compat-process compat-procfs compat-signals compat-syscall
-	compat-syscall-edges compat-threads compat-time
-	compat-native package embedding
-)
-linux=(
-	production production-full-aarch64 production-full-x86_64
-	production-config lifecycle checkpoint checkpoint-io dynamic-e2e
-	integration e2e-oracle isa-fuzz perf-linux perf-native
-)
-darwin=(
-	macos e2e-mac perf-macos compat-abi-corpus compat-core-abi
-	compat-core-syscall compat-core-regress compat-core-workload
-	compat-isa-x86-64 compat-isa-aarch64 compat-soak compat-extended
-	compat-direct
-)
+# One `set(NAME` .. `)` block, one lane per line.
+lanes_in() {
+	awk -v name="$1" '
+		$0 ~ "^set\\(" name "$" { on = 1; next }
+		on && /^\)/ { exit }
+		on { gsub(/[ \t]/, ""); if ($0 != "" && $0 !~ /^#/) print }
+	' "$lanes_file"
+}
 
 case "$host" in
 Linux)
-	labels=("${both[@]}" "${linux[@]}")
+	labels=$(lanes_in HL_CI_SHARDED_LINUX
+		lanes_in HL_CI_DIRECT_LINUX
+		lanes_in HL_CI_REGISTRY_LINUX)
 	;;
 Darwin)
-	labels=("${both[@]}" "${darwin[@]}")
+	labels=$(lanes_in HL_CI_SHARDED_DARWIN
+		lanes_in HL_CI_DIRECT_DARWIN
+		lanes_in HL_CI_REGISTRY_DARWIN)
 	;;
 *)
 	printf 'lane-parity: unsupported host %s\n' "$host" >&2
@@ -46,25 +42,29 @@ Darwin)
 	;;
 esac
 
+if [ -z "$labels" ]; then
+	printf 'lane-parity: parsed no lanes from %s\n' "$lanes_file" >&2
+	exit 1
+fi
+
 status=0
-for label in "${labels[@]}"; do
+count=0
+for label in $labels; do
+	count=$((count + 1))
 	output=$("$ctest" --test-dir "$build" -N -L "^${label}$" 2>&1)
-	count=$(printf '%s\n' "$output" |
+	n=$(printf '%s\n' "$output" |
 		sed -n 's/^[[:space:]]*Total Tests: \([0-9][0-9]*\)$/\1/p' |
 		tail -1)
-	if [ -z "$count" ]; then
+	if [ -z "$n" ]; then
 		printf 'lane-parity: could not enumerate label %s\n%s\n' \
 			"$label" "$output" >&2
 		status=1
-	elif [ "$count" -eq 0 ]; then
+	elif [ "$n" -eq 0 ]; then
 		printf 'lane-parity: label %s selects zero tests on %s\n' \
 			"$label" "$host" >&2
 		status=1
 	fi
 done
 
-if [ "$status" -ne 0 ]; then
-	exit "$status"
-fi
-printf 'lane-parity: %d required labels are non-empty on %s\n' \
-	"${#labels[@]}" "$host"
+[ "$status" -eq 0 ] || exit "$status"
+printf 'lane-parity: %d declared lanes are non-empty on %s\n' "$count" "$host"

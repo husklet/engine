@@ -191,6 +191,20 @@ if(HL_BUILD_TESTS)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Compat.cmake)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Gates.cmake)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase4Mac.cmake)
+
+    # Engines + runners every compat suite needs, so a CI shard can build just
+    # its own lane:
+    #   cmake --build <dir> --target compat-engines compat-<lane>-fixtures
+    # Declared here because the two hosts build the engines in different
+    # phases (Phase 2 on Linux, Phase4Mac on Darwin).
+    set(_compat_engines hl-engine-linux-aarch64 hl-engine-linux-x86_64
+        matrix-runner forkserver-runner)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      list(APPEND _compat_engines linux-production-remote-supervisor deny-icmp)
+    else()
+      list(APPEND _compat_engines hl-remote-supervisor)
+    endif()
+    add_custom_target(compat-engines DEPENDS ${_compat_engines})
   endif()
 endif()
 
