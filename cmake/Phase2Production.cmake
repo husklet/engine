@@ -43,6 +43,11 @@ endforeach()
 string(REPLACE ";" "\n" _HL_ARCHIVE_SOURCES_TEXT "${_HL_ARCHIVE_SOURCES}")
 file(WRITE "${CMAKE_BINARY_DIR}/archive-sources.txt"
   "${_HL_ARCHIVE_SOURCES_TEXT}\n")
+
+# Binds every shipped archive object to the sources it was built from; both
+# hosts' archive lanes stamp their objects. Host-agnostic, like hl_object().
+include(${CMAKE_SOURCE_DIR}/cmake/ArchiveStamp.cmake)
+hl_archive_stamp_setup(${_HL_UNITY_DEPS})
 # Helper: one .c -> OBJECT library with an exact flag list (CPPFLAGS via the
 # hl_cpp_flags interface + the caller's FLAGS), optionally with the unity dep
 # closure. All the bespoke production flag combos live in ONE place.
@@ -121,6 +126,11 @@ hl_object(dual_dispatch src/core/target/dual.c FLAGS -D_GNU_SOURCE -O2)
 add_library(dual_activation OBJECT src/core/activation.c)
 target_link_libraries(dual_activation PRIVATE hl_engine_cflags)
 target_compile_options(dual_activation PRIVATE -D_GNU_SOURCE)
+
+foreach(_stamped hl-embedded-objs dual_aarch64_target dual_x86_64_target
+        dual_aarch64_core dual_x86_64_core dual_dispatch dual_activation)
+  hl_stamp_archive_object(${_stamped})
+endforeach()
 
 add_library(hl-engine-activation STATIC
   $<TARGET_OBJECTS:dual_aarch64_target> $<TARGET_OBJECTS:dual_x86_64_target>

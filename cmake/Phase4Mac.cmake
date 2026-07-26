@@ -111,6 +111,11 @@ hl_object(macdual_dispatch src/core/target/dual.c FLAGS -O2)
 add_library(macdual_activation OBJECT src/core/activation.c)
 target_link_libraries(macdual_activation PRIVATE hl_engine_cflags)
 
+foreach(_stamped hl-mac-embedded-objs macdual_target_aarch64 macdual_target_x86_64
+        macdual_core_aarch64 macdual_core_x86_64 macdual_dispatch macdual_activation)
+  hl_stamp_archive_object(${_stamped})
+endforeach()
+
 add_library(hl-engine-dual STATIC
   $<TARGET_OBJECTS:macdual_target_aarch64> $<TARGET_OBJECTS:macdual_target_x86_64>
   $<TARGET_OBJECTS:macdual_core_aarch64>   $<TARGET_OBJECTS:macdual_core_x86_64>

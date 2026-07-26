@@ -12,11 +12,11 @@ verified by `check-crate-archives` in CI. Do not edit it by hand.
 <!-- BEGIN GENERATED ARCHIVE PROVENANCE -->
 
 ```
-source-commit: bff1ee14fbc0a75a053b147234ca7b5922805617
+source-commit: 9cf99a0054a13c37073c4a13f4d4546d7d25f766
 config-abi: 1
 source-manifest: ac66e2eaa9e45e947ba9c91bf18b7dd6efbb67ac477eb1d182dfdb3c56d74af1
-aarch64-unknown-linux-gnu: c25699343b4f91b7cdd11e60621664729a6c05dae00b869819a5c15ddaf0f256
-aarch64-apple-darwin: 443151b4aebb2d33dbd38540d94c28464296d71cf32d5298dcde9c8e6ef43c76
+aarch64-unknown-linux-gnu: 73bfabfc10f519fbb067a486fb4bd45353b753aa1c4ac76235d18fa1e0a05d6e
+aarch64-apple-darwin: 86a2de77b5ede5491c9d5c1cec1277c4e949beed8ee1b0ce9db850b85f7aeb37
 ```
 
 <!-- END GENERATED ARCHIVE PROVENANCE -->
@@ -29,6 +29,15 @@ moved on from the committed archives. A byte-for-byte rebuild comparison is not
 usable here — the build is deterministic for a fixed toolchain, but the compiler
 records the absolute checkout directory in every object, so the same commit
 built at a different path yields different bytes.
+
+The manifest describes the sources; it does not prove the archive came from
+them. That link is the compiled-in build stamp: every object force-includes a
+generated header holding `HL-ARCHIVE-SOURCE-MANIFEST:<digest>`, and
+`tools/check_crate_archives.sh` requires one distinct stamp per archive, present
+in every member, equal to the `source-manifest` above. An archive built from
+other sources — a refresh in an incremental build directory that skipped a
+changed file, or a hand-committed `.a` — carries the wrong digest, or two
+digests, and fails the gate on every lane.
 
 These archives are what `cargo publish` ships; the crate never compiles `src/`.
 Whenever `HL_CONFIG_ABI` changes, or any engine change must reach crate users,
