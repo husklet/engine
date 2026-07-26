@@ -259,5 +259,12 @@ int hl_host_process_peers(hl_host_process_peer *entries, size_t capacity, size_t
 }
 
 int hl_host_process_interrupt(hl_host_process_peer peer) {
-    return peer.identity > 0 && peer.identity <= INT32_MAX && kill((pid_t)peer.identity, SIGURG) == 0;
+    /* SIGRTMIN+7 is the engine's own THREAD_INT_SIG (native_compat.h aliases it as SIGINFO; see
+     * src/linux_abi/thread.c), the ONE signal every engine process installs a permanent handler for.
+     * It must not be a guest-reachable signal: the engine installs a host handler for one of those only
+     * when the guest itself calls rt_sigaction on it, so kicking with SIGURG -- whose default action is
+     * *ignore* -- silently failed to interrupt any guest that does not handle SIGURG. An interactive shell
+     * parked in read(2) on its pty was therefore never bounced to its safepoint and never entered capture;
+     * the whole tree then waited for it and the embedder saw only a deadline. */
+    return peer.identity > 0 && peer.identity <= INT32_MAX && kill((pid_t)peer.identity, SIGRTMIN + 7) == 0;
 }

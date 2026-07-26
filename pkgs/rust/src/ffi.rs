@@ -107,6 +107,29 @@ unsafe extern "C" {
     fn fcntl(descriptor: c_int, command: c_int, ...) -> c_int;
     #[link_name = "kill"]
     fn process_signal(process: c_int, signal: c_int) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn __libc_current_sigrtmin() -> c_int;
+}
+
+/// The host signal the engine reserves to bounce a process out of a blocking host syscall to its next
+/// dispatcher safepoint (where checkpoint capture runs).
+///
+/// It MUST be the engine's own `THREAD_INT_SIG` (`src/linux_abi/thread.c`), the only signal for which every
+/// engine process installs a permanent, guest-unreachable handler. Any guest-reachable signal is useless
+/// here: the engine installs a host handler for one only when the guest itself calls `rt_sigaction` on it,
+/// so kicking with (say) `SIGURG` is a silent no-op against a shell that never handles `SIGURG` -- its
+/// default action is *ignore*, which does not interrupt a blocked `read`. That is exactly how an
+/// interactive `bash` parked on its PTY was left unreachable, and capture then never began at all.
+pub(crate) fn interrupt_signal() -> c_int {
+    // Linux: SIGRTMIN + 7, matching native_compat.h's SIGINFO alias. macOS: SIGINFO(29), which sig_l2m omits.
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { __libc_current_sigrtmin() + 7 }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        29
+    }
 }
 
 pub(crate) fn guest_fd_limit() -> u32 {
@@ -266,7 +289,7 @@ pub(crate) fn broker_pair() -> std::io::Result<(std::os::unix::net::UnixDatagram
 pub(crate) fn broker_accept(
     broker: &std::os::unix::net::UnixDatagram,
     timeout: std::time::Duration,
-) -> Option<std::os::unix::net::UnixStream> {
+) -> Option<(std::os::unix::net::UnixStream, u64)> {
     let milliseconds = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
     let mut host_pid = 0_u64;
     let descriptor =
@@ -275,7 +298,10 @@ pub(crate) fn broker_accept(
         return None;
     }
     // SAFETY: the descriptor was installed into this process by recvmsg and is owned by it.
-    Some(unsafe { std::os::unix::net::UnixStream::from_raw_fd(descriptor) })
+    Some((
+        unsafe { std::os::unix::net::UnixStream::from_raw_fd(descriptor) },
+        host_pid,
+    ))
 }
 
 /// A raw descriptor this process owns and closes on drop.

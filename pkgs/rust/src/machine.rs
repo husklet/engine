@@ -79,9 +79,14 @@ impl Machine {
             .as_ref()
             .ok_or_else(|| ControlError::unsupported("checkpoint"))?;
         channel.trigger.bump();
-        crate::ffi::signal(self.id(), checkpoint_interrupt_signal())
-            .map_err(|error| checkpoint_error("interrupt checkpoint target", &error))?;
+        let mut kicked = self.kick_participants();
+        if kicked.is_empty() {
+            return Err(checkpoint_context(
+                "no engine process could be interrupted to start a checkpoint",
+            ));
+        }
         let deadline = Instant::now() + timeout;
+        let mut next_kick = Instant::now() + KICK_INTERVAL;
         loop {
             if channel.server.committed() {
                 return Ok(());
@@ -89,18 +94,42 @@ impl Machine {
             if let Some(failure) = channel.server.failure() {
                 return Err(checkpoint_context(failure));
             }
+            let progress = channel.server.progress();
             if self.child.completed() {
-                return Err(checkpoint_context(
-                    "engine exited without committing a complete checkpoint image",
-                ));
+                return Err(checkpoint_context(format!(
+                    "engine exited without committing a complete checkpoint image ({progress})"
+                )));
             }
             if Instant::now() >= deadline {
-                return Err(checkpoint_context(
-                    "checkpoint deadline expired before the image was committed",
-                ));
+                return Err(checkpoint_context(capture_stall(&progress, &kicked)));
+            }
+            if Instant::now() >= next_kick {
+                // Re-kick: a process that entered a blocking host syscall after the first interrupt (or
+                // registered late) would otherwise sit there until the deadline, and the whole tree waits
+                // on it. Kicking again is free -- the signal is engine-owned and its handler is empty.
+                kicked = self.kick_participants();
+                next_kick = Instant::now() + KICK_INTERVAL;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    /// Bounces every process in this machine's domain out of any blocking host syscall so it reaches the
+    /// dispatcher safepoint where the checkpoint trigger is read. Returns the host pids actually signalled.
+    ///
+    /// Signalling only the launch process is not enough: the guest tree runs as further host processes, and
+    /// the coordinator among them is the *container init*, not the process this handle names.
+    fn kick_participants(&self) -> Vec<u64> {
+        let signal = crate::ffi::interrupt_signal();
+        let mut kicked = Vec::new();
+        for process in self.processes().unwrap_or_default() {
+            // Never the launch process itself: it runs no guest and therefore never installs the engine's
+            // handler for this signal, so delivering it there would KILL the launch instead of nudging it.
+            if process.host_id != self.id() && crate::ffi::signal(process.host_id, signal).is_ok() {
+                kicked.push(process.host_id);
+            }
+        }
+        kicked
     }
 
     #[must_use]
@@ -317,26 +346,40 @@ impl Machine {
     }
 }
 
+/// How often a capture in flight re-interrupts its participants.
+const KICK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Explains a capture that ran out of time, naming what was outstanding rather than only the deadline.
+fn capture_stall(progress: &crate::checkpoint_stream::Progress, kicked: &[u64]) -> String {
+    if !progress.aborted.is_empty() {
+        return format!(
+            "checkpoint abandoned: {} was aborted by the engine (an unsupported resource is refused during \
+             capture; the engine's [ckpt] log names it) -- {progress}",
+            progress.aborted.join(", ")
+        );
+    }
+    if !progress.incomplete.is_empty() {
+        return format!(
+            "checkpoint deadline expired: {} entered capture but never committed -- {progress}",
+            progress.incomplete.join(", ")
+        );
+    }
+    if progress.any_image_started() {
+        return format!("checkpoint deadline expired before the image was committed -- {progress}");
+    }
+    format!(
+        "checkpoint deadline expired before any process entered capture: no engine process opened a process \
+         image after {} interrupt(s) to host pid(s) {kicked:?} -- {progress}",
+        kicked.len()
+    )
+}
+
 fn checkpoint_context(context: impl Into<String>) -> ControlError {
     ControlError {
         category: crate::ControlErrorCategory::Host,
         operation: "checkpoint",
         context: context.into(),
     }
-}
-
-fn checkpoint_error(context: &str, error: &std::io::Error) -> ControlError {
-    checkpoint_context(format!("{context}: {error}"))
-}
-
-#[cfg(target_os = "linux")]
-const fn checkpoint_interrupt_signal() -> i32 {
-    23 // SIGURG: reserved engine interrupt on Linux.
-}
-
-#[cfg(target_os = "macos")]
-const fn checkpoint_interrupt_signal() -> i32 {
-    29 // SIGINFO: reserved engine interrupt on macOS.
 }
 
 #[cfg(target_os = "linux")]
