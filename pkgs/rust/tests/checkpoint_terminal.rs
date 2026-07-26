@@ -293,6 +293,10 @@ fn round_trip(foreground: Option<&str>, interrupt: bool) -> bool {
         thread::sleep(Duration::from_millis(500));
         session.send(b"\x03");
     }
+    // The restored shell must serve MORE than one line. Establishing readiness the same way the pre-capture
+    // half does costs one command, so a shell that accepts a single line and then reports EOF fails here
+    // instead of spending its one working line on the probe and looking healthy.
+    synchronise(&session, "B");
     let after = probe_terminal_state(&session, "after restore");
     assert_eq!(
         before.directory, after.directory,
@@ -308,22 +312,18 @@ fn an_idle_interactive_shell_on_a_pty_is_captured_and_restored() {
     round_trip(None, false);
 }
 
-/// KNOWN BAD, reported separately: capture, restore and Ctrl-C all work here -- the restored shell kills
-/// its foreground job and prints a fresh prompt -- but the restored pty then corrupts or ends the input
-/// stream: typed bytes come back duplicated or dropped, and the shell reaches EOF and logs out before the
-/// state probe finishes. That is the pty byte-echo/imported-handle defect being fixed separately, not the
-/// checkpoint path; un-ignore this once it lands.
+/// Ctrl-C at the restored prompt must end the foreground job and hand the terminal back, after which the
+/// shell keeps serving commands. This is the case that proved the restored init never re-created its own
+/// process group: the shell's terminal handoff named a group it was not in, its next read was a background
+/// read, and it saw EOF and logged out.
 #[test]
-#[ignore = "the restored pty corrupts typed input and then reports EOF"]
 fn an_interactive_shell_with_a_foreground_job_is_captured_and_restored() {
     round_trip(Some("sleep 1000"), true);
 }
 
-/// KNOWN BAD, reported separately: everything else about the terminal survives, but the restored shell's
-/// process group reads back as a raw HOST pgid through `/proc/self/stat` instead of the guest pgid it had
-/// (1 for the container init). The restore's pid-translation table covers pids, not the `stat` pgrp field.
+/// The restored shell is still the container init's own process group, so `/proc/self/stat` reports guest
+/// pgid 1 -- the same value it reported before the capture -- and not a raw host pgid.
 #[test]
-#[ignore = "restore does not translate the process group in /proc/<pid>/stat"]
 fn the_restored_shell_keeps_its_guest_process_group() {
     assert!(
         round_trip(None, false),

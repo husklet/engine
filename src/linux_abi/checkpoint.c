@@ -49,6 +49,7 @@
 // bytes over the socket activation handed the engine; the embedder owns the other end.
 
 #include <sys/wait.h>   // waitid/waitpid: coordinator peer-reap; multi-thread refusal probe
+#include <termios.h>    // the controlling terminal's line discipline is captured and replayed
 
 #include "../host/file.h"
 #include "../host/system.h"
@@ -129,6 +130,15 @@ struct ckpt_manifest {
     // init's own group; 0 == none/unknown). Restore re-points the fresh pty at it (tcsetpgrp) so ^C/^Z reach
     // the foreground job -- without it the resumed tree's fg group defaults to the init and ^C kills the tree.
     int32_t fg_pgid_gpid;
+    // The controlling terminal's LINE DISCIPLINE at checkpoint. Restore attaches a fresh pty, which the host
+    // creates in cooked mode (ICANON|ECHO); a guest that had put its terminal in raw mode -- every readline
+    // shell at a prompt -- does not re-issue tcsetattr after resume, because it believes the terminal is
+    // already prepared. The tty then echoes the typed line itself on top of the shell's own echo (bytes come
+    // back doubled) and hands the shell whole lines instead of characters. 0 == no terminal / unreadable.
+    uint32_t tty_termios;
+    uint32_t tty_iflag, tty_oflag, tty_cflag, tty_lflag;
+    uint32_t tty_ispeed, tty_ospeed;
+    uint8_t tty_cc[32];
 };
 
 struct ckpt_meta {
@@ -2130,7 +2140,19 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
     {
         int tf = isatty(0) ? 0 : isatty(1) ? 1 : isatty(2) ? 2 : -1;
         int fgh = (tf >= 0) ? tcgetpgrp(tf) : -1;
+        struct termios tio;
         man.fg_pgid_gpid = (fgh <= 0) ? 0 : (g_init_hostpid && fgh == g_init_hostpid) ? 1 : fgh;
+        if (tf >= 0 && tcgetattr(tf, &tio) == 0) {
+            size_t cc = sizeof tio.c_cc < sizeof man.tty_cc ? sizeof tio.c_cc : sizeof man.tty_cc;
+            man.tty_termios = 1;
+            man.tty_iflag = (uint32_t)tio.c_iflag;
+            man.tty_oflag = (uint32_t)tio.c_oflag;
+            man.tty_cflag = (uint32_t)tio.c_cflag;
+            man.tty_lflag = (uint32_t)tio.c_lflag;
+            man.tty_ispeed = (uint32_t)cfgetispeed(&tio);
+            man.tty_ospeed = (uint32_t)cfgetospeed(&tio);
+            memcpy(man.tty_cc, tio.c_cc, cc);
+        }
     }
     // The digest is asked of the sink: the server accumulated it while the bytes went past, so nothing
     // re-reads the embedder's store.
@@ -5201,6 +5223,30 @@ static void ckpt_claim_tty_fg(void) {
     sigprocmask(SIG_SETMASK, &sv, NULL);
 }
 
+// Replay the captured line discipline onto the fresh pty. The restored guest keeps its in-memory belief about
+// the terminal (readline's "already prepared" flag), so a mode it set before the capture has to be there when
+// it resumes. SIGTTOU is blocked: the init is not yet the foreground group at this point. Best effort -- a
+// non-tty or an unsettable mode just leaves the launcher's default cooked terminal.
+static void ckpt_restore_tty_mode(const struct ckpt_manifest *man) {
+    struct termios tio;
+    int tf = isatty(0) ? 0 : isatty(1) ? 1 : isatty(2) ? 2 : -1;
+    if (!man->tty_termios || tf < 0 || tcgetattr(tf, &tio) != 0) return;
+    size_t cc = sizeof tio.c_cc < sizeof man->tty_cc ? sizeof tio.c_cc : sizeof man->tty_cc;
+    tio.c_iflag = (tcflag_t)man->tty_iflag;
+    tio.c_oflag = (tcflag_t)man->tty_oflag;
+    tio.c_cflag = (tcflag_t)man->tty_cflag;
+    tio.c_lflag = (tcflag_t)man->tty_lflag;
+    memcpy(tio.c_cc, man->tty_cc, cc);
+    (void)cfsetispeed(&tio, (speed_t)man->tty_ispeed);
+    (void)cfsetospeed(&tio, (speed_t)man->tty_ospeed);
+    sigset_t sv, bl;
+    sigemptyset(&bl);
+    sigaddset(&bl, SIGTTOU);
+    sigprocmask(SIG_BLOCK, &bl, &sv);
+    (void)tcsetattr(tf, TCSANOW, &tio);
+    sigprocmask(SIG_SETMASK, &sv, NULL);
+}
+
 // Best-effort reconstruction of this process's group/session relative to the LIVE (re-forked) tree. A
 // process that led its own group/session re-creates it; otherwise it joins its (already-inherited) parent
 // group. Errors are ignored (the process is at worst left in its inherited group -- never fatal).
@@ -5378,6 +5424,7 @@ static int ckpt_restore_tree(const char *rootfs) {
     // SIGTTIN blocked that read fails EIO -- readline reports EOF and the shell logs out after one line.
     // Only the GROUP is re-created: the session belongs to the launcher, which owns the pty.
     if (im.pgid_gpid == 1) (void)setpgid(0, 0);
+    ckpt_restore_tty_mode(&man);
     // Publish which guest group owned the tty foreground, so whichever re-forked process is that group's leader
     // claims the controlling terminal AFTER it re-creates its group (see ckpt_claim_tty_fg). Set before the fork
     // so every child inherits it. Without this the resumed tree's fg group defaults to the init's, and a tty
