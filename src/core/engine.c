@@ -317,6 +317,7 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
     const size_t abi3_size = offsetof(hl_engine_box_config, file_owners);
     const size_t abi4_size = offsetof(hl_engine_box_config, checkpoint_policy);
     int has_checkpoint_policy;
+    int has_checkpoint_directories;
     int has_v2;
     if (box == NULL) return HL_STATUS_OK;
     if ((box->abi != HL_ENGINE_BOX_ABI_1 && box->abi != HL_ENGINE_BOX_ABI_3 && box->abi != HL_ENGINE_BOX_ABI_4 &&
@@ -328,6 +329,8 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
         return HL_STATUS_ABI_MISMATCH;
     has_v2 = box->abi >= HL_ENGINE_BOX_ABI_4;
     has_checkpoint_policy = box->abi >= HL_ENGINE_BOX_ABI;
+    /* ABI 1's struct ends before these fields; reading them would run off the caller's allocation. */
+    has_checkpoint_directories = box->abi >= HL_ENGINE_BOX_ABI_3;
     if (has_v2)
         known_flags |=
             HL_ENGINE_BOX_PUBLISH_EXTERNAL | HL_ENGINE_BOX_TRANSLATION_CACHE_DISABLED | HL_ENGINE_BOX_SENTRY_ONLY;
@@ -363,8 +366,12 @@ static hl_status hl_engine_apply_box(hl_engine *engine, const hl_engine_box_conf
             if (box->publish[index].host_port == 0 || box->publish[index].guest_port == 0)
                 return HL_STATUS_INVALID_ARGUMENT;
     }
-    if (box->checkpoint_directory != NULL || box->restore_directory != NULL) {
-        number[0] = (char)('0' + (has_checkpoint_policy ? box->checkpoint_policy : 0));
+    if (has_checkpoint_directories && (box->checkpoint_directory != NULL || box->restore_directory != NULL)) {
+        /* The one place the box's policy word acquires meaning. A box ABI without the field was compiled
+         * against headers where 0 meant refuse and observed exactly that, so give it refuse; only the
+         * current ABI's 0 means "no policy requested" and selects the permissive restore default. */
+        uint32_t policy = has_checkpoint_policy ? box->checkpoint_policy : HL_CONFIG_CHECKPOINT_REFUSE;
+        number[0] = (char)('0' + policy);
         number[1] = 0;
         if (hl_options_set(&engine->options, "HL_CHECKPOINT_POLICY", number, 1) != HL_STATUS_OK)
             return HL_STATUS_OUT_OF_MEMORY;
