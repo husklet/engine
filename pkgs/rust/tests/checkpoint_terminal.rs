@@ -29,7 +29,14 @@ mod checkpoint_env;
 
 const ROWS: u16 = 31;
 const COLUMNS: u16 = 117;
-const DEADLINE: Duration = Duration::from_secs(20);
+const DEADLINE: Duration = Duration::from_secs(30);
+/// Bound on a shell becoming interactive, and on it answering a request. Generous on purpose: the hosted
+/// four-core runner is an order of magnitude slower than a development box, and every wait here ends on a
+/// marker the guest produced, so a long bound costs nothing when things work.
+const READY_DEADLINE: Duration = Duration::from_secs(90);
+const ANSWER_DEADLINE: Duration = Duration::from_secs(60);
+/// How many times readiness is re-asked before the wait becomes purely passive.
+const SYNC_ATTEMPTS: usize = 12;
 
 /// An interactive shell that exists on every host this crate builds for. The alpine fixture rootfs has no
 /// bash, and the defect is about a job-control shell on a pty, which is what `bash -il` is.
@@ -102,16 +109,19 @@ impl Session {
     }
 
     /// Runs `command` in the guest shell and waits for `marker` to come back out of the pty.
-    fn ask(&self, command: &str, marker: &str) -> String {
+    fn ask(&self, command: &str, marker: &str, tag: &str) -> String {
         self.send(format!("{command}\n").as_bytes());
-        self.expect(marker)
+        self.expect(marker, tag)
     }
 
-    fn expect(&self, marker: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(15);
+    fn expect(&self, marker: &str, tag: &str) -> String {
+        let deadline = Instant::now() + ANSWER_DEADLINE;
         loop {
             let text = self.text();
-            // Skip the shell's own echo of the line we just typed: the answer is what follows it.
+            // Skip the shell's own echo of the line we just typed: the answer is what follows it. Every
+            // marker this test waits for is computed by the shell (`$((20+3))`), so it can never appear in
+            // the echo of the request -- the transcript is one interleaved stream of echo and output, and
+            // matching the echo would prove nothing about the guest.
             if let Some(offset) = text.rfind(marker) {
                 if text[offset..].contains('\n') {
                     return text;
@@ -119,11 +129,58 @@ impl Session {
             }
             assert!(
                 Instant::now() < deadline,
-                "the guest never produced {marker:?}; transcript so far:\n{text}"
+                "[{tag}] the guest never produced {marker:?}; transcript so far:\n{text}"
             );
             thread::sleep(Duration::from_millis(20));
         }
     }
+
+    /// Blocks until the guest has written anything at all to its terminal.
+    fn wait_for_first_output(&self, tag: &str) {
+        let deadline = Instant::now() + READY_DEADLINE;
+        while self.text().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "[{tag}] the guest never wrote anything to its terminal"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Waits until the shell is genuinely interactive, and proves it with an answer the shell had to compute.
+///
+/// Readiness is never inferred from a delay. It also cannot be established with a single write: a shell
+/// that has not finished setting up its line discipline discards type-ahead, and the discarded bytes were
+/// still echoed by the tty, so the transcript shows the request while the shell never saw it. On a busy
+/// four-core runner that window is wide enough to swallow the whole probe. The request is therefore
+/// idempotent (`echo`) and repeated until the shell answers it, under one generous overall deadline.
+fn synchronise(session: &Session, tag: &str) {
+    let marker = format!("SYNC{tag}-42");
+    let request = format!("echo SYNC{tag}-$((6*7))\n");
+    let deadline = Instant::now() + READY_DEADLINE;
+    // Bounded resends, then a pure wait. Repeating forever would eventually fill the terminal's input queue
+    // against a shell that is not reading, and the write -- not the marker -- would be what blocked.
+    for _ in 0..SYNC_ATTEMPTS {
+        session.send(request.as_bytes());
+        let retry = Instant::now() + Duration::from_millis(750);
+        while Instant::now() < retry {
+            if session.text().contains(&marker) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    while Instant::now() < deadline {
+        if session.text().contains(&marker) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "[{tag}] the shell never became interactive; transcript so far:\n{}",
+        session.text()
+    );
 }
 
 /// Every probe the acceptance criteria ask for, in ONE line typed at the terminal, ending in a sentinel.
@@ -150,7 +207,7 @@ struct Observed {
 
 /// Drives the shell through every acceptance probe and returns the state that must survive a round trip.
 fn probe_terminal_state(session: &Session, tag: &str) -> Observed {
-    let text = session.ask(PROBE, "PROBE-23");
+    let text = session.ask(PROBE, "PROBE-23", tag);
     let expected = format!("SIZE=[{ROWS} {COLUMNS}]");
     assert!(
         text.contains(&expected),
@@ -198,6 +255,8 @@ fn round_trip(foreground: Option<&str>, interrupt: bool) -> bool {
         )
         .expect("launch an interactive shell with a store attached");
     let session = Session::attach(machine.take_terminal().expect("a pty was requested"));
+    session.wait_for_first_output("before capture");
+    synchronise(&session, "A");
     let before = probe_terminal_state(&session, "before capture");
     if let Some(command) = foreground {
         session.send(format!("{command}\n").as_bytes());
