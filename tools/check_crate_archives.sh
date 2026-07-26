@@ -8,12 +8,20 @@
 # every engine change made since it was built. Releases 0.1.17, 0.1.18 and
 # 0.1.26 shipped an archive 478 commits behind the headers for that reason.
 #
-# This compares two things against the generated block in
+# This compares three things against the generated block in
 # pkgs/rust/assets/PROVENANCE.md:
 #   1. the source manifest hash (see tools/crate_archive_manifest.sh) -- catches
 #      "a .c file changed and nobody regenerated the archives";
 #   2. the SHA-256 of each committed archive -- catches an archive edited or
-#      replaced without updating its recorded provenance.
+#      replaced without updating its recorded provenance;
+#   3. the build stamp carried by every object inside each archive (see
+#      tools/gen_archive_stamp.sh) -- catches an archive that does not come from
+#      the manifest it is filed under. 1 and 2 are both satisfied by an archive
+#      built from other sources: a refresh in an incremental build directory
+#      that failed to recompile a changed file produced exactly that, and the
+#      resulting archive passed this gate while failing the crate's terminal
+#      test. The stamp is compiled in, so it cannot be forged by rewriting
+#      PROVENANCE.md.
 set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -103,6 +111,48 @@ for target in aarch64-unknown-linux-gnu aarch64-apple-darwin; do
 		printf '%s recorded: %s\n' "$target" "$recorded"
 		printf '%s actual:   %s\n' "$target" "$actual"
 		report_error "committed $target archive does not match its recorded SHA-256."
+	fi
+done
+
+# Every object in a shipped archive force-includes the generated stamp header,
+# so the archive states which source manifest it was compiled against. This is
+# an INTEGRITY check, not a freshness one: it compares archive bytes against the
+# recorded manifest, never against the working tree, so it holds on every push
+# lane exactly as it holds at release time. It runs on both hosts because it
+# only reads bytes -- no target-specific tooling.
+check_stamp() {
+	local target=$1 archive=$2 stamps total members unique
+	stamps=$(LC_ALL=C grep -oa 'HL-ARCHIVE-SOURCE-MANIFEST:[0-9a-f]\{64\}' "$archive" |
+		sed 's/^[^:]*://' | LC_ALL=C sort || true)
+	total=$(printf '%s' "$stamps" | grep -c . || true)
+	if [ "$total" -eq 0 ]; then
+		report_error "$target archive carries no build stamp; it was not produced by this build system."
+		return
+	fi
+	unique=$(printf '%s\n' "$stamps" | uniq)
+	if [ "$(printf '%s\n' "$unique" | grep -c .)" -ne 1 ]; then
+		printf '%s stamps found:\n%s\n' "$target" "$unique"
+		report_error "$target archive mixes objects built from different sources (stale objects in the build directory)."
+		return
+	fi
+	if [ "$unique" != "$recorded_manifest" ]; then
+		printf '%s stamped manifest: %s\n' "$target" "$unique"
+		printf '%s recorded manifest: %s\n' "$target" "$recorded_manifest"
+		report_error "$target archive was built from sources other than the manifest it is recorded under."
+		return
+	fi
+	# An unstamped member would carry no claim at all, so require one per member.
+	# BSD ar lists the Mach-O symbol table as a member; GNU ar hides it.
+	members=$(ar -t "$archive" | grep -v '^__\.SYMDEF' | grep -c . || true)
+	if [ "$total" -ne "$members" ]; then
+		report_error "$target archive has $members members but $total build stamps; some object bypassed the stamp."
+	fi
+}
+
+for target in aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+	archive="pkgs/rust/assets/lib/$target/libhl-engine.a"
+	if [ -f "$archive" ]; then
+		check_stamp "$target" "$archive"
 	fi
 done
 

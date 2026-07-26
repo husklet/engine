@@ -627,12 +627,23 @@ Two CI gates protect this, on Linux and on `publish`:
   the Mach-O archive needs a Darwin host, so the Linux runner does the host-independent part (ar container, member
   list, required symbols) and the macOS workflow runs the same gate for the link test. Requiring the Mach-O link on
   Linux previously made this step red on every commit regardless of freshness.
+- The same gate reads the **build stamp** out of the archive bytes. Every object in a shipped archive force-includes a
+  generated header (`tools/gen_archive_stamp.sh`, `cmake/ArchiveStamp.cmake`) holding
+  `HL-ARCHIVE-SOURCE-MANIFEST:<digest>` for the sources it was compiled against, so the archive states its own
+  provenance instead of PROVENANCE.md asserting it. The gate requires exactly one distinct stamp, equal to the recorded
+  `source-manifest`, in every member. This is the *correspondence* check: the manifest and SHA-256 above are both
+  satisfied by an archive built from other sources, which is what a refresh in an incremental build directory that
+  failed to recompile a changed file produces — it validated as "current" while failing the crate's terminal test.
+  A stale object keeps the older digest and the archive then carries two stamps. The stamp is `static`, hence invisible
+  to `nm`; the gate matches the byte string, which no linkage choice can hide. It compares archive bytes against
+  recorded text only, never against the working tree, so it is enforced on the push lanes as well
+  (`--skip-freshness` defers currency, not this).
 - `pkgs/rust/tests/packaged_archive.rs` launches a guest through the committed archive on both hosts. This is the
   *correctness* check.
 
 Byte-comparing a CI rebuild against the committed archive is not used: the build is deterministic for a fixed
 toolchain, but the compiler records the absolute checkout directory in each object, so the same commit built at a
-different path produces different bytes. The manifest hash has no such dependence.
+different path produces different bytes. The manifest hash and the stamp have no such dependence.
 
 ## 8. Testing model
 
