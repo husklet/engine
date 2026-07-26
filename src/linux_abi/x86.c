@@ -25,6 +25,7 @@ static void *elf_host_map(void *context, void *address, size_t length, uint32_t 
 #include "../host/range.h"
 #include "page.h"
 #include "image.h"
+#include "../translator/guest/x86_64/cpuid.h" // AT_HWCAP derives from the guest CPUID model, not the host
 
 static int x86_image_read(const char *path, hl_linux_image *image) {
     if (g_initial_executable_image != NULL)
@@ -495,6 +496,23 @@ static void load_elf(const char *path, struct loaded *out) {
 // Build the SysV x86-64 process stack (identical layout to aarch64). Returns rsp.
 static char *g_guest_env[] = {"PATH=/usr/bin:/bin", "HOME=/root", "TERM=dumb", "LANG=C", NULL};
 
+// AT_HWCAP on x86-64 is CPUID.1:EDX (arch/x86/include/asm/elf.h ELF_HWCAP; measured 0x178bfbff natively
+// here). It was hardcoded 0. glibc hid that -- getauxval(AT_HWCAP) returns its own _dl_hwcap, not the kernel
+// word, which is why the `auxval` fixture still read hwcap_nz=1 -- but a /proc/self/auxv reader saw a CPU with
+// no features at all.
+//
+// Not the host's word: the guest never executes on this CPU. The one model is hl_x86_cpuid()'s leaf 1, where
+// -- the rule guest/aarch64/cpu.h records -- a bit is set only when BOTH backends implement the whole feature
+// exactly, and which the guest reads directly with `cpuid`. Ask it rather than restate it, so the two surfaces
+// cannot disagree. AT_HWCAP2 is 0 by the same derivation, not omission: its bits are RING3MWAIT and FSGSBASE,
+// and leaf 7 EBX bit 0 is clear in that model. Linux emits it unconditionally, so the entry must exist at 0.
+static uint64_t x86_guest_hwcap(void) {
+    struct cpu probe = {0}; // hl_x86_cpuid reads RAX/RCX and writes RAX..RDX; nothing else is touched
+    probe.r[RAX] = 1;
+    hl_x86_cpuid(&probe);
+    return (uint64_t)(uint32_t)probe.r[RDX];
+}
+
 static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t at_base) {
     size_t SZ = 8u << 20, GUARD = 0x10000;
     // stack-overflow safety: a PROT_NONE guard gap immediately BELOW the usable stack (Linux's
@@ -621,16 +639,20 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         {7, at_base},
         {8, 0},
         {9, lm->entry},
-        {11, 0},
-        {12, 0},
-        {13, 0}, // AT_UID/EUID/GID -> container root
-        {14, 0},
-        {16, 0},
+        // AT_UID/EUID/GID/EGID: 0 with a "container root" comment, but cuid()/cgid() ARE the container
+        // identity (state.c: configured id, else the host's) and are what container_init seeds g_ruid/g_euid
+        // from -- so the constant did not mean root, it meant auxv contradicted this guest's own getuid() and
+        // the aarch64 engine. Measured: aarch64 guest 1000, x86-64 guest 0, same uncontainerised run.
+        {11, (uint64_t)cuid()},
+        {12, (uint64_t)cuid()},
+        {13, (uint64_t)cgid()},
+        {14, (uint64_t)cgid()},
+        {16, x86_guest_hwcap()},
         {15, plat},
         {25, rnd},
         {23, 0},       // AT_SECURE 0
         {17, 100},     // AT_CLKTCK
-        {26, 0},       // AT_HWCAP2
+        {26, 0},       // AT_HWCAP2 -- 0 by derivation, see x86_guest_hwcap()
         {31, execfn}, // AT_EXECFN -> execve pathname string (glibc/Rust/uutils multicall read it). Missing it
                       // made getauxval(AT_EXECFN)==0 -> strlen(0) -> SIGSEGV.
         {0, 0},        // AT_NULL terminator

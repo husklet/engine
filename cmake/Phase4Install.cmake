@@ -7,10 +7,18 @@
 #     cmake --build build
 #     cmake --install build --prefix /usr/local
 #
-# giving  include/hl/*.h, lib/libhl-{engine,translator,linux-abi,host-<host>}.a,
-# lib/libhl-engine-activation.a (aarch64 only), lib/pkgconfig/*.pc and
-# bin/hl-engine-runner — the exact artefact set of the Makefile `install`
-# target (Makefile 474-486).
+# giving  include/hl/*.h, lib/libhl-{engine,linux-abi,host-<host>}.a,
+# lib/libhl-engine-activation.a, lib/pkgconfig/*.pc and bin/hl-engine-runner.
+#
+# libhl-engine-activation.a + hl-engine-activation.pc are THE complete engine an embedder links: one
+# force-loaded archive with both guest-ISA targets, the translator and the whole ABI (pkgs/rust/build.rs
+# already links exactly it). hl-engine.pc is the smaller host/ABI contract package.c exercises.
+#
+# libhl-translator.a is deliberately NOT published: a build component of the runner, both production
+# engines and the activation archive, never linkable alone. Off an AArch64 host it carries 84 undefined
+# ARM64-emitter references (e_*, emit_*, hl_x86_emit_*, rm_*) defined only by the src/core/target/x86_64.c
+# unity TU, which is in no published archive but the activation one -- and nothing else installed
+# references a translator symbol, so -lhl-translator handed a consumer half of a component.
 # ---------------------------------------------------------------------------
 
 set(HL_VERSION 0.1.10)
@@ -67,7 +75,7 @@ includedir=\${prefix}/include
 Name: hl-engine
 Description: Portable Linux guest translation and ABI engine
 Version: @HL_VERSION@
-Libs: -L\${libdir} -lhl-host-@HL_PACKAGE_HOST@ -lhl-engine -lhl-translator -lhl-linux-abi @HL_PACKAGE_SYSTEM_LIBS@
+Libs: -L\${libdir} -lhl-host-@HL_PACKAGE_HOST@ -lhl-engine -lhl-linux-abi @HL_PACKAGE_SYSTEM_LIBS@
 Cflags: -I\${includedir}
 ")
 configure_file(${HL_PC_DIR}/hl-engine.pc.in ${HL_PC_DIR}/hl-engine.pc @ONLY)
@@ -108,7 +116,7 @@ endif()
 set(CMAKE_INSTALL_LIBDIR "lib" CACHE PATH "object code libraries (relative to prefix)")
 include(GNUInstallDirs)
 
-set(HL_INSTALL_LIBS hl-engine hl-translator hl-linux-abi)
+set(HL_INSTALL_LIBS hl-engine hl-linux-abi)
 if(TARGET hl-host-linux)
   list(APPEND HL_INSTALL_LIBS hl-host-linux)
 elseif(TARGET hl-host-macos)
@@ -173,6 +181,11 @@ endif()
 # what is checked cannot drift from what is installed. Runs in the `unit` lane
 # because it is two nm sweeps and one link.
 #
+# The installed binaries used to be providers too, because libhl-translator.a's
+# ARM64 emitter references had no definition in any archive. Unpublishing it
+# removed the exception: the installed archives now close over themselves plus
+# the system toolchain on both hosts, so the gate asserts that directly.
+#
 # Linux host only: Apple's nm spells the selectors differently and a Mach-O
 # probe takes another system-library set. The macOS artefact is Phase4Mac's
 # hl-engine-dual, which mac-dual-backend-link-test already force-loads whole.
@@ -191,20 +204,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND HL_BUILD_TESTS)
     list(APPEND _closure_archives $<TARGET_FILE:${HL_ACTIVATION_TARGET}>)
   endif()
 
-  # The installed binaries an archive is a component of. Without them every
-  # per-guest-ISA entry point the target unity TU owns (hl_run_linux_guest, the
-  # ARM64 emitters) would read as dangling.
-  set(_closure_binaries $<TARGET_FILE:hl-engine-runner>)
-  foreach(_engine_arch aarch64 x86_64)
-    if(TARGET hl-engine-linux-${_engine_arch})
-      list(APPEND _closure_binaries $<TARGET_FILE:hl-engine-linux-${_engine_arch}>)
-    endif()
-  endforeach()
-
   add_test(NAME gate.archive-closure
     COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_archive_closure.sh
-            ${HL_NM_EXECUTABLE} ${CMAKE_C_COMPILER}
-            ${_closure_archives} -- ${_closure_binaries})
+            ${HL_NM_EXECUTABLE} ${CMAKE_C_COMPILER} ${_closure_archives})
   set_tests_properties(gate.archive-closure PROPERTIES
     LABELS "unit;gate" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()

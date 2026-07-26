@@ -10,20 +10,18 @@
 # undefined symbols instead of at the compile that created them.
 #
 # The check has two halves, and neither is an allowlist:
-#   providers  -- symbols defined by the installed archives and the installed
-#                 engine binaries. An archive is a component of those binaries,
-#                 so a reference the production engine satisfies is resolved,
-#                 not dangling. (What it does NOT prove is that an archive is
-#                 linkable ALONE; that is a packaging question, not this gate.)
+#   providers  -- symbols defined by the installed archives, and nothing else.
+#                 There is no "but a build-tree binary defines it" escape: the
+#                 published set has to close over itself.
 #   toolchain  -- everything else is offered to the real linker against the
 #                 system libraries only. Whatever it still cannot resolve is an
 #                 engine symbol with no definition anywhere, and it is named.
 #
-# usage: check_archive_closure.sh <nm> <cc> <archive>... -- <binary>...
+# usage: check_archive_closure.sh <nm> <cc> <archive>...
 set -euo pipefail
 
 if [ "$#" -lt 3 ]; then
-	printf 'usage: %s <nm> <cc> <archive>... -- <binary>...\n' "$0" >&2
+	printf 'usage: %s <nm> <cc> <archive>...\n' "$0" >&2
 	exit 2
 fi
 
@@ -31,20 +29,7 @@ nm=$1
 cc=$2
 shift 2
 
-archives=()
-binaries=()
-seen_separator=0
-for argument in "$@"; do
-	if [ "$argument" = "--" ]; then
-		seen_separator=1
-		continue
-	fi
-	if [ "$seen_separator" -eq 0 ]; then
-		archives+=("$argument")
-	else
-		binaries+=("$argument")
-	fi
-done
+archives=("$@")
 
 if [ "${#archives[@]}" -eq 0 ]; then
 	printf 'archive-closure: no archives named\n' >&2
@@ -60,7 +45,7 @@ trap 'rm -rf "$work"' EXIT
 defined_symbols() { "$nm" --defined-only "$1" 2>/dev/null | awk 'NF == 3 { print $3 }'; }
 undefined_symbols() { "$nm" --undefined-only "$1" 2>/dev/null | awk '$1 == "U" { print $2 }'; }
 
-for artifact in "${archives[@]}" "${binaries[@]}"; do
+for artifact in "${archives[@]}"; do
 	if [ ! -f "$artifact" ]; then
 		printf 'archive-closure: %s does not exist\n' "$artifact" >&2
 		exit 2

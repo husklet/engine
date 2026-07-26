@@ -58,7 +58,9 @@ a host CPU. But:
 - `include/hl/codegen.h` and `include/hl/ir.h` are `HL_API` and **are installed** — verified:
   `cmake/Phase4Install.cmake:138` is `file(GLOB HL_PUBLIC_HEADERS ${CMAKE_SOURCE_DIR}/include/hl/*.h)`, which
   removes only `activation.h`, and `hl-engine.pc` publishes `-lhl-translator`. Removal is an ABI decision
-  taken by a human, not a structural cleanup.
+  taken by a human, not a structural cleanup. **Overtaken by events:** that decision was taken —
+  `include/hl/{ir,codegen}.h` were deleted in `1387b1df` and `hl-engine.pc` no longer publishes
+  `-lhl-translator` (§2.1). N1 is history.
 - The neighbouring `src/translator/reloc.c` **is** live — `hl_reloc_slide` serves the persistent cache from
   `guest/*/cache.c` — and it hardcodes AArch64 `MOVZ`/`MOVK` while sitting in the same layer. Moving the
   dead half would strand the live half in a directory whose name no longer describes it.
@@ -121,8 +123,15 @@ Three things surfaced that are stronger than the individual defects, and they dr
 
 ### 2.1 `libhl-translator.a` is not a library
 
-`add_library(hl-translator STATIC ${IR_SOURCES})` (`CMakeLists.txt:181`) and it is **installed and
-published**: `HL_INSTALL_LIBS` includes it and `hl-engine.pc` emits `-lhl-translator`
+**Resolved by unpublishing it** (P12's stated alternative end state). It is no longer in
+`HL_INSTALL_LIBS` and no longer in `hl-engine.pc`; it remains a build component of the runner, both
+production engines and `libhl-engine-activation.a`. The residual 84 below are therefore no longer in
+any shipped artifact, and `gate.archive-closure` dropped the installed binaries from its provider set:
+the installed archives now close over themselves plus the system toolchain. The analysis below stands as
+the reason.
+
+`add_library(hl-translator STATIC ${IR_SOURCES})` (`CMakeLists.txt:181`) and it was **installed and
+published**: `HL_INSTALL_LIBS` included it and `hl-engine.pc` emitted `-lhl-translator`
 (`cmake/Phase4Install.cmake:74,115`). Running `nm` over the built archive on **both** hosts:
 
 | host | archive members with engine-internal unresolved references |
@@ -722,6 +731,11 @@ the order, which is the work).
 ---
 
 ### P12 — Make `libhl-translator.a` self-contained, then gate it
+
+**Status: part 3 done; parts 1-2 superseded by the packaging decision.** The human choice this asked for
+was taken the other way: `libhl-translator.a` is no longer published, so its 84 unresolved ARM64-emitter
+references are not in any shipped artifact and need not be moved to make the archive shippable. Parts 1-2
+remain worth doing for the DOCS.md §3 layering violation, which unpublishing does not fix.
 
 **What.** Two parts, in order:
 

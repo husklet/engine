@@ -654,6 +654,12 @@ the `pkg-config` program on build hosts), runs it against the real host provider
 public header was removed. Rust `build.rs` integrations consume this same installed C ABI and must not compile a second
 implementation of engine behavior.
 
+An embedder that wants a whole engine links `libhl-engine-activation.a` through `hl-engine-activation.pc`, which
+force-loads it: that single archive carries both guest-ISA targets, the translator and the ABI. `hl-engine.pc` is the
+smaller host/ABI contract. `libhl-translator.a` is a build component of the runner, the production engines and the
+activation archive, and is deliberately not installed — off an AArch64 host it is not linkable on its own
+(`cmake/Phase4Install.cmake`).
+
 Production targets link common implementation from these archives instead of recompiling it inside each guest-ISA
 target. In particular, the resident fork-server's bounded argument/environment codec, exact stream transfer, and
 SCM_RIGHTS descriptor transport live in `libhl-linux-abi.a`; target roots retain only per-engine warm-image and JIT
