@@ -60,6 +60,13 @@ jobs:
         timeout-minutes: 25
         run: tools/ci_run.sh 1320 "Test Rust package" -- nix build --print-build-logs .#checks.aarch64-darwin.rust
 
+      # The only Darwin host in CI, so the only place the committed
+      # aarch64-apple-darwin archive can be repacked and force-loaded into a
+      # real link. The Linux runner runs the same gate but defers that part.
+      - name: Check the committed crate archives match the C sources
+        timeout-minutes: 15
+        run: tools/ci_run.sh 720 "Check the committed crate archives match the C sources" -- nix develop --command make check-crate-archives
+
       - name: Test macOS host services
         timeout-minutes: 30
         shell: bash
