@@ -108,11 +108,17 @@ static const char *g_exe_path = "";
 static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
 
 // Guest-signal delivery, really defined in linux_abi/signal.c -- which is compiled LATER in this same unity TU,
-// so it is declared (not defined) here. Only BRK/HLT need it: they are the one instruction class whose whole
-// architectural meaning is "raise a synchronous exception", and every other guest signal this backend produces
-// travels the dispatcher's reason codes instead. Declaring a static before its definition is ordinary C and is
-// the same technique translate.c uses for the tentative definitions above.
+// so these are declared (not defined) here. Only the architecturally-trapping instruction classes need them
+// (UDF, BRK, HLT and the EL2/EL3 forms); every other guest signal this backend produces travels the
+// dispatcher's reason codes instead. Declaring a static before its definition is ordinary C and is the same
+// technique translate.c uses for the tentative definitions above.
+//
+// raise_guest_signal owns the DISPOSITION: a guest handler gets the signal queued, SIG_IGN drops it, and
+// SIG_DFL for these fatal-default signals goes through guest_group_fatal so the container reports 128+signo
+// with the core-dump flag. sigq_flush is what converts that process-wide queueing into the THREAD-directed
+// delivery a synchronous fault requires; see interp_raise_sync_signal below for why both are needed.
 static void raise_guest_signal(struct cpu *c, int sig);
+static void sigq_flush(int sig);
 
 // PC-relative base for ADR/ADRP and for the return address a BL/BLR writes to x30.
 //
@@ -180,7 +186,59 @@ static __thread uint64_t g_interp_access_address;  // its effective guest addres
 static __thread uint64_t g_interp_access_bytes;    // its size
 static __thread int g_interp_access_write;         // 1 for a store, 0 for a load
 
+// ---- The past-EOF SIGBUS ledger ----
+//
+// Linux raises SIGBUS/BUS_ADRERR for an access to a whole page of a file mapping that lies past the file's
+// end. The engine cannot let the HOST deliver that: linux_abi/syscall/mem.c deliberately re-maps the
+// genuinely-past-EOF tail of a MAP_PRIVATE file mapping as anonymous zero (see the long note at its
+// "Past-EOF tail zero-fill"), because ld.so maps a .so's whole vaddr span from the first segment and a stray
+// engine-side touch of one of those pages must not kill the engine. The guest-visible SIGBUS is therefore
+// owed by the TRANSLATOR, from a ledger mem.c maintains (gbus_add) and core/bus.h exposes as
+// jit_guest_bus_active() / jit_guest_bus_fault(). The JIT pays for it with an inline guard around every
+// emitted access (emit_a64_bus_guard in translate.c); an interpreter is already in C, so one predicate here
+// covers every access instead.
+//
+// This is the ONE chokepoint: interp_access_begin is called by interp_read_guest, interp_write_guest and by
+// each atomic/exclusive site, i.e. it is exactly "a guest access to [address, bytes) is about to happen".
+// Adding the query anywhere else would mean auditing ~50 call sites and re-auditing them on every new
+// instruction class.
+//
+// Two details that are easy to get wrong:
+//
+//   * The LEDGER HOLDS HOST ADDRESSES -- gbus_add is fed the value mmap returned -- while the guest's own
+//     signal handler compares si_addr against its GUEST pointer. Those differ by g_nonpie_bias for an access
+//     folded into a non-PIE ET_EXEC's high mapping, so the query uses interp_guest_pointer(address) and the
+//     reported fault address is converted back. (The JIT's guard queries the un-folded address and is
+//     therefore wrong in exactly that case; it is not reachable for any image the matrix loads, since a
+//     past-EOF file mapping inside a non-PIE image's link range cannot occur, but there is no reason to
+//     reproduce the defect here.)
+//   * The reported address is the FIRST past-EOF byte in the access, not the access's base -- which is what
+//     jit_guest_bus_fault already returns, and what makes a 4-byte load straddling the EOF page boundary
+//     report the page boundary the way Linux does.
+//
+// Escaping is the same siglongjmp the host-fault path uses, for the same reason: the caller is several
+// frames deep in an instruction whose source registers have already been read into locals and whose
+// destination has not been written, so abandoning it leaves cpu->pc naming an instruction that has not
+// executed. cpu->reason = R_BUS is what interp_dispatch.h's arm turns into raise_guest_bus().
+static void interp_bus_ledger_check(uint64_t address, uint64_t bytes) {
+    // Inert for every guest that never maps a file past its end: g_bus is empty, so `enabled` is 0 and this
+    // is one relaxed atomic load per access.
+    if (!jit_guest_bus_active()) return;
+    uint64_t host = interp_guest_pointer(address);
+    uint64_t host_fault = jit_guest_bus_fault(host, bytes);
+    if (host_fault == 0) return;
+    struct cpu *cpu = g_interp_marker_cpu;
+    if (cpu == NULL || !g_interp_marker_armed) return; // no landing pad: cannot happen from run_block
+    uint64_t guest_fault = host_fault - (host - address);
+    cpu->fault_addr = guest_fault;
+    cpu->bus_ea = guest_fault;
+    cpu->reason = R_BUS;
+    g_interp_access_active = 0;
+    siglongjmp(g_interp_marker_jmp, 1);
+}
+
 static void interp_access_begin(uint64_t address, uint64_t bytes, int write) {
+    interp_bus_ledger_check(address, bytes);
     g_interp_access_address = address;
     g_interp_access_bytes = bytes;
     g_interp_access_write = write;
@@ -523,13 +581,73 @@ static int interp_bit_masks(unsigned sf, unsigned immn, unsigned imms, unsigned 
 }
 
 // ---------------------------------------------------------------------------
+// The other exit: an architecturally-defined trap, delivered to the guest.
+// ---------------------------------------------------------------------------
+// The counterpart of interp_undefined below, and the two must never be confused. This one is for an
+// instruction the ARCHITECTURE defines as raising a synchronous exception at EL0 -- UDF and the whole
+// RESERVED group, BRK, HLT, HVC/SMC/DCPS. Those are guest events: Linux turns them into a signal at the
+// faulting PC and the program may well survive (a SIGILL handler that advances uc_mcontext.pc past the word
+// is the documented way to probe for an instruction, and __builtin_trap's BRK is caught by any debugger or
+// crash reporter the guest installs). Reporting them as an engine gap would stop the run with exit code 70
+// and lose the program; conversely, turning a genuine gap into a silent SIGILL would replace a precise
+// "encoding 0x… class=…" message with an obscure guest crash. Hence two functions, and every decode site
+// picks one deliberately.
+//
+// WHY THIS IS NOT JUST raise_guest_signal(). Linux delivers a fault-class signal with a full siginfo --
+// si_code says WHICH kind of illegal instruction (ILL_ILLOPC) or trap (TRAP_BRKPT), and si_addr is the
+// faulting PC -- and it FORCES delivery: force_sig_fault ignores the thread's signal mask, because a
+// synchronous fault whose handler never runs would simply re-execute the same instruction forever.
+// raise_guest_signal is the process-directed kill(2)-shaped route: it stamps SI_USER, carries no address,
+// and honours the mask. So this composes the two mechanisms linux_abi/signal.c already has, exactly as
+// raise_guest_bus/raise_guest_fetch_fault do for a memory fault:
+//
+//   1. c->sync_signal / c->sync_code / c->sync_address are the SYNCHRONOUS siginfo. maybe_deliver_signal
+//      reads them (rather than the async g_sigcode/g_sigaddr slots) precisely when the signal arrives via
+//      the THREAD-directed pending word and c->sync_signal names it -- `synchronous = had_t &&
+//      c->sync_signal == sig` in signal.c.
+//   2. Clearing the mask bit is what makes it forced.
+//   3. raise_guest_signal is still called, because it -- and nothing reachable from this file -- owns the
+//      DISPOSITION: SIG_DFL for these fatal-default signals goes through guest_group_fatal (so the parent's
+//      wait4 reconstructs WIFSIGNALED/WTERMSIG and the core-dump flag, which is what sigill_probe's forked
+//      child pins), SIG_IGN drops it, and a handler gets it queued. g_sigact is a file-static of an
+//      anonymous struct type in signal.c and cannot be declared here, so there is no way to ask the
+//      question directly.
+//   4. sigq_flush then converts that PROCESS-wide queued instance into the THREAD-directed one a
+//      synchronous fault must be: without it the instance sits in the process queue where an unrelated
+//      guest thread could claim it -- running the handler on the wrong thread with SI_USER siginfo -- and
+//      this thread would ALSO deliver it via the tpending bit set below. One synchronous fault, one
+//      delivery, on the thread that took it.
+//
+// The residual gap, which needs a change outside this file: with SIG_IGN installed, Linux resets the
+// disposition and kills the process (force_sig_info_to_task), while here step 3 drops the signal and the
+// instruction re-executes forever. Closing it needs a raise_guest_sync_signal(c, sig, code, addr) beside
+// raise_guest_bus() in linux_abi/signal.c -- which would also collapse steps 1-4 into one call.
+static void interp_raise_sync_signal(struct cpu *cpu, int signo, int si_code, uint64_t si_addr) {
+    cpu->sync_signal = signo;
+    cpu->sync_code = si_code;
+    cpu->sync_address = si_addr;
+    cpu->sigmask &= ~(1ull << (signo - 1)); // forced: a sync fault is delivered even if the guest blocked it
+    raise_guest_signal(cpu, signo);         // owns the disposition; does not return for SIG_DFL
+    sigq_flush(signo);                      // drop the process-directed instance it queued (see 4 above)
+    __atomic_or_fetch(&cpu->tpending, 1ull << signo, __ATOMIC_SEQ_CST);
+    // Resume as a plain branch. cpu->pc has been left ON the trapping instruction by the caller, which is
+    // both what the guest's frame must name and what makes a handler that returns without advancing re-take
+    // the trap -- real Linux behaviour for every member of this group.
+    cpu->reason = R_BRANCH;
+}
+
+// ---------------------------------------------------------------------------
 // The one diagnostic exit.
 // ---------------------------------------------------------------------------
-// Every encoding this backend cannot execute -- a class that is not written yet, and a genuinely unallocated
-// encoding -- funnels through here. The two are not distinguished, deliberately: while coverage is partial
-// there is no way to tell "the guest executed something illegal" from "this backend has a gap", and guessing
-// wrong in either direction is worse than saying exactly what was seen. When coverage is complete the
-// unallocated case becomes a guest SIGILL and this function keeps only the gap case.
+// Every encoding this backend cannot execute funnels through here, and it means exactly one thing: THIS BACKEND
+// HAS A GAP. It deliberately does not also mean "the guest executed something illegal", because the two demand
+// opposite responses -- a gap must stop the engine loudly, an illegal instruction must become a guest SIGILL and
+// let the program carry on -- and guessing wrong in either direction is worse than saying exactly what was seen.
+//
+// Where the architecture makes the distinction unambiguous, it is drawn at the decode site rather than here.
+// interp_step's op0 == 0000 case is the whole of the RESERVED group, so every encoding in it is UNDEFINED by
+// definition and raises a guest SIGILL; the exception-generation box likewise raises SIGTRAP for BRK and SIGILL
+// for HLT/HVC/SMC. What is left over is genuinely "not written yet", which is what this report says.
 //
 // The report goes out two ways, because the two answer different questions. stderr is what a developer
 // running the engine by hand needs and is the only route guaranteed to be visible (HL_ENABLE_LOGGING is 0 in
@@ -4976,9 +5094,24 @@ static int interp_step(struct cpu *cpu) {
     }
     switch ((insn >> 25) & 0xF) {
     case 0x0:
-        // op0 == 0000 is reserved; the all-zero word (UDF #0) is what execution off the end of a .text
-        // section runs into, so naming it specifically makes that failure legible.
-        return interp_undefined(cpu, insn, insn == 0 ? "reserved -- UDF #0 (executed zero bytes)" : "reserved");
+        // op0 == 0000 is the architecture's RESERVED group, and this is the one place where "unallocated" and
+        // "not implemented here" do NOT need to be conflated -- which is what interp_undefined's header
+        // anticipates. The group's only allocated member is UDF, which is defined to be PERMANENTLY undefined,
+        // so every encoding here raises an Undefined Instruction exception on real hardware; none of it is a
+        // class this backend has yet to reach. (Contrast the SME and SVE cases just below, which the
+        // architecture DOES allocate and which therefore remain genuine gaps and stay fatal.)
+        //
+        // So deliver a guest SIGILL rather than stopping the engine. That matches the JIT exactly: it copies the
+        // word verbatim, the host executes it, takes a real SIGILL, and deliver_guest_fault routes it to the
+        // guest's handler. It is also what tests/compat/signals/sigill_probe.c pins -- an installed handler runs
+        // and may advance uc_mcontext.pc past the instruction, while SIG_DFL still terminates with SIGILL.
+        //
+        // cpu->pc stays ON the undefined instruction, which is what Linux gives the handler and what makes the
+        // handler's `pc += 4` the documented way to step over it. A handler that returns without advancing
+        // re-executes it and traps again -- again, exactly real behaviour.
+        raise_guest_signal(cpu, 4); // Linux SIGILL
+        cpu->reason = R_BRANCH;
+        return INTERP_END;
     case 0x1:
         return interp_undefined(cpu, insn, "unallocated (SME)");
     case 0x2:
@@ -5183,9 +5316,14 @@ static void run_block(struct cpu *cpu, void *code) {
     // the mask the handler was entered with; see the fault-model comment at the top of this file for why
     // jumping out of a handler is safe here.
     if (sigsetjmp(g_interp_marker_jmp, 1) != 0) {
-        // Arrived from interp_signal_resume. The abandoned access left no partial architectural state, and
-        // the handler has already set cpu->reason (plus sync_signal/sync_code and the pending-signal bit) --
-        // so returning is all that is left to do. The dispatcher delivers the guest signal.
+        // Arrived from one of the two abandon-the-access paths, both of which have already left cpu in the
+        // state the dispatcher needs and neither of which changed any architectural state:
+        //   * interp_signal_resume, after a real host SIGSEGV/SIGBUS -- the shared handler set cpu->reason
+        //     plus sync_signal/sync_code and the pending-signal bit;
+        //   * interp_bus_ledger_check, for a past-EOF access the host was deliberately made not to fault on
+        //     -- it set cpu->reason = R_BUS and cpu->fault_addr, and interp_dispatch.h's R_BUS arm calls
+        //     raise_guest_bus.
+        // Returning is all that is left to do either way.
         g_interp_access_active = 0;
         g_interp_marker_armed = 0;
         g_interp_marker_cpu = NULL;
