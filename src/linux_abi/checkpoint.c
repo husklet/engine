@@ -179,6 +179,20 @@ struct ckpt_fd {
     char path[512];
 };
 
+// `path` arrives as 512 raw image bytes with no guaranteed NUL. Every C-string use (open, snprintf,
+// the recovery-journal escaper) would otherwise scan past the record. Terminate at read time.
+static void ckpt_fd_terminate(struct ckpt_fd *record) { record->path[sizeof record->path - 1] = 0; }
+
+static void ckpt_fd_terminate_all(struct ckpt_fd *records, size_t count) {
+    for (size_t index = 0; index < count; ++index) ckpt_fd_terminate(&records[index]);
+}
+
+static int ckpt_rd_fd(FILE *file, struct ckpt_fd *record) {
+    if (ckpt_rd_all(file, record, sizeof *record) != 0) return -1;
+    ckpt_fd_terminate(record);
+    return 0;
+}
+
 #define CKPT_EPOLL_MAGIC UINT64_C(0x484c45504f4c4c31)
 struct ckpt_epoll_header {
     uint64_t magic;
@@ -2228,7 +2242,7 @@ static int ckpt_restore_backing_seed(const char *procdir, uint64_t object_id, ui
     struct ckpt_fd record;
     int found = 0;
     int expandable = 0;
-    while (ckpt_rd_all(records, &record, sizeof record) == 0)
+    while (ckpt_rd_fd(records, &record) == 0)
         if (record.object_id == object_id &&
             (record.kind == CKF_FILE || record.kind == CKF_BLOB || record.kind == CKF_MEMFD)) {
             found = 1;
@@ -2911,6 +2925,7 @@ static int ckpt_restore_fds_dir(const char *procdir) {
         return -1;
     }
     ckpt_source_fclose(f);
+    ckpt_fd_terminate_all(records, (size_t)count);
     /* A restored child inherits its restorer parent's public eventfd descriptors and process-local routing
      * tables. They are not part of the child's saved fd table merely because the parent owned them. Drop
      * those public copies without closing the inherited hidden writer seeds, then rebuild exactly this
@@ -3703,7 +3718,7 @@ static int ckpt_recovery_report_queue(FILE *report, const struct ckpt_proc *proc
         }
         for (uint32_t index = 0; index < frame.rights_count; ++index) {
             struct ckpt_fd right;
-            if (ckpt_rd_all(queue, &right, sizeof right) != 0) {
+            if (ckpt_rd_fd(queue, &right) != 0) {
                 ckpt_source_fclose(queue);
                 return -1;
             }
@@ -3742,7 +3757,7 @@ static int ckpt_recovery_report(int policy) {
         FILE *fds = ckpt_source_fopen(fd_path);
         if (fds) {
             struct ckpt_fd record;
-            while (ckpt_rd_all(fds, &record, sizeof record) == 0) {
+            while (ckpt_rd_fd(fds, &record) == 0) {
                 const char *outcome = "reconstructed";
                 if (!process->viable) outcome = "stopped";
                 else if (record.kind == CKF_FILE || record.kind == CKF_TTY || record.kind == CKF_DEVICE ||
@@ -3840,7 +3855,7 @@ static int ckpt_validate_process_image(const struct ckpt_proc *process,
     if (!fds) return -1;
     uint64_t descriptors = 0;
     struct ckpt_fd record;
-    while (ckpt_rd_all(fds, &record, sizeof record) == 0) {
+    while (ckpt_rd_fd(fds, &record) == 0) {
         if (record.gfd < 0 || record.gfd >= HL_NFD || record.kind < CKF_TTY || record.kind > CKF_DEVICE) {
             ckpt_source_fclose(fds);
             return -1;
@@ -3900,7 +3915,7 @@ static int ckpt_preflight_socket_queue(const struct ckpt_fd *socket_record,
         }
         for (uint32_t index = 0; index < frame.rights_count; ++index) {
             struct ckpt_fd right;
-            if (ckpt_rd_all(file, &right, sizeof right) != 0) {
+            if (ckpt_rd_fd(file, &right) != 0) {
                 ckpt_source_fclose(file);
                 return -1;
             }
@@ -3931,7 +3946,7 @@ static int ckpt_restore_preflight(int policy) {
             continue;
         }
         struct ckpt_fd record;
-        while (process->viable && ckpt_rd_all(file, &record, sizeof record) == 0) {
+        while (process->viable && ckpt_rd_fd(file, &record) == 0) {
             if (record.kind == CKF_FILE || record.kind == CKF_DEVICE) {
                 if (ckpt_external_unavailable(&record)) {
                     char reason[192];
@@ -3982,7 +3997,7 @@ static int ckpt_prepare_restore_pipes(void) {
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
-        while (ckpt_rd_all(file, &record, sizeof record) == 0) {
+        while (ckpt_rd_fd(file, &record) == 0) {
             if (record.kind != CKF_PIPE) continue;
             uint64_t identity = (uint64_t)record.offset;
             struct ckpt_restore_pipe *pipe = ckpt_restore_pipe_find(identity);
@@ -4445,6 +4460,7 @@ static int ckpt_restore_socket_queue_load(struct ckpt_restore_socket_endpoint *e
             ckpt_source_fclose(file);
             return -1;
         }
+        ckpt_fd_terminate_all(rights, frame.rights_count);
         for (uint32_t index = 0; index < frame.rights_count; ++index) {
             right_fds[index] = ckpt_restore_right_prepare(&rights[index]);
             if (right_fds[index] < 0) {
@@ -4730,7 +4746,7 @@ static int ckpt_prepare_restore_sockets(void) {
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
-        while (ckpt_rd_all(file, &record, sizeof record) == 0) {
+        while (ckpt_rd_fd(file, &record) == 0) {
             if (record.kind != CKF_SOCKETPAIR) continue;
             struct ckpt_restore_socket_endpoint *endpoint = ckpt_restore_socket_find(record.object_id);
             if (endpoint != NULL) {
@@ -4859,7 +4875,7 @@ static int ckpt_prepare_restore_socket_states(void) {
         FILE *records = ckpt_source_fopen(records_path);
         if (!records) return -1;
         struct ckpt_fd record;
-        while (ckpt_rd_all(records, &record, sizeof record) == 0) {
+        while (ckpt_rd_fd(records, &record) == 0) {
             if (record.kind != CKF_SOCKET || ckpt_restore_socket_state_find(record.object_id) != NULL) continue;
             if (!record.object_id ||
                 ckpt_vector_reserve((void **)&g_restore_sockets, &g_restore_sockets_capacity,
@@ -4955,7 +4971,7 @@ static int ckpt_prepare_restore_eventfds(void) {
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
-        while (ckpt_rd_all(file, &record, sizeof record) == 0) {
+        while (ckpt_rd_fd(file, &record) == 0) {
             if (record.kind != CKF_EVENTFD) continue;
             struct ckpt_restore_eventfd *object = ckpt_restore_eventfd_find(record.object_id);
             if (object) {
@@ -5034,7 +5050,7 @@ static int ckpt_prepare_restore_signalfds(void) {
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
-        while (ckpt_rd_all(file, &record, sizeof record) == 0) {
+        while (ckpt_rd_fd(file, &record) == 0) {
             if (record.kind != CKF_SIGNALFD || ckpt_restore_signalfd_find(record.object_id)) continue;
             if (ckpt_restore_right_prepare(&record) < 0) {
                 ckpt_source_fclose(file);
@@ -5060,7 +5076,7 @@ static int ckpt_prepare_restore_timerfds(void) {
         FILE *file = ckpt_source_fopen(path);
         if (!file) return -1;
         struct ckpt_fd record;
-        while (ckpt_rd_all(file, &record, sizeof record) == 0) {
+        while (ckpt_rd_fd(file, &record) == 0) {
             if (record.kind != CKF_TIMERFD || ckpt_restore_timerfd_find(record.object_id)) continue;
             if (!record.object_id ||
                 ckpt_vector_reserve((void **)&g_restore_timerfds, &g_restore_timerfds_capacity,
