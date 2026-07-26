@@ -458,7 +458,43 @@ static int g_nfilemap;
 static _Atomic uint64_t g_filemap_shared_lo = UINT64_MAX;
 static _Atomic uint64_t g_filemap_shared_hi;
 static _Atomic uint64_t g_filemap_shared_epoch;
+#define FILEMAP_SHARED_FILTER_WORDS 1024u
+#define FILEMAP_SHARED_FILTER_BITS (FILEMAP_SHARED_FILTER_WORDS * 64u)
+// Monotonic page bloom for the executable-alias store observer. A stale bit only causes a locked registry
+// scan; clearing on unmap could race a replacement mapping and miss a real shared write. The exact registry
+// remains authoritative.
+static _Atomic uint64_t g_filemap_shared_filter[FILEMAP_SHARED_FILTER_WORDS];
 static pthread_mutex_t g_filemap_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void filemap_shared_filter_add(uint64_t address, uint64_t size) {
+    uint64_t first = address >> 12;
+    uint64_t last = (address + size - 1) >> 12;
+    if (last - first >= FILEMAP_SHARED_FILTER_BITS) {
+        for (size_t index = 0; index < FILEMAP_SHARED_FILTER_WORDS; ++index)
+            atomic_store_explicit(&g_filemap_shared_filter[index], UINT64_MAX, memory_order_release);
+        return;
+    }
+    for (uint64_t page = first;; ++page) {
+        uint64_t bit = page & (FILEMAP_SHARED_FILTER_BITS - 1);
+        atomic_fetch_or_explicit(&g_filemap_shared_filter[bit >> 6], UINT64_C(1) << (bit & 63),
+                                 memory_order_release);
+        if (page == last) break;
+    }
+}
+
+static int filemap_shared_filter_maybe(uint64_t address, uint64_t size) {
+    uint64_t first = address >> 12;
+    uint64_t last = (address + size - 1) >> 12;
+    if (last - first >= FILEMAP_SHARED_FILTER_BITS) return 1;
+    for (uint64_t page = first;; ++page) {
+        uint64_t bit = page & (FILEMAP_SHARED_FILTER_BITS - 1);
+        if (atomic_load_explicit(&g_filemap_shared_filter[bit >> 6], memory_order_acquire) &
+            (UINT64_C(1) << (bit & 63)))
+            return 1;
+        if (page == last) break;
+    }
+    return 0;
+}
 
 /* A file mapping survives fork in every guest process, while the bookkeeping
    above becomes process-private COW memory.  File size/data mutations do not:
@@ -566,6 +602,7 @@ static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t o
     if (g_nfilemap < GNA_MAX && retained >= 0) {
         if (shared) atomic_fetch_add_explicit(&g_filemap_shared_epoch, 1, memory_order_seq_cst);
         if (shared) {
+            filemap_shared_filter_add(address, size);
             uint64_t old = atomic_load_explicit(&g_filemap_shared_lo, memory_order_relaxed);
             while (address < old &&
                    !atomic_compare_exchange_weak_explicit(&g_filemap_shared_lo, &old, address, memory_order_release,

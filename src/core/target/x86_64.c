@@ -303,28 +303,29 @@ void emit_load_mem(struct insn *insn, uint64_t next, int width, int rt) {
 
 static void jit86_store_alias_changed(uint64_t guest, uint64_t size) {
     if (size == 0 || guest > UINT64_MAX - size) return;
+    if (!filemap_shared_filter_maybe(guest, size)) return;
     struct cpu *cpu = pthread_getspecific(g_cpu_key);
     if (cpu == NULL) return;
     uint64_t ranges[GNA_MAX + 1][2];
-    uint32_t range_count = 1;
-    ranges[0][0] = guest;
-    ranges[0][1] = guest + size;
+    uint32_t range_count = 0;
 
     pthread_mutex_lock(&g_filemap_lock);
     uint64_t device = 0, inode = 0, offset = 0, length = 0;
-    int source_shared = 0;
     for (int index = 0; index < g_nfilemap; ++index) {
         const struct guest_file_mapping *mapping = &g_filemap[index];
         if (guest < mapping->lo || guest >= mapping->hi) continue;
+        if (!mapping->shared) break;
         uint64_t span = mapping->hi - guest;
         length = size < span ? size : span;
         offset = mapping->offset + (guest - mapping->lo);
         device = mapping->device;
         inode = mapping->inode;
-        source_shared = mapping->shared != 0;
+        ranges[range_count][0] = guest;
+        ranges[range_count][1] = guest + length;
+        range_count++;
         break;
     }
-    if (source_shared && length != 0) {
+    if (range_count != 0 && length != 0) {
         uint64_t file_last = offset + length;
         for (int index = 0; index < g_nfilemap && range_count < GNA_MAX + 1; ++index) {
             const struct guest_file_mapping *mapping = &g_filemap[index];
@@ -342,6 +343,7 @@ static void jit86_store_alias_changed(uint64_t guest, uint64_t size) {
         }
     }
     pthread_mutex_unlock(&g_filemap_lock);
+    if (range_count == 0) return;
     for (uint32_t r = 0; r < range_count; ++r) {
         uint64_t lo = ranges[r][0], hi = ranges[r][1];
         int merged = 0;

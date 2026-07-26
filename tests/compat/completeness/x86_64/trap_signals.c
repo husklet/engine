@@ -1,4 +1,4 @@
-// int3 (#BP -> SIGTRAP) and UD2 (#UD -> SIGILL) must reach the guest's signal handler, not terminate the
+// int3 (#BP -> SIGTRAP) and UD1/UD2 (#UD -> SIGILL) must reach the guest's signal handler, not terminate the
 // process. On Apple Silicon a JIT'd host BRK/UDF raises a Mach exception the x86 engine did not catch, so
 // the guest handler was silently skipped and hl exited 133/132. This exercises: (1) int3 delivering SIGTRAP
 // and recovering via siglongjmp, (2) ud2 delivering SIGILL and RESUMING after the handler advances RIP past
@@ -11,6 +11,7 @@
 
 static volatile int trap_seen = 0;
 static volatile int ill_seen = 0;
+static volatile int ud1_seen = 0;
 static sigjmp_buf jb;
 
 static void on_trap(int s, siginfo_t *si, void *uc) {
@@ -26,7 +27,13 @@ static void on_ill(int s, siginfo_t *si, void *ucv) {
     (void)si;
     ill_seen = 1;
     ucontext_t *uc = (ucontext_t *)ucv;
-    uc->uc_mcontext.gregs[REG_RIP] += 2; // skip the 2-byte ud2 (0F 0B) and resume
+    unsigned char *pc = (unsigned char *)uc->uc_mcontext.gregs[REG_RIP];
+    if (pc[0] == 0x67 && pc[1] == 0x0f && pc[2] == 0xb9) {
+        ud1_seen = 1;
+        uc->uc_mcontext.gregs[REG_RIP] += 5; // 67 0F B9 /r disp8: Chrome's addr32 UD1 probe
+    } else {
+        uc->uc_mcontext.gregs[REG_RIP] += 2; // 0F 0B: UD2
+    }
 }
 
 int main(void) {
@@ -43,5 +50,8 @@ int main(void) {
     sigaction(SIGILL, &sa, NULL);
     __asm__ volatile("ud2");
     printf("ud2 ill=%d resumed=1\n", ill_seen);
+
+    __asm__ volatile(".byte 0x67, 0x0f, 0xb9, 0x40, 0x0b");
+    printf("ud1 ill=%d resumed=1\n", ud1_seen);
     return 0;
 }

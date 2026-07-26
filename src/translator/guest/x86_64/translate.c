@@ -1292,7 +1292,7 @@ static void emit_vex_fp(int vd, int src1, int src2, int op, int dbl) {
     e_v3(0x4EA01C00u, vd, vd, 23);            // vd |= sign  (ORR.16b)
 }
 
-// Deliver a guest trap SIGNAL (int3 -> SIGTRAP, UD2 -> SIGILL) by EXITING the block to the dispatcher with
+// Deliver a guest trap SIGNAL (int3 -> SIGTRAP, UD1/UD2 -> SIGILL) by EXITING the block to the dispatcher with
 // R_TRAP, rather than emitting a host BRK/UDF. On Apple Silicon a JIT'd BRK/UDF raises a Mach exception the
 // x86 engine does not catch, so the host BSD SIGTRAP/SIGILL never reaches jit86_syncguard and the process
 // dies (exit 133/132) instead of running the guest handler. Routing through the dispatcher (raise_guest_trap)
@@ -1561,16 +1561,17 @@ static void emit_div64_fast(uint64_t next, uint64_t gpc, int idiv, int rmv) {
     *b_done = 0x14000000u | ((uint32_t)dd & 0x3FFFFFF); // b Ldone
 }
 
-// 0F 0B (UD2): an explicitly-undefined opcode that real software (e.g. ruby's unreachable/trap paths,
-// libc CPU-feature probes) uses as a deliberate trap. On x86 it raises #UD -> SIGILL; with a guest
-// handler that runs, otherwise the process dies with status 128+SIGILL = 132. Emit a host UDF so the
-// SIGILL guard delivers it to the guest handler (or default-terminates), instead of the old always-
-// terminate hack. This is distinct from report_unimpl's "engine aborted" path (status 70), which would
-// mislabel a legitimate guest fault as an unimplemented-opcode bug of ours.
+// UD1/UD2: explicitly-undefined opcodes that real software (e.g. Chrome feature probes, ruby's
+// unreachable/trap paths, libc CPU-feature probes) uses as deliberate traps. On x86 they raise #UD -> SIGILL; with a guest
+// handler that runs, otherwise the process dies with status 128+SIGILL = 132. Route through the dispatcher
+// so the guest handler receives it (or the default disposition terminates), instead of aborting translation.
+// This is distinct from report_unimpl's "engine aborted" path (status 70), which would mislabel a legitimate
+// guest fault as an unimplemented-opcode bug of ours.
 static void emit_sigill(uint64_t pc) {
-    // Quiet by default: UD2 frequently sits on never-taken paths (compiler trap/unreachable slots) that get
+    // Quiet by default: undefined instructions frequently sit on never-taken paths (compiler
+    // trap/unreachable slots) that get
     // translated as block fall-through but never run; an unconditional message would falsely imply delivery.
-    emit_guest_signal(pc, 4, 2); // ud2 -> SIGILL (si_code ILL_ILLOPN), rip = the faulting insn
+    emit_guest_signal(pc, 4, 2); // #UD -> SIGILL (si_code ILL_ILLOPN), rip = the faulting insn
 }
 
 // Restore the user-visible RFLAGS lanes from `src`.  POPFQ and IRETQ use the same architectural
@@ -4530,10 +4531,10 @@ static void *translate_block(uint64_t gpc) {
                 emit_exit_const(next, R_SYSCALL);
                 break;
             } // syscall
-            if (op == 0x0B) {
+            if (op == 0x0B || op == 0xB9) {
                 emit_sigill(gpc);
                 break;
-            } // ud2 -> guest SIGILL (terminate like real Linux), not an engine abort
+            } // ud1/ud2 -> guest SIGILL (terminate like real Linux), not an engine abort
             // ===== SSE / SSE2 (guest xmm0..15 == host v0..v15) =====
             // mandatory prefix selects the variant: 66=packed-int/double, F3=scalar-single,
             // F2=scalar-double, none=packed-single. reg/rm fields index xmm directly.
