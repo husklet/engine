@@ -151,6 +151,19 @@ hl_guest_suite(SRC_DIR tests/compat/process OUT_DIR ${HL_COMPAT}/process
   LINKAGE static-pie FLAGS ${_gnu} LIBS ${_pt})
 hl_guest_suite(SRC_DIR tests/compat/process OUT_DIR ${HL_COMPAT}/process
   LINKAGE static FLAGS ${_gnu} LIBS ${_pt})
+# A RELATIVE symlink to the exec_symlink guest, registered as its own manifest case
+# (exec-symlink-entry). The engine's launch path must follow it exactly as execve does; opening the entry
+# program O_NOFOLLOW failed every symlinked program with ELOOP. Same binary, so the golden is shared.
+foreach(_arch ${HL_GUEST_ARCHES})
+  add_custom_command(OUTPUT ${HL_COMPAT}/process/${_arch}/exec_symlink_entry
+    COMMAND ${CMAKE_COMMAND} -E create_symlink exec_symlink
+            ${HL_COMPAT}/process/${_arch}/exec_symlink_entry
+    DEPENDS ${HL_COMPAT}/process/${_arch}/exec_symlink
+    COMMENT "guest[${_arch}] symlink exec_symlink_entry"
+    VERBATIM)
+  set_property(GLOBAL APPEND PROPERTY HL_GUEST_ALL_OUTPUTS
+    ${HL_COMPAT}/process/${_arch}/exec_symlink_entry)
+endforeach()
 
 # ===========================================================================
 # 6. time / isolation / ipc / threads

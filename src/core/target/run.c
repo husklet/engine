@@ -56,9 +56,10 @@ int hl_native_engine_run(uint32_t guest_isa, const char *rootfs, uint32_t argc, 
     if (checkpoint_mode != 0) config.box = &box;
     if (status == HL_STATUS_OK) {
         if (rootfs == NULL && argc != 0 && argv != NULL && argv[0] != NULL) {
-            hl_host_result opened =
-                services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, argv[0], strlen(argv[0]),
-                                             HL_HOST_FILE_READ | HL_HOST_FILE_NOFOLLOW, 0, 0);
+            /* execve(2) follows the program symlink: /bin/echo -> ../lib/coreutils/echo must load its
+               target, not ELOOP. NOFOLLOW here rejected every symlinked entry program outright. */
+            hl_host_result opened = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, argv[0],
+                                                                 strlen(argv[0]), HL_HOST_FILE_READ, 0, 0);
             if (opened.status != HL_STATUS_OK)
                 status = (hl_status)opened.status;
             else {
