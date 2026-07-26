@@ -1237,8 +1237,22 @@ static hl_host_result hl_linux_stream_close(void *context, hl_host_handle stream
     return hl_linux_close_descriptor(context, stream);
 }
 
+/* Readiness is asked about any pollable host object, not just pipes. Imported
+ * stdio -- a pty slave included -- is registered as HL_LINUX_HANDLE_FILE, so the
+ * stream-only lookup would reject it and the caller would fall back to
+ * always-ready. Accept files here (macOS does the same); the other stream entry
+ * points stay stream-typed. */
+static int hl_linux_pollable_descriptor(hl_host_linux *host, hl_host_handle handle) {
+    int descriptor, pinned = -1;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, handle, HL_LINUX_HANDLE_STREAM, HL_LINUX_HANDLE_FILE);
+    if (descriptor >= 0) pinned = fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
+    pthread_mutex_unlock(&host->lock);
+    return pinned;
+}
+
 static hl_host_result hl_linux_stream_readiness(void *context, hl_host_handle stream, uint32_t interests) {
-    int descriptor = hl_linux_stream_descriptor(context, stream);
+    int descriptor = hl_linux_pollable_descriptor(context, stream);
     struct pollfd probe = {descriptor, 0, 0};
     uint32_t ready = 0;
     if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
