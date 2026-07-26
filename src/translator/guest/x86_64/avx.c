@@ -268,19 +268,66 @@ static double avx_dnan_f64(double r, double x, double y) {
     return r;
 }
 
-// FMA generates a default NaN (inf*0, or an inf-inf in the fused add) with the x86 indefinite
-// sign SET whenever the result is NaN and none of the three operands is NaN; a NaN propagated
-// from any operand keeps that operand's sign on both ISAs. Three-operand analogue of avx_dnan_*.
-static float fma_dnan_f32(float r, float x, float y, float z) {
-    if (r != r && x == x && y == y && z == z) {
+static void fma_raise_ie(void) {
+    volatile double z = 0.0, q = z / z; // 0/0 raises #I and nothing else, on either host
+    (void)q;
+}
+
+// x86 FMA, three-operand analogue of avx_dnan_*. Computes the SDM's a*b+c with `nmul`/`nadd`
+// selecting the fmsub/fnmadd/fnmsub sign variants; a and b are the multiplicands, c the addend.
+// Measured on Zen 4 over all 1728 triples of {+-SNaN,+-QNaN}x{min,max payload} + {1.0, +0, +-inf}
+// for every form (132/213/231), every sign variant, both widths, scalar and packed:
+//   (1) OPERAND NaN: the FIRST NaN in a*b+c ORDER wins -- a, then b, then c -- propagated VERBATIM
+//       (sign and payload) with only the quiet bit forced. The addend never beats a multiplicand
+//       and b never beats a, so the product/addend negation never touches the propagated sign. The
+//       only flag raised is #I, and only for an SNaN operand: a NaN operand suppresses even the #D
+//       of a denormal operand, and the #I that 0*inf would otherwise raise. So the host FMA must
+//       NOT run here. aarch64 FMADD answers this case SNaN-first-then-ADDEND-first, and for 0*inf
+//       with a QNaN addend the ARM ARM mandates DefaultNaN + IOC (measured on bare NEON under
+//       qemu, so it is the ISA and not the emulator). An x86-64 host is no better: which
+//       multiplicand lands in the encoding's first slot is the compiler's choice, and it chose the
+//       wrong one for the float path -- 13008 of 43680 NaN triples were wrong on THIS host.
+//   (2) GENERATED NaN (no NaN operand: 0*inf, or an inf-inf in the fused add): x86 yields the QNaN
+//       indefinite with the sign SET, ARM the positive default NaN -- same payload, opposite sign.
+// The negations are FNEG, not a multiply by -1: exact, and it cannot raise a flag of its own.
+static float fma_x86_f32(float a, float b, float c, int nmul, int nadd) {
+    uint32_t ab, bb, cb;
+    memcpy(&ab, &a, 4);
+    memcpy(&bb, &b, 4);
+    memcpy(&cb, &c, 4);
+    if (nan32(ab) || nan32(bb) || nan32(cb)) {
+        // #I follows ANY SNaN operand, not the winner: a QNaN a beside an SNaN b still raises it.
+        if ((nan32(ab) && !(ab & 0x00400000u)) || (nan32(bb) && !(bb & 0x00400000u)) ||
+            (nan32(cb) && !(cb & 0x00400000u)))
+            fma_raise_ie();
+        uint32_t w = (nan32(ab) ? ab : nan32(bb) ? bb : cb) | 0x00400000u;
+        memcpy(&a, &w, 4);
+        return a;
+    }
+    float r = __builtin_fmaf(nmul ? -a : a, b, nadd ? -c : c);
+    if (r != r) {
         uint32_t u = 0xFFC00000u;
         memcpy(&r, &u, 4);
     }
     return r;
 }
 
-static double fma_dnan_f64(double r, double x, double y, double z) {
-    if (r != r && x == x && y == y && z == z) {
+static double fma_x86_f64(double a, double b, double c, int nmul, int nadd) {
+    uint64_t ab, bb, cb;
+    memcpy(&ab, &a, 8);
+    memcpy(&bb, &b, 8);
+    memcpy(&cb, &c, 8);
+    if (nan64(ab) || nan64(bb) || nan64(cb)) {
+        // #I follows ANY SNaN operand, not the winner: a QNaN a beside an SNaN b still raises it.
+        if ((nan64(ab) && !(ab & 0x0008000000000000ull)) || (nan64(bb) && !(bb & 0x0008000000000000ull)) ||
+            (nan64(cb) && !(cb & 0x0008000000000000ull)))
+            fma_raise_ie();
+        uint64_t w = (nan64(ab) ? ab : nan64(bb) ? bb : cb) | 0x0008000000000000ull;
+        memcpy(&a, &w, 8);
+        return a;
+    }
+    double r = __builtin_fma(nmul ? -a : a, b, nadd ? -c : c);
+    if (r != r) {
         uint64_t u = 0xFFF8000000000000ull;
         memcpy(&r, &u, 8);
     }
@@ -2038,14 +2085,14 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                     memcpy(&x, m1 + i, 8);
                     memcpy(&y, m2 + i, 8);
                     memcpy(&z, ad + i, 8);
-                    double res = fma_dnan_f64(__builtin_fma(x, y, sub ? -z : z), x, y, z);
+                    double res = fma_x86_f64(x, y, z, 0, sub);
                     memcpy(d + i, &res, 8);
                 } else {
                     float x, y, z;
                     memcpy(&x, m1 + i, 4);
                     memcpy(&y, m2 + i, 4);
                     memcpy(&z, ad + i, 4);
-                    float res = fma_dnan_f32(__builtin_fmaf(x, y, sub ? -z : z), x, y, z);
+                    float res = fma_x86_f32(x, y, z, 0, sub);
                     memcpy(d + i, &res, 4);
                 }
             }
@@ -2081,8 +2128,8 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             int scalar = op & 1;
             int dbl = I.vex_w;
             int es = dbl ? 8 : 4;
-            int sneg_mul = (base == 0x0C || base == 0x0E) ? -1 : 1;
-            int sneg_add = (base == 0x0A || base == 0x0E) ? -1 : 1;
+            int nmul = (base == 0x0C || base == 0x0E); // fnmadd/fnmsub negate the product
+            int nadd = (base == 0x0A || base == 0x0E); // fmsub/fnmsub negate the addend
             uint8_t dst[64];
             avx_get(c, rd, dst);
             avx_get(c, vv, a);
@@ -2099,14 +2146,14 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                     memcpy(&x, m1 + i, 8);
                     memcpy(&y, m2 + i, 8);
                     memcpy(&z, ad + i, 8);
-                    double res = fma_dnan_f64(__builtin_fma(sneg_mul * x, y, sneg_add * z), x, y, z);
+                    double res = fma_x86_f64(x, y, z, nmul, nadd);
                     memcpy(d + i, &res, 8);
                 } else {
                     float x, y, z;
                     memcpy(&x, m1 + i, 4);
                     memcpy(&y, m2 + i, 4);
                     memcpy(&z, ad + i, 4);
-                    float res = fma_dnan_f32(__builtin_fmaf((float)sneg_mul * x, y, (float)sneg_add * z), x, y, z);
+                    float res = fma_x86_f32(x, y, z, nmul, nadd);
                     memcpy(d + i, &res, 4);
                 }
             }

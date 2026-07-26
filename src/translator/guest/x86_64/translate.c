@@ -1255,6 +1255,9 @@ static void emit_nan_input_gate(int vd, int s, int dbl, uint64_t gpc) {
 // Result is left in `acc`. Generated-NaN sign fixup (0*inf, inf-inf: x86 yields the negative QNaN
 // indefinite, ARM the positive default NaN -- same payload, opposite sign) is applied over the THREE
 // inputs exactly like the SSE emit_dnan_pre/post, keyed on "result is NaN AND no input was NaN".
+// A NaN INPUT never reaches here: the caller's gate exits to R_AVX first, and avx.c's fma_x86_f32/f64
+// owns the operand-selection rule, which no FMLA sequence reproduces (ARM is SNaN-first-then-addend,
+// x86 is first-NaN-in-a*b+c-order). So the "no input was NaN" arm of the fixup is the only live one.
 // rA/rB are the multiplicands, rC the addend (all distinct host vregs); acc/mt1/mt2 are scratch vregs
 // distinct from the sources. dbl: 1 -> .2d (pd), 0 -> .4s (ps).
 static void emit_fma_group(int rA, int rB, int rC, int acc, int mt1, int mt2, int neg, int fmls, int dbl) {

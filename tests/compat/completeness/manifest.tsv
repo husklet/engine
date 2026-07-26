@@ -25,6 +25,7 @@ dc-zva-model	op_arm_misc	aarch64/dc_zva_model.c	-	aarch64	-static -O2 -std=gnu11
 avx	op_x86_avx	x86_64/avx.c	completeness/x86_avx.c	x86_64	-static -O2 -std=gnu11 -Itests/compat/completeness	-	-	0	expected/x86_64/avx.out	linux-libc	active	ported Rust registration
 avx2	op_x86_avx	x86_64/avx2.c	completeness/x86_avx2.c	x86_64	-static -O2 -std=gnu11 -Itests/compat/completeness	-	-	0	expected/x86_64/avx2.out	linux-libc	active	ported Rust registration
 fma	op_x86_avx	x86_64/fma.c	completeness/x86_fma.c	x86_64	-static -O2 -std=gnu11 -Itests/compat/completeness	-	-	0	expected/x86_64/fma.out	linux-libc	active	ported Rust registration
+fma-nan	op_x86_avx	x86_64/fma_nan.c	-	x86_64	-static -O2 -std=gnu11 -Itests/compat/completeness	-	-	0	expected/x86_64/fma_nan.out	linux-libc	active	FMA NaN: first NaN in a*b+c order wins verbatim-quieted, addend never beats a multiplicand, #I only for an SNaN operand
 f16c	op_x86_avx	x86_64/f16c.c	completeness/x86_f16c.c	x86_64	-static -O2 -std=gnu11 -Itests/compat/completeness	-	-	0	expected/x86_64/f16c.out	linux-libc	active	ported Rust registration
 vmov-scalar-merge	op_x86_avx	x86_64/vmov_scalar_merge.c	completeness/x86_vmov_scalar_merge.c	x86_64	-static -O2 -std=gnu11 -Itests/compat/completeness	-	-	0	expected/x86_64/vmov_scalar_merge.out	linux-libc	active	ported Rust registration
 avx-sigreturn	op_x86_avx	x86_64/avx_sigreturn.c	completeness/x86_avx_sigreturn.c	x86_64	-static -O2 -std=gnu11 -Itests/compat/completeness	-	-	0	expected/x86_64/avx_sigreturn.out	linux-libc	active	ported Rust registration
