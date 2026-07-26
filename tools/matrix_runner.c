@@ -13,6 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/statfs.h>
+#endif
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -22,6 +25,10 @@
 
 #include "hl/config.h"
 
+/* CASE_MAX bounds the fixed cases[] array in main(). The largest manifest in the tree is
+   tests/compat/completeness/manifest.tsv at 167 active rows, so 256 leaves ~90 rows of headroom; the
+   overflow path below names the limit rather than blaming the manifest, because a manifest that parses
+   perfectly is not a parse error and reporting it as one sends a reader to the wrong file. */
 enum { CASE_MAX = 256, FIELD_MAX = 512, OUTPUT_MAX = 1024 * 1024, ERROR_MAX = 64 * 1024, TIMEOUT_MS = 120000 };
 
 /* Per-case hang detector. 120s suits every suite whose cases are milliseconds of
@@ -109,6 +116,208 @@ static int load_timeout_scale(void) {
            "slow-but-correct guest execution and is NOT evidence of speed comparable to an unscaled lane\n",
            timeout_scale, (unsigned long long)case_timeout_ms());
     return 0;
+}
+
+/*
+ * The stall detector: a hang is a lack of PROGRESS, not a lack of time.
+ *
+ * Scaling the wall-clock budget above fixed the false positive (slow-but-correct reported as a hang) and
+ * created a false negative in its place: at HL_MATRIX_TIMEOUT_SCALE=30 the budget is 3600s per case, and
+ * compat-soak's HL_MATRIX_CASE_TIMEOUT_MS=600000 makes it 5 HOURS. Nothing bounded a real hang any more,
+ * and there was a real one to bound: the x86_64 futex-across-fork cases were observed sitting in
+ * do_wait/futex_do_wait indefinitely at ZERO CPU (that engine defect is since fixed; the signature is what
+ * the class looks like, and the class is what this detects).
+ *
+ * A larger or smaller number cannot separate the two cases, because they differ in kind rather than in
+ * degree. An interpreted guest is 10-50x slower per unit of work; it is not 10-50x more idle. So measure
+ * progress directly and give it its own, much shorter budget:
+ *
+ *   progress := the guest's captured stdout/stderr grew, OR the case's process tree consumed CPU.
+ *
+ * Both signals are needed. Output alone would kill a correct case that computes for minutes before
+ * printing (soak/reallocchurn does exactly that), and CPU alone would kill a correct case blocked on a
+ * timer. Together they are only both absent when nothing in the launch is running or producing anything,
+ * which is the definition of the hang this exists to catch. Note that neither signal can be taken from the
+ * runner's own pipes: tools/remote_supervisor.c writes a heartbeat byte to its stderr every 250ms, so pipe
+ * traffic proves the SUPERVISOR is alive and says nothing about the guest. The capture files are the
+ * guest's real output, and the process tree is where its real work happens.
+ *
+ * The tree is walked by parent-child descent from the runner's own child rather than by process group,
+ * because the supervisor deliberately puts the engine in a group of its OWN (setpgid(0,0) in the forked
+ * child there) -- a pgid scan finds the supervisor and misses every process that does the work. A
+ * descendant that has been reparented away (a deliberately orphaned daemon) is not counted; its output
+ * still is. Anything the host will not answer -- a non-Linux host, an unreadable /proc, more processes
+ * than the table holds -- reports "unknown", which counts as progress. Missing evidence must never be
+ * allowed to manufacture a hang.
+ *
+ * The budget is DERIVED, not invented: it is the UNSCALED per-case budget (suite_case_timeout_ms(), i.e.
+ * 120s, or whatever HL_MATRIX_CASE_TIMEOUT_MS says this suite is worth), with a floor of STALL_FLOOR_MS.
+ * Two consequences, both wanted:
+ *
+ *   * On any lane where the scale is 1 the stall budget is >= the wall budget, so the wall clock always
+ *     fires first and the detector is inert BY CONSTRUCTION. The aarch64 and Darwin lanes therefore cannot
+ *     change behaviour, and that is a property of the arithmetic rather than a claim about it.
+ *   * A suite that says it does more work (compat-soak's 600s) automatically gets a longer stall budget
+ *     too. That is the honest coupling: the one knob that means "this suite is big" already means "this
+ *     suite may legitimately go quiet for longer". No second environment variable exists to get wrong.
+ *
+ * Why the floor cannot fire on a correct case: firing needs STALL_FLOOR_MS (60s) in which the whole
+ * process tree consumed zero CPU ticks AND wrote zero bytes. The longest deliberate sleep anywhere in the
+ * corpus is 10s (the 100s/1000s values in tests/compat/time are timers armed far into the future and read
+ * back, never waited on), so the margin is at least 6x, and it is a margin against idleness rather than
+ * against speed -- the axis a slower host does not move along.
+ */
+enum { STALL_FLOOR_MS = 60000, STALL_SAMPLE_MS = 1000, STALL_PROCESS_MAX = 4096 };
+
+static uint64_t stall_timeout_ms(void) {
+    uint64_t budget = suite_case_timeout_ms();
+    if (budget < STALL_FLOOR_MS) budget = STALL_FLOOR_MS;
+    /* Inert whenever the wall clock would fire no later -- the unscaled case. Returning 0 rather than a
+       number that can never be reached keeps the sampling out of the poll loop entirely there. */
+    return budget >= case_timeout_ms() ? 0 : budget;
+}
+
+#if defined(__linux__)
+typedef struct process_row {
+    long pid;
+    long parent;
+    unsigned long long ticks;
+    int descends;
+} process_row;
+
+/* Total user+system clock ticks charged to `root` and its live descendants, or -1 when the host cannot
+   answer. Ticks are monotone per process, so a sum that has not moved is proof no counted process ran. */
+static long long tree_cpu_ticks(long root) {
+    /* static: 4096 rows is far too large for a frame in the per-case poll loop, and the runner is
+       single-threaded (one case at a time, by construction of main()). */
+    static process_row rows[STALL_PROCESS_MAX];
+    DIR *directory = opendir("/proc");
+    struct dirent *entry;
+    size_t count = 0, index;
+    long long total = 0;
+    unsigned pass;
+    if (directory == NULL) return -1;
+    while ((entry = readdir(directory)) != NULL) {
+        char path[64], text[1024], *tail;
+        int descriptor;
+        ssize_t got;
+        long pid, parent;
+        unsigned long long user_ticks, system_ticks;
+        char *end = NULL;
+        if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
+        errno = 0;
+        pid = strtol(entry->d_name, &end, 10);
+        if (errno != 0 || end == NULL || *end != 0) continue;
+        if (count == STALL_PROCESS_MAX) {
+            (void)closedir(directory);
+            return -1; /* Truncated is unknown, and unknown counts as progress. */
+        }
+        if (snprintf(path, sizeof path, "/proc/%ld/stat", pid) >= (int)sizeof path) continue;
+        descriptor = open(path, O_RDONLY | O_CLOEXEC);
+        if (descriptor < 0) continue; /* Exited between readdir and open; its ticks are simply not seen. */
+        got = read(descriptor, text, sizeof text - 1u);
+        (void)close(descriptor);
+        if (got <= 0) continue;
+        text[got] = 0;
+        /* Field 2 is comm, which is parenthesised and may itself contain spaces and parentheses, so the
+           only correct place to start parsing is after the LAST ')'. */
+        tail = strrchr(text, ')');
+        if (tail == NULL) continue;
+        if (sscanf(tail + 1, " %*c %ld %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &parent, &user_ticks,
+                   &system_ticks) != 3)
+            continue;
+        rows[count].pid = pid;
+        rows[count].parent = parent;
+        rows[count].ticks = user_ticks + system_ticks;
+        rows[count].descends = pid == root;
+        count++;
+    }
+    (void)closedir(directory);
+    /* Transitive closure over the parent links. /proc is not ordered parent-before-child, so this is
+       repeated until it stops changing; the trees here are a handful of levels deep. */
+    for (pass = 0; pass < 32; ++pass) {
+        int changed = 0;
+        for (index = 0; index < count; ++index) {
+            size_t other;
+            if (rows[index].descends) continue;
+            for (other = 0; other < count; ++other)
+                if (rows[other].descends && rows[other].pid == rows[index].parent) {
+                    rows[index].descends = 1;
+                    changed = 1;
+                    break;
+                }
+        }
+        if (!changed) break;
+    }
+    for (index = 0; index < count; ++index)
+        if (rows[index].descends) total += (long long)rows[index].ticks;
+    return total;
+}
+#else
+static long long tree_cpu_ticks(long root) {
+    (void)root;
+    /* No portable per-tree CPU accounting. Reporting "unknown" disables the detector rather than leaving
+       it running on the output signal alone, which would make a Darwin lane STRICTER than it is today. */
+    return -1;
+}
+#endif
+
+/*
+ * HL_MATRIX_SCRATCH_DIR, and why a silent fallback is a trap.
+ *
+ * The guest's /tmp is a per-case scratch directory, so the filesystem BENEATH it decides whether memfd
+ * seals, statx btime and friends behave as the goldens (captured on Linux) say they must. The variable is
+ * exported by .github/workflows/linux.yml and by nothing else, so a developer running `ctest -L
+ * compat-syscall` on an ext4 build tree fails syscall/memfd-seals on both ISAs for a reason that has
+ * nothing to do with the engine, and the run says nothing about why.
+ *
+ * It is deliberately NOT set from CMake -- see the note in cmake/Phase3Compat.cmake. Some suites' goldens
+ * were captured against the build tree's own filesystem (linux.yml unsets it for compat-core-syscall for
+ * exactly that reason), so a build system that forced tmpfs on every suite would break those cases to fix
+ * these. Instead the runner records what it actually used and says so WHEN A RUN FAILS -- the one moment
+ * the information is worth anything, and the one place it cannot add noise to a green lane.
+ */
+static char scratch_base_used[1024];
+static int scratch_overridden;
+static int scratch_override_rejected;
+static int scratch_is_tmpfs = -1; /* 1 yes, 0 no, -1 the host will not say */
+
+static void scratch_observe(const char *base, int overridden, int rejected) {
+    if (scratch_base_used[0] != 0) return; /* First case only; every case uses the same base. */
+    (void)snprintf(scratch_base_used, sizeof scratch_base_used, "%s", base);
+    scratch_overridden = overridden;
+    scratch_override_rejected = rejected;
+#if defined(__linux__)
+    {
+        struct statfs info;
+        /* TMPFS_MAGIC, spelled out rather than pulled from <linux/magic.h> so the tool keeps building
+           against a bare libc header set. */
+        if (statfs(base, &info) == 0) scratch_is_tmpfs = (unsigned long long)info.f_type == 0x01021994ULL ? 1 : 0;
+    }
+#endif
+}
+
+static void scratch_note(void) {
+    if (scratch_override_rejected)
+        fprintf(stderr,
+                "matrix-runner: NOTE: HL_MATRIX_SCRATCH_DIR was set but is not a writable directory; the guest's "
+                "/tmp fell back to %s\n",
+                scratch_base_used);
+    if (scratch_is_tmpfs != 0 || scratch_overridden) return;
+    fprintf(stderr,
+            "matrix-runner: NOTE: the guest's /tmp was backed by %s, which is NOT tmpfs. Cases asserting "
+            "tmpfs-only behaviour (memfd seals, statx btime) fail on any other filesystem for that reason alone, "
+            "on BOTH ISAs. Set HL_MATRIX_SCRATCH_DIR to a tmpfs (e.g. /dev/shm) before reading those failures as "
+            "engine defects; CI does this in .github/workflows/linux.yml.\n",
+            scratch_base_used);
+}
+
+static uint64_t capture_bytes(const char *output_path, const char *error_path) {
+    struct stat status;
+    uint64_t total = 0;
+    if (stat(output_path, &status) == 0 && status.st_size > 0) total += (uint64_t)status.st_size;
+    if (stat(error_path, &status) == 0 && status.st_size > 0) total += (uint64_t)status.st_size;
+    return total;
 }
 
 #ifndef AARCH64_DYNAMIC_LOADER
@@ -295,10 +504,10 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
         if (cursor != NULL || (field_count != 7 && field_count != 13)) goto invalid;
         if (field_count == 7) {
             size_t source_size = strlen(fields[0]);
-            if (*case_count == CASE_MAX || !relative_path(fields[0]) || source_size < 3 ||
-                strcmp(fields[0] + source_size - 2, ".c") != 0 || strcmp(fields[2], "aarch64,x86_64") != 0 ||
-                !relative_path(fields[4]) || strncmp(fields[4], "golden/", 7) != 0 ||
-                parse_exit(fields[3], &cases[*case_count].expected_exit) != 0)
+            if (*case_count == CASE_MAX) goto overflow;
+            if (!relative_path(fields[0]) || source_size < 3 || strcmp(fields[0] + source_size - 2, ".c") != 0 ||
+                strcmp(fields[2], "aarch64,x86_64") != 0 || !relative_path(fields[4]) ||
+                strncmp(fields[4], "golden/", 7) != 0 || parse_exit(fields[3], &cases[*case_count].expected_exit) != 0)
                 goto invalid;
             cases[*case_count].isa = ISA_BOTH;
             cases[*case_count].needs_rootfs = 0;
@@ -321,8 +530,9 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
             (*excluded)++;
             continue;
         }
-        if ((strcmp(fields[11], "active") != 0 && !macos_only) || *case_count == CASE_MAX ||
-            !relative_path(fields[2]) || !relative_path(fields[9]) || strncmp(fields[9], "expected/", 9) != 0 ||
+        if (*case_count == CASE_MAX) goto overflow;
+        if ((strcmp(fields[11], "active") != 0 && !macos_only) || !relative_path(fields[2]) ||
+            !relative_path(fields[9]) || strncmp(fields[9], "expected/", 9) != 0 ||
             (strcmp(fields[6], "-") != 0 && strncmp(fields[6], "argv:", 5) != 0) || !valid_environment(fields[7]) ||
             parse_exit(fields[8], &cases[*case_count].expected_exit) != 0)
             goto invalid;
@@ -359,6 +569,17 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
     return *case_count == 0;
 invalid:
     fprintf(stderr, "matrix-runner: invalid manifest row near active case %zu\n", *case_count + 1);
+    free(line);
+    fclose(file);
+    return 1;
+    /* Overflow used to fall into `invalid` above, so a manifest that parses perfectly was reported as a
+       parse error -- sending the reader to the manifest to look for a malformed row that is not there.
+       The limit is the harness's, so the harness says so, and names the file it was reading. */
+overflow:
+    fprintf(stderr,
+            "matrix-runner: %s holds more than %d active cases, which is CASE_MAX in tools/matrix_runner.c. The "
+            "manifest is not malformed; raise CASE_MAX (the array is a fixed-size main() local) and rebuild.\n",
+            path, CASE_MAX);
     free(line);
     fclose(file);
     return 1;
@@ -665,7 +886,8 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
                      const char *rootfs, const char *environment, const char *binary_root, capture *result) {
     int output_pipe[2], error_pipe[2], output_eof = 0, error_eof = 0, exited = 0;
     char config_path[1024], scratch[1024], supervisor[1024], capture_output[1200], capture_error[1200];
-    uint64_t deadline;
+    uint64_t deadline, stall_budget = stall_timeout_ms(), stall_bytes = 0, stall_stamp, stall_sampled;
+    long long stall_ticks = -1;
     pid_t child;
     memset(result, 0, sizeof(*result));
     result->output = malloc(OUTPUT_MAX);
@@ -683,10 +905,14 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
          * special-casing of /tmp and /dev/shm does not apply to it.
          */
         const char *scratch_base = getenv("HL_MATRIX_SCRATCH_DIR");
+        int requested = scratch_base != NULL && scratch_base[0] != 0, rejected = 0;
         struct stat base_stat;
-        if (scratch_base == NULL || scratch_base[0] == 0 || stat(scratch_base, &base_stat) != 0 ||
-            !S_ISDIR(base_stat.st_mode) || access(scratch_base, W_OK) != 0)
+        if (!requested || stat(scratch_base, &base_stat) != 0 || !S_ISDIR(base_stat.st_mode) ||
+            access(scratch_base, W_OK) != 0) {
+            rejected = requested;
             scratch_base = binary_root;
+        }
+        scratch_observe(scratch_base, requested && !rejected, rejected);
         if (snprintf(scratch, sizeof scratch, "%s/.matrix-scratch-XXXXXX", scratch_base) >= (int)sizeof scratch ||
             mkdtemp(scratch) == NULL)
             return 1;
@@ -740,16 +966,44 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
         return 1;
     }
     deadline = monotonic_ms() + case_timeout_ms();
+    stall_stamp = monotonic_ms();
+    stall_sampled = stall_stamp;
     while (!exited || !output_eof || !error_eof) {
         struct pollfd descriptors[2] = {{output_pipe[0], POLLIN | POLLHUP, 0}, {error_pipe[0], POLLIN | POLLHUP, 0}};
+        uint64_t now = monotonic_ms();
         pid_t waited;
-        if (interrupted_signal != 0 || monotonic_ms() >= deadline) {
+        if (interrupted_signal != 0 || now >= deadline) {
             terminate(child);
             close(output_pipe[0]);
             close(error_pipe[0]);
             unlink(config_path);
             remove_tree(scratch);
             return 2;
+        }
+        /* Sampled once a second rather than on every 10ms poll: a /proc walk is cheap but not free, and a
+           stall is measured in tens of seconds. `exited` guards the tail of the loop where the child is
+           already reaped and only the pipes are being drained -- there is no tree left to sample. */
+        if (stall_budget != 0 && !exited && now - stall_sampled >= STALL_SAMPLE_MS) {
+            uint64_t bytes = capture_bytes(capture_output, capture_error);
+            long long ticks = tree_cpu_ticks((long)child);
+            stall_sampled = now;
+            if (ticks < 0 || bytes != stall_bytes || ticks != stall_ticks) {
+                stall_bytes = bytes;
+                stall_ticks = ticks;
+                stall_stamp = now;
+            } else if (now - stall_stamp >= stall_budget) {
+                terminate(child);
+                close(output_pipe[0]);
+                close(error_pipe[0]);
+                /* Unlike the wall-clock path, recover whatever the guest DID print before it stopped: a
+                   hang is diagnosed from where it got to, and this path can only be reached on a lane
+                   whose budget was scaled, so no existing lane's failure text is affected. */
+                (void)read_capture(capture_output, result->output, OUTPUT_MAX, &result->output_size);
+                (void)read_capture(capture_error, result->error, ERROR_MAX, &result->error_size);
+                unlink(config_path);
+                remove_tree(scratch);
+                return 3;
+            }
         }
         if (poll(descriptors, 2, 10) < 0 && errno != EINTR) {
             terminate(child);
@@ -935,6 +1189,18 @@ static const char *timeout_reason(void) {
     return text;
 }
 
+/* A stall is a different verdict from a timeout and must read as one: the case did not run out of time, it
+   stopped doing anything. Naming both budgets is what lets a reader tell "hung" from "the scale is too
+   low" without re-running anything. */
+static const char *stall_reason(void) {
+    static char text[192];
+    (void)snprintf(text, sizeof text,
+                   "HUNG: no guest output and no CPU anywhere in its process tree for %llums (the %llums per-case "
+                   "budget had NOT expired, so this is a hang, not slow execution)",
+                   (unsigned long long)stall_timeout_ms(), (unsigned long long)case_timeout_ms());
+    return text;
+}
+
 static int run_one(const suite_case *item, const char *bridge, const char *engine, const char *binary_root,
                    const char *suite_root, const char *isa, capture *result) {
     char guest[1024], expected_path[1024], binary[256], rootfs[1024] = {0};
@@ -999,7 +1265,11 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
         else if (result->output_size != expected_size)
             fprintf(stderr, "matrix-runner: %s [%s] stdout length: got=%zu expected=%zu\n", item->name, isa,
                     result->output_size, expected_size);
-        diagnostic(item, isa, status == 2 ? timeout_reason() : "exit/stdout mismatch", result);
+        diagnostic(item, isa,
+                   status == 2   ? timeout_reason()
+                   : status == 3 ? stall_reason()
+                                 : "exit/stdout mismatch",
+                   result);
         free(expected);
         return 1;
     }
@@ -1010,6 +1280,12 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
 int main(int argc, char **argv) {
     suite_case cases[CASE_MAX];
     size_t count, excluded, index, selected = 0, failures = 0;
+    /* Per-ISA tallies. One run of one suite has to answer "how did each backend do", which is the whole
+       point of a two-ISA matrix and was unanswerable while the second leg was conditional on the first. */
+    size_t aarch64_selected = 0, aarch64_failures = 0, x86_64_selected = 0, x86_64_failures = 0;
+    size_t cross_compared = 0, cross_failures = 0, cross_skipped = 0;
+    int legs_aarch64 = 0, legs_x86_64 = 0, failed_aarch64 = 0, failed_x86_64 = 0, failed_cross = 0,
+        failed_resources = 0;
     const char *only = NULL;
     unsigned long repetitions = 1;
     unsigned long repetition;
@@ -1050,31 +1326,73 @@ int main(int argc, char **argv) {
         if (interrupted_signal != 0) return 128 + interrupted_signal;
         if (only != NULL && strcmp(only, cases[index].name) != 0) continue;
         selected++;
+        /*
+         * BOTH ISAs always run. They used to be chained -- the x86_64 leg was conditional on the aarch64
+         * leg having passed -- which meant one run could never report per-ISA numbers, and, worse, that a
+         * host where the two backends have DIVERGED is exactly the host where the divergence is invisible:
+         * the first ISA to fail suppressed the other's result and the cross-ISA identity check with it.
+         * The verdict is deliberately unchanged (a case failing on either ISA still fails the case, and
+         * the identity check still requires two passing legs to have something to compare), so this is a
+         * measurement fix and not a scoring change.
+         */
+        legs_aarch64 = cases[index].isa != ISA_X86_64;
+        legs_x86_64 = cases[index].isa != ISA_AARCH64;
+        failed_aarch64 = 0;
+        failed_x86_64 = 0;
+        failed_cross = 0;
+        failed_resources = 0;
         for (repetition = 0; repetition < repetitions; ++repetition) {
             if (interrupted_signal != 0) return 128 + interrupted_signal;
             capture a = {0}, x = {0};
             // Keep-going: a failing case emits its own ::error diagnostic (above, in run_one) but does not
             // abort the run -- record it and move to the next case so ONE run reports every failure, not just
             // the first. The run still exits non-zero when any case failed (checked after the loop).
-            int case_failed = 0;
-            if ((cases[index].isa == ISA_AARCH64 || cases[index].isa == ISA_BOTH) &&
-                run_one(&cases[index], argv[1], argv[2], argv[3], argv[6], "aarch64", &a) != 0)
-                case_failed = 1;
-            if (!case_failed && (cases[index].isa == ISA_X86_64 || cases[index].isa == ISA_BOTH) &&
-                run_one(&cases[index], argv[1], argv[4], argv[5], argv[6], "x86_64", &x) != 0)
-                case_failed = 1;
-            if (!case_failed && cases[index].isa == ISA_BOTH &&
+            int case_failed;
+            if (legs_aarch64 && run_one(&cases[index], argv[1], argv[2], argv[3], argv[6], "aarch64", &a) != 0)
+                failed_aarch64 = 1;
+            if (legs_x86_64 && run_one(&cases[index], argv[1], argv[4], argv[5], argv[6], "x86_64", &x) != 0)
+                failed_x86_64 = 1;
+            if (!failed_aarch64 && !failed_x86_64 && cases[index].isa == ISA_BOTH &&
                 (a.output_size != x.output_size || memcmp(a.output, x.output, a.output_size) != 0)) {
                 diagnostic(&cases[index], "cross-ISA", "stdout mismatch", &x);
-                case_failed = 1;
+                failed_cross = 1;
             }
             capture_free(&a);
             capture_free(&x);
-            if (!case_failed && !resources_restored(baseline, &cases[index])) case_failed = 1;
-            if (case_failed) {
-                failures++;
-                break; // stop repeating this case; continue with the rest of the suite
+            case_failed = failed_aarch64 || failed_x86_64 || failed_cross;
+            if (!case_failed && !resources_restored(baseline, &cases[index])) {
+                failed_resources = 1;
+                case_failed = 1;
             }
+            if (case_failed) break; // stop repeating this case; continue with the rest of the suite
+        }
+        if (legs_aarch64) {
+            aarch64_selected++;
+            aarch64_failures += (size_t)failed_aarch64;
+        }
+        if (legs_x86_64) {
+            x86_64_selected++;
+            x86_64_failures += (size_t)failed_x86_64;
+        }
+        if (cases[index].isa == ISA_BOTH) {
+            if (failed_aarch64 || failed_x86_64)
+                cross_skipped++;
+            else if (failed_cross)
+                cross_failures++;
+            else
+                cross_compared++;
+        }
+        if (failed_aarch64 || failed_x86_64 || failed_cross || failed_resources) {
+            failures++;
+            /* One line per failing case naming the LEG, because the per-leg diagnostics above are
+               interleaved with the engine's own stderr and a reader scanning a 3000-case log needs the
+               (case, ISA) pair to be greppable on its own. */
+            fprintf(stderr, "matrix-runner: %s FAILED on %s\n", cases[index].name,
+                    failed_aarch64 && failed_x86_64 ? "BOTH ISAs"
+                    : failed_aarch64                ? (legs_x86_64 ? "aarch64 only (x86_64 passed)" : "aarch64")
+                    : failed_x86_64                 ? (legs_aarch64 ? "x86_64 only (aarch64 passed)" : "x86_64")
+                    : failed_cross                  ? "cross-ISA stdout identity (both ISAs passed on their own)"
+                                                    : "host resource restoration (both ISAs passed)");
         }
     }
     if (only != NULL && selected == 0) {
@@ -1087,9 +1405,18 @@ int main(int argc, char **argv) {
         printf("matrix-runner: per-case timeout was scaled x%lu; this run's timing is not comparable to an "
                "unscaled lane\n",
                timeout_scale);
+    /* Unconditional, on stdout, in a fixed shape: a per-ISA number is the deliverable of a two-ISA matrix,
+       and printing it only on failure would make a green run the one place the numbers are missing. The
+       cross-ISA line reports what was COMPARED separately from what could not be, because "not compared"
+       is a gap in the identity evidence, not a pass. */
+    printf("matrix-runner: per-ISA: aarch64 %zu/%zu passed, x86_64 %zu/%zu passed; cross-ISA identity %zu "
+           "compared, %zu mismatched, %zu not comparable (a leg failed)\n",
+           aarch64_selected - aarch64_failures, aarch64_selected, x86_64_selected - x86_64_failures, x86_64_selected,
+           cross_compared, cross_failures, cross_skipped);
     if (failures != 0) {
         fprintf(stderr, "matrix-runner: %zu of %zu selected case(s) FAILED; %zu excluded\n", failures, selected,
                 excluded);
+        scratch_note();
         return 1;
     }
     printf("matrix-runner: %zu active cases passed with %lu repetition(s); %zu manifest cases excluded\n", selected,

@@ -10,25 +10,46 @@ name: Linux x86-64
 #     be independently referenceable.
 #   * linux.yml's per-SHA concurrency group is tuned to a lane that keeps up.
 #
-# SCOPE, deliberately narrow. The engine does not yet EXECUTE guests on an
-# x86_64 host -- the host code generator / interpreter backends are being
-# written. So this job proves exactly what is true today: the tree configures,
-# the host libraries, production engines and both guest fixture corpora build,
-# the host-only `unit` lane passes on this host CPU, and the Rust crate accepts
-# and links an x86_64 host archive. It claims nothing about running a guest.
+# SCOPE, deliberately narrow -- but no longer for the reason it used to give.
+# This block said "the engine does not yet EXECUTE guests on an x86_64 host";
+# that is now false. Both interpreter backends run guests, and a sweep of all 24
+# compat manifests on this host CPU measures 2632/3013 (case, guest-ISA) runs
+# passing: 87.4% overall, 85.7% on the aarch64 guest, 89.0% on the x86-64 guest.
+#
+# So what this job proves is narrower than what the host can do: the tree
+# configures, the host libraries, production engines and both guest fixture
+# corpora build, the host-only `unit` lane passes on this host CPU, and the Rust
+# crate accepts and links an x86_64 host archive. Everything below is absent
+# because it is not yet GREEN here, which is a different claim from impossible,
+# and the ~381 failing runs are unmeasured by CI rather than absent from the
+# tree. docs/ci-green.md, "What IS hidden by the lanes absent from
+# linux-x86_64.yml", is the accounting.
 #
 # Lanes deliberately ABSENT, and what unblocks each:
-#   compat-*        the sharded compat matrix. Needs a working x86_64 host
-#                   backend. Then declare Linux-x86_64 in HL_CI_COMPAT_HOSTS
-#                   (cmake/CiLanes.cmake) and add a compat matrix job here;
-#                   invariant I20 fails if a shard appears before the
-#                   declaration does.
-#   production*     the linux-production engines have to run guests.
-#   e2e-oracle      each case launches a guest through a production engine.
-#   checkpoint*
-#   dynamic-e2e
-#   lifecycle
-#   integration
+#   compat-*        the sharded compat matrix. NOT blocked on a backend any
+#                   more; blocked on being green. The gateable subset is the
+#                   suites measured green on BOTH guest ISAs -- today that is
+#                   compat-syscall-edges (52/52 per ISA), with compat-time
+#                   (39/39 per ISA) held back only because timer assertions are
+#                   the classic hosted-runner flake. The argument and the
+#                   measurements live beside HL_CI_COMPAT_HOSTS in
+#                   cmake/CiLanes.cmake; the reason a label is the unit is that
+#                   cmake/Phase3Compat.cmake gives each one ONE CTest case
+#                   covering both ISAs, so a suite green on the x86-64 guest and
+#                   red on the aarch64 one is a red lane, not half a green one.
+#                   Sharding a subset also needs cmake/CiLanes.cmake's
+#                   HL_CI_SHARDED_LINUX split per host CPU first: I19 refuses a
+#                   second compat host on an OS whose lane list cannot say which
+#                   host it describes, and declaring Linux-x86_64 in
+#                   HL_CI_COMPAT_HOSTS before that switches I20 OFF, leaving
+#                   this file with no structural guard at all.
+#   production*     the production-full sweeps; same story, plus their runner
+#                   (tools/linux_matrix.c) is where the remaining hangs land.
+#   e2e-oracle      each case launches a guest through a production engine, and
+#   checkpoint*     these runners still carry unscaled per-case budgets
+#   dynamic-e2e     (tools/e2e_runner.c and friends at 30s,
+#   lifecycle       tests/integration/checkpoint_tree_runner.c at 15s), so an
+#   integration     interpreted guest trips them as if it had hung.
 #   perf-linux      a measurement OF the engine, so it needs the engine. The
 #                   host baseline it is read against, perf-native, does register
 #                   on this host now -- but it is registry-only on every host,
@@ -47,10 +68,10 @@ name: Linux x86-64
 # publish.yml is NOT extended to need this job, and invariant P1 still pins
 # `needs: [linux, mac]`. What a release ships is the crate, and the crate ships
 # two aarch64 archives -- nothing in a release artifact is built by an x86_64
-# host. Gating every release on a lane that cannot execute a guest would add
-# release latency and no release signal. Revisit together with HL_CI_COMPAT_HOSTS
-# above: once this host runs the production matrix it is a genuine release
-# signal, and then it belongs in `needs:` and in P1.
+# host. Gating every release on a lane that runs no guest case would add release
+# latency and no release signal. Revisit together with HL_CI_COMPAT_HOSTS above:
+# once this host gates a compat subset it carries a genuine release signal, and
+# then it belongs in `needs:` and in P1.
 
 on:
   pull_request: {}

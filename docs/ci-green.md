@@ -50,6 +50,7 @@ writes nothing at 1, and the enforced perf command line is unchanged).
 | Gate | aarch64 host | x86_64 host | What names it in the output |
 |---|---|---|---|
 | per-case guest timeout (`matrix_runner.c` 120s, `linux_matrix.c` 20s, `e2e_runner.c`/`config_e2e_runner.c`/`rootfs_e2e_runner.c` 30s, `checkpoint_tree_runner.c` 15s) | unchanged | multiplied by `HL_MATRIX_TIMEOUT_SCALE` (30), and so is the CTest `TIMEOUT` of the 226 tests the six runners drive | `per-case timeout scaled x30 ...` on stdout at the start of the run, repeated after the pass/fail summary; a timeout diagnostic names the budget that expired |
+| per-case **stall** detector (`matrix_runner.c`, `linux_matrix.c`) | inert by construction — its budget is ≥ the wall budget, which fires first | armed: a case whose process tree consumes no CPU and writes no output for the *unscaled* budget (≥60s) is killed and reported as hung | `HUNG -- no ... output and no CPU in its process tree for <n>ms, with the <n>ms per-case budget unexpired` |
 | tracked cold/p99 perf thresholds (`PERF_LIMIT_*`, `cmake/Phase3Gates.cmake`) | enforced, 26 cases | recorded, not enforced (`HL_PERF_ENFORCE=OFF`) | the case is *named* `perf.linux-<case>-<arch>.record-only`, and echoes `RECORD-ONLY ...: measured but NOT gated` with the thresholds that were not applied |
 
 ### Why the timeout is scaled rather than raised for everyone
@@ -75,6 +76,59 @@ slower *this host* executes any of it.
 30 is the middle of the range `docs/amd64-host.md` predicts, not a measurement — the
 interpreters are being written. It is a `-D` cache variable so it can be corrected once there
 are numbers; what must not happen is that it silently stays at 1.
+
+### What re-arms the hang detector the scale disarmed
+
+Scaling fixed a false positive and bought a false negative with it. At scale 30 the matrix
+runner's budget is 3600s per case, and `compat-soak`'s `HL_MATRIX_CASE_TIMEOUT_MS=600000`
+makes it **five hours**; the CTest `TIMEOUT` becomes 30h per suite. Nothing bounded a genuine
+hang any more — and there was one to bound. The x86-64 futex-across-fork cases
+(`threads/futex-fork-stale-waiter`, `process/{fork-blocked-io,fork-child-futex,shared-key-futex}`)
+were observed on this branch sitting in `do_wait`/`futex_do_wait` indefinitely on the x86-64
+guest, at **zero CPU** and with zero output — measured at 95s of elapsed time with `00:00:00`
+of process time across the whole tree. (That engine defect has since been fixed; the detector
+is for the class, not for those four cases, and the zero-CPU signature is what the class looks
+like.)
+
+No choice of number separates the two, because they differ in kind. An interpreted guest is
+10–50x slower per unit of work; it is not one bit more *idle*. So both matrix runners measure
+progress directly:
+
+> **progress** := the guest's captured stdout/stderr grew, **or** the case's process tree
+> consumed CPU.
+
+Both signals are required. Output alone would kill a correct case that computes for minutes
+before printing (`soak/reallocchurn` does exactly that); CPU alone would kill a correct case
+blocked on a timer. They are only *both* absent when nothing in the launch is running or
+producing anything — which is what a hang is. Neither signal can come from the runner's pipes:
+`tools/remote_supervisor.c` writes a heartbeat byte to stderr every 250ms, so pipe traffic
+proves the supervisor is alive and says nothing about the guest. The tree is walked by parent
+link rather than by process group, because the supervisor deliberately puts the engine in a
+group of its own; anything the host will not answer (a non-Linux host, an unreadable `/proc`)
+reports *unknown*, and unknown counts as progress — missing evidence must never manufacture a
+hang.
+
+The stall budget is **derived, not invented**: it is the *unscaled* per-case budget, with a
+60s floor. Two consequences, both wanted.
+
+* Wherever the scale is 1, the stall budget is ≥ the wall budget, so the wall clock fires
+  first and the detector cannot change a verdict. The aarch64 and Darwin lanes are unaffected
+  **by arithmetic**, not by assertion.
+* A suite that declares it does more work (`compat-soak`'s 600s) gets a proportionally longer
+  stall budget for free. The one knob that means "this suite is big" already means "this suite
+  may legitimately go quiet for longer", so there is no second variable to get wrong.
+
+Why the floor cannot fire on a slow guest: firing requires 60s in which the whole process tree
+burned **zero** CPU ticks and wrote **zero** bytes. The longest deliberate sleep in the corpus
+these runners drive is 10s; the longest `poll`/`epoll_wait` timeout is under 10s; and the
+100s/50s alarms and 100s/1000s timers in `tests/compat/time` are armed and then read back or
+cancelled, never waited on. So the margin is ≥6x — and it is a margin against
+idleness, which is the axis a slower host does not move along. A true hang is now bounded to
+2 minutes per case instead of 5 hours.
+
+What it deliberately does **not** catch: a livelock that burns CPU forever. That is
+indistinguishable from a correct long computation without a semantics for the guest, so it
+stays the wall clock's job — which is why the wall clock is still there.
 
 ### Why the perf thresholds are recorded rather than re-set or skipped
 
@@ -119,9 +173,29 @@ per-case budgets are *not* covered by the scale, because they live in runners ou
 matrix pair and will need the same knob before their lanes can run interpreted:
 `tools/e2e_runner.c`, `tools/config_e2e_runner.c` and `tools/rootfs_e2e_runner.c` (30s, so
 `e2e-oracle`, `production.config-*`, `dynamic-e2e` and the `warm-cache` perf case) and
-`tests/integration/checkpoint_tree_runner.c` (15s, every `checkpoint.*` case). Those lanes are
-absent from `.github/workflows/linux-x86_64.yml` today for a different reason — the engine
-cannot execute a guest there yet — so nothing is currently hidden by it.
+`tests/integration/checkpoint_tree_runner.c` (15s, every `checkpoint.*` case).
+
+### What IS hidden by the lanes absent from `linux-x86_64.yml`
+
+This paragraph previously said those lanes were absent "for a different reason — the engine
+cannot execute a guest there yet — so nothing is currently hidden by it." Both halves are
+false, and the second follows from the first only while the first holds. The engine executes
+guests on this host through the two interpreter backends, and a sweep of all 24 compat
+manifests measures **2632/3013 (case, guest-ISA) runs passing — 87.4%** (aarch64 guest 85.7%,
+x86-64 guest 89.0%).
+
+`linux-x86_64.yml` runs `ctest -L unit`. So **none of those 3013 runs is gated**, and the ~381
+that fail are invisible to CI rather than absent from the tree. That is the real cost of the
+missing shards, and it is what the sentence above used to deny.
+
+What it takes to close it is written where the decision lives (`cmake/CiLanes.cmake`,
+`HL_CI_COMPAT_HOSTS`): the gateable subset is the suites measured green on **both** guest
+ISAs, because `cmake/Phase3Compat.cmake` gives each compat label one CTest case covering both,
+so a suite green on one guest ISA and red on the other is a red lane and not half a green one.
+Declaring the host token is also not a one-line edit — `tools/check_ci_workflows.sh`'s I19
+rejects a second compat host on an OS whose sharded lane list cannot say which host it
+describes, and declaring the token first would switch I20 off and leave that workflow with no
+structural guard at all.
 
 ## Runtime self-skips
 

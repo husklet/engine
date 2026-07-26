@@ -262,6 +262,16 @@ set_tests_properties(production.matrix PROPERTIES LABELS "production" RESOURCE_L
 hl_matrix_timeout_scale(production.matrix)
 
 # test-linux-production-{aarch64-,}full: whole-suite sweeps via linux-matrix.
+#
+# 21 suites per guest ISA, each one process. The runner used to stop at its first
+# failing case, so a lane whose job is to sweep a corpus reported one case per
+# suite and nothing about the other 46; it now records the failure and continues,
+# matching matrix-runner, and its summary names what ran, what failed and what it
+# skipped. The verdict is unchanged -- any failure is still a non-zero exit -- so
+# these lanes are not weakened, only made legible. The budget below still bounds
+# the whole sweep, and the runner's own stall detector (tools/linux_matrix.c)
+# bounds a hung case to a minute rather than to the scaled per-case budget, which
+# is what keeps "continue past failures" from turning one hang into hours.
 set(_full_suites
   abi:tests/compat/abi  abi-corpus:tests/compat/abi/corpus  libc:tests/compat/libc
   completeness:tests/compat/completeness  posix:tests/compat/posix

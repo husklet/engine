@@ -469,6 +469,28 @@ function(hl_matrix_timeout_scale)
   endforeach()
 endfunction()
 
+# --- HL_MATRIX_SCRATCH_DIR is deliberately NOT set here ----------------------
+# matrix-runner maps the guest's /tmp to a per-case scratch directory, and the
+# filesystem beneath it is observable: syscall/memfd-seals and the statx-btime
+# cases need tmpfs. A build tree on ext4 therefore fails them on BOTH ISAs for a
+# reason that is not the engine's, which is misleading on a local `ctest -L
+# compat-syscall`.
+#
+# Setting the variable from here would fix that suite and break others. Some
+# goldens were captured against the build tree's own filesystem, which is why
+# .github/workflows/linux.yml sets the variable per suite and explicitly UNSETS
+# it for compat-core-syscall ("the filesystem the goldens were captured against,
+# where the whole suite is 57/57"). A CTest ENVIRONMENT property also overrides
+# the caller's exported value rather than deferring to it, so a blanket setting
+# here would silently defeat that per-suite choice -- and it would put the
+# variable into every aarch64 lane's generated CTestTestfile.cmake, where the
+# guarantee is that this host-CPU work changes nothing.
+#
+# So the runner reports it instead: tools/matrix_runner.c records the scratch
+# base it used, and on a FAILING run names it and the variable when the base is
+# not tmpfs. Green runs stay silent; a red one says which of its failures are
+# about the filesystem before anyone reads them as engine defects.
+#
 # hl_compat_suite(<label> <bin-subdir> <suite-source-dir> [SERIAL] [LOCKS ...])
 #   Adds `compat.<label>` running the whole suite through matrix-runner, with
 #   LABELS <label> so `ctest -L compat-ipc` selects exactly that suite.

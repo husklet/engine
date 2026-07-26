@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -68,6 +69,120 @@ static int load_timeout_scale(void) {
     return 0;
 }
 
+/*
+ * The stall detector. tools/matrix_runner.c carries the same one, for the same reason and with the same
+ * arithmetic; the two runners drive the same guests and must not disagree about when a case is hung. The
+ * long-form reasoning lives beside stall_timeout_ms() there. In brief:
+ *
+ * Scaling the wall-clock budget stopped slow-but-correct being reported as a hang, and left nothing
+ * bounding a real one -- at scale 30 this runner's budget is 600s per case, and the production-full lanes
+ * are 21 suites of them. Slow and hung differ in kind, not degree: an interpreted guest is 10-50x slower
+ * per unit of work and not one bit more idle. So the detector measures PROGRESS -- the case's stdout grew,
+ * or something in its process tree consumed CPU -- and kills only when both have been absent for the stall
+ * budget.
+ *
+ * That budget is the UNSCALED per-case budget with a floor of STALL_FLOOR_MS, which makes it >= the wall
+ * budget whenever the scale is 1: on an unscaled lane the wall clock always fires first and this code
+ * cannot change a verdict. The floor is 6x the longest deliberate sleep in the whole guest corpus (10s),
+ * and it is a margin against idleness rather than against speed -- the axis a slower host does not move
+ * along.
+ */
+enum { STALL_FLOOR_MS = 60000, STALL_SAMPLE_MS = 1000, STALL_PROCESS_MAX = 4096 };
+
+static uint64_t stall_timeout_ms(void) {
+    uint64_t budget = CASE_TIMEOUT_MS;
+    if (budget < STALL_FLOOR_MS) budget = STALL_FLOOR_MS;
+    return budget >= (uint64_t)CASE_TIMEOUT_MS * timeout_scale ? 0 : budget;
+}
+
+#if defined(__linux__)
+typedef struct process_row {
+    long pid;
+    long parent;
+    unsigned long long ticks;
+    int descends;
+} process_row;
+
+/* User+system clock ticks charged to `root` and its live descendants, or -1 when the host will not say.
+   Descent by parent link rather than by process group: a guest is free to call setpgid, and a process that
+   leaves the group would otherwise look like a process that stopped running. Unknown counts as progress,
+   so missing evidence can never manufacture a hang. */
+static long long tree_cpu_ticks(long root) {
+    static process_row rows[STALL_PROCESS_MAX]; /* Too large for a frame in the per-case wait loop. */
+    DIR *directory = opendir("/proc");
+    struct dirent *entry;
+    size_t count = 0, index;
+    long long total = 0;
+    unsigned pass;
+    if (directory == NULL) return -1;
+    while ((entry = readdir(directory)) != NULL) {
+        char path[64], text[1024], *tail, *end = NULL;
+        int descriptor;
+        ssize_t got;
+        long pid, parent;
+        unsigned long long user_ticks, system_ticks;
+        if (entry->d_name[0] < '1' || entry->d_name[0] > '9') continue;
+        errno = 0;
+        pid = strtol(entry->d_name, &end, 10);
+        if (errno != 0 || end == NULL || *end != 0) continue;
+        if (count == STALL_PROCESS_MAX) {
+            (void)closedir(directory);
+            return -1;
+        }
+        if (snprintf(path, sizeof path, "/proc/%ld/stat", pid) >= (int)sizeof path) continue;
+        descriptor = open(path, O_RDONLY | O_CLOEXEC);
+        if (descriptor < 0) continue;
+        got = read(descriptor, text, sizeof text - 1u);
+        (void)close(descriptor);
+        if (got <= 0) continue;
+        text[got] = 0;
+        /* Field 2 is comm: parenthesised, and free to contain spaces and parentheses. The last ')' is the
+           only correct place to start parsing. */
+        tail = strrchr(text, ')');
+        if (tail == NULL) continue;
+        if (sscanf(tail + 1, " %*c %ld %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &parent, &user_ticks,
+                   &system_ticks) != 3)
+            continue;
+        rows[count].pid = pid;
+        rows[count].parent = parent;
+        rows[count].ticks = user_ticks + system_ticks;
+        rows[count].descends = pid == root;
+        count++;
+    }
+    (void)closedir(directory);
+    for (pass = 0; pass < 32; ++pass) {
+        int changed = 0;
+        for (index = 0; index < count; ++index) {
+            size_t other;
+            if (rows[index].descends) continue;
+            for (other = 0; other < count; ++other)
+                if (rows[other].descends && rows[other].pid == rows[index].parent) {
+                    rows[index].descends = 1;
+                    changed = 1;
+                    break;
+                }
+        }
+        if (!changed) break;
+    }
+    for (index = 0; index < count; ++index)
+        if (rows[index].descends) total += (long long)rows[index].ticks;
+    return total;
+}
+#else
+static long long tree_cpu_ticks(long root) {
+    (void)root;
+    /* No portable per-tree CPU accounting, so the detector stays off rather than running on the output
+       signal alone -- which would make such a host stricter than it is today. */
+    return -1;
+}
+#endif
+
+static uint64_t output_bytes(int descriptor) {
+    struct stat status;
+    if (fstat(descriptor, &status) != 0 || status.st_size < 0) return 0;
+    return (uint64_t)status.st_size;
+}
+
 static uint64_t milliseconds(void) {
     struct timespec value;
     if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0;
@@ -100,11 +215,13 @@ static int same_file(int actual, const char *expected_path) {
 static int run_case(const char *engine, const char *guest, const char *golden, int expected_exit) {
     const struct timespec tick = {0, 10000000};
     const uint64_t budget = (uint64_t)CASE_TIMEOUT_MS * timeout_scale;
+    const uint64_t stall_budget = stall_timeout_ms();
     char temporary[] = "/tmp/hl-linux-matrix-XXXXXX";
     int output = mkstemp(temporary);
-    int status = 0, timed_out = 0;
+    int status = 0, timed_out = 0, stalled = 0;
     pid_t child;
-    uint64_t start;
+    uint64_t start, stall_stamp, stall_sampled, stall_bytes = 0;
+    long long stall_ticks = -1;
     if (output < 0 || unlink(temporary) != 0) {
         perror("matrix output");
         if (output >= 0) close(output);
@@ -125,23 +242,51 @@ static int run_case(const char *engine, const char *guest, const char *golden, i
     }
     (void)setpgid(child, child);
     start = milliseconds();
+    stall_stamp = start;
+    stall_sampled = start;
     for (;;) {
         pid_t result = waitpid(child, &status, WNOHANG);
+        uint64_t now;
         if (result == child) break;
         if (result < 0 && errno != EINTR) {
             perror("waitpid");
             close(output);
             return 1;
         }
-        if (milliseconds() - start >= budget) {
+        now = milliseconds();
+        if (now - start >= budget) {
             timed_out = 1;
             (void)kill(-child, SIGKILL);
             while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
             break;
         }
+        /* Sampled once a second: a /proc walk is cheap but not free, and a stall is measured in tens of
+           seconds. Unknown CPU (ticks < 0) counts as progress. */
+        if (stall_budget != 0 && now - stall_sampled >= STALL_SAMPLE_MS) {
+            uint64_t bytes = output_bytes(output);
+            long long ticks = tree_cpu_ticks((long)child);
+            stall_sampled = now;
+            if (ticks < 0 || bytes != stall_bytes || ticks != stall_ticks) {
+                stall_bytes = bytes;
+                stall_ticks = ticks;
+                stall_stamp = now;
+            } else if (now - stall_stamp >= stall_budget) {
+                stalled = 1;
+                (void)kill(-child, SIGKILL);
+                while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+                break;
+            }
+        }
         (void)nanosleep(&tick, NULL);
     }
-    if (timed_out) {
+    if (stalled)
+        /* A distinct verdict from a timeout, and it must read as one: the case did not run out of time, it
+           stopped doing anything at all while time remained. */
+        fprintf(stderr,
+                "%s: HUNG -- no stdout and no CPU in its process tree for %llums, with the %llums per-case budget "
+                "unexpired (this is a hang, not slow execution)\n",
+                guest, (unsigned long long)stall_budget, (unsigned long long)budget);
+    else if (timed_out) {
         /* Naming the budget matters only when it is not the built-in one; at scale 1 the text stays verbatim so
            an unscaled lane's failure output is unchanged by the existence of the knob. */
         if (timeout_scale == 1)
@@ -182,10 +327,19 @@ static int parse_exit(const char *text, int *value) {
     return 0;
 }
 
+/*
+ * Whole-suite sweep.
+ *
+ * This used to return on the FIRST failing case, unlike tools/matrix_runner.c, which records a failure and
+ * carries on. The production-full-{aarch64,x86_64} lanes are 21 suites each of exactly this runner, so one
+ * broken case anywhere in a suite reduced that suite's entire report to a single line -- and a lane whose
+ * job is to measure a corpus cannot be allowed to stop measuring at the first thing it finds. Nothing
+ * about the VERDICT changes: any failure still exits non-zero. Only the amount of evidence does.
+ */
 static int run_suite(const char *engine, const char *binary_root, const char *suite_root) {
     char manifest[1024], *line = NULL;
     const char *architecture = strrchr(binary_root, '/');
-    size_t capacity = 0, passed = 0, unsupported = 0, excluded = 0;
+    size_t capacity = 0, passed = 0, failed = 0, unsupported = 0, excluded = 0;
     ssize_t length;
     FILE *file;
     architecture = architecture == NULL ? binary_root : architecture + 1;
@@ -235,13 +389,16 @@ static int run_suite(const char *engine, const char *binary_root, const char *su
             memcpy(binary, fields[0], source_size - 2);
             binary[source_size - 2] = 0;
             if (snprintf(guest, sizeof(guest), "%s/%s", binary_root, binary) >= (int)sizeof(guest) ||
-                snprintf(golden, sizeof(golden), "%s/%s", suite_root, fields[4]) >= (int)sizeof(golden) ||
-                run_case(engine, guest, golden, expected_exit) != 0) {
+                snprintf(golden, sizeof(golden), "%s/%s", suite_root, fields[4]) >= (int)sizeof(golden)) {
+                fprintf(stderr, "linux-matrix: path too long for %s\n", fields[0]);
                 free(line);
                 fclose(file);
                 return 1;
             }
-            passed++;
+            if (run_case(engine, guest, golden, expected_exit) != 0)
+                failed++;
+            else
+                passed++;
             continue;
         }
         /* `excluded-macos` is a PER-ENGINE disposition: the case is skipped only on the Mach-O macOS
@@ -292,24 +449,29 @@ static int run_suite(const char *engine, const char *binary_root, const char *su
             fclose(file);
             return 1;
         }
-        if (run_case(engine, guest, golden, expected_exit) != 0) {
-            free(line);
-            fclose(file);
-            return 1;
-        }
-        passed++;
+        if (run_case(engine, guest, golden, expected_exit) != 0)
+            failed++;
+        else
+            passed++;
     }
     free(line);
     if (fclose(file) != 0) return 1;
-    printf("linux-matrix: %zu active %s cases passed; %zu require typed launch; %zu excluded or other ISA\n", passed,
-           architecture, unsupported, excluded);
+    /* The summary reports what RAN, what FAILED and what was skipped, in one line. It previously named
+       only the pass count, which was accurate solely because the first failure ended the run -- so a
+       reader could not tell a 47-case suite that passed from one that stopped at case 12, and the skip
+       counts sat beside a pass count they were not proportional to. */
+    printf("linux-matrix: %s: %zu of %zu active %s cases passed, %zu FAILED; %zu skipped (%zu require typed launch, "
+           "%zu excluded or other ISA)\n",
+           suite_root, passed, passed + failed, architecture, failed, unsupported + excluded, unsupported, excluded);
     /* The summary line is what a reader takes away, and on a scaled host the same case count does not mean what
        it means on an unscaled one. */
     if (timeout_scale != 1)
         printf("linux-matrix: per-case timeout was scaled x%lu; this run's timing is not comparable to an "
                "unscaled lane\n",
                timeout_scale);
-    return passed == 0;
+    /* `passed == 0` is retained as a failure: a suite that selected nothing at all is a registration bug,
+       and it looked identical to a clean sweep before anything counted the cases it did not run. */
+    return failed != 0 || passed == 0;
 }
 
 int main(int argc, char **argv) {

@@ -40,10 +40,57 @@ set(HL_CI_HOSTS
 )
 
 # Host tokens whose workflow shards the compat matrix, i.e. the hosts that run
-# guests. This is a capability statement, not a scheduling one: `Linux-x86_64`
-# is absent because the engine cannot yet EXECUTE guests on an x86_64 host --
-# the host code generator / interpreter backends are unwritten -- so a compat
-# shard there would fail every case rather than measure anything.
+# guests.
+#
+# `Linux-x86_64` is absent, and the reason it used to give -- "the engine cannot
+# yet EXECUTE guests on an x86_64 host ... so a compat shard there would fail
+# every case rather than measure anything" -- is now FALSE, and load-bearingly
+# so: it is why .github/workflows/linux-x86_64.yml runs `ctest -L unit` alone,
+# and therefore why not one of this host's ~3000 corpus runs is gated by CI.
+# Both interpreter backends execute guests. A sweep of all 24 compat manifests
+# on this host measures 2632/3013 (case, guest-ISA) runs passing -- 87.4%
+# overall, 85.7% on the aarch64 guest, 89.0% on the x86-64 guest.
+#
+# What keeps the token out now is 87.4%, not 0%. A shard here must be a GATE,
+# and a gate that is red says nothing that a measurement does not say better.
+# The unit of gating is the LABEL, and cmake/Phase3Compat.cmake gives each label
+# ONE CTest case covering both guest ISAs -- so "green on the x86-64 guest"
+# (`compat-ipc`, `compat-signals`) is not half a green lane, it is a red one.
+# The gateable subset is therefore the suites green on BOTH guest ISAs.
+#
+# Measured on this host with the corrected runner (per-ISA counts are only
+# obtainable since it stopped skipping the second leg):
+#
+#   compat-syscall-edges  aarch64 52/52, x86_64 52/52, 52 cross-ISA identical
+#                         -> GATE THIS FIRST. It is also the cheapest lane in
+#                            the matrix, so it costs a runner almost nothing.
+#   compat-time           aarch64 39/39, x86_64 39/39, 39 identical -> green,
+#                         but deliberately NOT in the first shard: its cases are
+#                         timerfd/itimer/clock-skew assertions, the classic
+#                         source of runner-only flake, and 30x interpretation on
+#                         a 2-vCPU hosted runner is not the machine they were
+#                         measured on. Add it once it has been observed green
+#                         there, not before.
+#   compat-core-regress   aarch64 11/11 but x86_64 9/10 (`nonpie-v8blob`)
+#                         -> NOT gateable, and a good example of why a per-ISA
+#                            number had to exist before any of this could be
+#                            argued.
+#
+# Everything else is unmeasured here or known red on at least one guest ISA, and
+# stays out. `compat-isa-x86-64` in particular cannot be gated on ANY x86_64
+# host: docs/amd64-host-findings.md section 3.9 shows its golden disagrees with
+# real x86-64 hardware on 107 lines, so it is unreachable by construction until
+# the golden is regenerated.
+#
+# Adding that subset is not one edit here. Every list below is keyed by host OS,
+# and tools/check_ci_workflows.sh's I19 refuses a second compat host on an OS
+# whose sharded list cannot say which of the two it describes ("HL_CI_COMPAT_
+# HOSTS must name exactly one Linux host while HL_CI_SHARDED_LINUX is keyed by
+# OS"). So the work is: split HL_CI_SHARDED_LINUX into per-host-CPU lists, teach
+# I19/I20 to read them, then declare the token and shard the green subset. Doing
+# it in the other order -- declaring the token first -- turns I20 off (it only
+# applies to a host absent from this list) and leaves the x86_64 workflow with
+# NO structural guard at all, which is strictly worse than today.
 #
 # Consumed by tools/check_ci_workflows.sh: I19 requires cross-host parity only
 # between the hosts named here, and I20 requires a host NOT named here to shard
