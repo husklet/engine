@@ -532,6 +532,11 @@ compat-threads           compat-time
 compat-soak
 ```
 
+The matrix runner maps the guest's `/tmp` to a per-case scratch directory taken from the build tree. A few cases
+(`memfd-seals`, and anything asserting statx btime) require that scratch to be tmpfs-backed. When the build tree
+lives on a disk filesystem, point the runner at a tmpfs: `export HL_MATRIX_SCRATCH_DIR=/dev/shm`. CI mounts a tmpfs
+at `/mnt/hl-scratch` for exactly this reason (`.github/workflows/linux.yml`).
+
 The behavioral gate is six independent subgates, aggregated by `e2e-mac-gates`:
 `e2e-lifecycle-signal`, `e2e-lifecycle-control`, `e2e-lifecycle-hygiene`, `e2e-embedding-fd`,
 `e2e-embedding-stdio`, `e2e-embedding-dir`. Run each with its own timeout. The compatibility matrix is separate:
