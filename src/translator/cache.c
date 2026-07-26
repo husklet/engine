@@ -675,6 +675,13 @@ typedef struct {
    16-byte alignment the atomic ldp/stp entry access requires. */
 #define IBTC_PAGE_ALIGN 65536u
 _Alignas(IBTC_PAGE_ALIGN) static ibtc_ent g_ibtc[IBTC_N];
+/* Both publish paths in ibtc_publish() depend on this, and only one of them says so loudly if it breaks:
+   AArch64's stp is single-copy atomic only within a 16-byte granule, and x86-64's movdqa #GP-faults on a
+   misaligned operand. A member added to ibtc_ent would grow the entry past the granule and silently
+   reintroduce the torn-dispatch hazard on the AArch64 side, which is the host every lane currently tests.
+   Assert the size here rather than leaving the alignment argument resting on a comment. */
+_Static_assert(sizeof(ibtc_ent) == 16, "ibtc_ent must be one 16-byte granule for the atomic pair publish");
+_Static_assert(IBTC_PAGE_ALIGN % 16u == 0u, "the ibtc table's alignment must keep every entry 16-byte aligned");
 
 /* Wholesale-invalidate the inline-branch cache.  In a fork child the table is
    COW-inherited fully populated, so a memset first faults in every page (~190us
