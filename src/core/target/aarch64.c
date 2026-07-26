@@ -102,7 +102,9 @@ static void filemap_refresh_emulated(uint64_t lo, uint64_t hi);
 
 // The translator may not link the Linux ABI (DOCS.md 3), so the engine hands it the ledger lookup the
 // instruction fetch needs. The data/non-PIE entries are x86-only; an aarch64 guest never uses them.
-static const hl_guest_memory_ops g_guest_memory_ops = {hl_logical_vma_resolve_exec, NULL, NULL, NULL, NULL};
+static const hl_guest_memory_ops g_guest_memory_ops = {
+    hl_logical_vma_resolve_exec,          NULL, NULL, NULL, NULL, hl_logical_vma_resolve_exec_span,
+    hl_logical_vma_global_exec_generation};
 
 static const hl_host_services *effective_host_services(void) {
     return hl_target_services_effective(&g_target_services);

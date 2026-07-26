@@ -216,9 +216,10 @@ static int jit86_guest_memory_write(uint64_t guest, const void *source, size_t l
     return 1;
 }
 
-static const hl_guest_memory_ops g_guest_memory_ops = {hl_logical_vma_resolve_exec, jit86_guest_memory_read,
-                                                       jit86_guest_memory_write, hl_logical_vma_global_active,
-                                                       hl_x86_guest_pointer};
+static const hl_guest_memory_ops g_guest_memory_ops = {
+    hl_logical_vma_resolve_exec,          jit86_guest_memory_read, jit86_guest_memory_write,
+    hl_logical_vma_global_active,         hl_x86_guest_pointer,    hl_logical_vma_resolve_exec_span,
+    hl_logical_vma_global_exec_generation};
 
 // Host-CPU fork: an AArch64 host takes the x86-64 -> ARM64 translator below (register model at the top of
 // this file); any other takes interp.c, which decodes x86-64 directly. Both share struct cpu: it is the

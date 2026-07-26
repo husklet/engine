@@ -103,6 +103,10 @@ static void publish_locked(hl_logical_vma_ledger *ledger, hl_logical_vma_snapsho
     }
     qsort(snapshot->views, snapshot->count, sizeof(*snapshot->views), view_compare);
     hl_logical_vma_snapshot *old = atomic_exchange_explicit(&ledger->current, snapshot, memory_order_acq_rel);
+    /* Bump AFTER the exchange: a reader samples the generation first, so this
+       order lets it see a stale snapshot with a stale generation (harmless --
+       it refills) but never a stale snapshot with a fresh one. */
+    atomic_fetch_add_explicit(&ledger->generation, 1, memory_order_release);
     if (old != NULL) {
         old->next = ledger->retired;
         ledger->retired = old;
@@ -155,6 +159,7 @@ int hl_logical_vma_init(hl_logical_vma_ledger *ledger) {
     }
     *ledger = (hl_logical_vma_ledger){0};
     atomic_init(&ledger->current, NULL);
+    atomic_init(&ledger->generation, 1);
     return pthread_mutex_init(&ledger->lock, NULL);
 }
 
@@ -164,6 +169,7 @@ void hl_logical_vma_destroy(hl_logical_vma_ledger *ledger) {
     while (ledger->count != 0)
         backing_put(ledger->entries[--ledger->count].backing);
     hl_logical_vma_snapshot *snapshot = atomic_exchange_explicit(&ledger->current, NULL, memory_order_acq_rel);
+    atomic_fetch_add_explicit(&ledger->generation, 1, memory_order_release);
     snapshot_free(snapshot);
     while (ledger->retired != NULL) {
         snapshot = ledger->retired;
@@ -368,6 +374,7 @@ void hl_logical_vma_commit_shared(hl_logical_vma_plan *plan) {
 
     hl_logical_vma_snapshot *next = atomic_exchange_explicit(&plan->staged.current, NULL, memory_order_acq_rel);
     hl_logical_vma_snapshot *old = atomic_exchange_explicit(&live->current, next, memory_order_acq_rel);
+    atomic_fetch_add_explicit(&live->generation, 1, memory_order_release); /* publish_locked's rule, applied here */
     if (old != NULL) {
         old->next = live->retired;
         live->retired = old;
@@ -648,6 +655,49 @@ int hl_logical_vma_resolve_exec(uint64_t guest, size_t length, const void **host
         *contiguous = resolution.contiguous;
     }
     return result;
+}
+
+int hl_logical_vma_resolve_exec_span(uint64_t guest, uint64_t *generation, uint64_t *first, uint64_t *last,
+                                     uint64_t *delta) {
+    (void)pthread_once(&g_logical_vmas_once, global_init);
+    if (generation == NULL || first == NULL || last == NULL || delta == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    *generation = atomic_load_explicit(&g_logical_vmas.generation, memory_order_acquire);
+    hl_logical_vma_snapshot *snapshot = atomic_load_explicit(&g_logical_vmas.current, memory_order_acquire);
+    size_t count = snapshot != NULL ? snapshot->count : 0;
+    size_t low = 0, high = count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        const hl_logical_vma_view *candidate = &snapshot->views[middle];
+        if (guest < candidate->guest_first)
+            high = middle;
+        else if (guest >= candidate->guest_last)
+            low = middle + 1;
+        else {
+            if ((candidate->protection & HL_LOGICAL_VMA_EXEC) == 0) {
+                errno = EACCES;
+                return -1;
+            }
+            *first = candidate->guest_first;
+            *last = candidate->guest_last;
+            *delta = candidate->host_delta;
+            return 1;
+        }
+    }
+    /* Miss: views are sorted and disjoint, so `low` is the first view past
+       `guest` and low-1 the last one before it.  The gap between them is
+       ordinary for its whole width. */
+    *first = low != 0 ? snapshot->views[low - 1].guest_last : 0;
+    *last = low != count ? snapshot->views[low].guest_first : UINT64_MAX;
+    *delta = 0;
+    return 0;
+}
+
+const _Atomic uint64_t *hl_logical_vma_global_exec_generation(void) {
+    (void)pthread_once(&g_logical_vmas_once, global_init);
+    return &g_logical_vmas.generation;
 }
 
 int hl_logical_vma_resolve_data(uint64_t guest, size_t length, uint32_t required, void **host, size_t *contiguous) {

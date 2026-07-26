@@ -29,7 +29,12 @@ static int direct_fetch_valid(uint64_t address, size_t length) {
 }
 
 // What core/target/*.c binds; the translator itself never names the ledger.
-static const hl_guest_memory_ops g_ledger_ops = {hl_logical_vma_resolve_exec, NULL, NULL, NULL, NULL};
+static const hl_guest_memory_ops g_ledger_ops = {
+    hl_logical_vma_resolve_exec,          NULL, NULL, NULL, NULL, hl_logical_vma_resolve_exec_span,
+    hl_logical_vma_global_exec_generation};
+
+// The same table without the span seam: the memo must stay off, not guess.
+static const hl_guest_memory_ops g_unmemoised_ops = {hl_logical_vma_resolve_exec, NULL, NULL, NULL, NULL, NULL, NULL};
 
 int main(void) {
     int descriptor = scratch_fd();
@@ -84,6 +89,45 @@ int main(void) {
        according to the target's authoritative direct-range validator. */
     g_direct_enabled = 0;
     HL_CHECK(hl_guest_fetch_exec(guest + 4094, fetched, 3) == -1);
+
+    g_direct_enabled = 1;
+
+    /* The fetch path memoises a mapping, never bytes: rewriting the backing
+       store under a cached mapping shows through on the very next fetch. */
+    unsigned char rewritten[15];
+    for (size_t index = 0; index < sizeof rewritten; ++index)
+        rewritten[index] = (unsigned char)(index * 53u + 11u);
+    HL_CHECK(hl_guest_fetch_exec(guest, fetched, sizeof rewritten) == 0);
+    HL_CHECK(memcmp(fetched, source, sizeof rewritten) == 0);
+    HL_CHECK(pwrite(descriptor, rewritten, sizeof rewritten, 4096) == (ssize_t)sizeof rewritten);
+    HL_CHECK(hl_guest_fetch_exec(guest, fetched, sizeof rewritten) == 0);
+    HL_CHECK(memcmp(fetched, rewritten, sizeof rewritten) == 0);
+
+    /* Every mapping transition must retire the cached resolution. Dropping
+       EXEC... */
+    HL_CHECK(hl_logical_vma_global_protect(guest, 4096, HL_LOGICAL_VMA_READ) == 0);
+    hl_logical_vma_global_reclaim_quiescent();
+    HL_CHECK(hl_guest_fetch_exec(guest, fetched, sizeof rewritten) == -1);
+
+    /* ...removing the VMA, which re-exposes the direct page beneath it... */
+    HL_CHECK(hl_logical_vma_global_unmap(guest, 4096) == 0);
+    hl_logical_vma_global_reclaim_quiescent();
+    HL_CHECK(hl_guest_fetch_exec(guest, fetched, sizeof rewritten) == 0);
+    HL_CHECK(memcmp(fetched, direct + 4096, sizeof rewritten) == 0);
+
+    /* ...and the dangerous edge: a cached "ordinary" answer must not survive a
+       mapping appearing inside the hole it described. */
+    HL_CHECK(hl_logical_vma_global_map_shared(guest, 4096, HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_EXEC, descriptor, 4096,
+                                              16384) == 0);
+    hl_logical_vma_global_reclaim_quiescent();
+    HL_CHECK(hl_guest_fetch_exec(guest, fetched, sizeof rewritten) == 0);
+    HL_CHECK(memcmp(fetched, rewritten, sizeof rewritten) == 0);
+
+    /* An ops table without the span seam resolves every fetch, as before. */
+    hl_guest_memory_bind(&g_unmemoised_ops);
+    HL_CHECK(hl_guest_fetch_exec(guest, fetched, sizeof rewritten) == 0);
+    HL_CHECK(memcmp(fetched, rewritten, sizeof rewritten) == 0);
+    HL_CHECK(hl_guest_fetch_exec(guest + 4094, fetched, 4) == 0);
 
     hl_logical_vma_global_reset_quiescent();
     hl_guest_fetch_set_direct_validator(NULL);
