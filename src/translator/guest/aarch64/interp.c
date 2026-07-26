@@ -458,6 +458,25 @@ static uint64_t interp_ror64(uint64_t value, unsigned amount) {
     return amount ? ((value >> amount) | (value << (64 - amount))) : value;
 }
 
+// CRC32/CRC32C, in the REFLECTED form the architecture defines. ARM spells it as bit-reversing the operands,
+// doing a polynomial division by the generator, and bit-reversing the result; that is algebraically identical to
+// the ordinary table-free reflected CRC loop below, which is also what the zlib and ACLE `__crc32*` spellings
+// compute -- so a guest that checksums with these and compares against its own software CRC agrees. The two
+// constants are the reflections of 0x04C11DB7 (CRC-32) and 0x1EDC6F41 (CRC-32C, Castagnoli).
+//
+// The data operand is consumed LOW BYTE FIRST, which is what makes CRC32X equal to two CRC32W steps over the
+// same little-endian bytes. An implementation that fed it high byte first would produce plausible-looking
+// checksums that never match anything, with no other symptom.
+static uint64_t interp_crc32(uint32_t accumulator, uint64_t data, unsigned bytes, int castagnoli) {
+    uint32_t polynomial = castagnoli ? 0x82F63B78u : 0xEDB88320u;
+    for (unsigned index = 0; index < bytes; index++) {
+        accumulator ^= (uint32_t)((data >> (8u * index)) & 0xFFu);
+        for (unsigned bit = 0; bit < 8u; bit++)
+            accumulator = (accumulator >> 1) ^ (polynomial & (uint32_t)(-(int32_t)(accumulator & 1u)));
+    }
+    return (uint64_t)accumulator;
+}
+
 static uint32_t interp_ror32(uint32_t value, unsigned amount) {
     amount &= 31;
     return amount ? ((value >> amount) | (value << (32 - amount))) : value;
@@ -1011,6 +1030,9 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
         case 9: result = interp_shift_operand(a, 1, (unsigned)(b & (sf ? 63u : 31u)), sf); break; // LSRV
         case 10: result = interp_shift_operand(a, 2, (unsigned)(b & (sf ? 63u : 31u)), sf); break; // ASRV
         case 11: result = interp_shift_operand(a, 3, (unsigned)(b & (sf ? 63u : 31u)), sf); break; // RORV
+        // CRC32B/H/W/X (opcode 10000..10011) and CRC32CB/H/W/X (10100..10111). The accumulator and result are
+        // always 32-bit; sf selects only whether the DATA operand is a W or an X register, which is why sf must
+        // be 1 for exactly the ..X forms and 0 for the others.
         case 16:
         case 17:
         case 18:
@@ -1018,8 +1040,17 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
         case 20:
         case 21:
         case 22:
-        case 23:
-            return interp_undefined(cpu, insn, "data-processing register -- CRC32/CRC32C");
+        case 23: {
+            unsigned data_bytes = 1u << (opcode & 3u);
+            if ((data_bytes == 8) != (sf != 0))
+                return interp_undefined(cpu, insn, "data-processing register -- CRC32 size/sf mismatch");
+            result = interp_crc32((uint32_t)a, b, data_bytes, (opcode & 4u) != 0);
+            // The result is a 32-bit value in a W register whatever sf said, so it cannot go through the
+            // sf-selected write below.
+            interp_set_gpr32(cpu, rd, (uint32_t)result);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
         default: return interp_undefined(cpu, insn, "data-processing register -- unallocated 2-source opcode");
         }
         if (sf)
@@ -1415,9 +1446,20 @@ static int interp_advsimd_expand_imm(unsigned op, unsigned cmode, unsigned o2, u
     } else if (selector == 6) { // 32-bit element with a "moving ones" low field (MSL)
         uint32_t narrow = low ? (uint32_t)((imm8 << 16) | 0xFFFFu) : (uint32_t)((imm8 << 8) | 0xFFu);
         imm64 = ((uint64_t)narrow << 32) | narrow;
-    } else if (!low) { // 8-bit element replicated across all 8 bytes
+    } else if (!low && !op) { // 8-bit element replicated across all 8 bytes: MOVI Vd.8B/16B, #imm8
         if (o2) return 0;
         imm64 = imm8 * UINT64_C(0x0101010101010101);
+    } else if (!low) {
+        // cmode == 1110 with op == 1: MOVI Dd, #imm / MOVI Vd.2D, #imm, where each BIT of imm8 expands to a
+        // whole BYTE of the 64-bit element -- imm8<0> becomes the LOWEST byte and imm8<7> the highest. This is
+        // how a lane mask is materialised in one instruction, so `movi v0.2d, #0xffffffff` (imm8 == 0x0f) means
+        // 0x00000000ffffffff and NOT the byte-replicated 0x0f0f0f0f0f0f0f0f the op == 0 spelling above gives.
+        // Sharing that arm was a silent wrong-answer bug: -O2 emits this form for the clamp mask in any
+        // vectorised saturating add, so the mask compared as ~1.08e18 instead of 2^32-1 and never fired.
+        if (o2) return 0;
+        imm64 = 0;
+        for (unsigned byte = 0; byte < 8u; byte++)
+            if ((imm8 >> byte) & 1u) imm64 |= UINT64_C(0xFF) << (8u * byte);
     } else if (!op) { // single-precision float expansion, replicated
         uint32_t sign = (uint32_t)((imm8 >> 7) & 1), exponent = (uint32_t)((imm8 >> 4) & 7);
         uint32_t fraction = (uint32_t)(imm8 & 0xFu);
@@ -1552,51 +1594,85 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
     // Q here is the AdvSIMD structure forms' vector-length bit; the scalar addressing modes below do not use it.
     unsigned q = (insn >> 30) & 1;
 
-    // ---- AdvSIMD load/store multiple structures: LD1/ST1 (and the LD2/LD3/LD4 de-interleaving forms) ----
+    // ---- AdvSIMD load/store multiple structures: LD1/ST1 and the de-interleaving LD2/LD3/LD4, ST2/ST3/ST4 ----
     // A different top-level encoding from the scalar loads, which is why it is tested here explicitly rather
-    // than falling out of the size/opc decode below. Only the CONTIGUOUS forms (LD1/ST1, opcode 0b0111 for one
-    // register and 0b1010/0b0110/0b0010 for two/three/four) are implemented: they are what memcpy and the
-    // string routines use, and the de-interleaving LD2/LD3/LD4 forms are a separate shuffle problem.
-    if ((insn & 0xBFBF0000u) == 0x0C000000u || (insn & 0xBFA00000u) == 0x0C800000u) {
-        unsigned load = (insn >> 22) & 1u, opcode = (insn >> 12) & 0xFu, size = (insn >> 10) & 3u;
+    // than falling out of the size/opc decode below.
+    //   0 Q 0011 000 L 000000 opcode size Rn Rt   (no offset)
+    //   0 Q 0011 001 L 0 Rm   opcode size Rn Rt   (post-index; Rm == 11111 selects the implicit immediate)
+    // `opcode` names both the number of registers and whether they INTERLEAVE. The distinction is the whole
+    // point of the group: LD1 with four registers is four consecutive full-register loads, while LD4 walks
+    // memory one element at a time round-robin across the four registers -- the de-interleaving array-of-structs
+    // load that a vectorising compiler emits and that cannot be expressed as "copy N bytes into a register".
+    if ((insn & 0xBF200000u) == 0x0C000000u) {
+        unsigned load = (insn >> 22) & 1u, opcode = (insn >> 12) & 0xFu, esize_code = (insn >> 10) & 3u;
         int post_index = (insn & 0x00800000u) != 0;
-        unsigned registers;
+        unsigned registers, interleaved = 1;
         switch (opcode) {
-        case 0x7: registers = 1; break; // LD1/ST1, one register
-        case 0xA: registers = 2; break; // LD1/ST1, two registers
-        case 0x6: registers = 3; break; // LD1/ST1, three registers
-        case 0x2: registers = 4; break; // LD1/ST1, four registers
-        default:
-            return interp_undefined(cpu, insn,
-                                    "AdvSIMD load/store -- de-interleaving multi-structure form (LD2/LD3/LD4)");
+        case 0x0: registers = 4; break;                    // LD4/ST4
+        case 0x2: registers = 4; interleaved = 0; break;    // LD1/ST1, four registers
+        case 0x4: registers = 3; break;                    // LD3/ST3
+        case 0x6: registers = 3; interleaved = 0; break;    // LD1/ST1, three registers
+        case 0x7: registers = 1; interleaved = 0; break;    // LD1/ST1, one register
+        case 0x8: registers = 2; break;                    // LD2/ST2
+        case 0xA: registers = 2; interleaved = 0; break;    // LD1/ST1, two registers
+        default: return interp_undefined(cpu, insn, "AdvSIMD load/store -- unallocated multi-structure opcode");
         }
         unsigned bytes = q ? 16u : 8u;
         uint64_t base = interp_gpr_sp(cpu, rn);
         uint64_t address = base;
-        for (unsigned index = 0; index < registers; index++) {
-            int reg = (rt + (int)index) % 32; // the register list wraps at V31
-            if (load) {
-                interp_vec value;
-                memset(value.byte, 0, sizeof value.byte);
-                for (unsigned offset = 0; offset < bytes; offset += 8) {
-                    uint64_t chunk = interp_load_bits(address + offset, 8);
-                    memcpy(value.byte + offset, &chunk, 8);
+        // The 1D arrangement (size == 11, Q == 0) exists only for the one-register LD1/ST1 form; a
+        // multi-register form needs a whole 128-bit vector per register when the element is 64 bits wide.
+        if (esize_code == 3 && !q && registers > 1)
+            return interp_undefined(cpu, insn, "AdvSIMD load/store -- 1D arrangement with several registers");
+        if (interleaved) {
+            unsigned lanes = interp_vec_lanes(esize_code, q), element_bytes = 1u << esize_code;
+            for (unsigned lane = 0; lane < lanes; lane++)
+                for (unsigned index = 0; index < registers; index++) {
+                    int reg = (rt + (int)index) % 32; // the register list wraps at V31
+                    if (load) {
+                        uint64_t element = interp_load_bits(address, element_bytes);
+                        // Read-modify-write one lane at a time, but the FIRST lane of each register starts from
+                        // zero rather than from the register's old contents: the lanes this instruction does not
+                        // write (all of bits [127:64] in a Q == 0 form) must end up zero, not stale.
+                        interp_vec value;
+                        if (lane == 0)
+                            memset(value.byte, 0, sizeof value.byte);
+                        else
+                            value = interp_vec_read(cpu, reg);
+                        interp_vec_set_element(&value, esize_code, lane, element);
+                        interp_vec_write(cpu, reg, value, 1);
+                    } else {
+                        interp_vec value = interp_vec_read(cpu, reg);
+                        interp_store_bits(address, interp_vec_element(&value, esize_code, lane), element_bytes);
+                    }
+                    address += element_bytes;
                 }
-                interp_vec_write(cpu, reg, value, q);
-            } else {
-                interp_vec value = interp_vec_read(cpu, reg);
-                for (unsigned offset = 0; offset < bytes; offset += 8) {
-                    uint64_t chunk;
-                    memcpy(&chunk, value.byte + offset, 8);
-                    interp_store_bits(address + offset, chunk, 8);
+        } else {
+            for (unsigned index = 0; index < registers; index++) {
+                int reg = (rt + (int)index) % 32;
+                if (load) {
+                    interp_vec value;
+                    memset(value.byte, 0, sizeof value.byte);
+                    for (unsigned offset = 0; offset < bytes; offset += 8) {
+                        uint64_t chunk = interp_load_bits(address + offset, 8);
+                        memcpy(value.byte + offset, &chunk, 8);
+                    }
+                    interp_vec_write(cpu, reg, value, q);
+                } else {
+                    interp_vec value = interp_vec_read(cpu, reg);
+                    for (unsigned offset = 0; offset < bytes; offset += 8) {
+                        uint64_t chunk;
+                        memcpy(&chunk, value.byte + offset, 8);
+                        interp_store_bits(address + offset, chunk, 8);
+                    }
                 }
+                address += bytes;
             }
-            address += bytes;
         }
-        (void)size;
         if (post_index) {
             // Rm == 31 means the immediate form, whose increment is the whole transfer size; otherwise the
-            // increment is the register Rm.
+            // increment is the register Rm. Committed AFTER every access, so an abandoned access leaves the
+            // base register naming exactly what the guest's own fault handler expects.
             uint64_t increment = rm == 31 ? (uint64_t)registers * bytes : interp_gpr(cpu, rm);
             interp_set_gpr_sp(cpu, rn, base + increment);
         }
@@ -2875,8 +2951,13 @@ static uint64_t interp_fp_from_int(unsigned fmt, uint64_t value, unsigned source
     } else {
         magnitude = source_bits == 32 ? (uint64_t)(uint32_t)value : value;
     }
+    // Two statements, deliberately: passing interp_fp_pack(...) and `raised` as two arguments of one call
+    // leaves their evaluation order unspecified, and the compiler is free to read `raised` BEFORE the pack that
+    // fills it in -- which silently drops every Inexact/Overflow/Underflow this conversion raises. (Found by
+    // the FPSR probe: UCVTF of UINT64_MAX rounds up to 2^64 and must report Inexact, and reported nothing.)
     unsigned raised = 0;
-    return interp_fp_postprocess(fmt, interp_fp_pack(sign, magnitude, -(int)fbits, fmt, rmode, &raised), raised);
+    uint64_t packed = interp_fp_pack(sign, magnitude, -(int)fbits, fmt, rmode, &raised);
+    return interp_fp_postprocess(fmt, packed, raised);
 }
 
 // VFPExpandImm: the 8-bit FMOV-immediate encoding. One sign bit, then an exponent built as NOT(b) followed by
@@ -2892,6 +2973,114 @@ static uint64_t interp_fp_expand_imm(unsigned fmt, uint64_t imm8) {
         exponent |= (((UINT64_C(1) << (exp_bits - 3u)) - 1u) << 2);
     exponent |= (imm8 >> 4) & 3u;
     return (sign << (interp_fp_width(fmt) - 1u)) | (exponent << mant) | ((imm8 & 0xFu) << (mant - 4u));
+}
+
+// ---------------------------------------------------------------------------
+// Integer saturation, for the AdvSIMD saturating group.
+// ---------------------------------------------------------------------------
+// FPSR.QC is CUMULATIVE and sticky exactly like the IEEE exception bits: any saturating instruction whose
+// result was clamped sets it, nothing clears it but MSR FPSR, so a guest checks it once after a whole run of
+// them. It is not an IEEE exception and no FP operation touches it.
+
+// SQADD / SQSUB on one element. The 64-bit element form is real, so the wide case cannot be computed in a
+// wider signed type; it uses overflow detection instead, and the clamp direction follows from the WRAPPED
+// sign (a sum that wrapped positive was really too negative, and vice versa).
+static uint64_t interp_sqadd_element(uint64_t a, uint64_t b, unsigned size, int subtract) {
+    unsigned esize = 8u << size;
+    int64_t x = (int64_t)interp_element_sext(a, size), y = (int64_t)interp_element_sext(b, size);
+    if (esize < 64) {
+        int64_t result = subtract ? x - y : x + y;
+        int64_t max = (int64_t)((UINT64_C(1) << (esize - 1u)) - 1u), min = -max - 1;
+        if (result > max) {
+            interp_fpsr_raise(INTERP_FPSR_QC);
+            result = max;
+        } else if (result < min) {
+            interp_fpsr_raise(INTERP_FPSR_QC);
+            result = min;
+        }
+        return (uint64_t)result & interp_element_mask(size);
+    }
+    int64_t result;
+    int overflow = subtract ? __builtin_sub_overflow(x, y, &result) : __builtin_add_overflow(x, y, &result);
+    if (overflow) {
+        interp_fpsr_raise(INTERP_FPSR_QC);
+        result = result < 0 ? INT64_MAX : INT64_MIN;
+    }
+    return (uint64_t)result;
+}
+
+static uint64_t interp_uqadd_element(uint64_t a, uint64_t b, unsigned size, int subtract) {
+    uint64_t mask = interp_element_mask(size);
+    a &= mask;
+    b &= mask;
+    if (subtract) {
+        if (a < b) {
+            interp_fpsr_raise(INTERP_FPSR_QC);
+            return 0;
+        }
+        return a - b;
+    }
+    uint64_t sum;
+    // A 64-bit element can carry out of the type itself, so the carry is tested as well as the mask.
+    if (__builtin_add_overflow(a, b, &sum) || sum > mask) {
+        interp_fpsr_raise(INTERP_FPSR_QC);
+        return mask;
+    }
+    return sum;
+}
+
+// The saturating NARROWING conversions. `size` is the DESTINATION element width and the source element is
+// twice that, so the source is at most 64 bits and the destination at most 32 -- which is why this needs no
+// 64-bit edge case even though SQADD above does. Three combinations exist and they are genuinely different:
+// SQXTN is signed->signed, UQXTN unsigned->unsigned, and SQXTUN signed->UNSIGNED (a negative source saturates
+// to zero rather than to the most negative value).
+static uint64_t interp_sat_narrow(uint64_t element, unsigned size, int source_signed, int dest_signed) {
+    unsigned esize = 8u << size;
+    uint64_t mask = interp_element_mask(size);
+    if (source_signed) {
+        int64_t value = (int64_t)interp_element_sext(element, size + 1u);
+        if (dest_signed) {
+            int64_t max = (int64_t)((UINT64_C(1) << (esize - 1u)) - 1u), min = -max - 1;
+            if (value > max) {
+                interp_fpsr_raise(INTERP_FPSR_QC);
+                value = max;
+            } else if (value < min) {
+                interp_fpsr_raise(INTERP_FPSR_QC);
+                value = min;
+            }
+            return (uint64_t)value & mask;
+        }
+        if (value < 0) {
+            interp_fpsr_raise(INTERP_FPSR_QC);
+            return 0;
+        }
+        if ((uint64_t)value > mask) {
+            interp_fpsr_raise(INTERP_FPSR_QC);
+            return mask;
+        }
+        return (uint64_t)value;
+    }
+    uint64_t value = element & interp_element_mask(size + 1u);
+    if (value > mask) {
+        interp_fpsr_raise(INTERP_FPSR_QC);
+        return mask;
+    }
+    return value;
+}
+
+// Polynomial (carry-less) multiply of two `bits`-wide operands, low 64 bits of the product in *low and the
+// high 64 in *high. PMUL keeps only the low half of an 8x8 product; PMULL keeps the whole 16-bit or, in the
+// 64x64 form the crypto and CRC code uses, the whole 128-bit one.
+static void interp_poly_mul(uint64_t a, uint64_t b, unsigned bits, uint64_t *low, uint64_t *high) {
+    uint64_t result_low = 0, result_high = 0;
+    for (unsigned bit = 0; bit < bits; bit++) {
+        if (!((b >> bit) & 1u)) continue;
+        // A shift by 0 must not become a shift of the high word by 64, which is undefined in C.
+        result_low ^= a << bit;
+        if (bit) result_high ^= a >> (64u - bit);
+    }
+    *low = result_low;
+    *high = result_high;
 }
 
 // Read/write the low element of a vector register as a scalar of `fmt`. A scalar FP write ZEROES bits
@@ -3227,6 +3416,26 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     if ((insn & 0x7F000000u) == 0x1E000000u || (insn & 0x7F000000u) == 0x1F000000u)
         return interp_exec_fp_scalar(cpu, insn);
 
+    // ---- AdvSIMD SCALAR forms, normalised into their vector spelling ----
+    // bits[31:30] == 01 with bits[28:25] == 1111 is the AdvSIMD scalar space: ADD/SUB/CMxx/NEG/ABS/ADDP on D
+    // registers, the saturating group on any width, the shift-by-immediate group, the FP compares and
+    // conversions, and DUP (element). Every one of them puts U, size, opcode, Rm, Rn and Rd at EXACTLY the
+    // positions its vector counterpart does -- that is why the architecture chose those positions -- so the
+    // scalar encoding becomes the vector encoding with Q == 0 by clearing two bits, and the only remaining
+    // difference is that it operates on ONE lane and always zeroes bits [127:esize].
+    //
+    // Normalising here rather than writing a second copy of each handler is what keeps the two spellings from
+    // drifting apart, and it is why `scalar` is threaded through the lane counts below rather than being
+    // handled by a parallel switch. Two things it must NOT do: use interp_vec_lanes (which would give 2 lanes
+    // for, say, a scalar 32-bit form), and apply the vector group's "1D is reserved" checks (a scalar form is
+    // 64-bit-only precisely where the vector one is reserved).
+    unsigned scalar = 0;
+    if ((insn & 0xDE000000u) == 0x5E000000u) {
+        scalar = 1;
+        insn &= ~UINT32_C(0x50000000); // clear bit30 (becomes Q == 0) and bit28 (becomes the vector op0)
+        q = 0;
+    }
+
     // ---- AdvSIMD copy: DUP (element/general), INS (element/general), SMOV, UMOV ----
     if ((insn & 0x9F208400u) == 0x0E000400u) {
         unsigned op = (insn >> 29) & 1, imm4 = (insn >> 11) & 0xFu, imm5 = (insn >> 16) & 0x1Fu;
@@ -3347,31 +3556,75 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         unsigned combined = (immh << 3) | immb;
         interp_vec source = interp_vec_read(cpu, rn), result;
         memset(result.byte, 0, sizeof result.byte);
-        unsigned lanes = interp_vec_lanes(size, q);
+        // A scalar shift-by-immediate (SHL/SSHR/USHR/SSRA/USRA on a D register) is this same encoding with one
+        // lane, and the 64-bit element it names is exactly the vector group's reserved 1D form -- so the lane
+        // count and the reservation check below both have to know which spelling this is.
+        unsigned lanes = scalar ? 1u : interp_vec_lanes(size, q);
         uint64_t mask = interp_element_mask(size);
 
-        if (opcode == 0x10 || opcode == 0x11) {
-            // SHRN / RSHRN (and their "2" variants when Q == 1). Read elements of TWICE the destination width,
-            // shift right, and truncate -- this is how a 16-byte vector compare mask gets packed into 8 bytes so
-            // that a single FMOV can carry it into a general register, which is the core of glibc's strlen and
-            // memchr. There is no 128-bit source element, so immh's top bit is unallocated here.
-            if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD shift -- SHRN with a 64-bit result element");
+        // ---- the fixed-point FP conversions, which are the only members whose immh means something else ----
+        // SCVTF/UCVTF and FCVTZS/FCVTZU with a fractional-bit count. immh still selects the element width, but
+        // (immh:immb) is a SCALE rather than a shift: fbits = 2*esize - (immh:immb), the same relation the
+        // scalar fixed-point conversions use, which is why both go through interp_fp_to_int/from_int.
+        if (opcode == 0x1C || opcode == 0x1F) {
+            if (size < 1) return interp_undefined(cpu, insn, "AdvSIMD shift -- fixed-point conversion needs immh != 0");
+            unsigned fmt = size == 3 ? INTERP_FP_D : (size == 2 ? INTERP_FP_S : INTERP_FP_H);
+            unsigned fbits = 2u * esize - combined;
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t element = interp_vec_element(&source, size, lane);
+                uint64_t value;
+                if (opcode == 0x1C) // SCVTF / UCVTF (fixed-point)
+                    value = interp_fp_from_int(fmt, element, esize, !u, INTERP_FPCR_RMODE(g_interp_fpcr), fbits);
+                else // FCVTZS / FCVTZU (fixed-point): always round toward zero
+                    value = interp_fp_to_int(fmt, element, esize, !u, INTERP_RM_RZ, fbits);
+                interp_vec_set_element(&result, size, lane, value & mask);
+            }
+            interp_vec_write(cpu, rd, result, scalar ? 0u : q);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+
+        if (opcode == 0x10 || opcode == 0x11 || opcode == 0x12 || opcode == 0x13) {
+            // The NARROWING right shifts, all sharing one shape: read elements of TWICE the destination width,
+            // shift right, and write 64 bits into the half of the destination Q selects. SHRN/RSHRN truncate,
+            // which is how a 16-byte vector compare mask gets packed into 8 bytes so a single FMOV can carry it
+            // to a general register (the core of glibc's strlen and memchr); the rest SATURATE, in three senses:
+            //   opcode 10000/10001, U == 1  SQSHRUN / SQRSHRUN   signed source, UNSIGNED saturated result
+            //   opcode 10010/10011, U == 0  SQSHRN  / SQRSHRN    signed source, signed saturated result
+            //   opcode 10010/10011, U == 1  UQSHRN  / UQRSHRN    unsigned source, unsigned saturated result
+            // The odd opcode of each pair is the ROUNDING variant, which adds half of the discarded field first.
+            if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD shift -- narrowing shift with a 64-bit result");
             unsigned shift = 2u * esize - combined;
             unsigned narrow_lanes = 64u / esize; // the result is always 64 bits wide; Q selects WHICH half
             uint64_t wide_mask = interp_element_mask(size + 1u);
+            int saturating = opcode >= 0x12 || u;
+            int source_signed = opcode >= 0x12 ? !u : 1;
+            int dest_signed = opcode >= 0x12 ? !u : 0;
+            int rounding = (opcode & 1u) != 0;
             interp_vec packed;
             memset(packed.byte, 0, sizeof packed.byte);
-            for (unsigned lane = 0; lane < narrow_lanes; lane++) {
+            for (unsigned lane = 0; lane < (scalar ? 1u : narrow_lanes); lane++) {
                 uint64_t element = interp_vec_element(&source, size + 1u, lane) & wide_mask;
-                // RSHRN rounds rather than truncates, by adding half of the discarded field first.
-                if (opcode == 0x11 && shift > 0) element += UINT64_C(1) << (shift - 1u);
-                interp_vec_set_element(&packed, size, lane, (element >> shift) & mask);
+                uint64_t shifted;
+                if (saturating && source_signed) {
+                    // Shift the SIGN-EXTENDED value, so the sign is replicated rather than zeroes shifted in,
+                    // and so the saturation test below sees the true magnitude.
+                    int64_t wide = (int64_t)interp_element_sext(element, size + 1u);
+                    if (rounding && shift > 0) wide += (int64_t)(UINT64_C(1) << (shift - 1u));
+                    shifted = (uint64_t)(wide >> shift) & wide_mask;
+                } else {
+                    if (rounding && shift > 0) element = (element + (UINT64_C(1) << (shift - 1u))) & wide_mask;
+                    shifted = (element >> shift) & wide_mask;
+                }
+                interp_vec_set_element(&packed, size, lane,
+                                      saturating ? interp_sat_narrow(shifted, size, source_signed, dest_signed)
+                                                 : (shifted & mask));
             }
-            if (!q) {
-                // SHRN writes the low 64 bits and zeroes the upper half.
+            if (!q || scalar) {
+                // The unsuffixed mnemonic writes the low 64 bits and ZEROES the upper half.
                 interp_vec_write(cpu, rd, packed, 0);
             } else {
-                // SHRN2 writes the UPPER 64 bits and must leave the lower half untouched.
+                // The "2" mnemonic writes the UPPER 64 bits and must leave the lower half untouched.
                 interp_vec destination = interp_vec_read(cpu, rd);
                 memcpy(destination.byte + 8, packed.byte, 8);
                 interp_vec_write(cpu, rd, destination, 1);
@@ -3399,34 +3652,96 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             return INTERP_NEXT;
         }
 
-        if (size == 3 && !q) return interp_undefined(cpu, insn, "AdvSIMD shift -- 64-bit element requires Q");
-        if (opcode == 0x0A) { // SHL: shift left by (combined - esize)
+        if (size == 3 && !q && !scalar)
+            return interp_undefined(cpu, insn, "AdvSIMD shift -- 64-bit element requires Q");
+        if (opcode == 0x0A && !u) { // SHL: shift left by (combined - esize)
             unsigned shift = combined - esize;
             for (unsigned lane = 0; lane < lanes; lane++)
                 interp_vec_set_element(&result, size, lane,
                                        (interp_vec_element(&source, size, lane) << shift) & mask);
-        } else if (opcode == 0x00 || opcode == 0x02) { // SSHR/USHR and the accumulating SSRA/USRA
+        } else if (opcode == 0x08 || (opcode == 0x0A && u)) {
+            // SRI (opcode 01000) and SLI (01010 with U == 1): shift and INSERT. The shifted-in bits are taken
+            // from the DESTINATION rather than being zeroes, which is what makes them bitfield inserts.
+            interp_vec destination = interp_vec_read(cpu, rd);
+            unsigned shift = opcode == 0x08 ? 2u * esize - combined : combined - esize;
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t element = interp_vec_element(&source, size, lane) & mask;
+                uint64_t base = interp_vec_element(&destination, size, lane) & mask;
+                uint64_t moved, keep;
+                if (opcode == 0x08) { // SRI: keep the destination's TOP `shift` bits
+                    moved = shift >= esize ? 0 : (element >> shift);
+                    keep = shift == 0 ? 0 : (mask << (esize - shift)) & mask;
+                } else { // SLI: keep the destination's BOTTOM `shift` bits
+                    moved = (element << shift) & mask;
+                    keep = shift == 0 ? 0 : ((UINT64_C(1) << shift) - 1u);
+                }
+                interp_vec_set_element(&result, size, lane, (moved & ~keep) | (base & keep));
+            }
+        } else if (opcode == 0x0C || opcode == 0x0E) {
+            // SQSHLU (01100, U == 1 only), SQSHL and UQSHL (01110): saturating shift LEFT by an immediate.
+            // Expressed as a repeated saturating doubling so that the one-bit-at-a-time overflow test is the
+            // same one SQADD uses and FPSR.QC is set identically; a shift amount is at most esize - 1, so the
+            // cost is bounded and the alternative (a wider intermediate type) does not exist for esize == 64.
+            if (opcode == 0x0C && !u) return interp_undefined(cpu, insn, "AdvSIMD shift -- unallocated SQSHLU");
+            unsigned shift = combined - esize;
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t element = interp_vec_element(&source, size, lane);
+                uint64_t value;
+                if (opcode == 0x0E && u) { // UQSHL: unsigned source, unsigned saturation
+                    value = element & mask;
+                    for (unsigned step = 0; step < shift; step++) value = interp_uqadd_element(value, value, size, 0);
+                } else if (opcode == 0x0E) { // SQSHL: signed source, signed saturation
+                    value = element & mask;
+                    for (unsigned step = 0; step < shift; step++) value = interp_sqadd_element(value, value, size, 0);
+                } else { // SQSHLU: signed source, UNSIGNED saturation -- a negative operand saturates to zero
+                    int64_t signed_element = (int64_t)interp_element_sext(element, size);
+                    if (signed_element < 0) {
+                        interp_fpsr_raise(INTERP_FPSR_QC);
+                        value = 0;
+                    } else {
+                        value = (uint64_t)signed_element & mask;
+                        for (unsigned step = 0; step < shift; step++)
+                            value = interp_uqadd_element(value, value, size, 0);
+                    }
+                }
+                interp_vec_set_element(&result, size, lane, value & mask);
+            }
+        } else if (opcode == 0x00 || opcode == 0x02 || opcode == 0x04 || opcode == 0x06) {
+            // SSHR/USHR (00000), SSRA/USRA (00010) and their ROUNDING counterparts SRSHR/URSHR (00100) and
+            // SRSRA/URSRA (00110). The 0x02 pair accumulates into the destination; the 0x04/0x06 pair adds half
+            // of the field about to be discarded before shifting.
             unsigned shift = 2u * esize - combined;
+            int rounding = opcode == 0x04 || opcode == 0x06;
+            int accumulating = opcode == 0x02 || opcode == 0x06;
             interp_vec accumulate = interp_vec_read(cpu, rd);
             for (unsigned lane = 0; lane < lanes; lane++) {
                 uint64_t element = interp_vec_element(&source, size, lane);
                 // A right shift of the FULL element width is defined for these instructions (the result is 0,
                 // or the replicated sign bit) but is undefined behaviour in C, so it is handled explicitly.
+                // The rounding increment is likewise the bit at position shift-1, which for a full-width shift
+                // is the element's top bit.
                 uint64_t shifted;
-                if (u)
-                    shifted = shift >= esize ? 0 : (element >> shift);
-                else {
+                if (u) {
+                    uint64_t value = element & mask;
+                    uint64_t round = rounding && shift > 0 ? ((value >> (shift - 1u)) & 1u) : 0u;
+                    shifted = (shift >= esize ? 0 : (value >> shift)) + round;
+                } else {
                     int64_t signed_element = (int64_t)interp_element_sext(element, size);
+                    uint64_t round =
+                        rounding && shift > 0
+                            ? (uint64_t)((signed_element >> (shift > esize ? esize - 1u : shift - 1u)) & 1)
+                            : 0u;
                     shifted = (uint64_t)(shift >= esize ? (signed_element >> (esize - 1)) : (signed_element >> shift));
+                    shifted += round;
                 }
                 shifted &= mask;
-                if (opcode == 0x02) shifted = (shifted + interp_vec_element(&accumulate, size, lane)) & mask;
+                if (accumulating) shifted = (shifted + interp_vec_element(&accumulate, size, lane)) & mask;
                 interp_vec_set_element(&result, size, lane, shifted);
             }
         } else {
             return interp_undefined(cpu, insn, "AdvSIMD shift by immediate -- unimplemented opcode");
         }
-        interp_vec_write(cpu, rd, result, q);
+        interp_vec_write(cpu, rd, result, scalar ? 0u : q);
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
@@ -3518,6 +3833,58 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     // Tested before two-register-misc: both live at bits[21:17] == 10000/11000 and differ only in bit 20.
     if ((insn & 0x9F3E0C00u) == 0x0E300800u) {
         unsigned size = (insn >> 22) & 3u, opcode = (insn >> 12) & 0x1Fu;
+        // ---- the floating-point reductions: FMAXNMV / FMAXV / FMINNMV / FMINV ----
+        // Same field reinterpretation as the other FP boxes (bit23 selects max vs min, bit22 is sz), and they
+        // are U == 1 only. Folded left to right so that a NaN or a signed zero reaches the same answer the
+        // pairwise tree in hardware would: FPMax/FPMin are associative for those cases because their NaN and
+        // zero-sign rules are symmetric in the two operands.
+        if (u && (opcode == 0x0Cu || opcode == 0x0Fu)) {
+            unsigned fmt = (size & 1u) ? INTERP_FP_D : INTERP_FP_S, high = (size >> 1) & 1u;
+            unsigned element = fmt + 1u, lanes = interp_vec_lanes(element, q);
+            if (fmt == INTERP_FP_D || !q)
+                return interp_undefined(cpu, insn, "AdvSIMD across lanes -- unallocated FP reduction size");
+            interp_vec source = interp_vec_read(cpu, rn), result;
+            memset(result.byte, 0, sizeof result.byte);
+            uint64_t accumulator = interp_vec_element(&source, element, 0);
+            for (unsigned lane = 1; lane < lanes; lane++)
+                accumulator = interp_fp_minmax(fmt, accumulator, interp_vec_element(&source, element, lane), !high,
+                                              opcode == 0x0Cu);
+            interp_vec_set_element(&result, element, 0, accumulator);
+            interp_vec_write(cpu, rd, result, 0);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        // ---- the AdvSIMD SCALAR pairwise forms, which share this encoding box ----
+        // ADDP Dd, Vn.2D and the FP pairwise reductions FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP Sd/Dd, Vn.2S/2D.
+        // They are not reductions across a whole vector: they combine exactly the TWO lanes of the source, so
+        // they need their own arm rather than the fold below (which starts from lane 0 and would be equivalent
+        // only by accident) and they must bypass the vector group's size/Q reservations.
+        if (scalar) {
+            interp_vec source = interp_vec_read(cpu, rn), result;
+            memset(result.byte, 0, sizeof result.byte);
+            if (!u && opcode == 0x1Bu) { // ADDP (scalar): 64-bit element only
+                if (size != 3) return interp_undefined(cpu, insn, "AdvSIMD scalar pairwise -- ADDP needs 2D");
+                interp_vec_set_element(&result, 3, 0,
+                                      interp_vec_element(&source, 3, 0) + interp_vec_element(&source, 3, 1));
+            } else if (u && (opcode == 0x0Cu || opcode == 0x0Du || opcode == 0x0Fu)) {
+                unsigned fmt = (size & 1u) ? INTERP_FP_D : INTERP_FP_S, high = (size >> 1) & 1u;
+                unsigned element = fmt + 1u;
+                uint64_t a = interp_vec_element(&source, element, 0), b = interp_vec_element(&source, element, 1);
+                uint64_t value;
+                if (opcode == 0x0Du) { // FADDP (scalar); bit23 set is unallocated here
+                    if (high) return interp_undefined(cpu, insn, "AdvSIMD scalar pairwise -- unallocated FADDP");
+                    value = interp_fp_arith(fmt, INTERP_FPOP_ADD, a, b);
+                } else { // FMAXNMP/FMINNMP (0x0C) and FMAXP/FMINP (0x0F)
+                    value = interp_fp_minmax(fmt, a, b, !high, opcode == 0x0Cu);
+                }
+                interp_vec_set_element(&result, element, 0, value);
+            } else {
+                return interp_undefined(cpu, insn, "AdvSIMD scalar pairwise -- unimplemented opcode");
+            }
+            interp_vec_write(cpu, rd, result, 0);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
         if (size == 3 || (size == 2 && !q))
             return interp_undefined(cpu, insn, "AdvSIMD across lanes -- reserved size/Q combination");
         interp_vec source = interp_vec_read(cpu, rn), result;
@@ -3567,6 +3934,237 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         interp_vec source = interp_vec_read(cpu, rn), result;
         memset(result.byte, 0, sizeof result.byte);
         unsigned bytes = q ? 16u : 8u;
+
+        // ---- the floating-point members of this box ----
+        // Opcodes 01100..01111 and 10110..11111 are FP, and there `size` splits the way it does in the FP
+        // three-same group: bit23 becomes an operation selector and bit22 is `sz`. That is how FRINTN (bit23
+        // clear) and FRINTP (bit23 set) share opcode 11000, and it is why reading `size` as an element width
+        // here would pick a 16-bit lane for every single-precision form.
+        if ((opcode >= 0x0Cu && opcode <= 0x0Fu) || opcode >= 0x16u) {
+            unsigned fmt = (size & 1u) ? INTERP_FP_D : INTERP_FP_S, high = (size >> 1) & 1u;
+            unsigned element = fmt + 1u;
+            uint64_t saved_nzcv = cpu->nzcv; // see the note in the three-same FP block
+            // FCVTL/FCVTN change the element width, so they are handled before the equal-width loop. FCVTL
+            // widens the selected half to the next format up; FCVTN narrows into the selected half. Both name
+            // the NARROW format in sz, so sz == 0 means half->single and sz == 1 means single->double.
+            if (opcode == 0x16u || opcode == 0x17u) {
+                if (u && opcode == 0x16u)
+                    return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- FCVTXN");
+                if (high) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated FCVTL/FCVTN size");
+                unsigned narrow = (size & 1u) ? INTERP_FP_S : INTERP_FP_H, wide = narrow + 1u;
+                // The narrow side is always exactly 64 bits' worth of elements; Q says which half of the
+                // 128-bit register those 64 bits live in.
+                unsigned narrow_lanes = narrow == INTERP_FP_S ? 2u : 4u;
+                if (opcode == 0x17u) { // FCVTL / FCVTL2: widen
+                    for (unsigned lane = 0; lane < narrow_lanes; lane++) {
+                        uint64_t element_bits =
+                            interp_vec_element(&source, narrow + 1u, q ? lane + narrow_lanes : lane);
+                        interp_vec_set_element(&result, wide + 1u, lane, interp_fp_convert(narrow, wide, element_bits));
+                    }
+                    interp_vec_write(cpu, rd, result, 1);
+                } else { // FCVTN / FCVTN2: narrow
+                    interp_vec packed;
+                    memset(packed.byte, 0, sizeof packed.byte);
+                    for (unsigned lane = 0; lane < narrow_lanes; lane++) {
+                        uint64_t element_bits = interp_vec_element(&source, wide + 1u, lane);
+                        interp_vec_set_element(&packed, narrow + 1u, lane, interp_fp_convert(wide, narrow, element_bits));
+                    }
+                    if (!q) {
+                        interp_vec_write(cpu, rd, packed, 0);
+                    } else {
+                        interp_vec destination = interp_vec_read(cpu, rd);
+                        memcpy(destination.byte + 8, packed.byte, 8);
+                        interp_vec_write(cpu, rd, destination, 1);
+                    }
+                }
+                cpu->pc = gpc + 4;
+                return INTERP_NEXT;
+            }
+            if (fmt == INTERP_FP_D && !q && !scalar)
+                return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- 2D form requires Q");
+            // Spelled as an explicit per-width choice rather than as interp_vec_lanes(element, q): the element
+            // width here is DERIVED (from sz, not from a size field), and a shift by a derived width leaves the
+            // optimiser unable to see that the lane count and the element stride come from the same number --
+            // which it reports as a possible out-of-bounds element access. Writing the two together makes the
+            // correlation visible and is also simply clearer about what the two arrangements are.
+            unsigned fp_lanes = scalar ? 1u : (element == 3u ? (q ? 2u : 1u) : (q ? 4u : 2u));
+            for (unsigned lane = 0; lane < fp_lanes; lane++) {
+                uint64_t a = interp_vec_element(&source, element, lane), value;
+                uint64_t all_ones = interp_element_mask(element);
+                if (opcode >= 0x0Cu && opcode <= 0x0Fu) {
+                    // The compare-against-zero forms, plus FABS/FNEG which share opcode 01111 across U.
+                    if (opcode == 0x0Fu) {
+                        value = u ? (a ^ interp_fp_sign_mask(fmt)) : (a & ~interp_fp_sign_mask(fmt));
+                    } else {
+                        interp_fp_compare(cpu, fmt, a, 0, 0);
+                        int ordered = !(interp_flag_c(cpu) && interp_flag_v(cpu));
+                        int zero = interp_flag_z(cpu) != 0, negative = interp_flag_n(cpu) != 0;
+                        int holds;
+                        if (opcode == 0x0Cu)
+                            holds = ordered && (u ? (!negative) : (!negative && !zero)); // FCMGE / FCMGT
+                        else if (opcode == 0x0Du)
+                            holds = ordered && (u ? (negative || zero) : zero); // FCMLE / FCMEQ
+                        else
+                            holds = ordered && negative && !u; // FCMLT
+                        if (opcode == 0x0Eu && u)
+                            return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated FP compare");
+                        value = holds ? all_ones : UINT64_C(0);
+                    }
+                } else {
+                    switch (opcode) {
+                    case 0x18: // FRINTN (bit23 clear) / FRINTP (set), and FRINTA / FRINTX under U
+                        value = interp_fp_round_integral(fmt, a, u ? INTERP_RM_RA : (high ? INTERP_RM_RP : INTERP_RM_RN),
+                                                        0);
+                        if (u && high) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated FRINT");
+                        break;
+                    case 0x19:
+                        // FRINTM / FRINTZ (U == 0), FRINTX / FRINTI (U == 1). FRINTX is the only one of the
+                        // four that reports Inexact, which is its whole reason for existing.
+                        if (u)
+                            value = interp_fp_round_integral(fmt, a, INTERP_FPCR_RMODE(g_interp_fpcr), high ? 0 : 1);
+                        else
+                            value = interp_fp_round_integral(fmt, a, high ? INTERP_RM_RZ : INTERP_RM_RM, 0);
+                        break;
+                    case 0x1A: // FCVTNS/FCVTNU (bit23 clear) / FCVTPS/FCVTPU (set)
+                        value = interp_fp_to_int(fmt, a, interp_fp_width(fmt), !u, high ? INTERP_RM_RP : INTERP_RM_RN, 0);
+                        break;
+                    case 0x1B: // FCVTMS/FCVTMU (bit23 clear) / FCVTZS/FCVTZU (set)
+                        value = interp_fp_to_int(fmt, a, interp_fp_width(fmt), !u, high ? INTERP_RM_RZ : INTERP_RM_RM, 0);
+                        break;
+                    case 0x1C: // FCVTAS/FCVTAU (bit23 clear); URECPE/URSQRTE (set) are estimates, see below
+                        if (high) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- URECPE/URSQRTE");
+                        value = interp_fp_to_int(fmt, a, interp_fp_width(fmt), !u, INTERP_RM_RA, 0);
+                        break;
+                    case 0x1D:
+                        // SCVTF/UCVTF (bit23 clear). FRECPE/FRSQRTE (set) are the reciprocal ESTIMATES, whose
+                        // result is an architecturally specified but coarse approximation; reported rather than
+                        // approximated for the same reason as FRECPS above.
+                        if (high) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- FRECPE/FRSQRTE");
+                        value = interp_fp_from_int(fmt, a, interp_fp_width(fmt), !u, INTERP_FPCR_RMODE(g_interp_fpcr),
+                                                  0);
+                        break;
+                    case 0x1F: // FSQRT (U == 1 only)
+                        if (!u) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated opcode 11111");
+                        value = interp_fp_sqrt(fmt, a);
+                        break;
+                    default: return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unimplemented FP opcode");
+                    }
+                }
+                interp_vec_set_element(&result, element, lane, value);
+            }
+            cpu->nzcv = saved_nzcv;
+            interp_vec_write(cpu, rd, result, q);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+
+        switch (opcode) {
+        case 0x02:   // SADDLP / UADDLP: pairwise add of adjacent lanes into elements of TWICE the width
+        case 0x06: { // SADALP / UADALP: the same, accumulated into the destination
+            if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated ADDLP size");
+            unsigned wide = size + 1u, wide_lanes = scalar ? 1u : interp_vec_lanes(wide, q);
+            uint64_t wide_mask = interp_element_mask(wide);
+            interp_vec accumulate = interp_vec_read(cpu, rd);
+            for (unsigned lane = 0; lane < wide_lanes; lane++) {
+                uint64_t a = interp_vec_element(&source, size, lane * 2u);
+                uint64_t b = interp_vec_element(&source, size, lane * 2u + 1u);
+                if (!u) {
+                    a = interp_element_sext(a, size);
+                    b = interp_element_sext(b, size);
+                }
+                uint64_t total = (a + b) & wide_mask;
+                if (opcode == 0x06) total = (total + interp_vec_element(&accumulate, wide, lane)) & wide_mask;
+                interp_vec_set_element(&result, wide, lane, total);
+            }
+            interp_vec_write(cpu, rd, result, q);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        case 0x03:
+            // SUQADD ("signed accumulator += unsigned operand, saturating as signed") and USQADD (the mirror).
+            // Reported rather than guessed at: mixed-signedness saturation is not the same rule as either
+            // SQADD's or UQADD's, and getting it wrong would be silent.
+            return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- SUQADD/USQADD");
+        case 0x04: { // CLS (U=0) / CLZ (U=1)
+            if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated CLS/CLZ size");
+            unsigned esize = 8u << size, lanes = scalar ? 1u : interp_vec_lanes(size, q);
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t a = interp_vec_element(&source, size, lane) & interp_element_mask(size);
+                // CLS counts the leading bits that MATCH the sign bit, not counting the sign bit itself, so
+                // it is CLZ of the value with its sign folded out and is 0..esize-1 rather than 0..esize.
+                uint64_t folded = ((a >> 1) ^ a) & (interp_element_mask(size) >> 1);
+                unsigned count;
+                if (!u)
+                    count = folded == 0 ? esize - 1u
+                                        : (unsigned)(esize - 2u - (unsigned)(63 - __builtin_clzll(folded)));
+                else
+                    count = a == 0 ? esize : (unsigned)(esize - 1u - (unsigned)(63 - __builtin_clzll(a)));
+                interp_vec_set_element(&result, size, lane, count);
+            }
+            break;
+        }
+        case 0x07: { // SQABS (U=0) / SQNEG (U=1): saturating, because negating the most negative value overflows
+            unsigned lanes = scalar ? 1u : interp_vec_lanes(size, q);
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t a = interp_vec_element(&source, size, lane);
+                // Expressed as 0 - a (SQNEG) or |a| = 0 - a when negative (SQABS), so the one overflowing input
+                // -- the most negative value, whose negation is not representable -- saturates through the same
+                // helper the rest of the group uses and sets FPSR.QC identically.
+                int64_t x = (int64_t)interp_element_sext(a, size);
+                uint64_t value;
+                if (!u && x >= 0)
+                    value = a & interp_element_mask(size);
+                else
+                    value = interp_sqadd_element(0, a, size, 1);
+                interp_vec_set_element(&result, size, lane, value);
+            }
+            break;
+        }
+        case 0x12:   // XTN (U=0) / SQXTUN (U=1)
+        case 0x14: { // SQXTN (U=0) / UQXTN (U=1)
+            // Narrowing: `size` names the RESULT element and the source elements are twice as wide, so the
+            // result is 64 bits and Q selects which half of the destination register receives it -- exactly
+            // SHRN's shape. XTN simply truncates; the other three saturate, in three different senses.
+            if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated XTN size");
+            unsigned narrow_lanes = 64u / (8u << size);
+            interp_vec packed;
+            memset(packed.byte, 0, sizeof packed.byte);
+            for (unsigned lane = 0; lane < (scalar ? 1u : narrow_lanes); lane++) {
+                uint64_t wide_element = interp_vec_element(&source, size + 1u, lane);
+                uint64_t value;
+                if (opcode == 0x12 && !u)
+                    value = wide_element & interp_element_mask(size); // XTN: plain truncation
+                else if (opcode == 0x12)
+                    value = interp_sat_narrow(wide_element, size, 1, 0); // SQXTUN: signed -> unsigned
+                else
+                    value = interp_sat_narrow(wide_element, size, u ? 0 : 1, u ? 0 : 1); // UQXTN / SQXTN
+                interp_vec_set_element(&packed, size, lane, value);
+            }
+            if (!q || scalar) {
+                interp_vec_write(cpu, rd, packed, 0);
+            } else {
+                interp_vec destination = interp_vec_read(cpu, rd);
+                memcpy(destination.byte + 8, packed.byte, 8);
+                interp_vec_write(cpu, rd, destination, 1);
+            }
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        case 0x13: { // SHLL / SHLL2 (U=1): widen each element and shift left by the FULL element width
+            if (!u || size == 3) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated SHLL");
+            unsigned wide = size + 1u, wide_lanes = 64u / (8u << size);
+            for (unsigned lane = 0; lane < wide_lanes; lane++) {
+                uint64_t a = interp_vec_element(&source, size, q ? lane + wide_lanes : lane);
+                interp_vec_set_element(&result, wide, lane,
+                                      (a << (8u << size)) & interp_element_mask(wide));
+            }
+            interp_vec_write(cpu, rd, result, 1);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        default: break;
+        }
+
         switch (opcode) {
         case 0x00:   // REV64 (U=0) / REV32 (U=1)
         case 0x01: { // REV16 (U=0)
@@ -3606,10 +4204,10 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         case 0x08:   // CMGT (zero, U=0) / CMGE (zero, U=1)
         case 0x09:   // CMEQ (zero, U=0) / CMLE (zero, U=1)
         case 0x0A: { // CMLT (zero, U=0)
-            if (size == 3 && !q)
+            if (size == 3 && !q && !scalar)
                 return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- 1D compare is reserved");
             uint64_t mask = interp_element_mask(size);
-            for (unsigned lane = 0; lane < interp_vec_lanes(size, q); lane++) {
+            for (unsigned lane = 0; lane < (scalar ? 1u : interp_vec_lanes(size, q)); lane++) {
                 int64_t element = (int64_t)interp_element_sext(interp_vec_element(&source, size, lane), size);
                 int holds;
                 if (opcode == 0x08)
@@ -3627,9 +4225,10 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             break;
         }
         case 0x0B: { // ABS (U=0) / NEG (U=1)
-            if (size == 3 && !q) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- 1D ABS/NEG reserved");
+            if (size == 3 && !q && !scalar)
+                return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- 1D ABS/NEG reserved");
             uint64_t mask = interp_element_mask(size);
-            for (unsigned lane = 0; lane < interp_vec_lanes(size, q); lane++) {
+            for (unsigned lane = 0; lane < (scalar ? 1u : interp_vec_lanes(size, q)); lane++) {
                 int64_t element = (int64_t)interp_element_sext(interp_vec_element(&source, size, lane), size);
                 uint64_t value = u ? (uint64_t)(-element) : (uint64_t)(element < 0 ? -element : element);
                 interp_vec_set_element(&result, size, lane, value & mask);
@@ -3643,14 +4242,244 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
+    // ---- AdvSIMD three different: the widening and narrowing group ----
+    //   0 Q U 01110 size 1 Rm opcode(15:12) 00 Rn Rd
+    // Separated from three-same (bit10 == 1) and from across-lanes/two-reg-misc (bits[11:10] == 10) by
+    // bits[11:10] == 00 alone. This is the one structural shape nothing else in this file has: the SOURCE and
+    // DESTINATION element widths differ, and `size` always names the NARROWER of the two. So for the widening
+    // forms the sources are `size` and the result is `size + 1`, while for the narrowing ADDHN/SUBHN it is the
+    // other way round -- the same width trap SHRN sets, in a group where every member steps on it.
+    //
+    // Q does not select a lane count here (it is fixed at 64 bits of the narrow side, i.e. 64/esize lanes).
+    // It selects WHICH HALF of the 128-bit narrow-side register is used: the "2" mnemonics (ADDHN2, SMULL2)
+    // read the upper half of their narrow sources, or write the upper half of their narrow destination while
+    // leaving the lower half untouched. Getting that backwards silently corrupts half a register.
+    if ((insn & 0x9F200C00u) == 0x0E200000u) {
+        unsigned size = (insn >> 22) & 3u, opcode = (insn >> 12) & 0xFu;
+        interp_vec left = interp_vec_read(cpu, rn), right = interp_vec_read(cpu, rm);
+        int narrowing = opcode == 0x4 || opcode == 0x6; // ADDHN/RADDHN and SUBHN/RSUBHN
+        // PMULL's 64x64 -> 128 form is the only member whose result element is 128 bits wide, so it cannot go
+        // through the element accessors at all and is handled on its own below.
+        if (opcode == 0xE && size == 3) {
+            uint64_t a, b, low, high;
+            memcpy(&a, left.byte + (q ? 8 : 0), 8);
+            memcpy(&b, right.byte + (q ? 8 : 0), 8);
+            interp_poly_mul(a, b, 64, &low, &high);
+            interp_vec result;
+            memcpy(result.byte, &low, 8);
+            memcpy(result.byte + 8, &high, 8);
+            interp_vec_write(cpu, rd, result, 1);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
+        if (size == 3)
+            return interp_undefined(cpu, insn, "AdvSIMD three different -- 64-bit narrow element is reserved");
+        unsigned wide = size + 1u, lanes = 64u / (8u << size); // always 64 bits' worth of narrow elements
+        uint64_t narrow_mask = interp_element_mask(size), wide_mask = interp_element_mask(wide);
+        interp_vec result;
+        memset(result.byte, 0, sizeof result.byte);
+        interp_vec destination = interp_vec_read(cpu, rd);
+
+        for (unsigned lane = 0; lane < lanes; lane++) {
+            // The widening forms take their narrow operand(s) from the upper half when Q is set; the narrowing
+            // forms read full-width sources from lane `lane` and place the result in the selected half.
+            unsigned narrow_lane = q && !narrowing ? lane + lanes : lane;
+            uint64_t a, b;
+            if (narrowing) {
+                a = interp_vec_element(&left, wide, lane);
+                b = interp_vec_element(&right, wide, lane);
+                uint64_t sum = (opcode == 0x4 ? a + b : a - b) & wide_mask;
+                // RADDHN/RSUBHN round rather than truncate, by adding half of the discarded low field first.
+                if (u) sum = (sum + (UINT64_C(1) << ((8u << size) - 1u))) & wide_mask;
+                interp_vec_set_element(&result, size, lane, (sum >> (8u << size)) & narrow_mask);
+                continue;
+            }
+            a = interp_vec_element(&left, opcode == 0x1 || opcode == 0x3 ? wide : size,
+                                   opcode == 0x1 || opcode == 0x3 ? lane : narrow_lane);
+            b = interp_vec_element(&right, size, narrow_lane);
+            // Every widening form sign-extends when U == 0 and zero-extends when U == 1, except PMULL, whose
+            // operands are polynomials with no sign at all.
+            uint64_t extended_a = opcode == 0x1 || opcode == 0x3 ? a
+                                  : (u ? a & narrow_mask : (interp_element_sext(a, size) & wide_mask));
+            uint64_t extended_b = u ? (b & narrow_mask) : (interp_element_sext(b, size) & wide_mask);
+            uint64_t value;
+            switch (opcode) {
+            case 0x0: value = extended_a + extended_b; break; // SADDL / UADDL
+            case 0x1: value = extended_a + extended_b; break; // SADDW / UADDW (Rn is already wide)
+            case 0x2: value = extended_a - extended_b; break; // SSUBL / USUBL
+            case 0x3: value = extended_a - extended_b; break; // SSUBW / USUBW
+            case 0x5:   // SABAL / UABAL: accumulate the absolute difference
+            case 0x7: { // SABDL / UABDL: the absolute difference alone
+                uint64_t difference;
+                if (u) {
+                    uint64_t x = a & narrow_mask, y = b & narrow_mask;
+                    difference = x > y ? x - y : y - x;
+                } else {
+                    int64_t x = (int64_t)interp_element_sext(a, size), y = (int64_t)interp_element_sext(b, size);
+                    difference = (uint64_t)(x > y ? x - y : y - x);
+                }
+                value = difference;
+                if (opcode == 0x5) value += interp_vec_element(&destination, wide, lane);
+                break;
+            }
+            case 0x8:   // SMLAL / UMLAL
+            case 0xA:   // SMLSL / UMLSL
+            case 0xC: { // SMULL / UMULL
+                uint64_t product;
+                if (u)
+                    product = (a & narrow_mask) * (b & narrow_mask);
+                else
+                    product = (uint64_t)((int64_t)interp_element_sext(a, size) * (int64_t)interp_element_sext(b, size));
+                uint64_t base = interp_vec_element(&destination, wide, lane);
+                value = opcode == 0x8 ? base + product : (opcode == 0xA ? base - product : product);
+                break;
+            }
+            case 0xE: { // PMULL: polynomial multiply, 8x8 -> 16 (the 64x64 form is handled above)
+                if (u || size != 0)
+                    return interp_undefined(cpu, insn, "AdvSIMD three different -- unallocated PMULL form");
+                uint64_t low, high;
+                interp_poly_mul(a & narrow_mask, b & narrow_mask, 8, &low, &high);
+                value = low;
+                break;
+            }
+            default:
+                return interp_undefined(cpu, insn,
+                                        "AdvSIMD three different -- saturating doubling form (SQDMULL/SQDMLAL/"
+                                        "SQDMLSL)");
+            }
+            interp_vec_set_element(&result, wide, lane, value & wide_mask);
+        }
+        if (!narrowing) {
+            interp_vec_write(cpu, rd, result, 1); // a widening result is always a full 128-bit register
+        } else if (!q) {
+            interp_vec_write(cpu, rd, result, 0); // ADDHN writes the low 64 bits and ZEROES the upper half
+        } else {
+            memcpy(destination.byte + 8, result.byte, 8); // ADDHN2 writes the upper half, preserving the lower
+            interp_vec_write(cpu, rd, destination, 1);
+        }
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
     // ---- AdvSIMD three same: the bitwise group, the compares, ADD/SUB, MIN/MAX, ADDP, shifts ----
     if ((insn & 0x9F200400u) == 0x0E200400u) {
         unsigned size = (insn >> 22) & 3u, opcode = (insn >> 11) & 0x1Fu;
         interp_vec left = interp_vec_read(cpu, rn), right = interp_vec_read(cpu, rm), result;
         memset(result.byte, 0, sizeof result.byte);
         unsigned bytes = q ? 16u : 8u;
-        unsigned lanes = interp_vec_lanes(size, q);
+        unsigned lanes = scalar ? 1u : interp_vec_lanes(size, q);
         uint64_t mask = interp_element_mask(size);
+
+        // ---- the floating-point members of this box ----
+        // From opcode 11000 upward the fields are reinterpreted: bit23 (size<1>) stops being part of the
+        // element width and becomes an operation selector, and bit22 (size<0>) is `sz` -- 0 for single, 1 for
+        // double. That is why FADD and FSUB share one opcode and differ only in bit23, and it is the reason a
+        // naive `size` read here would silently pick a 16-bit element for every single-precision form.
+        if (opcode >= 0x18) {
+            unsigned fmt = (size & 1u) ? INTERP_FP_D : INTERP_FP_S, high = (size >> 1) & 1u;
+            if (fmt == INTERP_FP_D && !q && !scalar)
+                return interp_undefined(cpu, insn, "AdvSIMD three same -- 2D form requires Q");
+            unsigned fp_lanes = scalar ? 1u : interp_vec_lanes(fmt + 1u, q);
+            unsigned element = fmt + 1u;
+            interp_vec accumulate = interp_vec_read(cpu, rd);
+            uint64_t sign = interp_fp_sign_mask(fmt);
+            // interp_fp_compare writes NZCV because that is what the SCALAR FCMP family is defined to do. A
+            // VECTOR compare must not touch the flags at all, so the incoming value is kept and restored below.
+            uint64_t saved_nzcv = cpu->nzcv;
+            for (unsigned lane = 0; lane < fp_lanes; lane++) {
+                // The pairwise forms (FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP) draw both operands from the
+                // CONCATENATION Vn:Vm rather than from matching lanes, exactly as the integer ADDP does.
+                int pairwise = u && (opcode == 0x18 || opcode == 0x1A || opcode == 0x1E) &&
+                               !(opcode == 0x1A && high);
+                uint64_t a, b;
+                if (pairwise) {
+                    const interp_vec *source = lane < fp_lanes / 2u ? &left : &right;
+                    unsigned base = (lane < fp_lanes / 2u ? lane : lane - fp_lanes / 2u) * 2u;
+                    a = interp_vec_element(source, element, base);
+                    b = interp_vec_element(source, element, base + 1u);
+                } else {
+                    a = interp_vec_element(&left, element, lane);
+                    b = interp_vec_element(&right, element, lane);
+                }
+                uint64_t value;
+                if (!u) {
+                    switch (opcode) {
+                    case 0x18: value = interp_fp_minmax(fmt, a, b, !high, 1); break; // FMAXNM / FMINNM
+                    case 0x19: { // FMLA / FMLS: fused multiply-accumulate INTO the destination lane
+                        uint64_t addend = interp_vec_element(&accumulate, element, lane);
+                        value = interp_fp_muladd(fmt, addend, high ? (a ^ sign) : a, b);
+                        break;
+                    }
+                    case 0x1A:
+                        value = interp_fp_arith(fmt, high ? INTERP_FPOP_SUB : INTERP_FPOP_ADD, a, b);
+                        break; // FADD / FSUB
+                    case 0x1B:
+                        // FMULX. Deliberately reported rather than approximated: it is FMUL with inf * 0
+                        // redefined to +-2.0, and it exists only as the first step of a reciprocal Newton
+                        // iteration whose remaining steps (FRECPE/FRECPS below) this backend also declines. A
+                        // partially-correct reciprocal sequence is worse than an honest report, because it
+                        // produces answers that are close but not equal to the JIT's.
+                        return interp_undefined(cpu, insn, "AdvSIMD three same -- FMULX");
+                    case 0x1C: { // FCMEQ (register)
+                        if (high) return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated FP opcode");
+                        interp_fp_compare(cpu, fmt, a, b, 0);
+                        value = interp_flag_z(cpu) ? interp_element_mask(element) : UINT64_C(0);
+                        break;
+                    }
+                    case 0x1E: value = interp_fp_minmax(fmt, a, b, !high, 0); break; // FMAX / FMIN
+                    case 0x1F:
+                        // FRECPS / FRSQRTS, the Newton-Raphson refinement steps. Reported for the same reason
+                        // as FMULX: the architecture defines each as a SINGLE rounding of (2 - a*b) or
+                        // (3 - a*b)/2 with its own special cases for zero times infinity, and an
+                        // almost-right version of a reciprocal iteration is the worst possible outcome.
+                        return interp_undefined(cpu, insn, "AdvSIMD three same -- FRECPS/FRSQRTS");
+                    default: return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated FP opcode");
+                    }
+                } else {
+                    switch (opcode) {
+                    case 0x18: value = interp_fp_minmax(fmt, a, b, !high, 1); break; // FMAXNMP / FMINNMP
+                    case 0x1A:
+                        // FADDP when bit23 is clear, FABD (the absolute difference) when it is set -- and FABD
+                        // is not pairwise, which is why the `pairwise` predicate above excludes it.
+                        value = high ? (interp_fp_arith(fmt, INTERP_FPOP_SUB, a, b) & ~sign)
+                                     : interp_fp_arith(fmt, INTERP_FPOP_ADD, a, b);
+                        break;
+                    case 0x1B:
+                        if (high) return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated FP opcode");
+                        value = interp_fp_arith(fmt, INTERP_FPOP_MUL, a, b);
+                        break; // FMUL
+                    case 0x1C: // FCMGE / FCMGT
+                    case 0x1D: { // FACGE / FACGT: the same comparison on the ABSOLUTE values
+                        uint64_t x = a, y = b;
+                        if (opcode == 0x1D) {
+                            x &= ~sign;
+                            y &= ~sign;
+                        }
+                        interp_fp_compare(cpu, fmt, x, y, 0);
+                        // "greater or equal" is C set with the unordered case excluded, and "greater" adds
+                        // Z clear. A vector compare answers all-ones or all-zeroes, never a flag.
+                        int ordered = !(interp_flag_c(cpu) && interp_flag_v(cpu));
+                        int holds = ordered && interp_flag_c(cpu) && (!high || !interp_flag_z(cpu));
+                        value = holds ? interp_element_mask(element) : UINT64_C(0);
+                        break;
+                    }
+                    case 0x1E: value = interp_fp_minmax(fmt, a, b, !high, 0); break; // FMAXP / FMINP
+                    case 0x1F:
+                        if (high) return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated FP opcode");
+                        value = interp_fp_arith(fmt, INTERP_FPOP_DIV, a, b);
+                        break; // FDIV
+                    default: return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated FP opcode");
+                    }
+                }
+                interp_vec_set_element(&result, element, lane, value);
+            }
+            // A vector FP compare writes NZCV as a side effect of borrowing interp_fp_compare, which the
+            // architecture does NOT do -- only the SCALAR FCMP family touches the flags. Restore them.
+            if (opcode == 0x1C || opcode == 0x1D) cpu->nzcv = saved_nzcv;
+            interp_vec_write(cpu, rd, result, q);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
 
         if (opcode == 0x03) { // the purely bitwise group: size is a sub-opcode here, not an element width
             interp_vec destination = interp_vec_read(cpu, rd);
@@ -3665,11 +4494,20 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                     default: value = (uint8_t)(a | (uint8_t)~b); break; // ORN
                     }
                 } else {
+                    // The three insert/select forms all take the DESTINATION as a third operand, and which
+                    // register supplies the mask differs -- which is exactly why they are easy to get backwards
+                    // and why a mistake is invisible until a vectorised `?:` gives the opposite answer.
+                    //   BSL  the DESTINATION is the mask:  Vd = Vd ? Vn : Vm
+                    //   BIT  Vm is the mask, insert if true:  Vd = Vm ? Vn : Vd
+                    //   BIF  Vm is the mask, insert if false: Vd = Vm ? Vd : Vn
+                    // BSL had Vn and Vm the wrong way round here, so every `cmgt`/`fcmgt` + `bsl` pair -- which
+                    // is what -O2 emits for a vectorised min/max or clamp -- selected the operand the guest did
+                    // NOT ask for and silently computed a minimum where the source said maximum.
                     switch (size) {
-                    case 0: value = (uint8_t)(a ^ b); break;                        // EOR
-                    case 1: value = (uint8_t)((b & d) | (a & (uint8_t)~d)); break;   // BSL
-                    case 2: value = (uint8_t)(d ^ ((d ^ a) & b)); break;             // BIT
-                    default: value = (uint8_t)(d ^ ((d ^ a) & (uint8_t)~b)); break;  // BIF
+                    case 0: value = (uint8_t)(a ^ b); break;                          // EOR
+                    case 1: value = (uint8_t)((a & d) | (b & (uint8_t)~d)); break;     // BSL
+                    case 2: value = (uint8_t)(d ^ ((d ^ a) & b)); break;               // BIT
+                    default: value = (uint8_t)(d ^ ((d ^ a) & (uint8_t)~b)); break;    // BIF
                     }
                 }
                 result.byte[index] = value;
@@ -3679,10 +4517,153 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             return INTERP_NEXT;
         }
 
-        if (size == 3 && !q && opcode != 0x10)
+        // The vector group reserves a 64-bit element with Q == 0 (there is no 1D arrangement); the SCALAR
+        // spelling of the same encoding is precisely the D-register form, so it must not be rejected here.
+        if (size == 3 && !q && !scalar && opcode != 0x10)
             return interp_undefined(cpu, insn, "AdvSIMD three same -- reserved 1D form");
 
         switch (opcode) {
+        case 0x00:   // SHADD / UHADD: halving add, which cannot overflow because it halves first
+        case 0x02:   // SRHADD / URHADD: rounding halving add
+        case 0x04: { // SHSUB / UHSUB
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t a = interp_vec_element(&left, size, lane), b = interp_vec_element(&right, size, lane);
+                uint64_t value;
+                if (u) {
+                    a &= mask;
+                    b &= mask;
+                    if (opcode == 0x04)
+                        value = (a - b) >> 1; // the borrow bit is exactly what the shift discards
+                    else
+                        // (a + b) can carry out of a 64-bit element, so the sum is formed as the average
+                        // directly: (a & b) + ((a ^ b) >> 1) is (a + b) >> 1 without the intermediate carry.
+                        value = (a & b) + (((a ^ b) >> 1) & (mask >> 1)) + (opcode == 0x02 ? ((a ^ b) & 1u) : 0u);
+                } else {
+                    int64_t x = (int64_t)interp_element_sext(a, size), y = (int64_t)interp_element_sext(b, size);
+                    if (opcode == 0x04)
+                        value = (uint64_t)((x - y) >> 1);
+                    else
+                        value = (uint64_t)((x & y) + ((x ^ y) >> 1) + (opcode == 0x02 ? ((x ^ y) & 1) : 0));
+                }
+                interp_vec_set_element(&result, size, lane, value & mask);
+            }
+            break;
+        }
+        case 0x01:   // SQADD / UQADD
+        case 0x05: { // SQSUB / UQSUB
+            int subtract = opcode == 0x05;
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t a = interp_vec_element(&left, size, lane), b = interp_vec_element(&right, size, lane);
+                interp_vec_set_element(&result, size, lane,
+                                      u ? interp_uqadd_element(a, b, size, subtract)
+                                        : interp_sqadd_element(a, b, size, subtract));
+            }
+            break;
+        }
+        case 0x09:   // SQSHL / UQSHL: a saturating variable left shift (a right shift when Rm's lane is negative)
+        case 0x0A:   // SRSHL / URSHL: rounding variable shift
+        case 0x0B: { // SQRSHL / UQRSHL
+            unsigned esize = 8u << size;
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t a = interp_vec_element(&left, size, lane);
+                int8_t amount = (int8_t)(interp_vec_element(&right, size, lane) & 0xFFu);
+                uint64_t value;
+                if (amount >= 0) {
+                    unsigned shift = (unsigned)amount;
+                    if (opcode == 0x0A) { // SRSHL/URSHL left: an exact shift, wrapping like SSHL/USHL
+                        value = shift >= esize ? 0 : (a << shift) & mask;
+                    } else if (u) {
+                        uint64_t saturated = (a & mask);
+                        // Saturate when any bit would leave the element, which is the same test as "the value
+                        // no longer fits after the shift".
+                        if (shift >= esize ? saturated != 0 : (saturated >> (esize - shift)) != 0) {
+                            interp_fpsr_raise(INTERP_FPSR_QC);
+                            value = mask;
+                        } else {
+                            value = (saturated << shift) & mask;
+                        }
+                    } else {
+                        int64_t x = (int64_t)interp_element_sext(a, size);
+                        int64_t max = esize == 64 ? INT64_MAX : (int64_t)((UINT64_C(1) << (esize - 1u)) - 1u);
+                        int64_t min = esize == 64 ? INT64_MIN : -max - 1;
+                        int64_t shifted = x;
+                        int overflowed = 0;
+                        for (unsigned step = 0; step < shift && !overflowed; step++) {
+                            if (shifted > (max >> 1) || shifted < (min >> 1) || (shifted << 1) >> 1 != shifted)
+                                overflowed = 1;
+                            else
+                                shifted <<= 1;
+                        }
+                        if (overflowed || shifted > max || shifted < min) {
+                            interp_fpsr_raise(INTERP_FPSR_QC);
+                            shifted = x < 0 ? min : max;
+                        }
+                        value = (uint64_t)shifted & mask;
+                    }
+                } else {
+                    // A negative amount is a right shift, which never saturates. The rounding variants add half
+                    // of the discarded field first, which is what distinguishes SRSHL from SSHL.
+                    unsigned shift = (unsigned)(-amount);
+                    int rounding = opcode == 0x0A || opcode == 0x0B;
+                    if (u) {
+                        uint64_t x = a & mask;
+                        uint64_t round = rounding && shift <= 64u && shift > 0 ? (x >> (shift - 1u)) & 1u : 0u;
+                        value = shift >= esize ? round : ((x >> shift) + round);
+                    } else {
+                        int64_t x = (int64_t)interp_element_sext(a, size);
+                        uint64_t round = rounding && shift > 0 ? (uint64_t)((x >> (shift >= 64u ? 63u : shift - 1u)) & 1)
+                                                              : 0u;
+                        int64_t shifted = shift >= esize ? (x >> (esize - 1u)) : (x >> shift);
+                        value = (uint64_t)shifted + round;
+                    }
+                    value &= mask;
+                }
+                interp_vec_set_element(&result, size, lane, value);
+            }
+            break;
+        }
+        case 0x0E:   // SABD / UABD: absolute difference
+        case 0x0F: { // SABA / UABA: absolute difference accumulated into the destination
+            interp_vec accumulate = interp_vec_read(cpu, rd);
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                uint64_t a = interp_vec_element(&left, size, lane), b = interp_vec_element(&right, size, lane);
+                uint64_t difference;
+                if (u) {
+                    a &= mask;
+                    b &= mask;
+                    difference = a > b ? a - b : b - a;
+                } else {
+                    int64_t x = (int64_t)interp_element_sext(a, size), y = (int64_t)interp_element_sext(b, size);
+                    difference = (uint64_t)(x > y ? x - y : y - x);
+                }
+                if (opcode == 0x0F) difference += interp_vec_element(&accumulate, size, lane);
+                interp_vec_set_element(&result, size, lane, difference & mask);
+            }
+            break;
+        }
+        case 0x16: { // SQDMULH / SQRDMULH: doubled high half of the product, saturating
+            if (size == 0 || size == 3)
+                return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated SQDMULH element size");
+            unsigned esize = 8u << size;
+            for (unsigned lane = 0; lane < lanes; lane++) {
+                int64_t x = (int64_t)interp_element_sext(interp_vec_element(&left, size, lane), size);
+                int64_t y = (int64_t)interp_element_sext(interp_vec_element(&right, size, lane), size);
+                // esize is 16 or 32 here, so 2*x*y fits in int64 with room and no wide type is needed.
+                int64_t product = 2 * x * y;
+                if (u) product += (int64_t)(UINT64_C(1) << (esize - 1u)); // SQRDMULH rounds
+                int64_t narrowed = product >> esize;
+                int64_t max = (int64_t)((UINT64_C(1) << (esize - 1u)) - 1u), min = -max - 1;
+                if (narrowed > max) {
+                    interp_fpsr_raise(INTERP_FPSR_QC);
+                    narrowed = max;
+                } else if (narrowed < min) {
+                    interp_fpsr_raise(INTERP_FPSR_QC);
+                    narrowed = min;
+                }
+                interp_vec_set_element(&result, size, lane, (uint64_t)narrowed & mask);
+            }
+            break;
+        }
         case 0x06:   // CMGT (U=0) / CMHI (U=1)
         case 0x07:   // CMGE (U=0) / CMHS (U=1)
         case 0x11: { // CMTST (U=0) / CMEQ (U=1)
@@ -3765,8 +4746,17 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             }
             break;
         }
-        case 0x13: { // MUL (U=0). PMUL (U=1) is polynomial multiply, which is a different operation.
-            if (u) return interp_undefined(cpu, insn, "AdvSIMD three same -- PMUL (polynomial multiply)");
+        case 0x13: { // MUL (U=0) / PMUL (U=1), which is carry-less polynomial multiply, not a scaled product
+            if (u) {
+                if (size != 0) return interp_undefined(cpu, insn, "AdvSIMD three same -- PMUL requires 8B/16B");
+                for (unsigned lane = 0; lane < lanes; lane++) {
+                    uint64_t low, high;
+                    interp_poly_mul(interp_vec_element(&left, 0, lane), interp_vec_element(&right, 0, lane), 8,
+                                    &low, &high);
+                    interp_vec_set_element(&result, 0, lane, low & 0xFFu);
+                }
+                break;
+            }
             if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD three same -- 64-bit element MUL");
             for (unsigned lane = 0; lane < lanes; lane++)
                 interp_vec_set_element(&result, size, lane,
@@ -4012,13 +5002,21 @@ static void *translate_block(uint64_t gpc) {
 // host_v[] stay untouched (they remain part of the checkpoint image, which is why they are still in
 // struct cpu at all).
 //
-// External linkage with hidden visibility mirrors what the AArch64 arms of core/dispatch.c and
-// guest/x86_64/translate.c do, for the same reason: core/target/aarch64.c takes &block_return, and a symbol
-// that is taken by address should be one symbol.
-void run_block(struct cpu *cpu, void *code) __attribute__((visibility("hidden")));
-void block_return(void) __attribute__((visibility("hidden")));
+// LOCAL linkage, and that is load-bearing rather than tidiness. __attribute__((visibility("hidden"))) is not
+// local linkage: it controls export from a shared object, but the symbol stays STB_GLOBAL inside a static link.
+// The dual activation archive links BOTH per-guest-ISA target objects into one binary, and core/target/
+// namespace.h -- which renames the per-ISA symbols precisely so the two can coexist -- does not cover these
+// two names, so a global run_block in each interpreter is a multiple definition. `static` also matches what the
+// JIT already does: its trampolines come from a file-scope __asm__ block containing `.hidden`, which the
+// assembler emits as a genuinely local symbol (nm reports a lowercase `t`, not `T`).
+//
+// Nothing is lost. interp.c is #included into the target translation unit, so every caller is in this same TU:
+// core/dispatch.c's run_block(c, code) call and core/target/aarch64.c taking &block_return. Taking the address
+// of a static function within its TU is ordinary C.
+static void run_block(struct cpu *cpu, void *code);
+static void block_return(void);
 
-void run_block(struct cpu *cpu, void *code) {
+static void run_block(struct cpu *cpu, void *code) {
     const struct interp_block *block = (const struct interp_block *)code;
     if (block == NULL || block->magic != INTERP_BLOCK_MAGIC) {
         // Not a descriptor this backend wrote. The only way to get here is a restored persistent cache or
@@ -4081,7 +5079,7 @@ void run_block(struct cpu *cpu, void *code) {
 // Aborting rather than returning is the point: a silent return would leave cpu->reason holding the previous
 // block's value and send the dispatcher round the loop against stale state, turning a specific bug into an
 // unbounded spin somewhere else.
-void block_return(void) {
+static void block_return(void) {
     fprintf(stderr, "hl: block_return() entered under the aarch64 interpreter backend on a " HL_HOST_CPU_NAME
                     " host.\n"
                     "    Nothing in the code arena is executable here, so no translated block can have branched\n"
