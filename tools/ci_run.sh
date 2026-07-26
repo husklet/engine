@@ -46,9 +46,19 @@ fi
 
 [ "$status" -ne 0 ] || exit 0
 
-# Prefer the lines that name a failing test or gate; fall back to the tail.
-detail=$(grep -aE '^(test .+ (FAILED|panicked)|failures:|error(\[|:)|thread .+ panicked|The following tests FAILED|[[:space:]]+[0-9]+ - .+(Failed|Timeout)|VIOLATION:|make(\[[0-9]+\])?: \*\*\*)' \
-	"$log" | head -n 25)
+# Prefer the lines that name a failing test or gate; fall back to the tail. A
+# panic line alone does not say what broke, so keep the four lines after it: for
+# cargo that is the assertion, its left/right values, and the note. `---- x ----`
+# and `test result: FAILED` carry the failing test's name and the pass/fail
+# counts; SKIP lines say which runtime self-skips fired on this host.
+detail=$(awk '
+	/^(test .+ (FAILED|panicked)|test result: FAILED|failures:|---- .+ ----|error(\[|:)|ERROR:|The following tests FAILED|VIOLATION:)/ { print; next }
+	/^[[:space:]]*(SKIP|assertion) /                                                                                              { print; next }
+	/^[[:space:]]+[0-9]+ - .+(Failed|Timeout)/                                                                                    { print; next }
+	/^make(\[[0-9]+\])?: \*\*\*/                                                                                            { print; next }
+	/^thread .+ panicked/ { print; window = 4; next }
+	window > 0            { print; window--; next }
+' "$log" | head -n 60)
 [ -n "$detail" ] || detail=$(tail -c 1500 "$log")
 [ -n "$detail" ] || detail='the gate produced no output'
 detail=${detail//'%'/'%25'}

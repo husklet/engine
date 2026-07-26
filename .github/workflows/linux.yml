@@ -25,6 +25,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Host facts as a ::notice annotation. A gate that passes on a dev host and
+      # fails here differs by environment, and the job-log endpoint needs admin
+      # rights -- so the comparison has to travel through the annotations API.
+      - name: Runner environment
+        timeout-minutes: 5
+        run: tools/ci_env.sh ubuntu-24.04-arm
+
       - uses: DeterminateSystems/nix-installer-action@v22
         with:
           # Disable the post-run install-diagnostic upload: it periodically hangs
@@ -177,9 +184,15 @@ jobs:
       #     its /proc/self/limits private-descriptor-band check.
       # There is no continue-on-error and no --skip masking list: a real regression
       # fails the job.
+      #
+      # --no-fail-fast because cargo otherwise stops at the first failing target:
+      # a red `spec` hid whatever `terminal` and `traits` would have said, and the
+      # public check-run data carries only the annotation this step emits. It
+      # weakens nothing -- every failure still fails the job, there are just more
+      # of them named in one run.
       - name: Full Rust integration suite
         timeout-minutes: 25
-        run: tools/ci_run.sh 1320 "Full Rust integration suite" -- nix develop --command cargo test --release --locked --manifest-path pkgs/rust/Cargo.toml
+        run: tools/ci_run.sh 1320 "Full Rust integration suite" -- nix develop --command cargo test --release --locked --no-fail-fast --manifest-path pkgs/rust/Cargo.toml
 
       # The launch and integration tests above prove the committed archive
       # works. This final hard gate independently proves that it is current.
