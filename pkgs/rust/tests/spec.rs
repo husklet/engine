@@ -1932,10 +1932,8 @@ int main(int argc, char **argv) {
 
 #[test]
 fn projected_directory_exposes_a_service_backed_device_to_a_real_guest() {
-    let base = std::env::temp_dir().join(format!(
-        "hl-provider-device-overlay-{}",
-        std::process::id()
-    ));
+    let base =
+        std::env::temp_dir().join(format!("hl-provider-device-overlay-{}", std::process::id()));
     let upper = base.join("upper");
     let work = base.join("work");
     let _ = fs::remove_dir_all(&base);
@@ -2010,10 +2008,7 @@ fn projected_directory_exposes_a_service_backed_device_to_a_real_guest() {
         .wait()
         .unwrap();
     let _ = fs::remove_dir_all(&base);
-    assert_eq!(
-        exit,
-        Exit::Code(0)
-    );
+    assert_eq!(exit, Exit::Code(0));
 }
 
 #[test]
