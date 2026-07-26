@@ -241,6 +241,62 @@ invariants)
 	check_shards "$wfdir/mac.yml" "$(lanes_in HL_CI_SHARDED_DARWIN)" I13 || exit 1
 	check_shards "$wfdir/linux.yml" "$(lanes_in HL_CI_SHARDED_LINUX)" I14 || exit 1
 
+	# I19: cross-host parity. I13 and I14 each compare ONE host's declared list
+	# against ONE workflow, so both hold for a lane that is simply absent from
+	# HL_CI_SHARDED_LINUX -- which is how compat-abi-corpus, compat-core-*,
+	# compat-isa-* and compat-soak (~270 cases) ran on macOS only for the life
+	# of the matrix, and why smcprecise could fail deterministically on the
+	# Linux engine with a manifest note claiming it passed. Asymmetry is now
+	# legal only when HL_CI_SHARDED_HOST_ONLY declares it.
+	linux_lanes=$(lanes_in HL_CI_SHARDED_LINUX)
+	darwin_lanes=$(lanes_in HL_CI_SHARDED_DARWIN)
+	host_only=$(lanes_in HL_CI_SHARDED_HOST_ONLY)
+	has() { printf '%s\n' $2 | grep -Fqx -- "$1"; }
+	parity=0
+	for lane in $darwin_lanes; do
+		has "$lane" "$linux_lanes" && continue
+		if ! printf '%s\n' $host_only | grep -Fqx -- "Darwin:$lane"; then
+			printf 'VIOLATION: I19 `%s` is sharded on Darwin only; declare `Darwin:%s` in HL_CI_SHARDED_HOST_ONLY or shard it on Linux\n' \
+				"$lane" "$lane" >&2
+			parity=1
+		fi
+	done
+	for lane in $linux_lanes; do
+		has "$lane" "$darwin_lanes" && continue
+		if ! printf '%s\n' $host_only | grep -Fqx -- "Linux:$lane"; then
+			printf 'VIOLATION: I19 `%s` is sharded on Linux only; declare `Linux:%s` in HL_CI_SHARDED_HOST_ONLY or shard it on Darwin\n' \
+				"$lane" "$lane" >&2
+			parity=1
+		fi
+	done
+	# A stale exemption is as dangerous as a missing lane: it silently blesses
+	# an asymmetry that no longer exists, or one that never did.
+	for entry in $host_only; do
+		host=${entry%%:*}
+		lane=${entry#*:}
+		case "$host" in
+		Linux) own=$linux_lanes; other=$darwin_lanes ;;
+		Darwin) own=$darwin_lanes; other=$linux_lanes ;;
+		*)
+			printf 'VIOLATION: I19 `%s` names no host; use Linux:<lane> or Darwin:<lane>\n' \
+				"$entry" >&2
+			parity=1
+			continue
+			;;
+		esac
+		if ! has "$lane" "$own"; then
+			printf 'VIOLATION: I19 `%s` exempts `%s`, absent from HL_CI_SHARDED_%s\n' \
+				"$entry" "$lane" "$host" >&2
+			parity=1
+		fi
+		if has "$lane" "$other"; then
+			printf 'VIOLATION: I19 `%s` is stale: `%s` is sharded on both hosts\n' \
+				"$entry" "$lane" >&2
+			parity=1
+		fi
+	done
+	[ "$parity" -eq 0 ] || exit 1
+
 	# I15: `ctest -L <label>` EXITS 0 when the label matches nothing. Every
 	# label-driven step must pass --no-tests=error or a dropped lane reports
 	# green. `-N` is listing, not running, and is exempt.
