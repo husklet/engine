@@ -690,6 +690,15 @@ static int64_t legacy_time_seconds(void *context) {
     return (int64_t)time(NULL);
 }
 
+// legacy.c dereferences a few guest pointers itself (arch_prctl GET_FS/GS, time's tloc, the legacy
+// timeval/utimbuf buffers). Same span validity the syscall handlers use, injected because the translator
+// may not reach into linux_abi. `address` arrives already folded to storage.
+static int legacy_access_ok(void *context, uint64_t address, uint64_t length, int write) {
+    (void)context;
+    return write ? host_range_writable((uintptr_t)address, (size_t)length)
+                 : host_range_mapped((uintptr_t)address, (size_t)length);
+}
+
 static int legacy_set_alarm(void *context, uint64_t seconds, uint64_t *remaining_seconds) {
     struct itimerval next = {{0, 0}, {0, 0}};
     struct itimerval previous = {{0, 0}, {0, 0}};

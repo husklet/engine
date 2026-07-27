@@ -31,14 +31,28 @@ static uint64_t x86_nonpie(const hl_x86_legacy_context *context, uint64_t addres
                : address;
 }
 
+// Fold a guest pointer to storage and prove the engine may touch it there. Every deref in this file is one
+// the KERNEL performs on the guest's behalf, so an unmapped (or read-only) destination is the guest's error
+// -- Linux answers EFAULT. Without the check the engine dereferences it and dies at 139 on a guest bug.
+// Returns 0 => the caller must serve EFAULT.
+static int x86_deref(const hl_x86_legacy_context *context, uint64_t address, uint64_t length, int write, void **out) {
+    uint64_t storage = x86_nonpie(context, address);
+    if (!context->access_ok(context->callback_context, storage, length, write)) return 0;
+    *out = (void *)(uintptr_t)storage;
+    return 1;
+}
+
+static const uint64_t EFAULT_RET = (uint64_t)-14;
+
 // Convert a guest `struct timeval[2]` (utimes/futimesat) at guest pointer `p` into `ts`. On x86-64 Linux a
 // `struct timeval` is {s64 tv_sec; s64 tv_usec} (16 bytes) -- NOT the host macOS layout (suseconds_t is 32b)
 // -- so read the four fields as raw s64 rather than casting to the host struct. Returns 1 if `ts` was filled,
 // 0 if p==NULL ("set to now": the caller then passes a NULL times pointer, which utimensat maps to UTIME_NOW
-// on both fields, matching Linux utimes(NULL)/futimesat(...,NULL)).
+// on both fields, matching Linux utimes(NULL)/futimesat(...,NULL)), -1 if p is unreadable (-> EFAULT).
 static int x86_tv2ts(const hl_x86_legacy_context *context, uint64_t p, struct timespec ts[2]) {
     if (!p) return 0;
-    int64_t *tv = (int64_t *)(uintptr_t)x86_nonpie(context, p);
+    int64_t *tv;
+    if (!x86_deref(context, p, 4 * sizeof(int64_t), 0, (void **)&tv)) return -1;
     ts[0].tv_sec = (time_t)tv[0];
     ts[0].tv_nsec = (long)tv[1] * 1000L;
     ts[1].tv_sec = (time_t)tv[2];
@@ -91,16 +105,18 @@ int hl_x86_legacy_normalize(struct cpu *c, const hl_x86_legacy_context *context)
             r[0] = 0;
             return 1;
         } // ARCH_SET_GS
-        if (r[7] == 0x1003) {
-            *(uint64_t *)r[6] = c->fs_base;
+        // ARCH_GET_FS/GS store the base THROUGH a guest pointer: fold it (a non-PIE's .bss slot is a low link
+        // vaddr) and prove it writable (Linux answers EFAULT; the raw store killed the engine on every linkage).
+        if (r[7] == 0x1003 || r[7] == 0x1004) {
+            uint64_t *slot;
+            if (!x86_deref(context, r[6], sizeof(uint64_t), 1, (void **)&slot)) {
+                r[0] = EFAULT_RET;
+                return 1;
+            }
+            *slot = r[7] == 0x1003 ? c->fs_base : c->gs_base;
             r[0] = 0;
             return 1;
-        } // ARCH_GET_FS
-        if (r[7] == 0x1004) {
-            *(uint64_t *)r[6] = c->gs_base;
-            r[0] = 0;
-            return 1;
-        } // ARCH_GET_GS
+        }
         r[0] = (uint64_t)-22;
         return 1; // EINVAL
     // --- path ops: prepend AT_FDCWD, shift the rest ---
@@ -208,7 +224,11 @@ int hl_x86_legacy_normalize(struct cpu *c, const hl_x86_legacy_context *context)
         static __thread struct timespec ts[2];
         uint64_t tp = r[6];
         if (tp) {
-            int64_t *ub = (int64_t *)(uintptr_t)x86_nonpie(context, tp);
+            int64_t *ub;
+            if (!x86_deref(context, tp, 2 * sizeof(int64_t), 0, (void **)&ub)) {
+                r[0] = EFAULT_RET;
+                return 1;
+            }
             ts[0].tv_sec = (time_t)ub[0];
             ts[0].tv_nsec = 0;
             ts[1].tv_sec = (time_t)ub[1];
@@ -224,7 +244,12 @@ int hl_x86_legacy_normalize(struct cpu *c, const hl_x86_legacy_context *context)
     }
     case 235: { // utimes(path, const struct timeval[2] | NULL)
         static __thread struct timespec ts[2];
-        r[2] = x86_tv2ts(context, r[6], ts) ? (uint64_t)ts : 0;
+        int filled = x86_tv2ts(context, r[6], ts);
+        if (filled < 0) {
+            r[0] = EFAULT_RET;
+            return 1;
+        }
+        r[2] = filled ? (uint64_t)ts : 0;
         r[6] = r[7];
         r[7] = ATFD;
         r[10] = 0;
@@ -234,7 +259,12 @@ int hl_x86_legacy_normalize(struct cpu *c, const hl_x86_legacy_context *context)
     case 261: { // futimesat(dirfd, path, const struct timeval[2] | NULL) -- dirfd(rdi)/path(rsi) already sit
                 // in the utimensat arg slots; only the times buffer (rdx) needs conversion.
         static __thread struct timespec ts[2];
-        r[2] = x86_tv2ts(context, r[2], ts) ? (uint64_t)ts : 0;
+        int filled = x86_tv2ts(context, r[2], ts);
+        if (filled < 0) {
+            r[0] = EFAULT_RET;
+            return 1;
+        }
+        r[2] = filled ? (uint64_t)ts : 0;
         r[10] = 0;
         r[0] = 280;
         return 0;
@@ -245,7 +275,14 @@ int hl_x86_legacy_normalize(struct cpu *c, const hl_x86_legacy_context *context)
     // non-NULL (a non-PIE .bss slot -> rebase before the store).
     case 201: {
         int64_t seconds = context->time_seconds(context->callback_context);
-        if (r[7]) *(int64_t *)(uintptr_t)x86_nonpie(context, r[7]) = seconds;
+        if (r[7]) {
+            int64_t *tloc;
+            if (!x86_deref(context, r[7], sizeof(int64_t), 1, (void **)&tloc)) {
+                r[0] = EFAULT_RET;
+                return 1;
+            }
+            *tloc = seconds;
+        }
         r[0] = (uint64_t)seconds;
         return 1;
     }
@@ -300,8 +337,13 @@ int hl_x86_legacy_normalize(struct cpu *c, const hl_x86_legacy_context *context)
     // (socat, apr's select-based sleep) do.
     case 23: {
         static __thread struct timespec sts;
-        if (r[8]) { // non-NULL timeout: timeval -> timespec
-            struct timeval *tv = (struct timeval *)r[8];
+        if (r[8]) { // non-NULL timeout: timeval -> timespec. Fold + guard like every other deref here; this
+                    // one had neither, so a non-PIE .bss timeout read garbage and a bad one killed the engine.
+            struct timeval *tv;
+            if (!x86_deref(context, r[8], sizeof(struct timeval), 0, (void **)&tv)) {
+                r[0] = EFAULT_RET;
+                return 1;
+            }
             sts.tv_sec = tv->tv_sec;
             sts.tv_nsec = (long)tv->tv_usec * 1000L;
             r[8] = (uint64_t)&sts;

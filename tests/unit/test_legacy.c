@@ -26,6 +26,16 @@ static int set_alarm(void *context, uint64_t seconds, uint64_t *remaining) {
     return state->alarm_error;
 }
 
+// The target's span validator (host_range_writable / host_range_mapped in core/target/x86_64.c). legacy.c
+// dereferences a few guest pointers itself, and Linux answers EFAULT for a destination the guest cannot
+// touch; without this the engine faulted instead. Here: reject the low page and a wrapping span, which is
+// enough to cover both the guest's NULL and its garbage pointer.
+static int access_ok(void *context, uint64_t address, uint64_t length, int write) {
+    (void)context;
+    (void)write;
+    return address >= 0x1000 && address + length >= address;
+}
+
 static void initialize(struct cpu *cpu, uint64_t number) {
     memset(cpu, 0, sizeof(*cpu));
     for (size_t index = 0; index < 16; ++index)
@@ -48,6 +58,7 @@ int main(void) {
     hl_x86_legacy_context context = {
         .time_seconds = now_seconds,
         .set_alarm = set_alarm,
+        .access_ok = access_ok,
         .callback_context = &state,
     };
     struct cpu cpu;
@@ -146,5 +157,47 @@ int main(void) {
     state.alarm_error = EPERM;
     initialize(&cpu, 37);
     HL_CHECK(hl_x86_legacy_normalize(&cpu, &context) == 1 && (int64_t)cpu.r[RAX] == -EPERM);
+
+    // Every guest pointer legacy.c dereferences itself must answer EFAULT rather than fault the engine.
+    // arch_prctl GET_FS/GET_GS store THROUGH the pointer, so the unguarded form killed the engine on every
+    // linkage; time/select/utime/utimes/futimesat read through theirs.
+    {
+        const struct {
+            uint64_t number, argument_register, value;
+        } faults[] = {
+            {158, RDI, 0x1003},
+            {158, RDI, 0x1004}, // arch_prctl GET_FS/GET_GS: destination in RSI
+        };
+
+        for (size_t index = 0; index < sizeof(faults) / sizeof(faults[0]); ++index) {
+            initialize(&cpu, faults[index].number);
+            cpu.r[faults[index].argument_register] = faults[index].value;
+            cpu.r[RSI] = 0; // NULL is EFAULT on Linux, not a silent skip
+            HL_CHECK(hl_x86_legacy_normalize(&cpu, &context) == 1 && (int64_t)cpu.r[RAX] == -EFAULT);
+            initialize(&cpu, faults[index].number);
+            cpu.r[faults[index].argument_register] = faults[index].value;
+            cpu.r[RSI] = UINT64_MAX;
+            HL_CHECK(hl_x86_legacy_normalize(&cpu, &context) == 1 && (int64_t)cpu.r[RAX] == -EFAULT);
+        }
+        initialize(&cpu, 201); // time(tloc)
+        cpu.r[RDI] = UINT64_MAX;
+        HL_CHECK(hl_x86_legacy_normalize(&cpu, &context) == 1 && (int64_t)cpu.r[RAX] == -EFAULT);
+        initialize(&cpu, 23); // select(..., timeval*)
+        cpu.r[8] = UINT64_MAX;
+        HL_CHECK(hl_x86_legacy_normalize(&cpu, &context) == 1 && (int64_t)cpu.r[RAX] == -EFAULT);
+        initialize(&cpu, 132); // utime(path, utimbuf*)
+        cpu.r[RSI] = UINT64_MAX;
+        HL_CHECK(hl_x86_legacy_normalize(&cpu, &context) == 1 && (int64_t)cpu.r[RAX] == -EFAULT);
+        initialize(&cpu, 235); // utimes(path, timeval[2])
+        cpu.r[RSI] = UINT64_MAX;
+        HL_CHECK(hl_x86_legacy_normalize(&cpu, &context) == 1 && (int64_t)cpu.r[RAX] == -EFAULT);
+        initialize(&cpu, 261); // futimesat(dirfd, path, timeval[2])
+        cpu.r[RDX] = UINT64_MAX;
+        HL_CHECK(hl_x86_legacy_normalize(&cpu, &context) == 1 && (int64_t)cpu.r[RAX] == -EFAULT);
+        // A NULL times pointer still means "now" -- it is not a fault.
+        initialize(&cpu, 235);
+        cpu.r[RSI] = 0;
+        HL_CHECK(hl_x86_legacy_normalize(&cpu, &context) == 0 && cpu.r[RAX] == 280 && cpu.r[RDX] == 0);
+    }
     return 0;
 }

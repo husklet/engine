@@ -1183,13 +1183,24 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             goto done;
         }
         case 0x52:   // vrsqrtps(NP)/ss(F3): approximate reciprocal square root
-        case 0x53: { // vrcpps(NP)/ss(F3): approximate reciprocal. Modeled at full float precision to
-            // match the reference x86 oracle (qemu) and the native-aarch64 golden, both of which use the
-            // full-precision 1/x rather than the hardware's ~12-bit table.
-            // These raise NO SIMD floating-point exception whatsoever -- measured against native for a
-            // denormal source, an overflow and a zero -- but the 1.0f/x standing in for the table is a real
-            // division and reports #D, #O, #P and (under DAZ) #Z. Park the sticky flags across the whole
-            // loop; the result is untouched.
+        case 0x53: { // vrcpps(NP)/ss(F3): approximate reciprocal.
+            // VALUE: the EXACT reciprocal, not the hardware estimate -- the same choice the legacy 0F 52/53
+            // lowering makes (translate.c), decided once for both encodings. The SDM specifies only a bound,
+            // |relerr| <= 1.5*2^-12, never a value, and the exact result satisfies it with error 0. There is
+            // no single hardware answer to copy: the 12-bit table is microarchitecture-specific (unlike
+            // VRCP14PS, which IS defined), so "match hardware" means "match one vendor's ROM" and a guest
+            // that depends on the raw bits already breaks when moved between native x86 parts. Measured on
+            // this host (Zen 4, legacy and VEX bit-identical): rcpps worst relative error 2^-11.63,
+            // rsqrtps 2^-11.92, both inside the bound. On the aarch64 host there is no cheap conforming
+            // approximation either -- FRECPE is an 8-bit estimate, outside the x86 bound, so it would need a
+            // Newton step anyway, at which point exact is simpler and strictly closer.
+            // FLAGS: these raise NO SIMD floating-point exception whatsoever -- measured against native for
+            // a denormal source, an overflow, a zero, a negative and both NaN classes -- but the 1.0f/x
+            // standing in for the table is a real division and reports #D, #O, #P and (under DAZ) #Z. Park
+            // the sticky flags across the whole loop; the result is untouched.
+            // NaN: avx_dnan_f32 applies x86's rules host-independently -- a NaN input propagates quieted
+            // (7f800001 -> 7fc00001), and rsqrt of a negative yields x86's NEGATIVE indefinite ffc00000,
+            // where a bare ARM FSQRT would produce 7fc00000.
             unsigned parked = cvt_fp_flags();
             int rsqrt = (op == 0x52), scalar = (pp == 2);
             avx_get_rm(state, c, &I, next, scalar ? 4 : W, b);
@@ -1198,14 +1209,14 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                 memcpy(d, a, 16);
                 float x;
                 memcpy(&x, b, 4);
-                float y = rsqrt ? 1.0f / __builtin_sqrtf(x) : 1.0f / x;
+                float y = avx_dnan_f32(rsqrt ? 1.0f / __builtin_sqrtf(x) : 1.0f / x, x, x);
                 memcpy(d, &y, 4);
                 avx_put(c, rd, d, 16);
             } else {
                 for (int i = 0; i < W; i += 4) {
                     float x;
                     memcpy(&x, b + i, 4);
-                    float y = rsqrt ? 1.0f / __builtin_sqrtf(x) : 1.0f / x;
+                    float y = avx_dnan_f32(rsqrt ? 1.0f / __builtin_sqrtf(x) : 1.0f / x, x, x);
                     memcpy(d + i, &y, 4);
                 }
                 avx_put(c, rd, d, W);

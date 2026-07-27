@@ -5341,9 +5341,12 @@ static void *translate_block(uint64_t gpc) {
                         else
                             e_ins_s(vd, 0, 17, 0);
                     }
-                } else if (op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E || op == 0x51) {
+                } else if (op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E || op == 0x51 ||
+                           ((op == 0x52 || op == 0x53) && !I.p66 && !I.repne)) {
                     // add/mul/sub/div/min/max/sqrt. Prefix selects width: F2=scalar double, F3=scalar
                     // single, 66=PACKED double (.2d), none=PACKED single (.4s).
+                    // 0F 52 RSQRTPS/SS and 0F 53 RCPPS/SS join the UNARY group with sqrt: baseline SSE1,
+                    // single-precision only (66/F2 are reserved, excluded above -> UNIMPL as before).
                     int packed = !I.repne && !I.rep;
                     int s = vm;
                     if (I.is_mem) {
@@ -5360,7 +5363,14 @@ static void *translate_block(uint64_t gpc) {
                         s = 16;
                     }
                     int dbl = packed ? I.p66 : I.repne; // element type: double vs single
-                    if (packed && op != 0x51) {
+                    int unary = (op == 0x51 || op == 0x52 || op == 0x53);
+                    // RSQRT/RCP raise NO SIMD FP exception at all (SDM; measured against native for a
+                    // denormal, an overflow, a zero, a negative and both NaN classes). The FSQRT/FDIV
+                    // standing in for the hardware table DO raise #D/#O/#P/#Z, so park FPSR across the
+                    // whole sequence -- the same rule avx.c applies to the VEX forms.
+                    int park = (op == 0x52 || op == 0x53);
+                    if (park) emit32(0xD53B4420u | 16); // mrs x16, fpsr
+                    if (packed && !unary) {
                         // ---- packed add/sub/mul/div: RESULT gate ----
                         // Replaces the NaN-INPUT gate + emit_dnan_pre/post pair used below (which cost 16
                         // host instructions for one guest op -- 30 of the 53 instructions the float_simd
@@ -5405,7 +5415,7 @@ static void *translate_block(uint64_t gpc) {
                         *p_cbnz = 0x35000000u | ((uint32_t)(((Lfast - (uint8_t *)p_cbnz) / 4) & 0x7FFFF) << 5) | 16;
                         e_vmov(vd, 18);
                     } else {
-                        if (op != 0x51) {
+                        if (!unary) {
                             // ---- NaN-input gate ----
                             // NEON FADD/FMUL/FSUB/FDIV + emit_dnan is bit-exact to x86 for finite inputs, for a
                             // GENERATED NaN (fixed up below), and for a SINGLE NaN input (propagated + quieted,
@@ -5436,15 +5446,23 @@ static void *translate_block(uint64_t gpc) {
                             *p_cbz = cbz | ((uint32_t)(((Lfast - (uint8_t *)p_cbz) / 4) & 0x7FFFF) << 5) | 16;
                         }
                         int fixnan = fpdnan_on();
-                        if (fixnan) emit_dnan_pre(vd, s, op != 0x51, dbl); // capture "no input NaN" (uses v20/v21)
-                        if (packed) {                                      // vector FP: 66 -> .2d (sz bit), none -> .4s
+                        if (fixnan) emit_dnan_pre(vd, s, !unary, dbl); // capture "no input NaN" (uses v20/v21)
+                        if (packed) {                                  // vector FP: 66 -> .2d (sz bit), none -> .4s
                             uint32_t d = I.p66 ? 0x00400000u : 0;
                             uint32_t b = op == 0x58   ? 0x4E20D400u  // FADD
                                          : op == 0x59 ? 0x6E20DC00u  // FMUL
                                          : op == 0x5C ? 0x4EA0D400u  // FSUB
                                          : op == 0x5E ? 0x6E20FC00u  // FDIV
                                                       : 0x6EA1F800u; // FSQRT (2-reg)  [min/max: see 0x5D/0x5F above]
-                            if (op == 0x51)
+                            if (op == 0x52 || op == 0x53) {
+                                emit32(0x4F03F600u | 19); // fmov v19.4s, #1.0
+                                int n = s;
+                                if (op == 0x52) {
+                                    emit32(0x6EA1F800u | (s << 5) | 18); // fsqrt v18.4s, s.4s
+                                    n = 18;
+                                }
+                                emit32(0x6E20FC00u | (n << 16) | (19 << 5) | vd); // fdiv vd.4s, v19.4s, vn.4s
+                            } else if (op == 0x51)
                                 emit32(b | d | (s << 5) | vd); // FSQRT vd.T, s.T
                             else
                                 emit32(b | d | (s << 16) | (vd << 5) | vd); // op vd.T, vd.T, s.T
@@ -5459,7 +5477,15 @@ static void *translate_block(uint64_t gpc) {
                             // element; the rest of the destination is architecturally PRESERVED. The ARM
                             // scalar forms zero everything above the element, so land the result in
                             // scratch v18 (which the default-NaN fixup then stamps) and INS it back.
-                            if (op == 0x51)
+                            if (op == 0x52 || op == 0x53) {
+                                emit32(0x1E2E1000u | 19); // fmov s19, #1.0
+                                int n = s;
+                                if (op == 0x52) {
+                                    emit32(0x1E21C000u | (s << 5) | 18); // fsqrt s18, s
+                                    n = 18;
+                                }
+                                emit32(0x1E201800u | (n << 16) | (19 << 5) | 18); // fdiv s18, s19, sn
+                            } else if (op == 0x51)
                                 emit32(b | ty | (s << 5) | 18); // FSQRT s18/d18, s
                             else
                                 emit32(b | ty | (s << 16) | (vd << 5) | 18); // FADD/... s18/d18, vd, s
@@ -5473,6 +5499,7 @@ static void *translate_block(uint64_t gpc) {
                                 e_ins_s(vd, 0, 18, 0);
                         }
                     }
+                    if (park) emit32(0xD51B4420u | 16); // msr fpsr, x16
                 } else if (op == 0x5A) {
                     // 0F 5A is FOUR instructions, selected by the mandatory prefix:
                     //   F2 cvtsd2ss   F3 cvtss2sd   66 cvtpd2ps (PACKED)   none cvtps2pd (PACKED)
