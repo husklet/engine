@@ -6,6 +6,25 @@
 # signed launches per process) live in Phase4Mac.cmake behind the host guard.
 # ---------------------------------------------------------------------------
 
+# --- host guard -------------------------------------------------------------
+# The native-Linux lane below (section 2b onward) is already behind
+# `if(CMAKE_SYSTEM_NAME STREQUAL "Linux")`, and the FATAL_ERROR sweep at the end
+# of this file -- six test-name patterns, each of which MUST match at least one
+# registered test or configure dies -- sits inside it. That guard is load-bearing
+# and must not be relaxed to admit a host that does not register those six lanes.
+# This early return is the safe way to add a host: sections 1-2 (the guest
+# fixtures) are host-agnostic only in the sense that they drive Linux cross
+# compilers, which a Windows host does not have, so there is nothing above the
+# guard for it to do either.
+#
+# Purely additive: false on Linux and Darwin, where the file is unchanged.
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  message(STATUS
+    "Windows host -- the e2e/checkpoint/perf gates are not registered "
+    "(see docs/windows/build-system.md M8).")
+  return()
+endif()
+
 set(HL_E2E  ${CMAKE_BINARY_DIR}/e2e)
 set(HL_PERF ${CMAKE_BINARY_DIR}/perf)
 set(_o2 -O2)

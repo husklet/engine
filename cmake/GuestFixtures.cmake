@@ -64,6 +64,26 @@ set(HL_GUEST_ARCHES aarch64 x86_64)
 # it vanished.
 option(HL_GUEST_TESTS "build the guest test fixtures (needs Linux cross compilers)" AUTO)
 set(HL_HAVE_GUEST_CC TRUE)
+
+# A Windows host has no route to these compilers at all: nix does not run
+# natively on Windows and no MSYS2 package supplies an x86_64-linux-gnu /
+# aarch64-linux-gnu cross gcc with a static glibc. Even were one found, a corpus
+# built against a different glibc than CI's produces different goldens, so
+# "it compiled" is not the bar -- byte-identical output against the nix build is.
+# Decide it here, positively, rather than letting the fixture-less configure fall
+# out of two empty environment variables: this is the single condition that keeps
+# Phase3Compat, Phase3Gates, Phase4Mac and LaneParity out of a Windows configure
+# (CMakeLists.txt gates all four on HL_HAVE_GUEST_CC), and it should be findable.
+# See docs/windows/build-system.md 4.
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  set(HL_HAVE_GUEST_CC FALSE)
+  message(STATUS
+    "Windows host -- guest test fixtures and every suite that runs one are DISABLED. "
+    "There is no Windows-hosted Linux cross toolchain with a static glibc matching CI's. "
+    "The libraries and host unit lane are the supported Windows configuration.")
+  return()
+endif()
+
 foreach(_a ${HL_GUEST_ARCHES})
   if(NOT HL_GUEST_CC_${_a})
     set(HL_HAVE_GUEST_CC FALSE)

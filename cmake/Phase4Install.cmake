@@ -26,6 +26,12 @@ set(HL_VERSION 0.1.10)
 # The Makefile's HOST/HOST_ARCH conditionals (lines 165-207), reproduced.
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   set(HL_PACKAGE_HOST macos)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  # -lhl-host-windows names an archive that does not exist yet (M4). Emitting
+  # `windows` anyway is still right: the alternative is emitting `linux`, i.e. a
+  # .pc file that names the WRONG archive rather than a missing one, which is
+  # exactly the class of path-literal bug docs/amd64-host.md 8.1 records.
+  set(HL_PACKAGE_HOST windows)
 else()
   set(HL_PACKAGE_HOST linux)
 endif()
@@ -121,6 +127,10 @@ if(TARGET hl-host-linux)
   list(APPEND HL_INSTALL_LIBS hl-host-linux)
 elseif(TARGET hl-host-macos)
   list(APPEND HL_INSTALL_LIBS hl-host-macos)
+elseif(TARGET hl-host-windows)
+  # Not built yet (M4). Asks the build graph rather than the OS, so the arm needs
+  # no further edit when CMakeLists.txt starts defining the target.
+  list(APPEND HL_INSTALL_LIBS hl-host-windows)
 endif()
 
 install(TARGETS ${HL_INSTALL_LIBS} ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})

@@ -11,7 +11,15 @@ if(NOT HL_HAVE_GUEST_CC)
   return()
 endif()
 
-find_program(HL_BASH_EXECUTABLE NAMES bash REQUIRED)
+# HL_BASH_EXECUTABLE is found once, in CMakeLists.txt, and is OPTIONAL there.
+# Unreachable without it in practice -- this file already requires
+# HL_HAVE_GUEST_CC, i.e. the nix devShell, which supplies bash -- but the
+# duplicate REQUIRED find_program that used to sit here would have failed a
+# configure rather than skipping one test.
+if(NOT HL_BASH_EXECUTABLE)
+  message(STATUS "bash not found -- gate.ci-lane-parity is not registered")
+  return()
+endif()
 
 # The host is the (OS, CPU) PAIR, not the OS: the two Linux host CPUs register
 # different tests (perf.native-*, isa-fuzz.aarch64-*), so a lane empty on one and

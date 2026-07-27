@@ -24,7 +24,25 @@
 cmake_minimum_required(VERSION 3.20)
 project(hl_engine LANGUAGES C)
 
-find_program(HL_BASH_EXECUTABLE NAMES bash REQUIRED)
+# The shell. OPTIONAL, and found exactly once: cmake/Phase3CiConfig.cmake and
+# cmake/LaneParity.cmake used to repeat this call with REQUIRED, so three
+# separate sites could fail a configure over a tool that only two CTest cases
+# and a handful of developer/release targets actually need. A Windows host has
+# no bash unless MSYS2/Git-for-Windows is installed, and nothing in the compile
+# graph needs one (cmake/ArchiveStamp.cmake's command is only pulled in by the
+# Linux and Darwin production lanes). So: find it, say so when it is missing,
+# and let each bash-backed target/test gate on it -- the pattern
+# cmake/Format.cmake, cmake/Lint.cmake and cmake/RustLint.cmake already use for
+# clang-format, the linter and cargo.
+find_program(HL_BASH_EXECUTABLE NAMES bash)
+if(NOT HL_BASH_EXECUTABLE)
+  message(STATUS
+    "bash not found -- the shell-backed CTest cases (unit.ci-workflow-invariants, "
+    "unit.publish-gating, gate.ci-lane-parity, gate.archive-closure) and the "
+    "crate-archive targets (check-crate-archives, refresh-crate-archives*) are NOT "
+    "registered. The libraries, engines and runner still build. Install MSYS2 or "
+    "Git for Windows to get them.")
+endif()
 
 # The host-CPU axis. DOCS.md section 1's "host platform" is really two axes, host
 # OS and host CPU, and only the first ever had a name here. Name it once and
@@ -44,6 +62,8 @@ endif()
 # gets published as the aarch64 crate asset.
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   set(HL_PACKAGE_ARCH_DIR ${CMAKE_BINARY_DIR}/package/macos-${HL_HOST_ARCH})
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  set(HL_PACKAGE_ARCH_DIR ${CMAKE_BINARY_DIR}/package/windows-${HL_HOST_ARCH})
 else()
   set(HL_PACKAGE_ARCH_DIR ${CMAKE_BINARY_DIR}/package/linux-${HL_HOST_ARCH})
 endif()
@@ -95,8 +115,19 @@ target_compile_options(hl_engine_cflags INTERFACE
   -std=c11
   -Wall -Wextra -Wpedantic -Wconversion -Wshadow
   -Wstrict-prototypes -Wmissing-prototypes
-  -Werror=implicit-function-declaration -Werror=implicit-int
-  -fvisibility=hidden)
+  -Werror=implicit-function-declaration -Werror=implicit-int)
+
+# -fvisibility=hidden is an ELF/Mach-O concept with no PE/COFF equivalent:
+# Windows exports are per-symbol (__declspec(dllexport)) or by a .def file, and
+# only mean anything at a DLL boundary. This project builds STATIC archives and
+# executables exclusively, so on Windows the flag is at best a no-op and at
+# worst a per-TU warning. Appended (rather than left inline above) so the flag
+# ORDER on Linux and Darwin is byte-identical to what it was.
+# Nothing replaces it: introducing a dllexport/dllimport HL_API macro is a
+# public-ABI decision, not a Windows-port detail. See docs/windows/build-system.md 2.2.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  target_compile_options(hl_engine_cflags INTERFACE -fvisibility=hidden)
+endif()
 
 # --- source lists -----------------------------------------------------------
 set(PROVIDER_SOURCES
@@ -197,6 +228,18 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     ${MACOS_HOST_SOURCES} ${COMMON_HOST_SOURCES}
     src/host/clock.c src/host/file.c)
   target_link_libraries(hl-host-macos PRIVATE hl_engine_cflags)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  # No libhl-host-windows yet. src/host/windows/ reserves the boundary and holds
+  # only a README; COMMON_HOST_SOURCES is not portable to it as it stands
+  # (resolve.c needs the *at() family, child.c needs SIGCHLD, fork_wire.c needs
+  # SCM_RIGHTS, private.c needs a fork-inherited shared mapping). That archive is
+  # milestone M4 in docs/windows/build-system.md and brings the
+  # COMMON_HOST_SOURCES re-split with it. Everything downstream asks
+  # `if(TARGET hl-host-windows)` rather than testing the OS, so adding the arm
+  # later is a one-place change.
+  message(STATUS
+    "Windows host: no libhl-host-windows yet (src/host/windows/ is a reserved "
+    "boundary). The host-neutral archives still build.")
 endif()
 
 # --- Phase 2: Linux production engines + dual embedded activation archive ----
@@ -250,7 +293,7 @@ endif()
 # Preserve the Linux-to-macOS transport entry point.  The real Darwin build
 # and CTest registry remain authoritative; this target only drives them over
 # OrbStack's shared-checkout `mac` command.
-if(HL_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(HL_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND HL_BASH_EXECUTABLE)
   add_custom_target(perf-macos-remote
     COMMAND ${HL_BASH_EXECUTABLE}
             ${CMAKE_SOURCE_DIR}/tools/run_remote_macos_ctest.sh
@@ -261,30 +304,36 @@ if(HL_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     USES_TERMINAL)
 endif()
 
-add_custom_target(check-crate-archives
-  COMMAND ${HL_BASH_EXECUTABLE}
-          ${CMAKE_SOURCE_DIR}/tools/check_crate_archives.sh
-  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-  USES_TERMINAL)
+# Release/developer targets, all four of them shell scripts. Gated on the shell
+# rather than on the OS: tools/refresh_crate_archives.sh refuses a non-Linux
+# `uname -s` of its own accord, so the OS test would be a second, weaker copy of
+# a rule the script already enforces. Absent bash they are simply not declared.
+if(HL_BASH_EXECUTABLE)
+  add_custom_target(check-crate-archives
+    COMMAND ${HL_BASH_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tools/check_crate_archives.sh
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    USES_TERMINAL)
 
-add_custom_target(refresh-crate-archives
-  COMMAND ${CMAKE_COMMAND} -E env
-          BUILD=${CMAKE_BINARY_DIR}/crate-archives
-          ${HL_BASH_EXECUTABLE}
-          ${CMAKE_SOURCE_DIR}/tools/refresh_crate_archives.sh
-  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-  USES_TERMINAL)
-
-# The halves, for a host that is not both aarch64 Linux and Apple silicon.
-foreach(_half linux darwin provenance)
-  add_custom_target(refresh-crate-archives-${_half}
+  add_custom_target(refresh-crate-archives
     COMMAND ${CMAKE_COMMAND} -E env
             BUILD=${CMAKE_BINARY_DIR}/crate-archives
             ${HL_BASH_EXECUTABLE}
-            ${CMAKE_SOURCE_DIR}/tools/refresh_crate_archives.sh --${_half}
+            ${CMAKE_SOURCE_DIR}/tools/refresh_crate_archives.sh
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)
-endforeach()
+
+  # The halves, for a host that is not both aarch64 Linux and Apple silicon.
+  foreach(_half linux darwin provenance)
+    add_custom_target(refresh-crate-archives-${_half}
+      COMMAND ${CMAKE_COMMAND} -E env
+              BUILD=${CMAKE_BINARY_DIR}/crate-archives
+              ${HL_BASH_EXECUTABLE}
+              ${CMAKE_SOURCE_DIR}/tools/refresh_crate_archives.sh --${_half}
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      USES_TERMINAL)
+  endforeach()
+endif()
 
 # --- clang-format targets ---------------------------------------------------
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Format.cmake)

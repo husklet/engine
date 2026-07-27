@@ -14,6 +14,23 @@
 function(hl_archive_stamp_setup)
   set(_dir "${CMAKE_BINARY_DIR}/archive-stamp")
   set(HL_ARCHIVE_STAMP_HEADER "${_dir}/hl_archive_stamp.h" PARENT_SCOPE)
+  # tools/gen_archive_stamp.sh is a shell script and HL_BASH_EXECUTABLE is
+  # optional (CMakeLists.txt). This function is called unconditionally from
+  # cmake/Phase2Production.cmake, ABOVE its Linux guard, so it is evaluated on
+  # every host including one with no shell. An add_custom_command whose COMMAND
+  # begins with an empty variable is not a build error -- it is a silently
+  # successful no-op that hands the compiler a -include naming a file that was
+  # never written. Declare a target that fails loudly instead. Nothing depends on
+  # it here: hl_stamp_archive_object() is only called from the Linux (Phase 2)
+  # and Darwin (Phase 4) archive lanes, both of which have bash by construction.
+  if(NOT HL_BASH_EXECUTABLE)
+    add_custom_target(hl-archive-stamp
+      COMMAND ${CMAKE_COMMAND} -E echo
+              "hl-archive-stamp needs bash to run tools/gen_archive_stamp.sh"
+      COMMAND ${CMAKE_COMMAND} -E false
+      COMMENT "hl-archive-stamp (unavailable: no bash)")
+    return()
+  endif()
   add_custom_command(
     OUTPUT "${_dir}/hl_archive_stamp.h"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_dir}"

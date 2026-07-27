@@ -23,8 +23,12 @@ target_compile_options(hl_lint PRIVATE
   -O2 -g -std=c11
   -Wall -Wextra -Wpedantic -Wconversion -Wshadow
   -Wstrict-prototypes -Wmissing-prototypes
-  -Werror=implicit-function-declaration -Werror=implicit-int
-  -fvisibility=hidden)
+  -Werror=implicit-function-declaration -Werror=implicit-int)
+# Same reason as CMakeLists.txt's hl_engine_cflags: no PE/COFF equivalent, and
+# hl_lint is an executable, so the flag can only cost a warning per TU here.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  target_compile_options(hl_lint PRIVATE -fvisibility=hidden)
+endif()
 
 set_target_properties(hl_lint PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")

@@ -87,6 +87,35 @@ static inline void *hl_host_uc_xmm(ucontext_t *context) {
 
 #define HL_HOST_UC_XMM(uc) hl_host_uc_xmm(uc)
 
+/* Windows / x86-64 -- host-neutral macros only, like the macOS/x86-64 arm above,
+ * so the matrix stays total.
+ *
+ * Windows has no ucontext_t and no signal-handler context at all. The equivalent
+ * is a CONTEXT record, reached as EXCEPTION_POINTERS->ContextRecord inside a
+ * vectored exception handler, and mutating it before returning
+ * EXCEPTION_CONTINUE_EXECUTION is the analogue of editing a ucontext_t and
+ * returning from a POSIX handler. So HL_HOST_UC_PC / HL_HOST_UC_SP are spelled
+ * here over CONTEXT.Rip / CONTEXT.Rsp -- but note that the ARGUMENT TYPE differs
+ * from every other arm: `uc` is a CONTEXT *, not a ucontext_t *. Making that
+ * asymmetry disappear (a typed hl_host_context_t, or two accessor families) is a
+ * host-contract decision, not a build-system one; it is owned by the
+ * signals-and-faults work and must be settled before hl-host-windows exists.
+ *
+ * No HL_HOST_HAS_X64_CONTEXT: the Linux/x86-64 arm's remaining surface is the
+ * gregset_t index family (HL_HOST_UC_GREGS + the REG_* re-exports) and an
+ * fpregs->_xmm pointer, and a Windows CONTEXT has neither -- named fields and
+ * XMM0..15 / XSAVE areas instead. Claiming the flag would make code that only
+ * ever compiled against gregs indices try to compile here.
+ *
+ * DELIBERATELY includes no Windows header. These are textual macros, nothing
+ * expands them on Windows today, and pulling <windows.h> into every translator
+ * and linux_abi TU that includes this file (nine of them) to satisfy an unused
+ * arm would be a large and gratuitous blast radius. Whichever TU first expands
+ * them will be a Windows-host TU and will have included <windows.h> already. */
+#elif defined(_WIN32) && defined(HL_HOST_CPU_X86_64)
+#define HL_HOST_UC_PC(uc) ((uc)->Rip)
+#define HL_HOST_UC_SP(uc) ((uc)->Rsp)
+
 #else
 #error "hl engine has no signal-context mapping for this host OS and CPU"
 #endif

@@ -25,6 +25,22 @@
 # always agree here.
 # ---------------------------------------------------------------------------
 
+# Windows: not yet. Two independent blockers, both structural rather than
+# cosmetic. (1) The `_hostl` archive below resolves to hl-host-linux on any host
+# that is not Darwin, and no host archive exists on Windows at all until M4, so
+# fourteen unit binaries would be handed a library name with no target behind it.
+# (2) The archive-less cases name Linux sources directly (src/host/linux/
+# directory.c, process.c, system.c). Registering this lane needs
+# _HL_WINDOWS_EXCLUDED_UNITS, the Windows sibling of _HL_DARWIN_EXCLUDED_UNITS
+# below, and that list cannot be written before the archive it excludes against
+# exists. Milestone M6 in docs/windows/build-system.md.
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  message(STATUS
+    "Windows host -- the host unit lane is not registered yet (needs libhl-host-windows "
+    "and a _HL_WINDOWS_EXCLUDED_UNITS list; see docs/windows/build-system.md M6).")
+  return()
+endif()
+
 set(_HL_UNIT_DEFAULT_LIBS hl-engine hl-translator hl-linux-abi hl-host-fake)
 set(_HL_DARWIN_EXCLUDED_UNITS
   directory directory_services eventfd_fork linux_fork native pipe_linux

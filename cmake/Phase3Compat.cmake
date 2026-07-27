@@ -21,6 +21,29 @@
 # rule over a pattern rule.
 # ---------------------------------------------------------------------------
 
+# --- host guard -------------------------------------------------------------
+# Unlike Phase3Gates.cmake, which puts its native lane behind an explicit
+# `if(CMAKE_SYSTEM_NAME STREQUAL "Linux")` at section 2b, this file is almost
+# entirely UNGUARDED: the ~30 compat suites below are registered on whatever host
+# configures it, and the only host branches are the three that pick an engine
+# directory. Today it is reached solely through HL_HAVE_GUEST_CC, so the two
+# supported hosts are the only ones that ever see it and the omission is
+# invisible. On a host with no Windows arm that stops being true the moment guest
+# fixtures arrive from anywhere (an archive, WSL, a container): the suites would
+# point at ${CMAKE_BINARY_DIR}/linux-production, which Phase2Production.cmake:65
+# never builds off Linux, and the fixture-path prefix match further down is a
+# literal string compare that a path-separator difference empties.
+#
+# So state the guard now, while it costs nothing, rather than discovering it as a
+# wall of missing targets later. Purely additive: on Linux and Darwin the
+# condition is false and the file continues exactly as before.
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  message(STATUS
+    "Windows host -- the compat matrix is not registered (no Windows production "
+    "engine; see docs/windows/build-system.md M8).")
+  return()
+endif()
+
 set(HL_COMPAT ${CMAKE_BINARY_DIR}/compat)
 set(HL_TESTS  ${CMAKE_SOURCE_DIR}/tests)
 
