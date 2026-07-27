@@ -25,38 +25,53 @@ set(HL_CI_HOSTS
   Linux-aarch64
   Linux-x86_64
   Darwin-aarch64
+  Windows-x86_64
 )
 
-# Windows-x86_64 is NOT declared, and this records exactly why, because the
-# guards around it are already in place and the omission would otherwise read as
-# one of them having been forgotten.
+# Windows-x86_64 IS now declared, and this records what made it declarable,
+# because the previous state of this comment was a list of reasons not to.
 #
-# In place and verified on a Windows host: tools/check_lane_parity.sh has a
-# Windows arm selecting HL_CI_{SHARDED,DIRECT,REGISTRY}_WINDOWS;
-# cmake/LaneParity.cmake registers gate.ci-lane-parity on the real condition
-# (this host's token is declared here) instead of on the presence of guest cross
-# compilers, which a Windows host can never have and which has nothing to do
-# with whether its lanes are countable; tools/check_ci_workflows.sh's I20
-# iterates HL_CI_HOSTS through a token -> workflow map instead of testing the
-# literal Linux-x86_64, so a new token gets the shards-nothing guarantee
-# automatically; and its new I21 fails a token declared here with no lanes in
-# the three lists above. .github/workflows/windows-x86_64.yml exists.
+# The blocker was never the wiring -- tools/check_lane_parity.sh already had a
+# Windows arm selecting HL_CI_{SHARDED,DIRECT,REGISTRY}_WINDOWS,
+# cmake/LaneParity.cmake already keyed gate.ci-lane-parity on this list rather
+# than on guest cross compilers a Windows host can never have,
+# tools/check_ci_workflows.sh's I20 already iterated HL_CI_HOSTS through a
+# token -> workflow map, and its I21 already failed a token declared here whose
+# three lane lists are empty. The blocker was that `ctest -L unit` was RED
+# there: cmake/RustLint.cmake registers rust.fmt and rust.clippy with
+# LABELS "unit;rust" wherever cargo is on PATH -- it is on a hosted Windows
+# runner -- and rust.clippy failed because pkgs/rust/build.rs refused the host
+# triple, a build-script panic rather than a lint verdict.
 #
-# The one thing missing is a lane that is non-empty AND GREEN there.
-# HL_CI_DIRECT_WINDOWS would have to be `unit`, and `ctest -L unit` on a Windows
-# host is red: cmake/RustLint.cmake registers rust.fmt and rust.clippy with
-# LABELS "unit;rust" wherever cargo is on PATH, cargo is on PATH on a hosted
-# Windows runner, and rust.clippy fails there -- pkgs/rust/build.rs refuses the
-# host triple, so the failure is a build-script panic rather than a lint
-# verdict. rust.fmt passes. Everything else in the label passes:
-# unit.ci-workflow-invariants, unit.publish-gating and gate.windows-imports.
+# That is fixed. build.rs now accepts x86_64-pc-windows-msvc and downgrades the
+# missing prebuilt archive to a warning, so a check and a lint succeed while
+# only a LINK against the crate still fails. Measured on a Windows host,
+# `ctest -L unit` selects five cases and all five pass:
+# unit.ci-workflow-invariants, unit.publish-gating, gate.windows-imports,
+# rust.fmt and rust.clippy. Declaring the token adds gate.ci-lane-parity to that
+# same label, which is what makes the declaration self-checking.
 #
-# Declaring the token while that holds would declare a red lane, which is the
-# one thing this file exists to stop. Resolve the crate's Windows story first --
-# note the C build here is mingw-w64 (x86_64-w64-windows-gnu) while rustup's
-# default host is x86_64-pc-windows-msvc, so this is not only a missing archive
-# -- then add the token, HL_CI_DIRECT_WINDOWS with `unit`, and the empty
-# SHARDED/REGISTRY lists in one change. Everything else is already waiting.
+# The lists below are therefore `unit` and nothing else, and the two empties are
+# deliberate rather than unfinished:
+#   HL_CI_SHARDED_WINDOWS  -- a Windows host shards no compat lane. The guest
+#       corpus is not consumed there (cmake/Phase3Compat.cmake and
+#       cmake/Phase3Gates.cmake return at their own Windows guard) and there is
+#       no Windows production engine to run a fixture against. Adding an entry
+#       here without also adding the token to HL_CI_COMPAT_HOSTS is a violation
+#       I20 catches; doing both needs a measured green matrix first.
+#   HL_CI_REGISTRY_WINDOWS -- registry-only lanes reserve a LABEL against being
+#       renamed. Every label worth reserving on this host is guest-backed and
+#       does not register here, so reserving one would assert a selection that
+#       cannot be non-empty and gate.ci-lane-parity would fail on it.
+#
+# `package` is NOT declared, and that is the honest part of this change:
+# package.consumer-link registers on a Windows host and FAILS. It is labelled
+# `package`, never `unit`, so it is outside the declared lane -- but do not
+# promote it. The install leg passes now that hl-engine-runner links; the
+# consumer leg does not, because tests/integration/package.c has no Windows arm
+# and stops at `#error "the package integration test needs a supported host
+# provider"`. That is a real gap, not a toolchain accident, and the lane stays
+# undeclared until it closes.
 
 # Host tokens whose workflow shards the compat matrix. I19 requires cross-host
 # parity only between these; I20 requires a host NOT named here to shard nothing.
@@ -170,6 +185,17 @@ set(HL_CI_SHARDED_DARWIN
   compat-time
 )
 
+# Empty, and it must stay empty while Windows-x86_64 is absent from
+# HL_CI_COMPAT_HOSTS: I20 requires a non-compat host's workflow to name no lane,
+# so an entry here with no matching shard in windows-x86_64.yml fails I20, and a
+# shard added without the HL_CI_COMPAT_HOSTS entry fails it the other way. The
+# block exists rather than being omitted because tools/check_lane_parity.sh's
+# Windows arm reads it by name, and a missing block and an empty one are the
+# same thing to that parser -- but not to a reader deciding whether the omission
+# was a decision.
+set(HL_CI_SHARDED_WINDOWS
+)
+
 # --- declared single-host sharded lanes -------------------------------------
 # I19 requires every sharded lane to run on BOTH hosts, because that is the
 # only property neither I13 nor I14 can see: each of those compares ONE host's
@@ -213,6 +239,22 @@ set(HL_CI_DIRECT_DARWIN
   e2e-mac
 )
 
+# The whole of this host's declared surface: one lane, measured green on a
+# Windows host before it was written here.
+#
+# On this host `unit` is a SMALLER label than on Linux or Darwin -- no host unit
+# binary registers yet (cmake/Phase3Units.cmake returns at its Windows guard,
+# pending libhl-host-windows plus a _HL_WINDOWS_EXCLUDED_UNITS list), so what it
+# selects is the shell-backed CI metadata gates, the PE import gate, the two
+# cargo cases and gate.ci-lane-parity itself. That is not the same coverage the
+# name carries elsewhere, and .github/workflows/windows-x86_64.yml says so in
+# its scope block rather than letting a shared label imply parity.
+#
+# `package` is deliberately not here; see the note under HL_CI_HOSTS.
+set(HL_CI_DIRECT_WINDOWS
+  unit
+)
+
 # --- registry-only lanes ----------------------------------------------------
 # No workflow runs these today. They are still guarded: a label rename here is
 # exactly the kind of edit that would silently empty a future workflow step.
@@ -254,4 +296,14 @@ set(HL_CI_REGISTRY_DARWIN
   package-activation
   package-embedded
   perf-macos
+)
+
+# Empty on purpose. A registry-only lane is a RESERVATION -- it says "this label
+# must keep selecting something here even though no workflow runs it" -- and
+# gate.ci-lane-parity enforces exactly that. Every label that would be worth
+# reserving on this host (checkpoint, compat-*, production, perf-*, lifecycle)
+# is guest-backed and registers no case here at all, so reserving one would make
+# gate.ci-lane-parity fail rather than protect anything. Add an entry only once
+# the suite behind it registers on a Windows host.
+set(HL_CI_REGISTRY_WINDOWS
 )
