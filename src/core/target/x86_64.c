@@ -354,6 +354,13 @@ void emit_load_mem(struct insn *insn, uint64_t next, int width, int rt) {
 
 #include "../../translator/guest/x86_64/translate.c" // x86-64 translate_block + trampolines
 #include "../../translator/guest/x86_64/cache.c"     // persistent translated-code cache (HL_PCACHE=1)
+// The same-ISA transliterator is a THIRD arm of this fork and belongs to the interpreter's side of it
+// (translator/guest/x86_64/translit/, included by interp.c). The two hooks the rest of this file calls
+// exist here too, so the ARM64 host arm needs no #ifdef at either call site.
+static int translit_enabled(void) {
+    return 0;
+}
+static void translit_report(void) {}
 #else
 // interp.c defines the same names emit.c/translate.c/cache.c do, so everything below is host-identical.
 #include "../../translator/guest/x86_64/interp.c"
@@ -900,7 +907,11 @@ static int engine_global_init(void) {
     g_notier2x = 0;
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
-    sa.sa_flags = SA_SIGINFO;
+    // SA_ONSTACK only for the transliterator: it is the one backend whose HOST stack IS the guest stack, so
+    // a guest stack overflow leaves no room to build the SIGSEGV frame and the handler that would deliver
+    // the guest's signal never runs. The interpreter runs on its own host stack and does not need it, and
+    // adding the flag there would change an existing lane for nothing.
+    sa.sa_flags = SA_SIGINFO | (translit_enabled() ? SA_ONSTACK : 0);
     extern void jit86_lazyguard(int, siginfo_t *, void *);
     sa.sa_sigaction = jit86_lazyguard;
     sigaction(SIGSEGV, &sa, NULL);
@@ -1001,6 +1012,7 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
     if (g_untrusted) sentry_shutdown(); // signal quit + waitpid (reap, no orphan)
     if (g_fast_count)
         fprintf(stderr, "[fastsys] enabled=%d inline-served=%llu\n", g_fastsys, (unsigned long long)g_fast_count);
+    translit_report();
     if (g_prof)
         fprintf(stderr, "[prof] dispatcher round-trips=%llu  IBTC fills=%llu  (IBTC %s)\n",
                 (unsigned long long)g_disp_n, (unsigned long long)g_ibtc_fill, g_noibtc ? "OFF" : "ON");

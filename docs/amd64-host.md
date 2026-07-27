@@ -133,6 +133,13 @@ virtualised. That is already largely paid for: `struct cpu` carries `gs_base` al
 rather than executed. Guest `%gs` use is rare in practice; guest `%fs` use is ubiquitous and stays
 untouched.
 
+**Built, off by default: `docs/amd64-host-translit.md`.** The register model above is what
+`src/translator/guest/x86_64/translit/` implements, with two corrections this section got wrong. Guest `%fs`
+cannot "stay untouched" — leaving it live means putting the guest FS base in the host's, and every host
+signal handler then reads its TLS through it — so `%fs` is declined to the interpreter, not passed through.
+And the non-PIE bias fold is not something verbatim copying can carry at all, so a biased image is declined
+wholesale rather than transliterated.
+
 Scratch registers need no steal either. x86-64 addressing modes fold most of what the ARM64 side needed
 scratch for, and the sequences that genuinely need a temporary are the block-exit and chaining stubs, which
 run at block boundaries where all guest state is being spilled to `struct cpu` anyway. The one invariant to

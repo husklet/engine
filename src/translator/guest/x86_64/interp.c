@@ -129,12 +129,15 @@ static inline void interp_access_end(void) {
 
 int interp_signal_capture(struct cpu *cpu, void *native_context);
 void interp_signal_resume(struct cpu *cpu, void *native_context);
+static int translit_signal_capture(struct cpu *cpu, void *native_context); // translit/translit.c
 
-// 1 only for a fault the GUEST caused, i.e. one inside a marked access.
+// 1 only for a fault the GUEST caused: inside a marked interpreter access, or -- when the transliterator
+// is on -- at a host PC inside the code cache, where every access is a guest access by construction and
+// *cpu has to be rebuilt from the host register file before it is authoritative.
 int interp_signal_capture(struct cpu *cpu, void *native_context) {
-    (void)native_context; // *cpu is already authoritative
-    if (cpu == NULL || !g_interp_pad_armed || !g_interp_guest_access) return 0;
-    return 1;
+    if (cpu == NULL || !g_interp_pad_armed) return 0;
+    if (translit_signal_capture(cpu, native_context)) return 1;
+    return g_interp_guest_access ? 1 : 0;
 }
 
 // WHY THIS EXISTS, AND WHY IT IS NOT sigsetjmp(pad, 1).
@@ -626,11 +629,20 @@ static uint64_t interp_locked_rmw(uint64_t guest_address, int width, enum interp
 // persistent cache -- fail loudly at the first execution.
 #define INTERP_BLOCK_MAGIC UINT64_C(0x496e74657270426b) // "InterpBk"
 
+// host_entry_off is the whole of the transliterator's intrusion on this backend: 0 means "interpret this
+// block", anything else is the offset to same-ISA host code emitted straight after the header. Both kinds
+// live in one cache and the dispatcher cannot tell them apart, which is what makes the second backend
+// strictly additive (translit/translit.c).
 struct interp_block {
     uint64_t magic;
     uint64_t gpc;
     uint64_t generation; // diagnostic
+    uint64_t guest_end;  // one past the last transliterated guest byte (== gpc + 1 when interpreted)
+    uint32_t host_entry_off;
+    uint32_t host_len;
 };
+
+#include "translit/translit.c"
 
 // Must return a distinct non-NULL pointer per guest PC: non-NULL from map_host() suppresses re-translation.
 static void *translate_block(uint64_t gpc) {
@@ -645,8 +657,14 @@ static void *translate_block(uint64_t gpc) {
     block->magic = INTERP_BLOCK_MAGIC;
     block->gpc = gpc;
     block->generation = g_cache_gen;
-    // host == body (no prologue to skip); SOURCE range [gpc, gpc+1) so SMC invalidation finds it by address.
-    map_put(gpc, gpc, gpc + 1, block, block);
+    block->guest_end = gpc + 1;
+    block->host_entry_off = 0;
+    block->host_len = 0;
+    if (translit_build(block, gpc) == NULL) g_translit_declines++;
+    // host == body (no prologue to skip). SOURCE range [gpc, guest_end) so SMC invalidation finds it by
+    // address -- a transliterated block caches guest BYTES and so owns the range it copied, where an
+    // interpreted one re-decodes and needs only its entry.
+    map_put(gpc, gpc, block->guest_end, block, block);
     return block;
 }
 
@@ -1000,9 +1018,22 @@ static void run_block(struct cpu *cpu, void *code) {
     }
     g_interp_pad_armed = 1;
     g_interp_pad_cpu = cpu;
-    interp_execute(cpu);
+    // A transliterated block, if this one is one and the image still permits it. Both preconditions are
+    // re-tested here because they are runtime facts: an image that takes a PROT_EXEC mapping or an emulated
+    // MAP_SHARED alias mid-run must stop executing verbatim stores, and the descriptor is still a valid
+    // interpreter block, so falling back costs nothing but speed.
+    if (block->host_entry_off != 0 && translit_image_ok() && translit_bind_cpu(cpu)) {
+        g_translit_runs++;
+        translit_run(cpu, block);
+    } else {
+        g_translit_interp_runs++;
+        interp_execute(cpu);
+    }
     g_interp_pad_armed = previous;
     g_interp_pad_cpu = previous_cpu;
+    // exit_group/exit never returns from service(), so the fallback-rate report has no later hook.
+    if (translit_stats_wanted() && cpu->reason == R_SYSCALL && (cpu->r[RAX] == 231 || cpu->r[RAX] == 60))
+        translit_report();
 }
 
 static void block_return(void) {

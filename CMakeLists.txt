@@ -71,6 +71,12 @@ endif()
 
 set(HL_DEBUG_LOGGING "0" CACHE STRING "HL_ENABLE_LOGGING value")
 
+# --- x86-64 same-ISA transliterator -----------------------------------------
+# Always COMPILED (so one binary reaches both backends and HL_X86_TRANSLIT=1 selects at run time); this
+# only moves the default. OFF because the interpreter is the correct-by-construction lane and the
+# transliterator is additive -- see docs/amd64-host-translit.md. Inert on any host that is not x86-64.
+option(HL_TRANSLIT "default the x86-64 guest to the same-ISA transliterator instead of the interpreter" OFF)
+
 # --- flags in ONE place, as INTERFACE libraries (no directory-scope leakage) -
 # Interface libs are used instead of add_compile_options() so that Phase-2
 # production TUs (which need a DIFFERENT, minimal flag set) do not inherit the
@@ -79,7 +85,8 @@ set(HL_DEBUG_LOGGING "0" CACHE STRING "HL_ENABLE_LOGGING value")
 # dep flags never affect object contents.)
 add_library(hl_cpp_flags INTERFACE)
 target_include_directories(hl_cpp_flags INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_definitions(hl_cpp_flags INTERFACE HL_ENABLE_LOGGING=${HL_DEBUG_LOGGING})
+target_compile_definitions(hl_cpp_flags INTERFACE HL_ENABLE_LOGGING=${HL_DEBUG_LOGGING}
+  HL_TRANSLIT_DEFAULT=$<BOOL:${HL_TRANSLIT}>)
 
 add_library(hl_engine_cflags INTERFACE)
 target_link_libraries(hl_engine_cflags INTERFACE hl_cpp_flags)
