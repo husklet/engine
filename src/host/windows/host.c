@@ -2,13 +2,18 @@
  * The Windows host backend: handle table, error mapping, log, sync and the
  * constructor that assembles hl_host_services.
  *
- * Phase 1 advertises MEMORY | CLOCK | LOG | SYNC | CODE_MAPPING and nothing
- * else. Omitting a bit is safe by construction -- hl_host_services_validate
- * inspects a group's pointers only when its bit is set -- and the contract's
- * rule is that a capability is advertised only when the whole group is real.
- * file, stream, event, counter, transfer, network, shared_memory, directory,
- * watch, process and posix_attachment are therefore absent rather than stubbed:
- * a half-populated table would pass validation and fail at run time.
+ * Advertised: MEMORY | CLOCK | LOG | SYNC | CODE_MAPPING | FILE. Omitting a bit
+ * is safe by construction -- hl_host_services_validate inspects a group's
+ * pointers only when its bit is set -- and the contract's rule is that a
+ * capability is advertised only when the whole group is real. stream, event,
+ * counter, transfer, network, shared_memory, directory, watch, process and
+ * posix_attachment are therefore absent rather than stubbed: a half-populated
+ * table would pass validation and fail at run time.
+ *
+ * FILE is advertised because all 41 of its callbacks are implemented, including
+ * the two -- make_fifo and set_owner -- that report a typed NOT_SUPPORTED. That
+ * is a complete group answering honestly, not a gap: a filesystem FIFO and a
+ * guest uid have no Windows spelling at all, and file.c says why at each.
  */
 #include "internal.h"
 
@@ -276,6 +281,13 @@ hl_status hl_host_windows_create(hl_host_windows **out_host, hl_host_services *o
         free(host);
         return HL_STATUS_NOT_SUPPORTED;
     }
+    /* Every export the file group binds has shipped in ntdll since NT 4, so a
+     * failure here means the process is running against something that is not
+     * Windows rather than an older Windows -- refuse rather than degrade. */
+    if (!hl_windows_resolve_ntdll(&host->nt)) {
+        free(host);
+        return HL_STATUS_NOT_SUPPORTED;
+    }
     host->handles = calloc(HL_WINDOWS_HANDLE_CAPACITY, sizeof(*host->handles));
     if (host->handles == NULL) {
         free(host);
@@ -294,13 +306,14 @@ hl_status hl_host_windows_create(hl_host_windows **out_host, hl_host_services *o
 
     out_services->abi = HL_HOST_SERVICES_ABI;
     out_services->size = sizeof(*out_services);
-    out_services->capabilities =
-        HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_SYNC | HL_HOST_CAP_CODE_MAPPING;
+    out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_SYNC |
+                                 HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_FILE;
     out_services->context = host;
     out_services->memory = &hl_windows_memory_services;
     out_services->clock = &hl_windows_clock_services;
     out_services->log = &log;
     out_services->sync = &sync;
+    out_services->file = &hl_windows_file_services;
     *out_host = host;
     return HL_STATUS_OK;
 }
