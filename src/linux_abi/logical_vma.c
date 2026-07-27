@@ -1,5 +1,7 @@
 #include "logical_vma.h"
 
+#include "fdhandle.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -11,6 +13,14 @@
 #include <sys/mman.h>
 #endif
 
+/* The backing's private reference to the object the guest descriptor named.  At
+ * most one member is live: a duplicate descriptor where a descriptor IS the
+ * object, a duplicate host handle where it is not. */
+typedef struct logical_backing_ref {
+    int fd;
+    hl_host_handle handle;
+} logical_backing_ref;
+
 struct hl_logical_vma_backing {
     void *mapping;
     size_t length;
@@ -18,7 +28,7 @@ struct hl_logical_vma_backing {
     uint64_t device;
     uint64_t inode;
     uint64_t file_offset;
-    int fd;
+    logical_backing_ref retained;
     int writable;
 };
 
@@ -31,37 +41,72 @@ static hl_logical_vma_ledger g_logical_vmas;
 static pthread_once_t g_logical_vmas_once = PTHREAD_ONCE_INIT;
 static _Atomic int g_fail_next_prepare;
 
-/* The canonical host backing behind a shared logical mapping. This is the one operation in this file that
- * the typed memory seam ought to own -- map_file() is its exact shape, down to the offset and the shared
- * flag -- and the single thing in the way is that the whole logical-VMA API is keyed on a NATIVE descriptor:
- * the guest mmap path hands down the host fd that the Linux fd table holds, while the seam speaks in opaque
- * handles and offers no operation that adopts a native fd into one. Routing therefore waits on the fd table
- * carrying host handles, which is a change to the Linux front and not to this ledger. Keeping both halves
- * behind these two calls is what makes that a one-function edit here when it happens.
- *
- * Windows reaches neither side of it today, so the map reports its absence through the same NULL-and-errno
- * channel a refused mmap already uses; every caller below unwinds on that, so no half-built backing and no
- * unbacked ledger entry can result. */
-static void *logical_backing_map(int fd, size_t length, uint64_t offset, int writable) {
+/* The reference a guest descriptor denotes: the descriptor itself where a descriptor IS the object, and the
+ * handle filed under it where it is not.  A descriptor with no binding on such a host fails here rather than
+ * later, because the number denotes nothing at all and the caller must unwind rather than map something
+ * else. */
+static int logical_backing_ref_open(int fd, logical_backing_ref *reference) {
+    reference->fd = -1;
+    reference->handle = HL_HOST_HANDLE_INVALID;
 #if defined(_WIN32)
-    (void)fd;
-    (void)length;
-    (void)offset;
-    (void)writable;
-    errno = ENOSYS;
-    return NULL;
+    if (!hl_fdhandle_lookup(fd, &reference->handle)) {
+        errno = ENOSYS;
+        return -1;
+    }
+#else
+    reference->fd = fd;
+#endif
+    return 0;
+}
+
+/* The canonical host backing behind a shared logical mapping.  This is the one operation in this file that
+ * the typed memory seam ought to own -- map_file() is its exact shape, down to the offset and the shared
+ * flag -- and the single thing that used to be in the way is that the whole logical-VMA API was keyed on a
+ * NATIVE descriptor: the guest mmap path hands down the host fd that the Linux fd table holds, while the
+ * seam speaks in opaque handles.  The descriptor -> host-handle table (fdhandle.h) is what closes that, and
+ * keeping both halves behind these calls is what made it the edit it is.
+ *
+ * A descriptor with no binding still reports its absence through the same NULL-and-errno channel a refused
+ * mmap already uses; every caller below unwinds on that, so no half-built backing and no unbacked ledger
+ * entry can result. */
+static void *logical_backing_map(const logical_backing_ref *reference, size_t length, uint64_t offset,
+                                 int writable) {
+#if defined(_WIN32)
+    const hl_host_services *host = hl_fdhandle_host();
+    hl_host_file_mapping mapping = {HL_HOST_FILE_MAPPING_ABI, sizeof(mapping), 0, 0, 0, 0};
+    hl_host_result result;
+    if (reference->handle == HL_HOST_HANDLE_INVALID || host == NULL || host->memory == NULL ||
+        host->memory->map_file == NULL) {
+        errno = ENOSYS;
+        return NULL;
+    }
+    /* Canonical storage is engine-private and RW; SHARED because the whole point of this backing is that
+       every logical view of the same file region observes one another's stores. */
+    result = host->memory->map_file(host->context, reference->handle, 0, offset, (uint64_t)length,
+                                    HL_HOST_MEMORY_READ | (writable ? HL_HOST_MEMORY_WRITE : 0u),
+                                    HL_HOST_MEMORY_SHARED, &mapping);
+    if (result.status != HL_STATUS_OK) {
+        errno = hl_fdhandle_errno(result.status);
+        return NULL;
+    }
+    /* The ledger keeps an address, not a token, and unmaps by address below; a live ownership handle over
+       this range would make that address-keyed release refuse. */
+    if (host->memory->discard != NULL) (void)host->memory->discard(host->context, mapping.handle);
+    return (void *)(uintptr_t)mapping.address;
 #else
     /* Canonical storage is engine-private and RW. Guest permission checks stay
        in the logical entry and never depend on host VMA protection. */
-    void *mapping = mmap(NULL, length, PROT_READ | (writable ? PROT_WRITE : 0), MAP_SHARED, fd, (off_t)offset);
+    void *mapping =
+        mmap(NULL, length, PROT_READ | (writable ? PROT_WRITE : 0), MAP_SHARED, reference->fd, (off_t)offset);
     return mapping == MAP_FAILED ? NULL : mapping;
 #endif
 }
 
 static void logical_backing_unmap(void *mapping, size_t length) {
 #if defined(_WIN32)
-    (void)mapping;
-    (void)length;
+    const hl_host_services *host = hl_fdhandle_host();
+    if (host == NULL || host->memory == NULL || host->memory->unmap_address == NULL) return;
+    (void)host->memory->unmap_address(host->context, (uint64_t)(uintptr_t)mapping, (uint64_t)length);
 #else
     (void)munmap(mapping, length);
 #endif
@@ -70,23 +115,57 @@ static void logical_backing_unmap(void *mapping, size_t length) {
 /* The backing outlives the guest descriptor it was built from, so it keeps a private duplicate: the guest may
  * close its fd, and a checkpoint re-maps from this one. Close-on-exec is not decoration -- the engine execve's
  * a fresh guest image in place, and an inherited canonical descriptor would be a stray open file the guest
- * descriptor scan cannot account for. This is the descriptor half of the same unrouted boundary as the map
- * above: it disappears with it once the fd table carries host handles, where clone_for_fork() already covers
- * the duplication and the handle is not a native descriptor to leak in the first place. */
-static int logical_backing_retain(int fd) {
+ * descriptor scan cannot account for. Where the reference is a host handle rather than a descriptor that
+ * concern does not arise at all: clone_for_fork() produces an independent reference to the same open file
+ * description, and a handle is not in the descriptor namespace an exec sweep walks. */
+static int logical_backing_retain(const logical_backing_ref *source, logical_backing_ref *reference) {
+    reference->fd = -1;
+    reference->handle = HL_HOST_HANDLE_INVALID;
 #if defined(_WIN32)
-    (void)fd;
-    errno = ENOSYS;
-    return -1;
-#else
-    int retained = fcntl(fd, F_DUPFD, 0);
-    if (retained >= 0 && fcntl(retained, F_SETFD, FD_CLOEXEC) != 0) {
-        int saved = errno;
-        close(retained);
-        errno = saved;
-        return -1;
+    {
+        const hl_host_services *host = hl_fdhandle_host();
+        hl_host_result cloned;
+        if (source->handle == HL_HOST_HANDLE_INVALID || host == NULL || host->file == NULL ||
+            host->file->clone_for_fork == NULL) {
+            errno = ENOSYS;
+            return -1;
+        }
+        cloned = host->file->clone_for_fork(host->context, source->handle);
+        if (cloned.status != HL_STATUS_OK || cloned.value == HL_HOST_HANDLE_INVALID) {
+            errno = hl_fdhandle_errno(cloned.status);
+            return -1;
+        }
+        reference->handle = (hl_host_handle)cloned.value;
+        return 0;
     }
-    return retained;
+#else
+    {
+        int retained = fcntl(source->fd, F_DUPFD, 0);
+        if (retained < 0) return -1;
+        if (fcntl(retained, F_SETFD, FD_CLOEXEC) != 0) {
+            int saved = errno;
+            close(retained);
+            errno = saved;
+            return -1;
+        }
+        reference->fd = retained;
+        return 0;
+    }
+#endif
+}
+
+static void logical_backing_release(logical_backing_ref *reference) {
+    if (reference->fd >= 0) {
+        close(reference->fd);
+        reference->fd = -1;
+    }
+#if defined(_WIN32)
+    if (reference->handle != HL_HOST_HANDLE_INVALID) {
+        const hl_host_services *host = hl_fdhandle_host();
+        if (host != NULL && host->file != NULL && host->file->close != NULL)
+            (void)host->file->close(host->context, reference->handle);
+        reference->handle = HL_HOST_HANDLE_INVALID;
+    }
 #endif
 }
 
@@ -114,7 +193,7 @@ static int grow(hl_logical_vma_ledger *ledger, size_t need) {
 static void backing_put(hl_logical_vma_backing *backing) {
     if (atomic_fetch_sub_explicit(&backing->references, 1, memory_order_acq_rel) != 1) return;
     logical_backing_unmap(backing->mapping, backing->length);
-    if (backing->fd >= 0) close(backing->fd);
+    logical_backing_release(&backing->retained);
     free(backing);
 }
 
@@ -288,8 +367,13 @@ int hl_logical_vma_map_shared(hl_logical_vma_ledger *ledger, uint64_t guest_firs
     uint64_t canonical_last = (requested_last + host_page - 1) & ~((uint64_t)host_page - 1);
     int requested_writable = (protection & HL_LOGICAL_VMA_WRITE) != 0;
     int canonical_writable = requested_writable;
-    int mapping_fd = fd;
+    logical_backing_ref mapping_ref;
     int expanded;
+    if (logical_backing_ref_open(fd, &mapping_ref) != 0) {
+        free(next_snapshot);
+        pthread_mutex_unlock(&ledger->lock);
+        return -1;
+    }
     do {
         expanded = 0;
         for (size_t index = 0; index < ledger->count; ++index) {
@@ -299,7 +383,9 @@ int hl_logical_vma_map_shared(hl_logical_vma_ledger *ledger, uint64_t guest_firs
             if (candidate_last < canonical_first || candidate->file_offset > canonical_last) continue;
             if (candidate->writable) {
                 canonical_writable = 1;
-                if (!requested_writable) mapping_fd = candidate->fd;
+                /* A read-only request widening onto a writable backing has to map through a writable
+                   reference, and the candidate's retained one is the only one in reach. */
+                if (!requested_writable) mapping_ref = candidate->retained;
             }
             if (candidate->file_offset < canonical_first) {
                 canonical_first = candidate->file_offset;
@@ -319,7 +405,7 @@ int hl_logical_vma_map_shared(hl_logical_vma_ledger *ledger, uint64_t guest_firs
         return -1;
     }
     size_t mapped_length = (size_t)(canonical_last - canonical_first);
-    void *mapping = logical_backing_map(mapping_fd, mapped_length, canonical_first, canonical_writable);
+    void *mapping = logical_backing_map(&mapping_ref, mapped_length, canonical_first, canonical_writable);
     if (mapping == NULL) {
         free(next_snapshot);
         pthread_mutex_unlock(&ledger->lock);
@@ -334,8 +420,8 @@ int hl_logical_vma_map_shared(hl_logical_vma_ledger *ledger, uint64_t guest_firs
         errno = saved;
         return -1;
     }
-    int retained = logical_backing_retain(mapping_fd);
-    if (retained < 0) {
+    logical_backing_ref retained;
+    if (logical_backing_retain(&mapping_ref, &retained) != 0) {
         int saved = errno;
         logical_backing_unmap(mapping, mapped_length);
         free(backing);

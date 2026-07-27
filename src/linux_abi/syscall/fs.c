@@ -495,6 +495,13 @@ static void fd_reset_emul(int fd) {
     dirs_drop(fd);
     ovldents_drop(fd);
     hl_fdcache_fd_clear(fd);
+    // The host-handle binding is one more table keyed on this number, and it is the
+    // one whose staleness is silent: a handle left filed under a reused descriptor
+    // sends the next read or write to the previous object rather than failing. It
+    // sheds here with the rest, on close, on dup2's implicit close of the target,
+    // on the execve CLOEXEC sweep and on a reopen-by-number. No-op where nothing
+    // published, which is every host whose descriptors already name their objects.
+    (void)hl_fdhandle_release(fd);
 }
 
 // Linux *at dirfd precondition, shared by the fstatat/statx/link/symlink/rename/unlink/... family.

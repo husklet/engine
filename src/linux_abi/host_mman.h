@@ -65,6 +65,7 @@
 
 #else /* Windows */
 
+#include "fdhandle.h"
 #include "hl/host_services.h"
 
 #include <errno.h>
@@ -157,19 +158,56 @@ static inline uint32_t hl_linux_host_protection(int protection) {
  * carves a hole in is the failure mode the memory group's own notes warn about.
  *
  * A file-backed request needs map_file(), which takes an hl_host_handle for the
- * file.  The caller has an int fd, and on Windows that number names nothing the
- * host knows.  Refused rather than approximated -- population (2) above.
+ * file.  The caller has an int fd -- so this used to be population (2)'s
+ * refusal, "the engine has no descriptor-to-HANDLE table yet".  It has one now
+ * (fdhandle.h), and a BOUND descriptor is therefore REAL through map_file(),
+ * which is the same operation down to the offset and the sharing flag.  An
+ * unbound descriptor still refuses, because the number still names nothing.
+ *
+ * The file case ends in the same discard() as the anonymous one and for the
+ * same reason: munmap() below is address-keyed, unmap_address() refuses any
+ * range overlapping a live ownership handle, and mmap(2)'s contract is that the
+ * caller gets pages and not a token.  discard() on a file mapping releases the
+ * section this layer never sees and leaves the view exactly where it is.
  */
+static inline void *hl_linux_host_map_file(void *address, size_t length, int protection, int flags, int fd,
+                                           off_t offset) {
+    const hl_host_services *host = effective_host_services();
+    hl_host_file_mapping mapping = {HL_HOST_FILE_MAPPING_ABI, sizeof(mapping), 0, 0, 0, 0};
+    hl_host_result result;
+    hl_host_handle file;
+    uint32_t seam_flags = (flags & MAP_SHARED) ? HL_HOST_MEMORY_SHARED : HL_HOST_MEMORY_PRIVATE;
+    if (!hl_fdhandle_lookup(fd, &file) || host == NULL || host->memory == NULL || host->memory->map_file == NULL) {
+        errno = ENOSYS;
+        return MAP_FAILED;
+    }
+    if (length == 0 || offset < 0) {
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+    if (flags & MAP_FIXED_NOREPLACE)
+        seam_flags |= HL_HOST_MEMORY_FIXED_NOREPLACE;
+    else if (flags & MAP_FIXED)
+        seam_flags |= HL_HOST_MEMORY_FIXED;
+    result = host->memory->map_file(host->context, file, (uint64_t)(uintptr_t)address, (uint64_t)offset,
+                                    (uint64_t)length, hl_linux_host_protection(protection), seam_flags, &mapping);
+    if (result.status != HL_STATUS_OK) {
+        errno = hl_fdhandle_errno(result.status);
+        return MAP_FAILED;
+    }
+    /* Ownership retired, pages kept: see the note above. */
+    if (host->memory->discard != NULL) (void)host->memory->discard(host->context, mapping.handle);
+    return (void *)(uintptr_t)mapping.address;
+}
+
 static inline void *mmap(void *address, size_t length, int protection, int flags, int fd, off_t offset) {
     const hl_host_services *host = effective_host_services();
     hl_host_memory_mapping mapping = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(mapping), 0, 0, 0, 0};
     hl_host_result result;
     uint32_t seam_flags = (flags & MAP_SHARED) ? HL_HOST_MEMORY_SHARED : HL_HOST_MEMORY_PRIVATE;
 
-    if (!(flags & MAP_ANONYMOUS) || fd >= 0) {
-        errno = ENOSYS; /* file-backed mmap: no descriptor-to-handle table yet */
-        return MAP_FAILED;
-    }
+    if (!(flags & MAP_ANONYMOUS) || fd >= 0)
+        return hl_linux_host_map_file(address, length, protection, flags, fd, offset);
     if (host == NULL || host->memory == NULL || length == 0) {
         errno = EINVAL;
         return MAP_FAILED;

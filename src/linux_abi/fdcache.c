@@ -11,6 +11,11 @@
 #include <sys/mman.h>
 #endif
 
+// The descriptor -> host-handle side table. Compiled in here so the unity target
+// TU and the separately compiled library sources share one instance; see the
+// note at the top of fdhandle.c.
+#include "fdhandle.c"
+
 #define MCACHE_N 8192
 #define RCACHE_N 8192
 #define UDCACHE_N 4096
@@ -825,5 +830,23 @@ int hl_fdcache_bind(const hl_fdcache_binding *binding) {
     }
     g_fdcache.binding = *binding;
     fsgen_bind(binding->host, binding->generation_file);
+    hl_fdhandle_bind(binding->host);
+#if defined(_WIN32)
+    /* Adopt the three standard streams into the handle table.
+     *
+     * Gated on the host for a reason that is about descriptor numbering and not
+     * about which host is which. Adopting a stream asks the file group for an
+     * independent handle onto it, and where a host handle IS a descriptor that
+     * consumes three more descriptor numbers -- which shifts every subsequent
+     * guest fd allocation up by three and is observable to any guest that
+     * expects a pipe on the by-convention-lowest free number. The table earns
+     * nothing there in exchange: the descriptor already names the object, so a
+     * handle beside it answers no question the descriptor could not. Where the
+     * two namespaces do not coincide it earns everything -- it is the only way
+     * the vectored, positional and mapping operations can reach the object at
+     * all -- and it costs no guest-visible number, because the handle is not
+     * one. */
+    (void)hl_fdhandle_adopt_standard_streams();
+#endif
     return 0;
 }

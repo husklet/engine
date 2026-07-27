@@ -49,6 +49,12 @@ static void fd_carry_virt(int newfd, int oldfd, struct fdvis_reservation *reserv
     // find the surviving alias -- e.g. epoll readiness must persist while a dup keeps the watched OFD open.
     ofd_link_dup(newfd, oldfd);
     hl_native_kqueue_duplicate(oldfd, newfd);
+    // A host handle is per open file description, so the duplicate needs its own
+    // reference to the same description -- which is what the file group's
+    // clone_for_fork produces. Failure is not an error here: the new descriptor
+    // simply has no binding, which is the state every descriptor is in on a host
+    // where nothing publishes, and every consumer already treats as "ambient".
+    (void)hl_fdhandle_clone(oldfd, newfd);
     // Synthetic character devices keep their Linux behavior across descriptor duplication. Shell
     // redirections open the target and dup2 it onto stdout before writing; dropping these tags made
     // `echo x > /dev/full` write successfully to the /dev/zero backing instead of failing ENOSPC.

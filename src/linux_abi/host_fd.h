@@ -125,6 +125,8 @@
 
 #else /* Windows */
 
+#include "fdhandle.h" /* the descriptor -> host-handle table this file's REALs go through */
+
 #include <direct.h> /* _mkdir: the UCRT puts it here, not in <io.h> */
 #include <errno.h>
 #include <fcntl.h>
@@ -333,11 +335,22 @@ static inline char *realpath(const char *path, char *resolved) {
 }
 
 /*
- * REFUSAL -- population (2).  fcntl is the single largest caller in this layer
- * (F_GETFD/F_SETFD/F_GETFL/F_SETFL/F_DUPFD/F_DUPFD_CLOEXEC and the record-lock
- * commands), and not one of those answers is reachable from the CRT.
+ * REAL for the four flag commands on a BOUND descriptor; REFUSAL otherwise.
  *
- * Each of the plausible fakes is worse than ENOSYS, so name them:
+ * fcntl is the single largest caller in this layer (F_GETFD/F_SETFD/F_GETFL/
+ * F_SETFL/F_DUPFD/F_DUPFD_CLOEXEC and the record-lock commands), and the whole
+ * call used to refuse, because not one of those answers is reachable from the
+ * CRT: it exposes no per-descriptor metadata channel at all.
+ *
+ * What changed is not the CRT.  The four flag commands do not ask the host
+ * anything -- close-on-exec, the access mode and the two settable status flags
+ * are facts about what the ENGINE asked for when it produced the descriptor,
+ * and a host is merely the usual place to keep them.  The handle table keeps
+ * them for a bound descriptor, so for those the answers are records, not
+ * approximations, and this is the same fcntl the other two hosts implement.
+ *
+ * An UNBOUND descriptor still refuses, and each of the plausible fakes for it
+ * is still worse than ENOSYS, so they stay named:
  *   - F_GETFD returning 0 says "this descriptor is not close-on-exec", which
  *     syscall/proc.c's exec sweep believes and then leaks the fd across execve.
  *   - F_GETFL returning O_RDWR says the fd is readable and writable and neither
@@ -346,16 +359,80 @@ static inline char *realpath(const char *path, char *resolved) {
  *     had not.
  *   - F_SETLK returning 0 grants a lock that nothing is holding, which is the
  *     one failure mode a lock exists to prevent.
- * F_DUPFD is the only command with a synthesizable body (dup in a loop until
- * the result clears the floor, closing the rejects), and it is refused with the
- * rest: syscall/io.c's engine_fd_reloc asks for a floor of 1 << 20, and a dup
- * loop toward that floor would exhaust the 8192-entry table long before it.
+ *
+ * WHICH IS ALSO THE WARNING.  F_GETFD is used across this layer as an "is this
+ * descriptor open?" probe, and the answer this function gives is now "yes" for
+ * a bound descriptor and "no" for every other -- which is a statement about the
+ * TABLE and not about the descriptor.  That is sound only because a binding is
+ * filed under a live descriptor number and is shed the moment that number is
+ * closed or reused (fd_reset_emul), so a bound descriptor is always open.  The
+ * converse is not true and never will be: an unbound descriptor may be wide
+ * open.  A probe therefore under-reports here, exactly as it did when the whole
+ * call refused, and no caller may read a refusal as proof of a closed fd.
+ *
+ * F_DUPFD stays refused.  It is the one command with a synthesizable body (dup
+ * in a loop until the result clears the floor, closing the rejects), and
+ * syscall/io.c's engine_fd_reloc asks for a floor of 1 << 20, which a dup loop
+ * would chase until it exhausted the 8192-entry table.  The record-lock and
+ * SIGIO-owner commands stay refused because nothing records them yet.
  */
 static inline int fcntl(int descriptor, int command, ...) {
-    (void)descriptor;
-    (void)command;
-    errno = ENOSYS;
-    return -1;
+    hl_host_handle handle;
+    uint32_t state = 0;
+    int flags = 0;
+    if (!hl_fdhandle_lookup_state(descriptor, &handle, &state)) {
+        errno = ENOSYS;
+        return -1;
+    }
+    switch (command) {
+    case F_GETFD: return (state & HL_FDHANDLE_CLOEXEC) ? FD_CLOEXEC : 0;
+    case F_GETFL:
+        /* The access mode is the low two bits of the open flag word and is not a
+           bit-set: O_RDONLY is 0, so "readable" is the absence of O_WRONLY. */
+        flags = (state & HL_FDHANDLE_READ) ? ((state & HL_FDHANDLE_WRITE) ? O_RDWR : O_RDONLY) : O_WRONLY;
+        if (state & HL_FDHANDLE_APPEND) flags |= O_APPEND;
+        if (state & HL_FDHANDLE_NONBLOCK) flags |= O_NONBLOCK;
+        return flags;
+    case F_SETFD: {
+        /* REAL, and enforced rather than merely recorded: the emulated execve
+           sweep in syscall/proc.c reads this flag back through F_GETFD above and
+           sheds the binding for every descriptor that carries it. */
+        va_list arguments;
+        uint32_t updated;
+        va_start(arguments, command);
+        flags = va_arg(arguments, int);
+        va_end(arguments);
+        updated = (flags & FD_CLOEXEC) ? (state | HL_FDHANDLE_CLOEXEC) : (state & ~(uint32_t)HL_FDHANDLE_CLOEXEC);
+        if (hl_fdhandle_set_state(descriptor, updated) != 0) {
+            errno = EBADF;
+            return -1;
+        }
+        return 0;
+    }
+    case F_SETFL: {
+        /* REAL only where it changes nothing, REFUSAL otherwise, and the split
+           is deliberate.  O_APPEND and O_NONBLOCK are properties of the open
+           file description that the object itself must honour -- the file group
+           takes them at open time and has no operation that alters them
+           afterwards, and nothing in this layer emulates either one.  Recording
+           a change here would therefore answer the guest's next F_GETFL with a
+           flag no read or write obeys: a guest that asked for non-blocking would
+           be told it had it and would then block forever instead of seeing
+           EAGAIN.  A no-op set is still a real success, and runtimes issue one
+           routinely after reading the flags back unchanged. */
+        va_list arguments;
+        uint32_t requested = state & ~HL_FDHANDLE_SETFL_MASK;
+        va_start(arguments, command);
+        flags = va_arg(arguments, int);
+        va_end(arguments);
+        if (flags & O_APPEND) requested |= HL_FDHANDLE_APPEND;
+        if (flags & O_NONBLOCK) requested |= HL_FDHANDLE_NONBLOCK;
+        if (requested == state) return 0;
+        errno = ENOSYS;
+        return -1;
+    }
+    default: errno = ENOSYS; return -1;
+    }
 }
 
 /*
@@ -554,38 +631,108 @@ static inline int utimensat(int directory, const char *path, const struct timesp
     return -1;
 }
 
+/*
+ * REAL for a bound descriptor, REFUSAL otherwise.  The paragraph above is about
+ * the CRT and stays true of it; the file group's set_times is a different
+ * primitive with the two properties the CRT lacks -- a per-timestamp
+ * NOW/OMIT/EXPLICIT selector, and nanoseconds -- so for a descriptor that names
+ * a handle this is the operation utimensat is defined as, not a rounding of it.
+ * A NULL `times` is "set both to now", which is that selector's other value.
+ */
 static inline int futimens(int descriptor, const struct timespec *times) {
-    (void)descriptor;
-    (void)times;
-    errno = ENOSYS;
-    return -1;
+    const hl_host_services *host = hl_fdhandle_host();
+    hl_host_handle handle;
+    hl_host_file_time applied[2];
+    hl_host_result result;
+    int index;
+    if (!hl_fdhandle_lookup(descriptor, &handle) || host == NULL || host->file == NULL ||
+        host->file->set_times == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    for (index = 0; index < 2; index++) {
+        long nanoseconds = times == NULL ? UTIME_NOW : times[index].tv_nsec;
+        applied[index].mode = HL_HOST_FILE_TIME_EXPLICIT;
+        applied[index].seconds = times == NULL ? 0 : (int64_t)times[index].tv_sec;
+        applied[index].nanoseconds = times == NULL ? 0 : (uint32_t)times[index].tv_nsec;
+        if (nanoseconds == UTIME_NOW) {
+            applied[index].mode = HL_HOST_FILE_TIME_NOW;
+            applied[index].seconds = 0;
+            applied[index].nanoseconds = 0;
+        } else if (nanoseconds == UTIME_OMIT) {
+            applied[index].mode = HL_HOST_FILE_TIME_OMIT;
+            applied[index].seconds = 0;
+            applied[index].nanoseconds = 0;
+        } else if (nanoseconds < 0 || nanoseconds >= 1000000000L) {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    result = host->file->set_times(host->context, handle, applied);
+    if (result.status != HL_STATUS_OK) {
+        errno = hl_fdhandle_errno(result.status);
+        return -1;
+    }
+    return 0;
 }
 
 /*
- * REFUSAL -- population (3).  There is no positional read or write in the CRT.
- * The seek/read/seek synthesis is the obvious body and is refused for the
+ * REAL for a bound descriptor, REFUSAL otherwise.  There is no positional read
+ * or write in the CRT, and the seek/read/seek synthesis is refused for the
  * reason host_uio.h refuses a writev loop, only sharper: pread(2) is defined to
  * leave the file offset untouched and to be atomic against a concurrent
  * reader, and a thread that seeks between this thread's seek and its read gets
  * the WRONG BYTES rather than merely interleaved ones.  Windows answers this
- * exactly, with an OVERLAPPED offset on ReadFile/WriteFile -- in the backend.
+ * exactly, with an OVERLAPPED offset on ReadFile/WriteFile -- and the file
+ * group's read_at/write_at are that answer, reachable once the descriptor names
+ * a handle.
  */
 static inline ssize_t pread(int descriptor, void *buffer, size_t count, off_t offset) {
-    (void)descriptor;
-    (void)buffer;
-    (void)count;
-    (void)offset;
-    errno = ENOSYS;
-    return -1;
+    const hl_host_services *host = hl_fdhandle_host();
+    hl_host_handle handle;
+    hl_host_bytes output;
+    hl_host_result result;
+    if (offset < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!hl_fdhandle_lookup(descriptor, &handle) || host == NULL || host->file == NULL ||
+        host->file->read_at == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    output.data = buffer;
+    output.size = count;
+    result = host->file->read_at(host->context, handle, (uint64_t)offset, output);
+    if (result.status != HL_STATUS_OK) {
+        errno = hl_fdhandle_errno(result.status);
+        return -1;
+    }
+    return (ssize_t)result.value;
 }
 
 static inline ssize_t pwrite(int descriptor, const void *buffer, size_t count, off_t offset) {
-    (void)descriptor;
-    (void)buffer;
-    (void)count;
-    (void)offset;
-    errno = ENOSYS;
-    return -1;
+    const hl_host_services *host = hl_fdhandle_host();
+    hl_host_handle handle;
+    hl_host_const_bytes input;
+    hl_host_result result;
+    if (offset < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!hl_fdhandle_lookup(descriptor, &handle) || host == NULL || host->file == NULL ||
+        host->file->write_at == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    input.data = buffer;
+    input.size = count;
+    result = host->file->write_at(host->context, handle, (uint64_t)offset, input);
+    if (result.status != HL_STATUS_OK) {
+        errno = hl_fdhandle_errno(result.status);
+        return -1;
+    }
+    return (ssize_t)result.value;
 }
 
 /*
