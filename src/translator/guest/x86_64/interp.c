@@ -724,9 +724,11 @@ static int interp_exit(struct cpu *cpu, uint64_t rip, uint64_t reason) {
     return STEP_END;
 }
 
-// Push/pop default to 64-bit in long mode; insn->opsize follows REX.W, so ask here instead.
+// Push/pop default to 64-bit in long mode; insn->opsize follows REX.W, so ask here instead. 66 narrows the
+// stack operand to 16 bits, but REX.W WINS over 66 (SDM vol 2 table 3-4): measured on silicon, `66 48 50`
+// moves RSP by 8 and stores 8 bytes, where this moved it by 2.
 static int interp_stack_width(const struct insn *insn) {
-    return insn->p66 ? 2 : 8;
+    return (insn->p66 && !insn->rexW) ? 2 : 8;
 }
 
 static void interp_push(struct cpu *cpu, uint64_t value, int width) {
@@ -1782,8 +1784,17 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
 
     if (op >= 0xD8 && op <= 0xDF) return interp_step_x87(cpu, insn, pc, next);
 
-    // Rest of the map, split trap-versus-gap. INTO is invalid in 64-bit mode: #UD, not a gap.
-    if (op == 0xCE) return interp_guest_trap(cpu, pc, 4 /*SIGILL*/, 2 /*ILL_ILLOPN*/);
+    // Rest of the map, split trap-versus-gap. These opcodes do not EXIST in 64-bit mode -- the 32-bit
+    // segment pushes, BCD adjusts, PUSHA/POPA, the 0x82 group-1 alias, far CALL/JMP, AAM/AAD/SALC and
+    // INTO. #UD is the whole implementation; routing them to interp_undefined killed the engine with
+    // exit 70 where a guest that branched into data must see SIGILL (272 encodings in the sweep).
+    switch (op) {
+    case 0x06: case 0x07: case 0x0E: case 0x16: case 0x17: case 0x1E: case 0x1F:
+    case 0x27: case 0x2F: case 0x37: case 0x3F: case 0x60: case 0x61: case 0x82:
+    case 0x9A: case 0xCE: case 0xD4: case 0xD5: case 0xD6: case 0xEA:
+        return interp_guest_trap(cpu, pc, 4 /*SIGILL*/, 2 /*ILL_ILLOPN*/);
+    default: break;
+    }
 
     // Port I/O at CPL 3 with IOPL 0: always #GP(0), with no implementation to add.
     if (op == 0x6C || op == 0x6D || op == 0x6E || op == 0x6F || op == 0xE4 || op == 0xE5 || op == 0xE6 || op == 0xE7 ||
@@ -2179,31 +2190,49 @@ static void interp_fp_put_dq(uint8_t image[16], __m128i value) {
     memcpy(image, &value, 16);
 }
 
+// SCALAR-VS-PACKED IS THE SAME TRAP ONE LEVEL UP, and the barrier above does not cover it: `scalar ?
+// _mm_min_ss(a, b) : _mm_min_ps(a, b)` is if-converted into BOTH instructions plus a select, so every
+// SCALAR SSE arithmetic instruction also ran its packed twin over the destination's upper lanes and OR-ed
+// their exceptions into the guest MXCSR. Measured on hardware: `MINSS %xmm0,%xmm0` with a QNaN in lane 3
+// raised #I here and nothing on silicon. Writing the host instruction as asm is the only form that
+// guarantees exactly one of them executes; the mnemonic IS the guest opcode, so there is nothing to keep
+// in step. Operand order is AT&T: %1 = source, %0 = destination, which is also the merge target.
+#define INTERP_FP_BIN(mnemonic) __asm__ volatile(mnemonic " %1,%0" : "+x"(a) : "x"(b))
+#define INTERP_FP_CMP(scalar_mnemonic, packed_mnemonic, predicate)                                                     \
+    do {                                                                                                               \
+        if (scalar)                                                                                                    \
+            __asm__ volatile(scalar_mnemonic " $" #predicate ",%1,%0" : "+x"(a) : "x"(b));                             \
+        else                                                                                                           \
+            __asm__ volatile(packed_mnemonic " $" #predicate ",%1,%0" : "+x"(a) : "x"(b));                             \
+    } while (0)
+
 // CMPPS/CMPSS predicate (imm8[2:0]): EQ/NEQ/UNORD/ORD are QUIET, LT/LE/NLT/NLE SIGNAL #IE on a QNaN.
 static __m128 interp_fp_cmp_ps(__m128 a, __m128 b, unsigned predicate, int scalar) {
     switch (predicate & 7u) {
-    case 0: return scalar ? _mm_cmpeq_ss(a, b) : _mm_cmpeq_ps(a, b);
-    case 1: return scalar ? _mm_cmplt_ss(a, b) : _mm_cmplt_ps(a, b);
-    case 2: return scalar ? _mm_cmple_ss(a, b) : _mm_cmple_ps(a, b);
-    case 3: return scalar ? _mm_cmpunord_ss(a, b) : _mm_cmpunord_ps(a, b);
-    case 4: return scalar ? _mm_cmpneq_ss(a, b) : _mm_cmpneq_ps(a, b);
-    case 5: return scalar ? _mm_cmpnlt_ss(a, b) : _mm_cmpnlt_ps(a, b);
-    case 6: return scalar ? _mm_cmpnle_ss(a, b) : _mm_cmpnle_ps(a, b);
-    default: return scalar ? _mm_cmpord_ss(a, b) : _mm_cmpord_ps(a, b);
+    case 0: INTERP_FP_CMP("cmpss", "cmpps", 0); break;
+    case 1: INTERP_FP_CMP("cmpss", "cmpps", 1); break;
+    case 2: INTERP_FP_CMP("cmpss", "cmpps", 2); break;
+    case 3: INTERP_FP_CMP("cmpss", "cmpps", 3); break;
+    case 4: INTERP_FP_CMP("cmpss", "cmpps", 4); break;
+    case 5: INTERP_FP_CMP("cmpss", "cmpps", 5); break;
+    case 6: INTERP_FP_CMP("cmpss", "cmpps", 6); break;
+    default: INTERP_FP_CMP("cmpss", "cmpps", 7); break;
     }
+    return a;
 }
 
 static __m128d interp_fp_cmp_pd(__m128d a, __m128d b, unsigned predicate, int scalar) {
     switch (predicate & 7u) {
-    case 0: return scalar ? _mm_cmpeq_sd(a, b) : _mm_cmpeq_pd(a, b);
-    case 1: return scalar ? _mm_cmplt_sd(a, b) : _mm_cmplt_pd(a, b);
-    case 2: return scalar ? _mm_cmple_sd(a, b) : _mm_cmple_pd(a, b);
-    case 3: return scalar ? _mm_cmpunord_sd(a, b) : _mm_cmpunord_pd(a, b);
-    case 4: return scalar ? _mm_cmpneq_sd(a, b) : _mm_cmpneq_pd(a, b);
-    case 5: return scalar ? _mm_cmpnlt_sd(a, b) : _mm_cmpnlt_pd(a, b);
-    case 6: return scalar ? _mm_cmpnle_sd(a, b) : _mm_cmpnle_pd(a, b);
-    default: return scalar ? _mm_cmpord_sd(a, b) : _mm_cmpord_pd(a, b);
+    case 0: INTERP_FP_CMP("cmpsd", "cmppd", 0); break;
+    case 1: INTERP_FP_CMP("cmpsd", "cmppd", 1); break;
+    case 2: INTERP_FP_CMP("cmpsd", "cmppd", 2); break;
+    case 3: INTERP_FP_CMP("cmpsd", "cmppd", 3); break;
+    case 4: INTERP_FP_CMP("cmpsd", "cmppd", 4); break;
+    case 5: INTERP_FP_CMP("cmpsd", "cmppd", 5); break;
+    case 6: INTERP_FP_CMP("cmpsd", "cmppd", 6); break;
+    default: INTERP_FP_CMP("cmpsd", "cmppd", 7); break;
     }
+    return a;
 }
 
 // COMIS* (0F 2F) and UCOMIS* (0F 2E) are the only SSE instructions that write EFLAGS, and differ only in
@@ -2346,11 +2375,20 @@ static int interp_step_sse_fp(struct cpu *cpu, struct insn *insn, uint64_t pc, u
         interp_sse_rm_get(cpu, insn, next, source_bytes, s);
         if (dbl) {
             __m128d a = interp_fp_get_pd(d), b = interp_fp_get_pd(s);
-            interp_fp_put_pd(d, scalar ? _mm_sqrt_sd(a, b) : _mm_sqrt_pd(b));
+            if (scalar)
+                INTERP_FP_BIN("sqrtsd");
+            else
+                INTERP_FP_BIN("sqrtpd");
+            interp_fp_put_pd(d, a);
         } else {
             __m128 a = interp_fp_get_ps(d), b = interp_fp_get_ps(s);
-            __m128 r = op == 0x51 ? _mm_sqrt_ps(b) : op == 0x52 ? _mm_rsqrt_ps(b) : _mm_rcp_ps(b);
-            interp_fp_put_ps(d, scalar ? _mm_move_ss(a, r) : r);
+            if (op == 0x51 && scalar) INTERP_FP_BIN("sqrtss");
+            else if (op == 0x51) INTERP_FP_BIN("sqrtps");
+            else if (op == 0x52 && scalar) INTERP_FP_BIN("rsqrtss");
+            else if (op == 0x52) INTERP_FP_BIN("rsqrtps");
+            else if (scalar) INTERP_FP_BIN("rcpss");
+            else INTERP_FP_BIN("rcpps");
+            interp_fp_put_ps(d, a);
         }
         interp_xmm_put(cpu, destination, d);
         cpu->rip = next;
@@ -2367,27 +2405,27 @@ static int interp_step_sse_fp(struct cpu *cpu, struct insn *insn, uint64_t pc, u
         interp_xmm_get(cpu, destination, d);
         interp_sse_rm_get(cpu, insn, next, source_bytes, s);
         if (dbl) {
-            __m128d a = interp_fp_get_pd(d), b = interp_fp_get_pd(s), r;
+            __m128d a = interp_fp_get_pd(d), b = interp_fp_get_pd(s);
             switch (op) {
-            case 0x58: r = scalar ? _mm_add_sd(a, b) : _mm_add_pd(a, b); break;
-            case 0x59: r = scalar ? _mm_mul_sd(a, b) : _mm_mul_pd(a, b); break;
-            case 0x5C: r = scalar ? _mm_sub_sd(a, b) : _mm_sub_pd(a, b); break;
-            case 0x5D: r = scalar ? _mm_min_sd(a, b) : _mm_min_pd(a, b); break;
-            case 0x5E: r = scalar ? _mm_div_sd(a, b) : _mm_div_pd(a, b); break;
-            default: r = scalar ? _mm_max_sd(a, b) : _mm_max_pd(a, b); break;
+            case 0x58: if (scalar) INTERP_FP_BIN("addsd"); else INTERP_FP_BIN("addpd"); break;
+            case 0x59: if (scalar) INTERP_FP_BIN("mulsd"); else INTERP_FP_BIN("mulpd"); break;
+            case 0x5C: if (scalar) INTERP_FP_BIN("subsd"); else INTERP_FP_BIN("subpd"); break;
+            case 0x5D: if (scalar) INTERP_FP_BIN("minsd"); else INTERP_FP_BIN("minpd"); break;
+            case 0x5E: if (scalar) INTERP_FP_BIN("divsd"); else INTERP_FP_BIN("divpd"); break;
+            default: if (scalar) INTERP_FP_BIN("maxsd"); else INTERP_FP_BIN("maxpd"); break;
             }
-            interp_fp_put_pd(d, r);
+            interp_fp_put_pd(d, a);
         } else {
-            __m128 a = interp_fp_get_ps(d), b = interp_fp_get_ps(s), r;
+            __m128 a = interp_fp_get_ps(d), b = interp_fp_get_ps(s);
             switch (op) {
-            case 0x58: r = scalar ? _mm_add_ss(a, b) : _mm_add_ps(a, b); break;
-            case 0x59: r = scalar ? _mm_mul_ss(a, b) : _mm_mul_ps(a, b); break;
-            case 0x5C: r = scalar ? _mm_sub_ss(a, b) : _mm_sub_ps(a, b); break;
-            case 0x5D: r = scalar ? _mm_min_ss(a, b) : _mm_min_ps(a, b); break;
-            case 0x5E: r = scalar ? _mm_div_ss(a, b) : _mm_div_ps(a, b); break;
-            default: r = scalar ? _mm_max_ss(a, b) : _mm_max_ps(a, b); break;
+            case 0x58: if (scalar) INTERP_FP_BIN("addss"); else INTERP_FP_BIN("addps"); break;
+            case 0x59: if (scalar) INTERP_FP_BIN("mulss"); else INTERP_FP_BIN("mulps"); break;
+            case 0x5C: if (scalar) INTERP_FP_BIN("subss"); else INTERP_FP_BIN("subps"); break;
+            case 0x5D: if (scalar) INTERP_FP_BIN("minss"); else INTERP_FP_BIN("minps"); break;
+            case 0x5E: if (scalar) INTERP_FP_BIN("divss"); else INTERP_FP_BIN("divps"); break;
+            default: if (scalar) INTERP_FP_BIN("maxss"); else INTERP_FP_BIN("maxps"); break;
             }
-            interp_fp_put_ps(d, r);
+            interp_fp_put_ps(d, a);
         }
         interp_xmm_put(cpu, destination, d);
         cpu->rip = next;
@@ -2455,28 +2493,29 @@ static int interp_step_sse_fp(struct cpu *cpu, struct insn *insn, uint64_t pc, u
         if (!pd && prefix != SSE_F2) return interp_undefined(cpu, insn, pc, "reserved (SSE3 0F 7C/7D/D0 prefix)");
         interp_xmm_get(cpu, destination, d);
         interp_sse_rm_get(cpu, insn, next, 16, s);
+        // The host instruction, not a blend of both halves: composing ADDSUB from a full-width SUB OR-ed
+        // with a full-width ADD runs BOTH on every lane, so the guest MXCSR collects the exceptions of the
+        // operation each lane did not perform (measured: ADDSUBPD raising #I that hardware does not). The
+        // horizontal pair has the same problem in the other direction -- its addend order is x86's, and
+        // reconstructing it from unpacks gets NaN propagation right only by accident.
         if (pd) {
-            __m128d a = interp_fp_get_pd(d), b = interp_fp_get_pd(s), r;
-            if (op == 0xD0) { // ADDSUBPD: lane0 subtracts, lane1 adds
-                __m128d mask = _mm_castsi128_pd(_mm_set_epi64x(0, -1));
-                r = _mm_or_pd(_mm_and_pd(mask, _mm_sub_pd(a, b)), _mm_andnot_pd(mask, _mm_add_pd(a, b)));
-            } else {
-                __m128d even = _mm_unpacklo_pd(a, b);
-                __m128d odd = _mm_unpackhi_pd(a, b);
-                r = op == 0x7C ? _mm_add_pd(even, odd) : _mm_sub_pd(even, odd);
-            }
-            interp_fp_put_pd(d, r);
+            __m128d a = interp_fp_get_pd(d), b = interp_fp_get_pd(s);
+            if (op == 0xD0)
+                INTERP_FP_BIN("addsubpd");
+            else if (op == 0x7C)
+                INTERP_FP_BIN("haddpd");
+            else
+                INTERP_FP_BIN("hsubpd");
+            interp_fp_put_pd(d, a);
         } else {
-            __m128 a = interp_fp_get_ps(d), b = interp_fp_get_ps(s), r;
-            if (op == 0xD0) { // ADDSUBPS: even lanes subtract, odd lanes add
-                __m128 mask = _mm_castsi128_ps(_mm_set_epi32(0, -1, 0, -1));
-                r = _mm_or_ps(_mm_and_ps(mask, _mm_sub_ps(a, b)), _mm_andnot_ps(mask, _mm_add_ps(a, b)));
-            } else {
-                __m128 even = _mm_shuffle_ps(a, b, 0x88); // {a0, a2, b0, b2}
-                __m128 odd = _mm_shuffle_ps(a, b, 0xdd);  // {a1, a3, b1, b3}
-                r = op == 0x7C ? _mm_add_ps(even, odd) : _mm_sub_ps(even, odd);
-            }
-            interp_fp_put_ps(d, r);
+            __m128 a = interp_fp_get_ps(d), b = interp_fp_get_ps(s);
+            if (op == 0xD0)
+                INTERP_FP_BIN("addsubps");
+            else if (op == 0x7C)
+                INTERP_FP_BIN("haddps");
+            else
+                INTERP_FP_BIN("hsubps");
+            interp_fp_put_ps(d, a);
         }
         interp_xmm_put(cpu, destination, d);
         cpu->rip = next;
