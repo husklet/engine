@@ -28,11 +28,17 @@ guest ISAs. Linux x86-64 is not there yet, and the table says only what is prove
   interpreting the AArch64 build of hl-engine, which in turn JIT-compiles an x86-64 guest, runs to
   completion; so does a three-engine chain. The lane skips loudly, never silently, when the aarch64 cross
   build is absent.
-- Guest execution there is **interpreted**, not JIT-compiled. Measured overhead is not one number: **3.4×
-  on kernel-bound work, 94–605× on guest-execution-bound work** (median 25.3×), so the `perf-linux` lane is
-  record-only rather than threshold-enforcing. The single largest cost is a host syscall per guest basic
-  block, not the interpretation — see [`docs/amd64-host-performance.md`](docs/amd64-host-performance.md).
-  Neither guest ISA has a code generator for an x86-64 host: both production frontends emit ARM64 directly.
+- Guest execution there is **interpreted** by default. Measured overhead is not one number: **3.4× on
+  kernel-bound work, 94–605× on guest-execution-bound work** (median 25.3×), so the `perf-linux` lane is
+  record-only rather than threshold-enforcing — see
+  [`docs/amd64-host-performance.md`](docs/amd64-host-performance.md), where the single largest cost turned
+  out to be a host syscall per guest basic block rather than the interpretation itself.
+- An **x86-64 same-ISA transliterator** exists behind `HL_X86_TRANSLIT=1` (`-DHL_TRANSLIT=ON` moves the
+  default), giving **15× on compute** — 351 ns → 23.4 ns per guest block. It is off by default and falls
+  back to the interpreter per block, so anything it does not handle costs speed rather than correctness.
+  It declines non-PIE images, guest `%fs`, SSE/AVX and x87 today; see
+  [`docs/amd64-host-translit.md`](docs/amd64-host-translit.md). The **aarch64** guest is still interpreted
+  and always will be on this host without a new backend — that quadrant is cross-ISA.
 - The AArch64 host arm can be **executed** on an x86-64 box under `qemu-aarch64`, which is how several
   defects in the shipped AArch64 JIT were confirmed rather than merely inferred.
   [`docs/emulated-aarch64.md`](docs/emulated-aarch64.md) states precisely what emulation vouches for and
