@@ -15,15 +15,17 @@ guest ISAs. Linux x86-64 is not there yet, and the table says only what is prove
   published Rust crate accepts the host.
 - **Both** guest ISAs run to completion through the production engine: `production.smoke-aarch64`,
   `production.smoke-x86_64`, `production.matrix`, both `production.full-*.core-abi` manifests,
-  `production.full-aarch64.signals`, `compat.isa-aarch64` and all ten `lifecycle` cases pass, and
-  `checkpoint` is 77/78.
-- Measured across the whole compatibility corpus — 24 manifests, 1580 active cases, 3013 (case, guest-ISA)
-  runs, per case, nothing sampled, binaries pinned — **99.34% pass** (aarch64 guest 1488/1496, x86-64 guest
-  1505/1517), with zero cross-ISA output divergence among cases passing on both. **20 of the 24 matrix
-  suites are fully green on both guest ISAs.** The remainder is a short list of named defects, each with a
-  reproducer, in [`docs/amd64-host-findings.md`](docs/amd64-host-findings.md) §3.12.
-  **None of that is gated by CI yet**: `cmake/CiLanes.cmake` still excludes this host from the compat
-  shards, so `.github/workflows/linux-x86_64.yml` runs only `ctest -L unit`.
+  `production.full-aarch64.signals`, `compat.isa-aarch64` and all ten `lifecycle` cases pass;
+  `checkpoint` is **82/82**, and `ckpt-cross` (an image captured by one backend and restored by the other,
+  both directions) is 11/11.
+- Measured across the whole compatibility corpus — 24 manifests, both guest ISAs, 3036 (case, guest-ISA)
+  runs, per case, nothing sampled, binaries pinned, in an isolated worktree — **99.84% pass** (aarch64 guest
+  1500/1503, x86-64 guest 1531/1533), with zero cross-ISA output divergence. The five residual legs are
+  four environmental (a `nice ≤ 5` precondition the harness does not enforce) and one real defect, named
+  with a reproducer in [`docs/amd64-host-findings.md`](docs/amd64-host-findings.md) §3.12.
+- **The compat corpus is not gated by CI here yet**: `cmake/CiLanes.cmake` still excludes this host from the
+  compat shards. `.github/workflows/linux-x86_64.yml` does gate `unit`, `nested-engine`,
+  `emulated-aarch64-gated` and the package check.
 - The engine hosts **itself**, and it is a gate rather than a habit — `nested.*`, five cells. An amd64 host
   interpreting the AArch64 build of hl-engine, which in turn JIT-compiles an x86-64 guest, runs to
   completion; so does a three-engine chain. The lane skips loudly, never silently, when the aarch64 cross
@@ -34,9 +36,9 @@ guest ISAs. Linux x86-64 is not there yet, and the table says only what is prove
   [`docs/amd64-host-performance.md`](docs/amd64-host-performance.md), where the single largest cost turned
   out to be a host syscall per guest basic block rather than the interpretation itself.
 - An **x86-64 same-ISA transliterator** exists behind `HL_X86_TRANSLIT=1` (`-DHL_TRANSLIT=ON` moves the
-  default), giving **15× on compute** — 351 ns → 23.4 ns per guest block. It is off by default and falls
-  back to the interpreter per block, so anything it does not handle costs speed rather than correctness.
-  It declines non-PIE images, guest `%fs`, SSE/AVX and x87 today; see
+  default), giving **15× on compute** — 351 ns → 23.4 ns per guest block — and 9.7×–23× on the fixtures it
+  used to refuse. It is off by default and falls back to the interpreter **per block**, so anything it does
+  not handle costs speed rather than correctness. It declines guest `%fs`, SSE/AVX and x87 today; see
   [`docs/amd64-host-translit.md`](docs/amd64-host-translit.md). The **aarch64** guest is still interpreted
   and always will be on this host without a new backend — that quadrant is cross-ISA.
 - The AArch64 host arm can be **executed** on an x86-64 box under `qemu-aarch64`, which is how several
