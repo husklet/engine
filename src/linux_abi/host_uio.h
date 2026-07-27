@@ -180,8 +180,19 @@ static inline ssize_t hl_linux_uio_seam(hl_host_handle handle, const struct iove
  * so this path is taken ONLY for a descriptor the engine recorded as SEEKABLE,
  * which on this host means a regular file that openat() opened by name.  For a
  * regular file the loop and the vectored call transfer the same bytes to the
- * same offsets in the same order, and POSIX specifies no additional atomicity
- * that a single-threaded advance of one file offset would violate.
+ * same offsets in the same order.
+ *
+ * THE RESIDUAL DIVERGENCE, stated rather than argued away: Linux performs a
+ * writev to a regular file under the inode lock, so two guest threads writing
+ * the same description cannot interleave their segments.  This loop can.  A
+ * guest that concurrently writev()s a shared regular-file descriptor from more
+ * than one thread may therefore observe segment interleaving it would not see
+ * on Linux.  Nothing in the corpus exercises that shape, which is why this is a
+ * comment and not a refusal -- but it is a real difference, and the fix is the
+ * descriptor-to-handle routing that makes file->writev reachable here, not a
+ * wider loop.  Until then the trade is deliberate: without this path a guest
+ * doing readv/writev on a file it opened got ENOSYS for the whole call, which
+ * fails every time rather than under concurrency.
  *
  * Anything else still refuses.  It is the count > 1 refusal that was reached in
  * practice: a guest doing readv/writev over a file it opened got ENOSYS for the
