@@ -94,9 +94,27 @@ callbacks.
 
 But it is *larger* somewhere else, and this is the finding that matters for scheduling. The `*at` family
 is the **middle** of three surfaces. Surface 3 is ambient POSIX on descriptors, where **a guest fd number
-literally is a host fd number** (`ATFD` at `dispatch.c:32`, `close(cf)` at `fs.c:3588`) — roughly **900
-calls**. That, not `posix_attachment`, is the real Windows schedule driver. It is recorded here so it is
-not discovered late.
+literally is a host fd number** (`ATFD` at `dispatch.c:32`, `close(cf)` at `fs.c:3588`). That, not
+`posix_attachment`, is the real Windows schedule driver.
+
+A full sweep ([`prior-art-flinux-fs.md`](prior-art-flinux-fs.md)) found 1,289 sites across 52 distinct
+POSIX functions — but they are **three populations with three different answers**, and the first
+estimate of "~900 to port" was wrong because it did not separate them:
+
+| Population | Size | Where | Disposition |
+| --- | --- | --- | --- |
+| **A** — genuine guest fds | **~441** | `syscall/{fs,io,net,event,binding}.c` | Route through `hl_linux_abi`. The API already exists, and `bound_shadow_reserve`'s shadow descriptor disappears with it |
+| **B** — engine-internal | ~351 | `checkpoint.c` alone is 276, incl. `SCM_RIGHTS` capture | A **host-private** table inside `src/host/windows/`, never exposed above the seam |
+| **C** — Linux-only features | ~319 | `container/{netns,vfs}.c` | Do not compile |
+
+So the real figure is **~441 sites, roughly half of them one-line `close`/`fcntl` substitutions**.
+
+The recommendation is to route them (option b), **not** to write a Windows fd-emulation shim (option a).
+The CRT already *is* such a shim and it was measured insufficient: `_fstat64` returns `st_ino = 0,
+st_dev = 0`, and a Winsock `SOCKET` wrapped by `_open_osfhandle` cannot be `_write`n — so files and
+sockets can never share one namespace. A hand-written shim would be a second descriptor table beside
+`hl_linux_abi`: the same dual-lane trap `jail_open_plan` already demonstrates, exercised in production
+only on the host with no reference implementation to differ against.
 
 [`linux-abi-fd-lane.md`](linux-abi-fd-lane.md) has the four-milestone breakdown and the seven-step
 ordering, each step green on its own.
