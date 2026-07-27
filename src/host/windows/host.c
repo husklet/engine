@@ -2,11 +2,11 @@
  * The Windows host backend: handle table, error mapping, log, sync and the
  * constructor that assembles hl_host_services.
  *
- * Advertised: MEMORY | CLOCK | LOG | SYNC | CODE_MAPPING | FILE. Omitting a bit
- * is safe by construction -- hl_host_services_validate inspects a group's
- * pointers only when its bit is set -- and the contract's rule is that a
+ * Advertised: MEMORY | CLOCK | LOG | SYNC | CODE_MAPPING | FILE | PROCESS.
+ * Omitting a bit is safe by construction -- hl_host_services_validate inspects a
+ * group's pointers only when its bit is set -- and the contract's rule is that a
  * capability is advertised only when the whole group is real. stream, event,
- * counter, transfer, network, shared_memory, directory, watch, process and
+ * counter, transfer, network, shared_memory, directory, watch and
  * posix_attachment are therefore absent rather than stubbed: a half-populated
  * table would pass validation and fail at run time.
  *
@@ -14,6 +14,12 @@
  * the two -- make_fifo and set_owner -- that report a typed NOT_SUPPORTED. That
  * is a complete group answering honestly, not a gap: a filesystem FIFO and a
  * guest uid have no Windows spelling at all, and file.c says why at each.
+ *
+ * PROCESS is advertised on the same footing: all five callbacks are real over
+ * CreateProcess, and the two inputs that have no Windows meaning -- an entry
+ * context that is a pointer into the parent's private memory, and a request to
+ * deliver an arbitrary catchable signal -- are refused with a typed
+ * NOT_SUPPORTED rather than approximated. process.c says why at each.
  */
 #include "internal.h"
 
@@ -307,13 +313,14 @@ hl_status hl_host_windows_create(hl_host_windows **out_host, hl_host_services *o
     out_services->abi = HL_HOST_SERVICES_ABI;
     out_services->size = sizeof(*out_services);
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_SYNC |
-                                 HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_FILE;
+                                 HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_FILE | HL_HOST_CAP_PROCESS;
     out_services->context = host;
     out_services->memory = &hl_windows_memory_services;
     out_services->clock = &hl_windows_clock_services;
     out_services->log = &log;
     out_services->sync = &sync;
     out_services->file = &hl_windows_file_services;
+    out_services->process = &hl_windows_process_services;
     *out_host = host;
     return HL_STATUS_OK;
 }

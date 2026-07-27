@@ -70,6 +70,12 @@ enum {
     HL_WINDOWS_FILE_DIRECTORY = 1u << 1
 };
 
+/* entry->process_state, valid on HL_WINDOWS_HANDLE_PROCESS slots only. */
+enum {
+    /* A wait has observed the child exit and the exit fields below are final. */
+    HL_WINDOWS_PROCESS_REAPED = 1u << 0
+};
+
 typedef struct hl_windows_handle_entry {
     uint32_t generation;
     uint16_t kind;
@@ -90,6 +96,16 @@ typedef struct hl_windows_handle_entry {
      * carries its cursor inside the file object. This counter only fills in
      * hl_host_file_entry.next_offset with something monotonic per handle. */
     uint64_t file_cursor;
+    /* HL_WINDOWS_HANDLE_PROCESS only. The completion is retained on the slot
+     * once a wait has observed it and is released only by close, which is what
+     * lets repeated and concurrent waiters read one identical answer. The id is
+     * kept alongside the handle because a console control event names a process
+     * group by id, not by handle. */
+    uint32_t process_id;
+    uint32_t process_state; /* HL_WINDOWS_PROCESS_* */
+    uint32_t process_waiters;
+    uint32_t process_exit_kind; /* hl_host_process_exit_kind */
+    uint64_t process_exit_value;
 } hl_windows_handle_entry;
 
 /*
@@ -213,6 +229,7 @@ int hl_windows_symlink_read(const hl_windows_ntdll *nt, HANDLE file, char *targe
 extern const hl_host_memory_services hl_windows_memory_services;
 extern const hl_host_clock_services hl_windows_clock_services;
 extern const hl_host_file_services hl_windows_file_services;
+extern const hl_host_process_services hl_windows_process_services;
 
 /* Tear down every mapping a destroyed host still owns. */
 void hl_windows_memory_destroy_entry(hl_host_windows *host, hl_windows_handle_entry *entry);
