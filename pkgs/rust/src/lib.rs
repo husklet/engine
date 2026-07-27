@@ -19,11 +19,12 @@
 #[cfg(not(any(
     all(target_arch = "aarch64", target_os = "macos"),
     all(target_arch = "aarch64", target_os = "linux"),
-    all(target_arch = "x86_64", target_os = "linux")
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "x86_64", target_os = "windows", target_env = "msvc")
 )))]
 compile_error!(
-    "hl-engine supports only the aarch64-apple-darwin, aarch64-unknown-linux-gnu and \
-     x86_64-unknown-linux-gnu hosts"
+    "hl-engine supports only the aarch64-apple-darwin, aarch64-unknown-linux-gnu, \
+     x86_64-unknown-linux-gnu and x86_64-pc-windows-msvc hosts"
 );
 
 // Internal contract layers (formerly the api/provider/protocol/runtime crates).
@@ -52,6 +53,8 @@ mod result;
 #[allow(dead_code)]
 mod service;
 pub mod spec;
+/// The crate's single host-platform boundary. Everything above it is host-neutral.
+mod sys;
 mod terminal;
 pub mod transport;
 mod wire;

@@ -1,8 +1,8 @@
 #![allow(unsafe_code)]
+use crate::sys;
 use std::{
     ffi::{c_char, c_int, c_void},
     fs::File,
-    os::fd::{AsRawFd, FromRawFd},
 };
 
 #[repr(C)]
@@ -14,11 +14,12 @@ pub(crate) struct Handle(*mut Process);
 // SAFETY: activation processes have no thread affinity. The safe wrapper never
 // exposes the pointer, provides no concurrent access, and destroys it exactly once.
 unsafe impl Send for Handle {}
+/// The three process streams handed to activation. `-1` in a field inherits this application's.
 #[repr(C)]
 pub(crate) struct Streams {
-    pub input: i32,
-    pub output: i32,
-    pub error: i32,
+    pub input: sys::RawDescriptor,
+    pub output: sys::RawDescriptor,
+    pub error: sys::RawDescriptor,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -103,33 +104,6 @@ unsafe extern "C" {
     ) -> i32;
     pub(crate) fn hl_activation_process_destroy(process: *mut Process);
     pub(crate) fn hl_activation_process_id(process: *const Process, id: *mut u64) -> i32;
-    fn pipe(descriptors: *mut c_int) -> c_int;
-    fn fcntl(descriptor: c_int, command: c_int, ...) -> c_int;
-    #[link_name = "kill"]
-    fn process_signal(process: c_int, signal: c_int) -> c_int;
-    #[cfg(target_os = "linux")]
-    fn __libc_current_sigrtmin() -> c_int;
-}
-
-/// The host signal the engine reserves to bounce a process out of a blocking host syscall to its next
-/// dispatcher safepoint (where checkpoint capture runs).
-///
-/// It MUST be the engine's own `THREAD_INT_SIG` (`src/linux_abi/thread.c`), the only signal for which every
-/// engine process installs a permanent, guest-unreachable handler. Any guest-reachable signal is useless
-/// here: the engine installs a host handler for one only when the guest itself calls `rt_sigaction` on it,
-/// so kicking with (say) `SIGURG` is a silent no-op against a shell that never handles `SIGURG` -- its
-/// default action is *ignore*, which does not interrupt a blocked `read`. That is exactly how an
-/// interactive `bash` parked on its PTY was left unreachable, and capture then never began at all.
-pub(crate) fn interrupt_signal() -> c_int {
-    // Linux: SIGRTMIN + 7, matching native_compat.h's SIGINFO alias. macOS: SIGINFO(29), which sig_l2m omits.
-    #[cfg(target_os = "linux")]
-    {
-        unsafe { __libc_current_sigrtmin() + 7 }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        29
-    }
 }
 
 pub(crate) fn guest_fd_limit() -> u32 {
@@ -137,7 +111,7 @@ pub(crate) fn guest_fd_limit() -> u32 {
     unsafe { hl_engine_guest_fd_limit() }
 }
 pub(crate) fn resize(file: &File, size: TerminalSize) -> Result<(), i32> {
-    let status = unsafe { hl_terminal_resize(file.as_raw_fd(), size) };
+    let status = unsafe { hl_terminal_resize(sys::file_raw(file), size) };
     if status == 0 {
         Ok(())
     } else {
@@ -238,30 +212,6 @@ pub(crate) fn process_id(process: &Handle) -> Result<u64, i32> {
         Err(status)
     }
 }
-pub(crate) fn signal(process: u64, signal: i32) -> std::io::Result<()> {
-    let process = c_int::try_from(process).map_err(|_| std::io::Error::from_raw_os_error(22))?;
-    if unsafe { process_signal(process, signal) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-pub(crate) fn pipe_pair() -> std::io::Result<(File, File)> {
-    const F_SETFD: c_int = 2;
-    const FD_CLOEXEC: c_int = 1;
-    let mut descriptors = [-1, -1];
-    if unsafe { pipe(descriptors.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let read = unsafe { File::from_raw_fd(descriptors[0]) };
-    let write = unsafe { File::from_raw_fd(descriptors[1]) };
-    if unsafe { fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) } != 0
-        || unsafe { fcntl(descriptors[1], F_SETFD, FD_CLOEXEC) } != 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((read, write))
-}
 
 const _: () = assert!(std::mem::size_of::<EngineExit>() == 24);
 const _: () = assert!(std::mem::size_of::<*mut c_void>() == std::mem::size_of::<usize>());
@@ -273,59 +223,41 @@ const _: () = assert!(std::mem::size_of::<*mut c_void>() == std::mem::size_of::<
 // them -- the protocol codec, the demultiplexing server, the embedder's trait -- is safe code.
 
 /// The broker socketpair. The parent end is kept by the server; the child end is handed to activation.
-pub(crate) fn broker_pair() -> std::io::Result<(std::os::unix::net::UnixDatagram, OwnedDescriptor)>
-{
+///
+/// Both ends are plain owned descriptors. The parent end used to be typed as a `UnixDatagram`, which
+/// it never was in any useful sense: Rust never called a single method on it, and the only thing it
+/// was ever used for was handing its raw number straight back to `hl_ckpt_broker_accept`, which does
+/// the `poll` and the `recvmsg` in C. It was an owning descriptor wrapper wearing a datagram
+/// socket's type, and naming it honestly is what lets this compile on a host where `AF_UNIX`
+/// datagrams do not exist at all.
+pub(crate) fn broker_pair() -> std::io::Result<(sys::OwnedDescriptor, sys::OwnedDescriptor)> {
     let mut parent = -1;
     let mut child = -1;
     if unsafe { hl_ckpt_broker_pair(&mut parent, &mut child) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: both descriptors were just created by socketpair(2) and are owned by this process.
-    let parent = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(parent) };
-    Ok((parent, OwnedDescriptor(child)))
+    // SAFETY: both descriptors were just created by the engine and are owned by this process.
+    unsafe {
+        Ok((
+            sys::OwnedDescriptor::adopt(parent),
+            sys::OwnedDescriptor::adopt(child),
+        ))
+    }
 }
 
 /// Waits for one engine process to announce itself and returns its private channel.
 pub(crate) fn broker_accept(
-    broker: &std::os::unix::net::UnixDatagram,
+    broker: &sys::OwnedDescriptor,
     timeout: std::time::Duration,
-) -> Option<(std::os::unix::net::UnixStream, u64)> {
+) -> Option<(sys::Stream, u64)> {
     let milliseconds = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
     let mut host_pid = 0_u64;
-    let descriptor =
-        unsafe { hl_ckpt_broker_accept(broker.as_raw_fd(), milliseconds, &mut host_pid) };
+    let descriptor = unsafe { hl_ckpt_broker_accept(broker.raw(), milliseconds, &mut host_pid) };
     if descriptor < 0 {
         return None;
     }
-    // SAFETY: the descriptor was installed into this process by recvmsg and is owned by it.
-    Some((
-        unsafe { std::os::unix::net::UnixStream::from_raw_fd(descriptor) },
-        host_pid,
-    ))
-}
-
-/// A raw descriptor this process owns and closes on drop.
-#[derive(Debug)]
-pub(crate) struct OwnedDescriptor(c_int);
-
-impl OwnedDescriptor {
-    pub(crate) const fn raw(&self) -> c_int {
-        self.0
-    }
-}
-
-impl Drop for OwnedDescriptor {
-    fn drop(&mut self) {
-        if self.0 >= 0 {
-            // SAFETY: exclusive ownership of a descriptor this type created.
-            unsafe { close_descriptor(self.0) };
-        }
-    }
-}
-
-unsafe extern "C" {
-    #[link_name = "close"]
-    fn close_descriptor(descriptor: c_int) -> c_int;
+    // SAFETY: the descriptor was installed into this process by the engine and is owned by it.
+    Some((unsafe { sys::adopt_stream(descriptor) }, host_pid))
 }
 
 /// The shared generation counter used to request a capture.
@@ -415,7 +347,7 @@ pub(crate) fn start_combined(
             return Err(status);
         }
         // SAFETY: the descriptor was just created by the engine and is owned by this process.
-        Some(unsafe { File::from_raw_fd(master) })
+        Some(unsafe { sys::adopt_file(master) })
     } else {
         None
     };

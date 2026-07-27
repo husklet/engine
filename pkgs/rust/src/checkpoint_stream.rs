@@ -500,7 +500,7 @@ impl SinkServer {
     }
 
     /// Serves one engine process until it closes its channel.
-    fn serve(self: &Arc<Self>, channel: &mut std::os::unix::net::UnixStream, id: u64) {
+    fn serve(self: &Arc<Self>, channel: &mut crate::sys::Stream, id: u64) {
         loop {
             let mut header = [0_u8; REQUEST_BYTES];
             match channel.read_exact(&mut header) {
@@ -777,7 +777,7 @@ impl SinkServer {
 /// Runs the acceptor: every engine process that announces itself gets a thread.
 pub(crate) fn serve(
     server: &Arc<SinkServer>,
-    broker: std::os::unix::net::UnixDatagram,
+    broker: crate::sys::OwnedDescriptor,
 ) -> std::thread::JoinHandle<()> {
     let server = Arc::clone(server);
     std::thread::spawn(move || {
@@ -878,7 +878,7 @@ impl Reply {
         }
     }
 
-    fn write(&self, channel: &mut std::os::unix::net::UnixStream) -> std::io::Result<()> {
+    fn write(&self, channel: &mut crate::sys::Stream) -> std::io::Result<()> {
         let mut header = [0_u8; REPLY_BYTES];
         header[0..4].copy_from_slice(&MAGIC_REPLY.to_ne_bytes());
         header[4..8].copy_from_slice(&ABI.to_ne_bytes());

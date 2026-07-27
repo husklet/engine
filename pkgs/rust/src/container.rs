@@ -41,7 +41,9 @@ impl Container {
     pub(crate) fn resolve(self, config: &mut Config) -> Result<(), Error> {
         let mut mounts = BTreeMap::new();
         for mount in self.mounts {
-            if !mount.guest.is_absolute() {
+            // A guest mount path is a Linux path, and `Path::is_absolute` answers that question
+            // about the *host*: on Windows it is `false` for every `/`-rooted path.
+            if !crate::sys::guest_path::is_absolute(crate::sys::guest_path::bytes(&mount.guest)) {
                 return Err(Error::InvalidConfig("guest mount path must be absolute"));
             }
             if mounts.insert(mount.guest.clone(), mount).is_some() {

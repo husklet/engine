@@ -46,8 +46,7 @@ pub fn encode_namespace_install(
         },
     );
     for entry in entries {
-        use std::os::unix::ffi::OsStrExt;
-        let path = entry.path.as_os_str().as_bytes();
+        let path = crate::sys::guest_path::bytes(&entry.path);
         let (kind, major, minor) = match entry.kind {
             ProjectionKind::Service => (1, 0, 0),
             ProjectionKind::CharacterDevice { major, minor } => (4, major, minor),
@@ -80,7 +79,6 @@ pub fn decode_namespace_install(
     maximum_entries: u32,
     maximum_path: u32,
 ) -> Result<Vec<ServiceProjection>, ServiceFailure> {
-    use std::os::unix::ffi::OsStringExt;
     let mut input = Input::new(bytes);
     let encoded_count = input.u32()?;
     let version_three = encoded_count & 0xc000_0000 == 0xc000_0000;
@@ -99,7 +97,14 @@ pub fn decode_namespace_install(
         if length == 0 || length > maximum_path {
             return Err(linux(36, "service projection path exceeds launch bound"));
         }
-        let path = std::ffi::OsString::from_vec(input.bytes(length as usize)?.to_vec()).into();
+        // This is the *receive* path: these bytes came from the engine, not from a round trip of
+        // this crate's own output. A projected path this host cannot represent is a protocol error,
+        // which is the same class of answer the surrounding decoder already gives a malformed
+        // transaction.
+        let path: std::path::PathBuf =
+            crate::sys::os_string(input.bytes(length as usize)?.to_vec())
+                .ok_or_else(|| linux(22, "service projection path is not representable"))?
+                .into();
         if version_three && input.u16()? != 0 {
             return Err(linux(22, "service projection symlink target is invalid"));
         }
@@ -130,33 +135,33 @@ fn validate_projections(
     maximum_entries: u32,
     maximum_path: u32,
 ) -> Result<(), ServiceFailure> {
-    use std::os::unix::ffi::OsStrExt;
+    use crate::sys::guest_path;
     if entries.len() > maximum_entries as usize {
         return Err(linux(7, "service projection count exceeds launch bound"));
     }
     let mut paths = std::collections::BTreeSet::new();
     for entry in entries {
-        let path = entry.path.as_os_str().as_bytes();
+        let path = guest_path::bytes(&entry.path);
+        // A projected path is a guest path, so it is classified by its bytes rather than by the
+        // host's path parser: `is_absolute` and the component sweep both answer differently per host
+        // and neither difference produces a diagnostic. `is_normalized_absolute` subsumes the
+        // rooted-ness check, the `.`/`..` sweep and the NUL check in one byte-level pass.
         if entry.service.0 == 0
             || entry.mode & !0o7777 != 0
             || path.is_empty()
-            || path == b"/"
+            || guest_path::is_root(path)
             || path.len() > maximum_path as usize
             || path.len() > u16::MAX as usize
-            || path.contains(&0)
-            || !entry.path.is_absolute()
-            || entry.path.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir | std::path::Component::CurDir
-                )
-            })
+            || !guest_path::is_normalized_absolute(path)
             || !paths.insert(entry.path.clone())
             || matches!(entry.kind, ProjectionKind::CharacterDevice { major, minor } | ProjectionKind::BlockDevice { major, minor } if major >= 4096 || minor >= (1 << 20))
         {
             return Err(linux(22, "invalid or conflicting service projection"));
         }
     }
+    // Every path in the set is now known to be `/`-rooted with no `.`, `..`, empty or `\` segment,
+    // and that is exactly the condition under which `Path`'s *structural* operations agree on every
+    // host. So the containment sweep stays as it was.
     for path in &paths {
         if path
             .ancestors()

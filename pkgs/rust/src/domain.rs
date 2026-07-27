@@ -13,10 +13,9 @@ impl Domain {
     }
 
     pub(crate) fn create() -> Result<Self, Error> {
-        use std::io::Read as _;
         loop {
             let mut bytes = [0_u8; 16];
-            std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+            crate::sys::secure_random(&mut bytes)?;
             let identity = [
                 u64::from_ne_bytes(bytes[..8].try_into().unwrap()),
                 u64::from_ne_bytes(bytes[8..].try_into().unwrap()),

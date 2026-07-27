@@ -1,15 +1,24 @@
+use crate::sys::{self, guest_path};
 use crate::{config::NetworkTransport, Access, Config, Error, Sandbox};
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
+/// The bytes one host string contributes to the launch configuration's string pool.
+///
+/// The pool is read by the *Linux guest* as argv, environment records, mount paths and file-owner
+/// keys, so what is wanted is bytes. On a host whose `OsStr` is already a byte string this is a
+/// lossless identity; where it is not, [`sys::os_bytes`] states the encoding policy and this returns
+/// the same class of error the pool already raises for an embedded NUL.
 fn checked_bytes(value: &OsStr) -> Result<&[u8], Error> {
-    use std::os::unix::ffi::OsStrExt;
-    if value.as_bytes().contains(&0) {
+    let bytes = sys::os_bytes(value).ok_or(Error::InvalidConfig(
+        "configuration strings must be representable as guest bytes on this host",
+    ))?;
+    if bytes.contains(&0) {
         Err(Error::InvalidConfig(
             "configuration strings must not contain NUL",
         ))
     } else {
-        Ok(value.as_bytes())
+        Ok(bytes)
     }
 }
 
@@ -96,6 +105,26 @@ impl Pool {
         self.string(value.map(Path::as_os_str))
     }
 
+    /// Bytes this crate composed itself, rather than a host string it was handed.
+    ///
+    /// The composed records (environment, file owners, volumes, interfaces) are built from inputs
+    /// [`checked_bytes`] has already validated, so they never needed the round trip through
+    /// `OsString` they used to make -- a round trip that existed only because `OsStringExt::from_vec`
+    /// was the shortest way back to the type `string` wanted.
+    fn bytes(&mut self, value: Option<&[u8]>) -> Result<u32, Error> {
+        let Some(value) = value else { return Ok(0) };
+        if value.contains(&0) {
+            return Err(Error::InvalidConfig(
+                "configuration strings must not contain NUL",
+            ));
+        }
+        let offset = u32::try_from(self.0.len())
+            .map_err(|_| Error::InvalidConfig("launch configuration is too large"))?;
+        self.0.extend_from_slice(value);
+        self.0.push(0);
+        Ok(offset)
+    }
+
     fn paths(&mut self, values: &[std::path::PathBuf]) -> Result<u32, Error> {
         if values.is_empty() {
             return Ok(0);
@@ -163,8 +192,7 @@ impl Header {
     }
 }
 
-fn environment(config: &Config) -> Result<Option<OsString>, Error> {
-    use std::os::unix::ffi::OsStringExt;
+fn environment(config: &Config) -> Result<Option<Vec<u8>>, Error> {
     if config.environment.is_empty() {
         return Ok(None);
     }
@@ -186,11 +214,18 @@ fn environment(config: &Config) -> Result<Option<OsString>, Error> {
         output.push(b'=');
         output.extend_from_slice(value);
     }
-    Ok(Some(OsString::from_vec(output)))
+    Ok(Some(output))
 }
 
-fn file_owners(config: &Config) -> Result<Option<OsString>, Error> {
-    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+/// The file-owner records: a guest path, a uid and a gid, tab-separated, one per line.
+///
+/// The key is a guest path relative to the guest filesystem root, and the guard below is the reason
+/// [`guest_path`] exists. It used to be `path.is_absolute()` plus a `Component::Normal` sweep, both
+/// of which are `std::path` questions and therefore *host* questions:
+/// `Path::new("/etc/passwd").is_absolute()` is `false` on Windows, so the rejection of absolute keys
+/// silently stopped happening and an absolute path went into the pool where the engine expects a
+/// normalized relative one. A guest path is a Linux path; it is classified by its bytes.
+fn file_owners(config: &Config) -> Result<Option<Vec<u8>>, Error> {
     if config.file_owners.is_empty() {
         return Ok(None);
     }
@@ -198,15 +233,10 @@ fn file_owners(config: &Config) -> Result<Option<OsString>, Error> {
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     let mut output = Vec::new();
     for (index, (path, uid, gid)) in entries.into_iter().enumerate() {
-        let bytes = path.as_os_str().as_bytes();
-        if path.is_absolute()
-            || bytes.is_empty()
-            || bytes.contains(&0)
+        let bytes = guest_path::bytes(path);
+        if !guest_path::is_normalized_relative(bytes)
             || bytes.contains(&b'\n')
             || bytes.contains(&b'\t')
-            || path
-                .components()
-                .any(|part| !matches!(part, std::path::Component::Normal(_)))
         {
             return Err(Error::InvalidConfig(
                 "file owner paths must be normalized and relative",
@@ -221,11 +251,10 @@ fn file_owners(config: &Config) -> Result<Option<OsString>, Error> {
         output.push(b'\t');
         output.extend_from_slice(gid.to_string().as_bytes());
     }
-    Ok(Some(OsString::from_vec(output)))
+    Ok(Some(output))
 }
 
-fn volumes(config: &Config) -> Result<Option<OsString>, Error> {
-    use std::os::unix::ffi::OsStringExt;
+fn volumes(config: &Config) -> Result<Option<Vec<u8>>, Error> {
     if config.mounts.is_empty() && config.namespace_links.is_empty() {
         return Ok(None);
     }
@@ -277,7 +306,7 @@ fn volumes(config: &Config) -> Result<Option<OsString>, Error> {
         output.extend_from_slice(host);
         index += 1;
     }
-    Ok(Some(OsString::from_vec(output)))
+    Ok(Some(output))
 }
 
 fn validate_publish(config: &Config) -> Result<(), Error> {
@@ -332,8 +361,7 @@ fn validate_network(config: &Config) -> Result<(), Error> {
     Ok(())
 }
 
-fn interfaces(config: &Config) -> Option<OsString> {
-    use std::os::unix::ffi::OsStringExt;
+fn interfaces(config: &Config) -> Option<Vec<u8>> {
     if config.network_interfaces.is_empty() {
         return None;
     }
@@ -348,7 +376,7 @@ fn interfaces(config: &Config) -> Option<OsString> {
         bytes.push(b'/');
         bytes.extend_from_slice(interface.prefix().to_string().as_bytes());
     }
-    Some(OsString::from_vec(bytes))
+    Some(bytes)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -374,7 +402,7 @@ pub(crate) fn encode(
     let hostname = pool.string(config.hostname.as_deref())?;
     let workdir = pool.string(config.working_directory.as_deref())?;
     let environment = environment(config)?;
-    let environment = pool.string(environment.as_deref())?;
+    let environment = pool.bytes(environment.as_deref())?;
     let cache = pool.path(config.translation_cache.as_deref())?;
     let namespace = pool.string(
         config
@@ -393,13 +421,13 @@ pub(crate) fn encode(
         .map(|value| OsString::from(value.to_string()));
     let ipv4 = pool.string(ipv4.as_deref())?;
     let interfaces = interfaces(config);
-    let interfaces = pool.string(interfaces.as_deref())?;
+    let interfaces = pool.bytes(interfaces.as_deref())?;
     let file_owners = file_owners(config)?;
-    let file_owners = pool.string(file_owners.as_deref())?;
+    let file_owners = pool.bytes(file_owners.as_deref())?;
     let filesystem_generation = pool.path(config.filesystem_generation.as_deref())?;
     let publish = pool.publish(&config.publish)?;
     let volumes = volumes(config)?;
-    let volumes = pool.string(volumes.as_deref())?;
+    let volumes = pool.bytes(volumes.as_deref())?;
     let result = pool.path(result)?;
     let arguments = pool.arguments(arguments)?;
     let pool_size = u32::try_from(pool.0.len())
@@ -642,8 +670,6 @@ mod tests {
 
     #[test]
     fn filesystem_generation_uses_the_c_abi_offset_and_rejects_nul() {
-        use std::os::unix::ffi::OsStringExt;
-
         let wire = encode(
             &Config::new().filesystem_generation("/run/hl/filesystem-generation"),
             &[OsString::from("/bin/true")],
@@ -655,7 +681,7 @@ mod tests {
             Some("/run/hl/filesystem-generation")
         );
 
-        let invalid = std::path::PathBuf::from(OsString::from_vec(b"/run/bad\0path".to_vec()));
+        let invalid = std::path::PathBuf::from("/run/bad\0path");
         assert!(encode(
             &Config::new().filesystem_generation(invalid),
             &[OsString::from("/bin/true")],
@@ -735,5 +761,51 @@ mod tests {
             None
         )
         .is_err());
+    }
+
+    /// A file-owner key is a guest path relative to the guest filesystem root, and this guard is the
+    /// only thing standing between a caller and an absolute one reaching the engine.
+    ///
+    /// It used to ask `Path::is_absolute`, which is a *host* question with a different answer per
+    /// host: **`Path::new("/etc/passwd").is_absolute()` is `false` on Windows**, because absoluteness
+    /// there requires a drive or UNC prefix and a bare leading separator is not one. So `/etc/passwd`
+    /// was rejected on Linux and accepted on Windows, and was then written into the configuration
+    /// pool as an absolute path where the engine expects a normalized relative one. Nothing warned,
+    /// nothing failed to compile, and no test that itself went through `std::path` could see it.
+    ///
+    /// The same reasoning covers the component sweep. `r"a\b"` is one filename on Linux and two
+    /// components on Windows, and `Path` accepted it on both while meaning different things by it.
+    /// A guest path is a Linux path, so both questions are now asked of the bytes.
+    ///
+    /// Every rejection below must hold on *every* host. If one starts failing, the guard has gone
+    /// back to asking `std::path`.
+    #[test]
+    fn file_owner_keys_are_classified_as_linux_paths_on_every_host() {
+        let rejected = |path: &str| {
+            encode(
+                &Config::new().owner(path, 1, 2),
+                &["/bin/true".into()],
+                None,
+            )
+            .is_err()
+        };
+        assert!(rejected("/etc/passwd"), "absolute guest key");
+        assert!(rejected("/"), "the guest root");
+        assert!(rejected(r"a\b"), "a host separator inside a guest segment");
+        assert!(rejected(r"\etc\passwd"), "a host-absolute guest key");
+        assert!(rejected("a/../b"), "traversal");
+        assert!(rejected("./a"), "an unnormalized leading segment");
+        assert!(rejected("a//b"), "a doubled separator");
+        assert!(rejected("a/"), "a trailing separator");
+        assert!(rejected(""), "an empty key");
+        assert!(!rejected("a/file"), "a normalized relative key is accepted");
+        // Accepted, and deliberately so: `C:` is a legal Linux directory name and a legal guest
+        // segment. `Path` reads it as a drive prefix on Windows and as an ordinary component on
+        // Linux, which is the disagreement -- and Linux is the host whose answer is correct here,
+        // because the consumer is a Linux guest. Rejecting it would be the host leaking back in.
+        assert!(
+            !rejected("C:/windows"),
+            "a segment that merely looks like a drive"
+        );
     }
 }

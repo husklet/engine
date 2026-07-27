@@ -120,12 +120,14 @@ impl Machine {
     /// Signalling only the launch process is not enough: the guest tree runs as further host processes, and
     /// the coordinator among them is the *container init*, not the process this handle names.
     fn kick_participants(&self) -> Vec<u64> {
-        let signal = crate::ffi::interrupt_signal();
+        let signal = crate::sys::signal::interrupt_engine();
         let mut kicked = Vec::new();
         for process in self.processes().unwrap_or_default() {
             // Never the launch process itself: it runs no guest and therefore never installs the engine's
             // handler for this signal, so delivering it there would KILL the launch instead of nudging it.
-            if process.host_id != self.id() && crate::ffi::signal(process.host_id, signal).is_ok() {
+            if process.host_id != self.id()
+                && crate::sys::signal_process(process.host_id, signal).is_ok()
+            {
                 kicked.push(process.host_id);
             }
         }
@@ -382,19 +384,9 @@ fn checkpoint_context(context: impl Into<String>) -> ControlError {
     }
 }
 
-#[cfg(target_os = "linux")]
 const fn stop_signal() -> i32 {
-    19
+    crate::sys::signal::STOP
 }
-#[cfg(target_os = "macos")]
-const fn stop_signal() -> i32 {
-    17
-}
-#[cfg(target_os = "linux")]
 const fn continue_signal() -> i32 {
-    18
-}
-#[cfg(target_os = "macos")]
-const fn continue_signal() -> i32 {
-    19
+    crate::sys::signal::CONTINUE
 }

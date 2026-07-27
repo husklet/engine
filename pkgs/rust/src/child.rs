@@ -71,7 +71,7 @@ impl Child {
         if self.completed {
             return Err(Error::InvalidState);
         }
-        ffi::signal(self.id(), signal).map_err(Error::Io)
+        crate::sys::signal_process(self.id(), signal).map_err(Error::Io)
     }
 
     pub(crate) const fn completed(&self) -> bool {

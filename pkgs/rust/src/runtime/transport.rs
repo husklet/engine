@@ -2,7 +2,6 @@
 
 use std::{
     io::{Read, Write},
-    os::unix::net::UnixStream,
     sync::{
         atomic::{AtomicU64, Ordering},
         Mutex,
@@ -12,6 +11,13 @@ use std::{
 
 use crate::protocol::{decode_header, encode_header, HEADER_BYTES};
 pub use crate::protocol::{Frame, MessageType, TransportError};
+use crate::sys::stream_pair;
+/// The host's local byte stream, opaque and identical in role on every host.
+///
+/// Named here because [`Channel::from_stream`] takes one. It used to be
+/// `std::os::unix::net::UnixStream` outright, which put a host type in a signature that is otherwise
+/// host-neutral; on Unix `Stream: From<UnixStream>`, so an existing caller adds one `.into()`.
+pub use crate::sys::Stream;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransportLimits {
@@ -31,8 +37,8 @@ impl Default for TransportLimits {
 /// One bounded full-duplex provider channel. The owner decides how its socket is inherited.
 #[derive(Debug)]
 pub struct Channel {
-    reader: Mutex<UnixStream>,
-    writer: Mutex<UnixStream>,
+    reader: Mutex<Stream>,
+    writer: Mutex<Stream>,
     limits: TransportLimits,
     next_request: AtomicU64,
 }
@@ -43,7 +49,7 @@ impl Channel {
     /// # Errors
     /// Returns [`TransportError::Io`] when the host cannot create the channel.
     pub fn pair(limits: TransportLimits) -> Result<(Self, Self), TransportError> {
-        let (left, right) = UnixStream::pair().map_err(|_| TransportError::Io)?;
+        let (left, right) = stream_pair().map_err(|_| TransportError::Io)?;
         Ok((
             Self::from_stream(left, limits)?,
             Self::from_stream(right, limits)?,
@@ -54,10 +60,7 @@ impl Channel {
     ///
     /// # Errors
     /// Returns [`TransportError::Io`] when a separate writer endpoint cannot be duplicated.
-    pub fn from_stream(
-        stream: UnixStream,
-        limits: TransportLimits,
-    ) -> Result<Self, TransportError> {
+    pub fn from_stream(stream: Stream, limits: TransportLimits) -> Result<Self, TransportError> {
         let writer = stream.try_clone().map_err(|_| TransportError::Io)?;
         Ok(Self {
             reader: Mutex::new(stream),
@@ -239,11 +242,11 @@ fn remaining(deadline: Instant) -> Result<Duration, TransportError> {
         .ok_or(TransportError::Timeout)
 }
 
-fn write_all(stream: &mut UnixStream, bytes: &[u8]) -> Result<(), TransportError> {
+fn write_all(stream: &mut Stream, bytes: &[u8]) -> Result<(), TransportError> {
     stream.write_all(bytes).map_err(io_error)
 }
 
-fn read_exact(stream: &mut UnixStream, bytes: &mut [u8]) -> Result<(), TransportError> {
+fn read_exact(stream: &mut Stream, bytes: &mut [u8]) -> Result<(), TransportError> {
     stream.read_exact(bytes).map_err(io_error)
 }
 

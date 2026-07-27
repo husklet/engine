@@ -1,3 +1,4 @@
+use crate::sys::{self, guest_path};
 use crate::{
     extension::{FileSource, NamespaceEntry},
     spec::{SpecError, SpecErrorCategory},
@@ -6,7 +7,6 @@ use crate::{
 use std::{
     fs,
     io::Write,
-    os::unix::{fs::symlink, fs::PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -57,7 +57,9 @@ impl Projection {
             let has_ancestor = paths
                 .iter()
                 .any(|candidate| *candidate != path && path.starts_with(candidate));
-            if matches!(entry, NamespaceEntry::Symlink(value) if value.target.is_absolute())
+            // The symlink target is a *guest* path, so its absoluteness is a guest question.
+            if matches!(entry, NamespaceEntry::Symlink(value)
+                if guest_path::is_absolute(guest_path::bytes(&value.target)))
                 || (matches!(entry, NamespaceEntry::Symlink(_)) && !has_ancestor)
             {
                 links.push((self.host_path(path)?, path.to_owned()));
@@ -107,8 +109,7 @@ impl Projection {
                         }
                     })
                     .map_err(projection_io)?;
-                fs::set_permissions(&host, fs::Permissions::from_mode(value.metadata.mode))
-                    .map_err(projection_io)?;
+                sys::set_mode(&host, value.metadata.mode).map_err(projection_io)?;
             }
             NamespaceEntry::File(value) => {
                 let (FileSource::Immutable(bytes) | FileSource::Mutable(bytes)) = &value.source
@@ -121,11 +122,10 @@ impl Projection {
                 let mut file = fs::File::create(&host).map_err(projection_io)?;
                 file.write_all(bytes).map_err(projection_io)?;
                 file.sync_all().map_err(projection_io)?;
-                fs::set_permissions(&host, fs::Permissions::from_mode(value.metadata.mode))
-                    .map_err(projection_io)?;
+                sys::set_mode(&host, value.metadata.mode).map_err(projection_io)?;
             }
             NamespaceEntry::Symlink(value) => {
-                symlink(&value.target, &host).map_err(projection_io)?;
+                sys::symlink(&value.target, &host).map_err(projection_io)?;
             }
             _ => {
                 return Err(unsupported(
@@ -137,11 +137,27 @@ impl Projection {
         Ok(())
     }
 
+    /// The host location backing one absolute guest path.
+    ///
+    /// Built segment by segment rather than with one `strip_prefix("/")` and `join`. That form
+    /// works on Unix and produces `C:\tmp\proj\etc/x` on Windows -- mixed separators, which Win32
+    /// accepts and the first string comparison written against the result does not.
     fn host_path(&self, guest: &Path) -> Result<PathBuf, SpecError> {
-        guest
-            .strip_prefix("/")
-            .map(|path| self.root.join(path))
-            .map_err(|_| unsupported(guest, "projected paths must be absolute"))
+        let bytes = guest_path::bytes(guest);
+        if !guest_path::is_absolute(bytes) {
+            return Err(unsupported(guest, "projected paths must be absolute"));
+        }
+        let mut host = self.root.clone();
+        for segment in guest_path::host_segments(bytes) {
+            // Through `sys` rather than `str::from_utf8`, so that a Linux host keeps accepting the
+            // arbitrary byte strings a Linux path may contain and only a host that cannot represent
+            // them rejects.
+            let segment = sys::os_string(segment.to_vec()).ok_or_else(|| {
+                unsupported(guest, "this host cannot represent the projected path")
+            })?;
+            host.push(segment);
+        }
+        Ok(host)
     }
 }
 

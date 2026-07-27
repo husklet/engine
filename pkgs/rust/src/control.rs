@@ -21,20 +21,15 @@ pub enum Signal {
 
 impl Signal {
     pub(crate) const fn host_number(self) -> i32 {
+        use crate::sys::signal;
         match self {
-            Self::Hangup => 1,
-            Self::Interrupt => 2,
-            Self::Quit => 3,
-            Self::Kill => 9,
-            Self::Terminate => 15,
-            #[cfg(target_os = "linux")]
-            Self::User1 => 10,
-            #[cfg(target_os = "linux")]
-            Self::User2 => 12,
-            #[cfg(target_os = "macos")]
-            Self::User1 => 30,
-            #[cfg(target_os = "macos")]
-            Self::User2 => 31,
+            Self::Hangup => signal::HANGUP,
+            Self::Interrupt => signal::INTERRUPT,
+            Self::Quit => signal::QUIT,
+            Self::Kill => signal::KILL,
+            Self::Terminate => signal::TERMINATE,
+            Self::User1 => signal::USER1,
+            Self::User2 => signal::USER2,
         }
     }
 }
