@@ -390,16 +390,39 @@ confirms `translate.c`'s own note that its BFDOT lowering is not bit-exact.
 No host-CPU-keyed harness disposition was needed in the end, because implementing all three made the rows
 pass on both hosts. §3.12's entry 6 is closed.
 
-### 3.14 The whole AdvSIMD vector × indexed-element box was unimplemented
+### 3.14 The unimplemented-instruction scan measured the corpus, not the ISA
 
-Found in passing, and **far bigger than the three named features**. The aarch64 interpreter implemented none
-of the "AdvSIMD vector x indexed element" encoding group — indexed `FMLA`, `MLA`, `MUL`, `SQDMULL`,
-`SQRDMULH` and the rest. Confirmed with a hand-built binary: `0x4f9e8bff` aborts.
+**The most important methodological finding on this branch**, and the one worth carrying to any future
+backend.
 
-This is **baseline Armv8.0** that any compiled NEON code uses constantly. The 3012-run scan missed it
-because no fixture in the corpus reaches it — which is the sharpest available illustration of what that scan
-does and does not prove: it measures the corpus, not the ISA. The box is now open for the dot products only;
-everything else in it still reports honestly.
+A scan over **3012 fixture-runs** reported **9** unimplemented encodings, and that number was quoted here
+and in status reports as if it bounded the gap. It did not. A later agent found the **entire AdvSIMD vector
+× indexed-element box** unimplemented — indexed `FMLA`, `MLA`, `MUL`, `SQDMULL`, `SQRDMULH` and the rest,
+**baseline Armv8.0** that every `vmla_lane_*` intrinsic and glibc's own aarch64 string routines land on.
+Confirmed with a hand-built binary: `0x4f9e8bff` aborted. The scan missed all of it because **no fixture in
+the corpus reaches those encodings.**
+
+Replacing the method changed the result by five orders of magnitude. A slot-per-encoding differential —
+`.inst ENC; b tramp_ret`, a trampoline that loads all 31 GPRs, `V0..V31`, NZCV and FPCR/FPSR from a seed and
+stores the whole architectural state back, hashed over five seed sets, run under bare `qemu-aarch64` as
+oracle — enumerated **2,882,308 encodings** and made **~4.0M full-state comparisons**:
+
+| | fixture scan | encoding sweep |
+|---|---|---|
+| encodings examined | whatever 3012 runs happened to execute | 2,882,308 |
+| unimplemented found | 9 | 39,000-odd, nearly all unadvertised extensions |
+| **silently mis-executed found** | **0 — it cannot see this class at all** | **11** |
+
+That last row is the point. A fixture scan can only find an instruction the corpus executes *and* which
+reports. It is structurally blind to an encoding that falls into a neighbouring case and returns a plausible
+wrong answer — which is the failure mode this codebase treats as worst, and which produced eleven real
+defects here including an entire FP16 box executing as `INS`, `UQRSHRN` returning zero with `FPSR.QC`
+**clear** where the answer is the maximum with QC **set**, and `FRINT32X` executing as `FSQRT`.
+
+Two harness properties were load-bearing and are worth reusing verbatim. The output struct must be
+**static, not a stack local** — otherwise an encoding whose `Rm` is the harness's own reserved register
+reads a stack address that differs between oracle and engine, and ~4600 encodings report false differences.
+And the probes must be built **`-no-pie`**, or `ADR`/`ADRP` are not comparable between the two runs.
 
 ### 3.15 The discovery surfaces did not derive from one model
 
