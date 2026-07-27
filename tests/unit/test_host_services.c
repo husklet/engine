@@ -434,6 +434,19 @@ int main(void) {
                                      HL_HOST_MEMORY_PRIVATE, &anonymous)
                      .status == HL_STATUS_OUT_OF_MEMORY);
         HL_CHECK(anonymous.handle == HL_HOST_HANDLE_INVALID && fake.live_mappings == 0);
+        /* A partial unmap_range keeps its handle -- only a full-range unmap consumes one. Retiring
+         * on a partial unmap is what strands a handle over a hole it no longer has. */
+        anonymous = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(anonymous), 0, 0, 0, 0};
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, 8192, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &anonymous)
+                     .status == HL_STATUS_OK &&
+                 fake.live_mappings == 1);
+        HL_CHECK(services.memory->unmap_range(services.context, anonymous.handle, 4096, 4096).status ==
+                     HL_STATUS_OK &&
+                 fake.live_mappings == 1);
+        HL_CHECK(services.memory->unmap_range(services.context, anonymous.handle, 0, 4096).status == HL_STATUS_OK &&
+                 fake.live_mappings == 0);
     }
 
     process = services.process->spawn_cloned(services.context, fake_process_entry, NULL);

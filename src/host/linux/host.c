@@ -5,6 +5,7 @@
 #include "hl/linux.h"
 #include "probe.h"
 #include "../host_cpu.h"
+#include "../range.h"
 #include "../system.h"
 #include "../resolve.h"
 #include "../sync.h"
@@ -65,6 +66,10 @@ typedef struct hl_linux_handle_entry {
     void *address;
     void *executable_address;
     uint64_t size;
+    /* Mapping handles only: the subranges of [address, address + size) a partial unmap gave back.
+     * address and size stay the addressing frame every offset-keyed call is measured against, so
+     * what the handle still holds has to be recorded beside them rather than folded into them. */
+    hl_host_hole_set retired;
     int wake_descriptor;
     uint32_t process_reaped;
     uint32_t process_waiting;
@@ -255,6 +260,39 @@ static hl_linux_handle_entry *hl_linux_lookup_locked(hl_host_linux *host, hl_hos
     return entry;
 }
 
+/* Retire a mapping slot. The frame, the record of what it gave back, and the kind go together:
+ * keeping them apart is what once left a handle claiming a hole it had already unmapped. */
+static void hl_linux_retire_mapping_locked(hl_linux_handle_entry *entry) {
+    hl_host_hole_set_release(&entry->retired);
+    entry->kind = HL_LINUX_HANDLE_NONE;
+    entry->address = NULL;
+    entry->executable_address = NULL;
+    entry->size = 0;
+}
+
+/* True when [low, high) touches a byte this mapping still holds. The frame alone is not the answer,
+ * because a partial unmap gives bytes back without consuming the handle. Both aliases of a code
+ * mapping count, because releasing either one out from under the owner is the failure the callers
+ * of this exist to prevent; only the writable alias is reachable by a subrange unmap, so only it
+ * carries holes. */
+static inline int hl_linux_entry_holds_locked(const hl_linux_handle_entry *entry, uintptr_t low, uintptr_t high) {
+    if (entry->kind != HL_LINUX_HANDLE_MAPPING || entry->size == 0) return 0;
+    if (entry->address != NULL) {
+        uintptr_t base = (uintptr_t)entry->address;
+        uintptr_t end = base + (uintptr_t)entry->size;
+        if (low < end && base < high) {
+            uint64_t from = low > base ? (uint64_t)(low - base) : 0;
+            uint64_t to = high < end ? (uint64_t)(high - base) : entry->size;
+            if (hl_host_hole_set_holds(&entry->retired, from, to - from)) return 1;
+        }
+    }
+    if (entry->executable_address != NULL) {
+        uintptr_t base = (uintptr_t)entry->executable_address;
+        if (low < base + (uintptr_t)entry->size && base < high) return 1;
+    }
+    return 0;
+}
+
 static hl_host_result hl_linux_allocate_handle(hl_host_linux *host, hl_linux_handle_kind kind, int descriptor,
                                                void *address, void *executable_address, uint64_t size,
                                                int wake_descriptor) {
@@ -279,6 +317,9 @@ static hl_host_result hl_linux_allocate_handle(hl_host_linux *host, hl_linux_han
     for (index = 0; index < host->handle_capacity; ++index) {
         hl_linux_handle_entry *entry = &host->handles[index];
         if (entry->kind == HL_LINUX_HANDLE_NONE) {
+            /* A reused slot must not inherit the previous tenant's holes. Every mapping retirement
+             * already drops them; this is the belt that makes that impossible to get wrong. */
+            hl_host_hole_set_release(&entry->retired);
             entry->generation++;
             if (entry->generation == 0) entry->generation = 1;
             entry->kind = (uint16_t)kind;
@@ -372,7 +413,20 @@ static hl_host_result hl_linux_memory_release(void *context, hl_host_handle mapp
         pthread_mutex_unlock(&host->lock);
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    result = munmap(entry->address, (size_t)entry->size);
+    /* Unmap what the handle still holds, not the frame. A partial unmap can have given a subrange
+     * back, and the address space is free to have handed that subrange to someone else since. With
+     * no holes this is the one whole-frame munmap it has always been. */
+    {
+        uint64_t held_offset;
+        uint64_t held_size;
+        uint32_t part = 0;
+        result = 0;
+        while (result == 0 &&
+               hl_host_hole_set_held_range(&entry->retired, entry->size, part, &held_offset, &held_size)) {
+            result = munmap((char *)entry->address + held_offset, (size_t)held_size);
+            ++part;
+        }
+    }
     if (result == 0 && entry->executable_address != NULL && entry->executable_address != entry->address)
         result = munmap(entry->executable_address, (size_t)entry->size);
     if (result == 0 && entry->descriptor >= 0) {
@@ -383,10 +437,7 @@ static hl_host_result hl_linux_memory_release(void *context, hl_host_handle mapp
         result = close(entry->descriptor);
     }
     if (result == 0) {
-        entry->kind = HL_LINUX_HANDLE_NONE;
-        entry->address = NULL;
-        entry->executable_address = NULL;
-        entry->size = 0;
+        hl_linux_retire_mapping_locked(entry);
         entry->descriptor = -1;
     }
     pthread_mutex_unlock(&host->lock);
@@ -402,10 +453,7 @@ static hl_host_result hl_linux_memory_discard(void *context, hl_host_handle mapp
         pthread_mutex_unlock(&host->lock);
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    entry->kind = HL_LINUX_HANDLE_NONE;
-    entry->address = NULL;
-    entry->executable_address = NULL;
-    entry->size = 0;
+    hl_linux_retire_mapping_locked(entry);
     entry->descriptor = -1;
     pthread_mutex_unlock(&host->lock);
     return hl_linux_result(HL_STATUS_OK, 0, 0);
@@ -476,19 +524,17 @@ static hl_host_result hl_linux_memory_map_file(void *context, hl_host_handle fil
         (void)hl_linux_memory_discard(context, registered.value);
         return failure;
     }
-    /* MAP_FIXED replaced these VMAs atomically. Retire stale ownership handles without unmapping the new VMA. */
+    /* MAP_FIXED replaced these VMAs atomically. Retire stale ownership handles without unmapping the
+     * new VMA -- but only the ones that still held a byte of it. A handle whose overlap with this
+     * range is entirely inside a hole it already gave back kept nothing here to go stale. */
     if (placement == HL_HOST_MEMORY_FIXED) {
         uintptr_t low = (uintptr_t)address, high = low + (uintptr_t)size;
         pthread_mutex_lock(&host->lock);
         for (uint32_t index = 0; index < host->handle_capacity; ++index) {
             hl_linux_handle_entry *entry = &host->handles[index];
-            uintptr_t old_low = (uintptr_t)entry->address, old_high = old_low + (uintptr_t)entry->size;
             if (hl_linux_encode_handle(index, entry->generation) != registered.value &&
-                entry->kind == HL_LINUX_HANDLE_MAPPING && low < old_high && old_low < high) {
-                entry->kind = HL_LINUX_HANDLE_NONE;
-                entry->address = NULL;
-                entry->size = 0;
-            }
+                hl_linux_entry_holds_locked(entry, low, high))
+                hl_linux_retire_mapping_locked(entry);
         }
         pthread_mutex_unlock(&host->lock);
     }
@@ -547,13 +593,9 @@ static hl_host_result hl_linux_memory_map_anonymous(void *context, uint64_t requ
         pthread_mutex_lock(&host->lock);
         for (uint32_t index = 0; index < host->handle_capacity; ++index) {
             hl_linux_handle_entry *entry = &host->handles[index];
-            uintptr_t old_low = (uintptr_t)entry->address, old_high = old_low + (uintptr_t)entry->size;
             if (hl_linux_encode_handle(index, entry->generation) != registered.value &&
-                entry->kind == HL_LINUX_HANDLE_MAPPING && low < old_high && old_low < high) {
-                entry->kind = HL_LINUX_HANDLE_NONE;
-                entry->address = NULL;
-                entry->size = 0;
-            }
+                hl_linux_entry_holds_locked(entry, low, high))
+                hl_linux_retire_mapping_locked(entry);
         }
         pthread_mutex_unlock(&host->lock);
     }
@@ -601,30 +643,30 @@ static hl_host_result hl_linux_memory_unmap_range(void *context, hl_host_handle 
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
     status = munmap((char *)entry->address + offset, (size_t)size);
-    if (status == 0 && offset == 0 && size == entry->size) {
-        entry->kind = HL_LINUX_HANDLE_NONE;
-        entry->address = NULL;
-        entry->size = 0;
+    if (status == 0) {
+        /* A full-range unmap consumes the handle. A partial one keeps it, so the subrange it just
+         * gave back has to leave the handle's coverage too -- otherwise the handle goes on claiming
+         * a hole the address space is free to hand to someone else. When repeated partial unmaps
+         * finally leave nothing held, the handle is consumed exactly as a single full one would
+         * have consumed it: a live mapping handle always holds at least one byte.
+         *
+         * If the record cannot grow, the subrange stays claimed. That refuses a reuse that would
+         * have been legal, which is recoverable; the other direction is not. The same reasoning
+         * applies to the tail of a non-page-aligned length: the kernel rounds it up and this does
+         * not, so the handle keeps claiming those last bytes rather than guessing them away. */
+        if ((offset == 0 && size == entry->size) ||
+            (hl_host_hole_set_retire(&entry->retired, offset, size) &&
+             !hl_host_hole_set_holds(&entry->retired, 0, entry->size)))
+            hl_linux_retire_mapping_locked(entry);
     }
     pthread_mutex_unlock(&host->lock);
     return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
-/* True while any live mapping handle covers a byte of [low, high). Both aliases of a code mapping count,
- * because releasing either one out from under the owner is the failure this guard exists to prevent. */
+/* True while any live mapping handle still holds a byte of [low, high). */
 static int hl_linux_range_owned_locked(hl_host_linux *host, uintptr_t low, uintptr_t high) {
-    for (uint32_t index = 0; index < host->handle_capacity; ++index) {
-        const hl_linux_handle_entry *entry = &host->handles[index];
-        if (entry->kind != HL_LINUX_HANDLE_MAPPING || entry->size == 0) continue;
-        if (entry->address != NULL) {
-            uintptr_t owned = (uintptr_t)entry->address;
-            if (low < owned + (uintptr_t)entry->size && owned < high) return 1;
-        }
-        if (entry->executable_address != NULL) {
-            uintptr_t owned = (uintptr_t)entry->executable_address;
-            if (low < owned + (uintptr_t)entry->size && owned < high) return 1;
-        }
-    }
+    for (uint32_t index = 0; index < host->handle_capacity; ++index)
+        if (hl_linux_entry_holds_locked(&host->handles[index], low, high)) return 1;
     return 0;
 }
 
@@ -3984,10 +4026,16 @@ void hl_host_linux_destroy(hl_host_linux *host) {
     for (i = 0; i < host->handle_capacity; ++i) {
         hl_linux_handle_entry *entry = &host->handles[i];
         if (entry->kind == HL_LINUX_HANDLE_MAPPING) {
-            munmap(entry->address, (size_t)entry->size);
+            /* Teardown gives back only what is still held, for the same reason release does. */
+            uint64_t held_offset;
+            uint64_t held_size;
+            for (uint32_t part = 0;
+                 hl_host_hole_set_held_range(&entry->retired, entry->size, part, &held_offset, &held_size); ++part)
+                munmap((char *)entry->address + held_offset, (size_t)held_size);
             if (entry->executable_address != NULL && entry->executable_address != entry->address)
                 munmap(entry->executable_address, (size_t)entry->size);
             if (entry->descriptor >= 0) close(entry->descriptor);
+            hl_host_hole_set_release(&entry->retired);
         } else if (entry->kind == HL_LINUX_HANDLE_PROCESS) {
             int status;
             if (entry->process_reaped) continue;

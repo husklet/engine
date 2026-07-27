@@ -104,13 +104,18 @@ static hl_host_result hl_fake_mapping_sync(void *context, hl_host_handle mapping
     return hl_fake_protect(context, mapping, offset, size, 0);
 }
 
+/* Only a full-range unmap consumes the mapping handle. A partial one leaves the handle live over
+ * what it kept, and treating it as a retirement is the same registry error that on a real host let
+ * a handle go on claiming a hole it had already given back. The fake keeps a live count rather than
+ * per-mapping frames, so it draws the one distinction that needs no frame: an unmap that starts
+ * past the base cannot be the whole range, so it never retires the handle. A head unmap is still
+ * counted as a full one here, which is the residue of having no span to compare against. */
 static hl_host_result hl_fake_unmap_range(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size) {
     hl_fake_host *fake = context;
-    (void)offset;
     if (mapping == 0 || size == 0 || fake->live_mappings == 0)
         return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
     hl_host_result result = hl_fake_result(fake, 0);
-    if (result.status == HL_STATUS_OK) fake->live_mappings--;
+    if (result.status == HL_STATUS_OK && offset == 0) fake->live_mappings--;
     return result;
 }
 

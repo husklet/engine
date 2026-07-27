@@ -2,6 +2,7 @@
 
 #include "hl/macos.h"
 #include "probe.h"
+#include "../range.h"
 #include "../system.h"
 #include "../resolve.h"
 #include "../sync.h"
@@ -55,6 +56,10 @@ typedef struct hl_macos_mapping {
     void *writable;
     void *executable;
     uint64_t size;
+    /* The subranges of [writable, writable + size) a partial unmap gave back. writable and size
+     * stay the addressing frame every offset-keyed call is measured against, so what the handle
+     * still holds has to be recorded beside them rather than folded into them. */
+    hl_host_hole_set retired;
 } hl_macos_mapping;
 
 typedef struct hl_macos_stream_shared {
@@ -400,6 +405,39 @@ static hl_macos_mapping *hl_macos_lookup(hl_host_macos *host, hl_host_handle han
     return &host->mappings[index];
 }
 
+/* Retire a mapping slot. The frame, the record of what it gave back, and the active bit go
+ * together: keeping them apart is what once left a handle claiming a hole it had already unmapped. */
+static void hl_macos_retire_mapping_locked(hl_macos_mapping *mapping) {
+    hl_host_hole_set_release(&mapping->retired);
+    mapping->active = 0;
+    mapping->writable = NULL;
+    mapping->executable = NULL;
+    mapping->size = 0;
+}
+
+/* True when [low, high) touches a byte this mapping still holds. The frame alone is not the answer,
+ * because a partial unmap gives bytes back without consuming the handle. Both aliases of a code
+ * mapping count, because releasing either one out from under the owner is the failure the callers
+ * of this exist to prevent; only the writable alias is reachable by a subrange unmap, so only it
+ * carries holes. */
+static inline int hl_macos_mapping_holds_locked(const hl_macos_mapping *mapping, uintptr_t low, uintptr_t high) {
+    if (!mapping->active || mapping->size == 0) return 0;
+    if (mapping->writable != NULL) {
+        uintptr_t base = (uintptr_t)mapping->writable;
+        uintptr_t end = base + (uintptr_t)mapping->size;
+        if (low < end && base < high) {
+            uint64_t from = low > base ? (uint64_t)(low - base) : 0;
+            uint64_t to = high < end ? (uint64_t)(high - base) : mapping->size;
+            if (hl_host_hole_set_holds(&mapping->retired, from, to - from)) return 1;
+        }
+    }
+    if (mapping->executable != NULL) {
+        uintptr_t base = (uintptr_t)mapping->executable;
+        if (low < base + (uintptr_t)mapping->size && base < high) return 1;
+    }
+    return 0;
+}
+
 static hl_host_result hl_macos_register(hl_host_macos *host, void *writable, void *executable, uint64_t size) {
     uint32_t index;
     hl_host_handle handle = 0;
@@ -407,6 +445,9 @@ static hl_host_result hl_macos_register(hl_host_macos *host, void *writable, voi
     for (index = 0; index < host->mapping_capacity; index++) {
         hl_macos_mapping *mapping = &host->mappings[index];
         if (!mapping->active) {
+            /* A reused slot must not inherit the previous tenant's holes. Every mapping retirement
+             * already drops them; this is the belt that makes that impossible to get wrong. */
+            hl_host_hole_set_release(&mapping->retired);
             mapping->generation++;
             if (mapping->generation == 0) mapping->generation = 1;
             mapping->active = 1;
@@ -522,15 +563,23 @@ static hl_host_result hl_macos_release(void *context, hl_host_handle handle) {
         pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    result = munmap(mapping->writable, (size_t)mapping->size);
+    /* Unmap what the handle still holds, not the frame. A partial unmap can have given a subrange
+     * back, and the address space is free to have handed that subrange to someone else since. With
+     * no holes this is the one whole-frame munmap it has always been. */
+    {
+        uint64_t held_offset;
+        uint64_t held_size;
+        uint32_t part = 0;
+        result = 0;
+        while (result == 0 &&
+               hl_host_hole_set_held_range(&mapping->retired, mapping->size, part, &held_offset, &held_size)) {
+            result = munmap((char *)mapping->writable + held_offset, (size_t)held_size);
+            ++part;
+        }
+    }
     if (mapping->executable != NULL && mapping->executable != mapping->writable)
         (void)munmap(mapping->executable, (size_t)mapping->size);
-    if (result == 0) {
-        mapping->active = 0;
-        mapping->writable = NULL;
-        mapping->executable = NULL;
-        mapping->size = 0;
-    }
+    if (result == 0) hl_macos_retire_mapping_locked(mapping);
     pthread_mutex_unlock(&host->lock);
     return result == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
@@ -544,10 +593,7 @@ static hl_host_result hl_macos_discard(void *context, hl_host_handle handle) {
         pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    mapping->active = 0;
-    mapping->writable = NULL;
-    mapping->executable = NULL;
-    mapping->size = 0;
+    hl_macos_retire_mapping_locked(mapping);
     pthread_mutex_unlock(&host->lock);
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
@@ -700,13 +746,8 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
         pthread_mutex_lock(&host->lock);
         for (uint32_t index = 0; index < host->mapping_capacity; ++index) {
             hl_macos_mapping *old = &host->mappings[index];
-            uintptr_t old_low = (uintptr_t)old->writable, old_high = old_low + (uintptr_t)old->size;
-            if (old->active && old->writable != NULL && low < old_high && old_low < low + total) {
-                old->active = 0;
-                old->writable = NULL;
-                old->executable = NULL;
-                old->size = 0;
-            }
+            if (hl_macos_mapping_holds_locked(old, (uintptr_t)low, (uintptr_t)(low + total)))
+                hl_macos_retire_mapping_locked(old);
         }
         pthread_mutex_unlock(&host->lock);
         if (!hl_macos_mapping_fill(host, registered.value, address, total)) abort();
@@ -753,19 +794,15 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
                            MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
         }
     }
-    /* MAP_FIXED replaced these VMAs atomically. Retire stale handles without unmapping the replacement. */
+    /* MAP_FIXED replaced these VMAs atomically. Retire stale handles without unmapping the
+     * replacement -- but only the ones that still held a byte of it. A handle whose overlap with
+     * this range is entirely inside a hole it already gave back kept nothing here to go stale. */
     if (placement == HL_HOST_MEMORY_FIXED) {
         uintptr_t low = (uintptr_t)address, high = low + (uintptr_t)size;
         pthread_mutex_lock(&host->lock);
         for (uint32_t index = 0; index < host->mapping_capacity; ++index) {
             hl_macos_mapping *old = &host->mappings[index];
-            uintptr_t old_low = (uintptr_t)old->writable, old_high = old_low + (uintptr_t)old->size;
-            if (old->active && old->writable != NULL && low < old_high && old_low < high) {
-                old->active = 0;
-                old->writable = NULL;
-                old->executable = NULL;
-                old->size = 0;
-            }
+            if (hl_macos_mapping_holds_locked(old, low, high)) hl_macos_retire_mapping_locked(old);
         }
         pthread_mutex_unlock(&host->lock);
     }
@@ -821,13 +858,7 @@ static hl_host_result hl_macos_map_anonymous(void *context, uint64_t requested_a
         pthread_mutex_lock(&host->lock);
         for (uint32_t index = 0; index < host->mapping_capacity; ++index) {
             hl_macos_mapping *old = &host->mappings[index];
-            uintptr_t old_low = (uintptr_t)old->writable, old_high = old_low + (uintptr_t)old->size;
-            if (old->active && old->writable != NULL && low < old_high && old_low < high) {
-                old->active = 0;
-                old->writable = NULL;
-                old->executable = NULL;
-                old->size = 0;
-            }
+            if (hl_macos_mapping_holds_locked(old, low, high)) hl_macos_retire_mapping_locked(old);
         }
         pthread_mutex_unlock(&host->lock);
     }
@@ -873,30 +904,28 @@ static hl_host_result hl_macos_unmap_range(void *context, hl_host_handle handle,
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
     status = munmap((char *)mapping->writable + offset, (size_t)size);
-    if (status == 0 && offset == 0 && size == mapping->size) {
-        mapping->active = 0;
-        mapping->writable = NULL;
-        mapping->size = 0;
+    if (status == 0) {
+        /* A full-range unmap consumes the handle. A partial one keeps it, so the subrange it just
+         * gave back has to leave the handle's coverage too -- otherwise the handle goes on claiming
+         * a hole the address space is free to hand to someone else. When repeated partial unmaps
+         * finally leave nothing held, the handle is consumed exactly as a single full one would
+         * have consumed it: a live mapping handle always holds at least one byte.
+         *
+         * If the record cannot grow, the subrange stays claimed. That refuses a reuse that would
+         * have been legal, which is recoverable; the other direction is not. */
+        if ((offset == 0 && size == mapping->size) ||
+            (hl_host_hole_set_retire(&mapping->retired, offset, size) &&
+             !hl_host_hole_set_holds(&mapping->retired, 0, mapping->size)))
+            hl_macos_retire_mapping_locked(mapping);
     }
     pthread_mutex_unlock(&host->lock);
     return status == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
 
-/* True while any live mapping handle covers a byte of [low, high). Both aliases of a code mapping count,
- * because releasing either one out from under the owner is the failure this guard exists to prevent. */
+/* True while any live mapping handle still holds a byte of [low, high). */
 static int hl_macos_range_owned_locked(hl_host_macos *host, uintptr_t low, uintptr_t high) {
-    for (uint32_t index = 0; index < host->mapping_capacity; ++index) {
-        const hl_macos_mapping *mapping = &host->mappings[index];
-        if (!mapping->active || mapping->size == 0) continue;
-        if (mapping->writable != NULL) {
-            uintptr_t owned = (uintptr_t)mapping->writable;
-            if (low < owned + (uintptr_t)mapping->size && owned < high) return 1;
-        }
-        if (mapping->executable != NULL) {
-            uintptr_t owned = (uintptr_t)mapping->executable;
-            if (low < owned + (uintptr_t)mapping->size && owned < high) return 1;
-        }
-    }
+    for (uint32_t index = 0; index < host->mapping_capacity; ++index)
+        if (hl_macos_mapping_holds_locked(&host->mappings[index], low, high)) return 1;
     return 0;
 }
 
@@ -4861,10 +4890,16 @@ void hl_host_macos_destroy(hl_host_macos *host) {
     pthread_mutex_unlock(&host->lock);
     for (index = 0; index < host->mapping_capacity; index++) {
         hl_macos_mapping *mapping = &host->mappings[index];
+        uint64_t held_offset;
+        uint64_t held_size;
         if (!mapping->active) continue;
-        munmap(mapping->writable, (size_t)mapping->size);
+        /* Teardown gives back only what is still held, for the same reason release does. */
+        for (uint32_t part = 0;
+             hl_host_hole_set_held_range(&mapping->retired, mapping->size, part, &held_offset, &held_size); ++part)
+            munmap((char *)mapping->writable + held_offset, (size_t)held_size);
         if (mapping->executable != NULL && mapping->executable != mapping->writable)
             munmap(mapping->executable, (size_t)mapping->size);
+        hl_host_hole_set_release(&mapping->retired);
     }
     for (index = 0; index < host->file_capacity; ++index) {
         hl_macos_file *file = &host->files[index];

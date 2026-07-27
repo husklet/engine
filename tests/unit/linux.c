@@ -250,16 +250,85 @@ int main(void) {
 
     HL_CHECK(hl_host_linux_create(&linux_host, &services) == HL_STATUS_OK);
     {
+        /* What a mapping handle covers after a partial unmap_range.
+         *
+         * A partial unmap keeps the handle -- only a full-range unmap consumes it -- but the
+         * subrange it gave back has to leave the handle's coverage, because the registry answers
+         * the ownership question from it. While the hole stayed inside the handle's frame, the
+         * registry claimed memory the owner no longer had: a genuinely vacant address was refused
+         * with BUSY, and a whole-handle teardown would have unmapped whatever the address space
+         * had placed in that hole in the meantime.
+         *
+         * The addressing frame itself cannot move. protect, sync and unmap_range are all keyed on
+         * an offset from the base the mapping was placed at, so shrinking the frame would shift
+         * every one of them; what changes is which bytes of the frame are still held. */
+        long page = sysconf(_SC_PAGESIZE);
+        hl_host_memory_mapping frame = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(frame), 0, 0, 0, 0};
+        hl_host_memory_mapping tenant = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(tenant), 0, 0, 0, 0};
+        uint64_t base;
+        HL_CHECK(page > 0);
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, (uint64_t)page * 3,
+                                     HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_PRIVATE, &frame)
+                     .status == HL_STATUS_OK);
+        base = frame.address;
+        HL_CHECK(services.memory->unmap_range(services.context, frame.handle, (uint64_t)page, (uint64_t)page).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(range_present(base, (uint64_t)page) && !range_present(base + (uint64_t)page, (uint64_t)page) &&
+                 range_present(base + (uint64_t)page * 2, (uint64_t)page));
+        /* The handle survived, and offsets still mean what they meant when it was created. */
+        HL_CHECK(services.memory->protect(services.context, frame.handle, (uint64_t)page * 2, (uint64_t)page,
+                                          HL_HOST_MEMORY_READ)
+                     .status == HL_STATUS_OK);
+        /* The hole is vacant, so an address-keyed release of it must succeed. */
+        HL_CHECK(services.memory->unmap_address(services.context, base + (uint64_t)page, (uint64_t)page).status ==
+                 HL_STATUS_OK);
+        /* What the handle kept is still refused, on either side of the hole and across all three. */
+        HL_CHECK(services.memory->unmap_address(services.context, base, (uint64_t)page).status == HL_STATUS_BUSY);
+        HL_CHECK(services.memory->unmap_address(services.context, base + (uint64_t)page * 2, (uint64_t)page).status ==
+                 HL_STATUS_BUSY);
+        HL_CHECK(services.memory->unmap_address(services.context, base, (uint64_t)page * 3).status == HL_STATUS_BUSY);
+        /* A placement is free to take the hole; the exact-address form proves it really is vacant. */
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, base + (uint64_t)page, (uint64_t)page,
+                                     HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED_NOREPLACE, &tenant)
+                     .status == HL_STATUS_OK &&
+                 tenant.address == base + (uint64_t)page);
+        ((char *)(uintptr_t)tenant.address)[0] = 'T';
+        /* Busy again, for the right reason: a second handle holds it now. */
+        HL_CHECK(services.memory->unmap_address(services.context, tenant.address, (uint64_t)page).status ==
+                 HL_STATUS_BUSY);
+        /* Tearing the first handle down gives back only what it still held. */
+        HL_CHECK(services.memory->release(services.context, frame.handle).status == HL_STATUS_OK);
+        HL_CHECK(!range_present(base, (uint64_t)page) && !range_present(base + (uint64_t)page * 2, (uint64_t)page));
+        HL_CHECK(range_present(tenant.address, (uint64_t)page) && ((char *)(uintptr_t)tenant.address)[0] == 'T');
+        HL_CHECK(services.memory->release(services.context, tenant.handle).status == HL_STATUS_OK);
+
+        /* Piecewise complete: when the last held byte goes the handle is consumed exactly as a
+         * single full-range unmap consumes it, so a live mapping handle always holds a byte. */
+        frame = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(frame), 0, 0, 0, 0};
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, (uint64_t)page * 2,
+                                     HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_PRIVATE, &frame)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services.memory->unmap_range(services.context, frame.handle, (uint64_t)page, (uint64_t)page).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.memory->unmap_range(services.context, frame.handle, 0, (uint64_t)page).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.memory->release(services.context, frame.handle).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(!range_present(frame.address, (uint64_t)page * 2));
+        HL_CHECK(services.memory->unmap_address(services.context, frame.address, (uint64_t)page * 2).status ==
+                 HL_STATUS_OK);
+    }
+    {
         /* Address-keyed release and range wiring, appended in HL_HOST_MEMORY_ABI 7. Both populations that
          * need an address key hold no mapping handle: a range a provider placed at a fixed address, and a
          * range whose ownership handle a later fixed placement retired. discard() reproduces the second
          * exactly, which is why it is the shape the success case is built on.
          *
-         * This runs first, on a registry with no mapping handles in it. A partial unmap_range leaves its
-         * handle live over the hole it made, and a later kernel-chosen placement can be handed that same
-         * address -- at which point a live handle covers a range its owner no longer has, and this refuses
-         * it. That is the safe answer, but it is answered from the registry, so the case is set up from a
-         * registry this block owns end to end rather than from whatever earlier blocks left behind. */
+         * BUSY is answered from the registry rather than from the address space, so the case is set up
+         * from mappings this block owns end to end rather than from whatever earlier blocks left behind. */
         long page = sysconf(_SC_PAGESIZE);
         hl_host_memory_mapping owned = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(owned), 0, 0, 0, 0};
         hl_host_memory_mapping neighbour = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(neighbour), 0, 0, 0, 0};
