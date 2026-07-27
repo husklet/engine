@@ -419,6 +419,54 @@ static void cvt_raise_pe(void) {
     (void)q;
 }
 
+// OR an exact set of exceptions, named by MXCSR bit (SSE_XI..SSE_XP), into the host sticky state. Setting
+// the bits beats synthesising each one with an arithmetic op (cvt_raise_pe's 1/3 above): no operation
+// raises exactly one exception in every case, and on aarch64 no operation raises #D at all.
+#define SSE_XI 0x01u // invalid
+#define SSE_XD 0x02u // denormal operand
+#define SSE_XZ 0x04u // divide by zero
+#define SSE_XO 0x08u // overflow
+#define SSE_XU 0x10u // underflow
+#define SSE_XP 0x20u // precision
+
+static void sse_raise(unsigned mxcsr_bits) {
+    if (!mxcsr_bits) return;
+#if defined(HL_HOST_CPU_AARCH64)
+    static const unsigned to_fpsr[6] = {0, 7, 1, 2, 3, 4}; // IE<-IOC DE<-IDC ZE<-DZC OE<-OFC UE<-UFC PE<-IXC
+    unsigned host = 0;
+    for (unsigned i = 0; i < 6; i++)
+        if (mxcsr_bits & (1u << i)) host |= 1u << to_fpsr[i];
+    cvt_fp_flags_set(cvt_fp_flags() | host);
+#else
+    cvt_fp_flags_set(cvt_fp_flags() | mxcsr_bits);
+#endif
+}
+
+// Guest denormals-are-zero. On an x86-64 host the guest MXCSR IS the host MXCSR, so read DAZ(6) directly;
+// on aarch64 the guest's FTZ|DAZ is carried by FPCR.FZ(24), which ldmxcsr set (see translate.c).
+static int sse_daz_active(void) {
+#if defined(HL_HOST_CPU_AARCH64)
+    unsigned long f;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(f));
+    return (f >> 24) & 1u;
+#elif defined(HL_HOST_CPU_X86_64)
+    return (_mm_getcsr() >> 6) & 1u;
+#else
+    return 0;
+#endif
+}
+
+// A denormal SOURCE, decided on the BIT PATTERN. Any FP comparison would do it in fewer lines and is not
+// available: COMISD/UCOMISD themselves report #D for a denormal operand, so the test would raise the flag
+// it is measuring. Exponent field zero with a nonzero significand; +-0 is not denormal.
+static int sse_is_denorm_f32(uint32_t b) {
+    return (b & 0x7f800000u) == 0 && (b & 0x007fffffu) != 0;
+}
+
+static int sse_is_denorm_f64(uint64_t b) {
+    return (b & UINT64_C(0x7ff0000000000000)) == 0 && (b & UINT64_C(0x000fffffffffffff)) != 0;
+}
+
 // x86 CVT[T]xx2{SI,DQ,PI}, the whole rule, for every convert the C emulator owns. Measured on Zen 4 over
 // the four RC modes and a kit whose out-of-range values include NON-INTEGERS -- the only ones that can
 // tell these three apart, and they exist only for an f64 source with a 32-bit destination:
@@ -441,7 +489,7 @@ static void cvt_raise_pe(void) {
             return indef;                                                                                              \
         }                                                                                                              \
         ty r = rnd(x, trunc);                                                                                          \
-        if (r >= lim || r < -lim) { /* r is integral, never denormal, so these cannot report #D */              \
+        if (r >= lim || r < -lim) { /* r is integral, never denormal, so these cannot report #D */                     \
             fma_raise_ie();                                                                                            \
             return indef;                                                                                              \
         }                                                                                                              \
@@ -514,7 +562,14 @@ static int avx_cmp_pred(double x, double y, int pred) {
 // which is round-to-nearest-even whatever the FP environment says. `mode` is the x86 rounding control as
 // ROUND* imm[1:0]: 0=nearest-even, 1=down, 2=up, 3=truncate. A NaN result is QUIET even from a signalling
 // source; overflow gives Infinity only when the mode rounds away from zero.
-static uint16_t avx_f32_to_f16_software(float f, unsigned mode) {
+// `flags`, when non-NULL, receives the MXCSR bits VCVTPS2PH raises -- measured against native for all six
+// imm encodings over the overflow, underflow and denormal boundaries. Every clause falls out of a value
+// this function already had: #P from round|sticky, #U from "tiny BEFORE rounding, and inexact" (which is
+// exponent < -14, so 65519.996 -> 0x03ff under RM is #U even though it lands on a normal), #O from the
+// same exponent16 >= 0x1f the return below tests (so +65520 under RM, which rounds DOWN to the largest
+// finite, is correctly NOT an overflow), and #I from an SNaN. #D is the CALLER's: it is the one bit both
+// host paths need alike, and the caller already inspects the source for DAZ.
+static uint16_t avx_f32_to_f16_software(float f, unsigned mode, unsigned *flags) {
     uint32_t bits;
     memcpy(&bits, &f, 4);
     uint32_t sign = bits >> 31;
@@ -523,8 +578,10 @@ static uint16_t avx_f32_to_f16_software(float f, unsigned mode) {
     uint16_t sign16 = (uint16_t)(sign << 15);
     // Directed modes round by sign alone; the same predicate picks Infinity vs largest-finite on overflow.
     uint32_t away = ((mode == 1 && sign != 0) || (mode == 2 && sign == 0)) ? 1u : 0u;
-    if (biased_exponent == 0xffu)
+    if (biased_exponent == 0xffu) {
+        if (flags && mantissa != 0 && !(mantissa & 0x400000u)) *flags = SSE_XI; // SNaN
         return mantissa == 0 ? (uint16_t)(sign16 | 0x7c00u) : (uint16_t)(sign16 | 0x7e00u | (uint16_t)(mantissa >> 13));
+    }
     if (biased_exponent == 0 && mantissa == 0) return sign16; // +-0 exact, sign preserved
     // significand * 2^(exponent-23), implicit bit explicit (a binary32 subnormal has none; exponent -126).
     uint32_t significand = biased_exponent == 0 ? mantissa : (mantissa | 0x800000u);
@@ -540,13 +597,17 @@ static uint16_t avx_f32_to_f16_software(float f, unsigned mode) {
         half += round_bit & (sticky | (half & 1u)); // nearest-even: up on >half, or half-to-even
     else
         half += away & (round_bit | sticky);
+    if (flags && (round_bit | sticky)) *flags |= SSE_XP | (exponent < -14 ? SSE_XU : 0u);
     if (exponent < -14) return (uint16_t)(sign16 | half); // subnormal; a carry out lands on 0x0400
     int32_t exponent16 = exponent + 15;
     if (half >> 11) { // the increment carried into the next binade
         half >>= 1;
         exponent16++;
     }
-    if (exponent16 >= 0x1f) return (uint16_t)(sign16 | (away != 0 || mode == 0 ? 0x7c00u : 0x7bffu));
+    if (exponent16 >= 0x1f) {
+        if (flags) *flags |= SSE_XO | SSE_XP;
+        return (uint16_t)(sign16 | (away != 0 || mode == 0 ? 0x7c00u : 0x7bffu));
+    }
     return (uint16_t)(sign16 | ((uint32_t)exponent16 << 10) | (half & 0x3ffu)); // implicit bit 0x400 drops out
 }
 #endif
@@ -556,7 +617,19 @@ static uint16_t avx_f32_to_f16_software(float f, unsigned mode) {
 static int sse_host_rounding_control(void);
 #endif
 
+// The two host paths reach the same exception set from opposite directions: the aarch64 FCVT raises #I/#U/
+// #O/#P itself and can only miss #D (ARM reports IDC solely when FPCR.FZ flushed an input), while the
+// software converter raises nothing and reports the whole set through its out-param.
 static uint16_t avx_f32_to_f16(float f, int imm) {
+    uint32_t fb;
+    memcpy(&fb, &f, 4);
+    if (sse_is_denorm_f32(fb)) { // DAZ zeroes the source first, making the conversion exact and flagless
+        if (sse_daz_active()) {
+            fb &= 0x80000000u;
+            memcpy(&f, &fb, 4);
+        } else
+            sse_raise(SSE_XD);
+    }
 #if defined(HL_HOST_CPU_AARCH64)
     _Float16 h;
     uint16_t o;
@@ -590,7 +663,10 @@ static uint16_t avx_f32_to_f16(float f, int imm) {
         }
 #endif
     }
-    return avx_f32_to_f16_software(f, mode);
+    unsigned flags = 0;
+    uint16_t o = avx_f32_to_f16_software(f, mode, &flags);
+    sse_raise(flags);
+    return o;
 #endif
 }
 
@@ -602,8 +678,8 @@ static float avx_f16_to_f32(uint16_t bits) {
 
 #pragma GCC diagnostic pop
 
-static double sse_round_d(double x, int mode, int use_mxcsr);
-static float sse_round_f(float x, int mode, int use_mxcsr);
+static double sse_round_d(double x, int imm); // imm = the ROUND* imm8 (mode, MXCSR-select, #P suppress)
+static float sse_round_f(float x, int imm);
 
 // AES round primitives (defined with the legacy do_sse3b block below) reused by the VEX AES forms.
 static const uint8_t k_aes_sbox[256];
@@ -1110,6 +1186,11 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
         case 0x53: { // vrcpps(NP)/ss(F3): approximate reciprocal. Modeled at full float precision to
             // match the reference x86 oracle (qemu) and the native-aarch64 golden, both of which use the
             // full-precision 1/x rather than the hardware's ~12-bit table.
+            // These raise NO SIMD floating-point exception whatsoever -- measured against native for a
+            // denormal source, an overflow and a zero -- but the 1.0f/x standing in for the table is a real
+            // division and reports #D, #O, #P and (under DAZ) #Z. Park the sticky flags across the whole
+            // loop; the result is untouched.
+            unsigned parked = cvt_fp_flags();
             int rsqrt = (op == 0x52), scalar = (pp == 2);
             avx_get_rm(state, c, &I, next, scalar ? 4 : W, b);
             if (scalar) {
@@ -1129,6 +1210,7 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                 }
                 avx_put(c, rd, d, W);
             }
+            cvt_fp_flags_set(parked);
             goto done;
         }
         // logical: dst = src1 OP src2  (src1=vvvv, src2=rm). byte-wise over W.
@@ -2281,18 +2363,17 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
         case 0x08:   // vroundps
         case 0x09: { // vroundpd -- single source (rm), imm[3:0] rounding control
             avx_get_rm(state, c, &I, next, W, b);
-            int use = (imm & 4) != 0, mode = imm & 3;
             if (op == 0x08) {
                 float a4[8], o[8];
                 memcpy(a4, b, (size_t)W);
                 for (int i = 0; i < W / 4; i++)
-                    o[i] = sse_round_f(a4[i], mode, use);
+                    o[i] = sse_round_f(a4[i], imm);
                 memcpy(d, o, (size_t)W);
             } else {
                 double a2[4], o[4];
                 memcpy(a2, b, (size_t)W);
                 for (int i = 0; i < W / 8; i++)
-                    o[i] = sse_round_d(a2[i], mode, use);
+                    o[i] = sse_round_d(a2[i], imm);
                 memcpy(d, o, (size_t)W);
             }
             avx_put(c, rd, d, W);
@@ -2300,19 +2381,18 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
         }
         case 0x0A:   // vroundss: low dword = round(rm low), rest of low-128 from src1(vvvv)
         case 0x0B: { // vroundsd: low qword = round(rm low)
-            int use = (imm & 4) != 0, mode = imm & 3;
             avx_get(c, vv, a);
             avx_get_rm(state, c, &I, next, op == 0x0A ? 4 : 8, b);
             memcpy(d, a, 16);
             if (op == 0x0A) {
                 float x;
                 memcpy(&x, b, 4);
-                float y = sse_round_f(x, mode, use);
+                float y = sse_round_f(x, imm);
                 memcpy(d, &y, 4);
             } else {
                 double x;
                 memcpy(&x, b, 8);
-                double y = sse_round_d(x, mode, use);
+                double y = sse_round_d(x, imm);
                 memcpy(d, &y, 8);
             }
             avx_put(c, rd, d, 16);
@@ -2730,36 +2810,95 @@ static int sse_host_rounding_control(void) {
 }
 #endif
 
-static double sse_round_d(double x, int mode, int use_mxcsr) {
+// ROUND* raises a SMALLER set than any rounding primitive available here, so the whole step runs with the
+// sticky flags parked and the caller's set is raised explicitly. Measured on Zen 4, all imm encodings:
+//   #P iff the result differs from the source, and imm[3] (the suppress-precision bit) is clear;
+//   #I iff the source is an SNaN, which the result also QUIETS (imm[3] suppresses neither);
+//   NOTHING else -- notably NEVER #D, which is what glibc's trunc/floor add via ROUNDSD (roundps of a
+//   denormal reported 22 here against native's 20).
+// Difference is decided on the BIT PATTERN: an FP compare of the two is a COMISD, which raises #D for a
+// denormal operand, and the sign of a zero must count (trunc(-0.4) = -0.0 is inexact). DAZ has to be
+// applied by hand for the same reason -- the hardware zeroes a denormal source before ROUND* runs, making
+// it exact, but a bit-pattern comparison against the UNzeroed source would call it inexact.
+static double sse_round_d(double x, int imm) {
+    unsigned parked = cvt_fp_flags(), raise = 0;
+    uint64_t xb;
+    memcpy(&xb, &x, 8);
+    if (sse_daz_active() && sse_is_denorm_f64(xb)) { // DAZ: the source reads as a zero of the same sign
+        xb &= UINT64_C(0x8000000000000000);
+        memcpy(&x, &xb, 8);
+    }
+    int mode = imm & 3, use_mxcsr = (imm & 4) != 0;
 #if defined(HL_HOST_CPU_X86_64)
     if (use_mxcsr) {
         mode = sse_host_rounding_control();
         use_mxcsr = 0;
     }
 #endif
-    if (use_mxcsr) return __builtin_rint(x); // honor MXCSR.RC (mirrored into host FPCR by ldmxcsr)
-    switch (mode & 3) {
-    case 1: return __builtin_floor(x);
-    case 2: return __builtin_ceil(x);
-    case 3: return __builtin_trunc(x);
-    default: return __builtin_roundeven(x); // explicit round-to-nearest-even
-    }
+    double r;
+    if (use_mxcsr)
+        r = __builtin_rint(x); // honor MXCSR.RC (mirrored into host FPCR by ldmxcsr)
+    else
+        switch (mode) {
+        case 1: r = __builtin_floor(x); break;
+        case 2: r = __builtin_ceil(x); break;
+        case 3: r = __builtin_trunc(x); break;
+        default: r = __builtin_roundeven(x); break; // explicit round-to-nearest-even
+        }
+    uint64_t rb;
+    memcpy(&rb, &r, 8);
+    if ((xb & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000) &&
+        (xb & UINT64_C(0x000fffffffffffff)) != 0) { // NaN
+        if (!(xb & UINT64_C(0x0008000000000000))) { // signalling
+            raise = SSE_XI;
+            rb = xb | UINT64_C(0x0008000000000000); // x86 returns it QUIET; glibc trunc/floor do not
+            memcpy(&r, &rb, 8);
+        }
+    } else if (rb != xb && !(imm & 8))
+        raise = SSE_XP;
+    cvt_fp_flags_set(parked);
+    sse_raise(raise);
+    return r;
 }
 
-static float sse_round_f(float x, int mode, int use_mxcsr) {
+static float sse_round_f(float x, int imm) {
+    unsigned parked = cvt_fp_flags(), raise = 0;
+    uint32_t xb;
+    memcpy(&xb, &x, 4);
+    if (sse_daz_active() && sse_is_denorm_f32(xb)) {
+        xb &= 0x80000000u;
+        memcpy(&x, &xb, 4);
+    }
+    int mode = imm & 3, use_mxcsr = (imm & 4) != 0;
 #if defined(HL_HOST_CPU_X86_64)
     if (use_mxcsr) {
         mode = sse_host_rounding_control();
         use_mxcsr = 0;
     }
 #endif
-    if (use_mxcsr) return __builtin_rintf(x);
-    switch (mode & 3) {
-    case 1: return __builtin_floorf(x);
-    case 2: return __builtin_ceilf(x);
-    case 3: return __builtin_truncf(x);
-    default: return __builtin_roundevenf(x);
-    }
+    float r;
+    if (use_mxcsr)
+        r = __builtin_rintf(x);
+    else
+        switch (mode) {
+        case 1: r = __builtin_floorf(x); break;
+        case 2: r = __builtin_ceilf(x); break;
+        case 3: r = __builtin_truncf(x); break;
+        default: r = __builtin_roundevenf(x); break;
+        }
+    uint32_t rb;
+    memcpy(&rb, &r, 4);
+    if ((xb & 0x7f800000u) == 0x7f800000u && (xb & 0x007fffffu) != 0) {
+        if (!(xb & 0x00400000u)) {
+            raise = SSE_XI;
+            rb = xb | 0x00400000u;
+            memcpy(&r, &rb, 4);
+        }
+    } else if (rb != xb && !(imm & 8))
+        raise = SSE_XP;
+    cvt_fp_flags_set(parked);
+    sse_raise(raise);
+    return r;
 }
 
 static inline int sat_s16(int v) {
@@ -3609,30 +3748,28 @@ void hl_x86_sse_run(const hl_x86_avx_state *state, struct cpu *c) {
         case 0x08:
         case 0x09:
         case 0x0A:
-        case 0x0B: { // roundps/pd/ss/sd, mode in imm[3:0]; bit2 set = use MXCSR.RC (current host FPCR)
-            int use_mxcsr = (imm & 4) != 0;
-            int mode = imm & 3;
+        case 0x0B: {          // roundps/pd/ss/sd, mode in imm[3:0]; bit2 set = use MXCSR.RC (current host FPCR)
             if (op == 0x08) { // roundps
                 float a[4], o[4];
                 memcpy(a, s, 16);
                 for (int i = 0; i < 4; i++)
-                    o[i] = sse_round_f(a[i], mode, use_mxcsr);
+                    o[i] = sse_round_f(a[i], imm);
                 memcpy(r, o, 16);
             } else if (op == 0x09) { // roundpd
                 double a[2], o[2];
                 memcpy(a, s, 16);
                 for (int i = 0; i < 2; i++)
-                    o[i] = sse_round_d(a[i], mode, use_mxcsr);
+                    o[i] = sse_round_d(a[i], imm);
                 memcpy(r, o, 16);
             } else if (op == 0x0A) { // roundss: low lane from src, rest from dst
                 float a;
                 memcpy(&a, s, 4);
-                a = sse_round_f(a, mode, use_mxcsr);
+                a = sse_round_f(a, imm);
                 memcpy(r, &a, 4);
             } else { // roundsd
                 double a;
                 memcpy(&a, s, 8);
-                a = sse_round_d(a, mode, use_mxcsr);
+                a = sse_round_d(a, imm);
                 memcpy(r, &a, 8);
             }
             break;

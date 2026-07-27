@@ -1337,6 +1337,14 @@ static void emit_guest_signal(uint64_t rip, int lsig, int code) {
 // loaded MXCSR back so a guest that CLEARS the sticky flags (feclearexcept) actually clears the host FPSR.
 static const int g_mxcsr_fpsr_bit[6] = {0, 7, 1, 2, 3, 4};
 
+// DE(1) cannot be taken at face value. ARM raises IDC ONLY when FPCR.FZ flushed a denormal input, i.e.
+// exactly in the mode where x86 must NOT report #D -- FZ carries the guest's DAZ, which zeroes the source
+// before the operation. Measured: with DAZ set no SSE op raises #D, against 105 of 192 probe lines that
+// were spuriously #D here. It also keeps the word self-consistent: stmxcsr reports DAZ from this same bit.
+// Costs, both accepted: a lone FTZ sets FZ too and x86 DOES raise #D there, but a lone FTZ already flushes
+// INPUTS on this host so those results are wrong regardless; and a guest that loads DE=1 under FZ cannot
+// read it back, the sticky flags living only in FPSR. The converse gap -- #D with DAZ clear, which ARM
+// cannot report at all -- is left open on cost; see tests/compat/completeness/x86_64/denorm_flags.c.
 static void emit_fpsr_to_mxcsr(int dst) { // OR the host FPSR sticky flags into `dst` at MXCSR bits 0..5
     emit32(0xD53B4420u | 22);             // mrs x22, fpsr
     e_movconst(21, 0);                    // accumulator
@@ -1346,6 +1354,10 @@ static void emit_fpsr_to_mxcsr(int dst) { // OR the host FPSR sticky flags into 
         e_rrr(A_AND, 20, 20, 19, 0, 0);
         e_rrr(A_ORR, 21, 21, 20, 0, i); // x21 |= bit << i
     }
+    emit32(0xD53B4400u | 22);       // mrs x22, fpcr
+    e_lsr_i(22, 22, 24, 0);         // x22 = FPCR>>24 (FZ -> bit0)
+    e_rrr(A_AND, 22, 22, 19, 0, 0); // x19 is still 1
+    e_rrr(A_BIC, 21, 21, 22, 0, 1); // FZ (== reported DAZ) -> drop DE
     e_rrr(A_ORR, dst, dst, 21, 0, 0);
 }
 

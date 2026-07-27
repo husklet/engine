@@ -106,6 +106,11 @@ void hl_x86_fxsave(struct cpu *cpu) {
             mxcsr |= (uint32_t)raised << bit;
             fsw_exc |= (uint16_t)(raised << bit); // FSW exception bits are at the same positions as MXCSR
         }
+        // MXCSR.DE only: ARM sets IDC exactly when FPCR.FZ flushed a denormal input, i.e. in the mode that
+        // carries the guest's DAZ -- and x86 with DAZ raises no #D. Same suppression as stmxcsr's
+        // emit_fpsr_to_mxcsr in translate.c, so the two projections cannot disagree. FSW.DE is left alone:
+        // x87 has no DAZ, and fnstsw's own projection does not suppress it either.
+        if (fpcr & (UINT64_C(1) << 24)) mxcsr &= ~UINT32_C(0x02);
         if (fsw_exc & (uint16_t)(~cpu->fpcw & 0x3f))
             fsw_exc |= (uint16_t)0x8080; // ES(7) + B(15) if any raised exception is unmasked per FCW
     }
