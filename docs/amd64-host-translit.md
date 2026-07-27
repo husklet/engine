@@ -141,11 +141,18 @@ of delivering the guest's handler; with it, both backends print `caught SIGSEGV 
 **Correctness first.** Same pinned binary, every x86-64 compat fixture run twice — switch off, switch on —
 comparing exit status and combined output:
 
-* **250/250 static-PIE fixtures** (`core`, `abi`, `signals`, `process`, `threads`, `ipc`, `network`,
-  `filesystem`, `isolation`, `isa`) agree. The single textual difference is on `process/execfault`, where the
-  engine's own `[HLFATAL]` line gains `hpc=/hblk=/hoff=/hinsn=` because the host PC is now inside the code
-  cache — strictly more diagnostic, same guest result.
-* **300/300 sampled non-PIE fixtures** agree, as they must: the transliterator declines them.
+* **246 of 250 static-PIE fixtures** (`core`, `abi`, `signals`, `process`, `threads`, `ipc`, `network`,
+  `filesystem`, `isolation`, `isa`) are byte-identical. All four remainders were inspected and none is a
+  behavioural difference:
+  * `process/execfault`, `signals/sigbus_mmap_eof`, `core/regress/stackoverflow` — same exit status, same
+    guest stdout; the engine's own `[HLFATAL]` line gains `hpc=/hblk=/hoff=/hinsn=` because the host PC is
+    now inside the code cache. Strictly more diagnostic.
+  * `core/syscall/edge_times` — the *interpreter* hits the 180 s harness timeout (exit 124) and the
+    transliterator finishes (exit 0). A speedup showing up as a diff.
+* **299 of 300 sampled non-PIE fixtures** are byte-identical, as they must be: the transliterator declines
+  them. The exception, `memory/dbt_codecache_straightline`, fails identically both ways (exit 70,
+  `unimplemented one-byte opcode`) and differs only in the ASLR'd `rip` the message prints — an artifact of
+  the comparison script's address normalisation, not of the engine.
 * One real regression was found and fixed this way: `core/regress/stackoverflow_catch` (see §5).
 
 The named suites were then run twice on that binary, switch off and switch on. **The two runs are identical**
