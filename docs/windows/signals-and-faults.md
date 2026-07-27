@@ -37,7 +37,7 @@ survey invalidated the fallback, not the design.
 | §3 preamble | VEH-vs-frame-handler ordering: now **measured**, and they compose |
 | §4.2 | `ContextFlags` at first chance: was "assert, never assume", now **measured `0x0010005f`** — every bit set, including `CONTEXT_XSTATE` |
 | §4.3 | **rewritten.** The `longjmp` ruling is now unconditional, and the replacement is an 80-byte pad at **1.06 ns**, not `RtlCaptureContext` at 22.9 ns |
-| §5.3 | AVX/AVX-512 through `LocateXStateFeature`: **measured**, both directions |
+| §4.5 | AVX/AVX-512 through `LocateXStateFeature`: **measured**, both directions |
 | §9 | unverified items 2, 3 and 4 closed by measurement; item 5 unchanged |
 
 ### 0.1 The experiment
@@ -371,7 +371,7 @@ Three things to check before this compiles, all of them cheap and none of them a
 1. ~~**Anonymous unions.**~~ **Measured (rev 2), no longer an open question on x86-64.** `ctx->Rax` and
    `ctx->FltSave.XmmRegisters` compile and resolve correctly under clang 22.1.8 `x86_64-w64-windows-gnu`
    with no `.DUMMYUNIONNAME` qualifier: mingw-w64's `__C89_NAMELESS` expands to nothing for clang, so the
-   union is genuinely anonymous. §5.3's probe read *and wrote* live `xmm0` through
+   union is genuinely anonymous. §4.5's probe read *and wrote* live `xmm0` through
    `ctx->FltSave.XmmRegisters`. The ARM64 spellings `(uc)->X` and `(uc)->V` remain unverified — no ARM64
    Windows toolchain was available — so that cell keeps the caveat.
 2. **`windows.h` in a header included by ten TUs.** It defines `ERROR`, `IN`, `OUT`, `near`, `far`,
@@ -388,7 +388,7 @@ Three things to check before this compiles, all of them cheap and none of them a
 | `HL_HOST_UC_SP` | `uc_mcontext.sp` / `gregs[REG_RSP]` | `Sp` / `Rsp` — same |
 | AArch64 V regs | `__reserved` chain walk for `FPSIMD_MAGIC`, may return NULL | plain `V[32]`, never NULL — **strictly simpler** |
 | x86-64 XMM | `uc_mcontext.fpregs` is optional, may be NULL | always present; `CONTEXT_FLOATING_POINT` measured set (§4.2) |
-| x86-64 YMM/ZMM upper lanes | not reachable from `ucontext` at all | reachable **and writable** via `LocateXStateFeature` (§5.3) — **a gain over POSIX** |
+| x86-64 YMM/ZMM upper lanes | not reachable from `ucontext` at all | reachable **and writable** via `LocateXStateFeature` (§4.5) — **a gain over POSIX** |
 | x86-64 EFLAGS | `gregs[REG_EFL]`, in the GPR index space | separate `EFlags` member — **the one shape break** |
 | signal mask | `uc_sigmask`, and `interp_restore_handler_mask` owes a restore | does not exist; **nothing is owed** (§4.3) |
 | MXCSR | not exposed by the matrix | `MxCsr` is a first-class member |
@@ -401,7 +401,15 @@ One process-wide VEH, registered once at `engine_global_init` with
 `AddVectoredExceptionHandler(1, hl_win_veh)` — `First != 0` puts it ahead of any handler a loaded DLL adds
 later. VEH is the right primitive precisely because it is *not* frame-based: it fires on every thread
 regardless of where in a call frame the fault happened, which is exactly the property
-`sigaction(SIGSEGV, ...)` has and `__try/__except` does not.
+`sigaction(SIGSEGV, ...)` has and any frame-scoped mechanism does not.
+
+That property is what makes VEH primary rather than merely available. Half the classifier chain fires from
+code that is **not** inside `run_block`: `hrm_fault_hook`'s probe read is issued from `service()`, which the
+dispatcher calls between blocks; `nonpie_fixup` serves absolute data references from anywhere; the lazy
+grower and the `gna`/`gro` registries must cover every engine thread including ones that never run guest
+code. No per-scope handler covers that set. §0.1 measured that a frame-scoped `.seh_handler` **composes**
+with the VEH rather than competing with it — VEH first, and a `CONTINUE_SEARCH` hands off cleanly — so the
+narrow uses in §4.3 remain open without disturbing this.
 
 Everything the engine does not own returns `EXCEPTION_CONTINUE_SEARCH` **immediately, before touching
 anything**. That list must include at minimum `DBG_PRINTEXCEPTION_C` (0x40010006),
@@ -426,9 +434,10 @@ fault path.
 
 ### 3.1 Fault address and read-vs-write
 
-`ExceptionInformation[1]` is the `si_addr` equivalent and is exactly as precise. `ExceptionInformation[0]`
-is *better* than anything POSIX hands the engine today, and three call sites should consume it directly
-rather than inferring:
+`ExceptionInformation[1]` is the `si_addr` equivalent and is exactly as precise — measured (§0.1): a write
+to address 0 reported `Info[0]=1`, `Info[1]=0x0`, and a write to a `PAGE_READONLY` page reported `Info[0]=1`
+with `Info[1]` equal to the exact faulting address. `ExceptionInformation[0]` is *better* than anything
+POSIX hands the engine today, and three call sites should consume it directly rather than inferring:
 
 - `gro_hit` (`x86.c:1160`) currently comments that any fault in the read-only registry "is a write fault".
   On Windows that becomes a check, not an assumption.
@@ -498,22 +507,37 @@ an empty stub on Windows.
 
 ### 4.2 Two things that are *not* the same
 
-**`ContextFlags` gates what is restored.** `NtContinue` honours the record according to its `ContextFlags`.
-Mutating a GPR needs `CONTEXT_INTEGER`; `Rip`/`Rsp`/`EFlags` need `CONTEXT_CONTROL`; XMM/V need
-`CONTEXT_FLOATING_POINT`. The exception-dispatch context is believed to carry `CONTEXT_ALL` on x64, but the
-handler must **assert it, not assume it** — `hl_x86_signal_capture` reads XMM and `hl_aarch64_signal_capture`
-reads V, and a silently absent `CONTEXT_FLOATING_POINT` would make a guest fault resume with garbage vector
-state. Cheapest form: `if ((ctx->ContextFlags & CONTEXT_FLOATING_POINT) == 0) return EXCEPTION_CONTINUE_SEARCH;`
-on the paths that need it, which fails loudly instead of quietly.
+**`ContextFlags` gates what is restored — and rev 1's open question is now closed by measurement.**
+`NtContinue` honours the record according to its `ContextFlags`. Mutating a GPR needs `CONTEXT_INTEGER`;
+`Rip`/`Rsp`/`EFlags` need `CONTEXT_CONTROL`; XMM/V need `CONTEXT_FLOATING_POINT`.
+
+Rev 1 said *"assert it, not assume it"*. Measured at first-chance VEH dispatch of an access violation, at
+`-O0` and `-O2`:
+
+```
+ContextFlags = 0x0010005f
+  CONTEXT_AMD64 (0x00100000) | CONTROL | INTEGER | SEGMENTS | FLOATING_POINT | DEBUG_REGISTERS | XSTATE
+```
+
+Every bit the engine could want is set, **including `CONTEXT_XSTATE`**. The same value appeared in a
+frame-scoped `.seh_handler` context, so it is a property of NT's dispatch rather than of VEH.
+
+Keep the assert anyway. It costs one `and`/`jz` on a path that already costs microseconds, the value is not
+contractual, and the failure it guards is silent: `hl_x86_signal_capture` reads XMM and
+`hl_aarch64_signal_capture` reads V, so an absent `CONTEXT_FLOATING_POINT` would resume a guest fault with
+garbage vector state. `if ((ctx->ContextFlags & CONTEXT_FLOATING_POINT) == 0) return EXCEPTION_CONTINUE_SEARCH;`
+fails loudly instead. The claim being asserted is now "this host still behaves as measured", not "we hope".
 
 **There is no `EXCEPTION_NONCONTINUABLE` on the paths we care about, but there is on some.** Attempting to
 continue a noncontinuable exception raises `EXCEPTION_NONCONTINUABLE_EXCEPTION`. Check
 `ExceptionRecord->ExceptionFlags & EXCEPTION_NONCONTINUABLE` before returning
 `EXCEPTION_CONTINUE_EXECUTION`.
 
-### 4.3 The interpreter's `siglongjmp` must not survive
+### 4.3 The interpreter's `siglongjmp` must not survive — *rewritten in rev 2*
 
-This is the sharpest correctness point in the whole design.
+This is the sharpest correctness point in the whole design, and rev 1 hedged it as contingent on
+`__try`/`__except` being available as a fallback. It is not. **The ruling is now unconditional, and the
+cost objection that made it uncomfortable has been measured away — in the favourable direction.**
 
 The interpreter's fault model (`src/translator/guest/*/interp.c:60-172`) is: arm a marker around every guest
 access, `sigsetjmp` at the top of `run_block`, and have the handler `siglongjmp` back so the in-flight
@@ -523,38 +547,75 @@ On x86-64 Windows, `longjmp` is **not** a bare register restore. The Win64 ABI i
 over SEH: `longjmp` calls `RtlUnwindEx` to unwind the frames between the jump and the target. Jumping out of
 a VEH means unwinding through `ntdll!RtlDispatchException` and `ntdll!KiUserExceptionDispatcher` while the
 kernel still believes exception dispatch is in progress. That is not a supported operation and it is exactly
-the sort of thing that works on one Windows build and not the next.
+the sort of thing that works on one Windows build and not the next. Nothing measured in §0.1 changes this.
 
-**Recommendation: replace the interpreter's long jump with a context edit — the JIT's own idiom.**
+**The replacement: an 80-byte pad and a context edit — the JIT's own idiom, measured cheaper than what it
+replaces.**
 
+Rev 1 proposed `RtlCaptureContext` and flagged its cost as the open risk, because `docs/amd64-host.md` §6
+records that the *previous* per-block cost on this exact path (`sigsetjmp(pad, 1)`'s `rt_sigprocmask`) was
+271.7 ns and 44% of compute CPU. Both halves are now measured, 1e6 iterations each, `-O0` and `-O2`:
+
+| Pad | Size | Cost/arm | Resume verified |
+|---|---|---|---|
+| `RtlCaptureContext` | 1232 B | **22.9 ns** | yes |
+| hand-rolled `minipad` | **80 B** | **1.06 ns** (`-O2`), 1.21 ns (`-O0`) | yes |
+| *(Linux today: `sigsetjmp(pad, 0)`)* | — | *2.57 ns* | — |
+| *(Linux before the amd64 fix: `sigsetjmp(pad, 1)`)* | — | *271.7 ns* | — |
+
+`RtlCaptureContext` is 9× cheaper than the thing the amd64 work removed, but 9× *more* expensive than what
+the interpreter pays today — and it is unnecessary, because `interp_signal_resume` only ever needs the
+`setjmp` register set. Capturing exactly that set costs **1.06 ns, cheaper than the `sigsetjmp` it
+replaces.** Take the pad, not `RtlCaptureContext`.
+
+```c
+/* Windows arm. 10 words: the resume label, SP, and the callee-saved set.
+ * Exactly what sigsetjmp(pad, 0) stores, minus the mask nobody owes here. */
+typedef struct { uint64_t rip, rsp, rbp, rbx, rsi, rdi, r12, r13, r14, r15; } hl_win_pad;
+
+#define HL_WIN_PAD_ARM(pad)                                      \
+    __asm__ volatile("leaq 1f(%%rip), %%rax\n\t"                 \
+                     "movq %%rax, 0(%0)\n\t"                     \
+                     "movq %%rsp, 8(%0)\n\t"                     \
+                     /* rbp rbx rsi rdi r12 r13 r14 r15 -> +16..+72 */ \
+                     "1:\n"                                      \
+                     : : "r"(pad) : "rax", "memory")
+
+/* interp_signal_resume, Windows arm: */
+c->Rip = pad->rip;  c->Rsp = pad->rsp;  c->Rbp = pad->rbp;  c->Rbx = pad->rbx;
+c->Rsi = pad->rsi;  c->Rdi = pad->rdi;
+c->R12 = pad->r12;  c->R13 = pad->r13;  c->R14 = pad->r14;  c->R15 = pad->r15;
+return EXCEPTION_CONTINUE_EXECUTION;
 ```
-run_block (Windows arm):
-  RtlCaptureContext(&tls_pad);          /* once per block entry, ~1.3 KB, no syscall */
-  tls_pad_armed = 1;
-  ... execute guest instructions ...
 
-interp_signal_resume (Windows arm):
-  *ExceptionInfo->ContextRecord = tls_pad;   /* Rip/Rsp/nonvolatiles all restored */
-  ContextRecord->Rax = 1;                    /* the "arrived by fault" discriminator */
-  return EXCEPTION_CONTINUE_EXECUTION;
-```
+Measured working end to end (`t5`, both `-O`): arm the pad, fault on a null store, handler restores the ten
+registers, execution resumes at the label with the "arrived" flag set. No unwinder is involved at any point,
+which is the whole reason to prefer it. `RtlCaptureContext` + whole-`CONTEXT` overwrite also works (`t4c`,
+`t4f`) and is the right shape if a future backend ever needs the volatile registers too; it costs 22.9 ns
+and 1232 bytes of TLS per thread to buy that.
 
-This is strictly more correct than `longjmp` (no unwinder involvement at all) and it is precisely what
-`hl_x86_signal_resume` already does for the JIT. The cost is `RtlCaptureContext` per block — which must be
-measured, because §6 of `docs/amd64-host.md` records that the *previous* per-block cost on this exact path
-(`sigsetjmp(pad, 1)`'s `rt_sigprocmask`) was 44% of compute CPU. `RtlCaptureContext` is a pure user-mode
-register store with no syscall, so it should be tens of nanoseconds rather than 272, but "should be" is not
-a measurement.
+Two obligations the POSIX version does not have. **The discriminator must be a global or a memory location,
+not a register** — an early probe read it through a `register DWORD64 rax` binding, which the compiler is
+free to clobber, and the pad re-armed and re-faulted forever. And the pad must be re-armed per block entry
+exactly as `sigsetjmp` is, because `rsp` in the pad names *this* invocation's frame.
 
-The fallback, if context-editing proves fragile, is a real `__try`/`__except` around `run_block`: clang for
-mingw-w64 supports MSVC SEH on x64 (GCC does not), and `__except` runs after a genuine unwind. It cannot
-replace the VEH — faults also occur outside `run_block`, e.g. `host_range_mapped`'s probe from `service()` —
-so it would be an *additional* mechanism, not a substitute.
+**The fallback changed.** Rev 1 named `__try`/`__except` around `run_block`; §0.1 killed it. The replacement
+fallback is `.seh_handler` — the Cygwin mechanism — which §0.1 measured working, including composing with
+the process-wide VEH (VEH first; `CONTINUE_SEARCH` hands off to the frame handler, which can then resume).
+Its precondition is that `run_block` has a prologue, which it does, and which `optnone` or a callee-saved
+clobber list makes unconditional. It remains an *additional* mechanism and not a substitute: faults also
+occur outside `run_block` — `host_range_mapped`'s probe is issued from `service()` — so the VEH stays.
+
+For completeness, `RtlAddFunctionTable` (§0.1) is the third working mechanism, and it is orthogonal to this
+question: it attaches a handler to *JIT-generated* code rather than to a C frame. It is not needed for the
+interpreter, but it is exactly what a future Windows JIT/transliterator cell would want, and it is also what
+makes crash reporters and debuggers able to unwind through emitted code. Worth building once the code cache
+exists; not on the critical path now.
 
 `hrm_fault_hook` (`thread.c:1634`) has the same problem and the same fix: it long-jumps back to
 `host_range_mapped` to report "unmapped". Its probe window is tiny and its landing pad is a single function,
-so the context-edit version is easy. Note its POSIX body also unblocks SIGSEGV/SIGBUS before jumping — on
-Windows that line simply deletes.
+so the pad version is easy — and its probe is one load, so the arm cost matters more there than anywhere.
+Note its POSIX body also unblocks SIGSEGV/SIGBUS before jumping; on Windows that line simply deletes.
 
 ### 4.4 Reentrancy and safety inside a VEH
 
@@ -594,6 +655,42 @@ Point (4) is the one that matters for wording: the header comment's "This is an 
 that arbitrary POSIX VM APIs are generally async-signal-safe" should gain a sentence saying the Windows
 implementation is safe by a *structural* argument (synchronous-only dispatch) rather than by an
 async-signal-safety list.
+
+### 4.5 Vector state through the context — *new in rev 2*
+
+`hl_x86_signal_capture` does `memcpy(c->v, HL_HOST_UC_XMM(uc), sizeof c->v)` and `hl_x86_signal_resume`
+relies on the reverse taking effect. Both directions are now measured on this host, `-O0` and `-O2`, with a
+probe that seeds `ymm0`, faults, inspects and rewrites the context, and reads the registers back after
+resume:
+
+| | Read by the handler | Written by the handler |
+|---|---|---|
+| `xmm0` low/high, via `ctx->FltSave.XmmRegisters` | exact live value | **takes effect on resume** |
+| `ymm0[128:256)`, via `LocateXStateFeature(ctx, XSTATE_AVX, &len)` | exact live value, `len = 256` | **takes effect on resume** |
+
+Two consequences.
+
+**`HL_HOST_UC_XMM(uc) = (uc)->FltSave.XmmRegisters` is correct as specified in §2.2**, and it is not merely
+readable — a resumed guest sees what the handler wrote, which is what the fault path needs.
+
+**Windows is strictly better than POSIX here, and it retires a known engine limitation.** Linux's
+`uc_mcontext.fpregs` exposes only the low 128 bits, which is why `hl_x86_signal_build` has to stash
+`c->vhi`, `c->kreg` and the x87 stack in the sigframe's free tail by hand
+(`src/translator/guest/x86_64/signal.c:76-82`, added after "an AVX handler zeroed the interrupted ymm UPPER
+lanes"). On Windows the upper lanes are in the context proper. The engine should still write its own frame —
+that frame is guest ABI and must not change — but the *capture* side gains a real oracle it does not have
+on Linux.
+
+The documented rule that makes this work, and the one to get wrong: **the feature is only restored if its
+bit is set in the XSTATE mask.** The probe calls `SetXStateFeaturesMask(ctx, XSTATE_MASK_AVX)` after writing
+through the `LocateXStateFeature` pointer; without it the write is silently dropped. Note also, per the
+prior-art survey, that unwind-pass contexts do not carry XSTATE — only first-chance dispatch does, which is
+where the engine's fault path lives.
+
+`mingw-w64` declares `LocateXStateFeature`, `GetXStateFeaturesMask` and `SetXStateFeaturesMask` in
+`kernel32.def.in`, so no `GetProcAddress` dance is needed. AVX-512 (`XSTATE_AVX512_KMASK` and friends) was
+**not** measured — this host's `len` for `XSTATE_AVX` was 256 bytes, i.e. ymm-high for 16 registers, and no
+AVX-512 probe was written.
 
 ---
 
@@ -907,38 +1004,75 @@ Everything below was read from Microsoft's documentation for this design; nothin
   [JOBOBJECT_ASSOCIATE_COMPLETION_PORT](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_associate_completion_port).
 - `SuspendThread` is asynchronous and `GetThreadContext` is what forces it to have taken effect —
   [The SuspendThread function suspends a thread, but it does so asynchronously](https://devblogs.microsoft.com/oldnewthing/20150205-00/?p=44743).
-- clang has SEH (`__try`/`__except`) support for mingw-w64 x86-64 where GCC does not —
+- ~~clang has SEH (`__try`/`__except`) support for mingw-w64 x86-64 where GCC does not~~ —
   [MinGW-w64 Exception Handling](https://sourceforge.net/p/mingw-w64/wiki2/Exception%20Handling/).
+  **Rev 2: this citation is wrong in practice and is retracted.** It describes driver-flag gating, not
+  working codegen. Measured (§0.1): `__try` compiles under `-fms-extensions` and segfaults, at `-O0` and
+  `-O2`. What *does* work is the `.seh_handler` directive with a handler we supply, and
+  `RtlAddFunctionTable`. This is the one place where a cited secondary source was overturned by measurement,
+  and it is the reason §0.1 exists.
 
-**Reasoned but NOT verified — probe these first:**
+**Measured on this host (rev 2)** — clang 22.1.8 `x86_64-w64-windows-gnu`, Windows 11 Pro 10.0.26200,
+x86-64; probes in the session scratchpad, every row at `-O0` and `-O2`. Details in §0.1.
+
+- `__try`/`__except`: **broken** (compiles with `-fms-extensions`, segfaults). Exactly one exception is
+  dispatched; the xdata correctly names `__C_specific_handler`, imported from
+  `api-ms-win-crt-private-l1-1-0.dll`, and that handler fails to claim it.
+- `.seh_handler` + our own handler: **works**, iff the enclosing function has a `.seh_proc` (i.e. a
+  prologue; a frameless leaf gets none and the directive fails to compile). Forced by `optnone` or a
+  callee-saved clobber list.
+- `RtlAddFunctionTable` + hand-built `UNWIND_INFO` over JIT code: **works**, with a control run proving
+  attribution (unregistered ⇒ the process dies).
+- VEH: **works** for protect-and-retry, `Rip` rewrite, register-set restore, and whole-`CONTEXT` restore.
+- VEH is dispatched **before** a frame-scoped `.seh_handler`, and a `CONTINUE_SEARCH` hands off to it
+  cleanly. They compose.
+- `ContextFlags` at first-chance dispatch = `0x0010005f`: `CONTROL | INTEGER | SEGMENTS | FLOATING_POINT |
+  DEBUG_REGISTERS | XSTATE`, all set (§4.2).
+- `Info[0] = 1` for a write; `Info[1]` = the exact faulting address (§3.1).
+- `xmm0` via `ctx->FltSave.XmmRegisters` and `ymm0`-high via `LocateXStateFeature`: readable **and**
+  writable, with `SetXStateFeaturesMask` required for the write to survive (§4.5).
+- Fault-pad arm cost: hand-rolled 80-byte pad **1.06 ns**; `RtlCaptureContext` **22.9 ns** / 1232 B (§4.3).
+
+**Still reasoned but NOT verified — probe these next:**
 
 1. Windows never raises a past-EOF fault on a mapped view (§3.2), because a view cannot exceed the section
    and the section cannot exceed the file. This determines whether the BUS ledger is the sole source of
-   guest `SIGBUS`.
-2. The exception-dispatch `CONTEXT` always carries `CONTEXT_FLOATING_POINT` (§4.2). Assert it at runtime
-   regardless.
-3. `RtlCaptureContext`'s per-block cost (§4.3), against the 272 ns / 44% of compute that the *previous*
-   per-block fault-pad cost on this exact path.
-4. That mingw-w64's `__C89_NAMELESS` unions make `ctx->Rax` / `ctx->X` / `ctx->V` / `ctx->FltSave` valid
-   under clang with the engine's `-std=` (§2.2).
+   guest `SIGBUS`. **Unchanged and now the top open item** — it is the only remaining claim that changes a
+   design decision rather than a cost.
+2. ~~`CONTEXT_FLOATING_POINT` is always set~~ — **closed by measurement** (§4.2). Keep the runtime assert.
+3. ~~`RtlCaptureContext`'s per-block cost~~ — **closed by measurement**, and the answer changed the design:
+   use the 80-byte pad, not `RtlCaptureContext` (§4.3).
+4. ~~`__C89_NAMELESS` unions~~ — **closed for x86-64** (`ctx->Rax`, `ctx->FltSave`). Still open for the
+   ARM64 cell's `ctx->X` / `ctx->V`: no Windows-on-ARM64 toolchain was available.
 5. Whether `MEM_WRITE_WATCH` + `GetWriteWatch` is usable on executable pages. If it is, it is a strictly
    better SMC primitive than the `VirtualProtect` toggle in `smc_on_write`, because it logs dirtied pages
    without a fault per page. Unmeasured, and not on the critical path.
+6. **New:** AVX-512 state through `LocateXStateFeature`. This host reported `len = 256` for `XSTATE_AVX`
+   (ymm-high only); no opmask/ZMM probe was written (§4.5).
+7. **New, environmental:** Windows Application Control blocked several freshly built probe binaries outright
+   (§0.1). Whether a CI lane that builds and runs an unsigned engine binary trips this needs establishing
+   before it is diagnosed as a test failure.
 
 ---
 
 ## 10. Order to build in
 
 1. `native_context.h`'s two cells plus the `HL_HOST_UC_EFLAGS` follow-up (§2). Purely additive; every
-   existing arm is untouched.
-2. The probe list in §9 — items 1, 2 and 4 gate design decisions, not just performance.
+   existing arm is untouched. The x86-64 cell's accessors are measured working (§0.1, §4.5); the ARM64
+   cell's are not.
+2. **Probe §9 item 1 — past-EOF behaviour on a mapped view.** It is the only remaining unverified claim that
+   changes a design decision, and it decides whether the BUS ledger is the sole source of guest `SIGBUS`.
+   (Items 2, 3 and 4 were closed by rev 2's measurements.)
 3. The VEH: registration, the exception filter, the `siginfo_t` shim in `src/host/native_compat.h`, and the
    `EXCEPTION_STACK_OVERFLOW` early-out (§3, §5.3).
 4. `repair_signal_page` + the `gna`/`gro`/SMC/lazy-map classifiers, which is the whole of (a) and (b)
    (§3, §4.4).
-5. The interpreter's resume path — context edit, not `longjmp` (§4.3). This is the item most likely to be
-   got wrong quietly.
+5. The interpreter's resume path — the 80-byte pad and a context edit, never `longjmp` (§4.3). This is the
+   item most likely to be got wrong quietly, and rev 2's measurements make it cheaper than the Linux path
+   it replaces rather than more expensive.
 6. **Decide the control channel** (§7.2). Everything in (c) depends on it: `child.c`, `activation.c`,
    `hl_host_process_interrupt`, cross-process `rt_sigaction`, and `terminate`'s signal reasons.
 7. `child.c` on a job object + IOCP (§6), `SetConsoleCtrlHandler` (§7.1), then STW on
    suspend/inspect/resume (§7.3).
+8. Later, with the code cache: `RtlAddFunctionTable` over the RX alias (§0.1, §4.3) so debuggers, crash
+   reporters and any host unwind crossing emitted frames work. Not needed by the interpreter.
