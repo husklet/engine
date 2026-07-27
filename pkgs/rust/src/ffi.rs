@@ -14,12 +14,47 @@ pub(crate) struct Handle(*mut Process);
 // SAFETY: activation processes have no thread affinity. The safe wrapper never
 // exposes the pointer, provides no concurrent access, and destroys it exactly once.
 unsafe impl Send for Handle {}
-/// The three process streams handed to activation. `-1` in a field inherits this application's.
-#[repr(C)]
+/// The three process streams handed to activation, in this crate's own descriptor spelling: `-1`
+/// in a field inherits this application's stream. Converted to [`NativeStreams`] at the call.
 pub(crate) struct Streams {
     pub input: sys::RawDescriptor,
     pub output: sys::RawDescriptor,
     pub error: sys::RawDescriptor,
+}
+
+/// A borrowed host descriptor as the C API carries it, and the one spelling of "absent".
+///
+/// The engine's older entry points spelled absence as `-1`, which is a usable non-descriptor on a Unix
+/// host and an unusable one on Windows: `(HANDLE)-1` is simultaneously `INVALID_HANDLE_VALUE` *and* the
+/// pseudo-handle `GetCurrentProcess()` returns, so "nothing attached" and "a live handle to this very
+/// process" would share a bit pattern. `DESCRIPTOR_NONE` is 0 instead — never a valid Win32 handle, and
+/// never handed out by the engine on Unix either, which relocates any descriptor that lands on 0.
+///
+/// The width is for the type, not the range: values stay 32-bit significant, and the conversions below
+/// refuse anything wider rather than truncating it.
+pub(crate) type Descriptor = u64;
+pub(crate) const DESCRIPTOR_NONE: Descriptor = 0;
+
+/// This crate's `-1`-means-absent descriptor to the engine's `0`-means-absent one.
+fn descriptor(raw: sys::RawDescriptor) -> Descriptor {
+    Descriptor::try_from(raw).unwrap_or(DESCRIPTOR_NONE)
+}
+
+/// The inverse. Anything the engine could not have produced becomes `-1`, this crate's absent value.
+fn raw_descriptor(value: Descriptor) -> sys::RawDescriptor {
+    if value == DESCRIPTOR_NONE {
+        -1
+    } else {
+        sys::RawDescriptor::try_from(value).unwrap_or(-1)
+    }
+}
+
+/// The C layout of [`Streams`].
+#[repr(C)]
+pub(crate) struct NativeStreams {
+    pub input: Descriptor,
+    pub output: Descriptor,
+    pub error: Descriptor,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -62,31 +97,31 @@ impl Default for EngineExit {
 
 unsafe extern "C" {
     pub(crate) fn hl_engine_guest_fd_limit() -> u32;
-    pub(crate) fn hl_activation_start_with_channels(
+    pub(crate) fn hl_activation_start_with_streams(
         executable: *const c_char,
         guest: u32,
         config: *const c_char,
-        streams: *const Streams,
+        streams: *const NativeStreams,
         size: *const TerminalSize,
-        transport: c_int,
-        checkpoint: c_int,
-        trigger: c_int,
-        master: *mut i32,
+        transport: Descriptor,
+        checkpoint: Descriptor,
+        trigger: Descriptor,
+        master: *mut Descriptor,
         process: *mut *mut Process,
     ) -> i32;
-    pub(crate) fn hl_ckpt_broker_pair(parent: *mut c_int, child: *mut c_int) -> c_int;
+    pub(crate) fn hl_ckpt_broker_pair(parent: *mut Descriptor, child: *mut Descriptor) -> c_int;
     pub(crate) fn hl_ckpt_broker_accept(
-        broker: c_int,
+        broker: Descriptor,
         timeout_ms: c_int,
         host_pid: *mut u64,
-    ) -> c_int;
+    ) -> Descriptor;
     pub(crate) fn hl_ckpt_trigger_create(
-        descriptor: *mut c_int,
+        descriptor: *mut Descriptor,
         mapping: *mut *mut c_void,
     ) -> c_int;
     pub(crate) fn hl_ckpt_trigger_bump(mapping: *mut c_void) -> u32;
-    pub(crate) fn hl_ckpt_trigger_destroy(mapping: *mut c_void, descriptor: c_int);
-    pub(crate) fn hl_terminal_resize(master: i32, size: TerminalSize) -> i32;
+    pub(crate) fn hl_ckpt_trigger_destroy(mapping: *mut c_void, descriptor: Descriptor);
+    pub(crate) fn hl_activation_terminal_resize(master: Descriptor, size: TerminalSize) -> i32;
     pub(crate) fn hl_activation_wait(process: *mut Process, exit: *mut EngineExit) -> i32;
     pub(crate) fn hl_activation_try_wait(
         process: *mut Process,
@@ -111,7 +146,7 @@ pub(crate) fn guest_fd_limit() -> u32 {
     unsafe { hl_engine_guest_fd_limit() }
 }
 pub(crate) fn resize(file: &File, size: TerminalSize) -> Result<(), i32> {
-    let status = unsafe { hl_terminal_resize(sys::file_raw(file), size) };
+    let status = unsafe { hl_activation_terminal_resize(descriptor(sys::file_raw(file)), size) };
     if status == 0 {
         Ok(())
     } else {
@@ -214,6 +249,7 @@ pub(crate) fn process_id(process: &Handle) -> Result<u64, i32> {
 }
 
 const _: () = assert!(std::mem::size_of::<EngineExit>() == 24);
+const _: () = assert!(std::mem::size_of::<NativeStreams>() == 24);
 const _: () = assert!(std::mem::size_of::<*mut c_void>() == std::mem::size_of::<usize>());
 
 // --- checkpoint streaming transport -------------------------------------------------------------
@@ -231,10 +267,14 @@ const _: () = assert!(std::mem::size_of::<*mut c_void>() == std::mem::size_of::<
 /// socket's type, and naming it honestly is what lets this compile on a host where `AF_UNIX`
 /// datagrams do not exist at all.
 pub(crate) fn broker_pair() -> std::io::Result<(sys::OwnedDescriptor, sys::OwnedDescriptor)> {
-    let mut parent = -1;
-    let mut child = -1;
+    let mut parent = DESCRIPTOR_NONE;
+    let mut child = DESCRIPTOR_NONE;
     if unsafe { hl_ckpt_broker_pair(&mut parent, &mut child) } != 0 {
         return Err(std::io::Error::last_os_error());
+    }
+    let (parent, child) = (raw_descriptor(parent), raw_descriptor(child));
+    if parent < 0 || child < 0 {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
     }
     // SAFETY: both descriptors were just created by the engine and are owned by this process.
     unsafe {
@@ -252,12 +292,14 @@ pub(crate) fn broker_accept(
 ) -> Option<(sys::Stream, u64)> {
     let milliseconds = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
     let mut host_pid = 0_u64;
-    let descriptor = unsafe { hl_ckpt_broker_accept(broker.raw(), milliseconds, &mut host_pid) };
-    if descriptor < 0 {
+    let channel = raw_descriptor(unsafe {
+        hl_ckpt_broker_accept(descriptor(broker.raw()), milliseconds, &mut host_pid)
+    });
+    if channel < 0 {
         return None;
     }
     // SAFETY: the descriptor was installed into this process by the engine and is owned by it.
-    Some((unsafe { sys::adopt_stream(descriptor) }, host_pid))
+    Some((unsafe { sys::adopt_stream(channel) }, host_pid))
 }
 
 /// The shared generation counter used to request a capture.
@@ -274,10 +316,14 @@ unsafe impl Sync for Trigger {}
 
 impl Trigger {
     pub(crate) fn create() -> std::io::Result<Self> {
-        let mut descriptor = -1;
+        let mut created = DESCRIPTOR_NONE;
         let mut mapping = std::ptr::null_mut();
-        if unsafe { hl_ckpt_trigger_create(&mut descriptor, &mut mapping) } != 0 {
+        if unsafe { hl_ckpt_trigger_create(&mut created, &mut mapping) } != 0 {
             return Err(std::io::Error::last_os_error());
+        }
+        let descriptor = raw_descriptor(created);
+        if descriptor < 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
         }
         Ok(Self {
             descriptor,
@@ -297,7 +343,7 @@ impl Trigger {
 
 impl Drop for Trigger {
     fn drop(&mut self) {
-        unsafe { hl_ckpt_trigger_destroy(self.mapping, self.descriptor) };
+        unsafe { hl_ckpt_trigger_destroy(self.mapping, descriptor(self.descriptor)) };
         self.mapping = std::ptr::null_mut();
         self.descriptor = -1;
     }
@@ -321,19 +367,24 @@ pub(crate) fn start_combined(
     trigger: c_int,
 ) -> Result<(Handle, Option<File>), i32> {
     let mut process = std::ptr::null_mut();
-    let mut master = -1;
+    let mut master = DESCRIPTOR_NONE;
     let size_ptr = size.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
-    let streams_ptr = streams.map_or(std::ptr::null(), std::ptr::from_ref);
+    let native = streams.map(|streams| NativeStreams {
+        input: descriptor(streams.input),
+        output: descriptor(streams.output),
+        error: descriptor(streams.error),
+    });
+    let streams_ptr = native.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
     let status = unsafe {
-        hl_activation_start_with_channels(
+        hl_activation_start_with_streams(
             executable.as_ptr(),
             guest,
             config.as_ptr(),
             streams_ptr,
             size_ptr,
-            transport,
-            checkpoint,
-            trigger,
+            descriptor(transport),
+            descriptor(checkpoint),
+            descriptor(trigger),
             &mut master,
             &mut process,
         )
@@ -341,8 +392,10 @@ pub(crate) fn start_combined(
     if status != 0 || process.is_null() {
         return Err(status);
     }
-    // The engine only fills the master when a terminal size was requested; a stdio process leaves it -1.
+    // The engine only fills the master when a terminal size was requested; a stdio process leaves it
+    // at the absent descriptor.
     let terminal = if size.is_some() {
+        let master = raw_descriptor(master);
         if master < 0 {
             return Err(status);
         }

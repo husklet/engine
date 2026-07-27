@@ -120,6 +120,10 @@ impl Machine {
     /// Signalling only the launch process is not enough: the guest tree runs as further host processes, and
     /// the coordinator among them is the *container init*, not the process this handle names.
     fn kick_participants(&self) -> Vec<u64> {
+        // A host signal rather than a C engine call for the same reason `Child::signal` sends one: the
+        // targets are guest-tree processes this handle does not own, and the engine exposes no
+        // signal-a-pid entry point. On a host without one, the kick is unavailable and every capture
+        // stalls -- which is what the empty-`kicked` diagnostic above already reports.
         let signal = crate::sys::signal::interrupt_engine();
         let mut kicked = Vec::new();
         for process in self.processes().unwrap_or_default() {

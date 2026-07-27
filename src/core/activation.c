@@ -726,6 +726,19 @@ static int wait_child(pid_t child, int *waited) {
     return result == child ? 0 : -1;
 }
 
+/* A terminal master is reported to the caller, and hl_activation_descriptor spells "no terminal" as
+ * HL_ACTIVATION_DESCRIPTOR_NONE == 0. openpty() hands back the lowest free descriptor, which is 0 whenever
+ * the embedder closed its standard input -- a live master indistinguishable from "absent". Move it off
+ * zero at the source so no caller of either descriptor form can be handed that value. Returns the
+ * (possibly new) descriptor, or -1 after closing the original when it cannot be moved. */
+static int reserve_master_descriptor(int master) {
+    int moved;
+    if (master != 0) return master;
+    moved = fcntl(master, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+    (void)close(master);
+    return moved;
+}
+
 static int reserve_control_descriptors(int pair[2]) {
     size_t index;
     for (index = 0; index < 2; ++index) {
@@ -822,8 +835,10 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
     if (terminal != NULL) {
         struct winsize size = {.ws_row = terminal->rows, .ws_col = terminal->columns};
         int close_limit = getdtablesize();
-        if (openpty(&master, &slave, NULL, NULL, &size) != 0 ||
-            fcntl(master, F_SETFD, FD_CLOEXEC) != 0 || fcntl(slave, F_SETFD, FD_CLOEXEC) != 0) {
+        int opened = openpty(&master, &slave, NULL, NULL, &size);
+        if (opened == 0) master = reserve_master_descriptor(master);
+        if (opened != 0 || master < 0 || fcntl(master, F_SETFD, FD_CLOEXEC) != 0 ||
+            fcntl(slave, F_SETFD, FD_CLOEXEC) != 0) {
             if (master >= 0) close(master);
             if (slave >= 0) close(slave);
             close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
@@ -996,6 +1011,63 @@ hl_status hl_terminal_resize(int32_t master, hl_terminal_size size) {
     struct winsize native = {.ws_row = size.rows, .ws_col = size.columns};
     if (master < 0 || size.rows == 0 || size.columns == 0) return HL_STATUS_INVALID_ARGUMENT;
     return ioctl(master, TIOCSWINSZ, &native) == 0 ? HL_STATUS_OK : HL_STATUS_PLATFORM_FAILURE;
+}
+
+/* HL_ACTIVATION_DESCRIPTOR_NONE is the API's "absent"; -1 is what everything below this boundary has
+ * always used for it. A value too wide to be a descriptor number is rejected rather than truncated, so a
+ * caller that passed a whole 64-bit handle by mistake gets an error instead of its low half. Returns 0 on
+ * success, -1 on a value this API cannot carry. */
+static int activation_native_descriptor(hl_activation_descriptor value, int *out) {
+    if (value == HL_ACTIVATION_DESCRIPTOR_NONE) {
+        *out = -1;
+        return 0;
+    }
+    if (value > (hl_activation_descriptor)INT32_MAX) return -1;
+    *out = (int)value;
+    return 0;
+}
+
+hl_status hl_activation_start_with_streams(const char *executable, uint32_t guest_isa, const char *guest,
+                                           const hl_activation_streams *streams, const hl_terminal_size *size,
+                                           hl_activation_descriptor transport, hl_activation_descriptor checkpoint,
+                                           hl_activation_descriptor trigger, hl_activation_descriptor *out_master,
+                                           hl_activation_process **out_process) {
+    hl_activation_stdio native_streams = {.input = -1, .output = -1, .error = -1};
+    int32_t master = -1;
+    int native_transport;
+    int native_checkpoint;
+    int native_trigger;
+    hl_status status;
+    if (out_master != NULL) *out_master = HL_ACTIVATION_DESCRIPTOR_NONE;
+    if (activation_native_descriptor(transport, &native_transport) != 0 ||
+        activation_native_descriptor(checkpoint, &native_checkpoint) != 0 ||
+        activation_native_descriptor(trigger, &native_trigger) != 0)
+        return HL_STATUS_INVALID_ARGUMENT;
+    if (streams != NULL) {
+        int input;
+        int output;
+        int error;
+        if (activation_native_descriptor(streams->input, &input) != 0 ||
+            activation_native_descriptor(streams->output, &output) != 0 ||
+            activation_native_descriptor(streams->error, &error) != 0)
+            return HL_STATUS_INVALID_ARGUMENT;
+        native_streams.input = (int32_t)input;
+        native_streams.output = (int32_t)output;
+        native_streams.error = (int32_t)error;
+    }
+    status = activation_start(executable, guest_isa, guest, streams != NULL ? &native_streams : NULL, size,
+                              out_master != NULL ? &master : NULL, native_transport, native_checkpoint,
+                              native_trigger, out_process);
+    /* activation_start leaves master at -1 whenever no terminal was produced, which is exactly the case
+     * this API reports as NONE. */
+    if (out_master != NULL && master >= 0) *out_master = (hl_activation_descriptor)master;
+    return status;
+}
+
+hl_status hl_activation_terminal_resize(hl_activation_descriptor master, hl_terminal_size size) {
+    int native;
+    if (activation_native_descriptor(master, &native) != 0 || native < 0) return HL_STATUS_INVALID_ARGUMENT;
+    return hl_terminal_resize((int32_t)native, size);
 }
 
 hl_status hl_activation_start(const char *executable, uint32_t guest_isa, const char *config_path,
