@@ -8,6 +8,12 @@ explicitly marked as unverified. Where the honest answer is "this needs an exper
 
 Line and file references were checked against the tree at `feat/windows-amd64`.
 
+**Revision note.** §9 (`event`) was rewritten after a parallel design pass —
+`docs/windows/prior-art-cygwin-threads-signals.md` — challenged its original conclusion with evidence from our own
+Linux ABI that this document had not consulted. The challenge was upheld on the decisive point. The superseded
+IOCP-centric design and the reasoning that retired it are both recorded in §9, because the *shape* of the argument
+matters more than the answer: the host contract looks like `epoll`, and our consumer does not use it like `epoll`.
+
 ---
 
 ## 1. What this document is not
@@ -181,7 +187,7 @@ guest supplies a 4 KiB-aligned offset.
 | sync | `SYNC` (mandatory) | 7 | trivial | **yes** — required by `engine.c:470` |
 | file | `FILE` | 40 | **hard** | yes (with named omissions) |
 | stream | `STREAM` | 8 | moderate–hard | yes |
-| event | `EVENT` | 5 | **hard** | yes |
+| event | `EVENT` | 5 | moderate (was **hard**; see §9) | yes |
 | event / timer | `EVENT_TIMER` | 2 | moderate | yes |
 | counter | `COUNTER` | 10 | moderate | yes |
 | transfer | `TRANSFER` | 5 | moderate | yes |
@@ -333,7 +339,7 @@ not need.
 
 ## 8. file (`HL_HOST_FILE_ABI 23`)
 
-Forty callbacks. The largest group and, after `event`, the most work.
+Forty callbacks. The largest group and, after `memory`, the most work.
 
 **Architecture.** Every file handle is a Win32 `HANDLE` opened through `NtCreateFile`, because
 `OBJECT_ATTRIBUTES.RootDirectory` is the only relative-open mechanism Windows has and the entire group is `*at`-shaped.
@@ -402,66 +408,117 @@ implementation will drift into. This is the single largest fidelity question in 
 
 ---
 
-## 9. event (`HL_HOST_EVENT_ABI 2`) — the readiness/completion problem
+## 9. event (`HL_HOST_EVENT_ABI 2`) — adjudicated
 
-This is the classic hard one and it deserves being stated precisely rather than waved at.
+**Ruling: `WaitForMultipleObjects` over a registered handle set wins. The IOCP/AFD design is withdrawn.**
 
-**The mismatch.** `epoll`/`kqueue` are *readiness* interfaces: "tell me when I could read without blocking", and
-the caller then performs the read itself. IOCP is a *completion* interface: "I have submitted this read; tell me
-when it finished", and the kernel owns the buffer in the meantime. These are not trivially interconvertible.
-Converting completion→readiness requires issuing an operation the caller did not ask for; converting
-readiness→completion requires a buffer the caller has not supplied.
+This section originally proposed one IOCP with four feeders, including `IOCTL_AFD_POLL` on `\Device\Afd`, on the
+reasoning that `epoll` is a readiness interface and IOCP is a completion interface and the gap must be bridged in
+the host. `docs/windows/prior-art-cygwin-threads-signals.md` argued the opposite from evidence in
+`src/linux_abi/`. That evidence was checked, it holds, and it is decisive.
 
-There is no single Windows mechanism that covers every object the contract feeds to `event.control`. The Linux
-backend accepts six handle kinds there (`host.c:2650-2658`): `FILE`, `SOCKET`, `STREAM`, `COUNTER`, `DIRECTORY`,
-`TRANSFER`. Each needs a different Windows answer.
+### 9.1 What the Linux ABI actually asks of `event.wait`
 
-**Proposed architecture — one IOCP, four feeders.**
+Four call sites consume the group outside the host backends. Read together they say something narrow:
+
+| Consumer | Uses `token`? | Uses `readiness`? | Evidence |
+|---|---|---|---|
+| `src/linux_abi/epoll.c:427-428` | **no** | **no** | `hl_host_event_record ignored;` — the record is declared, passed, and discarded. |
+| `src/linux_abi/syscall/inotify.c:350-354` | no | no | Declares `event`, then tests only `waited.status == HL_STATUS_OK && waited.value != 0`. |
+| `src/linux_abi/syscall/binding.c:200-219` | **yes** | no | Uses `events[index].token` to find the source, then calls `watch->drain` for the actual state. |
+| `src/linux_abi/syscall/time.c:186-197` | **yes** | **yes** | `if (waited.value == 0 \|\| (event.readiness & HL_HOST_READY_TIMER) == 0) continue;` |
+
+`epoll.c` is the load-bearing one, and it is more emphatic than "discards the record":
+
+- **Readiness is re-derived, not received.** `epoll_sample` (`epoll.c:354-399`) walks every watch and calls
+  `hl_linux_object_ready(&target, watch->interests)` (`:373`) or `hl_provider_files_readiness` (`:376`). The host's
+  answer is never consulted.
+- **The host is never told what to watch for.** `epoll_subscribe` registers with a *constant*
+  `HL_HOST_READY_READ` (`epoll.c:187-188`) regardless of the guest's interests. A host that synthesized accurate
+  per-object readiness would be answering a question it was never asked, and could not answer correctly anyway,
+  because it does not know the interests.
+- **Edge-triggering is emulated above the host.** `epoll.c:380-384` computes `ready & ~watch->previous` itself.
+- **One-shot is emulated above the host.** `epoll.c:392` sets `current->disabled = 1`.
+- **The registered object is not the guest object.** `control` receives `target.ops->wait_handle(...)`
+  (`epoll.c:182-183`) — a host handle the ABI object chooses to expose. Objects with no `wait_handle` fall back to
+  `ops->subscribe` (`epoll.c:195-204`), entirely outside the pollset.
+
+So the pollset is a **wakeup bus**. `HL_HOST_READY_EDGE` and `HL_HOST_READY_ONESHOT` in `control` are advisory —
+`binding.c:242` requests `EDGE`, but its loop re-drains and a spurious level wake yields `drain_changes == 0`, so
+level-triggered delivery is merely less efficient, never wrong.
+
+**Two things the wakeup-bus reading does *not* excuse, and the original brief was right to flag them:**
+
+1. **Tokens must be exact.** `binding.c:211` and `time.c:193` both index by token. A wakeup bus that returned
+   "something happened" without saying *which* token would break both.
+2. **`HL_HOST_READY_TIMER` must be exact.** `time.c:191` hard-gates on it. Get it wrong and every POSIX guest
+   timer silently never fires — a failure that would look like a guest bug for weeks.
+
+`counter.readiness` and `stream.readiness` remain separate callbacks needing real per-object answers (§10, §12).
+They are synchronous point queries — `WaitForSingleObject(ready, 0)`, `PeekNamedPipe`,
+`FilePipeLocalInformation.WriteQuotaAvailable` — and were never the expensive part of either design.
+
+### 9.2 The decisive criterion
+
+Both designs are viable and both deliver exact tokens and an exact `READY_TIMER`. Complexity, risk, and
+scalability are the axes. The tradeoff:
+
+> The IOCP design buys O(1) wake scaling and precise per-object readiness at the cost of an undocumented ioctl
+> (`IOCTL_AFD_POLL`), a completion-cancellation race on every `MOD`, and a level-trigger emulation layer that is
+> the bulk of wepoll's complexity. The `WaitForMultipleObjects` design buys documented APIs
+> (`WSAEventSelect`, `CreateWaitableTimerExW`, overlapped `hEvent`) and a state machine small enough to hold in
+> the head, at the cost of a 63-handle-per-wait ceiling requiring `CreateThreadpoolWait` fan-out above it, and
+> readiness precision it does not need. **The criterion that settles it is that `epoll_sample`
+> (`epoll.c:357-397`) already walks every watch on every wake.** The ABI is unconditionally O(n) above the host,
+> so the IOCP design's scalability advantage is erased before it reaches the guest — it buys a property the layer
+> above discards. With the only argument for the riskier design gone, the boring one wins on every remaining axis.
+
+### 9.3 The adopted design
 
 ```
-pollset = HANDLE hIocp (CreateIoCompletionPort)
-        + registration table {token -> {kind, object, interests, state}}
+pollset = HANDLE  hWake        (CreateEventW, manual-reset)  -- slot 0, always present
+        + HANDLE  handles[n]   registered waitables
+        + table   {token, kind, handle, interests}
 
-feeder 1  sockets            NtDeviceIoControlFile(\Device\Afd, IOCTL_AFD_POLL) -> completes on hIocp
-feeder 2  waitable kernel    RegisterWaitForSingleObject -> callback -> PostQueuedCompletionStatus(hIocp, token)
-          objects            (counters, timers, transfer queues)
-feeder 3  overlapped pipes   zero-byte ReadFile with OVERLAPPED -> completes on hIocp when data arrives
-feeder 4  directory changes  ReadDirectoryChangesW with OVERLAPPED -> completes on hIocp
-wake                         PostQueuedCompletionStatus(hIocp, token=0)
-wait                         GetQueuedCompletionStatusEx(hIocp, entries, n, ms, FALSE)
+sockets            WSAEventSelect(s, hEvent, FD_READ|FD_WRITE|FD_OOB|FD_ACCEPT|FD_CONNECT|FD_CLOSE)
+counters           the counter's own manual-reset `ready` Event (§10)
+transfer queues    the queue's manual-reset Event (§11)
+pipes / streams    the OVERLAPPED.hEvent of a standing zero-byte ReadFile (§12)
+directory changes  the OVERLAPPED.hEvent of a standing ReadDirectoryChangesW (§15)
+timers             CreateWaitableTimerExW -- a kernel object, waited directly
+wake               SetEvent(hWake)
+wait               WaitForMultipleObjects(1 + n, handles, FALSE, ms)   for n <= 63
+                   otherwise: 63-handle groups, each fanned out to CreateThreadpoolWait,
+                   whose callback SetEvent()s a group-ready event in the parent's set
 ```
 
-**Feeder 1 is undocumented and it is the right choice anyway.** `\Device\Afd` with `IOCTL_AFD_POLL` is the *actual*
-readiness interface underneath Winsock's `select`/`WSAPoll`. It is what
-[wepoll](https://github.com/piscisaureus/wepoll), libuv, and Rust's mio all use, and libuv has shipped it in
-production for over a decade — so "undocumented" here means "unsupported by Microsoft", not "fragile". The
-documented alternative is a dedicated thread running `WSAPoll` and posting to the IOCP: correct, O(n) per wake,
-and capped at `FD_SETSIZE` for `select`. Phase 1 can ship the `WSAPoll` thread and swap in AFD later behind the
-same internal interface; the registration table does not change.
+Every feeder is a documented API. `\Device\Afd` does not appear.
 
-**Feeder 3 is the trick that makes pipes work.** A zero-byte overlapped `ReadFile` completes when data becomes
-available *without consuming it* — that is a readiness signal synthesized out of a completion API. It is the
-standard technique and it is why `stream.pipe_pair` must create **overlapped named pipes**, not `CreatePipe`
-anonymous pipes (§12). There is no symmetric trick for *write* readiness on a byte-mode pipe;
-`NtQueryInformationFile(FilePipeLocalInformation)` gives `WriteQuotaAvailable`, which the backend can poll to
-synthesize `HL_HOST_READY_WRITE`. Reporting always-writable is the lazy answer and it will hang a guest that
-relies on `EPOLLOUT` for flow control.
+Note that **timers get *better*, not worse.** A waitable timer is a kernel object that `WaitForMultipleObjects`
+waits on directly; under IOCP it needed a `RegisterWaitForSingleObject` bridge to become a completion. The one
+readiness bit that must be exact is the one this design produces most naturally.
 
-**Level-triggered is the hard part, not edge-triggered.** AFD_POLL and zero-byte reads are inherently one-shot:
-each request yields exactly one notification. So `HL_HOST_READY_ONESHOT` is free and `HL_HOST_READY_EDGE` is
-nearly free, while *level-triggered* — the default — must be emulated: after delivering an event, immediately
-re-arm, and if the object is still ready, deliver again. This is precisely wepoll's design and precisely where
-its complexity lives.
+`WSAEventSelect`'s known quirks — it forces the socket non-blocking, and its per-bit edge semantics are
+idiosyncratic — are exactly the quirks a wakeup bus tolerates, because `epoll_sample` re-derives the true state
+immediately afterwards. That is not a lucky coincidence; it is the same reason the design is admissible at all.
 
-| Callback | Linux | Win32/NT | Gaps | Diff. | Ph.1 |
+| Callback | Linux | Win32 | Gaps | Diff. | Ph.1 |
 |---|---|---|---|---|---|
-| `create` | `epoll_create1` + an `eventfd` registered for wake | `CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0)` | No separate wake object needed — `PostQueuedCompletionStatus` is the wake. Simpler than Linux. | trivial | yes |
-| `control(op, object, token, interests)` | `epoll_ctl` ADD/MOD/DEL | dispatch on the handle kind to one of the four feeders; maintain the registration table | The whole architecture above. MOD on an armed one-shot request means cancelling it (`CancelIoEx`) and re-issuing, which races with a completion already in flight — the table must tolerate a stale completion arriving for a cancelled registration. This is the single most bug-prone piece of the backend. | **hard** | yes |
-| `wait(events, capacity, deadline_ns)` | `epoll_wait`, ms timeout rounded up | `GetQueuedCompletionStatusEx(..., dwMilliseconds, FALSE)` | Millisecond timeout granularity against a nanosecond deadline — but the Linux backend already rounds up to ms (`host.c:2701`), so this is parity, not a regression. `HL_HOST_DEADLINE_INFINITE` → `INFINITE`. The re-arm-and-recheck loop for level-triggered registrations lives here. | **hard** | yes |
-| `wake` | `write(eventfd, 1)` | `PostQueuedCompletionStatus(hIocp, 0, 0, NULL)` with token 0 | None. Cleaner. | trivial | yes |
-| `close` | close the timers, then the epoll fd | `CancelIoEx` every armed request, `UnregisterWaitEx(..., INVALID_HANDLE_VALUE)` every wait (synchronous quiesce), drain the IOCP, `CloseHandle` | Draining is mandatory: a completion in flight when the port closes is a use-after-free of the registration entry. | moderate | yes |
-| `arm_timer(token, deadline_ns, interval_ns)` | `timerfd_create`/`timerfd_settime(TFD_TIMER_ABSTIME)` + `epoll_ctl` | `CreateWaitableTimerExW(..., CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)`; `SetWaitableTimer` with a **negative relative** due time computed from the host-monotonic deadline; `RegisterWaitForSingleObject` → `PostQueuedCompletionStatus` | Deadlines are host-monotonic, and `SetWaitableTimer`'s absolute form is *system* time — so absolute cannot be used and the monotonic→relative conversion reintroduces a small window where a clock step during arming shifts the deadline. `lPeriod` is `LONG` **milliseconds**, so a sub-millisecond `interval_ns` rounds up to 1 ms; Linux's `timerfd` is an exact hrtimer. Real, guest-visible. | moderate | yes |
-| `disarm_timer(token)` | `epoll_ctl(DEL)` + `close(timerfd)` | `CancelWaitableTimer` + `UnregisterWaitEx(..., INVALID_HANDLE_VALUE)` + `CloseHandle` | `UnregisterWaitEx` with `INVALID_HANDLE_VALUE` blocks until any in-flight callback finishes, which is exactly the quiesce the contract wants. | trivial | yes |
+| `create` | `epoll_create1` + an `eventfd` registered for wake | `CreateEventW(NULL, TRUE, FALSE, NULL)` as slot 0 of an otherwise empty set | Structurally identical to Linux, which also reserves a wake object at token 0. | trivial | yes |
+| `control(op, object, token, interests)` | `epoll_ctl` ADD/MOD/DEL | dispatch on handle kind to obtain a waitable `HANDLE`; insert/update/remove in the table | ADD on a socket calls `WSAEventSelect`; on a counter/transfer it takes the object's existing Event; on a stream/directory it arms the standing zero-byte read and takes its `hEvent`. **MOD is nearly free** — the interests are advisory and the handle does not change, so it is a table write, with none of the IOCP design's cancel-and-re-issue race. DELETE on a socket must `WSAEventSelect(s, NULL, 0)` to restore blocking mode. | moderate | yes |
+| `wait(events, capacity, deadline_ns)` | `epoll_wait`, ms timeout rounded up | `WaitForMultipleObjects(1+n, …, FALSE, ms)`; on a signalled slot emit `{token, readiness}` and re-scan from the next index so a busy low slot cannot starve a high one | Millisecond granularity matches Linux's own rounding (`host.c:2701`), so parity. **`bWaitAll = FALSE` returns only the lowest signalled index**, so filling a caller's `capacity > 1` needs a follow-up zero-timeout sweep — cheap, and the ABI only ever asks for 1 (`epoll.c:428`, `inotify.c:353`, `time.c:186`) or 16 (`binding.c:201`). `readiness` is `HL_HOST_READY_READ` for object slots and `HL_HOST_READY_TIMER` for timer slots — the only distinction any consumer makes. | moderate | yes |
+| `wake` | `write(eventfd, 1)` | `SetEvent(hWake)`, cleared by `wait` before it returns | Manual-reset plus explicit clear reproduces `eventfd`'s drain-to-zero. | trivial | yes |
+| `close` | close the timers, then the epoll fd | `CancelIoEx` any standing zero-byte reads, `CloseThreadpoolWait`/`WaitForThreadpoolWaitCallbacks` on any fan-out groups, `CloseHandle(hWake)` | Simpler than the IOCP path: there is no completion queue to drain, because nothing was ever queued. | moderate | yes |
+| `arm_timer(token, deadline_ns, interval_ns)` | `timerfd_create`/`timerfd_settime(TFD_TIMER_ABSTIME)` + `epoll_ctl` | `CreateWaitableTimerExW(..., CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)` + `SetWaitableTimer`, inserted directly into the handle set | Deadlines are host-monotonic and `SetWaitableTimer`'s absolute form is *system* time, so a **negative relative** due time computed from the monotonic remainder is required; a clock step during arming shifts the deadline slightly. `lPeriod` is `LONG` **milliseconds**, so a sub-millisecond `interval_ns` rounds up to 1 ms against Linux's exact hrtimer — guest-visible, and the one place `EVENT_TIMER` is genuinely worse than Linux. Must set `HL_HOST_READY_TIMER` in the emitted record (`time.c:191`). | moderate | yes |
+| `disarm_timer(token)` | `epoll_ctl(DEL)` + `close(timerfd)` | `CancelWaitableTimer` + remove from the set + `CloseHandle` | None. | trivial | yes |
+
+### 9.4 What the withdrawn design would still be needed for
+
+If a future consumer ever *does* read per-object `readiness` out of `event.wait` — or if `epoll_subscribe` is
+changed to pass real interests through `control` instead of the constant at `epoll.c:188` — this ruling expires
+and the IOCP/AFD design becomes necessary again. **That inversion is worth a comment at `epoll.c:187`**, because
+nothing there currently signals that a Windows backend depends on the constant. It is recorded here rather than
+added, since this pass may not edit `src/`.
 
 ---
 
@@ -472,8 +529,8 @@ straightforward and the result is *cheaper* than Linux's, which spawns a thread 
 (`host.c:3021-3107`).
 
 Representation: `{ SRWLOCK lock; CONDITION_VARIABLE cv; uint64_t value; uint32_t flags; HANDLE ready; }` where
-`ready` is a manual-reset `Event` held signalled exactly when `value != 0`, so `event.control` can wait on it
-through feeder 2.
+`ready` is a manual-reset `Event` held signalled exactly when `value != 0`, so `event.control` can put it straight
+into the wait set (§9.3).
 
 | Callback | Linux | Win32 | Gaps | Diff. | Ph.1 |
 |---|---|---|---|---|---|
@@ -503,7 +560,7 @@ native descriptor numbers (`host_services.h:537-539`), and without `fork` both e
 process. So the right Windows implementation is **entirely in-process**: a refcounted, mutex-guarded queue of
 fixed-size `hl_linux_transfer_wire`-shaped records, with attachments retained as extra references on the
 counter objects in the host handle table until `receive` mints receiver-local handles. Back the queue with a
-manual-reset `Event` so `event.control` can poll it through feeder 2.
+manual-reset `Event` so `event.control` can put it straight into the wait set (§9.3).
 
 | Callback | Linux | Win32 | Gaps | Diff. | Ph.1 |
 |---|---|---|---|---|---|
@@ -522,7 +579,7 @@ there is no second engine process to transfer to.
 
 | Callback | Linux | Win32 | Gaps | Diff. | Ph.1 |
 |---|---|---|---|---|---|
-| `pipe_pair(flags)` | `pipe2(O_CLOEXEC\|O_NONBLOCK)` | `CreateNamedPipeW` with a GUID-unique name, `PIPE_ACCESS_INBOUND \| FILE_FLAG_OVERLAPPED`, `PIPE_TYPE_BYTE \| PIPE_WAIT`, then `CreateFileW` on that name for the write end | **`CreatePipe` is unusable**: it returns non-overlapped handles, and a non-overlapped handle cannot be associated with an IOCP, cannot be polled, and cannot be cancelled cleanly. The named-pipe route is the standard replacement. Name collisions need a retry loop. Both handles must be `FILE_FLAG_OVERLAPPED` for the event group to work. | moderate | yes |
+| `pipe_pair(flags)` | `pipe2(O_CLOEXEC\|O_NONBLOCK)` | `CreateNamedPipeW` with a GUID-unique name, `PIPE_ACCESS_INBOUND \| FILE_FLAG_OVERLAPPED`, `PIPE_TYPE_BYTE \| PIPE_WAIT`, then `CreateFileW` on that name for the write end | **`CreatePipe` is unusable**: it returns non-overlapped handles, and a non-overlapped handle has no `OVERLAPPED.hEvent` for the wait set, cannot be polled, and cannot be cancelled cleanly. The named-pipe route is the standard replacement. Name collisions need a retry loop. Both handles must be `FILE_FLAG_OVERLAPPED` for the event group to work. | moderate | yes |
 | `read` / `write` | `read`/`write`, with a `SIGPIPE`-blocking dance around the write (`host.c:1207-1226`) | `ReadFile`/`WriteFile` on the overlapped handle, waiting on the `OVERLAPPED` event for the synchronous case | **The entire `SIGPIPE` mechanism disappears** — Windows has no `SIGPIPE`, so the `pthread_sigmask`/`sigtimedwait` bracket is deleted, not ported. `ERROR_BROKEN_PIPE` → `HL_STATUS_DISCONNECTED`. Overlapped handles have no implicit file pointer, so every read/write must carry its own `OVERLAPPED`. | moderate | yes |
 | `duplicate` | `fcntl(F_DUPFD_CLOEXEC)` | `DuplicateHandle` | None. | trivial | yes |
 | `close` | `close` | `CancelIoEx` any in-flight overlapped op, then `CloseHandle` | Closing a handle with an outstanding overlapped operation whose `OVERLAPPED` lives on a freed heap block is a classic use-after-free. Cancel first, wait for the cancellation to complete, then close. | moderate | yes |
@@ -564,13 +621,13 @@ backend does not have, since everything is an `int`.
 
 ## 15. directory (`HL_HOST_DIRECTORY_ABI 1`) — omit in phase 1
 
-Linux uses `inotify`. Windows uses `ReadDirectoryChangesW` on an overlapped directory handle, completing on the
-IOCP (feeder 4).
+Linux uses `inotify`. Windows uses `ReadDirectoryChangesW` on an overlapped directory handle, whose
+`OVERLAPPED.hEvent` joins the wait set (§9.3).
 
 | Callback | Linux | Win32 | Gaps | Diff. |
 |---|---|---|---|---|
 | `create` | `inotify_init1` | allocate the instance object; no kernel object yet | Structural difference: one `inotify` fd carries *many* watches; Windows needs one open `HANDLE` and one outstanding `ReadDirectoryChangesW` **per watched directory**. | moderate |
-| `add(file, token, interests)` | `inotify_add_watch` via `/proc/self/fd` | `DuplicateHandle` the directory, associate with the IOCP, issue `ReadDirectoryChangesW` with the mapped filter | Filter mapping: `CREATE`/`DELETE`/`RENAME` → `FILE_NOTIFY_CHANGE_FILE_NAME \| _DIR_NAME`; `MODIFY` → `_LAST_WRITE \| _SIZE`; `ATTRIB` → `_ATTRIBUTES \| _SECURITY`. **`HL_HOST_DIRECTORY_ACCESS` has no analogue at all** — Windows never reports opens, reads, or closes. That interest must return `HL_STATUS_NOT_SUPPORTED` or be silently dropped, and DOCS §2 item 7 forbids the latter. | moderate |
+| `add(file, token, interests)` | `inotify_add_watch` via `/proc/self/fd` | `DuplicateHandle` the directory, issue `ReadDirectoryChangesW` with the mapped filter and a dedicated `OVERLAPPED.hEvent` | Filter mapping: `CREATE`/`DELETE`/`RENAME` → `FILE_NOTIFY_CHANGE_FILE_NAME \| _DIR_NAME`; `MODIFY` → `_LAST_WRITE \| _SIZE`; `ATTRIB` → `_ATTRIBUTES \| _SECURITY`. **`HL_HOST_DIRECTORY_ACCESS` has no analogue at all** — Windows never reports opens, reads, or closes. That interest must return `HL_STATUS_NOT_SUPPORTED` or be silently dropped, and DOCS §2 item 7 forbids the latter. | moderate |
 | `modify` | update the stored interests | cancel + re-issue with a new filter | Racy in the same way as `event.control` MOD. | moderate |
 | `remove` | `inotify_rm_watch` | `CancelIoEx` + `CloseHandle` + drain | | moderate |
 | `read(records, cap)` | `read` the inotify fd, coalesce into pending records | drain completed `FILE_NOTIFY_INFORMATION` buffers into the same pending-record queue | `IN_DELETE_SELF` / `IN_MOVE_SELF` for the watched directory itself are **not reported** by `ReadDirectoryChangesW` — Windows reports children only. Reproducing them requires also watching the parent, doubling the handle count. Buffer overflow → `ERROR_NOTIFY_ENUM_DIR`, which maps cleanly to `HL_HOST_DIRECTORY_IGNORED` / `IN_Q_OVERFLOW`. `HL_HOST_DIRECTORY_ONESHOT` must be emulated by not re-issuing. | **hard** |
@@ -689,8 +746,7 @@ neither of which carries a UTF-8/UTF-16 layer or a synthesized readiness engine.
 | file (40 callbacks) | 1900 | Linux ≈ 1400; `NtCreateFile` plumbing and `FileXxxInfo` structs are wordier |
 | `path.c` — WTF-8 ↔ UTF-16, NT path building | 250 | |
 | `resolve.c` sibling | 350 | 260 + `HANDLE` verbosity |
-| event — IOCP core, registration table, level-trigger emulation | 900 | wepoll is ~1800 for a *complete* epoll; this is a subset with a narrower contract |
-| event — AFD feeder | 250 | can be deferred behind a `WSAPoll` thread (~120) in phase 1 |
+| event — wait set, registration table, 63-handle fan-out, timers | 550 | **revised down from 1150** (§9). No level-trigger emulation, no completion-cancellation race, no AFD feeder. `WSAEventSelect` folds in at ~80. |
 | stream (8) | 500 | the overlapped state machine and `move`'s capacity-first loop dominate |
 | counter (10) | 350 | |
 | transfer (5) | 300 | in-process queue |
@@ -700,11 +756,14 @@ neither of which carries a UTF-8/UTF-16 layer or a synthesized readiness engine.
 | `private.c` shim | 40 | |
 | error mapping — Win32 + NTSTATUS | 180 | |
 | CMake, manifest, toolchain file | 150 | |
-| **Phase 1 subtotal** | **≈ 7 700** | |
+| **Phase 1 subtotal** | **≈ 7 100** | was ≈ 7 700 before the §9 ruling |
 | directory (7) — phase 2 | 500 | |
 | watch (4) — phase 2 | 250 | polling-only version ≈ 120 |
 | process (5) — blocked | 400 | only if a `fork` substitute is ever built |
-| **With phase 2** | **≈ 8 500** | |
+| **With phase 2** | **≈ 7 900** | |
+
+`event` is no longer one of the three hard groups. The remaining two are `memory` (placeholder reservations,
+non-atomic `MAP_FIXED`) and `file` (40 callbacks, `resolve_beneath`, `read_directory`).
 
 **Not counted, and larger than any of the above:** routing `root_handle_bind` and the 61 `*at` call sites in
 `src/linux_abi` through the host-services contract (§1.2, §18). That is the real critical path to a Windows host
@@ -731,7 +790,15 @@ Ranked by how much of the design they can invalidate.
    network share or a container overlay, `rename` and `unlink` silently fall back to legacy Windows semantics and
    a large class of guest behaviour breaks in ways that look like engine bugs.
 7. **Permission-bit policy** (§8 preamble) — a contract-level decision, not an implementation detail.
-8. **`stable_object` truncation on ReFS.** 128→64 bits. Probably irrelevant for CI; note it before someone hits it.
+8. **Does any realistic guest exceed 63 handles in one pollset?** The §9 ruling accepts a
+   `CreateThreadpoolWait` fan-out above `MAXIMUM_WAIT_OBJECTS`. If the corpus never crosses 63, the fan-out can be
+   a `HL_STATUS_RESOURCE_LIMIT` stub in phase 1 and ~150 lines come off the estimate. Measurable by counting
+   `epoll_subscribe` successes per instance across the compat corpus on Linux — no Windows needed.
+9. **`stable_object` truncation on ReFS.** 128→64 bits. Probably irrelevant for CI; note it before someone hits it.
+
+**Standing invariant, not a question.** `src/linux_abi/epoll.c:188` passes a constant `HL_HOST_READY_READ` to
+`event.control` and `epoll.c:427` discards the returned record. §9's ruling depends on both. If either changes,
+re-read §9.4 before assuming the Windows event backend still works.
 
 ---
 
@@ -747,9 +814,22 @@ Ranked by how much of the design they can invalidate.
 - [CreateSymbolicLinkW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createsymboliclinkw) — `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE`, Developer Mode
 - [AF_UNIX comes to Windows](https://devblogs.microsoft.com/commandline/af_unix-comes-to-windows/) — `SOCK_STREAM` only, no ancillary data, no `socketpair`
 - [Windows/WSL Interop with AF_UNIX](https://devblogs.microsoft.com/commandline/windowswsl-interop-with-af_unix/) — no `SCM_RIGHTS`
+- [WaitForMultipleObjects](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects) — `MAXIMUM_WAIT_OBJECTS`, `bWaitAll = FALSE` lowest-index semantics
+- [WSAEventSelect](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsaeventselect) — documented socket readiness into an event handle
+- [CreateThreadpoolWait](https://learn.microsoft.com/en-us/windows/win32/api/threadpoolapiset/nf-threadpoolapiset-createthreadpoolwait) — the above-63 fan-out
+- [CreateWaitableTimerExW](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createwaitabletimerexw) — `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`
+
+Cited for the **withdrawn** IOCP/AFD design (§9), retained so the reasoning can be re-checked if §9.4's inversion
+ever triggers:
+
 - [wepoll: fast epoll for windows](https://github.com/piscisaureus/wepoll) — the AFD/IOCP readiness design
 - [\Device\Afd, or, the Deal with the Devil that makes async Rust work on Windows](https://notgull.net/device-afd/)
 - [Adventures with \Device\Afd — Len Holgate](https://lenholgate.com/blog/2023/04/adventures-with-afd.html)
 - [mio issue #281 — use IOCTL_AFD_POLL](https://github.com/tokio-rs/mio/issues/281)
+
+In-tree:
+
+- `docs/windows/prior-art-cygwin-threads-signals.md` — the parallel design pass whose reading of
+  `src/linux_abi/epoll.c` retired the IOCP design (§9)
 - [mingw-w64 issue #27 — VirtualAlloc2/MapViewOfFile3 missing from mingw libs](https://github.com/mingw-w64/mingw-w64/issues/27)
 - [mingw-w64-public patch, Oct 2023 — MapViewOfFile3/VirtualAlloc2 in api-ms-win-core-memory](https://sourceforge.net/p/mingw-w64/mailman/mingw-w64-public/thread/20231025193048.28648-2-mark@harmstone.com/)
