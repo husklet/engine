@@ -482,6 +482,39 @@ fixtures, and none of them used `sigaltstack` until now. `tests/e2e/checkpoint_h
 heap alternate stack and says why in a comment; move it back to `.bss` once this is fixed, since that shape is
 the stricter test.
 
+### 3.17 The architecturally-undefined flag divergences: ruled, keep the model
+
+A decision, recorded because the opposite decision is defensible and someone will re-open it.
+
+Native x86-64 hardware and the engine disagree on:
+
+- **OF after a multi-bit `SHR`/`ROL`/`ROR`/`RCL`/`RCR`, and after `SHLD`/`SHRD`** — native computes a value,
+  the engine preserves the incoming OF.
+- **The `SHLD`/`SHRD` 16-bit result when the masked count exceeds 16** — native shifts, the engine no-ops,
+  flags included.
+
+**Ruling: keep the engine's model. Do not chase this silicon.** Three reasons, in order of weight:
+
+1. **These bits are documented undefined, and that is categorically different from the NaN case.** §3.13 and
+   the FMA work replaced an emulator-derived rule with a measured one because NaN propagation is
+   *specified* — both vendors define it, so "hardware disagrees with us" meant we were simply wrong. Here
+   the SDM says undefined, which means **no implementation is obliged to match any other**. We have measured
+   exactly one CPU (Zen 4). Matching it would pin the engine to one vendor's unspecified behaviour, with no
+   way to test the other from this machine, and would trade a known divergence for an untestable one.
+2. **Both backends currently agree with each other.** That is worth more here than agreeing with one host:
+   the shared `struct cpu` is the checkpoint format and `ckpt-cross` restores an interpreter image on the
+   JIT and back. A change to one backend splits them; a change to both is a large edit for bits no
+   conforming guest may read.
+3. `tests/compat/completeness/x86_64/shflag.c` exists to test **flag-elision correctness** — that a dead
+   flag is not wrongly elided and a live one not wrongly kept — and its qemu-derived golden serves that
+   purpose regardless of what the undefined bits contain.
+
+**What would re-open it**, and the only thing that should: evidence that a *defined* flag is riding along
+on the qemu golden. §3.9's `isa-regress` episode is the precedent — a qemu-shaped golden did hide a real
+defect there. So the open follow-up is not "match hardware", it is **confirm the divergence set is confined
+to bits the SDM marks undefined**, one bit at a time, against native. If anything defined is in that set, it
+is a real bug and this ruling does not cover it.
+
 ## 4. Documentation that misleads
 
 These cost real time on this task and will cost it again.
