@@ -6,23 +6,62 @@ independently. Windows is the **host-OS** axis. The host-CPU axis (x86-64) was s
 `feat/amd64-linux-host`, which this branch is based on — without it there would be no way to execute
 either guest ISA here, because both production frontends emit ARM64 directly.
 
-Status: **design complete, implementation started.** Nothing executes a guest on Windows yet.
+**Status: a Linux guest runs on Windows, and 769 of 1,471 active x86-64 compatibility cases pass
+(52.3%), golden-compared.** No `excluded-windows` disposition has been used to reach that number —
+every remaining failure is a named defect, not a hidden one.
+
+```
+$ hl-engine-windows-x86_64.exe build-guest-fixtures/compat/isa/x86_64/hello_x86 | od -c
+0000000   h   i  \n        rc=42      (nolibc static)
+$ hl-engine-windows-x86_64.exe build-guest-fixtures/compat/isa/x86_64/gw
+glibc-min ok               rc=0       (dynamically linked glibc)
+```
+
+| | |
+| --- | --- |
+| Archives, runner, production engine | build and link |
+| Host services | `memory` `clock` `log` `sync` `file` `process` complete; `terminal` added, Windows arm pending |
+| Guest fixtures | 3,233 cross-built from WSL, digest-gated, reproducible |
+| CI | `Windows-x86_64` declared, `ctest -L unit` 6/6, `gate.windows-imports` live |
+| Rust crate | checks clean on all three targets; no Windows archive yet, so link-dependent tests are gated |
+| Linux and macOS | unregressed throughout — flag order byte-identical, compat suites 100% both columns |
+
+Largest remaining blocks, by cases unblocked: IPC 117 · sockets 76 · filesystem 68 · memfd and
+file-backed mmap 59 · guest `fork()` 56 · epoll/inotify/timerfd/pidfd wiring 51 · PTY and termios ~15.
 
 ## The documents
+
+These are working material for coordinating the port, not shipped documentation, and **code must
+never reference them**. Several record measurements that later work corrected; where they disagree
+with a commit message, the commit is newer.
 
 | Document | Owns |
 | --- | --- |
 | [`toolchain.md`](toolchain.md) | The verified build environment and the viability gate. **Measured.** |
+| [`linux-regression.md`](linux-regression.md) | How "Linux is unregressed" is proved, and the script that proves it |
 | [`build-system.md`](build-system.md) | CMake, milestones M0–M8, what compiles when |
 | [`host-services-map.md`](host-services-map.md) | Every callback of all 15 groups → Win32/NT |
 | [`fork-model.md`](fork-model.md) | The process model. **Measured** NT primitives |
-| [`signals-and-faults.md`](signals-and-faults.md) | POSIX signals → VEH, the `native_context.h` cells |
-| [`linux-abi-fd-lane.md`](linux-abi-fd-lane.md) | The boot blocker: 61 borrowed-fd sites |
+| [`experiment-rtlclone.md`](experiment-rtlclone.md) | `RtlCloneUserProcess` against the engine's real process shape |
+| [`signals-and-faults.md`](signals-and-faults.md) | POSIX signals → VEH; all four fault mechanisms measured |
+| [`linux-abi-fd-lane.md`](linux-abi-fd-lane.md) | The boot blocker, and why it was a gate rather than a dependency |
+| [`surface3-plan.md`](surface3-plan.md) | The ambient-fd surface: 127 fd-indexed tables, not a call count |
+| [`testing-and-ci.md`](testing-and-ci.md) | Lane staging, and the three ways this matrix could report green |
 | [`rust-crate.md`](rust-crate.md) | Crate build model, the MSVC-vs-GNU ABI question |
 | [`rust-unix-port.md`](rust-unix-port.md) | The crate's Unix-only source dependencies |
 | [`prior-art-cygwin-fork.md`](prior-art-cygwin-fork.md) | How Cygwin actually forks |
 | [`prior-art-cygwin-threads-signals.md`](prior-art-cygwin-threads-signals.md) | Cygwin threads, signals, `select` |
+| [`prior-art-flinux.md`](prior-art-flinux.md) | flinux's fork, and seven facts the fork model had not considered |
+| [`prior-art-flinux-memory.md`](prior-art-flinux-memory.md) | Their 64-KiB block design, and why placeholders beat it |
+| [`prior-art-flinux-fs.md`](prior-art-flinux-fs.md) | Their fd table over HANDLEs; the path traps, measured |
+| [`prior-art-flinux-dbt.md`](prior-art-flinux-dbt.md) | Their translator exists for one segment register |
+| [`flinux-tty.md`](flinux-tty.md) | The tty block: VT flags delete their emulator, ConPTY is the wrong tool |
+| [`flinux-sockets.md`](flinux-sockets.md) | Sockets over Winsock; identical constants are the danger |
+| [`flinux-syscalls.md`](flinux-syscalls.md) | The syscall residue, and the shortest path to a running guest |
 | [`prior-art-survey.md`](prior-art-survey.md) | WSL1, MSYS2, Interix, PostgreSQL, JIT-on-Windows, containers |
+
+**flinux is GPLv3 and this engine is MIT.** Those documents extract techniques and measurements;
+no flinux code has been copied, and none may be.
 
 ## 1. What is settled
 
