@@ -1080,7 +1080,17 @@ static int interp_exec_branch_system(struct cpu *cpu, uint32_t insn) {
     }
 
     // MSR (immediate): DAIF and the other PSTATE fields. Interrupt masking is meaningless at EL0.
+    // op1 == 000 is excluded: it is CFINV / XAFLAG / AXFLAG (FEAT_FlagM, FlagM2), which REWRITE NZCV, plus
+    // the EL1-only UAO/PAN/SPSel. Neither feature is advertised -- as with RMIF and SETF8/16 -- and running
+    // them as no-ops left the flags silently wrong.
     if ((insn & 0xFFF8F01Fu) == 0xD500401Fu) {
+        unsigned pstate_op1 = (insn >> 16) & 7u, pstate_op2 = (insn >> 5) & 7u;
+        // op1:op2 == 011:011 is SVCR -- SMSTART/SMSTOP: no-oping it tells a guest streaming mode is on while
+        // op0 == 0001 reports every SME instruction. Report, as the top-level decode already does.
+        if (pstate_op1 == 0 || (pstate_op1 == 3 && pstate_op2 == 3))
+            return interp_undefined(cpu, insn,
+                                    "system -- MSR (immediate) CFINV/XAFLAG/AXFLAG, SMSTART/SMSTOP, or an EL1 "
+                                    "PSTATE field");
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
     }
@@ -1268,6 +1278,12 @@ static int interp_advsimd_expand_imm(unsigned op, unsigned cmode, unsigned o2, u
         imm64 = 0;
         for (unsigned byte = 0; byte < 8u; byte++)
             if ((imm8 >> byte) & 1u) imm64 |= UINT64_C(0xFF) << (8u * byte);
+    } else if (!op && o2) { // half-precision float expansion, replicated (FMOV Vd.4H/8H, #imm)
+        uint32_t sign = (uint32_t)((imm8 >> 7) & 1), exponent = (uint32_t)((imm8 >> 4) & 7);
+        uint32_t fraction = (uint32_t)(imm8 & 0xFu);
+        uint32_t narrow = (sign << 15) | ((exponent & 4u) ? 0x3000u : 0x4000u) |
+                          ((exponent & 3u) << 10) | (fraction << 6);
+        imm64 = (uint64_t)narrow * UINT64_C(0x0001000100010001);
     } else if (!op) { // single-precision float expansion, replicated
         uint32_t sign = (uint32_t)((imm8 >> 7) & 1), exponent = (uint32_t)((imm8 >> 4) & 7);
         uint32_t fraction = (uint32_t)(imm8 & 0xFu);
@@ -1275,7 +1291,7 @@ static int interp_advsimd_expand_imm(unsigned op, unsigned cmode, unsigned o2, u
                           ((exponent & 3u) << 23) | (fraction << 19);
         imm64 = ((uint64_t)narrow << 32) | narrow;
     } else { // double-precision float expansion (Q must be 1)
-        if (!q) return 0;
+        if (!q || o2) return 0;
         uint64_t sign = (imm8 >> 7) & 1, exponent = (imm8 >> 4) & 7, fraction = imm8 & 0xFu;
         imm64 = (sign << 63) | ((exponent & 4u) ? UINT64_C(0x3FC0000000000000) : UINT64_C(0x4000000000000000)) |
                 (exponent & 3u) << 52 | (fraction << 48);
@@ -2244,11 +2260,15 @@ static uint64_t interp_fp_postprocess(unsigned fmt, uint64_t bits, unsigned rais
     if (cls >= INTERP_FPC_QNAN) {
         // No operand was a NaN, so this is an invalid operation and the host's NaN is not FPDefaultNaN.
         bits = interp_fp_default_nan(fmt);
-    } else if (cls == INTERP_FPC_DENORM) {
+        // A result the host already underflowed all the way to zero is just as tiny as a denormal one, and
+        // FZ reports it the same way; the host's Precision flag for it is not AArch64's.
+    } else if (cls == INTERP_FPC_DENORM || (cls == INTERP_FPC_ZERO && (raised & INTERP_FPSR_UFC))) {
         unsigned flush = fmt == INTERP_FP_H ? INTERP_FPCR_FZ16(g_interp_fpcr) : INTERP_FPCR_FZ(g_interp_fpcr);
         if (flush) {
             bits &= interp_fp_sign_mask(fmt);
-            raised |= INTERP_FPSR_UFC;
+            // Underflow ALONE: FPRoundBase returns the flushed zero before the Inexact test, so the host's
+            // IXC for the denormal it actually computed must not survive.
+            raised = (raised & ~(unsigned)INTERP_FPSR_IXC) | INTERP_FPSR_UFC;
         }
     }
     interp_fpsr_raise(raised);
@@ -2575,8 +2595,9 @@ static uint64_t interp_fp_int_saturate(unsigned sign, unsigned dest_bits, int is
 }
 
 // FP to a `dest_bits`-wide integer, keeping `fbits` fractional bits (a scale is only an exponent addend).
-// ORDER matters: round to an integer FIRST (Inexact), then range-check (Invalid + saturate) -- FCVTZU of
-// -0.5 is 0 with Inexact and no Invalid, -1.5 saturates with both, and a NaN becomes 0 before the check.
+// ORDER matters: round to an integer FIRST, then range-check -- FCVTZU of -0.5 is 0 with Inexact and no
+// Invalid, and a NaN becomes 0 before the check. The two exceptions are exclusive (FPToFixed's if/elsif):
+// -1.5 saturates with Invalid ALONE, Inexact suppressed.
 static uint64_t interp_fp_to_int(unsigned fmt, uint64_t bits, unsigned dest_bits, int is_signed, unsigned rmode,
                                 unsigned fbits) {
     bits = interp_fp_flush_input(bits, fmt);
@@ -2602,7 +2623,9 @@ static uint64_t interp_fp_to_int(unsigned fmt, uint64_t bits, unsigned dest_bits
     int inexact = 0, too_large = 0;
     if (exponent >= 0) {
         // Already an integer, so nothing is inexact -- but it may not fit 64 bits, let alone the destination.
-        too_large = exponent >= 64 || (significand >> (64 - (unsigned)exponent)) != 0;
+        // exponent == 0 must be spelled out: `significand >> 64` is masked to a no-op by the host and made
+        // every scaled conversion whose result lands exactly at 2^0 saturate.
+        too_large = exponent >= 64 || (exponent > 0 && (significand >> (64 - (unsigned)exponent)) != 0);
         if (!too_large) magnitude = significand << (unsigned)exponent;
     } else {
         unsigned shift = (unsigned)(-exponent);
@@ -2618,7 +2641,7 @@ static uint64_t interp_fp_to_int(unsigned fmt, uint64_t bits, unsigned dest_bits
         inexact = round_bit | sticky;
         if (interp_fp_round_away(rmode, sign, round_bit, sticky, (unsigned)(magnitude & 1u))) magnitude++;
     }
-    if (inexact) interp_fpsr_raise(INTERP_FPSR_IXC);
+    // FPToFixed's exceptions are an if/elsif: a conversion that saturates raises Invalid and NOT Inexact.
     if (too_large) {
         interp_fpsr_raise(INTERP_FPSR_IOC);
         return interp_fp_int_saturate(sign, dest_bits, is_signed);
@@ -2632,6 +2655,7 @@ static uint64_t interp_fp_to_int(unsigned fmt, uint64_t bits, unsigned dest_bits
             interp_fpsr_raise(INTERP_FPSR_IOC);
             return interp_fp_int_saturate(0, dest_bits, 0);
         }
+        if (inexact) interp_fpsr_raise(INTERP_FPSR_IXC);
         return sign ? UINT64_C(0) : magnitude;
     }
     uint64_t limit = UINT64_C(1) << (dest_bits - 1u);
@@ -2640,12 +2664,14 @@ static uint64_t interp_fp_to_int(unsigned fmt, uint64_t bits, unsigned dest_bits
             interp_fpsr_raise(INTERP_FPSR_IOC);
             return interp_fp_int_saturate(1, dest_bits, 1);
         }
+        if (inexact) interp_fpsr_raise(INTERP_FPSR_IXC);
         return UINT64_C(0) - magnitude;
     }
     if (magnitude >= limit) {
         interp_fpsr_raise(INTERP_FPSR_IOC);
         return interp_fp_int_saturate(0, dest_bits, 1);
     }
+    if (inexact) interp_fpsr_raise(INTERP_FPSR_IXC);
     return magnitude;
 }
 
@@ -2653,12 +2679,17 @@ static uint64_t interp_fp_from_int(unsigned fmt, uint64_t value, unsigned source
                                   unsigned fbits) {
     unsigned sign = 0;
     uint64_t magnitude;
+    // Any width, not just 32: a 16-bit source (SCVTF Vd.8H, Vn.8H, #fbits) arrives zero-extended, and
+    // testing only for 32 made every negative half-width input convert as if it were unsigned.
+    uint64_t width_mask = source_bits >= 64 ? UINT64_MAX : ((UINT64_C(1) << source_bits) - 1u);
+    value &= width_mask;
     if (is_signed) {
-        int64_t signed_value = source_bits == 32 ? (int64_t)(int32_t)(uint32_t)value : (int64_t)value;
+        uint64_t sign_bit = UINT64_C(1) << (source_bits - 1u);
+        int64_t signed_value = (int64_t)((value ^ sign_bit) - sign_bit);
         sign = signed_value < 0;
         magnitude = sign ? (UINT64_C(0) - (uint64_t)signed_value) : (uint64_t)signed_value;
     } else {
-        magnitude = source_bits == 32 ? (uint64_t)(uint32_t)value : value;
+        magnitude = value;
     }
     // Two statements: as two arguments of one call, `raised` may be read before the pack that fills it.
     unsigned raised = 0;
@@ -3431,7 +3462,9 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
     }
 
     // AdvSIMD copy: DUP, INS, SMOV, UMOV
-    if ((decode & 0x9F208400u) == 0x0E000400u) {
+    // bits[23:21] must ALL be 000: leaving 23:22 unconstrained swallowed the whole three-same-FP16 box
+    // below, which shares bit21 == 0 and bit10 == 1, and ran it as INS/DUP with imm5 = Rm.
+    if ((decode & 0x9FE08400u) == 0x0E000400u) {
         unsigned op = (insn >> 29) & 1, imm4 = (insn >> 11) & 0xFu, imm5 = (insn >> 16) & 0x1Fu;
         unsigned size, index;
         if (op) { // INS (element)
@@ -3454,7 +3487,9 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             interp_vec source = interp_vec_read(cpu, rn), result;
             uint64_t element = interp_vec_element(&source, size, index);
             memset(result.byte, 0, sizeof result.byte);
-            for (unsigned lane = 0; lane < interp_vec_lanes(size, q); lane++)
+            // The scalar spelling (MOV Bd/Hd/Sd/Dd, Vn.T[index]) writes ONE element and zeroes the rest;
+            // only the D form coincides with filling the 64-bit half.
+            for (unsigned lane = 0; lane < (scalar ? 1u : interp_vec_lanes(size, q)); lane++)
                 interp_vec_set_element(&result, size, lane, element);
             interp_vec_write(cpu, rd, result, q);
             break;
@@ -3507,8 +3542,9 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         uint64_t pattern;
         if (!interp_advsimd_expand_imm(op, cmode, o2, q, imm8, &pattern))
             return interp_undefined(cpu, insn, "AdvSIMD modified immediate -- reserved cmode");
-        // cmode<0> == 1 with cmode<3:1> != 111 selects ORR/BIC; `op` picks which.
-        int read_modify = (cmode & 1u) && ((cmode >> 1) & 7u) != 7u;
+        // ORR/BIC is cmode 0xx1 and 10x1 only: cmode<0> == 1 with cmode<3:2> != 11. Testing cmode<3:1>
+        // instead let 1101 -- MOVI/MVNI with MSL #16 -- read-modify the destination instead of replacing it.
+        int read_modify = (cmode & 1u) && ((cmode >> 2) & 3u) != 3u;
         interp_vec result = interp_vec_read(cpu, rd);
         uint64_t low, high;
         memcpy(&low, result.byte, 8);
@@ -3589,14 +3625,21 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             for (unsigned lane = 0; lane < (scalar ? 1u : narrow_lanes); lane++) {
                 uint64_t element = interp_vec_element(&source, size + 1u, lane) & wide_mask;
                 uint64_t shifted;
+                // The rounding constant can carry out of the wide element (0xFFFF..FF + half at a 64-bit
+                // source), so add in 128 bits and clamp: a carry-out is always a saturation, and letting it
+                // wrap gave 0 with QC CLEAR where the answer is the maximum with QC SET.
                 if (saturating && source_signed) {
                     // Shift the SIGN-EXTENDED value so saturation sees the true magnitude.
-                    int64_t wide = (int64_t)interp_element_sext(element, size + 1u);
-                    if (rounding && shift > 0) wide += (int64_t)(UINT64_C(1) << (shift - 1u));
-                    shifted = (uint64_t)(wide >> shift) & wide_mask;
+                    __int128 wide = (__int128)(int64_t)interp_element_sext(element, size + 1u);
+                    if (rounding && shift > 0) wide += (__int128)1 << (shift - 1u);
+                    __int128 value = wide >> shift;
+                    __int128 wide_max = (__int128)(wide_mask >> 1);
+                    shifted = (uint64_t)(value > wide_max ? wide_max : value) & wide_mask;
                 } else {
-                    if (rounding && shift > 0) element = (element + (UINT64_C(1) << (shift - 1u))) & wide_mask;
-                    shifted = (element >> shift) & wide_mask;
+                    unsigned __int128 wide = element;
+                    if (rounding && shift > 0) wide += (unsigned __int128)1 << (shift - 1u);
+                    unsigned __int128 value = wide >> shift;
+                    shifted = value > (unsigned __int128)wide_mask ? wide_mask : (uint64_t)value;
                 }
                 interp_vec_set_element(&packed, size, lane,
                                       saturating ? interp_sat_narrow(shifted, size, source_signed, dest_signed)
@@ -3945,7 +3988,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                     if (opcode == 0x0Fu) {
                         value = u ? (a ^ interp_fp_sign_mask(fmt)) : (a & ~interp_fp_sign_mask(fmt));
                     } else {
-                        interp_fp_compare(cpu, fmt, a, 0, 0);
+                        // Only FCMEQ is FPCompareEQ; FPCompareGE/GT/LE/LT raise Invalid for a QUIET NaN too.
+                        interp_fp_compare(cpu, fmt, a, 0, !(opcode == 0x0Du && !u));
                         int ordered = !(interp_flag_c(cpu) && interp_flag_v(cpu));
                         int zero = interp_flag_z(cpu) != 0, negative = interp_flag_n(cpu) != 0;
                         int holds;
@@ -3989,8 +4033,13 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                         value = interp_fp_from_int(fmt, a, interp_fp_width(fmt), !u, INTERP_FPCR_RMODE(g_interp_fpcr),
                                                   0);
                         break;
-                    case 0x1F: // FSQRT (U == 1)
-                        if (!u) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated opcode 11111");
+                    case 0x1F: // FSQRT (U == 1, bit23 set)
+                        // bit23 clear is FRINT64Z/FRINT64X (FEAT_FRINTTS), which shares this opcode and was
+                        // being executed as FSQRT.
+                        if (!u || !high)
+                            return interp_undefined(cpu, insn,
+                                                    "AdvSIMD two-reg misc -- FRINT32Z/FRINT64Z/FRINT32X/FRINT64X "
+                                                    "or unallocated opcode 11111");
                         value = interp_fp_sqrt(fmt, a);
                         break;
                     default: return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unimplemented FP opcode");
@@ -4026,9 +4075,36 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             cpu->pc = gpc + 4;
             return INTERP_NEXT;
         }
-        case 0x03:
-            // SUQADD/USQADD: mixed-signedness saturation matches neither SQADD nor UQADD.
-            return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- SUQADD/USQADD");
+        case 0x03: {
+            // SUQADD / USQADD: the accumulator in Vd and the operand in Vn have OPPOSITE signedness and the
+            // saturation follows the accumulator's, so neither SQADD nor UQADD applies. 128-bit intermediate
+            // because a 64-bit element's sum does not fit either operand type.
+            interp_vec accumulate = interp_vec_read(cpu, rd);
+            unsigned esize = 8u << size, misc_lanes = scalar ? 1u : interp_vec_lanes(size, q);
+            uint64_t emask = interp_element_mask(size);
+            for (unsigned lane = 0; lane < misc_lanes; lane++) {
+                uint64_t a = interp_vec_element(&source, size, lane) & emask;
+                uint64_t d = interp_vec_element(&accumulate, size, lane) & emask;
+                __int128 total, low, high;
+                if (!u) { // SUQADD: signed accumulator + unsigned operand
+                    total = (__int128)(int64_t)interp_element_sext(d, size) + (__int128)a;
+                    high = ((__int128)1 << (esize - 1u)) - 1;
+                    low = -((__int128)1 << (esize - 1u));
+                } else { // USQADD: unsigned accumulator + signed operand
+                    total = (__int128)d + (__int128)(int64_t)interp_element_sext(a, size);
+                    high = ((__int128)1 << esize) - 1;
+                    low = 0;
+                }
+                if (total > high || total < low) {
+                    interp_fpsr_raise(INTERP_FPSR_QC);
+                    total = total > high ? high : low;
+                }
+                interp_vec_set_element(&result, size, lane, (uint64_t)total & emask);
+            }
+            interp_vec_write(cpu, rd, result, q);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
+        }
         case 0x04: { // CLS (U=0) / CLZ (U=1)
             if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated CLS/CLZ size");
             unsigned esize = 8u << size, lanes = scalar ? 1u : interp_vec_lanes(size, q);
@@ -4044,7 +4120,11 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                     count = a == 0 ? esize : (unsigned)(esize - 1u - (unsigned)(63 - __builtin_clzll(a)));
                 interp_vec_set_element(&result, size, lane, count);
             }
-            break;
+            // Must return here, not `break`: this switch's break falls into the NEXT switch, whose default
+            // reports -- CLS/CLZ and SQABS/SQNEG were computed and then thrown away as unimplemented.
+            interp_vec_write(cpu, rd, result, q);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
         }
         case 0x07: { // SQABS (U=0) / SQNEG (U=1)
             unsigned lanes = scalar ? 1u : interp_vec_lanes(size, q);
@@ -4059,7 +4139,9 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                     value = interp_sqadd_element(0, a, size, 1);
                 interp_vec_set_element(&result, size, lane, value);
             }
-            break;
+            interp_vec_write(cpu, rd, result, q);
+            cpu->pc = gpc + 4;
+            return INTERP_NEXT;
         }
         case 0x12:   // XTN (U=0) / SQXTUN (U=1)
         case 0x14: { // SQXTN (U=0) / UQXTN (U=1)
@@ -4295,9 +4377,12 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
-    // AdvSIMD three same
-    if ((decode & 0x9F200400u) == 0x0E200400u) {
-        unsigned size = (insn >> 22) & 3u, opcode = (insn >> 11) & 0x1Fu;
+    // AdvSIMD three same, and the separate three-same-FP16 box (bit22 set, bit21 clear, bits[15:14] 00)
+    // that spells the same FP operations at half precision with a 3-bit opcode under an implied 11.
+    unsigned fp16_three_same = (decode & 0x9F60C400u) == 0x0E400400u;
+    if (fp16_three_same || (decode & 0x9F200400u) == 0x0E200400u) {
+        unsigned size = (insn >> 22) & 3u;
+        unsigned opcode = fp16_three_same ? (0x18u | ((insn >> 11) & 7u)) : ((insn >> 11) & 0x1Fu);
         interp_vec left = interp_vec_read(cpu, rn), right = interp_vec_read(cpu, rm), result;
         memset(result.byte, 0, sizeof result.byte);
         unsigned bytes = q ? 16u : 8u;
@@ -4306,7 +4391,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
 
         // FP members (opcode >= 11000): bit23 the operation, bit22 `sz`
         if (opcode >= 0x18) {
-            unsigned fmt = (size & 1u) ? INTERP_FP_D : INTERP_FP_S, high = (size >> 1) & 1u;
+            unsigned fmt = fp16_three_same ? INTERP_FP_H : ((size & 1u) ? INTERP_FP_D : INTERP_FP_S);
+            unsigned high = (size >> 1) & 1u;
             if (fmt == INTERP_FP_D && !q && !scalar)
                 return interp_undefined(cpu, insn, "AdvSIMD three same -- 2D form requires Q");
             unsigned fp_lanes = scalar ? 1u : interp_vec_lanes(fmt + 1u, q);
@@ -4376,7 +4462,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                             x &= ~sign;
                             y &= ~sign;
                         }
-                        interp_fp_compare(cpu, fmt, x, y, 0);
+                        // FPCompareGE/GT raise Invalid for a QUIET NaN too, unlike FPCompareEQ above.
+                        interp_fp_compare(cpu, fmt, x, y, 1);
                         // "ge" is C set minus unordered; "gt" adds Z clear.
                         int ordered = !(interp_flag_c(cpu) && interp_flag_v(cpu));
                         int holds = ordered && interp_flag_c(cpu) && (!high || !interp_flag_z(cpu));
@@ -4485,7 +4572,11 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                         value = shift >= esize ? 0 : (a << shift) & mask;
                     } else if (u) {
                         uint64_t saturated = (a & mask);
-                        if (shift >= esize ? saturated != 0 : (saturated >> (esize - shift)) != 0) {
+                        // shift == 0 must be spelled out: at esize 64 the else arm shifts by 64, which the
+                        // host masks to 0 and so saturates every nonzero input on a no-op shift.
+                        int overflow = shift != 0 &&
+                                       (shift >= esize ? saturated != 0 : (saturated >> (esize - shift)) != 0);
+                        if (overflow) {
                             interp_fpsr_raise(INTERP_FPSR_QC);
                             value = mask;
                         } else {
