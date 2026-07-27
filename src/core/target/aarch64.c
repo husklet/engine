@@ -1147,44 +1147,9 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
 }
 
 // resident engine fork server (server/client/worker), shared with the x86-64 target through the
-// container-init/engine-init/load/run seam above. aarch64 has no
-// g_loadbase and its container model never chdir()s the engine into the rootfs (those knobs stay
-// default no-ops), but its load_elf applies per-segment W^X to the guest image (.text R+X, .rodata R;
-// the prewarm run's guest may mprotect more, e.g. musl RELRO) -- so the fork-server's pristine-image
-// restore must open the span RW and re-apply the PRISTINE load-time protections afterwards, mirroring
-// load_elf's p_flags loop. Without this the first restore memcpy SIGBUSes on the R+X .text.
-static void fsrv_restore_prep_a64(const struct loaded *L, uint64_t span) {
-    mprotect((void *)L->base, span, PROT_READ | PROT_WRITE);
-}
-
-static void fsrv_restore_done_a64(const struct loaded *L, uint64_t span) {
-    (void)span;
-    size_t host_page = hl_host_page_size();
-    const uint8_t *ph = (const uint8_t *)L->phdr;
-    uint64_t minv = ~0ull;
-    for (int i = 0; i < L->phnum; i++) {
-        const uint8_t *p = ph + (size_t)i * (size_t)L->phent;
-        if (rd32(p) != 1) continue; // PT_LOAD
-        uint64_t v = rd64(p + 16);
-        if (v < minv) minv = v;
-    }
-    uint64_t bias = L->base - (minv & ~0xFFFull); // load_elf: bias = host base - link basepage
-    for (int i = 0; i < L->phnum; i++) {
-        const uint8_t *p = ph + (size_t)i * (size_t)L->phent;
-        if (rd32(p) != 1) continue;
-        uint32_t fl = rd32(p + 4); // PF_X=1, PF_W=2, PF_R=4
-        uint64_t v = rd64(p + 16), msz = rd64(p + 40);
-        uint64_t s = (v + bias) & ~0xFFFull, e = (v + bias + msz + 0xFFFull) & ~0xFFFull;
-        int prot = PROT_READ | ((fl & 2) ? PROT_WRITE : 0) | ((fl & 1) ? PROT_EXEC : 0);
-        // Reapply only protections that do not round across a neighboring guest segment on a larger
-        // macOS page. load_elf uses the same independently-protectable-range rule.
-        if (e > s && host_page && !(s & (host_page - 1)) && !(e & (host_page - 1)))
-            mprotect((void *)s, e - s, prot);
-    }
-}
-
-#define FSRV_RESTORE_PREP(L, span) fsrv_restore_prep_a64((L), (span))
-#define FSRV_RESTORE_DONE(L, span) fsrv_restore_done_a64((L), (span))
+// container-init/engine-init/load/run seam above. aarch64 has no g_loadbase and its container model never
+// chdir()s the engine into the rootfs, so those knobs stay default no-ops; the pristine-image restore
+// around the guest image's W^X is now the shared default too (fork.c, fsrv_restore_prep/done).
 // Bind the same per-guest host-service tables a cold hl_run_linux_guest() would, so the fork-server prewarm
 // parent (which runs guests via run_loaded()) allocates them once and every warm COW worker inherits them.
 #define FSRV_GUEST_HOST_INIT()                                                                                          \

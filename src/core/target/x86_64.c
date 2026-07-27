@@ -551,6 +551,14 @@ static int soft_tlb_miss(struct cpu *c) {
             c->fault_addr = address;
             return raise_guest_data_map_fault(c);
         }
+        /* The string-op helper rejects a store into a read-only mapping itself (it copies with the host
+           memcpy, several C frames below translated code, where a hardware fault is unattributable) and
+           lands here.  Answering "writable" would re-run the same rejected element forever, so this is
+           where a bulk store learns the same answer the MMU gives a scalar one: mapped, not writable. */
+        if ((required & HL_LOGICAL_VMA_WRITE) && gro_hit(address, width)) {
+            c->fault_addr = address;
+            return raise_guest_fetch_fault(c);
+        }
         uint64_t end = address + width;
         uint64_t last = (address & ~UINT64_C(4095)) + UINT64_C(4096);
         if (end > last) last = end;

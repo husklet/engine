@@ -25,6 +25,7 @@ static void *elf_host_map(void *context, void *address, size_t length, uint32_t 
 
 #include "../host/range.h"
 #include "page.h"
+#include "elf_protect.h" // the loader's protection contract, shared with linux_abi/elf.c
 #include "image.h"
 #include "../translator/guest/x86_64/cpuid.h" // AT_HWCAP derives from the guest CPUID model, not the host
 
@@ -403,18 +404,6 @@ static void load_elf(const char *path, struct loaded *out) {
         if (rd32(ph) != 1) continue;
         uint64_t off = rd64(ph + 8), v = rd64(ph + 16), fsz = rd64(ph + 32);
         memcpy((void *)(v + bias), f + off, fsz);
-        uint64_t msz = rd64(ph + 40);
-        uint64_t lo = (v + bias) & ~0xfffull;
-        uint64_t hi = (v + bias + msz + 0xfffull) & ~0xfffull;
-        if (hi > lo) {
-            // GUEST coordinates, not the storage address the bytes were copied to: thread.c's rule. The
-            // loader keyed these folded while mprotect keys them unfolded, so the two never met.
-            uint64_t glo = nonpie_unfold(lo), ghi = nonpie_unfold(hi - 1) + 1;
-            if (rd32(ph + 4) & 2)
-                gro_clear(glo, ghi);
-            else
-                gro_add(glo, ghi);
-        }
     }
     // W6A item 1: for a biased non-PIE Go image, rebase firstmoduledata so the runtime's findfunc()
     // resolves the biased code PCs (otherwise runtime.pcdatavalue nil-derefs). Gated on g_nonpie_lo
@@ -479,9 +468,10 @@ static void load_elf(const char *path, struct loaded *out) {
             }
         }
     }
-    (void)effective_host_services()->memory->protect(effective_host_services()->context, map_context.mapping.handle, 0,
-                                                     span, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE |
-                                                               HL_HOST_MEMORY_EXECUTE);
+    // Per-segment W^X + read-only registry, once the rebases above have finished writing into the image.
+    // This used to force the whole span R|W|X while registering the read-only segments anyway, so a store
+    // into .rodata found a physically writable page and was silently kept -- elf_protect.h, the contract.
+    hl_elf_protect_segments(&map_context.mapping, f + phoff, phnum, phentsize, bias);
     // A dynamic ET_EXEC remains a LOW-address Linux object even though macOS forces its storage HIGH.
     // ld.so derives the main link_map bias and lookup range from AT_ENTRY/AT_PHDR; publishing host-biased
     // values makes dladdr/dlsym miss every LOW function pointer. The dispatcher already translates LOW

@@ -1,6 +1,7 @@
 // hl/linux_abi -- the ELF loader (map PT_LOAD high; static-PIE + dynamic via ld.so; build stack).
 
 #include "page.h"
+#include "elf_protect.h" // the loader's protection contract, shared with linux_abi/x86.c
 #include "image.h"
 #include "goimage.h"
 
@@ -721,10 +722,10 @@ static hl_host_memory_mapping elf_map_checked(void *hint, size_t len, uint32_t p
     }
 }
 
-// Narrow a segment's protection (W^X hardening) -- BEST-EFFORT, never fatal. The image is already fully
-// mapped R+W by the base reservation, and this JIT only READS guest code to translate it (it never
-// executes guest pages directly), so a segment left un-narrowed stays readable+writable = still fully
-// backed, never a hole. Two failures are expected and benign: EINVAL (segment bounds round to 4 KB but
+// Narrow a mapped range's protection -- BEST-EFFORT, never fatal. Used for the stack guard gap; the image
+// segments go through hl_elf_protect_segments, which owes the read-only registry the same answer. A range
+// left un-narrowed stays readable+writable = still fully backed, never a hole. Two failures are expected
+// and benign: EINVAL (segment bounds round to 4 KB but
 // Apple-Silicon mprotect needs 16 KB-aligned ranges, so adjacent segments share a host page) and, under
 // memory pressure, ENOMEM (XNU cannot allocate a vm_map_entry to split the span). Retry only the
 // transient ENOMEM a few times so the tightening still applies once pressure clears; give up quietly on
@@ -844,28 +845,8 @@ static void load_elf(const char *path, struct loaded *out) {
         uint64_t off = rd64(ph + 8), v = rd64(ph + 16), fsz = rd64(ph + 32);
         memcpy((void *)(v + bias), f + off, fsz);
     }
-    // per-segment W^X from p_flags: .text R+X, .rodata R, .data R+W
-    for (int i = 0; i < phnum; i++) {
-        uint8_t *ph = f + phoff + (uint64_t)i * phentsize;
-        if (rd32(ph) != 1) continue;
-        // PF_X=1, PF_W=2, PF_R=4
-        uint32_t fl = rd32(ph + 4);
-        uint64_t v = rd64(ph + 16), msz = rd64(ph + 40);
-        uint64_t s = (v + bias) & ~0xFFFull, e = (v + bias + msz + 0xFFFull) & ~0xFFFull;
-        uint32_t protection = HL_HOST_MEMORY_READ | ((fl & 2) ? HL_HOST_MEMORY_WRITE : 0) |
-                              ((fl & 1) ? HL_HOST_MEMORY_EXECUTE : 0);
-        if (e > s) {
-            elf_mprotect_besteffort(&image_mapping, (void *)s, e - s, protection, "image segment");
-            // The host mprotect above takes the STORAGE address; the read-only registry takes the GUEST
-            // one (thread.c's coordinate rule), which for a non-PIE is the low link vaddr. Registering it
-            // folded put the loader and the guest's own RELRO mprotect in two different coordinate systems.
-            uint64_t gs = nonpie_unfold(s), ge = nonpie_unfold(e - 1) + 1;
-            if (fl & 2)
-                gro_clear(gs, ge);
-            else
-                gro_add(gs, ge);
-        }
-    }
+    // per-segment W^X from p_flags: .text R+X, .rodata R, .data R+W -- elf_protect.h, the contract.
+    hl_elf_protect_segments(&image_mapping, f + phoff, phnum, phentsize, bias);
     // for a non-PIE ET_EXEC the engine maps the image HIGH (+bias) but keeps every GUEST-VISIBLE
     // address at its LOW link value (baked absolute pointers, un-biased `bl` return vaddrs, the dispatcher
     // re-biases only at execution). The auxv AT_ENTRY/AT_PHDR must therefore ALSO be LOW: glibc derives the
