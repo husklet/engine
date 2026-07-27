@@ -65,16 +65,25 @@ alternative shapes are a guess:
   there in the same TU and could step the one instruction at `+bias`), but it turns an unknown fraction of
   data accesses into signal round-trips, and "unknown fraction" is not a performance model.
 
-**What that costs:** 1285 of the 1536 x86-64 compat fixtures are non-PIE `ET_EXEC`, including 7 of the 8
-`compat.isa-x86-64` cases. They run on the interpreter, byte-identically to today. `compat.core-abi` is
-34/34 static-PIE and is fully transliterated.
+**What that cost, and why it no longer does.** The refusal above is still the right shape for a *folded*
+image, but on Linux there are none. The bias existed only because macOS `__PAGEZERO` reserves the low 4 GB;
+the loaders now place a non-PIE `ET_EXEC` at its own link address on Linux (`MAP_FIXED_NOREPLACE`, see
+`linux_abi/thread.c` "non-PIE image placement, per host"), so `g_nonpie_lo` stays 0 and every image is
+admitted. That took the previously-refused **1292 of 1542** x86-64 fixtures — including 7 of the 8
+`compat.isa-x86-64` cases — from 0 % host blocks to the rates below. A macOS host, and a Linux host
+restoring a checkpoint captured folded, still take the refusal.
 
-**What would lift it:** on Linux the bias is not needed at all. It exists because macOS `__PAGEZERO` reserves
-the low 4 GB (`linux_abi/x86.c` load_elf, the `etype == 2` arm), and the Linux loader still takes the
-kernel-chosen-base branch. Placing a non-PIE `ET_EXEC` at its own link address on Linux would set
-`g_nonpie_bias = 0`, admit those 1285 fixtures to this backend, and retire the whole defect family at the
-source. That is a change in `src/linux_abi/x86.c`, outside this work's scope, and it changes the interpreter
-lane too — so it is a proposal, not a fix.
+| previously-refused case | interpreter | transliterator | vs interp | host blocks |
+|---|---|---|---|---|
+| `busyloop` rebuilt `-static -no-pie` | 132.5 s | **13.6 s** | **9.7x** | 100.0 % |
+| `isa/x86_64/go_goro_x86` | 29.9 s | **1.3 s** | **23.2x** | 99.8 % |
+| `isa/x86_64/go_heapgc_x86` | 31.9 s | **4.8 s** | **6.7x** | 91.1 % |
+| `isa/x86_64/isa_regress` | 0.45 s | 0.17 s | 2.6x | 83.7 % |
+| `core/regress/nonpie_vec` | 0.02 s | 0.02 s | — | 91.2 % |
+
+USER+SYS CPU, `taskset` to one core, on a box running three other agents — so the ratios are conservative
+and not comparable to §6's quiet-box figures. Output is byte-identical with the switch off and on in every
+row.
 
 ## 3. What transliterates
 

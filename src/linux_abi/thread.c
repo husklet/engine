@@ -330,11 +330,47 @@ static inline struct futex_bucket *fbk_of(const void *uaddr) {
 // PROF: fast (no-lock) wakes, slow (locked) wakes, eagain pre-checks
 static uint64_t g_futex_wake_fast, g_futex_wake_slow, g_futex_wait_n;
 
+// ===================== non-PIE image placement, per host ========================================
+// Where a non-PIE ET_EXEC is mapped is a HOST property. It is the entire reason the next block exists,
+// and the reason the next block is dormant here.
+//   Linux: nothing owns the low 4 GB (vm.mmap_min_addr is 64 KiB, the link vaddr is 0x400000 for both
+//     guest ISAs, and the engine itself is PIE at ET_DYN_BASE), so the loader maps the image AT its link
+//     address. base == basepage, so the bias is 0, g_nonpie_lo stays 0, and one image byte has ONE name.
+//     Every fold below and every workaround built on it is then inert BY CONSTRUCTION, not by care.
+//   macOS: __PAGEZERO reserves the low 4 GB and no MAP_FIXED can get in, so the image must go HIGH and
+//     the two coordinate systems of the next block are unavoidable.
+// The machinery stays compiled in on both hosts: a checkpoint image records g_nonpie_lo/hi/bias and a
+// restore replays the placement its capture used, so a Linux engine must still be able to run folded.
+#if defined(__linux__)
+#define HL_NONPIE_LINK_PLACEMENT 1 // loaders (linux_abi/x86.c, linux_abi/elf.c) place ET_EXEC at p_vaddr
+#else
+#define HL_NONPIE_LINK_PLACEMENT 0
+#endif
+
+// Reserve [basepage, basepage+span) EXACTLY, or report failure by returning 0 with *mapping untouched.
+// MAP_FIXED_NOREPLACE, never MAP_FIXED: if anything already owns the link range -- a host below
+// vm.mmap_min_addr, an execve whose predecessor image has not been released, a kernel too old to honour
+// NOREPLACE -- the caller falls back to the biased placement rather than clobbering a live mapping.
+static uint64_t nonpie_place_at_link_address(uint64_t basepage, uint64_t span, hl_host_memory_mapping *mapping) {
+    if (!HL_NONPIE_LINK_PLACEMENT || basepage == 0 || span == 0) return 0;
+    const hl_host_services *host = effective_host_services();
+    hl_host_memory_mapping placed = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(placed), 0, 0, 0, 0};
+    hl_host_result result =
+        host->memory->map_anonymous(host->context, basepage, span, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                    HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED_NOREPLACE, &placed);
+    if (result.status != HL_STATUS_OK) return 0;
+    if (placed.address != basepage) { // pre-4.17 kernel: NOREPLACE degraded to a hint
+        (void)host->memory->release(host->context, placed.handle);
+        return 0;
+    }
+    *mapping = placed;
+    return basepage;
+}
+
 // ===================== non-PIE coordinates: the one rule ========================================
-// A non-PIE ET_EXEC is mapped HIGH at +g_nonpie_bias (macOS __PAGEZERO forbids the low 4 GB; the
-// checkpoint arena wants a deterministic slot), but it carries no dynamic relocations, so every
-// address BAKED INTO IT stays at the LOW link vaddr. One image byte therefore has two names, and
-// which one is correct is not a judgement call:
+// When the image IS folded (macOS, or a restored image captured folded) it is mapped HIGH at
+// +g_nonpie_bias but carries no dynamic relocations, so every address BAKED INTO IT stays at the LOW
+// link vaddr. One image byte therefore has two names, and which one is correct is not a judgement call:
 //
 //   GUEST (low) is canonical. Anything the guest can name, is handed, or asks about -- a baked
 //   pointer, a syscall argument, AT_PHDR/AT_ENTRY, a sigaltstack ss_sp, a /proc/self/maps row, a

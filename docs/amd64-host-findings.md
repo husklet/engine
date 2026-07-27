@@ -364,7 +364,11 @@ Two failures are **environmental, not engine defects**, and are now documented i
   underneath and is not fixed: at nice 12 the engine prints `set=1` where native prints `set=0`, i.e.
   `setpriority` reports success where the kernel returns `EACCES`. Host-neutral, invisible at nice 0.
 - `syscall/memfd-seals` needs `HL_MATRIX_SCRATCH_DIR` on tmpfs, which only the workflow sets. Re-verified
-  both ways.
+  both ways. **`core-syscall/fallocate` is the same shape and points the other way**: with
+  `HL_MATRIX_SCRATCH_DIR` on tmpfs its `FALLOC_FL_ZERO_RANGE` leg returns `zero_rc=-1` (deterministic, 3/3,
+  identically on two engine builds), while with the default scratch dir the suite is 57/57 + 56/56. So the
+  variable is the scratch filesystem, not the engine — and no single `HL_MATRIX_SCRATCH_DIR` makes both
+  `memfd-seals` and `fallocate` green.
 
 ### 3.13 The feature-advertisement contradiction, and how I mis-stated it
 
@@ -517,8 +521,9 @@ is a real bug and this ruling does not cover it.
 
 ### 3.18 The non-PIE bias family, retired at the source
 
-§3.11, §3.12 (entries 2 and 3), §3.16 and the two instances `45542ced` found are **eight symptoms of one
-line of loader code**, and that line was never required on this host.
+§3.11, §3.12 (entries 2 and 3), §3.16, the two instances `45542ced` found and `select(23)`'s unfolded
+`timeval` in `5ea4ad46` are **nine symptoms of one line of loader code**, and that line was never required
+on this host.
 
 **Why the bias existed.** One reason, and it is a macOS reason: `__PAGEZERO` reserves the low 4 GB of a
 Darwin process, so an `ET_EXEC` linked at `0x400000` cannot be mapped where it says it belongs and the
@@ -541,7 +546,11 @@ falls back to the biased placement and the machinery behaves exactly as it does 
 **The machinery stays compiled in, on purpose.** `ckpt_meta` records `nonpie_lo/hi/bias` and restore replays
 the mappings the capture wrote, so a checkpoint captured folded restores folded on a Linux engine and needs
 no format version bump in either direction. Making the fold a compile-time no-op on Linux would silently
-mis-restore those images.
+mis-restore those images. The same answers "is `45542ced`'s guest-coordinate normalisation now dead?" — no:
+`gna_hit`/`gro_hit`'s `nonpie_unfold` and `5ea4ad46`'s `nonpie_rebase_args` table still *run*, they just
+compute the identity when `g_nonpie_lo` is 0, which is the degenerate case of the same single rule rather
+than a second rule. They are trivially correct here and load-bearing on macOS and on a folded restore.
+Delete nothing.
 
 **What it bought.** The Stage-2 transliterator refuses `g_nonpie_lo != 0` outright; it now accepts 1292 of
 1542 x86-64 fixtures that were previously declined at every block — a `-static -no-pie` `busyloop` goes from
@@ -549,10 +558,26 @@ mis-restore those images.
 the same change removes `emit_bias`'s runtime compare-and-branch from every memory access of a non-PIE
 guest; that host is not measurable from here.
 
+**One defect found while measuring it, and it is not this one.** `posix/pthspin` — four threads, 100 000
+`pthread_spin_lock`-protected `counter++` each — **loses updates on the aarch64 guest**: `total_ok=0`,
+5/40 runs on a loaded box and 3/40 on a quiet one. It reproduces identically on a HEAD-clean engine
+(35/40 vs 37/40 with the placement change, i.e. the change if anything helps), the x86-64 guest is 25/25,
+and native is 25/25. So it is a **pre-existing aarch64-guest atomics or ordering defect**, load-dependent,
+in the interpreter lane on this host. It is not in §3.12's residue because the survey that produced 99.34 %
+happened to catch a passing run.
+
 **What it did not buy, and this is the point.** No golden moved. Not one compat golden encodes a guest image
 address, because guest-visible addresses were always the LOW link values — that *is* the coordinate rule of
-§3.11. The change moves storage, and storage was never observable. A family that produced eight
+§3.11. The change moves storage, and storage was never observable. A family that produced nine
 several-hours-each defects turned out to have a blast radius of zero on the corpus.
+
+**Measured**, all 24 manifests, both guest ISAs, one pinned pair of engine binaries built from HEAD plus
+this change alone: **3031/3036 = 99.84 %** (aarch64 guest 1500/1503, x86-64 guest 1531/1533), against the
+§3.10 baseline of 2993/3013 = 99.34 %. The leg count moved because fixtures were added since. The five
+remaining legs are `completeness/priority` ×2 and `process/sched-attr` ×2 (both the documented nice-12
+precondition) and `posix/pthspin` ×1 (the defect above, which is worse without this change than with it).
+`ctest -L checkpoint` 82/82 and `-L ckpt-cross` 11/11 — the lane that matters most here, since every
+checkpoint fixture is a non-PIE `ET_EXEC` and they now capture and restore at `0x400000`. `nested` 5/5.
 
 ## 4. Documentation that misleads
 
@@ -683,7 +708,9 @@ written when the interpreters were unfinished, and a reader who trusts the old t
   specific, unlike `VRCP14PS`, which *is* defined — so "match hardware" means "match one vendor's ROM", and
   a guest depending on the raw bits already breaks when moved between native x86 parts. This is the same
   distinction that made the *opposite* call correct for NaN propagation: there, hardware **was** the
-  architecture and qemu was the wrong oracle; here it is not. Measured on this host (Zen 4, legacy and VEX
+  architecture and qemu was the wrong oracle; here it is not. It is also why the AArch64 guest's
+  `FRECPE`/`FRSQRTE` (`75544a9a`) go the other way and transcribe the table: the ARM ARM *specifies* those
+  estimates bit-for-bit, so there the estimate **is** the architecture. Measured on this host (Zen 4, legacy and VEX
   bit-identical over 8192 sampled encodings): `rcpps` worst relative error `2^-11.63`, `rsqrtps` `2^-11.92`.
   On the aarch64 host `FRECPE` is an 8-bit estimate — *outside* the x86 bound — so it would need a Newton
   step regardless, at which point exact is simpler and strictly closer. Flags: measured to raise **nothing**
@@ -723,7 +750,8 @@ written when the interpreters were unfinished, and a reader who trusts the old t
 - **`#D` on denormal inputs is missing for every SSE op on the aarch64 host** — declined with measured
   numbers (14 fast-path instructions across ~40 sites), not overlooked.
 - **The x86-64 host's legacy `0F 52`/`0F 53` still return the hardware estimate**, because
-  `src/translator/guest/x86_64/interp.c:2352` serves them with the native `_mm_rcp_ps`/`_mm_rsqrt_ps`. The
+  `src/translator/guest/x86_64/interp.c` (case `0x52`/`0x53`, the `INTERP_FP_BIN("rcpps")` arms) executes
+  the native instruction, so the guest gets this silicon's table. Re-measured against current HEAD. The
   decision above says exact everywhere, so that one line is the remaining inconsistency: the same guest
   binary gets the vendor table on the x86-64 host and the exact value on the aarch64 host, and legacy
   disagrees with VEX *within* the x86-64 host. It is a two-line change in a file this pass did not own.

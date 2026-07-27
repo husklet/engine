@@ -781,16 +781,22 @@ static void load_elf(const char *path, struct loaded *out) {
     uint64_t basepage = minv & ~0xFFFull;
     uint64_t span = (maxv - basepage + 0xFFFF) & ~0xFFFFull;
     int etype = rd16(f + 16);
-    // NULL: non-colliding (main + interp). A non-PIE ET_EXEC gets biased here; the dispatcher redirects its
-    // absolute code jumps (g_nonpie_*) and the nonpie_guard SIGSEGV handler re-serves its absolute DATA refs
-    // to the low link vaddr at +bias (see nonpie_fixup above).
+    // NULL: non-colliding (main + interp). A non-PIE ET_EXEC that could NOT take the link address gets
+    // biased here; the dispatcher redirects its absolute code jumps (g_nonpie_*) and the nonpie_guard
+    // SIGSEGV handler re-serves its absolute DATA refs to the low link vaddr at +bias (nonpie_fixup above).
     // Map the whole image span [basepage, basepage+span) in one anon reservation, then copy each PT_LOAD
     // and narrow protections per segment below. elf_map_checked retries under transient host memory
     // pressure and aborts loudly on persistent failure, so the full range is guaranteed backed here (a
     // partial/failed map never slips through to become a SIGSEGV on the guest's own text/data).
     hl_host_memory_mapping image_mapping = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(image_mapping), 0, 0, 0, 0};
-    uint8_t *base;
-    if (g_force_base) {
+    uint8_t *base = NULL;
+    // Placement: thread.c, "non-PIE image placement, per host". On Linux an ET_EXEC goes AT its link
+    // address, so bias == 0 and nothing below arms. The link address is deterministic across runs, which
+    // is all the g_force_base / snapshot-arena hints below exist to provide -- consume the one-shot.
+    if (etype == 2) base = (uint8_t *)(uintptr_t)nonpie_place_at_link_address(basepage, span, &image_mapping);
+    if (base != NULL) {
+        g_force_base = 0; // one-shot, consumed by the link-address placement
+    } else if (g_force_base) {
         // map this image at a FIXED VA (one-shot) so the translated arena -- block-map keys AND any
         // guest address baked into host code (pcrel_base literals, non-PIE ranges) -- is byte-identical
         // across runs, hence reusable from the persistent cache. On failure fall back to a kernel-chosen
@@ -825,7 +831,9 @@ static void load_elf(const char *path, struct loaded *out) {
     }
     hl_gmap_add((uint64_t)base, span);
     uint64_t bias = (uint64_t)base - basepage;
-    if (etype == 2) {
+    // Armed on `bias != 0`, not on `etype == 2`: a link-address placement has one coordinate system, and
+    // leaving lo/hi set with bias 0 keeps the fold's whole workaround family reachable for no reason.
+    if (etype == 2 && bias != 0) {
         g_nonpie_lo = basepage;
         g_nonpie_hi = basepage + span;
         g_nonpie_bias = bias;

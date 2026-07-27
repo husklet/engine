@@ -1,4 +1,5 @@
-// hl/linux_abi -- x86-64 ELF loader (load PT_LOAD high; static-PIE + dynamic via ld.so) + stack.
+// hl/linux_abi -- x86-64 ELF loader (ET_EXEC at its link address on Linux, biased high on macOS;
+// static-PIE + dynamic via ld.so) + stack. Placement rule: thread.c, "non-PIE image placement, per host".
 #include "placement.h"
 #include "goimage.h"
 
@@ -335,14 +336,21 @@ static void load_elf(const char *path, struct loaded *out) {
     }
     uint64_t basepage = minv & ~0xFFFull;
     uint64_t span = (maxv - basepage + 0xFFFF) & ~0xFFFFull;
+    int etype = rd16(f + 16);
+    struct elf_host_map_context map_context = {
+        .mapping = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(hl_host_memory_mapping), 0, 0, 0, 0}};
+    uint8_t *base = NULL;
+    // Placement: thread.c, "non-PIE image placement, per host". On Linux an ET_EXEC goes AT its link
+    // address, so bias == 0 and the whole fold family below never arms. That address is also already
+    // deterministic across runs, which is the only thing g_force_base exists to provide -- consume it.
+    if (etype == 2) base = (uint8_t *)(uintptr_t)nonpie_place_at_link_address(basepage, span, &map_context.mapping);
     // opt8: the persistent cache needs deterministic guest bases across runs so the translated bytes
     // (RIP-relative leas, baked branch targets, block-map keys) are byte-identical. When g_force_base is
     // set, map MAP_FIXED at the caller-requested address; the image is PIE so basepage is ~0 and the chosen
     // base becomes out->base, deriving all guest PCs/addresses identically each run. One-shot per image.
-    struct elf_host_map_context map_context = {
-        .mapping = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(hl_host_memory_mapping), 0, 0, 0, 0}};
-    uint8_t *base;
-    if (g_force_base) {
+    if (base != NULL) {
+        g_force_base = 0; // one-shot, consumed by the link-address placement
+    } else if (g_force_base) {
         void *want = (void *)(g_force_base + basepage);
         int fixed_failed;
         g_force_base = 0; // one-shot: consumed for THIS load
@@ -376,17 +384,15 @@ static void load_elf(const char *path, struct loaded *out) {
     }
     hl_gmap_add((uint64_t)base, span);
     uint64_t bias = (uint64_t)base - basepage;
-    // W6A item 1: a non-PIE ET_EXEC (etype==2) links at a fixed low vaddr (e.g. 0x400000) but macOS
-    // __PAGEZERO reserves the low 4GB, so the loader (above) biases it to a high mmap. Its un-relocated
-    // ABSOLUTE refs then point at the original low vaddr (unmapped/__PAGEZERO) and fault. Record the
-    // original link range + bias so the dispatcher can redirect absolute CODE jumps and the SIGSEGV
-    // handler (nonpie_fixup) can serve absolute DATA loads/stores at +bias. PIE/static-PIE leave these
-    // 0 -> no redirect, no fixup, byte-identical. Coexists with the opt8 g_force_base path above (that
-    // only fires for PIE images under HL_PCACHE; a non-PIE ET_EXEC takes the NULL-hint branch).
+    // W6A item 1: a non-PIE ET_EXEC's un-relocated ABSOLUTE refs name its link vaddr, so whenever the
+    // loader could not place it there (macOS __PAGEZERO) those refs land on an unmapped address. Record
+    // the link range + bias so the dispatcher can redirect absolute CODE jumps and the SIGSEGV handler
+    // (nonpie_fixup) can serve absolute DATA loads/stores at +bias. Armed on `bias != 0`, not on
+    // `etype == 2`: a link-address placement (the Linux path above) has one coordinate system, and
+    // leaving lo/hi set with bias 0 would keep every workaround below reachable for no reason.
     // NONPIE_NOFIXUP=1 disables (legacy: code jump still faults on the low vaddr). g_nonpie_* live in the
     // shared os/linux/container/vfs.c; service.c resets them across execve (case 221) for re-loaded images.
-    int etype = rd16(f + 16);
-    if (etype == 2) {
+    if (etype == 2 && bias != 0) {
         g_nonpie_lo = basepage;
         g_nonpie_hi = basepage + span;
         g_nonpie_bias = bias;
@@ -418,10 +424,10 @@ static void load_elf(const char *path, struct loaded *out) {
     // baked `mov r32,imm` materialization to the high mapping -- see translate.c g_nonpie_blob_code. Only for a
     // biased non-PIE image that actually carries the symbol (node/mongosh/any embedded-V8 ET_EXEC); 0 otherwise
     // (PIE, Go, stripped, non-V8) -> inert. NOV8BLOB=1 disables for A/B.
-    // Gate on THIS image being the non-PIE ET_EXEC (etype==2), not on the persistent g_nonpie_lo: the
+    // Gate on THIS image being the BIASED non-PIE ET_EXEC, not on the persistent g_nonpie_lo: the
     // interpreter (ld.so, a DYN loaded by a SECOND load_elf in the same process) has no v8 symbol and would
     // otherwise reset the value the main image just recorded. Only the main non-PIE exe carries the blob.
-    if (etype == 2) g_nonpie_blob_code = go_symval(f, image.size, "v8_Default_embedded_blob_code_");
+    if (etype == 2 && bias != 0) g_nonpie_blob_code = go_symval(f, image.size, "v8_Default_embedded_blob_code_");
     // a biased non-PIE ET_EXEC (e.g. static glibc jq) carries baked ABSOLUTE pointers in
     // .data.rel.ro AND .data (pointer tables) that the static linker resolved to LINK addresses with NO
     // runtime relocation entry. After we bias the image high (macOS __PAGEZERO blocks the low link range)
@@ -430,8 +436,8 @@ static void load_elf(const char *path, struct loaded *out) {
     // abort (jq --version; same class as the gcc-ld / git / rustc SIGSEGVs). Re-relocate every 8-byte word
     // in those sections whose value lands in the original link range by +bias (what an R_X86_64_RELATIVE
     // would do). .data is mixed, so a non-pointer qword that happens to fall in [lo,hi) is a (rare) false
-    // positive -- the fully robust fix is to map the image AT its link address (engine with a small
-    // __PAGEZERO). Gated by NORELRO=1 for A/B. ET_EXEC only; static-PIE carries real relocs, never here.
+    // positive -- which is why a Linux host maps the image AT its link address instead and never gets
+    // here. Gated by NORELRO=1 for A/B. Biased ET_EXEC only; static-PIE carries real relocs, never here.
     // Skip GO binaries: go_rebase_nonpie above already rebased their moduledata/.data pointers; a blind
     // .data scan here double-biases the Go name/type tables (etcd -> "nameOff ... not in ranges"). Detect
     // Go via .gopclntab (present in every Go binary, stripped or not).
