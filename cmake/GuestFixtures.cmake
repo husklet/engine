@@ -67,28 +67,145 @@ set(HL_HAVE_GUEST_CC TRUE)
 
 # A Windows host has no route to these compilers at all: nix does not run
 # natively on Windows and no MSYS2 package supplies an x86_64-linux-gnu /
-# aarch64-linux-gnu cross gcc with a static glibc. Even were one found, a corpus
-# built against a different glibc than CI's produces different goldens, so
-# "it compiled" is not the bar -- byte-identical output against the nix build is.
-# Decide it here, positively, rather than letting the fixture-less configure fall
-# out of two empty environment variables: this is the single condition that keeps
-# Phase3Compat, Phase3Gates, Phase4Mac and LaneParity out of a Windows configure
+# aarch64-linux-gnu cross gcc with a static glibc. Decide it here, positively,
+# rather than letting the fixture-less configure fall out of two empty
+# environment variables: this is the single condition that keeps Phase3Compat,
+# Phase3Gates, Phase4Mac and LaneParity out of a Windows configure
 # (CMakeLists.txt gates all four on HL_HAVE_GUEST_CC), and it should be findable.
+#
+# What a Windows host CAN have is a corpus somebody else cross-compiled: a WSL2
+# Ubuntu on the same machine hosts a real gcc-aarch64-linux-gnu plus a native
+# gcc, both with a static glibc, and tools/windows/build_guest_fixtures.sh
+# drives THIS file's own declarations there and exports the result. So the
+# Windows arm is not "no fixtures", it is "fixtures from a cache, or none".
+#
+# That cache is a DEVELOPMENT corpus and the distinction matters: it is built
+# against a distro glibc, not the nix one CI pins, and a golden that encodes a
+# libc version will differ. "It compiled" is not the bar for a released
+# artifact -- matching the nix build is. What this buys is the ability to run
+# the suites at all on a Windows box, which is the difference between a lane
+# that is red for a reason and a lane that does not exist.
+#
+# Two things are deliberately NOT done here:
+#
+#  * calling the WSL compilers per fixture from the generated build. It works,
+#    but it puts wsl.exe on the critical path of ~3200 build edges and every
+#    one of them reads and writes the DrvFs /mnt/c mount, which is roughly an
+#    order of magnitude slower than the ext4 the same compiler sees natively.
+#    Worse, it makes a Windows build silently depend on a distro's package
+#    state: `apt upgrade` inside WSL would rebuild the corpus against a
+#    different glibc with no record that anything moved.
+#
+#  * trusting the cache because it exists. A stale corpus is the failure this
+#    port has been careful to avoid: the binaries still load, still run and
+#    still produce output, so the suites go green while testing a tree nobody
+#    has any more. The cache therefore carries a digest of the sources and
+#    recipes it was built from, and this configure recomputes that digest and
+#    refuses a mismatch instead of quietly using what it found.
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   set(HL_HAVE_GUEST_CC FALSE)
-  message(STATUS
-    "Windows host -- guest test fixtures and every suite that runs one are DISABLED. "
-    "There is no Windows-hosted Linux cross toolchain with a static glibc matching CI's. "
-    "The libraries and host unit lane are the supported Windows configuration.")
-  return()
+  # Default under build-*/ so it lands on the existing .gitignore rule: the
+  # corpus is ~2GB of build output and must never be committable by accident.
+  set(HL_GUEST_PREBUILT_DIR "${CMAKE_SOURCE_DIR}/build-guest-fixtures"
+      CACHE PATH "prebuilt guest fixture corpus (tools/windows/build_guest_fixtures.sh)")
+  set(_hl_manifest "${HL_GUEST_PREBUILT_DIR}/MANIFEST.txt")
+
+  if(NOT EXISTS "${_hl_manifest}")
+    if(HL_GUEST_TESTS STREQUAL "ON")
+      message(FATAL_ERROR
+        "No prebuilt guest fixture corpus at ${HL_GUEST_PREBUILT_DIR}, but "
+        "-DHL_GUEST_TESTS=ON was requested. Build one from a WSL2 Linux on this "
+        "machine:\n"
+        "    wsl -d Ubuntu -e bash -lc "
+        "'tools/windows/build_guest_fixtures.sh --src <repo> --out <dir>'")
+    endif()
+    message(STATUS
+      "Windows host and no prebuilt guest fixture corpus at ${HL_GUEST_PREBUILT_DIR} "
+      "-- guest test fixtures and every suite that runs one are DISABLED. The "
+      "libraries and host unit lane are the supported Windows configuration. "
+      "tools/windows/build_guest_fixtures.sh builds a corpus from a WSL2 Linux.")
+    return()
+  endif()
+
+  # Recompute the digest from THIS tree and compare it with what the corpus was
+  # filed under. FATAL, not a warning: a warning during a 40-second configure is
+  # a line nobody reads, and the whole point is that the wrong answer here is
+  # invisible downstream.
+  include("${CMAKE_SOURCE_DIR}/tools/guest_fixture_digest.cmake")
+  file(STRINGS "${_hl_manifest}" _hl_claim REGEX "^source-digest: ")
+  string(REPLACE "source-digest: " "" _hl_claim "${_hl_claim}")
+  hl_guest_fixture_digest(_hl_actual "${CMAKE_SOURCE_DIR}")
+  if(NOT _hl_claim STREQUAL _hl_actual)
+    message(FATAL_ERROR
+      "The prebuilt guest fixture corpus at ${HL_GUEST_PREBUILT_DIR} was built from "
+      "different sources than this tree.\n"
+      "    corpus was built from: ${_hl_claim}\n"
+      "    this tree hashes to:   ${_hl_actual}\n"
+      "Rebuild it, or point -DHL_GUEST_PREBUILT_DIR= at a current one:\n"
+      "    wsl -d Ubuntu -e bash -lc "
+      "'tools/windows/build_guest_fixtures.sh --src <repo> --out ${HL_GUEST_PREBUILT_DIR}'\n"
+      "Configuring with -DHL_BUILD_TESTS=OFF, or with the corpus directory removed, "
+      "returns to the supported fixture-less Windows configuration.")
+  endif()
+
+  # A .c edit does not re-run CMake by itself, so without this the digest above
+  # is only checked at the configure that happened to notice. Listing every
+  # digest input as a configure dependency turns "somebody edited a fixture
+  # source" into a re-configure, which is where the check lives.
+  hl_guest_fixture_inputs(_hl_inputs "${CMAKE_SOURCE_DIR}")
+  list(TRANSFORM _hl_inputs PREPEND "${CMAKE_SOURCE_DIR}/")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${_hl_inputs} "${_hl_manifest}")
+
+  set(HL_GUEST_PREBUILT "${HL_GUEST_PREBUILT_DIR}")
+  file(STRINGS "${_hl_manifest}" _hl_built REGEX "^(fixture-count|built-at|toolchain-)")
+  message(STATUS "Guest fixtures: prebuilt corpus at ${HL_GUEST_PREBUILT_DIR}, digest current")
+  foreach(_l ${_hl_built})
+    message(STATUS "  ${_l}")
+  endforeach()
+
+  # The corpus is present and current -- and still nothing on Windows consumes
+  # it. Phase3Compat.cmake and Phase3Gates.cmake each return at their OWN
+  # Windows guard (there is no Windows production engine to run a guest
+  # against), so setting HL_HAVE_GUEST_CC here declares zero fixtures while
+  # still reaching CMakeLists.txt's compat-engines target, whose dependencies
+  # -- hl-engine-linux-aarch64, hl-engine-linux-x86_64, matrix-runner,
+  # forkserver-runner -- no Windows configure defines. Measured: configure and
+  # generate both succeed and the default build is unaffected, but
+  # `ninja compat-engines` then dies with
+  #     ninja: error: 'hl-engine-linux-aarch64', needed by
+  #                   'CMakeFiles/compat-engines', missing and no known rule
+  # A build directory that advertises a target which cannot be built, for a
+  # corpus that was not declared, is the half-enabled state to avoid.
+  #
+  # So the default stays FALSE, with the remaining blockers named rather than
+  # left to be rediscovered. -DHL_GUEST_TESTS=ON is the deliberate opt-in for
+  # whoever lands those three changes.
+  if(NOT HL_GUEST_TESTS STREQUAL "ON")
+    message(STATUS
+      "Guest fixtures stay DISABLED on Windows: the corpus is ready, but the "
+      "suites that consume it are not. Phase3Compat and Phase3Gates still return "
+      "at their own Windows guard, and there is no Windows production engine for "
+      "them to run a fixture against. Once those are addressed, "
+      "-DHL_GUEST_TESTS=ON consumes this corpus.")
+    return()
+  endif()
+  set(HL_HAVE_GUEST_CC TRUE)
+  message(STATUS "  -DHL_GUEST_TESTS=ON -- consuming the prebuilt corpus")
+  # Deliberately NOT a return: the rest of this file defines hl_guest_binary()
+  # and the output registry, which is what actually stages the corpus.
 endif()
 
-foreach(_a ${HL_GUEST_ARCHES})
-  if(NOT HL_GUEST_CC_${_a})
-    set(HL_HAVE_GUEST_CC FALSE)
-    set(_hl_missing_cc ${_a})
-  endif()
-endforeach()
+# A prebuilt corpus is the answer to "no cross compiler", so do not then demand
+# one; every fixture below is staged from the cache instead of compiled.
+if(NOT HL_GUEST_PREBUILT)
+  foreach(_a ${HL_GUEST_ARCHES})
+    if(NOT HL_GUEST_CC_${_a})
+      set(HL_HAVE_GUEST_CC FALSE)
+      set(_hl_missing_cc ${_a})
+    endif()
+  endforeach()
+endif()
 
 if(NOT HL_HAVE_GUEST_CC)
   if(HL_GUEST_TESTS STREQUAL "ON")
@@ -154,6 +271,30 @@ function(hl_guest_binary arch output source)
   set_property(GLOBAL APPEND PROPERTY HL_GUEST_OUTPUTS "${output}")
 
   get_filename_component(_dir "${output}" DIRECTORY)
+
+  # Prebuilt corpus (a host with no cross compiler, i.e. Windows): every
+  # fixture, whatever its linkage, is staged from the cache. Uniformly, so
+  # there is exactly one answer to "where did this binary come from" on such a
+  # host -- a `copy`-linkage case served from the source tree while its
+  # neighbours came from the cache would be one more place for the two to
+  # disagree. The compile flags are not consulted at all here: they were
+  # consulted by the Linux build that produced the cache, and the digest gate
+  # above is what asserts that build saw this tree's recipes.
+  if(HL_GUEST_PREBUILT)
+    file(RELATIVE_PATH _rel "${CMAKE_BINARY_DIR}" "${output}")
+    set(_cached "${HL_GUEST_PREBUILT}/${_rel}")
+    if(NOT EXISTS "${_cached}")
+      set_property(GLOBAL APPEND PROPERTY HL_GUEST_MISSING "${_rel}")
+    endif()
+    add_custom_command(OUTPUT "${output}"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${_dir}"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_cached}" "${output}"
+      DEPENDS "${_cached}" ${G_DEPENDS}
+      COMMENT "guest[${arch}] prebuilt ${_rel}"
+      VERBATIM)
+    set_property(GLOBAL APPEND PROPERTY HL_GUEST_ALL_OUTPUTS "${output}")
+    return()
+  endif()
 
   if(G_LINKAGE STREQUAL "copy")
     add_custom_command(OUTPUT "${output}"
@@ -277,6 +418,36 @@ endfunction()
 # Collect everything declared so far into a buildable target.
 function(hl_guest_finalize target)
   get_property(_outs GLOBAL PROPERTY HL_GUEST_ALL_OUTPUTS)
+
+  # The authoritative list of what the corpus IS, as build-dir-relative paths.
+  # Written on every host: it is how tools/windows/build_guest_fixtures.sh knows
+  # which of a Linux build tree's files are fixtures, without a second, drifting
+  # copy of the answer. Nothing in the build reads it, so it cannot change what
+  # any host builds.
+  set(_rel "")
+  foreach(_o ${_outs})
+    file(RELATIVE_PATH _r "${CMAKE_BINARY_DIR}" "${_o}")
+    string(APPEND _rel "${_r}\n")
+  endforeach()
+  file(WRITE "${CMAKE_BINARY_DIR}/guest-fixtures.list" "${_rel}")
+
+  # A prebuilt corpus that is missing files the recipes declare is stale in the
+  # one way the source digest cannot see: the digest says "built from these
+  # sources", not "built all of them". Name every gap and stop, rather than
+  # letting the build fail later with a copy error per file and no summary.
+  get_property(_missing GLOBAL PROPERTY HL_GUEST_MISSING)
+  if(HL_GUEST_PREBUILT AND _missing)
+    list(LENGTH _missing _n)
+    list(LENGTH _outs _total)
+    string(REPLACE ";" "\n  " _missing "${_missing}")
+    message(FATAL_ERROR
+      "The prebuilt guest fixture corpus at ${HL_GUEST_PREBUILT} is missing ${_n} of "
+      "the ${_total} fixtures declared up to ${target}:\n  ${_missing}\n"
+      "It matches this tree's sources but was not built completely -- rebuild it "
+      "with tools/windows/build_guest_fixtures.sh and read that script's failure "
+      "report.")
+  endif()
+
   # ALL: CTest does not build test dependencies, so the fixtures must be part
   # of the default build for `cmake --build build && ctest` to work.
   add_custom_target(${target} ALL DEPENDS ${_outs})

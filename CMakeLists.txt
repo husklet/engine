@@ -217,6 +217,7 @@ set(MACOS_HOST_SOURCES
 # arrive with the groups that need them.
 set(WINDOWS_HOST_SOURCES
   src/host/windows/host.c src/host/windows/memory.c src/host/windows/clock.c
+  src/host/windows/ntpath.c src/host/windows/file.c
   src/host/sync.c)
 
 # --- archives ---------------------------------------------------------------
@@ -275,14 +276,23 @@ if(HL_BUILD_TESTS)
     #   cmake --build <dir> --target compat-engines compat-<lane>-fixtures
     # Declared here because the two hosts build the engines in different
     # phases (Phase 2 on Linux, Phase4Mac on Darwin).
-    set(_compat_engines hl-engine-linux-aarch64 hl-engine-linux-x86_64
-        matrix-runner forkserver-runner)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-      list(APPEND _compat_engines linux-production-remote-supervisor deny-icmp)
-    else()
-      list(APPEND _compat_engines hl-remote-supervisor)
+    #
+    # Not declared on Windows. A Windows host can now HAVE the fixture corpus --
+    # it is cross-built from a WSL2 Linux and staged from a digest-checked cache
+    # -- so HL_HAVE_GUEST_CC no longer implies the engines exist. The engines
+    # named here are Phase-2 Linux production targets and Phase4Mac Darwin ones,
+    # and neither phase runs on Windows, so declaring the target would give
+    # `ninja compat-engines` a dependency with no rule.
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
+      set(_compat_engines hl-engine-linux-aarch64 hl-engine-linux-x86_64
+          matrix-runner forkserver-runner)
+      if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND _compat_engines linux-production-remote-supervisor deny-icmp)
+      else()
+        list(APPEND _compat_engines hl-remote-supervisor)
+      endif()
+      add_custom_target(compat-engines DEPENDS ${_compat_engines})
     endif()
-    add_custom_target(compat-engines DEPENDS ${_compat_engines})
   endif()
 endif()
 
