@@ -136,6 +136,25 @@ static hl_host_result hl_fake_wire_range(void *context, uint64_t address, uint64
     return (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, (uint64_t)HL_HOST_WIRE_NONE};
 }
 
+/* The fake owns no address space, so it can never hold a mapping over an address-keyed range and
+ * never has a code mapping to refuse one for. Argument validation is real; the effect is nothing,
+ * which is the truthful answer for a provider with no pages. */
+static hl_host_result hl_fake_protect_address(void *context, uint64_t address, uint64_t size, uint32_t protection) {
+    hl_fake_host *fake = context;
+    if (address == 0 || size == 0 || (address & UINT64_C(4095)) != 0 ||
+        (protection & ~(uint32_t)(HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE | HL_HOST_MEMORY_EXECUTE)) != 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    return hl_fake_result(fake, 0);
+}
+
+static hl_host_result hl_fake_sync_address(void *context, uint64_t address, uint64_t size, uint32_t flags) {
+    hl_fake_host *fake = context;
+    if (address == 0 || size == 0 || (address & UINT64_C(4095)) != 0 ||
+        (flags & ~(uint32_t)(HL_HOST_MEMORY_SYNC_ASYNC | HL_HOST_MEMORY_SYNC_INVALIDATE)) != 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    return hl_fake_result(fake, 0);
+}
+
 static hl_host_result hl_fake_unwire_range(void *context, uint64_t address, uint64_t size) {
     (void)context;
     if (address == 0 || size == 0 || (address & UINT64_C(4095)) != 0)
@@ -315,6 +334,70 @@ static hl_host_result hl_fake_mutex_close(void *context, hl_host_handle mutex) {
 static hl_host_result hl_fake_fork_lifecycle(void *context) {
     (void)context;
     return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+}
+
+/*
+ * Parking, and a simulated console. Both keep their state here rather than in the fake host record
+ * because that record is a published type and this change does not widen it; nothing outside this
+ * file reads either, and hl_fake_host_init clears both so every test starts from the same place.
+ *
+ * The parking fake never blocks. A test double that can wait forever is the one behaviour a test
+ * double must not have, and there is no second thread here to end the wait -- so the two answers
+ * that are decided without waiting are real, the finite deadline reports as already reached, and
+ * an unbounded wait is refused outright rather than answered with a timeout that never happened.
+ */
+enum { HL_FAKE_PARK_RECORDS = 8u };
+
+static struct {
+    uint64_t interrupted[HL_FAKE_PARK_RECORDS];
+} hl_fake_park;
+
+static hl_host_result hl_fake_park_waiter(void *context, uint64_t waiter, uint32_t scope, uint64_t key,
+                                          const void *address, uint64_t expected, uint32_t compare_size,
+                                          uint64_t deadline_ns) {
+    uint32_t index;
+    (void)context;
+    (void)key;
+    if (waiter == 0 || address == NULL || (scope != HL_HOST_PARK_PRIVATE && scope != HL_HOST_PARK_SHARED) ||
+        (compare_size != 4u && compare_size != 8u) || ((uintptr_t)address % compare_size) != 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    for (index = 0; index < HL_FAKE_PARK_RECORDS; ++index)
+        if (hl_fake_park.interrupted[index] == waiter) {
+            hl_fake_park.interrupted[index] = 0;
+            return (hl_host_result){HL_STATUS_INTERRUPTED, 0, 0, 0};
+        }
+    {
+        uint64_t observed = 0;
+        memcpy(&observed, address, compare_size);
+        if (observed != expected) return (hl_host_result){HL_STATUS_WOULD_BLOCK, 0, 0, 0};
+    }
+    if (deadline_ns == HL_HOST_DEADLINE_INFINITE) return (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, 0};
+    return (hl_host_result){HL_STATUS_TIMED_OUT, 0, 0, 0};
+}
+
+static hl_host_result hl_fake_unpark(void *context, uint32_t scope, uint64_t key, const void *address,
+                                     uint32_t count) {
+    (void)context;
+    (void)key;
+    (void)count;
+    if (address == NULL || (scope != HL_HOST_PARK_PRIVATE && scope != HL_HOST_PARK_SHARED))
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    /* Nothing is ever parked here, so nothing can be proven released. */
+    return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+}
+
+static hl_host_result hl_fake_interrupt_park(void *context, uint64_t waiter) {
+    uint32_t index;
+    (void)context;
+    if (waiter == 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    for (index = 0; index < HL_FAKE_PARK_RECORDS; ++index)
+        if (hl_fake_park.interrupted[index] == waiter) return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+    for (index = 0; index < HL_FAKE_PARK_RECORDS; ++index)
+        if (hl_fake_park.interrupted[index] == 0) {
+            hl_fake_park.interrupted[index] = waiter;
+            return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+        }
+    return (hl_host_result){HL_STATUS_RESOURCE_LIMIT, 0, 0, 0};
 }
 
 static hl_host_result hl_fake_file_unsupported(void) {
@@ -1235,6 +1318,104 @@ static hl_host_result hl_fake_event_close(void *context, hl_host_handle pollset)
     return hl_fake_result(fake, 0);
 }
 
+/*
+ * A simulated console, so the terminal contract can be exercised without one.
+ *
+ * The fake's console is whichever file occupies the FIRST slot of its file table; every other file
+ * handle answers that it is not a terminal. That is the one distinction worth faking here -- a
+ * live, valid, perfectly ordinary object that is nevertheless not a terminal is exactly the case
+ * the group exists to answer and the case an object-type field cannot.
+ *
+ * Writes are looped back into the read queue, so a test can prove bytes travel without a device.
+ */
+enum { HL_FAKE_TERMINAL_QUEUE = 64u };
+
+static struct {
+    uint32_t mode;
+    hl_host_terminal_size size;
+    uint32_t queued;
+    uint8_t queue[HL_FAKE_TERMINAL_QUEUE];
+} hl_fake_terminal;
+
+static int hl_fake_terminal_is_console(const hl_fake_host *fake, hl_host_handle handle) {
+    return hl_fake_file_index(fake, handle) == 0;
+}
+
+static hl_host_result hl_fake_terminal_probe(void *context, hl_host_handle handle) {
+    hl_fake_host *fake = context;
+    if (hl_fake_file_index(fake, handle) < 0) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    return (hl_host_result){HL_STATUS_OK, 0, hl_fake_terminal_is_console(fake, handle) ? 1u : 0u, 0};
+}
+
+static hl_host_result hl_fake_terminal_get_mode(void *context, hl_host_handle handle, uint32_t *mode) {
+    hl_fake_host *fake = context;
+    if (mode == NULL || !hl_fake_terminal_is_console(fake, handle))
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    *mode = hl_fake_terminal.mode;
+    return (hl_host_result){HL_STATUS_OK, 0, hl_fake_terminal.mode, 0};
+}
+
+static hl_host_result hl_fake_terminal_set_mode(void *context, hl_host_handle handle, uint32_t mode) {
+    hl_fake_host *fake = context;
+    if (!hl_fake_terminal_is_console(fake, handle) ||
+        (mode & ~(uint32_t)(HL_HOST_TERMINAL_RAW_INPUT | HL_HOST_TERMINAL_ECHO | HL_HOST_TERMINAL_SIGNALS |
+                            HL_HOST_TERMINAL_FLOW_CONTROL | HL_HOST_TERMINAL_OUTPUT_PROCESSING)) != 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    hl_fake_terminal.mode = mode;
+    return (hl_host_result){HL_STATUS_OK, 0, mode, 0};
+}
+
+static hl_host_result hl_fake_terminal_get_size(void *context, hl_host_handle handle, hl_host_terminal_size *size) {
+    hl_fake_host *fake = context;
+    if (size == NULL || !hl_fake_terminal_is_console(fake, handle))
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    *size = hl_fake_terminal.size;
+    return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+}
+
+static hl_host_result hl_fake_terminal_set_size(void *context, hl_host_handle handle,
+                                                const hl_host_terminal_size *size) {
+    hl_fake_host *fake = context;
+    if (size == NULL || !hl_fake_terminal_is_console(fake, handle) || size->columns == 0 || size->rows == 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    hl_fake_terminal.size = *size;
+    return (hl_host_result){HL_STATUS_OK, 0, 0, 0};
+}
+
+static hl_host_result hl_fake_terminal_read(void *context, hl_host_handle handle, hl_host_bytes output) {
+    hl_fake_host *fake = context;
+    uint32_t count;
+    if (!hl_fake_terminal_is_console(fake, handle) || (output.size != 0 && output.data == NULL))
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    count = output.size < hl_fake_terminal.queued ? (uint32_t)output.size : hl_fake_terminal.queued;
+    memcpy(output.data, hl_fake_terminal.queue, count);
+    memmove(hl_fake_terminal.queue, hl_fake_terminal.queue + count, hl_fake_terminal.queued - count);
+    hl_fake_terminal.queued -= count;
+    return (hl_host_result){HL_STATUS_OK, 0, count, 0};
+}
+
+static hl_host_result hl_fake_terminal_write(void *context, hl_host_handle handle, hl_host_const_bytes input) {
+    hl_fake_host *fake = context;
+    uint32_t room;
+    uint32_t count;
+    if (!hl_fake_terminal_is_console(fake, handle) || (input.size != 0 && input.data == NULL))
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    room = HL_FAKE_TERMINAL_QUEUE - hl_fake_terminal.queued;
+    count = input.size < room ? (uint32_t)input.size : room;
+    memcpy(hl_fake_terminal.queue + hl_fake_terminal.queued, input.data, count);
+    hl_fake_terminal.queued += count;
+    return (hl_host_result){HL_STATUS_OK, 0, count, 0};
+}
+
+/* An independently closeable object that never becomes ready, which is all a console that cannot
+ * resize has to offer. It is a file handle, so the caller closes it through the file group exactly
+ * as it would close a real one. */
+static hl_host_result hl_fake_terminal_size_change_event(void *context, hl_host_handle handle) {
+    hl_fake_host *fake = context;
+    if (!hl_fake_terminal_is_console(fake, handle)) return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    return hl_fake_file_create_owned(fake, 0);
+}
+
 void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI,
                                                    sizeof(memory),
@@ -1254,7 +1435,9 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
                                                    hl_fake_repair_signal_page,
                                                    hl_fake_unmap_address,
                                                    hl_fake_wire_range,
-                                                   hl_fake_unwire_range};
+                                                   hl_fake_unwire_range,
+                                                   hl_fake_protect_address,
+                                                   hl_fake_sync_address};
     static const hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI,
                                                  .size = sizeof(clock),
                                                  .monotonic_ns = hl_fake_monotonic,
@@ -1268,9 +1451,15 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,       sizeof(process),       hl_fake_spawn_cloned, hl_fake_process_wait,
         hl_fake_process_terminate, hl_fake_process_close, hl_fake_spawn_cloned};
-    static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,       sizeof(sync),           hl_fake_mutex_create,
-                                               hl_fake_mutex_lock,     hl_fake_mutex_unlock,   hl_fake_mutex_close,
-                                               hl_fake_fork_lifecycle, hl_fake_fork_lifecycle, hl_fake_fork_lifecycle};
+    static const hl_host_sync_services sync = {
+        HL_HOST_SYNC_ABI,       sizeof(sync),           hl_fake_mutex_create,   hl_fake_mutex_lock,
+        hl_fake_mutex_unlock,   hl_fake_mutex_close,    hl_fake_fork_lifecycle, hl_fake_fork_lifecycle,
+        hl_fake_fork_lifecycle, hl_fake_park_waiter,    hl_fake_unpark,         hl_fake_interrupt_park};
+    static const hl_host_terminal_services terminal = {
+        HL_HOST_TERMINAL_ABI,       sizeof(terminal),           hl_fake_terminal_probe,
+        hl_fake_terminal_get_mode,  hl_fake_terminal_set_mode,  hl_fake_terminal_get_size,
+        hl_fake_terminal_set_size,  hl_fake_terminal_read,      hl_fake_terminal_write,
+        hl_fake_terminal_size_change_event};
     static const hl_host_counter_services counter = {
         HL_HOST_COUNTER_ABI,       sizeof(counter),           hl_fake_counter_create,      hl_fake_counter_read,
         hl_fake_counter_write,     hl_fake_counter_get_flags, hl_fake_counter_set_flags,   hl_fake_counter_duplicate,
@@ -1346,6 +1535,10 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     };
     memset(fake, 0, sizeof(*fake));
     memset(services, 0, sizeof(*services));
+    memset(&hl_fake_park, 0, sizeof(hl_fake_park));
+    memset(&hl_fake_terminal, 0, sizeof(hl_fake_terminal));
+    hl_fake_terminal.size.columns = 80;
+    hl_fake_terminal.size.rows = 24;
     fake->monotonic_ns = 1000;
     fake->realtime_ns = 2000;
     fake->raw_monotonic_ns = 3000;
@@ -1357,7 +1550,7 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     services->size = sizeof(*services);
     services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_PROCESS | HL_HOST_CAP_SYNC |
                              HL_HOST_CAP_COUNTER | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_EVENT |
-                             HL_HOST_CAP_WATCH | HL_HOST_CAP_STREAM | HL_HOST_CAP_FILE;
+                             HL_HOST_CAP_WATCH | HL_HOST_CAP_STREAM | HL_HOST_CAP_FILE | HL_HOST_CAP_TERMINAL;
     services->context = fake;
     services->memory = &memory;
     services->clock = &clock;
@@ -1370,6 +1563,7 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     services->watch = &watch;
     services->stream = &stream;
     services->file = &file;
+    services->terminal = &terminal;
 }
 
 void hl_fake_host_fail_next(hl_fake_host *fake, hl_status status) {

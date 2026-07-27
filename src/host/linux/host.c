@@ -26,6 +26,7 @@
 #include <sys/vfs.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -34,6 +35,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <netinet/in.h>
 #include <sys/un.h>
 #include <time.h>
@@ -688,6 +690,69 @@ static hl_host_result hl_linux_memory_unmap_address(void *context, uint64_t addr
     status = munmap((void *)low, (size_t)size);
     pthread_mutex_unlock(&host->lock);
     return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
+/* True while any live CODE mapping handle still holds a byte of [low, high). A code mapping is the
+ * one whose protection an address-keyed caller must not touch: the writable and executable views
+ * are a pair, the per-thread write gate flips between them, and a caller holding only an address
+ * cannot put back what it changed because it does not hold the handle that knows the other view. */
+static int hl_linux_code_range_owned_locked(hl_host_linux *host, uintptr_t low, uintptr_t high) {
+    for (uint32_t index = 0; index < host->handle_capacity; ++index) {
+        const hl_linux_handle_entry *entry = &host->handles[index];
+        if (entry->executable_address != NULL && hl_linux_entry_holds_locked(entry, low, high)) return 1;
+    }
+    return 0;
+}
+
+/* Page-align an address-keyed span the way mprotect(2) and msync(2) do: the address must already be
+ * aligned and the length is rounded up. Returns zero when the request cannot be expressed. */
+static int hl_linux_address_span(uint64_t address, uint64_t size, uintptr_t *low, size_t *span) {
+    long page = sysconf(_SC_PAGESIZE);
+    uint64_t rounded;
+    if (address == 0 || size == 0 || page <= 0 || address > UINTPTR_MAX || address % (uint64_t)page != 0) return 0;
+    rounded = size + ((uint64_t)page - 1u);
+    if (rounded < size) return 0;
+    rounded -= rounded % (uint64_t)page;
+    if (rounded > SIZE_MAX || rounded > (uint64_t)UINTPTR_MAX - address) return 0;
+    *low = (uintptr_t)address;
+    *span = (size_t)rounded;
+    return 1;
+}
+
+/* Reject before acting, so a refused range is left exactly as it was found. */
+static hl_host_result hl_linux_memory_protect_address(void *context, uint64_t address, uint64_t size,
+                                                      uint32_t protection) {
+    hl_host_linux *host = context;
+    uintptr_t low;
+    size_t span;
+    int status;
+    if ((protection & ~(uint32_t)(HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE | HL_HOST_MEMORY_EXECUTE)) != 0 ||
+        !hl_linux_address_span(address, size, &low, &span))
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    if (hl_linux_code_range_owned_locked(host, low, low + (uintptr_t)span)) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_BUSY, 0, 0);
+    }
+    status = mprotect((void *)low, span, hl_linux_protection(protection));
+    pthread_mutex_unlock(&host->lock);
+    return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_memory_sync_address(void *context, uint64_t address, uint64_t size, uint32_t flags) {
+    uintptr_t low;
+    size_t span;
+    int native_flags;
+    (void)context;
+    if ((flags & ~(uint32_t)(HL_HOST_MEMORY_SYNC_ASYNC | HL_HOST_MEMORY_SYNC_INVALIDATE)) != 0 ||
+        !hl_linux_address_span(address, size, &low, &span))
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    native_flags = (flags & HL_HOST_MEMORY_SYNC_ASYNC) != 0 ? MS_ASYNC : MS_SYNC;
+    if ((flags & HL_HOST_MEMORY_SYNC_INVALIDATE) != 0) native_flags |= MS_INVALIDATE;
+    /* No ownership question is asked. Flushing takes nothing away from a handle that covers the
+     * range: the mapping, its protection and its contents are all exactly as they were. */
+    return msync((void *)low, span, native_flags) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0)
+                                                       : hl_linux_errno_result();
 }
 
 /* mlock(2) pins against reclaim and charges RLIMIT_MEMLOCK, so this host reports HL_HOST_WIRE_RESIDENT.
@@ -3741,6 +3806,161 @@ static hl_host_result hl_linux_process_close(void *context, hl_host_handle handl
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 
+/* --- terminal ---------------------------------------------------------------------------
+ *
+ * The device, and only the device. Everything the guest's terminal vocabulary is made of -- the
+ * attribute structure, its control characters, canonical buffering, line editing, signal
+ * generation, minimum-and-timeout reads, output post-processing -- is above this and is not
+ * reachable from here on purpose.
+ *
+ * The five mode bits are the abstract capabilities the contract names, mapped onto the five native
+ * flags that carry the same meaning. Nothing else in the native attributes is read or written, so
+ * a caller that sets a mode gets exactly the change it named and no adjacent policy it did not.
+ */
+static int hl_linux_terminal_descriptor(hl_host_linux *host, hl_host_handle handle) {
+    int descriptor;
+    pthread_mutex_lock(&host->lock);
+    descriptor = hl_linux_descriptor(host, handle, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_FILE);
+    pthread_mutex_unlock(&host->lock);
+    return descriptor;
+}
+
+static hl_host_result hl_linux_terminal_probe(void *context, hl_host_handle handle) {
+    hl_host_linux *host = context;
+    int descriptor = hl_linux_terminal_descriptor(host, handle);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    /* This host answers from the terminal line discipline itself rather than from the object type,
+     * which is the distinction the contract exists for: a character device is not a terminal. */
+    return hl_linux_result(HL_STATUS_OK, isatty(descriptor) != 0 ? 1u : 0u, 0);
+}
+
+static hl_host_result hl_linux_terminal_get_mode(void *context, hl_host_handle handle, uint32_t *mode) {
+    hl_host_linux *host = context;
+    struct termios attributes;
+    int descriptor;
+    uint32_t value = 0;
+    if (mode == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    descriptor = hl_linux_terminal_descriptor(host, handle);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (tcgetattr(descriptor, &attributes) != 0) return hl_linux_errno_result();
+    if ((attributes.c_lflag & ICANON) == 0) value |= HL_HOST_TERMINAL_RAW_INPUT;
+    if ((attributes.c_lflag & ECHO) != 0) value |= HL_HOST_TERMINAL_ECHO;
+    if ((attributes.c_lflag & ISIG) != 0) value |= HL_HOST_TERMINAL_SIGNALS;
+    if ((attributes.c_iflag & IXON) != 0) value |= HL_HOST_TERMINAL_FLOW_CONTROL;
+    if ((attributes.c_oflag & OPOST) != 0) value |= HL_HOST_TERMINAL_OUTPUT_PROCESSING;
+    *mode = value;
+    return hl_linux_result(HL_STATUS_OK, value, 0);
+}
+
+static hl_host_result hl_linux_terminal_set_mode(void *context, hl_host_handle handle, uint32_t mode) {
+    hl_host_linux *host = context;
+    struct termios attributes;
+    int descriptor;
+    if ((mode & ~(uint32_t)(HL_HOST_TERMINAL_RAW_INPUT | HL_HOST_TERMINAL_ECHO | HL_HOST_TERMINAL_SIGNALS |
+                            HL_HOST_TERMINAL_FLOW_CONTROL | HL_HOST_TERMINAL_OUTPUT_PROCESSING)) != 0)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    descriptor = hl_linux_terminal_descriptor(host, handle);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (tcgetattr(descriptor, &attributes) != 0) return hl_linux_errno_result();
+    if ((mode & HL_HOST_TERMINAL_RAW_INPUT) != 0)
+        attributes.c_lflag &= (tcflag_t)~ICANON;
+    else
+        attributes.c_lflag |= (tcflag_t)ICANON;
+    if ((mode & HL_HOST_TERMINAL_ECHO) != 0)
+        attributes.c_lflag |= (tcflag_t)ECHO;
+    else
+        attributes.c_lflag &= (tcflag_t)~ECHO;
+    if ((mode & HL_HOST_TERMINAL_SIGNALS) != 0)
+        attributes.c_lflag |= (tcflag_t)ISIG;
+    else
+        attributes.c_lflag &= (tcflag_t)~ISIG;
+    if ((mode & HL_HOST_TERMINAL_FLOW_CONTROL) != 0)
+        attributes.c_iflag |= (tcflag_t)IXON;
+    else
+        attributes.c_iflag &= (tcflag_t)~IXON;
+    if ((mode & HL_HOST_TERMINAL_OUTPUT_PROCESSING) != 0)
+        attributes.c_oflag |= (tcflag_t)OPOST;
+    else
+        attributes.c_oflag &= (tcflag_t)~OPOST;
+    /* Applied now rather than after the queued output drains: a caller turning echo off before
+     * asking for a secret cannot be made to wait on a writer it does not control. */
+    if (tcsetattr(descriptor, TCSANOW, &attributes) != 0) return hl_linux_errno_result();
+    return hl_linux_result(HL_STATUS_OK, mode, 0);
+}
+
+static hl_host_result hl_linux_terminal_get_size(void *context, hl_host_handle handle, hl_host_terminal_size *size) {
+    hl_host_linux *host = context;
+    struct winsize window;
+    int descriptor;
+    if (size == NULL) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    descriptor = hl_linux_terminal_descriptor(host, handle);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memset(&window, 0, sizeof(window));
+    if (ioctl(descriptor, TIOCGWINSZ, &window) != 0) return hl_linux_errno_result();
+    size->columns = window.ws_col;
+    size->rows = window.ws_row;
+    size->pixel_width = window.ws_xpixel;
+    size->pixel_height = window.ws_ypixel;
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_linux_terminal_set_size(void *context, hl_host_handle handle,
+                                                 const hl_host_terminal_size *size) {
+    hl_host_linux *host = context;
+    struct winsize window;
+    int descriptor;
+    if (size == NULL || size->columns > UINT16_MAX || size->rows > UINT16_MAX || size->pixel_width > UINT16_MAX ||
+        size->pixel_height > UINT16_MAX)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    descriptor = hl_linux_terminal_descriptor(host, handle);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memset(&window, 0, sizeof(window));
+    window.ws_col = (unsigned short)size->columns;
+    window.ws_row = (unsigned short)size->rows;
+    window.ws_xpixel = (unsigned short)size->pixel_width;
+    window.ws_ypixel = (unsigned short)size->pixel_height;
+    if (ioctl(descriptor, TIOCSWINSZ, &window) != 0) return hl_linux_errno_result();
+    return hl_linux_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_linux_terminal_read(void *context, hl_host_handle handle, hl_host_bytes output) {
+    hl_host_linux *host = context;
+    int descriptor;
+    ssize_t count;
+    if ((output.size != 0 && output.data == NULL) || output.size > SSIZE_MAX)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    descriptor = hl_linux_terminal_descriptor(host, handle);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    count = read(descriptor, output.data, output.size);
+    return count >= 0 ? hl_linux_result(HL_STATUS_OK, (uint64_t)count, 0) : hl_linux_errno_result();
+}
+
+static hl_host_result hl_linux_terminal_write(void *context, hl_host_handle handle, hl_host_const_bytes input) {
+    hl_host_linux *host = context;
+    int descriptor;
+    ssize_t count;
+    if ((input.size != 0 && input.data == NULL) || input.size > SSIZE_MAX)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    descriptor = hl_linux_terminal_descriptor(host, handle);
+    if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    count = write(descriptor, input.data, input.size);
+    return count >= 0 ? hl_linux_result(HL_STATUS_OK, (uint64_t)count, 0) : hl_linux_errno_result();
+}
+
+/*
+ * Typed absence, not an oversight. On this host a resize is delivered as a process-directed signal
+ * that the engine's own signal machinery already owns end to end, so there is no separate object
+ * for this to hand back -- and manufacturing one would mean installing a process-wide handler
+ * underneath the layer that is already handling that signal, which is a worse bargain than saying
+ * so. The operation exists in the contract for a host where the resize arrives in the input stream
+ * instead, where waiting for input and then reading it is a deadlock rather than a composition.
+ */
+static hl_host_result hl_linux_terminal_size_change_event(void *context, hl_host_handle handle) {
+    hl_host_linux *host = context;
+    if (hl_linux_terminal_descriptor(host, handle) < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+}
+
 static hl_host_result hl_linux_mutex_create(void *context) {
     hl_host_linux *host = context;
     return hl_host_sync_mutex_create(host->sync);
@@ -3759,6 +3979,23 @@ static hl_host_result hl_linux_mutex_unlock(void *context, hl_host_handle handle
 static hl_host_result hl_linux_mutex_close(void *context, hl_host_handle handle) {
     hl_host_linux *host = context;
     return hl_host_sync_mutex_close(host->sync, handle);
+}
+
+static hl_host_result hl_linux_park(void *context, uint64_t waiter, uint32_t scope, uint64_t key, const void *address,
+                                    uint64_t expected, uint32_t compare_size, uint64_t deadline_ns) {
+    hl_host_linux *host = context;
+    return hl_host_sync_park(host->sync, waiter, scope, key, address, expected, compare_size, deadline_ns);
+}
+
+static hl_host_result hl_linux_unpark(void *context, uint32_t scope, uint64_t key, const void *address,
+                                      uint32_t count) {
+    hl_host_linux *host = context;
+    return hl_host_sync_unpark(host->sync, scope, key, address, count);
+}
+
+static hl_host_result hl_linux_interrupt_park(void *context, uint64_t waiter) {
+    hl_host_linux *host = context;
+    return hl_host_sync_interrupt_park(host->sync, waiter);
 }
 
 static hl_host_result hl_linux_fork_prepare(void *context) {
@@ -3791,6 +4028,10 @@ static hl_host_result hl_linux_fork_child(void *context) {
     hl_host_linux *host = context;
     uint32_t index;
     hl_host_result result = hl_host_sync_fork_complete(host->sync);
+    /* Only the forking thread exists here, so every waiter record inherited from the parent is about
+     * a thread this process does not have. Left in place they would hand a reused waiter identity
+     * someone else's outstanding interruption. */
+    hl_host_sync_park_reset(host->sync);
     for (index = 0; index < host->counter_subscription_capacity; ++index) {
         hl_linux_counter_subscription *subscription = host->counter_subscriptions[index];
         if (subscription == NULL) continue;
@@ -3819,8 +4060,11 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                    hl_linux_memory_map_file,     hl_linux_memory_sync,
                                                    hl_linux_memory_unmap_range,  hl_linux_memory_map_anonymous,
                                                    hl_linux_memory_discard,      hl_linux_memory_repair_signal_page,
-                                                   hl_linux_memory_unmap_address, hl_linux_memory_wire_range,
-                                                   hl_linux_memory_unwire_range};
+                                                   hl_linux_memory_unmap_address,
+                                                   hl_linux_memory_wire_range,
+                                                   hl_linux_memory_unwire_range,
+                                                   hl_linux_memory_protect_address,
+                                                   hl_linux_memory_sync_address};
     static const hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI,
                                                  .size = sizeof(clock),
                                                  .monotonic_ns = hl_linux_monotonic,
@@ -3915,9 +4159,14 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_linux_process_spawn,         hl_linux_process_wait,
         hl_linux_process_terminate, hl_linux_process_close, hl_linux_process_spawn_prepared};
-    static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,      sizeof(sync),           hl_linux_mutex_create,
-                                               hl_linux_mutex_lock,   hl_linux_mutex_unlock,  hl_linux_mutex_close,
-                                               hl_linux_fork_prepare, hl_linux_fork_complete, hl_linux_fork_child};
+    static const hl_host_sync_services sync = {
+        HL_HOST_SYNC_ABI,      sizeof(sync),           hl_linux_mutex_create, hl_linux_mutex_lock,
+        hl_linux_mutex_unlock, hl_linux_mutex_close,   hl_linux_fork_prepare, hl_linux_fork_complete,
+        hl_linux_fork_child,   hl_linux_park,          hl_linux_unpark,       hl_linux_interrupt_park};
+    static const hl_host_terminal_services terminal = {
+        HL_HOST_TERMINAL_ABI,      sizeof(terminal),          hl_linux_terminal_probe, hl_linux_terminal_get_mode,
+        hl_linux_terminal_set_mode, hl_linux_terminal_get_size, hl_linux_terminal_set_size, hl_linux_terminal_read,
+        hl_linux_terminal_write,   hl_linux_terminal_size_change_event};
     hl_host_linux *host;
     uint32_t i;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;
@@ -3977,7 +4226,8 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                  HL_HOST_CAP_EVENT | HL_HOST_CAP_EVENT_TIMER | HL_HOST_CAP_NETWORK |
                                  HL_HOST_CAP_SHARED_MEMORY | HL_HOST_CAP_PROCESS | HL_HOST_CAP_CODE_MAPPING |
                                  HL_HOST_CAP_SYNC | HL_HOST_CAP_COUNTER | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_DIRECTORY |
-                                 HL_HOST_CAP_WATCH | HL_HOST_CAP_STREAM | HL_HOST_CAP_POSIX_ATTACHMENT;
+                                 HL_HOST_CAP_WATCH | HL_HOST_CAP_STREAM | HL_HOST_CAP_POSIX_ATTACHMENT |
+                                 HL_HOST_CAP_TERMINAL;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
@@ -3994,6 +4244,7 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     out_services->watch = &watch;
     out_services->stream = &stream;
     out_services->posix_attachment = &posix_attachment;
+    out_services->terminal = &terminal;
     *out_host = host;
     return HL_STATUS_OK;
 }

@@ -6,10 +6,11 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_HOST_SERVICES_ABI 4u
-#define HL_HOST_MEMORY_ABI 7u
-/* Oldest memory group still accepted. An ABI 6 provider ends at repair_signal_page; the
- * address-keyed operations appended in ABI 7 are absent rather than NULL, so validation
- * checks the ABI 6 prefix and only demands the appended callbacks from an ABI 7 provider. */
+#define HL_HOST_MEMORY_ABI 8u
+/* Oldest memory group still accepted. An ABI 6 provider ends at repair_signal_page and an ABI 7
+ * provider ends at unwire_range; callbacks appended after a provider's own version are absent
+ * rather than NULL, so validation checks the prefix that version is required to carry and only
+ * demands an appended callback from a provider that declares the version which added it. */
 #define HL_HOST_MEMORY_ABI_MIN 6u
 #define HL_HOST_FILE_MAPPING_ABI 1u
 #define HL_HOST_MEMORY_MAPPING_ABI 1u
@@ -21,7 +22,12 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_NETWORK_ABI 1u
 #define HL_HOST_SHARED_MEMORY_ABI 1u
 #define HL_HOST_COUNTER_ABI 2u
-#define HL_HOST_SYNC_ABI 2u
+#define HL_HOST_SYNC_ABI 3u
+/* Oldest sync group still accepted. An ABI 2 provider ends at fork_child; the parking operations
+ * appended in ABI 3 are absent rather than NULL, so validation checks the ABI 2 prefix and only
+ * demands the appended callbacks from an ABI 3 provider. */
+#define HL_HOST_SYNC_ABI_MIN 2u
+#define HL_HOST_TERMINAL_ABI 1u
 #define HL_HOST_TRANSFER_ABI 2u
 #define HL_HOST_DIRECTORY_ABI 1u
 #define HL_HOST_WATCH_ABI 1u
@@ -49,7 +55,8 @@ enum {
     HL_HOST_CAP_DIRECTORY = UINT64_C(1) << 14,
     HL_HOST_CAP_WATCH = UINT64_C(1) << 15,
     HL_HOST_CAP_STREAM = UINT64_C(1) << 16,
-    HL_HOST_CAP_POSIX_ATTACHMENT = UINT64_C(1) << 17
+    HL_HOST_CAP_POSIX_ATTACHMENT = UINT64_C(1) << 17,
+    HL_HOST_CAP_TERMINAL = UINT64_C(1) << 18
 };
 
 enum {
@@ -132,6 +139,14 @@ enum {
 };
 
 enum { HL_HOST_CODE_DUAL_ALIAS = 1u << 0 };
+
+/* What sync_address is being asked to guarantee when it returns. Zero -- no bit set -- is the
+ * strong form and matches the handle-keyed sync: the range is durable in its backing object
+ * before the call returns. These are named rather than passed through as native flag words so a
+ * host is never handed a number it has to reinterpret, and so the mutually exclusive pair that
+ * the POSIX word encodes cannot be expressed at all: ASYNC set means "scheduled", ASYNC clear
+ * means "durable", and there is no third state to reject. */
+enum { HL_HOST_MEMORY_SYNC_ASYNC = 1u << 0, HL_HOST_MEMORY_SYNC_INVALIDATE = 1u << 1 };
 
 /* What a host actually does when asked to wire a range. A caller must not assume that a
  * successful wire means the same thing everywhere: Linux and Darwin mlock(2) pin pages
@@ -258,6 +273,46 @@ typedef struct hl_host_memory_services {
      */
     hl_host_result (*wire_range)(void *context, uint64_t address, uint64_t size, uint32_t flags);
     hl_host_result (*unwire_range)(void *context, uint64_t address, uint64_t size);
+    /* --- appended in HL_HOST_MEMORY_ABI 8 --- */
+    /*
+     * Change the protection of a range keyed by address rather than by an ownership handle.
+     * protect() and sync() are keyed on a mapping handle; a caller holding only an address --
+     * the same two populations unmap_address serves, plus every range a guest may legitimately
+     * re-protect -- cannot reach them at all. These complete that pair.
+     *
+     * address is page aligned. size is non-zero and is rounded up to whole pages, which is what
+     * the underlying host operations do. This differs deliberately from unmap_address, which
+     * demands an exact multiple: rounding an unmap up destroys pages the caller did not name,
+     * so it must state them, while rounding a protect or a flush up only touches pages it was
+     * already going to leave intact.
+     *
+     * protect_address does NOT carry unmap_address's live-handle refusal, and the difference is
+     * the point. unmap_address refuses a range overlapping a live handle because unmapping it
+     * would leave that handle claiming address space which no longer exists, and a later
+     * whole-handle teardown would then unmap whatever the host had since placed there -- an
+     * unrecoverable, non-local corruption. Re-protecting has no such consequence: the frame, the
+     * hole set, the contents and the handle all survive verbatim, the owner can restore the
+     * protection through the handle-keyed protect() at any time, and no registry invariant reads
+     * protection at all. Refusing here would also refuse the ordinary case, since re-protecting
+     * a mapping you own is exactly what mprotect is for.
+     *
+     * One population is still refused whole with HL_STATUS_BUSY and nothing changed: a range
+     * overlapping a live CODE mapping. There the protection is an engine invariant rather than a
+     * caller preference -- it is what the per-thread W^X gate and the writable/executable alias
+     * pair are made of -- and an address-keyed caller cannot restore it, because it does not hold
+     * the handle that knows the pair. That is the narrow case where the unmap argument does
+     * apply, so it keeps the unmap answer.
+     *
+     * protection uses HL_HOST_MEMORY_*; zero means no access.
+     */
+    hl_host_result (*protect_address)(void *context, uint64_t address, uint64_t size, uint32_t protection);
+    /*
+     * Flush a range keyed by address. flags is an HL_HOST_MEMORY_SYNC_* mask; zero is a durable
+     * flush. A range with no shared backing carries nothing to write back, so a host is free to
+     * succeed for it. No live-handle rule: flushing changes neither the address space nor any
+     * protection, so there is nothing an owner could observe as taken away.
+     */
+    hl_host_result (*sync_address)(void *context, uint64_t address, uint64_t size, uint32_t flags);
 } hl_host_memory_services;
 
 typedef struct hl_host_clock_services {
@@ -622,6 +677,18 @@ typedef struct hl_host_directory_services {
     hl_host_result (*close)(void *context, hl_host_handle instance);
 } hl_host_directory_services;
 
+/*
+ * Which population of processes can see a parking spot.
+ *
+ * PRIVATE spots are visible only inside the calling process and may be identified by a plain
+ * virtual address. SHARED spots must be reachable from a process that has never seen the waiter's
+ * address, so the caller supplies a key it has already canonicalised across processes as well as
+ * its own mapping of the word. A host is free to use either -- one whose primitive is keyed on
+ * physical page identity ignores the key, one whose primitive is a named kernel object ignores
+ * the address -- so a caller must supply both consistently rather than choosing.
+ */
+enum { HL_HOST_PARK_PRIVATE = 0, HL_HOST_PARK_SHARED = 1 };
+
 /* Opaque, non-recursive host mutexes. Callers must pair lock/unlock and exclude close while in use. */
 typedef struct hl_host_sync_services {
     HL_ABI_HEADER;
@@ -632,6 +699,62 @@ typedef struct hl_host_sync_services {
     hl_host_result (*fork_prepare)(void *context);
     hl_host_result (*fork_parent)(void *context);
     hl_host_result (*fork_child)(void *context);
+    /* --- appended in HL_HOST_SYNC_ABI 3 --- */
+    /*
+     * Compare-and-block on a word, the one primitive the contract had no form of at all. A guest
+     * futex, a process-shared mutex, a semaphore and a thread join are all this operation plus
+     * bookkeeping the guest layer already owns; without it each one is a busy loop or a lie.
+     *
+     * waiter names the blocking thread in the CALLER's own numbering. It is deliberately not a
+     * native thread id: no other operation in this contract hands out or accepts one, the caller
+     * already has a thread table, and a provider only needs the identity to be stable and unique
+     * among live waiters. A waiter identity may be reused once its previous owner is gone.
+     *
+     * The compare and the enqueue must be one indivisible step, which is why expected and
+     * compare_size are here and not left to the caller: a caller that tests the word itself and
+     * then asks to sleep has already lost the wake that landed in between. compare_size is 4 or
+     * 8; a host whose primitive cannot compare that width answers HL_STATUS_NOT_SUPPORTED rather
+     * than comparing a different one.
+     *
+     * deadline_ns is an absolute host monotonic timestamp; HL_HOST_DEADLINE_INFINITE blocks
+     * without one and zero polls.
+     *
+     * Spurious wakes are permitted: HL_STATUS_OK means only "re-read the word". That is the
+     * futex contract, and it is what lets a host wake at queue or bucket granularity instead of
+     * pretending to an exactness its primitive does not have.
+     *
+     *   HL_STATUS_OK             woken, or spuriously woken -- re-check and decide
+     *   HL_STATUS_WOULD_BLOCK    the word already differed; nothing was enqueued
+     *   HL_STATUS_TIMED_OUT      deadline reached
+     *   HL_STATUS_INTERRUPTED    interrupt_park named this waiter
+     *   HL_STATUS_NOT_SUPPORTED  this scope or width has no host primitive
+     */
+    hl_host_result (*park)(void *context, uint64_t waiter, uint32_t scope, uint64_t key, const void *address,
+                           uint64_t expected, uint32_t compare_size, uint64_t deadline_ns);
+    /*
+     * Release at most count waiters on (scope, key, address); UINT32_MAX releases all of them.
+     * value is the number the host can prove it released, which may be fewer than it actually
+     * woke -- a host waking a whole queue reports what it knows and leaves exact selection to the
+     * caller's own bookkeeping. The word is NOT read: releasing a waiter whose word is unchanged
+     * is legal and is what makes interruption expressible at all.
+     */
+    hl_host_result (*unpark)(void *context, uint32_t scope, uint64_t key, const void *address, uint32_t count);
+    /*
+     * Make one waiter's park return HL_STATUS_INTERRUPTED, so a guest signal can be delivered to
+     * a thread blocked in a wait. This is why park exists in this contract rather than being left
+     * to whatever the guest layer could build over a mutex: EINTR on a wait is load-bearing for
+     * signal delivery, and a wait primitive that cannot be interrupted cannot carry it.
+     *
+     * The interruption is recorded against the waiter, not against an outstanding wait, so the
+     * signal that arrives just before the thread parks is not lost: the next park consumes the
+     * record and returns HL_STATUS_INTERRUPTED without blocking. It is consumed by exactly one
+     * park -- a repeated call before that park still interrupts once.
+     *
+     * Idempotent, safe to call whether or not the waiter is parked or has ever parked, and usable
+     * from a signal-delivery context: providers must not allocate, take a lock that ordinary code
+     * can hold, or log.
+     */
+    hl_host_result (*interrupt_park)(void *context, uint64_t waiter);
 } hl_host_sync_services;
 
 enum {
@@ -687,6 +810,80 @@ typedef struct hl_host_stream_services {
                            uint64_t destination_offset, uint64_t size, uint32_t flags);
 } hl_host_stream_services;
 
+/*
+ * What the host device itself is doing to the byte stream. Abstract capabilities, not a native
+ * mode word: a host is asked which of these it is applying and told which to apply, and nothing
+ * about the guest's terminal vocabulary crosses the seam.
+ */
+enum {
+    /* Input bytes arrive as the device produced them: no host line editing or buffering. */
+    HL_HOST_TERMINAL_RAW_INPUT = 1u << 0,
+    /* The host echoes input bytes to the display. */
+    HL_HOST_TERMINAL_ECHO = 1u << 1,
+    /* The host turns interrupt/quit/suspend keys into an out-of-band event of its own instead of
+     * delivering them as bytes. Clearing this is what makes those keys readable. */
+    HL_HOST_TERMINAL_SIGNALS = 1u << 2,
+    /* The host consumes start/stop flow-control bytes rather than delivering them. */
+    HL_HOST_TERMINAL_FLOW_CONTROL = 1u << 3,
+    /* The host rewrites outbound bytes (line endings, escape handling). */
+    HL_HOST_TERMINAL_OUTPUT_PROCESSING = 1u << 4
+};
+
+typedef struct hl_host_terminal_size {
+    uint32_t columns;
+    uint32_t rows;
+    uint32_t pixel_width;
+    uint32_t pixel_height;
+} hl_host_terminal_size;
+
+/*
+ * Facts about a terminal device, and nothing about Linux.
+ *
+ * This group exists because file.metadata provably cannot answer "is this a terminal": a host
+ * whose null device reports the same character-device type as its console makes the file type a
+ * necessary and not a sufficient test, so a guest isatty answered from metadata alone would say
+ * yes to /dev/null. probe is the discriminator, and it is the reason this is a group rather than
+ * a field.
+ *
+ * The split is deliberate and is the whole design. The host owns facts about the DEVICE: whether
+ * it is one, the bytes it produces and accepts, which processing it is applying, its size, and
+ * when that size changes. The guest layer owns everything about LINUX: the terminal attribute
+ * structure and its control characters, canonical-mode buffering and line editing, echo policy,
+ * signal generation, minimum-and-timeout reads, output post-processing. Putting a generic
+ * device-control call in this contract instead would push Linux request numbers and structure
+ * layouts into every host, which is precisely what every other group here is typed to avoid.
+ *
+ * Handles are the same opaque file handles the file group produces.
+ */
+typedef struct hl_host_terminal_services {
+    HL_ABI_HEADER;
+    /* value is non-zero when the handle names an interactive terminal. */
+    hl_host_result (*probe)(void *context, hl_host_handle handle);
+    hl_host_result (*get_mode)(void *context, hl_host_handle handle, uint32_t *mode);
+    /* Apply exactly the named HL_HOST_TERMINAL_* set. A host that cannot express one of them
+     * refuses rather than applying a near miss: leaving echo on when it was asked to be off is a
+     * disclosure, not a cosmetic difference. */
+    hl_host_result (*set_mode)(void *context, hl_host_handle handle, uint32_t mode);
+    hl_host_result (*get_size)(void *context, hl_host_handle handle, hl_host_terminal_size *size);
+    hl_host_result (*set_size)(void *context, hl_host_handle handle, const hl_host_terminal_size *size);
+    /* Raw bytes to and from the device. value is the count transferred. read must not block on
+     * device activity that yields no bytes -- a size change is such activity on at least one host,
+     * where the input object is signalled and a blocking read of it then never returns. */
+    hl_host_result (*read)(void *context, hl_host_handle handle, hl_host_bytes output);
+    hl_host_result (*write)(void *context, hl_host_handle handle, hl_host_const_bytes input);
+    /*
+     * A borrowed, independently closeable object that becomes ready when the size changes, for a
+     * caller that must learn about a resize without reading. This is an operation rather than a
+     * size query alone because on a host where the resize is delivered in the input stream, the
+     * obvious composition -- wait for input, then read it -- deadlocks: the wait is satisfied by
+     * the resize and the read then blocks for a keystroke that never comes.
+     *
+     * A host that delivers resizes by some other means it does not own -- a process-directed
+     * signal, say -- answers HL_STATUS_NOT_SUPPORTED, and its caller uses that other means.
+     */
+    hl_host_result (*size_change_event)(void *context, hl_host_handle handle);
+} hl_host_terminal_services;
+
 /* Optional POSIX-host adapter for native ancillary descriptor transport. A borrow aliases the same
  * open-file description, is CLOEXEC, and must be released on every path. */
 typedef struct hl_host_posix_attachment_services {
@@ -715,6 +912,7 @@ typedef struct hl_host_services {
     const hl_host_watch_services *watch;
     const hl_host_stream_services *stream;
     const hl_host_posix_attachment_services *posix_attachment;
+    const hl_host_terminal_services *terminal;
 } hl_host_services;
 
 HL_API hl_status hl_host_services_validate(const hl_host_services *services, uint64_t required_capabilities);

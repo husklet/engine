@@ -16,6 +16,17 @@ static size_t hl_memory_prefix_size(void) {
     return offsetof(hl_host_memory_services, unmap_address);
 }
 
+/* Bytes an ABI 7 memory group is required to carry: the above plus the address-keyed release and
+ * the wiring pair, stopping before the ABI 8 protection and flush operations. */
+static size_t hl_memory_abi7_size(void) {
+    return offsetof(hl_host_memory_services, protect_address);
+}
+
+/* Bytes an ABI 2 sync group is required to carry: everything through fork_child. */
+static size_t hl_sync_prefix_size(void) {
+    return offsetof(hl_host_sync_services, park);
+}
+
 static int hl_valid_file_group(const hl_host_file_services *file) {
     return file != NULL && file->abi == HL_HOST_FILE_ABI && file->size >= sizeof(*file);
 }
@@ -33,10 +44,13 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
             memory->release == NULL || memory->publish_code == NULL || memory->map_anonymous == NULL ||
             memory->discard == NULL || memory->repair_signal_page == NULL)
             return HL_STATUS_ABI_MISMATCH;
-        /* The address-keyed operations exist only from ABI 7; an ABI 6 group stops before them. */
+        /* The address-keyed release and the wiring pair exist only from ABI 7; an ABI 6 group stops
+         * before them. The address-keyed protection and flush exist only from ABI 8. */
+        if (memory->abi >= 7u && (memory->size < hl_memory_abi7_size() || memory->unmap_address == NULL ||
+                                  memory->wire_range == NULL || memory->unwire_range == NULL))
+            return HL_STATUS_ABI_MISMATCH;
         if (memory->abi >= HL_HOST_MEMORY_ABI &&
-            (memory->size < sizeof(*memory) || memory->unmap_address == NULL || memory->wire_range == NULL ||
-             memory->unwire_range == NULL))
+            (memory->size < sizeof(*memory) || memory->protect_address == NULL || memory->sync_address == NULL))
             return HL_STATUS_ABI_MISMATCH;
     }
     if ((services->capabilities & HL_HOST_CAP_CODE_MAPPING) != 0 &&
@@ -107,13 +121,26 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->shared_memory->create == NULL || services->shared_memory->open == NULL ||
          services->shared_memory->resize == NULL || services->shared_memory->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
-    if ((services->capabilities & HL_HOST_CAP_SYNC) != 0 &&
-        (!hl_has_field(services->size, offsetof(hl_host_services, sync), sizeof(services->sync)) ||
-         !hl_valid_group(services->sync, HL_HOST_SYNC_ABI, sizeof(*services->sync)) ||
-         services->sync->mutex_create == NULL || services->sync->mutex_lock == NULL ||
-         services->sync->mutex_unlock == NULL || services->sync->mutex_close == NULL ||
-         services->sync->fork_prepare == NULL || services->sync->fork_parent == NULL ||
-         services->sync->fork_child == NULL))
+    if ((services->capabilities & HL_HOST_CAP_SYNC) != 0) {
+        const hl_host_sync_services *sync = services->sync;
+        if (!hl_has_field(services->size, offsetof(hl_host_services, sync), sizeof(services->sync)) || sync == NULL ||
+            sync->abi < HL_HOST_SYNC_ABI_MIN || sync->abi > HL_HOST_SYNC_ABI || sync->size < hl_sync_prefix_size() ||
+            sync->mutex_create == NULL || sync->mutex_lock == NULL || sync->mutex_unlock == NULL ||
+            sync->mutex_close == NULL || sync->fork_prepare == NULL || sync->fork_parent == NULL ||
+            sync->fork_child == NULL)
+            return HL_STATUS_ABI_MISMATCH;
+        /* The parking trio exists only from ABI 3; an ABI 2 group stops before it. */
+        if (sync->abi >= HL_HOST_SYNC_ABI && (sync->size < sizeof(*sync) || sync->park == NULL ||
+                                              sync->unpark == NULL || sync->interrupt_park == NULL))
+            return HL_STATUS_ABI_MISMATCH;
+    }
+    if ((services->capabilities & HL_HOST_CAP_TERMINAL) != 0 &&
+        (!hl_has_field(services->size, offsetof(hl_host_services, terminal), sizeof(services->terminal)) ||
+         !hl_valid_group(services->terminal, HL_HOST_TERMINAL_ABI, sizeof(*services->terminal)) ||
+         services->terminal->probe == NULL || services->terminal->get_mode == NULL ||
+         services->terminal->set_mode == NULL || services->terminal->get_size == NULL ||
+         services->terminal->set_size == NULL || services->terminal->read == NULL ||
+         services->terminal->write == NULL || services->terminal->size_change_event == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_COUNTER) != 0 &&
         (!hl_has_field(services->size, offsetof(hl_host_services, counter), sizeof(services->counter)) ||
