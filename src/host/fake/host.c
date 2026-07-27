@@ -114,6 +114,30 @@ static hl_host_result hl_fake_unmap_range(void *context, hl_host_handle mapping,
     return result;
 }
 
+/* The fake host owns no address space, so there is never an unowned range to release and never a page to
+ * wire. Argument validation is real, and the two wiring calls report their absence rather than reporting a
+ * success that pinned nothing -- which is the whole point of the typed unsupported status. */
+static hl_host_result hl_fake_unmap_address(void *context, uint64_t address, uint64_t size) {
+    hl_fake_host *fake = context;
+    if (address == 0 || size == 0 || (address & UINT64_C(4095)) != 0 || (size & UINT64_C(4095)) != 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    return hl_fake_result(fake, 0);
+}
+
+static hl_host_result hl_fake_wire_range(void *context, uint64_t address, uint64_t size, uint32_t flags) {
+    (void)context;
+    if (address == 0 || size == 0 || flags != 0 || (address & UINT64_C(4095)) != 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    return (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, (uint64_t)HL_HOST_WIRE_NONE};
+}
+
+static hl_host_result hl_fake_unwire_range(void *context, uint64_t address, uint64_t size) {
+    (void)context;
+    if (address == 0 || size == 0 || (address & UINT64_C(4095)) != 0)
+        return (hl_host_result){HL_STATUS_INVALID_ARGUMENT, 0, 0, 0};
+    return (hl_host_result){HL_STATUS_NOT_SUPPORTED, 0, 0, (uint64_t)HL_HOST_WIRE_NONE};
+}
+
 static hl_host_result hl_fake_monotonic(void *context) {
     hl_fake_host *fake = context;
     return hl_fake_result(fake, fake->monotonic_ns++);
@@ -1222,7 +1246,10 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
                                                    hl_fake_unmap_range,
                                                    hl_fake_map_anonymous,
                                                    hl_fake_discard,
-                                                   hl_fake_repair_signal_page};
+                                                   hl_fake_repair_signal_page,
+                                                   hl_fake_unmap_address,
+                                                   hl_fake_wire_range,
+                                                   hl_fake_unwire_range};
     static const hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI,
                                                  .size = sizeof(clock),
                                                  .monotonic_ns = hl_fake_monotonic,

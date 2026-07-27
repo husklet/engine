@@ -159,6 +159,79 @@ int main(void) {
     char contents[3] = {0};
     HL_CHECK(hl_host_macos_create(&host, &services) == HL_STATUS_OK);
     {
+        /* Address-keyed release and range wiring, appended in HL_HOST_MEMORY_ABI 7. Both populations that
+         * need an address key hold no mapping handle: a range a provider placed at a fixed address, and a
+         * range whose ownership handle a later fixed placement retired. discard() reproduces the second.
+         *
+         * This runs first, on a registry with no mapping handles in it. A partial unmap_range leaves its
+         * handle live over the hole it made, and a later kernel-chosen placement can be handed that same
+         * address -- at which point a live handle covers a range its owner no longer has, and this refuses
+         * it. That is the safe answer, but it is answered from the registry, so the case is set up from a
+         * registry this block owns end to end rather than from whatever earlier blocks left behind. */
+        long page_value = sysconf(_SC_PAGESIZE);
+        uint64_t page = page_value > 0 ? (uint64_t)page_value : UINT64_C(16384);
+        hl_host_memory_mapping owned = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(owned), 0, 0, 0, 0};
+        hl_host_memory_mapping wired_map = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(wired_map), 0, 0, 0, 0};
+        hl_host_result wired;
+        uint64_t base;
+        HL_CHECK(services.memory->abi == HL_HOST_MEMORY_ABI && services.memory->size >= sizeof(*services.memory));
+        HL_CHECK(services.memory->unmap_address(services.context, 0, page).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->unmap_address(services.context, page, 0).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->unmap_address(services.context, page + 1, page).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->unmap_address(services.context, page, page - 1).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->unmap_address(services.context, UINT64_MAX - page + 1, page * 2).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, page * 2, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &owned)
+                     .status == HL_STATUS_OK);
+        base = owned.address;
+        /* A live handle refuses the whole range, whether the overlap is total or partial, and nothing moves. */
+        HL_CHECK(services.memory->unmap_address(services.context, base, page * 2).status == HL_STATUS_BUSY);
+        HL_CHECK(services.memory->unmap_address(services.context, base + page, page).status == HL_STATUS_BUSY);
+        ((unsigned char *)(uintptr_t)base)[0] = 0xc3;
+        HL_CHECK(msync((void *)(uintptr_t)base, (size_t)(page * 2), MS_ASYNC) == 0);
+
+        /* Retiring the handle leaves the address space untouched: that is the range gmap is left holding. */
+        HL_CHECK(services.memory->discard(services.context, owned.handle).status == HL_STATUS_OK);
+        HL_CHECK(((unsigned char *)(uintptr_t)base)[0] == 0xc3);
+        HL_CHECK(services.memory->unmap_address(services.context, base, page).status == HL_STATUS_OK);
+        HL_CHECK(msync((void *)(uintptr_t)base, (size_t)page, MS_ASYNC) != 0);
+        HL_CHECK(msync((void *)(uintptr_t)(base + page), (size_t)page, MS_ASYNC) == 0);
+        /* A vacant range succeeds, exactly as munmap does, so a repeated teardown is not an error. */
+        HL_CHECK(services.memory->unmap_address(services.context, base, page).status == HL_STATUS_OK);
+        HL_CHECK(services.memory->unmap_address(services.context, base + page, page).status == HL_STATUS_OK);
+        /* The retired handle stays retired and never becomes an alias for the reused address. */
+        HL_CHECK(services.memory->unmap_range(services.context, owned.handle, 0, page).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->release(services.context, owned.handle).status == HL_STATUS_INVALID_ARGUMENT);
+
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, page, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &wired_map)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services.memory->wire_range(services.context, wired_map.address, page, 1).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->wire_range(services.context, 0, page, 0).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->wire_range(services.context, wired_map.address + 1, page, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->wire_range(services.context, wired_map.address, 0, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->unwire_range(services.context, 0, page).status == HL_STATUS_INVALID_ARGUMENT);
+        wired = services.memory->wire_range(services.context, wired_map.address, page, 0);
+        /* Darwin has mlock(2), so this host never answers NOT_SUPPORTED; an exhausted RLIMIT_MEMLOCK stays
+         * a refusal and is never reported as a success that pinned nothing. */
+        HL_CHECK(wired.status != HL_STATUS_NOT_SUPPORTED);
+        if (wired.status == HL_STATUS_OK) {
+            HL_CHECK(wired.detail == (uint64_t)HL_HOST_WIRE_RESIDENT);
+            HL_CHECK(services.memory->unwire_range(services.context, wired_map.address, page).status == HL_STATUS_OK);
+        }
+        HL_CHECK(services.memory->release(services.context, wired_map.handle).status == HL_STATUS_OK);
+        if (msync((void *)(uintptr_t)wired_map.address, (size_t)page, MS_ASYNC) != 0)
+            HL_CHECK(services.memory->wire_range(services.context, wired_map.address, page, 0).status != HL_STATUS_OK);
+    }
+    {
         hl_host_result root = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, "/", 1,
                                                            HL_HOST_FILE_PATH_ONLY | HL_HOST_FILE_DIRECTORY, 0, 0);
         struct stat status;

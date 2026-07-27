@@ -11,6 +11,11 @@ static int hl_valid_group(const void *group, uint32_t abi, size_t size) {
     return group != NULL && header[0] == abi && header[1] >= size;
 }
 
+/* Bytes an ABI 6 memory group is required to carry: everything through repair_signal_page. */
+static size_t hl_memory_prefix_size(void) {
+    return offsetof(hl_host_memory_services, unmap_address);
+}
+
 static int hl_valid_file_group(const hl_host_file_services *file) {
     return file != NULL && file->abi == HL_HOST_FILE_ABI && file->size >= sizeof(*file);
 }
@@ -23,14 +28,19 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
     if ((services->capabilities & required_capabilities) != required_capabilities) return HL_STATUS_NOT_SUPPORTED;
     if ((services->capabilities & HL_HOST_CAP_MEMORY) != 0) {
         const hl_host_memory_services *memory = services->memory;
-        if (memory == NULL || memory->abi != HL_HOST_MEMORY_ABI || memory->size < sizeof(*memory) ||
-            memory->reserve == NULL || memory->protect == NULL || memory->release == NULL ||
-            memory->publish_code == NULL || memory->map_anonymous == NULL || memory->discard == NULL ||
-            memory->repair_signal_page == NULL)
+        if (memory == NULL || memory->abi < HL_HOST_MEMORY_ABI_MIN || memory->abi > HL_HOST_MEMORY_ABI ||
+            memory->size < hl_memory_prefix_size() || memory->reserve == NULL || memory->protect == NULL ||
+            memory->release == NULL || memory->publish_code == NULL || memory->map_anonymous == NULL ||
+            memory->discard == NULL || memory->repair_signal_page == NULL)
+            return HL_STATUS_ABI_MISMATCH;
+        /* The address-keyed operations exist only from ABI 7; an ABI 6 group stops before them. */
+        if (memory->abi >= HL_HOST_MEMORY_ABI &&
+            (memory->size < sizeof(*memory) || memory->unmap_address == NULL || memory->wire_range == NULL ||
+             memory->unwire_range == NULL))
             return HL_STATUS_ABI_MISMATCH;
     }
     if ((services->capabilities & HL_HOST_CAP_CODE_MAPPING) != 0 &&
-        (services->memory == NULL || services->memory->size < sizeof(*services->memory) ||
+        (services->memory == NULL || services->memory->size < hl_memory_prefix_size() ||
          services->memory->reserve_code == NULL || services->memory->repair_code_after_fork == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_CODE_MAPPING) != 0 &&

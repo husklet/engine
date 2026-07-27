@@ -882,6 +882,66 @@ static hl_host_result hl_macos_unmap_range(void *context, hl_host_handle handle,
     return status == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
 
+/* True while any live mapping handle covers a byte of [low, high). Both aliases of a code mapping count,
+ * because releasing either one out from under the owner is the failure this guard exists to prevent. */
+static int hl_macos_range_owned_locked(hl_host_macos *host, uintptr_t low, uintptr_t high) {
+    for (uint32_t index = 0; index < host->mapping_capacity; ++index) {
+        const hl_macos_mapping *mapping = &host->mappings[index];
+        if (!mapping->active || mapping->size == 0) continue;
+        if (mapping->writable != NULL) {
+            uintptr_t owned = (uintptr_t)mapping->writable;
+            if (low < owned + (uintptr_t)mapping->size && owned < high) return 1;
+        }
+        if (mapping->executable != NULL) {
+            uintptr_t owned = (uintptr_t)mapping->executable;
+            if (low < owned + (uintptr_t)mapping->size && owned < high) return 1;
+        }
+    }
+    return 0;
+}
+
+/* Reject before acting, so a refused range is left exactly as it was found. */
+static hl_host_result hl_macos_unmap_address(void *context, uint64_t address, uint64_t size) {
+    hl_host_macos *host = context;
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t low;
+    int status;
+    if (address == 0 || size == 0 || size > SIZE_MAX || page <= 0 || address > UINTPTR_MAX ||
+        address % (uint64_t)page != 0 || size % (uint64_t)page != 0 || size > (uint64_t)UINTPTR_MAX - address)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    low = (uintptr_t)address;
+    pthread_mutex_lock(&host->lock);
+    if (hl_macos_range_owned_locked(host, low, low + (uintptr_t)size)) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_BUSY, 0, 0);
+    }
+    status = munmap((void *)low, (size_t)size);
+    pthread_mutex_unlock(&host->lock);
+    return status == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+}
+
+/* Darwin mlock(2) pins against reclaim and charges RLIMIT_MEMLOCK exactly as Linux does, so this host
+ * reports HL_HOST_WIRE_RESIDENT. The length follows mlock's own rule and is rounded up to whole pages. */
+static hl_host_result hl_macos_wire_range(void *context, uint64_t address, uint64_t size, uint32_t flags) {
+    long page = sysconf(_SC_PAGESIZE);
+    (void)context;
+    if (address == 0 || size == 0 || size > SIZE_MAX || page <= 0 || address > UINTPTR_MAX || flags != 0 ||
+        address % (uint64_t)page != 0 || size > (uint64_t)UINTPTR_MAX - address)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (mlock((void *)(uintptr_t)address, (size_t)size) != 0) return hl_macos_errno();
+    return hl_macos_result(HL_STATUS_OK, 0, (uint64_t)HL_HOST_WIRE_RESIDENT);
+}
+
+static hl_host_result hl_macos_unwire_range(void *context, uint64_t address, uint64_t size) {
+    long page = sysconf(_SC_PAGESIZE);
+    (void)context;
+    if (address == 0 || size == 0 || size > SIZE_MAX || page <= 0 || address > UINTPTR_MAX ||
+        address % (uint64_t)page != 0 || size > (uint64_t)UINTPTR_MAX - address)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (munlock((void *)(uintptr_t)address, (size_t)size) != 0) return hl_macos_errno();
+    return hl_macos_result(HL_STATUS_OK, 0, (uint64_t)HL_HOST_WIRE_RESIDENT);
+}
+
 static hl_host_result hl_macos_publish(void *context, hl_host_handle handle, uint64_t offset, uint64_t size) {
     hl_host_macos *host = context;
     hl_macos_mapping *mapping;
@@ -4529,7 +4589,8 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         HL_HOST_MEMORY_ABI,        sizeof(memory),          hl_macos_reserve,      hl_macos_protect,
         hl_macos_release,          hl_macos_publish,        hl_macos_reserve_code, hl_macos_repair_code,
         hl_macos_begin_code_write, hl_macos_end_code_write, hl_macos_map_file,     hl_macos_mapping_sync,
-        hl_macos_unmap_range,      hl_macos_map_anonymous,  hl_macos_discard,      hl_macos_repair_signal_page};
+        hl_macos_unmap_range,      hl_macos_map_anonymous,  hl_macos_discard,      hl_macos_repair_signal_page,
+        hl_macos_unmap_address,    hl_macos_wire_range,     hl_macos_unwire_range};
     static const hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI,
                                                  .size = sizeof(clock),
                                                  .monotonic_ns = hl_macos_monotonic,

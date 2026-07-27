@@ -6,7 +6,11 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_HOST_SERVICES_ABI 4u
-#define HL_HOST_MEMORY_ABI 6u
+#define HL_HOST_MEMORY_ABI 7u
+/* Oldest memory group still accepted. An ABI 6 provider ends at repair_signal_page; the
+ * address-keyed operations appended in ABI 7 are absent rather than NULL, so validation
+ * checks the ABI 6 prefix and only demands the appended callbacks from an ABI 7 provider. */
+#define HL_HOST_MEMORY_ABI_MIN 6u
 #define HL_HOST_FILE_MAPPING_ABI 1u
 #define HL_HOST_MEMORY_MAPPING_ABI 1u
 #define HL_HOST_CLOCK_ABI 4u
@@ -129,6 +133,18 @@ enum {
 
 enum { HL_HOST_CODE_DUAL_ALIAS = 1u << 0 };
 
+/* What a host actually does when asked to wire a range. A caller must not assume that a
+ * successful wire means the same thing everywhere: Linux and Darwin mlock(2) pin pages
+ * against reclaim, while the nearest Windows primitive (VirtualLock) only grows the
+ * process working set and leaves the pages reclaimable. Whose limit applies and what a
+ * refusal means differ with it, so wire_range reports the kind it applied instead of
+ * letting the caller guess from the name. */
+typedef enum hl_host_wire_kind {
+    HL_HOST_WIRE_NONE = 0,
+    HL_HOST_WIRE_RESIDENT = 1,
+    HL_HOST_WIRE_WORKING_SET = 2
+} hl_host_wire_kind;
+
 enum { HL_HOST_EVENT_ADD = 1, HL_HOST_EVENT_MODIFY = 2, HL_HOST_EVENT_DELETE = 3 };
 
 enum {
@@ -220,6 +236,28 @@ typedef struct hl_host_memory_services {
      * operation first protects an existing exact range, then claims a vacant
      * exact range without replacement. It never invalidates an owned mapping. */
     int (*repair_signal_page)(void *context, uint64_t address, uint64_t size, uint32_t protection);
+    /* --- appended in HL_HOST_MEMORY_ABI 7 --- */
+    /*
+     * Release a page-aligned range the engine owns NO mapping handle for. Two populations
+     * reach it: a range a provider placed at a fixed address, and a range whose ownership
+     * handle a later fixed placement already retired. unmap_range cannot express either,
+     * because it is keyed on an owning handle and by construction there is none.
+     *
+     * This is deliberately not a handle-free alias for unmap_range. A range that overlaps
+     * any live mapping handle is refused whole with HL_STATUS_BUSY and nothing is unmapped,
+     * so an address-keyed caller can never silently invalidate owned memory or strand a
+     * handle over a hole. A range with no mapping at all succeeds, matching the host.
+     */
+    hl_host_result (*unmap_address)(void *context, uint64_t address, uint64_t size);
+    /*
+     * Wire a range into memory. address is page aligned; size follows the host rule for
+     * wiring and is rounded up to whole pages. flags is reserved and must be zero.
+     * On success detail is the hl_host_wire_kind the host applied. A host with no wiring
+     * primitive returns HL_STATUS_NOT_SUPPORTED with detail HL_HOST_WIRE_NONE; callers
+     * whose contract is best-effort (guest mlockall) treat that as a range left pageable.
+     */
+    hl_host_result (*wire_range)(void *context, uint64_t address, uint64_t size, uint32_t flags);
+    hl_host_result (*unwire_range)(void *context, uint64_t address, uint64_t size);
 } hl_host_memory_services;
 
 typedef struct hl_host_clock_services {

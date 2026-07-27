@@ -610,6 +610,66 @@ static hl_host_result hl_linux_memory_unmap_range(void *context, hl_host_handle 
     return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
+/* True while any live mapping handle covers a byte of [low, high). Both aliases of a code mapping count,
+ * because releasing either one out from under the owner is the failure this guard exists to prevent. */
+static int hl_linux_range_owned_locked(hl_host_linux *host, uintptr_t low, uintptr_t high) {
+    for (uint32_t index = 0; index < host->handle_capacity; ++index) {
+        const hl_linux_handle_entry *entry = &host->handles[index];
+        if (entry->kind != HL_LINUX_HANDLE_MAPPING || entry->size == 0) continue;
+        if (entry->address != NULL) {
+            uintptr_t owned = (uintptr_t)entry->address;
+            if (low < owned + (uintptr_t)entry->size && owned < high) return 1;
+        }
+        if (entry->executable_address != NULL) {
+            uintptr_t owned = (uintptr_t)entry->executable_address;
+            if (low < owned + (uintptr_t)entry->size && owned < high) return 1;
+        }
+    }
+    return 0;
+}
+
+/* Reject before acting, so a refused range is left exactly as it was found. */
+static hl_host_result hl_linux_memory_unmap_address(void *context, uint64_t address, uint64_t size) {
+    hl_host_linux *host = context;
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t low;
+    int status;
+    if (address == 0 || size == 0 || size > SIZE_MAX || page <= 0 || address > UINTPTR_MAX ||
+        address % (uint64_t)page != 0 || size % (uint64_t)page != 0 || size > (uint64_t)UINTPTR_MAX - address)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    low = (uintptr_t)address;
+    pthread_mutex_lock(&host->lock);
+    if (hl_linux_range_owned_locked(host, low, low + (uintptr_t)size)) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_linux_result(HL_STATUS_BUSY, 0, 0);
+    }
+    status = munmap((void *)low, (size_t)size);
+    pthread_mutex_unlock(&host->lock);
+    return status == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
+}
+
+/* mlock(2) pins against reclaim and charges RLIMIT_MEMLOCK, so this host reports HL_HOST_WIRE_RESIDENT.
+ * The length follows mlock's own rule and is rounded up to whole pages by the kernel. */
+static hl_host_result hl_linux_memory_wire_range(void *context, uint64_t address, uint64_t size, uint32_t flags) {
+    long page = sysconf(_SC_PAGESIZE);
+    (void)context;
+    if (address == 0 || size == 0 || size > SIZE_MAX || page <= 0 || address > UINTPTR_MAX || flags != 0 ||
+        address % (uint64_t)page != 0 || size > (uint64_t)UINTPTR_MAX - address)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (mlock((void *)(uintptr_t)address, (size_t)size) != 0) return hl_linux_errno_result();
+    return hl_linux_result(HL_STATUS_OK, 0, (uint64_t)HL_HOST_WIRE_RESIDENT);
+}
+
+static hl_host_result hl_linux_memory_unwire_range(void *context, uint64_t address, uint64_t size) {
+    long page = sysconf(_SC_PAGESIZE);
+    (void)context;
+    if (address == 0 || size == 0 || size > SIZE_MAX || page <= 0 || address > UINTPTR_MAX ||
+        address % (uint64_t)page != 0 || size > (uint64_t)UINTPTR_MAX - address)
+        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (munlock((void *)(uintptr_t)address, (size_t)size) != 0) return hl_linux_errno_result();
+    return hl_linux_result(HL_STATUS_OK, 0, (uint64_t)HL_HOST_WIRE_RESIDENT);
+}
+
 static hl_host_result hl_linux_memory_publish(void *context, hl_host_handle mapping, uint64_t offset, uint64_t size) {
     hl_host_linux *host = context;
     hl_linux_handle_entry *entry;
@@ -3716,7 +3776,9 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
                                                    hl_linux_memory_code_write,   hl_linux_memory_code_write,
                                                    hl_linux_memory_map_file,     hl_linux_memory_sync,
                                                    hl_linux_memory_unmap_range,  hl_linux_memory_map_anonymous,
-                                                   hl_linux_memory_discard,      hl_linux_memory_repair_signal_page};
+                                                   hl_linux_memory_discard,      hl_linux_memory_repair_signal_page,
+                                                   hl_linux_memory_unmap_address, hl_linux_memory_wire_range,
+                                                   hl_linux_memory_unwire_range};
     static const hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI,
                                                  .size = sizeof(clock),
                                                  .monotonic_ns = hl_linux_monotonic,

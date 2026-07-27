@@ -2,6 +2,7 @@
 
 #include "hl/fake.h"
 
+#include <stddef.h>
 #include <string.h>
 
 static int32_t fake_process_entry(void *context) {
@@ -198,6 +199,68 @@ int main(void) {
              HL_STATUS_WOULD_BLOCK);
     HL_CHECK(services.event->close(services.context, pollset.value).status == HL_STATUS_OK);
     HL_CHECK(services.directory->close(services.context, directory_copy.value).status == HL_STATUS_OK);
+    /* HL_HOST_MEMORY_ABI 7 behaviour on the fake provider. It owns no address space, so the honest answer
+     * to a wiring request is the typed unsupported status, not a success that pinned nothing. */
+    HL_CHECK(services.memory->abi == HL_HOST_MEMORY_ABI && services.memory->unmap_address != NULL &&
+             services.memory->wire_range != NULL && services.memory->unwire_range != NULL);
+    HL_CHECK(services.memory->unmap_address(services.context, 0x40000000, 4096).status == HL_STATUS_OK);
+    HL_CHECK(services.memory->unmap_address(services.context, 0, 4096).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->unmap_address(services.context, 0x40000000, 0).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->unmap_address(services.context, 0x40000001, 4096).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->unmap_address(services.context, 0x40000000, 4095).status == HL_STATUS_INVALID_ARGUMENT);
+    hl_fake_host_fail_next(&fake, HL_STATUS_PLATFORM_FAILURE);
+    HL_CHECK(services.memory->unmap_address(services.context, 0x40000000, 4096).status == HL_STATUS_PLATFORM_FAILURE);
+    HL_CHECK(services.memory->unmap_address(services.context, 0x40000000, 4096).status == HL_STATUS_OK);
+    {
+        hl_host_result unsupported = services.memory->wire_range(services.context, 0x40000000, 4096, 0);
+        HL_CHECK(unsupported.status == HL_STATUS_NOT_SUPPORTED && unsupported.detail == (uint64_t)HL_HOST_WIRE_NONE);
+        unsupported = services.memory->unwire_range(services.context, 0x40000000, 4096);
+        HL_CHECK(unsupported.status == HL_STATUS_NOT_SUPPORTED && unsupported.detail == (uint64_t)HL_HOST_WIRE_NONE);
+    }
+    HL_CHECK(services.memory->wire_range(services.context, 0x40000000, 4096, 1).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->wire_range(services.context, 0, 4096, 0).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->wire_range(services.context, 0x40000001, 4096, 0).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->unwire_range(services.context, 0, 4096).status == HL_STATUS_INVALID_ARGUMENT);
+
+    /* An ABI 7 group must carry every appended callback. */
+    malformed_memory = *services.memory;
+    malformed_memory.unmap_address = NULL;
+    truncated = services;
+    truncated.memory = &malformed_memory;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+    malformed_memory = *services.memory;
+    malformed_memory.wire_range = NULL;
+    truncated.memory = &malformed_memory;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+    malformed_memory = *services.memory;
+    malformed_memory.unwire_range = NULL;
+    truncated.memory = &malformed_memory;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+    /* An ABI 6 group stops before them and stays valid: two shipping hosts are still on it. */
+    malformed_memory = *services.memory;
+    malformed_memory.abi = HL_HOST_MEMORY_ABI_MIN;
+    malformed_memory.size = (uint32_t)offsetof(hl_host_memory_services, unmap_address);
+    malformed_memory.unmap_address = NULL;
+    malformed_memory.wire_range = NULL;
+    malformed_memory.unwire_range = NULL;
+    truncated.memory = &malformed_memory;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_OK);
+    /* The code-mapping prefix is inside the ABI 6 group, so it stays reachable there too. */
+    malformed_memory.reserve_code = fake_reserve_code;
+    malformed_memory.repair_code_after_fork = fake_repair_code;
+    truncated.capabilities |= HL_HOST_CAP_CODE_MAPPING;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_CODE_MAPPING) == HL_STATUS_OK);
+    truncated.capabilities = services.capabilities;
+    /* One byte short of the ABI 6 prefix is not a prefix. */
+    malformed_memory.size = (uint32_t)offsetof(hl_host_memory_services, unmap_address) - 1u;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+    /* Neither an unreleased future group nor a retired older one is accepted. */
+    malformed_memory = *services.memory;
+    malformed_memory.abi = HL_HOST_MEMORY_ABI + 1u;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+    malformed_memory.abi = HL_HOST_MEMORY_ABI_MIN - 1u;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+
     malformed_memory = *services.memory;
     malformed_memory.reserve_code = fake_reserve_code;
     malformed_memory.repair_code_after_fork = fake_repair_code;
