@@ -1,14 +1,128 @@
 # Signals and faults on a Windows host
 
-Design, not a record: nothing here has been compiled or run. Every Win32 claim is either cited to Microsoft's
-own documentation (§9) or marked as reasoned-but-unverified. Every engine claim was checked against the tree
-on `feat/windows-amd64`; line numbers drift, the symbol names do not.
+Every Win32 claim here is one of three things, and they are never blurred: **measured** on this host by a
+probe written for this document (§0.1), **cited** to Microsoft's own documentation (§9), or explicitly
+marked reasoned-but-unverified. Every engine claim was checked against the tree on `feat/windows-amd64`;
+line numbers drift, the symbol names do not.
 
 `DOCS.md` is normative. `docs/arch.md` §4.2 item 5 names `src/host/native_context.h` as the seam this
 document fills in; item 2 explains why the fault path forks on the host CPU at all.
 
 The scope is the host-OS axis only. The host CPU is x86-64 first; the AArch64-Windows cell is designed here
 because the matrix must be total, not because anything will run on it soon.
+
+---
+
+## 0. Revision: the SEH ruling
+
+**Revision 2.** Revision 1 was design-only, with nothing compiled or run. `docs/windows/prior-art-survey.md`
+§4.4 then measured that `__try`/`__except` compiles under `-fms-extensions` and segfaults, and concluded
+*"VEH is the only fault-interception mechanism this toolchain actually has."* This revision adjudicates that
+by experiment.
+
+**The ruling, in one line: the survey's measurement is correct and its conclusion is too strong.**
+`__try`/`__except` is dead — reproduced exactly. But two *other* table-based SEH mechanisms work on this
+compiler, and one of them is the mechanism Cygwin actually uses. The distinction matters because the survey's
+conclusion was being read as "table-based SEH is unavailable", and that is false.
+
+**What did not change: VEH was already the primary design and remains it.** Revision 1 §3 opened *"One
+process-wide VEH, registered once at `engine_global_init` with `AddVectoredExceptionHandler(1, hl_win_veh)`"*,
+and §4.3 named `__try`/`__except` only as a fallback, explicitly noting *"It cannot replace the VEH."* The
+survey invalidated the fallback, not the design.
+
+| Section | Change |
+|---|---|
+| §0.1 | **new** — the four-mechanism experiment and its results |
+| §2.2 note 1 | anonymous unions: was "check this", now **measured working** (`ctx->FltSave`, `ctx->Rax`) |
+| §3 preamble | VEH-vs-frame-handler ordering: now **measured**, and they compose |
+| §4.2 | `ContextFlags` at first chance: was "assert, never assume", now **measured `0x0010005f`** — every bit set, including `CONTEXT_XSTATE` |
+| §4.3 | **rewritten.** The `longjmp` ruling is now unconditional, and the replacement is an 80-byte pad at **1.06 ns**, not `RtlCaptureContext` at 22.9 ns |
+| §5.3 | AVX/AVX-512 through `LocateXStateFeature`: **measured**, both directions |
+| §9 | unverified items 2, 3 and 4 closed by measurement; item 5 unchanged |
+
+### 0.1 The experiment
+
+Toolchain: clang 22.1.8, target `x86_64-w64-windows-gnu`, `C:\msys64\clang64` — the exact compiler the
+survey used and the one we ship with. Host: Windows 11 Pro 10.0.26200, x86-64. Probes are in the session
+scratchpad, not the repo. Every row was built and run at both `-O0` and `-O2`.
+
+| Mechanism | `-O0` | `-O2` | Verdict |
+|---|---|---|---|
+| `__try`/`__except`, no flag | `error: use of undeclared identifier '__try'` | same | unavailable |
+| `__try`/`__except`, `-fms-extensions` | compiles, **segfaults** | compiles, **segfaults** | **broken — survey confirmed** |
+| `.seh_handler` directive + our own handler | **works** | **works**, iff the enclosing function has a `.seh_proc` | **available, with a precondition** |
+| `RtlAddFunctionTable` + hand-built `UNWIND_INFO` | **works** | **works** | **available** |
+| VEH (control) | **works** | **works** | **available** |
+
+**`__try` — confirmed broken, and the failure is localised.** A logging VEH shows exactly **one** exception
+dispatched (`0xC0000005`, first chance, `Info[0]=1`, `Info[1]=0`), after which the process dies without a
+second exception and without the `__except` block running. The codegen is *not* the problem: clang emits
+`.seh_handler __C_specific_handler, @unwind, @except`, a well-formed MSVC scope table
+(`LabelStart`/`LabelEnd`/`CatchAll=1`/`JumpTarget`), and `llvm-readobj --unwind` confirms `main`'s xdata
+carries `ExceptionHandler | TerminateHandler` pointing at `__C_specific_handler`. That symbol is imported
+from `api-ms-win-crt-private-l1-1-0.dll`. So dispatch reached the CRT's scope-table walker and it failed to
+claim the exception. **The breakage is in the `__C_specific_handler` glue layer, not in `.seh_handler`, not
+in the xdata, and not in NT's dispatch.** Do not use `__try`; do not conclude from it that xdata handlers
+are unavailable.
+
+**`.seh_handler` — works, and this is the Cygwin mechanism.** A hand-written
+`EXCEPTION_DISPOSITION(EXCEPTION_RECORD*, void*, CONTEXT*, void*)` attached with
+`__asm__(".seh_handler my_handler, @except")` is called by `RtlDispatchException`, can rewrite `ctx->Rip`,
+and can return `ExceptionContinueExecution` to resume. `llvm-readobj --unwind` confirms the directive lands
+in the function's `UNWIND_INFO` as `Flags [ ExceptionHandler (0x1) ]` with the correct handler RVA. This is
+what `winsup/cygwin/local_includes/exception.h` does, installed in the outermost frame of every thread.
+
+The precondition, which cost the first attempt: **the directive requires an active `.seh_proc`, and clang
+emits none for a frameless leaf function.** At `-O1`+ a leaf gets no unwind info at all, and the directive
+fails to *compile* with `error: .seh_ directive must appear within an active frame`. Measured, same `-O2`,
+four variants of one function:
+
+| Variant | `-O2` |
+|---|---|
+| plain leaf | **compile error** |
+| non-leaf (makes a call) | **compile error** — a call is not sufficient |
+| `__attribute__((optnone))` | **works** |
+| clobbers `rbx`/`rbp`/`r12`–`r15` (forces `pushreg` prologue) | **works** |
+
+So the precondition is *"the function has a prologue"*, and it is satisfiable deliberately, not by luck. A
+`run_block`-shaped function has one anyway; `optnone` or a callee-saved clobber list makes it unconditional.
+This also explains why Cygwin never trips over it.
+
+*(A note on the first `.seh_handler` probe, because it nearly produced the wrong ruling: it used `&&label`
+for the resume address, clang folded the blockaddress to the integer `1`, and the handler faithfully set
+`Rip = 1`. The crash looked exactly like "the mechanism does not work". The xdata was correct the whole time.
+Both the resume label and the faulting instruction have to be in one inline-asm block for this test to mean
+anything.)*
+
+**`RtlAddFunctionTable` — works, with a clean control.** One `RUNTIME_FUNCTION` over a JIT page, a
+hand-built `UNWIND_INFO` (`Version=1`, `UNW_FLAG_EHANDLER`, `SizeOfProlog=0`, `CountOfCodes=0`, handler RVA
+at offset 4), and a `movabs rax, handler; jmp rax` thunk *inside* the range because the handler RVA is a
+32-bit offset from the table base — HotSpot's recipe, `os_windows_x86.cpp`. With the table registered the
+handler runs and `Rip += 6` resumes past the faulting store; **with the identical binary run without
+registering the table, the process dies.** No VEH was installed in either mode, so the result is
+attributable.
+
+**VEH — works, in all four shapes the engine needs**, at `-O0` and `-O2`:
+
+| Shape | Engine analogue | Result |
+|---|---|---|
+| `VirtualProtect` the page, return `CONTINUE_EXECUTION` (re-executes) | `smc_on_write`, the lazy zero-page grower | OK |
+| rewrite `ContextRecord->Rip` | `nonpie_fixup`, `hl_x86_signal_fast_clock_fault` | OK |
+| restore `Rip`/`Rsp`/`Rbp`/`Rbx`/`Rsi`/`Rdi`/`R12`–`R15` from a pad | `interp_signal_resume` | OK |
+| overwrite the whole `CONTEXT`, preserving `ContextFlags` | — | OK |
+
+**Ordering, measured.** With a process-wide VEH *and* a frame-scoped `.seh_handler` both live: the order is
+`VEH, FRAME`. When the VEH returns `EXCEPTION_CONTINUE_SEARCH` the frame handler receives the exception and
+can resume from it; when the VEH returns `EXCEPTION_CONTINUE_EXECUTION` the frame handler never runs.
+Identical at `-O0` and `-O2`. **The two compose**, which is what makes §4.3's fallback real rather than
+theoretical.
+
+*Environmental note, not a result:* several freshly built probe binaries were blocked by Windows Application
+Control (`Permission denied` from the shell, *"An Application Control policy has blocked this file"* from
+PowerShell) — reputation-based blocking of new, unsigned executables that rewrite `Rip` from an exception
+handler. Rebuilding under a different path cleared it every time. **Budget for this in CI:** a Windows lane
+that builds and immediately runs an unsigned engine binary can be blocked by policy, and the failure looks
+nothing like a test failure.
 
 ---
 
@@ -254,10 +368,12 @@ files other agents own, so it is proposed as a follow-up rather than taken here.
 
 Three things to check before this compiles, all of them cheap and none of them assumed here:
 
-1. **Anonymous unions.** `(uc)->Rax`, `(uc)->FltSave`, `(uc)->X` and `(uc)->V` all live inside
-   `DUMMYUNIONNAME`. mingw-w64 spells it `__C89_NAMELESS`, which expands to nothing under GCC/clang, so
-   the members are genuinely anonymous and the macros work. If a toolchain names the union, every accessor
-   gains a `.DUMMYUNIONNAME`.
+1. ~~**Anonymous unions.**~~ **Measured (rev 2), no longer an open question on x86-64.** `ctx->Rax` and
+   `ctx->FltSave.XmmRegisters` compile and resolve correctly under clang 22.1.8 `x86_64-w64-windows-gnu`
+   with no `.DUMMYUNIONNAME` qualifier: mingw-w64's `__C89_NAMELESS` expands to nothing for clang, so the
+   union is genuinely anonymous. §5.3's probe read *and wrote* live `xmm0` through
+   `ctx->FltSave.XmmRegisters`. The ARM64 spellings `(uc)->X` and `(uc)->V` remain unverified — no ARM64
+   Windows toolchain was available — so that cell keeps the caveat.
 2. **`windows.h` in a header included by ten TUs.** It defines `ERROR`, `IN`, `OUT`, `near`, `far`,
    `interface`, `min`/`max`. `WIN32_LEAN_AND_MEAN` + `NOMINMAX` + `NOGDI` covers the worst of it;
    a collision sweep over the engine's own identifiers is required, not optional.
@@ -271,7 +387,8 @@ Three things to check before this compiles, all of them cheap and none of them a
 | `HL_HOST_UC_PC` | `uc_mcontext.pc` / `gregs[REG_RIP]` | `Pc` / `Rip` — same |
 | `HL_HOST_UC_SP` | `uc_mcontext.sp` / `gregs[REG_RSP]` | `Sp` / `Rsp` — same |
 | AArch64 V regs | `__reserved` chain walk for `FPSIMD_MAGIC`, may return NULL | plain `V[32]`, never NULL — **strictly simpler** |
-| x86-64 XMM | `uc_mcontext.fpregs` is optional, may be NULL | always present, gated on `ContextFlags` |
+| x86-64 XMM | `uc_mcontext.fpregs` is optional, may be NULL | always present; `CONTEXT_FLOATING_POINT` measured set (§4.2) |
+| x86-64 YMM/ZMM upper lanes | not reachable from `ucontext` at all | reachable **and writable** via `LocateXStateFeature` (§5.3) — **a gain over POSIX** |
 | x86-64 EFLAGS | `gregs[REG_EFL]`, in the GPR index space | separate `EFlags` member — **the one shape break** |
 | signal mask | `uc_sigmask`, and `interp_restore_handler_mask` owes a restore | does not exist; **nothing is owed** (§4.3) |
 | MXCSR | not exposed by the matrix | `MxCsr` is a first-class member |
