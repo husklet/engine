@@ -798,7 +798,7 @@ static int container_init(const char *rootfs) {
     }
     if (rootfs && rootfs[0]) { // the shared container jails against the canonical rootfs + its dir fd
         g_rootfs = (char *)rootfs;
-        if (root_handle_bind(g_rootfs) != 0) return -1;
+        if (root_handle_bind(g_rootfs) != 0 || root_native_require(g_rootfs) != 0) return -1;
         container_populate_dev();        // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         container_populate_machine_id(); // /etc/machine-id agreeing with boot_id (if image ships none)
         // Container identity = root (0) by default; HL_UID/HL_GID or typed launch fields override it.

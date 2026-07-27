@@ -208,6 +208,17 @@ set(MACOS_HOST_SOURCES
   src/host/macos/directory.c src/host/macos/host.c src/host/macos/process.c
   src/host/macos/range.c src/host/macos/system.c)
 
+# The Windows archive deliberately does NOT pull COMMON_HOST_SOURCES wholesale:
+# resolve.c needs the *at() family, child.c needs SIGCHLD, fork_wire.c needs
+# SCM_RIGHTS and private.c needs a fork-inherited shared mapping, none of which
+# this host has. sync.c is the one member that is portable -- its registry
+# bookkeeping is host independent and only its ~30-line primitive layer is
+# POSIX, which it now selects per host -- so it is listed on its own. The rest
+# arrive with the groups that need them.
+set(WINDOWS_HOST_SOURCES
+  src/host/windows/host.c src/host/windows/memory.c src/host/windows/clock.c
+  src/host/sync.c)
+
 # --- archives ---------------------------------------------------------------
 # Each links the engine flag interface PRIVATE so the exact ENGINE_CFLAGS apply.
 add_library(hl-engine     STATIC ${CORE_SOURCES})
@@ -229,16 +240,12 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     src/host/clock.c src/host/file.c)
   target_link_libraries(hl-host-macos PRIVATE hl_engine_cflags)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-  # No libhl-host-windows yet. src/host/windows/ reserves the boundary and holds
-  # only a README; COMMON_HOST_SOURCES is not portable to it as it stands
-  # (resolve.c needs the *at() family, child.c needs SIGCHLD, fork_wire.c needs
-  # SCM_RIGHTS, private.c needs a fork-inherited shared mapping). That archive
-  # brings the COMMON_HOST_SOURCES re-split with it. Everything downstream asks
-  # `if(TARGET hl-host-windows)` rather than testing the OS, so adding the arm
-  # later is a one-place change.
-  message(STATUS
-    "Windows host: no libhl-host-windows yet (src/host/windows/ is a reserved "
-    "boundary). The host-neutral archives still build.")
+  # libhl-host-windows currently implements memory (incl. code mapping), clock,
+  # log and sync, and advertises exactly those capability bits. The remaining
+  # groups land as further src/host/windows/*.c files on this same list; nothing
+  # downstream tests the OS, it asks `if(TARGET hl-host-windows)`.
+  add_library(hl-host-windows STATIC ${WINDOWS_HOST_SOURCES})
+  target_link_libraries(hl-host-windows PRIVATE hl_engine_cflags)
 endif()
 
 # --- Phase 2: Linux production engines + dual embedded activation archive ----
