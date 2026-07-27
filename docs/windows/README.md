@@ -74,17 +74,32 @@ is no cheap subset: glibc's plain `fork()` carries no `CLONE_VM` signal, so an e
 
 `hl_host_posix_attachment_services` is an explicitly *optional* POSIX adapter that hands out a raw
 native descriptor. Windows has nothing to hand out. Omitting the capability is legal — validation's
-clause is inert when the bit is clear, and the fake backend already ships that way — but:
+clause is inert when the bit is clear, and the fake backend already ships that way — but
+`root_handle_bind` (`src/linux_abi/container/vfs.c`) hard-fails on the NULL pointer and
+`src/core/target/x86_64.c:801/812` turns that into unconditional init failure **for bare guests too**.
 
-- `root_handle_bind` (`src/linux_abi/container/vfs.c:1455`) hard-fails on the NULL pointer, and
-- `src/core/target/x86_64.c:801/812` turns that into unconditional init failure **for bare guests too**,
-- with 61 direct `openat`/`fstatat`/`readlinkat` sites in `src/linux_abi` sitting on that borrowed fd.
+**The scoping pass corrected two things about this, in opposite directions.**
 
-So a *perfect* Windows backend still would not boot a guest. This is the one place the portability seam
-was bypassed, and it happens to gate boot. It is portable-layer work that pays back on every host, which
-is the same argument DOCS.md §12 already makes for the persistent-cache routing that was done this way.
-[`linux-abi-fd-lane.md`](linux-abi-fd-lane.md) scopes it, and the question that decides milestone versus
-mountain is which subset a bare guest actually traverses.
+It is *smaller* than first reported. `root_handle_bind` turns out to be a **gate, not a functional
+dependency**: `jail_routed_at` (`fs.c:90-97`) returns `g_rootfs ? 1 : jail_match(...) >= 0`, so a bare
+guest with no volumes never enters the jail lane at all, and the ELF load already goes typed
+(`x86.c:70` → `image.c:43`). The entire boot blocker is **one call, `vfs.c:1475`, and about 15 lines**.
+A *statically linked* bare guest then needs nothing further in this lane, because it opens no path.
+
+The "61 sites" figure was also wrong — it counted identifier occurrences, which here are dominated by
+comments and `switch` labels. `fs.c` *mentions* `openat` 86 times and *calls* it 3 times; all 21 hits in
+`nonpie_args.h` are `case 56: // openat(...)` labels. Comment-stripped and `(`-anchored the real figure
+is **66 `*at`-family call sites**, of which 50 need nothing new and 13 need one of four appended
+callbacks.
+
+But it is *larger* somewhere else, and this is the finding that matters for scheduling. The `*at` family
+is the **middle** of three surfaces. Surface 3 is ambient POSIX on descriptors, where **a guest fd number
+literally is a host fd number** (`ATFD` at `dispatch.c:32`, `close(cf)` at `fs.c:3588`) — roughly **900
+calls**. That, not `posix_attachment`, is the real Windows schedule driver. It is recorded here so it is
+not discovered late.
+
+[`linux-abi-fd-lane.md`](linux-abi-fd-lane.md) has the four-milestone breakdown and the seven-step
+ordering, each step green on its own.
 
 ## 4. Where the tests can silently lie
 
