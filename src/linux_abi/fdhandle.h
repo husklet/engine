@@ -68,7 +68,27 @@ enum {
     HL_FDHANDLE_APPEND = 1u << 3,
     HL_FDHANDLE_NONBLOCK = 1u << 4,
     /* The object has a file offset -- false for a stream, pipe or terminal. */
-    HL_FDHANDLE_SEEKABLE = 1u << 5
+    HL_FDHANDLE_SEEKABLE = 1u << 5,
+    /* AMBIENT: this binding carries STATE ONLY and holds no host handle.
+     *
+     * It exists for the descriptor a host produced through its own ambient
+     * descriptor namespace -- the UCRT's open() on Windows -- where the int
+     * already names the object, so no handle is needed to read or write it, but
+     * the per-descriptor FACTS the guest may ask for later still have nowhere
+     * to live: the CRT exposes no per-descriptor metadata channel, so
+     * close-on-exec, the access mode and the two settable status flags are
+     * unanswerable unless the engine records what it asked for.
+     *
+     * The distinction is load-bearing rather than cosmetic. hl_fdhandle_lookup()
+     * -- the handle accessor every typed consumer uses (readv/writev, map_file,
+     * the logical VMA ledger) -- reports an ambient binding as a MISS, because
+     * there genuinely is no handle and those consumers must keep taking the
+     * ambient path they take today. Only hl_fdhandle_lookup_state(), whose
+     * callers read the state word and not the handle, sees it. That is what
+     * keeps this from becoming the "two positions for one file" hazard: an
+     * ambient descriptor has exactly ONE position, the host's, because nothing
+     * here ever opens a second object for it. */
+    HL_FDHANDLE_AMBIENT = 1u << 6
 };
 
 /* The status-flag subset F_SETFL is allowed to change. */
@@ -83,8 +103,17 @@ const hl_host_services *hl_fdhandle_host(void);
    Publishing over a live binding releases the one it replaced. */
 int hl_fdhandle_publish(int descriptor, hl_host_handle handle, uint32_t state);
 
-/* 1 and fills *handle when bound; 0 otherwise. *handle is untouched on a miss. */
+/* Record STATE ONLY for a descriptor whose object is the host's own ambient
+   descriptor -- see HL_FDHANDLE_AMBIENT. Owns nothing and closes nothing; the
+   descriptor is closed by whoever opened it. 0 on success, -1 out of range. */
+int hl_fdhandle_publish_ambient(int descriptor, uint32_t state);
+
+/* 1 and fills *handle when a HANDLE is bound; 0 otherwise -- and an ambient
+   binding is deliberately a 0 here, because it holds no handle. *handle is
+   untouched on a miss. */
 int hl_fdhandle_lookup(int descriptor, hl_host_handle *handle);
+/* 1 when a binding of EITHER kind exists. *handle is HL_HOST_HANDLE_INVALID for
+   an ambient one, so a caller that reads it must check. */
 int hl_fdhandle_lookup_state(int descriptor, hl_host_handle *handle, uint32_t *state);
 
 /* Replace the state word of a live binding. 0 on success, -1 if unbound. */

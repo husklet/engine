@@ -155,8 +155,12 @@ else
             > "cfg-$t-guest.log" 2>&1 || { echo "$t: configure with guest fixtures FAILED"; continue; }
         targets="compat-engines"
         for s in $COMPAT_SUITES; do targets="$targets compat-$s-fixtures"; done
+        # --target, not bare words: without it cmake reads the first target as a
+        # second positional argument, prints its usage and exits non-zero, so the
+        # step reported "fixture/engine build FAILED" on BOTH columns and the
+        # strongest check in this script had never actually run.
         # shellcheck disable=SC2086
-        cmake --build "build-$t-guest" $targets > "build-$t-guest.log" 2>&1 ||
+        cmake --build "build-$t-guest" --target $targets > "build-$t-guest.log" 2>&1 ||
             { echo "$t: fixture/engine build FAILED"; continue; }
         for s in $COMPAT_SUITES; do
             printf '%-9s compat.%-12s %s\n' "$t:" "$s" \

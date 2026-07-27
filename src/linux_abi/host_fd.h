@@ -108,11 +108,12 @@
  *     The fix is the Windows host backend's file group, which already takes
  *     typed HL_HOST_FILE_* access words instead of a flag bit-set.
  *
- *   - src/linux_abi/errno.c's hl_linux_errno_from_macos() is the identity on any
- *     non-Apple host, so a refusal's ENOSYS travels to the guest as the UCRT's
- *     number 40 -- which is Linux ELOOP, not Linux ENOSYS (38).  Every refusal
- *     below is still a refusal; it just arrives wearing the wrong name until
- *     that translator grows a Windows arm.
+ *   - RESOLVED. src/linux_abi/errno.c's hl_linux_errno_from_macos() now has a
+ *     Windows arm.  The residual noted here was worse than recorded: the
+ *     function is not the identity off Apple, it fed the UCRT's number to the
+ *     DARWIN table, so a refusal's ENOSYS (UCRT 40) reached the guest as Linux
+ *     90 EMSGSIZE -- "message too long" for "not implemented" -- rather than as
+ *     the ELOOP predicted here.  Both are wrong; it is now 38.
  */
 
 #if !defined(_WIN32)
@@ -439,9 +440,28 @@ static inline int fcntl(int descriptor, int command, ...) {
  * REAL for AT_FDCWD, REFUSAL otherwise -- population (1) -- and REFUSAL for a
  * flag the CRT would accept and ignore.  _O_BINARY is added unconditionally:
  * POSIX open performs no newline translation and the CRT's default does.
+ *
+ * ON SUCCESS IT ALSO FILES AN AMBIENT BINDING, and that is what makes fcntl()
+ * above work for a file the guest opened.  The descriptor this returns is the
+ * CRT's own, so read/write/lseek keep reaching it directly and nothing here
+ * opens a second object for it -- but the CRT then remembers NOTHING about it,
+ * and fcntl's four flag commands answer from the record or not at all.  Without
+ * the binding they refused, and the refusal was not academic: glibc's fdopen()
+ * calls fcntl(fd, F_GETFL) to recover the access mode, so tmpfile() returned
+ * NULL for every guest and the caller dereferenced it.  That single missing
+ * record was the whole of the libc suite's stdio failures.
+ *
+ * The state is what the ENGINE asked for, which is the only honest source: the
+ * access mode and O_APPEND come from the flag word, O_CLOEXEC from the same,
+ * and SEEKABLE is true because this call opens a name in the file system and
+ * the CRT gives every such descriptor an offset.  Losing the binding (leaf
+ * allocation failure) is not worth failing an open that succeeded -- it costs
+ * the fcntl answers, which is exactly where this host was a moment ago.
  */
 static inline int openat(int directory, const char *path, int flags, ...) {
     int mode = 0;
+    int descriptor;
+    uint32_t state;
     if (flags & O_CREAT) {
         va_list arguments;
         va_start(arguments, flags);
@@ -456,7 +476,20 @@ static inline int openat(int directory, const char *path, int flags, ...) {
         errno = ENOSYS; /* O_DIRECTORY / O_NOFOLLOW / O_NONBLOCK / O_PATH / ... */
         return -1;
     }
-    return open(path, (flags & ~O_TEXT) | _O_BINARY, mode);
+    descriptor = open(path, (flags & ~O_TEXT) | _O_BINARY, mode);
+    if (descriptor < 0) return descriptor;
+    /* O_RDONLY is 0, so the access mode is a value in the low two bits and not
+       a bit-set -- readable is the absence of O_WRONLY. */
+    switch (flags & O_ACCMODE) {
+    case O_WRONLY: state = HL_FDHANDLE_WRITE; break;
+    case O_RDWR: state = HL_FDHANDLE_READ | HL_FDHANDLE_WRITE; break;
+    default: state = HL_FDHANDLE_READ; break;
+    }
+    state |= HL_FDHANDLE_SEEKABLE;
+    if (flags & O_APPEND) state |= HL_FDHANDLE_APPEND;
+    if (flags & O_CLOEXEC) state |= HL_FDHANDLE_CLOEXEC;
+    (void)hl_fdhandle_publish_ambient(descriptor, state);
+    return descriptor;
 }
 
 /*

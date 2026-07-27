@@ -27,6 +27,10 @@
 extern void hl_host_private_init(void) __attribute__((weak));
 extern int hl_host_process_fd_private_add(int descriptor) __attribute__((weak));
 extern void hl_host_process_fd_private_remove(int descriptor) __attribute__((weak));
+/* Distinguishes "this host has no private band" (negative) from "it has one and
+ * the add still failed", which is the difference between a tolerable refusal and
+ * a real error at the registration site below. */
+extern int hl_host_process_fd_private_floor(void) __attribute__((weak));
 
 // hl_run_linux_guest() is the internal Linux guest entry defined by each target translation unit.
 int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable,
@@ -345,9 +349,29 @@ int hl_run_config_file_with(const char *path, hl_launch_runner runner) {
      * decoded from it.  It is engine control state, never a guest descriptor. */
     if (hl_host_private_init != NULL) hl_host_private_init();
     if (hl_host_process_fd_private_add != NULL && hl_host_process_fd_private_add(fd) != 0) {
-        close(fd);
-        fprintf(stderr, "hl-engine: --configfile: cannot reserve private descriptor\n");
-        return 78;
+        /* Registration failed. Whether that is fatal depends on WHY. The weak
+         * hook above already tolerates a host with no private-descriptor
+         * implementation at all (portable core/unit links); the same tolerance
+         * is owed to a host that HAS the implementation and answers "there is
+         * no private band here". Windows is exactly that host: it has neither
+         * F_DUPFD nor RLIMIT_NOFILE, so src/host/windows/private.c refuses the
+         * whole group by design and reports a negative floor to say so.
+         *
+         * The band is a COLLISION HAZARD control, not a correctness one --
+         * src/host/windows/private.c makes that argument, and _private_is()
+         * there answers "not private" for everything, so nothing downstream is
+         * told a lie by proceeding. Refusing instead cost the entire typed
+         * launch path on Windows: all 8 matrix-runner cases died here with
+         * "cannot reserve private descriptor" before the guest ever started.
+         *
+         * A host that HAS a band and still failed (ENOSPC: the registry is
+         * full) is a real failure and stays fatal. */
+        int floor = hl_host_process_fd_private_floor != NULL ? hl_host_process_fd_private_floor() : -1;
+        if (floor >= 0) {
+            close(fd);
+            fprintf(stderr, "hl-engine: --configfile: cannot reserve private descriptor\n");
+            return 78;
+        }
     }
     unlink(path);
     int rc = hl_read_config_file(fd, runner);

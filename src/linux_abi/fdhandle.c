@@ -80,18 +80,34 @@ static struct hl_fdhandle_slot *fdhandle_slot(int descriptor) {
     return leaf == NULL ? NULL : &leaf->slots[descriptor % HL_FDHANDLE_LEAF];
 }
 
-// Retire a binding and hand the caller the handle it held, or INVALID. The
-// handle is cleared before the state so no reader can see a live handle paired
-// with a state word that has already been reused.
-static hl_host_handle fdhandle_take(int descriptor) {
+// Retire a binding of either kind and hand the caller the handle it held, or
+// INVALID. The handle is cleared before the state so no reader can see a live
+// handle paired with a state word that has already been reused.
+//
+// *retired, when non-NULL, reports whether a binding EXISTED, which stopped
+// being the same question as "was there a handle" once an ambient binding could
+// be filed with no handle at all. Its liveness marker is HL_FDHANDLE_AMBIENT in
+// the state word, so the exchange below has to read both.
+static hl_host_handle fdhandle_take_full(int descriptor, int *retired) {
     struct hl_fdhandle_slot *slot = fdhandle_slot(descriptor);
     uint64_t previous;
+    uint32_t previous_state;
+    if (retired != NULL) *retired = 0;
     if (slot == NULL) return HL_HOST_HANDLE_INVALID;
     previous = atomic_exchange_explicit(&slot->handle, (uint64_t)HL_HOST_HANDLE_INVALID, memory_order_acq_rel);
-    if (previous == HL_HOST_HANDLE_INVALID) return HL_HOST_HANDLE_INVALID;
-    atomic_store_explicit(&slot->state, 0, memory_order_relaxed);
+    previous_state = atomic_exchange_explicit(&slot->state, 0, memory_order_acq_rel);
+    if (previous == HL_HOST_HANDLE_INVALID && !(previous_state & HL_FDHANDLE_AMBIENT))
+        return HL_HOST_HANDLE_INVALID;
+    if (retired != NULL) *retired = 1;
     (void)atomic_fetch_sub_explicit(&g_fdhandle_population, 1, memory_order_relaxed);
-    return (hl_host_handle)previous;
+    return previous == HL_HOST_HANDLE_INVALID ? HL_HOST_HANDLE_INVALID : (hl_host_handle)previous;
+}
+
+static hl_host_handle fdhandle_take(int descriptor) { return fdhandle_take_full(descriptor, NULL); }
+
+// Live in either sense: a handle binding, or an ambient state-only one.
+static int fdhandle_live(uint64_t handle, uint32_t state) {
+    return handle != HL_HOST_HANDLE_INVALID || (state & HL_FDHANDLE_AMBIENT) != 0;
 }
 
 static void fdhandle_close(hl_host_handle handle) {
@@ -117,11 +133,29 @@ int hl_fdhandle_publish(int descriptor, hl_host_handle handle, uint32_t state) {
     return 0;
 }
 
+int hl_fdhandle_publish_ambient(int descriptor, uint32_t state) {
+    struct hl_fdhandle_leaf *leaf = fdhandle_leaf_claim(descriptor);
+    struct hl_fdhandle_slot *slot;
+    if (leaf == NULL) return -1;
+    slot = &leaf->slots[descriptor % HL_FDHANDLE_LEAF];
+    // Same reuse rule as hl_fdhandle_publish: a live binding under this number
+    // belongs to an object that is gone, so retire (and close) it first.
+    fdhandle_close(fdhandle_take(descriptor));
+    // Release order: the AMBIENT bit is this binding's liveness marker, so the
+    // store that sets it must publish the rest of the state word with it.
+    atomic_store_explicit(&slot->state, state | (uint32_t)HL_FDHANDLE_AMBIENT, memory_order_release);
+    (void)atomic_fetch_add_explicit(&g_fdhandle_population, 1, memory_order_relaxed);
+    return 0;
+}
+
 int hl_fdhandle_lookup(int descriptor, hl_host_handle *handle) {
     struct hl_fdhandle_slot *slot = fdhandle_slot(descriptor);
     uint64_t found;
     if (slot == NULL) return 0;
     found = atomic_load_explicit(&slot->handle, memory_order_acquire);
+    // Deliberately does NOT consult HL_FDHANDLE_AMBIENT: this is the accessor
+    // every typed handle consumer uses, and an ambient binding has no handle to
+    // give them. A miss sends them down the ambient path, which is correct.
     if (found == HL_HOST_HANDLE_INVALID) return 0;
     if (handle != NULL) *handle = (hl_host_handle)found;
     return 1;
@@ -130,30 +164,46 @@ int hl_fdhandle_lookup(int descriptor, hl_host_handle *handle) {
 int hl_fdhandle_lookup_state(int descriptor, hl_host_handle *handle, uint32_t *state) {
     struct hl_fdhandle_slot *slot = fdhandle_slot(descriptor);
     uint64_t found;
+    uint32_t found_state;
     if (slot == NULL) return 0;
     found = atomic_load_explicit(&slot->handle, memory_order_acquire);
-    if (found == HL_HOST_HANDLE_INVALID) return 0;
-    if (handle != NULL) *handle = (hl_host_handle)found;
-    if (state != NULL) *state = atomic_load_explicit(&slot->state, memory_order_relaxed);
+    found_state = atomic_load_explicit(&slot->state, memory_order_acquire);
+    if (!fdhandle_live(found, found_state)) return 0;
+    if (handle != NULL) *handle = (hl_host_handle)found; /* INVALID when ambient */
+    if (state != NULL) *state = found_state;
     return 1;
 }
 
 int hl_fdhandle_set_state(int descriptor, uint32_t state) {
     struct hl_fdhandle_slot *slot = fdhandle_slot(descriptor);
-    if (slot == NULL || atomic_load_explicit(&slot->handle, memory_order_acquire) == HL_HOST_HANDLE_INVALID) return -1;
-    atomic_store_explicit(&slot->state, state, memory_order_relaxed);
+    uint64_t handle;
+    uint32_t current;
+    if (slot == NULL) return -1;
+    handle = atomic_load_explicit(&slot->handle, memory_order_acquire);
+    current = atomic_load_explicit(&slot->state, memory_order_acquire);
+    if (!fdhandle_live(handle, current)) return -1;
+    // AMBIENT is the binding's kind, not a flag a caller may set or clear, and
+    // for an ambient binding it is also the liveness marker -- dropping it here
+    // would silently retire the binding a caller was only editing.
+    atomic_store_explicit(&slot->state, (state & ~(uint32_t)HL_FDHANDLE_AMBIENT) |
+                                            (current & (uint32_t)HL_FDHANDLE_AMBIENT),
+                          memory_order_release);
     return 0;
 }
 
 int hl_fdhandle_forget(int descriptor) {
-    return fdhandle_take(descriptor) != HL_HOST_HANDLE_INVALID;
+    int retired = 0;
+    (void)fdhandle_take_full(descriptor, &retired);
+    return retired;
 }
 
 int hl_fdhandle_release(int descriptor) {
-    hl_host_handle handle = fdhandle_take(descriptor);
-    if (handle == HL_HOST_HANDLE_INVALID) return 0;
-    fdhandle_close(handle);
-    return 1;
+    int retired = 0;
+    hl_host_handle handle = fdhandle_take_full(descriptor, &retired);
+    // An ambient binding owns no handle, so there is nothing to close -- but it
+    // was still a binding, and the caller is entitled to know one was shed.
+    if (handle != HL_HOST_HANDLE_INVALID) fdhandle_close(handle);
+    return retired;
 }
 
 int hl_fdhandle_clone(int from, int to) {
@@ -164,6 +214,13 @@ int hl_fdhandle_clone(int from, int to) {
     hl_host_result cloned;
     if (from == to) return 0;
     if (!hl_fdhandle_lookup_state(from, &source, &state)) return -1;
+    // An ambient source has no handle to clone. It does not need one: the
+    // caller's own dup(2) already produced `to` in the host's descriptor
+    // namespace and both numbers name the one host object. All that is missing
+    // on the new number is the record, which is what dup(2) copies anyway --
+    // minus close-on-exec, exactly as below.
+    if (state & HL_FDHANDLE_AMBIENT)
+        return hl_fdhandle_publish_ambient(to, state & ~(uint32_t)HL_FDHANDLE_CLOEXEC);
     if (file == NULL || file->clone_for_fork == NULL) return -1;
     cloned = file->clone_for_fork(host->context, source);
     if (cloned.status != HL_STATUS_OK || cloned.value == HL_HOST_HANDLE_INVALID) return -1;
@@ -185,8 +242,12 @@ int hl_fdhandle_release_cloexec(void) {
         if (leaf == NULL) continue;
         for (slot_index = 0; slot_index < HL_FDHANDLE_LEAF; slot_index++) {
             struct hl_fdhandle_slot *slot = &leaf->slots[slot_index];
-            if (atomic_load_explicit(&slot->handle, memory_order_acquire) == HL_HOST_HANDLE_INVALID) continue;
-            if (!(atomic_load_explicit(&slot->state, memory_order_relaxed) & HL_FDHANDLE_CLOEXEC)) continue;
+            uint32_t slot_state = atomic_load_explicit(&slot->state, memory_order_acquire);
+            // Ambient bindings sweep here too: the descriptor they describe is
+            // closed by the exec path like any other close-on-exec fd, and a
+            // record left behind would then describe whatever reused the number.
+            if (!fdhandle_live(atomic_load_explicit(&slot->handle, memory_order_acquire), slot_state)) continue;
+            if (!(slot_state & HL_FDHANDLE_CLOEXEC)) continue;
             released += hl_fdhandle_release(leaf_index * HL_FDHANDLE_LEAF + slot_index);
         }
     }

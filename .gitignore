@@ -35,3 +35,7 @@ build-*/
 
 # Agent working directory: nix devshell helper and transient probes.
 scratchpad/
+
+# Corpus measurement logs (tools/windows/run_corpus.sh). Large, machine-specific,
+# and regenerated on demand -- the numbers belong in commit messages, not the tree.
+corpus-logs*/

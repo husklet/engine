@@ -167,10 +167,55 @@ static inline ssize_t hl_linux_uio_seam(hl_host_handle handle, const struct iove
     return (ssize_t)result.value;
 }
 
+/*
+ * A multi-segment transfer over a descriptor that has no handle: walk the
+ * segments with the CRT's own read/write, stopping on the first short or failed
+ * one exactly as the kernel does.
+ *
+ * WHY THIS IS SOUND HERE AND NOT IN GENERAL.  readv/writev differ from a loop in
+ * one respect only: the kernel performs them as a single operation against the
+ * file offset, so a concurrent transfer on the same description cannot interleave
+ * between segments.  That distinction is observable on a pipe, a socket or a
+ * terminal, where a second writer exists and PIPE_BUF atomicity is specified --
+ * so this path is taken ONLY for a descriptor the engine recorded as SEEKABLE,
+ * which on this host means a regular file that openat() opened by name.  For a
+ * regular file the loop and the vectored call transfer the same bytes to the
+ * same offsets in the same order, and POSIX specifies no additional atomicity
+ * that a single-threaded advance of one file offset would violate.
+ *
+ * Anything else still refuses.  It is the count > 1 refusal that was reached in
+ * practice: a guest doing readv/writev over a file it opened got ENOSYS for the
+ * whole call, which is why the vectored-IO cases failed with wrote=-1 read=-1.
+ */
+static inline ssize_t hl_linux_uio_ambient(int fd, const struct iovec *vectors, int count, int writing) {
+    ssize_t total = 0;
+    int index;
+    for (index = 0; index < count; index++) {
+        void *base = vectors[index].iov_base;
+        size_t length = vectors[index].iov_len;
+        int moved;
+        if (length == 0) continue;
+        moved = writing ? _write(fd, base, (unsigned int)length) : _read(fd, base, (unsigned int)length);
+        if (moved < 0) return total > 0 ? total : (ssize_t)-1; /* errno already set */
+        total += moved;
+        if ((size_t)moved < length) break; /* short transfer ends the call */
+    }
+    return total;
+}
+
+/* Returns 1 when `fd` carries an ambient binding the loop above may serve. */
+static inline int hl_linux_uio_ambient_ok(int fd) {
+    hl_host_handle handle;
+    uint32_t state = 0;
+    if (!hl_fdhandle_lookup_state(fd, &handle, &state)) return 0;
+    return (state & HL_FDHANDLE_AMBIENT) && (state & HL_FDHANDLE_SEEKABLE);
+}
+
 /* REAL for a bound descriptor at any count; REAL for one segment on an unbound
- * one; REFUSAL above that -- see the header note.  ENOSYS and not EBADF for the
- * refusal: EBADF would tell the guest its descriptor is wrong, which it is not.
- * EINVAL is reserved for a genuinely malformed count. */
+ * one, and for any count on a SEEKABLE ambient one; REFUSAL above that -- see
+ * the header note.  ENOSYS and not EBADF for the refusal: EBADF would tell the
+ * guest its descriptor is wrong, which it is not.  EINVAL is reserved for a
+ * genuinely malformed count. */
 static inline ssize_t readv(int fd, const struct iovec *vectors, int count) {
     hl_host_handle handle;
     if (count < 0 || count > IOV_MAX || (count > 0 && vectors == NULL)) {
@@ -179,6 +224,7 @@ static inline ssize_t readv(int fd, const struct iovec *vectors, int count) {
     }
     if (hl_fdhandle_lookup(fd, &handle)) return hl_linux_uio_seam(handle, vectors, count, 0, 0, 0);
     if (count > 1) {
+        if (hl_linux_uio_ambient_ok(fd)) return hl_linux_uio_ambient(fd, vectors, count, 0);
         errno = ENOSYS;
         return -1;
     }
@@ -193,6 +239,7 @@ static inline ssize_t writev(int fd, const struct iovec *vectors, int count) {
     }
     if (hl_fdhandle_lookup(fd, &handle)) return hl_linux_uio_seam(handle, vectors, count, 1, 0, 0);
     if (count > 1) {
+        if (hl_linux_uio_ambient_ok(fd)) return hl_linux_uio_ambient(fd, vectors, count, 1);
         errno = ENOSYS;
         return -1;
     }
