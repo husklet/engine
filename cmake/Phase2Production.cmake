@@ -62,6 +62,25 @@ function(hl_object name src)
   endif()
 endfunction()
 
+# ---- Windows: unity-TU compile probe --------------------------------------
+# The production engine is not a Windows artifact yet -- there is no Windows
+# `hl_run_linux_guest` and no host archive that could satisfy its link. What
+# this arm buys is the ONLY thing that can measure the remaining port surface:
+# an OBJECT library over the same unity TU, with the same minimal flag set the
+# Linux engine uses, so `ninja -k 0` enumerates every missing header and symbol
+# in one pass instead of a survey guessing at them.
+#
+# Deliberately compile-only (no executable, no archive, no link) so a failure
+# here is a compiler diagnostic about a specific line and never a link error
+# with no provenance. Removed once the TU compiles and a real Windows engine
+# target replaces it.
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  hl_object(win_unity_probe_x86_64 src/core/target/x86_64.c
+            FLAGS -D_GNU_SOURCE -O2 UNITY)
+  set_target_properties(win_unity_probe_x86_64 PROPERTIES EXCLUDE_FROM_ALL TRUE)
+  return()
+endif()
+
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   return()
 endif()

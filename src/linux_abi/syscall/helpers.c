@@ -81,7 +81,7 @@ static int flock_companion_identity(uint64_t device, uint64_t object) {
         errno = ENOLCK;
         return -1;
     }
-    mkdir(FLOCK_DIR, 0777);
+    hl_compat_mkdir(FLOCK_DIR, 0777);
     char p[80];
     snprintf(p, sizeof p, FLOCK_DIR "/%llx.%llx", (unsigned long long)device, (unsigned long long)object);
     int c = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0666);

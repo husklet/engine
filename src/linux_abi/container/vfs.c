@@ -3,6 +3,7 @@
 
 #include "../open_plan.h"
 #include "../shared.h"
+#include "../../host/libc_compat.h" // hl_compat_mkdir: the UCRT's mkdir takes no mode
 #include "../../host/file.h"
 #include "../../host/resolve.h"
 #include "../../core/provider/files.h"
@@ -1587,14 +1588,14 @@ static void vol_mkmountpoint(const char *guest, int isfile) {
     for (char *s = mp + g_rootfs_canon_len + 1; *s; s++)
         if (*s == '/') {
             *s = 0;
-            mkdir(mp, 0755);
+            hl_compat_mkdir(mp, 0755);
             *s = '/';
         }
     if (isfile) {
         int fd = open(mp, O_CREAT | O_RDONLY, 0644);
         if (fd >= 0) close(fd);
     } else
-        mkdir(mp, 0755);
+        hl_compat_mkdir(mp, 0755);
 }
 
 static void add_vol(const char *spec) { // "[ro:]guestpath:hostdir" -> a confined bind-mount volume
@@ -3567,7 +3568,7 @@ static void proc_reg_publish(const char *exe, int argc, char *const argv[]) {
     if (!g_init_hostpid) return; // process table is a container feature
     char dir[80];
     proc_reg_key(dir, sizeof dir);
-    mkdir(dir, 0777);
+    hl_compat_mkdir(dir, 0777);
     static int reg = 0;
     if (!reg) {
         atexit(proc_reg_unlink);
@@ -3619,7 +3620,7 @@ static void proc_reg_after_fork(void) {
     }
     char dir[80];
     proc_reg_key(dir, sizeof dir);
-    mkdir(dir, 0777);
+    hl_compat_mkdir(dir, 0777);
     proc_reg_write_files(dir, g_reg_last_buf, g_reg_last_len, g_reg_last_exe);
 }
 
@@ -4269,7 +4270,7 @@ static void proc_reg_mark_child(int hostpid) {
     if (!g_init_hostpid || hostpid <= 0) return;
     char dir[80], path[144];
     proc_reg_key(dir, sizeof dir);
-    mkdir(dir, 0777);
+    hl_compat_mkdir(dir, 0777);
     snprintf(path, sizeof path, "%s/%d", dir, hostpid);
     // EXCL: never clobber the child's real record.
     (void)hl_host_file_exclusive(&g_jit_services, path, 0644);
@@ -4534,11 +4535,11 @@ static int proc_leaf_dir_open(const char *guestpath, int with_task) {
     if (with_task) {
         char p[64];
         snprintf(p, sizeof p, "%s/task", tmpl);
-        mkdir(p, 0555);
+        hl_compat_mkdir(p, 0555);
         snprintf(p, sizeof p, "%s/fd", tmpl);
-        mkdir(p, 0555); // placeholder: an open of /proc/<pid>/fd re-enters the synthesis (proc_fd_dir_open)
+        hl_compat_mkdir(p, 0555); // placeholder: an open of /proc/<pid>/fd re-enters the synthesis (proc_fd_dir_open)
         snprintf(p, sizeof p, "%s/map_files", tmpl);
-        mkdir(p, 0555); // ditto -> proc_map_files_dir_open
+        hl_compat_mkdir(p, 0555); // ditto -> proc_map_files_dir_open
     }
     // Magic-link placeholders (exe/cwd/root) so getdents lists them with d_type DT_LNK, like Linux. Every
     // ACCESS to them goes by path or by (tagged dirfd, relative) and is intercepted -- readlink/stat/open
@@ -4570,7 +4571,7 @@ static int proc_task_dir_open(int gp) {
     if (!mkdtemp(tmpl)) return -1;
     char p[64];
     snprintf(p, sizeof p, "%s/%d", tmpl, gp);
-    mkdir(p, 0555); // the main thread tid (== pid)
+    hl_compat_mkdir(p, 0555); // the main thread tid (== pid)
     // For OUR OWN process, enumerate every live guest thread's tid so a /proc/self/task walk sees them all
     // (thread enumerators, profilers, debuggers). Peer processes keep just the main entry (no cross-process
     // thread registry yet).
@@ -4580,7 +4581,7 @@ static int proc_task_dir_open(int gp) {
         for (int i = 0; i < nt; i++) {
             if (tids[i] == gp) continue; // main already created
             snprintf(p, sizeof p, "%s/%d", tmpl, tids[i]);
-            mkdir(p, 0555);
+            hl_compat_mkdir(p, 0555);
         }
     }
     int fd = open(tmpl, O_RDONLY | O_DIRECTORY);
@@ -4703,14 +4704,14 @@ static int proc_root_dir_open(void) {
             int guest = (g_init_hostpid && host == g_init_hostpid) ? 1 : host;
             char p[96];
             snprintf(p, sizeof p, "%s/%d", tmpl, guest);
-            mkdir(p, 0555); // a real (empty) subdir: getdents reports DT_DIR, and htop opens /proc/<pid>
+            hl_compat_mkdir(p, 0555); // a real (empty) subdir: getdents reports DT_DIR, and htop opens /proc/<pid>
         }
         closedir(d);
     }
     { // always list ourselves (our registry write may have lagged the first `ps`)
         char p[96];
         snprintf(p, sizeof p, "%s/%d", tmpl, container_pid());
-        mkdir(p, 0555);
+        hl_compat_mkdir(p, 0555);
     }
     int fd = open(tmpl, O_RDONLY | O_DIRECTORY);
     if (fd < 0) {
@@ -4773,7 +4774,7 @@ static int sysnet_dir_open(const char *gp) {
         char p[96];
         snprintf(p, sizeof p, "%s/%s", tmpl, entries[i]);
         if (as_dirs || !strcmp(entries[i], "statistics")) // statistics/ is a subdir even within an iface dir
-            mkdir(p, 0555);
+            hl_compat_mkdir(p, 0555);
         else {
             int f = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0444);
             if (f >= 0) close(f);
@@ -4833,7 +4834,7 @@ static int syscpu_dir_open(const char *gp) {
         for (int i = 0; i < nc; i++) {
             char p[96];
             snprintf(p, sizeof p, "%s/cpu%d", tmpl, i);
-            mkdir(p, 0555); // real SUBDIR: getdents reports DT_DIR so htop counts it
+            hl_compat_mkdir(p, 0555); // real SUBDIR: getdents reports DT_DIR so htop counts it
         }
         static const char *const files[] = {"online", "possible", "present", "offline", 0};
         for (int i = 0; files[i]; i++) {
@@ -4873,7 +4874,7 @@ static int synth_names_dir_open(const char *guestpath, const char *const *names,
         char p[160];
         snprintf(p, sizeof p, "%s/%s", tmpl, names[i]);
         if (kind == 2)
-            mkdir(p, 0555);
+            hl_compat_mkdir(p, 0555);
         else if (kind == 1) {
             if (symlink_idempotent(".", p) != 0) {
                 procfd_dir_rm(tmpl);
@@ -6530,7 +6531,7 @@ static void container_populate_dev(void) {
     char base[4200];
     if ((size_t)snprintf(base, sizeof base, "%s/dev", g_rootfs_canon) >= sizeof base) return;
     size_t bl = strlen(base);
-    mkdir(base, 0755); // ensure /dev exists (image /dev contents were excluded at unpack)
+    hl_compat_mkdir(base, 0755); // ensure /dev exists (image /dev contents were excluded at unpack)
     // helper: build <rootfs>/dev/<leaf> into a scratch buffer
 #define DEVP(leaf) (snprintf(base + bl, sizeof base - bl, "/%s", (leaf)), base)
 #define DEVP2(d, leaf) (snprintf(base + bl, sizeof base - bl, "/%s/%s", (d), (leaf)), base)
@@ -6548,7 +6549,7 @@ static void container_populate_dev(void) {
         int fd = open(DEVP(chr[i]), O_CREAT | O_WRONLY, 0666);
         if (fd >= 0) close(fd);
     }
-    mkdir(DEVP("pts"), 0755); // devpts mount point; /dev/pts/N slaves resolve via ptsname in fs.c
+    hl_compat_mkdir(DEVP("pts"), 0755); // devpts mount point; /dev/pts/N slaves resolve via ptsname in fs.c
     // devpts publishes a /dev/pts/ptmx multiplexer node (docker mounts it with ptmxmode=0666); `ls /dev/pts`
     // lists it, and open("/dev/pts/ptmx") is intercepted like /dev/ptmx in fs.c.
     {
@@ -6563,8 +6564,8 @@ static void container_populate_dev(void) {
         int fd = open(DEVP("pts/0"), O_CREAT | O_WRONLY, 0620);
         if (fd >= 0) close(fd);
     }
-    mkdir(DEVP("shm"), 01777); // POSIX shm dir (shm_open names get redirected to a host tmp file in fs.c)
-    mkdir(DEVP("mqueue"), 01777);
+    hl_compat_mkdir(DEVP("shm"), 01777); // POSIX shm dir (shm_open names get redirected to a host tmp file in fs.c)
+    hl_compat_mkdir(DEVP("mqueue"), 01777);
 #undef DEVP
 #undef DEVP2
 }

@@ -3,6 +3,7 @@
 #include <netdb.h> // container DNS: getaddrinfo/getnameinfo via the macOS host resolver (dns_* below)
 
 #include "../shared.h"
+#include "../../host/libc_compat.h" // hl_compat_mkdir: the UCRT's mkdir takes no mode
 #include "../checkpoint.h"
 #include "socket_identity.h"
 
@@ -2301,7 +2302,7 @@ static void br_init(void) {
             g_netif[g_netif_count].ip = br_parse_ip(ip);
             if (!g_netif[g_netif_count].ip) break;
             g_netif[g_netif_count].prefix = (uint8_t)prefix;
-            mkdir(g_netif[g_netif_count].path, 0700);
+            hl_compat_mkdir(g_netif[g_netif_count].path, 0700);
             g_netif_count++;
             line = *end ? end + 1 : end;
         }
@@ -2313,7 +2314,7 @@ static void br_init(void) {
             g_netif[0].ip = br_parse_ip(dip);
             if (g_netif[0].ip) {
                 g_netif[0].prefix = 16;
-                mkdir(g_netif[0].path, 0700);
+                hl_compat_mkdir(g_netif[0].path, 0700);
                 g_netif_count = 1;
             }
         }
@@ -2953,7 +2954,7 @@ static void *udp_fwd_thread(void *p) {
     }
     f->hs = hs;
     snprintf(f->pdir, sizeof f->pdir, "/tmp/.hl-udp.%d.%u", (int)getpid(), (unsigned)f->hport);
-    mkdir(f->pdir, 0700);
+    hl_compat_mkdir(f->pdir, 0700);
     char buf[65536];
     for (;;) {
         struct pollfd pf[1 + UDP_FWD_MAXPEERS];
@@ -3509,7 +3510,7 @@ static void abs_init(void) {
     g_abs_init = 1;
     const char *ns = hl_option_get("HL_NETNS"); // same key used by ipc_ns_key (service.c)
     snprintf(g_absdir, sizeof g_absdir, "/tmp/.hl-abstract-%.40s", (ns && ns[0]) ? ns : "default");
-    mkdir(g_absdir, 0700); // EEXIST fine; peers share it (0700, guest is path-jailed)
+    hl_compat_mkdir(g_absdir, 0700); // EEXIST fine; peers share it (0700, guest is path-jailed)
 }
 
 // Is this guest sockaddr an abstract AF_UNIX addr? family u16==AF_UNIX, sun_path[0]==NUL, name>=1B.
