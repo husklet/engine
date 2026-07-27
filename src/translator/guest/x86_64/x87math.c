@@ -20,6 +20,65 @@ static void pop(struct cpu *cpu) {
     top_add(cpu, 1);
 }
 
+// |Q| mod 8, exactly and at ANY magnitude. Rounding ST0/ST1 and taking its low bits loses them above 2^53;
+// fmod against 8*|ST1| is exact, and dividing THAT by |ST1| lands in [0,8). FPREM1's quotient is
+// round-to-NEAREST, one more than the truncating one exactly when the IEEE remainder changed sign.
+static unsigned quotient_low3(double st0, double st1, int ieee) {
+    double a = fabs(st0), b = fabs(st1), scaled, reduced;
+    unsigned magnitude;
+    if (!isfinite(a) || !isfinite(b) || b == 0.0) return 0;
+    scaled = scalbn(b, 3);
+    reduced = scaled > a ? a : fmod(a, scaled); // scaled==inf (b huge) also lands here: a mod inf == a
+    magnitude = (unsigned)(reduced / b);
+    if (magnitude > 7u) magnitude = 7u; // the division may round up to exactly 8.0
+    if (ieee && signbit(remainder(a, b))) magnitude++;
+    return magnitude & 7u;
+}
+
+// FPREM/FPREM1 are EXACT by definition -- the remainder is a subset of ST0's bits -- so they raise NOTHING;
+// measured exc=00 on hardware for every case. The emitted f64 sequence this replaces raised a spurious #P,
+// because deriving the quotient bits divides, hence the hold/release around everything.
+//
+// C2=1 means "PARTIAL remainder, call me again", and hardware genuinely iterates once the operand exponents
+// differ by 64 or more (measured: `1e300 fmod 1e-300` takes 22 steps). glibc's remainderl loops on C2, so
+// always reporting 0 -- which the emitted single fused step did -- is a silent lie about a value the loop
+// then consumes. What is NOT reproducible is hardware's per-step quantum ("up to 63 quotient bits", measured
+// exponent deltas 32..68), so the step COUNT differs; the architectural contract -- iterate while C2, then an
+// exact remainder and |Q| mod 8 -- is what this reproduces. fmod against a SCALED ST1 makes each partial step
+// exact in the double carrier and drops the exponent difference by at least 64, so the loop terminates.
+static void x87_remainder(struct cpu *cpu, int ieee) {
+    double st0 = cpu->st[cpu->fptop & 7];
+    double st1 = cpu->st[(cpu->fptop + 1) & 7];
+    unsigned held;
+    if (hl_x87_phys_empty(cpu->fptop, (int)(cpu->fptop & 7)) ||
+        hl_x87_phys_empty(cpu->fptop, (int)((cpu->fptop + 1) & 7))) {
+        hl_x87_exceptions_raise(1u); // #IS underflow: IE|SF, C1 = 0
+        cpu->fpsw = (cpu->fpsw & ~(UINT64_C(1) << 9)) | UINT64_C(0x40);
+        hl_x87_phys_mark(&cpu->fptop, (int)(cpu->fptop & 7), 0);
+        cpu->st[cpu->fptop & 7] = hl_x87_indefinite();
+        return;
+    }
+    held = hl_x87_exceptions_get();
+    if (isfinite(st0) && isfinite(st1) && st0 != 0.0 && st1 != 0.0) {
+        int spread = ilogb(st0) - ilogb(st1);
+        if (spread >= 64) {
+            cpu->st[cpu->fptop & 7] = fmod(st0, scalbn(st1, spread - 63));
+            hl_x87_exceptions_set(held);
+            cpu->fpsw |= UINT64_C(0x400); // C2: partial. The quotient bits read 0 on hardware.
+            return;
+        }
+    }
+    cpu->st[cpu->fptop & 7] = ieee ? remainder(st0, st1) : fmod(st0, st1);
+    {
+        unsigned magnitude = quotient_low3(st0, st1, ieee);
+        // The remainder itself may legitimately have raised #IA (ST1 zero, ST0 infinite); keep that.
+        hl_x87_exceptions_set(held | (hl_x87_exceptions_get() & 1u));
+        // BOTH flavours publish |Q|'s low three bits as C1/C3/C0; the old lowering cleared them for FPREM1.
+        cpu->fpsw |= (uint64_t)((magnitude >> 2) & 1u) << 8 | (uint64_t)(magnitude & 1u) << 9 |
+                     (uint64_t)((magnitude >> 1) & 1u) << 14;
+    }
+}
+
 void hl_x86_x87_math(struct cpu *cpu) {
     double st0 = cpu->st[cpu->fptop & 7];
     double st1 = cpu->st[(cpu->fptop + 1) & 7];
@@ -73,6 +132,8 @@ void hl_x86_x87_math(struct cpu *cpu) {
         else
             cpu->st[cpu->fptop & 7] = cos(st0);
         break;
+    case X87_FPREM: x87_remainder(cpu, 0); break;
+    case X87_FPREM1: x87_remainder(cpu, 1); break;
     }
     if (clean_in) {
         // Neither input was a NaN, so any NaN now sitting in a slot this op could have written was

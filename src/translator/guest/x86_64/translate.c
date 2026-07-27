@@ -1447,19 +1447,30 @@ static void emit_stmxcsr(struct insn *I, uint64_t next) {
 // FPCR.RMode from the x87 RC (same two-bit swap as ldmxcsr), FRINTI, then restore FPCR so SSE rounding is
 // untouched. Scratch x20/x21/x22/x23; x19 (the store EA at every caller) is left intact.
 static void emit_x87_round_st0(void) {
-    e_ldr(20, 28, OFF_FPCW);                                          // w20 = cpu->fpcw
-    emit32(0x53000000u | (10u << 16) | (11u << 10) | (20 << 5) | 20); // ubfx w20,w20,#10,#2 -> RC (0..3)
-    e_movconst(21, 1);
-    e_rrr(A_AND, 22, 20, 21, 0, 0);       // w22 = RC & 1
-    e_lsr_i(21, 20, 1, 0);                // w21 = RC >> 1
-    e_rrr(A_ORR, 22, 21, 22, 0, 1);       // w22 = (RC>>1) | (RC&1)<<1 = ARM RMode (x87 RC bits swapped)
-    emit32(0xD53B4400u | 23);             // mrs x23, fpcr  (save the live -- SSE -- rounding mode)
-    e_movconst(21, 3u << 22);             // RMode mask
-    e_rrr(A_BIC, 20, 23, 21, 1, 0);       // x20 = fpcr & ~RMode
-    e_rrr(A_ORR, 20, 20, 22, 1, 22);      // x20 = | (ARM RMode << 22)
-    emit32(0xD51B4400u | 20);             // msr fpcr, x20  (x87 rounding mode)
+    hl_x86_emit_vector_copy(19, 16); // the unrounded value, for C1
+    hl_x86_x87_rc_enter();
     emit32(0x1E67C000u | (16 << 5) | 16); // frinti d16, d16 (round to integral per FPCR.RMode)
-    emit32(0xD51B4400u | 23);             // msr fpcr, x23  (restore SSE rounding mode)
+    hl_x86_x87_rc_leave();
+    hl_x86_x87_rounded_up(16, 19); // C1 = the magnitude grew
+}
+
+// A masked #IS on an integer store delivers the INTEGER indefinite of the destination width, and the form
+// still pops. x22 carries hl_x86_x87_live()'s verdict; `value` holds the normally-converted result.
+static void emit_x87_integer_indefinite(int value, int bytes) {
+    e_movconst(17, bytes == 2 ? UINT64_C(0x8000) : bytes == 4 ? UINT64_C(0x80000000) : (UINT64_C(1) << 63));
+    e_subi_s(31, 22, 0, 1);
+    e_csel(value, value, 17, 0 /*EQ: live*/, 1);
+}
+
+// FNSTENV/FLDENV m28, FNSAVE/FRSTOR m108 -> hl_x86_x87_environment(). All four rewrite the tag word, three
+// rewrite TOP and two convert eight ext80 registers; doing that inline would be two hundred instructions for
+// four instructions that appear once per setjmp-shaped guest. x19 = the translated host EA. Ends the block.
+static void emit_x87_environment(int selector, uint64_t next) {
+    hl_x86_x87_drop(); // the helper owns cpu->fptop from here
+    e_str(19, 28, OFF_X87EA);
+    e_movconst(16, (uint64_t)selector);
+    e_str(16, 28, OFF_DIVOP);
+    emit_exit_const(next, R_X87ENV);
 }
 
 // A JIT guest unmapped / remapped an executable VA range: any block translations we cached for guest PCs in
@@ -4042,13 +4053,13 @@ static void *translate_block(uint64_t gpc) {
                     if (op == 0xD9)
                         x87_bytes = reg == 6 || reg == 4 ? 28 : (reg == 5 || reg == 7 ? 2 : 4);
                     else if (op == 0xDD)
-                        x87_bytes = reg == 7 ? 2 : 8;
+                        x87_bytes = reg == 7 ? 2 : (reg == 4 || reg == 6 ? 108 : 8); // FRSTOR/FNSAVE m108
                     else if (op == 0xDB)
                         x87_bytes = reg == 5 || reg == 7 ? 10 : 4;
                     else if (op == 0xDF)
                         x87_bytes = reg == 5 || reg == 7 ? 8 : 2;
                     int x87_store = (op == 0xD9 && (reg == 2 || reg == 3 || reg == 6 || reg == 7)) ||
-                                    (op == 0xDD && (reg == 2 || reg == 3 || reg == 7)) ||
+                                    (op == 0xDD && (reg == 2 || reg == 3 || reg == 6 || reg == 7)) ||
                                     (op == 0xDB && (reg == 2 || reg == 3 || reg == 7)) ||
                                     (op == 0xDF && (reg == 3 || reg == 7));
                     if (x87_bytes)
@@ -4068,55 +4079,39 @@ static void *translate_block(uint64_t gpc) {
                     if (op == 0xD9) {    // f32 mem
                         if (reg == 0) {
                             g_ldr_s(16, 19);
+                            e_fmov_from_s(20, 16);
+                            hl_x86_x87_denormal(20, 1);
                             emit32(0x1E22C000u | (16 << 5) | 16);
                             hl_x86_x87_push(16);
                         } // fld m32
                         else if (reg == 2 || reg == 3) {
+                            hl_x86_x87_live(0, -1);
                             hl_x86_x87_load(16, 0);
+                            hl_x86_x87_rc_enter(); // the one x87 store that ROUNDS, so the one that needs RC
                             emit32(0x1E624000u | (16 << 5) | 16);
+                            hl_x86_x87_rc_leave();
+                            e_movconst(20, 0xffc00000u); // masked #IS delivers the m32 REAL indefinite
+                            e_fmov_to_s(17, 20);
+                            e_subi_s(31, 22, 0, 1);
+                            emit32(0x1E200C00u | (17 << 16) | (0u << 12) | (16 << 5) | 16); // fcsel s16,s16,s17,eq
                             g_str_s(16, 19);
-                            if (reg == 3) hl_x86_x87_adjust_top(1);
+                            if (reg == 3) hl_x86_x87_pop();
                         } // fst/fstp
                         else if (reg == 5) { // fldcw m16: load the x87 control word (RC/PC/exception masks)
                             emit32(0x79400000u | (19 << 5) | 16); // ldrh w16, [x19]
-                            e_str(16, 28, OFF_FPCW);              // cpu->fpcw = CW (honored by fist rounding)
-                        } else if (reg == 7) {                    // fnstcw m16: store the live x87 control word
+                            e_movconst(17, 0x1f3f);               // FCW is not stored verbatim: bit 6 reads
+                            e_rrr(A_AND, 16, 16, 17, 1, 0);       // back 1, bit 7 and 15:13 as 0 (measured:
+                            e_movconst(17, 0x40);                 // fldcw ffff -> fnstcw 1f7f)
+                            e_rrr(A_ORR, 16, 16, 17, 1, 0);
+                            e_str(16, 28, OFF_FPCW); // cpu->fpcw = CW (honored by fist rounding)
+                        } else if (reg == 7) {       // fnstcw m16: store the live x87 control word
                             e_ldr(16, 28, OFF_FPCW);
                             emit32(0x79000000u | (19 << 5) | 16); // strh w16, [x19]
                         } // fnstcw
-                        else if (reg == 6) {
-                            // FNSTENV m28: store the 28-byte 32-bit protected-mode x87 environment --
-                            // FCW@0, FSW@4 (TOP in bits 11:13), FTW@8, then FIP/FCS/FOO/FOS @12/16/20/24.
-                            // The engine keeps no per-reg tags, so emit the live FCW (cpu->fpcw, mirrors fnstcw)
-                            // and FTW=0xffff (all-empty); the instruction/data pointers are zeroed. OpenBLAS (R
-                            // startup, the only caller) just saves/restores FCW/FSW/FTW.
-                            // x19 = EA. hl_x86_x87_status() materializes cpu->fptop and yields FSW in x16.
-                            e_ldr(16, 28, OFF_FPCW);
-                            emit32(0x79000000u | (0u << 10) | (19 << 5) | 16); // strh FCW, [x19,#0]
-                            hl_x86_x87_status();                               // x16 = FSW | (TOP<<11)
-                            emit32(0x79000000u | (2u << 10) | (19 << 5) | 16); // strh FSW, [x19,#4]
-                            e_movconst(16, 0xffff);
-                            emit32(0x79000000u | (4u << 10) | (19 << 5) | 16); // strh FTW, [x19,#8]
-                            emit32(0xB9000000u | (3u << 10) | (19 << 5) | 31); // str  wzr, [x19,#12] FIP
-                            emit32(0xB9000000u | (4u << 10) | (19 << 5) | 31); // str  wzr, [x19,#16] FCS
-                            emit32(0xB9000000u | (5u << 10) | (19 << 5) | 31); // str  wzr, [x19,#20] FOO
-                            emit32(0xB9000000u | (6u << 10) | (19 << 5) | 31); // str  wzr, [x19,#24] FOS
-                            // FNSTENV then masks all FP exceptions in FCW; the engine's FCW is the fixed
-                            // default 0x037f (exception-mask bits 0-5 already set), so nothing to update.
-                        } // fnstenv m28
-                        else if (reg == 4) {
-                            // FLDENV m28: reload the x87 environment (inverse of FNSTENV). Restore the FCW
-                            // (so a later fist rounds per the reloaded RC) and the FSW condition codes + TOP;
-                            // FTW (no per-reg tags) is ignored. The reloaded TOP is unknown at translate
-                            // time, so leave the static-top model -> runtime-top addressing afterwards.
-                            hl_x86_x87_drop();
-                            emit32(0x79400000u | (0u << 10) | (19 << 5) | 16); // ldrh w16, [x19,#0]  (FCW)
-                            e_str(16, 28, OFF_FPCW);                           // cpu->fpcw = FCW
-                            emit32(0x79400000u | (2u << 10) | (19 << 5) | 16); // ldrh w16, [x19,#4]  (FSW)
-                            e_str(16, 28, OFF_FPSW);                           // cpu->fpsw  = FSW
-                            emit32(0x53000000u | (11u << 16) | (13u << 10) | (16 << 5) | 17); // ubfx w17,w16,#11,#3
-                            e_str(17, 28, OFF_FPTOP);                                         // cpu->fptop = TOP
-                        } // fldenv m28
+                        else if (reg == 4 || reg == 6) {
+                            emit_x87_environment(reg == 6 ? X87ENV_STORE : X87ENV_LOAD, next);
+                            break;
+                        } // fnstenv / fldenv m28
                         else {
                             report_unimpl(gpc, &I);
                             break;
@@ -4124,13 +4119,21 @@ static void *translate_block(uint64_t gpc) {
                     } else if (op == 0xDD) { // f64 mem
                         if (reg == 0) {
                             g_ldr_d(16, 19);
+                            e_fmov_from_d(20, 16);
+                            hl_x86_x87_denormal(20, 0);
                             hl_x86_x87_push(16);
                         } // fld m64
                         else if (reg == 2 || reg == 3) {
+                            hl_x86_x87_live(0, -1);
                             hl_x86_x87_load(16, 0);
+                            hl_x86_x87_indefinite(16);
                             g_str_d(16, 19);
-                            if (reg == 3) hl_x86_x87_adjust_top(1);
+                            if (reg == 3) hl_x86_x87_pop();
                         } // fst/fstp
+                        else if (reg == 4 || reg == 6) {
+                            emit_x87_environment(reg == 6 ? X87ENV_SAVE : X87ENV_RESTORE, next);
+                            break;
+                        } // fnsave / frstor m108
                         else if (reg == 7) {
                             hl_x86_x87_status();
                             emit32(0x79000000u | (19 << 5) | 16);
@@ -4146,11 +4149,13 @@ static void *translate_block(uint64_t gpc) {
                             hl_x86_x87_push(16);
                         } // fild m32
                         else if (reg == 2 || reg == 3) {
+                            hl_x86_x87_live(0, -1);
                             hl_x86_x87_load(16, 0);
                             emit_x87_round_st0();                 // round per x87 control word (default: nearest)
                             emit32(0x1E780000u | (16 << 5) | 16); // FCVTZS w16,d16 (exact: d16 already integral)
+                            emit_x87_integer_indefinite(16, 4);
                             emit32(0xB9000000u | (19 << 5) | 16);
-                            if (reg == 3) hl_x86_x87_adjust_top(1);
+                            if (reg == 3) hl_x86_x87_pop();
                         } // fist/fistp m32
                         else if (reg == 5) {
                             e_str(19, 28, OFF_X87EA);
@@ -4173,11 +4178,13 @@ static void *translate_block(uint64_t gpc) {
                             hl_x86_x87_push(16);
                         } // fild m16 (ldrsh)
                         else if (reg == 3) {
+                            hl_x86_x87_live(0, -1);
                             hl_x86_x87_load(16, 0);
                             emit_x87_round_st0();                 // round per x87 control word (default: nearest)
                             emit32(0x1E780000u | (16 << 5) | 16); // FCVTZS w16,d16 (exact: d16 already integral)
+                            emit_x87_integer_indefinite(16, 2);
                             emit32(0x79000000u | (19 << 5) | 16);
-                            hl_x86_x87_adjust_top(1);
+                            hl_x86_x87_pop();
                         } // fistp m16
                         else if (reg == 5) {
                             e_ldr(16, 19, 0);
@@ -4185,11 +4192,13 @@ static void *translate_block(uint64_t gpc) {
                             hl_x86_x87_push(16);
                         } // fild m64
                         else if (reg == 7) {
+                            hl_x86_x87_live(0, -1);
                             hl_x86_x87_load(16, 0);
                             emit_x87_round_st0();                 // round per x87 control word (default: nearest)
                             emit32(0x9E780000u | (16 << 5) | 16); // FCVTZS x16,d16 (exact: d16 already integral)
+                            emit_x87_integer_indefinite(16, 8);
                             e_str(16, 19, 0);
-                            hl_x86_x87_adjust_top(1);
+                            hl_x86_x87_pop();
                         } // fistp m64
                         else {
                             report_unimpl(gpc, &I);
@@ -4202,6 +4211,8 @@ static void *translate_block(uint64_t gpc) {
                         // fsubr(5)/fdiv(6)/fdivr(7) encoding for all four opcodes).
                         if (op == 0xD8) { // m32 float
                             g_ldr_s(16, 19);
+                            e_fmov_from_s(20, 16);
+                            hl_x86_x87_denormal(20, 1);
                             emit32(0x1E22C000u | (16 << 5) | 16); // fcvt d16, s16
                         } else if (op == 0xDA) {                  // m32 signed integer
                             emit32(0xB9400000u | (19 << 5) | 16); // ldr   w16, [x19]
@@ -4209,16 +4220,25 @@ static void *translate_block(uint64_t gpc) {
                         } else if (op == 0xDE) {                  // m16 signed integer
                             emit32(0x79C00000u | (19 << 5) | 16); // ldrsh w16, [x19]
                             emit32(0x1E620000u | (16 << 5) | 16); // scvtf d16, w16
-                        } else                                    // 0xDC: m64 float
+                        } else {                                  // 0xDC: m64 float
                             g_ldr_d(16, 19);
+                            e_fmov_from_d(20, 16);
+                            hl_x86_x87_denormal(20, 0);
+                        }
+                        hl_x86_x87_live(0, -1);
                         if (reg == 2 || reg == 3) {
                             hl_x86_x87_load(18, 0);
+                            hl_x86_x87_indefinite(18); // an empty ST0 compares UNORDERED as well as faulting
+                            hl_x86_x87_indefinite(16);
                             e_fcom_setfpsw(18, 16, 1);
-                            if (reg == 3) hl_x86_x87_adjust_top(1);
+                            if (reg == 3) hl_x86_x87_pop();
                             gpc = next;
                             continue;
                         } // fcom/fcomp
                         hl_x86_x87_load(18, 0);
+                        hl_x86_x87_indefinite(18);
+                        hl_x86_x87_indefinite(16);
+                        hl_x86_x87_rc_enter();
                         hl_x86_x87_dnan_pre(18, 16); // x86 indefinite is NEGATIVE; ARM's default NaN is not
                         if (reg == 0)
                             FAd(18, 18, 16);
@@ -4237,6 +4257,8 @@ static void *translate_block(uint64_t gpc) {
                             break;
                         }
                         hl_x86_x87_dnan_post(18);
+                        hl_x86_x87_narrow(18); // FCW.PC, inside the RC scope so it rounds the same way
+                        hl_x86_x87_rc_leave();
                         hl_x86_x87_store(18, 0);
                     }
                     gpc = next;
@@ -4245,23 +4267,33 @@ static void *translate_block(uint64_t gpc) {
                 // ---- register forms (mod=3) ----
                 if (op == 0xD9) {
                     if (reg == 0) {
-                        hl_x86_x87_load(16, rm);
+                        hl_x86_x87_live(rm, -1); // an empty SOURCE underflows; the PUSHED slot takes the
+                        hl_x86_x87_load(16, rm); // indefinite and the source stays empty
+                        hl_x86_x87_indefinite(16);
                         hl_x86_x87_push(16);
                     } // fld ST(i)
                     else if (reg == 1) {
+                        // FXCH: the exchange happens either way, then ST0 takes the indefinite -- ST(i) keeps
+                        // the old ST0 and is tagged live (measured on `fld1; fxch %st(1)`).
+                        hl_x86_x87_live(0, rm);
                         hl_x86_x87_load(16, 0);
                         hl_x86_x87_load(18, rm);
+                        hl_x86_x87_indefinite(18);
                         hl_x86_x87_store(18, 0);
                         hl_x86_x87_store(16, rm);
                     } // fxch
                     else if (reg == 4 && rm == 0) {
+                        hl_x86_x87_live(0, -1);
                         hl_x86_x87_load(16, 0);
                         emit32(0x1E614000u | (16 << 5) | 16);
+                        hl_x86_x87_indefinite(16);
                         hl_x86_x87_store(16, 0);
                     } // fchs
                     else if (reg == 4 && rm == 1) {
+                        hl_x86_x87_live(0, -1);
                         hl_x86_x87_load(16, 0);
                         emit32(0x1E60C000u | (16 << 5) | 16);
+                        hl_x86_x87_indefinite(16);
                         hl_x86_x87_store(16, 0);
                     } // fabs
                     else if (reg == 5) { // fld const
@@ -4277,14 +4309,20 @@ static void *translate_block(uint64_t gpc) {
                         e_fmov_to_d(16, 16);
                         hl_x86_x87_push(16);
                     } else if (reg == 7 && rm == 2) {
+                        hl_x86_x87_live(0, -1);
                         hl_x86_x87_load(16, 0);
+                        hl_x86_x87_indefinite(16);
+                        hl_x86_x87_rc_enter();
                         hl_x86_x87_dnan_pre(16, 16); // fsqrt(-x): x86 yields the NEGATIVE indefinite
                         emit32(0x1E61C000u | (16 << 5) | 16);
                         hl_x86_x87_dnan_post(16);
+                        hl_x86_x87_narrow(16);
+                        hl_x86_x87_rc_leave();
                         hl_x86_x87_store(16, 0);
                     } // fsqrt
                     else if (reg == 2 && rm == 0) { /* fnop */
                     } else if (reg == 4 && rm == 4) {
+                        hl_x86_x87_live(0, -1);
                         hl_x86_x87_test();
                     } // ftst
                     else if (reg == 4 && rm == 5) {
@@ -4307,10 +4345,12 @@ static void *translate_block(uint64_t gpc) {
                         break;
                     } // fpatan
                     else if (reg == 6 && rm == 4) {
+                        hl_x86_x87_live(0, -1);
                         hl_x86_x87_extract();
                     } // fxtract
                     else if (reg == 6 && rm == 5) {
-                        hl_x86_x87_remainder(1);
+                        hl_x86_x87_function(X87_FPREM1, next);
+                        break;
                     } // fprem1
                     else if (reg == 6 && rm == 6) {
                         hl_x86_x87_adjust_top(-1);
@@ -4319,7 +4359,8 @@ static void *translate_block(uint64_t gpc) {
                         hl_x86_x87_adjust_top(1);
                     } // fincstp
                     else if (reg == 7 && rm == 0) {
-                        hl_x86_x87_remainder(0);
+                        hl_x86_x87_function(X87_FPREM, next);
+                        break;
                     } // fprem
                     else if (reg == 7 && rm == 1) {
                         hl_x86_x87_function(X87_FYL2XP1, next);
@@ -4330,9 +4371,11 @@ static void *translate_block(uint64_t gpc) {
                         break;
                     } // fsincos
                     else if (reg == 7 && rm == 4) {
+                        hl_x86_x87_live(0, -1);
                         hl_x86_x87_round();
                     } // frndint
                     else if (reg == 7 && rm == 5) {
+                        hl_x86_x87_live(0, 1);
                         hl_x86_x87_scale();
                     } // fscale
                     else if (reg == 7 && rm == 6) {
@@ -4348,13 +4391,16 @@ static void *translate_block(uint64_t gpc) {
                         break;
                     }
                 } else if (op == 0xD8 || op == 0xDC || op == 0xDE) { // arith ST0/ST(i) [+pop for DE]
+                    hl_x86_x87_live(0, rm);
                     hl_x86_x87_load(18, 0);
-                    hl_x86_x87_load(16, rm);           // v18=ST0, v16=ST(rm)
+                    hl_x86_x87_load(16, rm); // v18=ST0, v16=ST(rm)
+                    hl_x86_x87_indefinite(18);
+                    hl_x86_x87_indefinite(16);
                     int dst_i = (op == 0xD8) ? 0 : rm; // D8 -> ST0; DC/DE -> ST(i)
                     if (reg == 2 || reg == 3) {
                         e_fcom_setfpsw(18, 16, 1);
-                        if (op == 0xDE && rm == 1) hl_x86_x87_adjust_top(1);
-                        if (reg == 3) hl_x86_x87_adjust_top(1);
+                        if (op == 0xDE && rm == 1) hl_x86_x87_pop();
+                        if (reg == 3) hl_x86_x87_pop();
                         gpc = next;
                         continue;
                     } // fcom[p]/fcompp
@@ -4363,6 +4409,7 @@ static void *translate_block(uint64_t gpc) {
                         a = 16;
                         b = 18;
                     } // DC/DE: dst=ST(i)=v16, other=ST0=v18
+                    hl_x86_x87_rc_enter();
                     hl_x86_x87_dnan_pre(18, 16); // x86 indefinite is NEGATIVE; ARM's default NaN is not
                     if (reg == 0)
                         FAd(a, a, b);
@@ -4394,24 +4441,29 @@ static void *translate_block(uint64_t gpc) {
                         break;
                     }
                     hl_x86_x87_dnan_post(a);
+                    hl_x86_x87_narrow(a); // FCW.PC, inside the RC scope so it rounds the same way
+                    hl_x86_x87_rc_leave();
+                    hl_x86_x87_indefinite(a);
                     hl_x86_x87_store(a, dst_i);
-                    if (op == 0xDE) hl_x86_x87_adjust_top(1); // pop
+                    if (op == 0xDE) hl_x86_x87_pop();
                 } else if (op == 0xDD) {
-                    if (reg == 0) { /* ffree: no tag tracking -> nop */
-                    } else if (reg == 2) {
+                    if (reg == 0) {
+                        hl_x86_x87_tag(rm, 1); // FFREE: punch a hole no depth model can express
+                    } else if (reg == 2 || reg == 3) {
+                        hl_x86_x87_live(0, -1);
                         hl_x86_x87_load(16, 0);
+                        hl_x86_x87_indefinite(16);
                         hl_x86_x87_store(16, rm);
-                    } // fst ST(i)
-                    else if (reg == 3) {
-                        hl_x86_x87_load(16, 0);
-                        hl_x86_x87_store(16, rm);
-                        hl_x86_x87_adjust_top(1);
-                    } // fstp ST(i)
+                        if (reg == 3) hl_x86_x87_pop();
+                    } // fst/fstp ST(i)
                     else if (reg == 4 || reg == 5) {
+                        hl_x86_x87_live(0, rm);
                         hl_x86_x87_load(18, 0);
                         hl_x86_x87_load(16, rm);
+                        hl_x86_x87_indefinite(18);
+                        hl_x86_x87_indefinite(16);
                         e_fcom_setfpsw(18, 16, 0);
-                        if (reg == 5) hl_x86_x87_adjust_top(1);
+                        if (reg == 5) hl_x86_x87_pop();
                     } // fucom[p]
                     else {
                         report_unimpl(gpc, &I);
@@ -4419,10 +4471,12 @@ static void *translate_block(uint64_t gpc) {
                     }
                 } else if (op == 0xDB) {
                     if (reg == 4 && rm == 3) {
-                        // FNINIT: reset TOP=0, FCW=0x037f (all exceptions masked, round-nearest, 64-bit),
-                        // clear FSW (condition codes) and the host FPSR sticky exception flags.
-                        e_movconst(16, 0);
+                        // FNINIT: TOP=0 and every slot EMPTY (st[] itself is untouched, which is why a later
+                        // FLDENV can re-tag and read the old values), FCW=0x037f (all exceptions masked,
+                        // round-nearest, 64-bit), FSW and the host FPSR sticky exception flags cleared.
+                        e_movconst(16, HL_X87_EMPTY_ALL | HL_X87_ARMED);
                         e_str(16, 28, OFF_FPTOP);
+                        e_movconst(16, 0);
                         e_str(16, 28, OFF_FPSW);
                         e_movconst(16, 0x037f);
                         e_str(16, 28, OFF_FPCW);
@@ -4436,8 +4490,11 @@ static void *translate_block(uint64_t gpc) {
                     } // fnclex: clear sticky exception flags
                     else if (reg == 4) { /* fneni/fndisi/fnsetpm: no-op */
                     } else if (reg == 5 || reg == 6) {
+                        hl_x86_x87_live(0, rm);
                         hl_x86_x87_load(18, 0);
                         hl_x86_x87_load(16, rm);
+                        hl_x86_x87_indefinite(18); // empty -> ZF=PF=CF=1, the unordered answer
+                        hl_x86_x87_indefinite(16);
                         FCMPd(18, 16, reg == 6);
                     } // fucomi(5, quiet) / fcomi(6, signals on any NaN)
                     else {
@@ -4450,10 +4507,13 @@ static void *translate_block(uint64_t gpc) {
                         e_bfi(RAX, 16, 0, 16, 1);
                     } // fnstsw ax
                     else if (reg == 5 || reg == 6) {
+                        hl_x86_x87_live(0, rm);
                         hl_x86_x87_load(18, 0);
                         hl_x86_x87_load(16, rm);
+                        hl_x86_x87_indefinite(18);
+                        hl_x86_x87_indefinite(16);
                         FCMPd(18, 16, reg == 6);
-                        hl_x86_x87_adjust_top(1);
+                        hl_x86_x87_pop();
                     } // fucomip(5, quiet) / fcomip(6, signals on any NaN)
                     else {
                         report_unimpl(gpc, &I);
@@ -4470,11 +4530,14 @@ static void *translate_block(uint64_t gpc) {
                                17); // fcsel d17, STi, ST0, cond
                         hl_x86_x87_store(17, 0);
                     } else if (reg == 5 && rm == 1) { // DA E9: fucompp (compare ST0,ST1; pop twice)
+                        hl_x86_x87_live(0, 1);
                         hl_x86_x87_load(18, 0);
                         hl_x86_x87_load(16, 1);
+                        hl_x86_x87_indefinite(18);
+                        hl_x86_x87_indefinite(16);
                         e_fcom_setfpsw(18, 16, 0);
-                        hl_x86_x87_adjust_top(1);
-                        hl_x86_x87_adjust_top(1);
+                        hl_x86_x87_pop();
+                        hl_x86_x87_pop();
                     } else {
                         report_unimpl(gpc, &I);
                         break;

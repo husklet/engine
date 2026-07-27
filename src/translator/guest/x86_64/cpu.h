@@ -251,6 +251,10 @@ _Static_assert(__builtin_offsetof(struct cpu, mmscratch) == OFF_MM, "OFF_MM drif
 #define R_SOFTMISS 18
 #define R_SOFTSPAN 19
 #define R_SMC 20
+// FNSTENV/FLDENV m28 and FNSAVE/FRSTOR m108 -> hl_x86_x87_environment(). All four move the tag word, three
+// move TOP and two convert eight ext80 registers, so they are C rather than 200 emitted instructions.
+// cpu->x87_ea = the host EA, cpu->divop = an X87ENV_* selector.
+#define R_X87ENV 21
 #define OFF_SMC_RANGE_COUNT ((int)__builtin_offsetof(struct cpu, smc_range_count))
 #define G_SMC_QUEUE_RESET(c)                                                                                           \
     do {                                                                                                               \
@@ -272,7 +276,24 @@ _Static_assert(__builtin_offsetof(struct cpu, mmscratch) == OFF_MM, "OFF_MM drif
 #define OFF_SOFT_REQUIRED ((int)__builtin_offsetof(struct cpu, soft_required))
 #define G_SOFT_TLB_CLEAR(c) ((c)->soft_snapshot = 0)
 
-enum { X87_F2XM1, X87_FYL2X, X87_FPTAN, X87_FPATAN, X87_FYL2XP1, X87_FSINCOS, X87_FSIN, X87_FCOS };
+// FPREM/FPREM1 join the libm group on the JIT side: the C2 partial-remainder loop, |Q| mod 8 at any
+// magnitude and the #IS screen are all exact-integer work the emitted f64 sequence got wrong (a fused
+// one-step reduction that always reported "complete" and raised a spurious #P deriving the quotient bits).
+enum {
+    X87_F2XM1,
+    X87_FYL2X,
+    X87_FPTAN,
+    X87_FPATAN,
+    X87_FYL2XP1,
+    X87_FSINCOS,
+    X87_FSIN,
+    X87_FCOS,
+    X87_FPREM,
+    X87_FPREM1
+};
+
+// FNSTENV/FLDENV m28 and FNSAVE/FRSTOR m108: cpu->divop selects which, cpu->x87_ea carries the host EA.
+enum { X87ENV_STORE, X87ENV_LOAD, X87ENV_SAVE, X87ENV_RESTORE };
 
 // x86 register encodings (== host reg numbers)
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI };

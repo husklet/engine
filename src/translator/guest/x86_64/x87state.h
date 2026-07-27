@@ -15,20 +15,15 @@ struct cpu;
 // (bits 2:0 are TOP), so sizeof(struct cpu) -- which IS the checkpoint format -- does not move.
 //
 // HL_X87_ARMED gates the whole model. A zero-initialised cpu reads as DISARMED = "no tag information",
-// which is exactly the pre-existing "every slot occupied" behaviour; interp.c arms it at the first x87
-// instruction, where the stack is architecturally empty. The AArch64 JIT does not maintain these bits
-// (lower/x87.c hl_x86_x87_materialize() stores TOP with a plain 64-bit str, clearing them), so
-// hl_x87_tags_modelled() is false there and every byte this header influences stays as it was.
+// which is exactly the pre-existing "every slot occupied" behaviour; both backends arm it at the first x87
+// instruction, where the stack is architecturally empty -- interp.c in interp_x87_arm(), the AArch64 JIT in
+// lower/x87.c fp_tags(), which is why the tag bits survive hl_x86_x87_materialize()'s store of TOP.
 #define HL_X87_EMPTY_SHIFT 8
 #define HL_X87_EMPTY_ALL (UINT64_C(0xff) << HL_X87_EMPTY_SHIFT)
 #define HL_X87_ARMED (UINT64_C(1) << 16)
 #define HL_X87_STATE_BITS (HL_X87_EMPTY_ALL | HL_X87_ARMED)
 
-#if defined(HL_HOST_CPU_AARCH64)
-#define hl_x87_tags_modelled() 0
-#else
 #define hl_x87_tags_modelled() 1
-#endif
 
 // `slot` is PHYSICAL (an index into cpu->st[]), like hardware's tag word and FXSAVE tag byte.
 static inline int hl_x87_phys_empty(uint64_t fptop, int slot) {
@@ -80,11 +75,22 @@ static inline double hl_x87_indefinite(void) {
 // (measured: fldcw ffff -> fnstcw 1f7f, fldcw 0000 -> 0040).
 #define HL_X87_FCW(v) ((uint64_t)(((v) & 0x1f3fu) | 0x40u))
 
+// The host's sticky FP exception flags, in x87 FSW bit order (IE0 DE1 ZE2 OE3 UE4 PE5) on either host.
+// Snapshot/restore them around a computation used only to DERIVE something: FPREM is exact by definition,
+// so the host division its quotient bits need must not leave a #P behind.
+unsigned hl_x87_exceptions_get(void);
+void hl_x87_exceptions_set(unsigned flags);
+void hl_x87_exceptions_raise(unsigned flags);
+
 double hl_x86_ext80_load(const uint8_t image[10]);
 void hl_x86_ext80_store(double value, uint8_t image[10]);
 void hl_x86_x87_load_ext80(struct cpu *cpu);
 void hl_x86_x87_store_ext80_pop(struct cpu *cpu);
 void hl_x86_fxsave(struct cpu *cpu);
 void hl_x86_fxrstor(struct cpu *cpu);
+// FSW as FNSTSW/FNSTENV/FXSAVE report it: cpu->fpsw's codes + SF, TOP, and the host's live exception flags.
+uint16_t hl_x86_x87_status_word(const struct cpu *cpu);
+// FNSTENV/FLDENV/FNSAVE/FRSTOR, selected by cpu->divop (X87ENV_*) at the host EA in cpu->x87_ea.
+void hl_x86_x87_environment(struct cpu *cpu);
 
 #endif

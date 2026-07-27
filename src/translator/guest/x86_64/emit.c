@@ -706,13 +706,16 @@ static void e_st_addr(int xa, int i) { // xa = &cpu->st[(fptop+i)&7]   (clobbers
     emit32(0x8B000000u | (16 << 16) | (3 << 10) | (xa << 5) | xa);           // add xa,xa,x16,lsl#3
 }
 
-void e_fp_settop(int delta) { // fptop = (fptop+delta) & 7   (clobbers x16)
+// fptop = (fptop+delta) & 7, keeping bits 63:3 -- the x87 tag word and its ARMED bit live there
+// (x87state.h), so this is a bfi rather than the mask-and-store it used to be. (clobbers x16/x17)
+void e_fp_settop(int delta) {
     e_ldr(16, 28, OFF_FPTOP);
+    e_mov_rr(17, 16, 0);
     if (delta < 0)
-        emit32(0x51000000u | ((unsigned)(-delta) << 10) | (16 << 5) | 16); // sub w16,w16,#n
+        emit32(0x51000000u | ((unsigned)(-delta) << 10) | (17 << 5) | 17); // sub w17,w17,#n
     else if (delta)
-        emit32(0x11000000u | ((unsigned)delta << 10) | (16 << 5) | 16); // add w16,w16,#n
-    emit32(0x12000800u | (16 << 5) | 16);                               // and w16,w16,#7
+        emit32(0x11000000u | ((unsigned)delta << 10) | (17 << 5) | 17); // add w17,w17,#n
+    e_bfi(16, 17, 0, 3, 1);
     e_str(16, 28, OFF_FPTOP);
 }
 
@@ -750,6 +753,10 @@ void e_fcom_setfpsw(int n, int m, int signaling) {
     e_rrr(A_ORR, 16, 16, 20, 0, 0); // | C2<<10
     e_lsl_i(17, 17, 14, 0);
     e_rrr(A_ORR, 16, 16, 17, 0, 0); // | C3<<14
+    e_ldr(17, 28, OFF_FPSW);        // SF (bit 6) is sticky: a condition-code write must not clear it
+    e_movconst(20, 0x40);
+    e_rrr(A_AND, 17, 17, 20, 1, 0);
+    e_rrr(A_ORR, 16, 16, 17, 1, 0);
     e_str(16, 28, OFF_FPSW);
 }
 
