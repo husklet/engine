@@ -4110,6 +4110,23 @@ static const char *proc_any_leaf(const char *rp, int *pid) {
     return q + i + 1;
 }
 
+// Is `host` inside OUR process tree? Walks the host ppid chain looking for this process or the container
+// init. A daemonized descendant (setsid) leaves our session, so the same-session fallback below cannot see
+// it: /proc/<pid>/* for a double-forked grandchild that reparented onto us read back ENOENT, and a
+// supervisor comparing that ppid against getppid() saw them disagree. Bounded hops; a chain that leaves our
+// tree climbs to the host init instead, so an unrelated pid is still rejected.
+static int proc_pid_descendant(int host) {
+    int self = (int)getpid();
+    for (int hop = 0; hop < 32 && host > 1; hop++) {
+        struct hl_procinfo pi;
+        if (!hl_get_procinfo(host, &pi)) return 0;
+        if (pi.ppid_host == self || (g_init_hostpid && pi.ppid_host == g_init_hostpid)) return 1;
+        if (pi.ppid_host <= 1 || pi.ppid_host == host) return 0;
+        host = pi.ppid_host;
+    }
+    return 0;
+}
+
 // Is guest pid `gp` a live member of this container? Fills *hostout with its host pid (gp==1 -> init).
 static int proc_pid_member(int gp, int *hostout) {
     int host = (gp == 1 && g_init_hostpid) ? g_init_hostpid : gp;
@@ -4120,7 +4137,10 @@ static int proc_pid_member(int gp, int *hostout) {
     proc_reg_key(dir, sizeof dir);
     snprintf(path, sizeof path, "%s/%d", dir, host);
     if (access(path, F_OK) == 0 && !(kill(host, 0) != 0 && errno == ESRCH)) return 1;
-    return kill(host, 0) == 0 && getsid(host) == getsid(0); // registry may lag; accept a live session peer
+    if (kill(host, 0) != 0) return 0;
+    // registry may lag (or is off outside container mode): accept a live session peer, or a descendant of
+    // ours that left the session.
+    return getsid(host) == getsid(0) || proc_pid_descendant(host);
 }
 
 // Does `rp` name a /proc/<pid>/... path for a pid other than this process? Such a path must never reach the
@@ -4325,8 +4345,10 @@ static int proc_stat_pid_text(char *b, size_t n, int gp, int host) {
     unsigned long long start_ticks = since > 0 ? (unsigned long long)since * (unsigned long long)hz : 0;
     int nthreads = 1; // Peer /proc/<pid>/task currently exposes one synthetic task.
     return snprintf(b, n,
+                    // Field 38 (exit_signal, SIGCHLD=17) sat at 39 here -- the same one-too-many zero after
+                    // field 25 that proc_stat_text carried, shifting every field from 26 up by one.
                     "%d (%s) %c %d %d %d 0 -1 4194560 0 0 0 0 %llu %llu 0 0 20 0 %d 0 %llu %llu %lu "
-                    "18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                    "18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
                     gp, comm, state, ppid, pgrp, psess, utime, stime, nthreads, start_ticks, vsize, rss_pg);
 }
 
@@ -5254,30 +5276,169 @@ static int guest_is_x86(void) {
     return 0;
 }
 
-// x86-64 /proc/cpuinfo block for one logical CPU. The `flags` list mirrors EXACTLY the feature set the JIT's
-// CPUID leaf reports (guest/x86_64/ops.c do_cpuid) -- every token here is backed by a CPUID bit hl actually sets, and
-// every CPUID bit hl sets appears here, so a guest gets the SAME answer from `cpuid` and from /proc:
-//   leaf 1 EDX:   fpu tsc cx8 sep pge cmov clflush mmx fxsr sse sse2
-//   leaf 1 ECX:   pni(sse3) pclmulqdq ssse3 cx16 sse4_1 sse4_2 popcnt aes  (movbe is deliberately WITHHELD --
-//                 see do_cpuid: the "movbe && !xsave" Atom fingerprint pessimizes openssl -- so it is absent here too)
-//   leaf 7 EBX/EDX: bmi1 bmi2 erms sha_ni fsrm
-//   ext 0x80000001: syscall nx rdtscp lm lahf_lm     ext 0x80000007: constant_tsc/nonstop_tsc (invariant TSC)
-//   synthetic (Linux always adds): cpuid nopl. NO AVX/xsave (xgetbv reports only x87+SSE). family 6 model 44
-//   stepping 2 decode leaf-1 EAX 0x000206c2; model name matches the CPUID brand string (0x80000002..4).
-static int cpuinfo_x86_block(char *b, size_t n, int idx, int ncpu) {
-    return snprintf(
-        b, n,
-        "processor\t: %d\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 44\n"
-        "model name\t: hl JIT x86-64 processor\nstepping\t: 2\nmicrocode\t: 0x1\ncpu MHz\t\t: 2500.000\n"
-        "cache size\t: 8192 KB\nphysical id\t: 0\nsiblings\t: %d\ncore id\t\t: %d\ncpu cores\t: %d\n"
-        "apicid\t\t: %d\ninitial apicid\t: %d\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 7\nwp\t\t: yes\n"
-        "flags\t\t: fpu tsc cx8 sep pge cmov clflush mmx fxsr sse sse2 syscall nx rdtscp lm constant_tsc "
-        "nonstop_tsc cpuid nopl pni pclmulqdq ssse3 cx16 sse4_1 sse4_2 popcnt aes lahf_lm bmi1 bmi2 erms "
-        "sha_ni fsrm\n"
-        "bugs\t\t:\nbogomips\t: 5000.00\nclflush size\t: 64\ncache_alignment\t: 64\n"
-        "address sizes\t: 39 bits physical, 48 bits virtual\npower management:\n\n",
-        idx, ncpu, idx, ncpu, idx, idx);
+// ---- /proc/cpuinfo, one CPU model, two renderings --------------------------
+// Both blocks below are DERIVED, never restated: the guest must not be able to get two different answers
+// to "what CPU is this" from CPUID/auxv and from /proc. Each side reads the same single source the auxv
+// reads -- hl_x86_cpuid() for the x86-64 guest, AT_HWCAP/AT_HWCAP2 (copied verbatim out of
+// g_aarch64_cpu_model by the loader) for the aarch64 guest. tests/compat/procfs/cpumodel.c gates both.
+// The arch is a compile-time property of the engine binary (one guest frontend per build), so the split is
+// the same G_* seam every other per-guest detail uses -- and only the x86-64 build links hl_x86_cpuid.
+#if G_SECCOMP_ARCH == 0xC000003Eu // AUDIT_ARCH_X86_64
+#include "../../translator/guest/x86_64/cpuid.h"
+
+// One CPUID leaf/subleaf, exactly as the guest's own CPUID instruction answers it -> {eax,ebx,ecx,edx}.
+static void cpuinfo_cpuid(uint32_t leaf, uint32_t sub, uint32_t out[4]) {
+    struct cpu probe = {0}; // hl_x86_cpuid reads RAX/RCX and writes RAX..RDX; nothing else is touched
+    probe.r[RAX] = leaf;
+    probe.r[RCX] = sub;
+    hl_x86_cpuid(&probe);
+    out[0] = (uint32_t)probe.r[RAX];
+    out[1] = (uint32_t)probe.r[RBX];
+    out[2] = (uint32_t)probe.r[RCX];
+    out[3] = (uint32_t)probe.r[RDX];
 }
+
+// CPUID bit -> /proc/cpuinfo flag token, in the order Linux prints them (x86_cap_flags word order).
+// `reg` indexes {eax,ebx,ecx,edx}. constant_tsc/nonstop_tsc are both the one invariant-TSC bit; `cpuid`
+// and `nopl` are Linux synthetics every long-mode CPU gets, so they hang off LM. Nothing here is a
+// standing claim: a flag appears iff hl_x86_cpuid sets its bit, so withholding MOVBE drops `movbe` too.
+static const struct {
+    uint32_t leaf, sub;
+    uint8_t reg, bit;
+    const char *name;
+} X86_FLAG[] = {
+    {1, 0, 3, 0, "fpu"},
+    {1, 0, 3, 4, "tsc"},
+    {1, 0, 3, 8, "cx8"},
+    {1, 0, 3, 11, "sep"},
+    {1, 0, 3, 13, "pge"},
+    {1, 0, 3, 15, "cmov"},
+    {1, 0, 3, 19, "clflush"},
+    {1, 0, 3, 23, "mmx"},
+    {1, 0, 3, 24, "fxsr"},
+    {1, 0, 3, 25, "sse"},
+    {1, 0, 3, 26, "sse2"},
+    {0x80000001, 0, 3, 11, "syscall"},
+    {0x80000001, 0, 3, 20, "nx"},
+    {0x80000001, 0, 3, 27, "rdtscp"},
+    {0x80000001, 0, 3, 29, "lm"},
+    {0x80000007, 0, 3, 8, "constant_tsc"},
+    {0x80000007, 0, 3, 8, "nonstop_tsc"},
+    {0x80000001, 0, 3, 29, "cpuid"},
+    {0x80000001, 0, 3, 29, "nopl"},
+    {1, 0, 2, 0, "pni"},
+    {1, 0, 2, 1, "pclmulqdq"},
+    {1, 0, 2, 9, "ssse3"},
+    {1, 0, 2, 13, "cx16"},
+    {1, 0, 2, 19, "sse4_1"},
+    {1, 0, 2, 20, "sse4_2"},
+    {1, 0, 2, 22, "movbe"},
+    {1, 0, 2, 23, "popcnt"},
+    {1, 0, 2, 25, "aes"},
+    {0x80000001, 0, 2, 0, "lahf_lm"},
+    {7, 0, 1, 3, "bmi1"},
+    {7, 0, 1, 8, "bmi2"},
+    {7, 0, 1, 9, "erms"},
+    {7, 0, 1, 29, "sha_ni"},
+    {7, 0, 3, 4, "fsrm"},
+};
+
+// x86-64 /proc/cpuinfo block for one logical CPU: vendor, family/model/stepping, brand string, cpuid
+// level, address sizes and the flag list all decoded out of the CPUID leaves themselves.
+static int cpuinfo_x86_block(char *b, size_t n, int idx, int ncpu) {
+    uint32_t l0[4], l1[4], ext[4], sizes[4];
+    cpuinfo_cpuid(0, 0, l0);
+    cpuinfo_cpuid(1, 0, l1);
+    cpuinfo_cpuid(0x80000000u, 0, ext);
+    cpuinfo_cpuid(0x80000008u, 0, sizes);
+    char vendor[13];
+    memcpy(vendor, &l0[1], 4);
+    memcpy(vendor + 4, &l0[3], 4);
+    memcpy(vendor + 8, &l0[2], 4);
+    vendor[12] = 0;
+    unsigned family = (l1[0] >> 8) & 0xf, model = (l1[0] >> 4) & 0xf;
+    if (family == 0xf) family += (l1[0] >> 20) & 0xff;
+    if (family == 6 || family == 0xf) model |= ((l1[0] >> 16) & 0xf) << 4;
+    char brand[49] = {0}; // brand leaves are space-padded; Linux prints the trimmed string
+    if (ext[0] >= 0x80000004u)
+        for (uint32_t i = 0; i < 3; i++) {
+            uint32_t r[4];
+            cpuinfo_cpuid(0x80000002u + i, 0, r);
+            memcpy(brand + i * 16, r, 16);
+        }
+    const char *name = brand;
+    while (*name == ' ')
+        name++;
+    char flags[512];
+    int fn = 0;
+    flags[0] = 0;
+    for (size_t i = 0; i < sizeof X86_FLAG / sizeof X86_FLAG[0]; i++) {
+        uint32_t r[4];
+        cpuinfo_cpuid(X86_FLAG[i].leaf, X86_FLAG[i].sub, r);
+        if (!((r[X86_FLAG[i].reg] >> X86_FLAG[i].bit) & 1u)) continue;
+        int w = snprintf(flags + fn, sizeof flags - (size_t)fn, "%s%s", fn ? " " : "", X86_FLAG[i].name);
+        if (w < 0 || (size_t)w >= sizeof flags - (size_t)fn) break;
+        fn += w;
+    }
+    return snprintf(b, n,
+                    "processor\t: %d\nvendor_id\t: %s\ncpu family\t: %u\nmodel\t\t: %u\n"
+                    "model name\t: %s\nstepping\t: %u\nmicrocode\t: 0x1\ncpu MHz\t\t: 2500.000\n"
+                    "cache size\t: 8192 KB\nphysical id\t: 0\nsiblings\t: %d\ncore id\t\t: %d\ncpu cores\t: %d\n"
+                    "apicid\t\t: %d\ninitial apicid\t: %d\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: %u\n"
+                    "wp\t\t: yes\nflags\t\t: %s\n"
+                    "bugs\t\t:\nbogomips\t: 5000.00\nclflush size\t: 64\ncache_alignment\t: 64\n"
+                    "address sizes\t: %u bits physical, %u bits virtual\npower management:\n\n",
+                    idx, vendor, family, model, name, l1[0] & 0xf, ncpu, idx, ncpu, idx, idx, l0[0], flags,
+                    sizes[0] & 0xff, (sizes[0] >> 8) & 0xff);
+}
+
+#define cpuinfo_block(b, n, i, nc) cpuinfo_x86_block((b), (n), (i), (nc))
+#else
+// HWCAP/HWCAP2 bit -> the token arch/arm64/kernel/cpuinfo.c prints; NULL is a bit Linux does not name.
+static const char *const ARM_HWCAP[64] = {
+    "fp",    "asimd",    "evtstrm", "aes",   "pmull",  "sha1",  "sha2", "crc32", "atomics", "fphp",    "asimdhp",
+    "cpuid", "asimdrdm", "jscvt",   "fcma",  "lrcpc",  "dcpop", "sha3", "sm3",   "sm4",     "asimddp", "sha512",
+    "sve",   "asimdfhm", "dit",     "uscat", "ilrcpc", "flagm", "ssbs", "sb",    "paca",    "pacg"};
+static const char *const ARM_HWCAP2[64] = {"dcpodp",  "sve2",   "sveaes", "svepmull", "svebitperm", "svesha3",
+                                           "svesm4",  "flagm2", "frint",  "svei8mm",  "svef32mm",   "svef64mm",
+                                           "svebf16", "i8mm",   "bf16",   "dgh",      "rng",        "bti",
+                                           "mte",     "ecv",    "afp",    "rpres"};
+
+// The value the loader planted for auxv entry `type`, or 0 when there is none.
+static uint64_t guest_auxv(uint64_t type) {
+    for (int i = 0; i + 16 <= g_auxv_len; i += 16) {
+        uint64_t t, v;
+        memcpy(&t, g_auxv_data + i, 8);
+        memcpy(&v, g_auxv_data + i + 8, 8);
+        if (t == type) return v;
+    }
+    return 0;
+}
+
+// aarch64 /proc/cpuinfo block for one logical CPU. `Features` is the decode of the SAME AT_HWCAP/AT_HWCAP2
+// pair the guest reads from its own auxv, so the seven features hl advertises beyond fp/asimd (aes pmull
+// sha1 sha2 crc32 atomics asimddp) can no longer be missing from one surface and present on the other.
+static int cpuinfo_arm_block(char *b, size_t n, int idx) {
+    const uint64_t caps[2] = {guest_auxv(16), guest_auxv(26)};
+    const char *const *names[2] = {ARM_HWCAP, ARM_HWCAP2};
+    char feat[512];
+    int fn = 0;
+    feat[0] = 0;
+    for (int word = 0; word < 2; word++)
+        for (int i = 0; i < 64; i++) {
+            if (!((caps[word] >> i) & 1u) || !names[word][i]) continue;
+            int w = snprintf(feat + fn, sizeof feat - (size_t)fn, "%s%s", fn ? " " : "", names[word][i]);
+            if (w < 0 || (size_t)w >= sizeof feat - (size_t)fn) break;
+            fn += w;
+        }
+    return snprintf(b, n,
+                    "processor\t: %d\nBogoMIPS\t: 100.00\nFeatures\t: %s\nCPU implementer\t: 0x61\n"
+                    "CPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0x000\nCPU revision\t: 0\n\n",
+                    idx, feat);
+}
+
+#define cpuinfo_block(b, n, i, nc) ((void)(nc), cpuinfo_arm_block((b), (n), (i)))
+#endif
 
 // Defined later in netns.c (same TU, included after vfs.c): emit the LISTEN rows for /proc/net/tcp[6].
 static int netns_tcp_emit(char *out, size_t cap, int v6);
@@ -5467,21 +5628,16 @@ static int proc_open(const char *rp) {
     }
     if (!strcmp(rp, "/proc/cpuinfo")) {
         int nc = container_online_cpus(); // docker --cpus cap (state.c), else all host cores
-        // One block per online CPU. The x86 block is ~570 bytes, so up to 64 CPUs need ~37KB -- far past the
-        // shared 8KB `buf` (which silently truncated cpuinfo to ~14 processors on a many-core host).
-        // Use a dedicated buffer sized for the 64-CPU ceiling and clamp each snprintf so a would-be overflow
-        // can never inflate `cn` past the buffer (proc_text_fd writes exactly `cn` bytes).
-        char cib[64 * 640]; // per-call (proc_open is reentrant across guest threads); ~40KB stack
+        // One block per online CPU, and container_online_cpus() caps at 64. The x86 block is 656 bytes today
+        // and its flag list is derived, so bound it by that list's own 512-byte ceiling rather than by a
+        // measurement: 1KB/CPU covers any model. (640 did not even cover today's block, and the shared 8KB
+        // `buf` silently truncated cpuinfo to ~14 processors on a many-core host.) Each snprintf is still
+        // clamped so a would-be overflow cannot inflate `cn` -- proc_text_fd writes exactly `cn` bytes.
+        char cib[64 * 1024]; // per-call (proc_open is reentrant across guest threads); 64KB stack
         int cn = 0;
         for (int i = 0; i < nc; i++) {
             size_t rem = sizeof cib - (size_t)cn;
-            int w =
-                guest_is_x86()
-                    ? cpuinfo_x86_block(cib + cn, rem, i, nc)
-                    : snprintf(cib + cn, rem,
-                               "processor\t: %d\nBogoMIPS\t: 100.00\nFeatures\t: fp asimd\nCPU implementer\t: 0x61\n"
-                               "CPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0x000\nCPU revision\t: 0\n\n",
-                               i);
+            int w = cpuinfo_block(cib + cn, rem, i, nc);
             if (w < 0 || (size_t)w >= rem) break; // truncated -> stop rather than over-report length
             cn += w;
         }
