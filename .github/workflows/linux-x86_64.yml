@@ -5,7 +5,8 @@ name: Linux x86-64
 # group is tuned to a lane that keeps up.
 #
 # Scope: configure, build the host libraries, production engines and both guest
-# fixture corpora, run the host-only `unit` lane, link an x86_64 host archive into
+# fixture corpora, run the `unit`, `nested-engine` and `emulated-aarch64-gated`
+# lanes -- the last EMULATED, see that step -- and link an x86_64 host archive into
 # the crate. Guests DO run here; every other lane is absent for not being GREEN
 # yet, not for being impossible -- docs/ci-green.md, "What IS hidden by the lanes
 # absent from linux-x86_64.yml", is the accounting. Split HL_CI_SHARDED_LINUX per
@@ -112,6 +113,28 @@ jobs:
             test -f build-ci-sdk/lib/libhl-engine.a
             test -f build-ci-sdk/lib/pkgconfig/hl-engine.pc
             test -x build-ci-sdk/bin/hl-engine-runner
+          '
+
+      # EMULATION, NOT HARDWARE -- and the ONLY place any CI job executes the
+      # aarch64 host arm cross-compiled two steps up: the aarch64 runners never
+      # compile the x86_64 arms and this runner never ran the aarch64 host, which is
+      # how several JIT defects on this branch merged without ever running.
+      #
+      # docs/emulated-aarch64.md is the category list. Instruction semantics, the
+      # W^X arena and signal delivery are vouched for; weak memory ordering is NOT,
+      # since qemu-user inherits this x86 host's stronger model -- a missing dmb in
+      # the IBTC or STW paths passes here and can still fail on silicon. Evidence,
+      # never proof, and never a substitute for an aarch64 runner.
+      #
+      # The label is the GREEN subset (cmake/Phase3Gates.cmake 9b): emulated.abi is
+      # the control, emulated.completeness is excluded while genuinely red. -V, as
+      # for nested-engine: CTest prints NOTHING for a skip, and a skip here means
+      # qemu-aarch64 or build-arm-check went missing.
+      - name: Test the aarch64 host under emulation (qemu-user)
+        timeout-minutes: 30
+        run: |
+          tools/ci_run.sh 1740 "Test the aarch64 host under emulation (qemu-user)" -- nix develop --command sh -c '
+            ctest --test-dir build-ci -L emulated-aarch64-gated --no-tests=error -V
           '
 
       # BUILT here, never committed: a third archive against the 10MB crates.io

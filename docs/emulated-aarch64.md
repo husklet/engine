@@ -9,29 +9,39 @@ This document records **what that is worth**, measured rather than assumed. A gr
 run under emulation is evidence, not proof, and the boundary matters: a false green
 is worse than no result.
 
-Lane: `emulated.*`, label `emulated-aarch64`, `cmake/Phase3Gates.cmake` section 9b,
-driver `tools/emulated_aarch64_gate.sh`. Registry-only — see "Status" below.
+Lane: `emulated.*`, `cmake/Phase3Gates.cmake` section 9b, driver
+`tools/emulated_aarch64_gate.sh`. Two labels — `emulated-aarch64` is every cell,
+`emulated-aarch64-gated` is the subset `.github/workflows/linux-x86_64.yml` runs.
+See "Status" below for which cell is in neither and why.
 
 ## Running it
 
-`qemu-aarch64` is **not** in the flake devShell, so the lane skips by default.
+`qemu-aarch64` comes from the flake devShell (`toolchainFor.emulators`, x86_64
+Linux only). Nothing names a `/nix/store` path; **flake.lock is the pin**.
 
 ```sh
 cmake -G Ninja -B build-arm-check -DHL_BUILD_TESTS=OFF \
       -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux.cmake
 ninja -C build-arm-check
-nix shell nixpkgs#qemu --command ctest --test-dir build -L emulated-aarch64 -V
+nix develop --command ctest --test-dir build -L emulated-aarch64 -V
 ```
 
-`HL_QEMU_AARCH64=/path/to/qemu-aarch64` works instead of putting it on `PATH`.
-Use `-V`: CTest prints nothing at all for a skipped test, and the skip message is
+`HL_QEMU_AARCH64=/path/to/qemu-aarch64` overrides the devShell's copy.
+Use `-V`: CTest prints nothing at all for a skipped test — verified, a skip under
+`--output-on-failure` produces only a "did not run" line — and the skip message is
 the part that names what is missing.
+
+The emulator version is this lane's **oracle**, so the gate prints it on every run
+and a nixpkgs bump that moves it invalidates the table below until re-measured.
 
 ## What was measured
 
 Probes were compiled for both aarch64 (run under qemu) and x86_64 (run natively as
 an oracle for the arch-neutral behaviour), then compared. Verified against
-qemu 11.0.2.
+qemu 11.0.2, and the lane re-measured on **qemu-user 10.2.2** — the version
+flake.lock's nixpkgs serves, and the one CI will therefore use. Every cell gave
+byte-identical results on both, down to the offset of each failing diff, so the
+two versions are interchangeable as oracles for this corpus.
 
 ### Category A — vouched for
 
@@ -80,11 +90,13 @@ synthetic probe.
   lines) and `dczid_el0` reads `0x7` under qemu; real hardware commonly differs.
   Code that sizes loops from these sees qemu's values.
 
-  This produces a **false RED**, not a false green, and one was observed:
-  `completeness/dotprod` fails under the lane with `hwcap_dp=0` where the golden
-  says `1` — and the same fixture run *directly* under `qemu-aarch64`, with no
-  engine, reports `1`. So the divergence is in what the engine sees and
-  re-advertises while itself emulated, not in the dotprod lowering. Treat any
+  This produces a **false RED**, not a false green. One was observed:
+  `completeness/dotprod` failed under the lane with `hwcap_dp=0` where the golden
+  says `1`, while the same fixture run *directly* under `qemu-aarch64` with no
+  engine reported `1` — the divergence was in what the engine saw and re-advertised
+  while itself emulated, not in the dotprod lowering. It **passes as of
+  2026-07-27**, after the feature-advertisement and auxv work (`23afa33e`,
+  `bb57d321`); the caveat stands even though its example no longer fires. Treat any
   HWCAP/`mrs`-derived case that fails only here as unproven in both directions
   until it runs on hardware.
 - **`tpidrro_el0`.** Reads 0 under qemu. That matches Linux/aarch64, which zeroes it
@@ -105,22 +117,50 @@ not part of its contract. Noted so the next person does not re-derive it.
 
 ## Status
 
-Registry-only in `cmake/CiLanes.cmake` (`HL_CI_REGISTRY_LINUX`, reserved to
-`Linux-x86_64` via `HL_CI_HOST_CPU_ONLY`).
+Measured 2026-07-27 against `build-arm-check`, twice, on qemu-user 10.2.2 and 11.0.2.
 
-The five defects that kept it out of a workflow are now fixed, and every one of them
-was found **by this lane** — none was reachable before it existed:
+| Cell | Result | Gated |
+|---|---|---|
+| `emulated.isa-x86-64` | 8/8 pass, 37s | yes |
+| `emulated.abi` | 71/71 aarch64, 73/73 x86-64, 63s | yes |
+| `emulated.completeness` | 117/118 aarch64, 150/154 x86-64, 264s | **no** |
 
-- `emulated.isa-x86-64` — 8/8. The 107-line failure was the two-NaN operand rule:
-  the engine implemented qemu-x86_64's softfloat `float_2nan_prop_x87`, where real
-  hardware is plain src1-priority-quieted. Measured on Zen 4 over all 64 ordered NaN
-  pairs; the goldens were right all along.
-- `emulated.completeness` — `movq-mmx-xmm` (MOVQ2DQ/MOVDQ2Q were not lowered at
-  all), `cvt-mmx` (all 160 lines) and `x87-compare-codes` (FCOM/FCOMI did not set
-  FSW.IE) now pass, as do `mmx-width` and `div-overflow`. Only `priority` fails, and
-  only because the harness process is already at nice 12 and cannot lower it -- it
-  fails identically on BOTH ISAs and on the native lane, so it is environmental.
-- `emulated.abi` — green, and present as a control: without one, total breakage and
-  a correctly-reported defect look alike.
+`emulated-aarch64-gated` carries the two green cells and is run by
+`.github/workflows/linux-x86_64.yml`. `emulated-aarch64` carries all three and stays
+in `HL_CI_REGISTRY_LINUX`. Both are reserved to `Linux-x86_64` by
+`HL_CI_HOST_CPU_ONLY`.
 
-Wiring it into `.github/workflows/linux-x86_64.yml` is now the right move.
+`emulated.abi` is the **control**: without a cell that must be green, total
+breakage and a correctly-reported defect look alike.
+
+The five defects that originally kept the lane out of a workflow are fixed, and every
+one was found **by this lane** — none was reachable before it existed. The 107-line
+`isa-x86-64` failure was the two-NaN operand rule: the engine implemented
+qemu-x86_64's softfloat `float_2nan_prop_x87`, where real hardware is plain
+src1-priority-quieted (measured on Zen 4 over all 64 ordered NaN pairs; the goldens
+were right all along). `movq-mmx-xmm` (MOVQ2DQ/MOVDQ2Q not lowered at all),
+`cvt-mmx` (all 160 lines), `x87-compare-codes` (FCOM/FCOMI did not set FSW.IE),
+`mmx-width` and `div-overflow` now pass too.
+
+### Why `completeness` is not gated
+
+Four cases fail. Three are real defects in the shipped aarch64 host, all three
+passing on the native x86-64 host engine and failing identically under both qemu
+versions — so neither an emulator artefact nor a wrong golden:
+
+- `x87-stack-faults` — the engine aborts with `UNIMPL 1B opcode 0xdd` at the guest's
+  `dd b5 60 ff ff ff`, i.e. **FRSTOR (DD /4) is not lowered**.
+- `x87-fprem-loop` — FPREM results diverge from byte 47.
+- `x87-precision-rounding` — precision-control results diverge from byte 204.
+
+All three fixtures arrived with `5d28c1ca`, which fixed the x86-host arm alone: the
+aarch64 arm shipped in the same commit without ever running. That is exactly the
+failure mode this lane exists to end, so the cell is left red and visible rather
+than excluded from the registry.
+
+The fourth, `priority`, is environmental — the harness is already at nice 12 and
+cannot lower it, and it fails identically on both ISAs and on the native lane
+(`docs/ci-green.md`, "Host-environment preconditions").
+
+Add `GATED` to the cell in `cmake/Phase3Gates.cmake` section 9b once the three x87
+defects are fixed.

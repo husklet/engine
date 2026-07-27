@@ -221,29 +221,36 @@ asserted non-empty so a rename fails the configure instead of silently leaving a
 This paragraph previously said those lanes were absent "for a different reason — the engine
 cannot execute a guest there yet — so nothing is currently hidden by it." Both halves are
 false, and the second follows from the first only while the first holds. The engine executes
-guests on this host through the two interpreter backends, and a sweep of all 24 compat
-manifests measures **2632/3013 (case, guest-ISA) runs passing — 87.4%** (aarch64 guest 85.7%,
-x86-64 guest 89.0%).
-
-That sweep is a snapshot taken at `fe722e2c`, and it is a floor rather than a current figure: the
-x86-64 ISA golden was regenerated from real hardware (`1387b1df`) and five interpreter/JIT fixes have
-landed since (`2b926d2f`, `4e94b2bb`, `1328eac3`, `5a519492`, `23afa33e`) with no re-sweep. Read it as
-"measured once, at that commit", and re-measure before quoting it as the state of the host.
+guests on this host through the two interpreter backends. A first sweep of all 24 compat
+manifests at `fe722e2c` measured 2632/3013 (case, guest-ISA) runs passing — 87.4%. **That figure
+is superseded.** A second sweep after the fixes landed, same method and same completeness against
+pinned binaries, measures **2993/3013 — 99.34%** (aarch64 guest 1488/1496, x86-64 guest
+1505/1517), with **20 of the 24 suites fully green on both guest ISAs**; the residue is
+`completeness`, `core-regress`, `process` and `procfs`. `docs/amd64-host-findings.md` §3.10 is
+the record. Still a snapshot, not a gate: re-measure before quoting it.
 
 `linux-x86_64.yml` gates `ctest -L unit` (twice — once sandboxed through `.#checks.x86_64-linux.unit`,
-once in the CMake tree), `ctest -L nested-engine`, the `package` nix check and a `cmake --install`
-assertion. No compat, production, perf, checkpoint or lifecycle lane. So **none of those 3013 runs is
-gated**, and the ~381 that fail are invisible to CI rather than absent from the tree. That is the real
-cost of the missing shards, and it is what the sentence above used to deny.
+once in the CMake tree), `ctest -L nested-engine`, `ctest -L emulated-aarch64-gated`, the `package`
+nix check and a `cmake --install` assertion. No compat, production, perf, checkpoint or lifecycle
+lane. So **none of those 3013 runs is gated**, and the ~20 that fail are invisible to CI rather than
+absent from the tree. That is the real cost of the missing shards, and it is what the sentence above
+used to deny.
 
-What it takes to close it is written where the decision lives (`cmake/CiLanes.cmake`,
-`HL_CI_COMPAT_HOSTS`): the gateable subset is the suites measured green on **both** guest
-ISAs, because `cmake/Phase3Compat.cmake` gives each compat label one CTest case covering both,
-so a suite green on one guest ISA and red on the other is a red lane and not half a green one.
-Declaring the host token is also not a one-line edit — `tools/check_ci_workflows.sh`'s I19
-rejects a second compat host on an OS whose sharded lane list cannot say which host it
-describes, and declaring the token first would switch I20 off and leave that workflow with no
-structural guard at all.
+The `emulated-aarch64-gated` step is the one lane that closed a gap of its own, and it is
+**emulation**: it runs the cross-built aarch64 host arm under `qemu-user` on this x86-64 runner,
+because CI otherwise never executes that arm anywhere. `docs/emulated-aarch64.md` is the category
+list — weak memory ordering is explicitly *not* vouched for, since qemu-user inherits this host's
+stronger model, so a missing barrier in the IBTC or STW paths passes there and can still fail on
+silicon. It does not substitute for an aarch64 runner and does not touch the 3013 runs above.
+
+What it takes to close the compat gap is written where the decision lives (`cmake/CiLanes.cmake`,
+`HL_CI_COMPAT_HOSTS`), as an ordered four-step sequence: split `HL_CI_SHARDED_LINUX` per host CPU,
+rework the OS-keyed guards, declare the host token and add a sharded matrix job to
+`linux-x86_64.yml` in one change, then gate lane by lane. The order is not cosmetic — the gateable
+subset is the suites measured green on **both** guest ISAs, because `cmake/Phase3Compat.cmake`
+gives each compat label one CTest case covering both; `tools/check_ci_workflows.sh`'s I19 rejects a
+second compat host on an OS whose sharded lane list cannot say which host it describes; and
+declaring the token first switches I20 off and leaves that workflow with no structural guard at all.
 
 ## Host-environment preconditions the harness does not enforce
 

@@ -835,14 +835,19 @@ hl_nested_case(${_nest_foreign}-${_nest_foreign}-${HL_HOST_ARCH}
 # x86_64 Linux hosts only: on an aarch64 host these suites run natively and better,
 # so cmake/CiLanes.cmake reserves the lane with HL_CI_HOST_CPU_ONLY.
 #
-# REGISTRY-ONLY today (cmake/CiLanes.cmake, HL_CI_REGISTRY_LINUX): two of the three
-# cells FAIL, on real defects in the shipped aarch64 host. Wiring this into
-# linux-x86_64.yml is the right move once those are fixed, and not before.
+# TWO labels. `emulated-aarch64` is every cell and is registry-only; the GATED
+# subset also carries `emulated-aarch64-gated`, which linux-x86_64.yml runs. A red
+# cell stays in the registry so the label cannot rot, and out of CI so the gate
+# cannot be weakened to admit it.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND HL_HOST_ARCH STREQUAL "x86_64")
   set(_emu_cross ${HL_NESTED_FOREIGN_TREE}/linux-production)
   set(_emu_shim ${CMAKE_BINARY_DIR}/emulated-aarch64)
-  # hl_emulated_case(<label> <bin-subdir> <suite-source-dir>)
+  # hl_emulated_case(<label> <bin-subdir> <suite-source-dir> [GATED])
   function(hl_emulated_case label bindir suitedir)
+    set(_emu_labels "emulated-aarch64")
+    if("GATED" IN_LIST ARGN)
+      list(APPEND _emu_labels "emulated-aarch64-gated")
+    endif()
     add_test(NAME emulated.${label}
       COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/emulated_aarch64_gate.sh
               ${_emu_cross} ${_emu_shim}/${label} $<TARGET_FILE:matrix-runner>
@@ -850,17 +855,25 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND HL_HOST_ARCH STREQUAL "x86_64")
     # Same RESOURCE_LOCK as the compat suites: these ARE those suites, and the
     # guests still bind ports and share /tmp scratch.
     set_tests_properties(emulated.${label} PROPERTIES
-      LABELS "emulated-aarch64" SKIP_RETURN_CODE 77 RESOURCE_LOCK hl-guest
+      LABELS "${_emu_labels}" SKIP_RETURN_CODE 77 RESOURCE_LOCK hl-guest
       TIMEOUT 3600 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endfunction()
 
-  # isa-x86-64 and completeness are the two that earn the lane: the first is the
-  # ISA regression corpus that exposed the NaN defect, the second the per-encoding
-  # sweep that exposed the MMX ones. abi is a currently-green control -- without
-  # one, a total breakage and a correctly-reported defect look alike.
-  hl_emulated_case(isa-x86-64   ${HL_COMPAT}/isa          tests/compat/isa/x86_64)
+  # isa-x86-64 is the ISA regression corpus that exposed the NaN defect; abi is the
+  # green control -- without one, a total breakage and a correctly-reported defect
+  # look alike. Both measured green under qemu-user 10.2.2 and 11.0.2.
+  hl_emulated_case(isa-x86-64   ${HL_COMPAT}/isa          tests/compat/isa/x86_64 GATED)
+  hl_emulated_case(abi          ${HL_COMPAT}/abi          tests/compat/abi        GATED)
+
+  # completeness is NOT gated: it is RED on real aarch64-host defects, which is the
+  # lane working, not the lane failing. Measured 2026-07-27 against build-arm-check,
+  # identically under both qemu versions, all three passing on the native x86_64
+  # host: x87-stack-faults dies on `UNIMPL 1B opcode 0xdd` (FRSTOR, DD /4, not
+  # lowered), x87-fprem-loop and x87-precision-rounding diverge on FPREM and
+  # precision-control results. All three fixtures arrived with 5d28c1ca, which fixed
+  # only the x86-host arm. Add GATED when they pass, and not before.
+  # (completeness/priority also fails, on nice level alone -- docs/ci-green.md.)
   hl_emulated_case(completeness ${HL_COMPAT}/completeness tests/compat/completeness)
-  hl_emulated_case(abi          ${HL_COMPAT}/abi          tests/compat/abi)
 
   # ---- 9c. CROSS-BACKEND checkpoint restore (label: ckpt-cross) -------------
   # struct cpu IS the checkpoint format (sizeof is written into the image and validated on

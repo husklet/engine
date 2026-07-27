@@ -11,8 +11,9 @@
 #   emulated_aarch64_gate.sh <cross-tree> <shim-dir> <matrix-runner> \
 #                            <bindir> <suitedir>
 #
-# Exit 77 (SKIP_RETURN_CODE) when qemu-aarch64 or the cross tree is absent --
-# both are external to a default build. Anything else missing is a hard failure.
+# Exit 77 (SKIP_RETURN_CODE) when qemu-aarch64 or the cross tree is absent: the
+# first comes from the flake devShell and the second from a configure no default
+# build runs. Anything else missing is a hard failure.
 set -uo pipefail
 
 if [ "$#" -ne 5 ]; then
@@ -30,9 +31,10 @@ if [ -z "$qemu" ] || [ ! -x "$qemu" ]; then
 	cat >&2 <<EOF
 emulated-aarch64: SKIPPED, this gate did NOT run and is NOT green.
 emulated-aarch64:   missing: qemu-aarch64 (not on PATH, and HL_QEMU_AARCH64 unset)
-emulated-aarch64: It is not in the flake devShell. Supply it with either:
-emulated-aarch64:   nix shell nixpkgs#qemu --command ctest ... -L emulated-aarch64
-emulated-aarch64:   HL_QEMU_AARCH64=/path/to/qemu-aarch64 ctest ... -L emulated-aarch64
+emulated-aarch64: flake.nix puts it on PATH (toolchainFor.emulators, x86_64 Linux only),
+emulated-aarch64: so this shell is not the project devShell. Fix it with either:
+emulated-aarch64:   nix develop --command ctest --test-dir <build> -L emulated-aarch64 -V
+emulated-aarch64:   HL_QEMU_AARCH64=/path/to/qemu-aarch64 ctest --test-dir <build> -L emulated-aarch64 -V
 EOF
 	exit 77
 fi
@@ -77,7 +79,10 @@ for isa in aarch64 x86_64; do
 	chmod +x "$shim/hl-engine-linux-$isa" || exit 1
 done
 
-printf 'emulated-aarch64: %s under %s\n' "$(basename -- "$suitedir")" "$qemu"
+# Print the emulator version: it is the lane's oracle, pinned by flake.lock, and a
+# result is only comparable to docs/emulated-aarch64.md's table alongside it.
+printf 'emulated-aarch64: %s under %s (%s)\n' "$(basename -- "$suitedir")" "$qemu" \
+	"$("$qemu" --version 2>/dev/null | head -1)"
 exec "$runner" env \
 	"$shim/hl-engine-linux-aarch64" "$bindir/aarch64" \
 	"$shim/hl-engine-linux-x86_64" "$bindir/x86_64" \

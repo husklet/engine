@@ -108,6 +108,15 @@
 
           crossCompilers = map ccPkgFor guestISAs;
 
+          # qemu-user for the emulated-aarch64 lane (cmake/Phase3Gates.cmake 9b),
+          # which executes the cross-built aarch64 host engines this host builds and
+          # otherwise never runs. x86_64 Linux only, for the same reason. The version
+          # is the lane's ORACLE (docs/emulated-aarch64.md), pinned by flake.lock and
+          # by nothing else -- no store path anywhere -- so a nixpkgs bump moves it
+          # and the lane must be re-measured. `qemu-user`, not `qemu`: same binaries,
+          # 208MB of closure instead of 3.7GB.
+          emulators = lib.optional (host.isLinux && hostCpu == "x86_64") pkgs.qemu-user;
+
           # Exactly the variable names the Makefile and cmake/toolchains/* read.
           # Note the two distinct prefixes that already exist in the tree:
           # <ISA>_LINUX_* for compilers, <ISA>_DYNAMIC_* for loader/libc.
@@ -308,7 +317,7 @@
               pkgs.cargo
               pkgs.rustfmt
               pkgs.clippy
-            ] ++ lib.optionals tc.canBuildGuests tc.crossCompilers;
+            ] ++ lib.optionals tc.canBuildGuests tc.crossCompilers ++ tc.emulators;
 
             # Each cc's setup-hook assigns $CC as it runs, so whichever cross
             # compiler happens to be listed last silently won -- which left $CC
