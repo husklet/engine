@@ -5,8 +5,8 @@
 # corpus in three separate ways:
 #
 #   * tests/**/*.out -- 1616 byte-exact goldens. The compat matrix compares guest
-#     output against these verbatim (DOCS.md 8.2), so a trailing \r fails every
-#     case that passes on Linux. This is silent: the diff looks identical.
+#     output against these verbatim, so a trailing \r fails every case that passes
+#     on Linux. This is silent: the diff looks identical on screen.
 #   * tests/**/*.tsv -- the case manifests. tools/matrix_runner.c splits on \t and
 #     reads a fixed column count; \r lands inside the last field, which is the
 #     disposition column that decides whether a case is active or excluded.

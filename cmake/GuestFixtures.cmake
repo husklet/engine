@@ -74,7 +74,6 @@ set(HL_HAVE_GUEST_CC TRUE)
 # out of two empty environment variables: this is the single condition that keeps
 # Phase3Compat, Phase3Gates, Phase4Mac and LaneParity out of a Windows configure
 # (CMakeLists.txt gates all four on HL_HAVE_GUEST_CC), and it should be findable.
-# See docs/windows/build-system.md 4.
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   set(HL_HAVE_GUEST_CC FALSE)
   message(STATUS

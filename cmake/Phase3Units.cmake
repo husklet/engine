@@ -33,11 +33,11 @@
 # directory.c, process.c, system.c). Registering this lane needs
 # _HL_WINDOWS_EXCLUDED_UNITS, the Windows sibling of _HL_DARWIN_EXCLUDED_UNITS
 # below, and that list cannot be written before the archive it excludes against
-# exists. Milestone M6 in docs/windows/build-system.md.
+# exists.
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   message(STATUS
-    "Windows host -- the host unit lane is not registered yet (needs libhl-host-windows "
-    "and a _HL_WINDOWS_EXCLUDED_UNITS list; see docs/windows/build-system.md M6).")
+    "Windows host -- the host unit lane is not registered yet (needs "
+    "libhl-host-windows and a _HL_WINDOWS_EXCLUDED_UNITS list).")
   return()
 endif()
 

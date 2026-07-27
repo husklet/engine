@@ -124,7 +124,7 @@ target_compile_options(hl_engine_cflags INTERFACE
 # worst a per-TU warning. Appended (rather than left inline above) so the flag
 # ORDER on Linux and Darwin is byte-identical to what it was.
 # Nothing replaces it: introducing a dllexport/dllimport HL_API macro is a
-# public-ABI decision, not a Windows-port detail. See docs/windows/build-system.md 2.2.
+# public-ABI decision, not a Windows-port detail.
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
   target_compile_options(hl_engine_cflags INTERFACE -fvisibility=hidden)
 endif()
@@ -232,9 +232,8 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   # No libhl-host-windows yet. src/host/windows/ reserves the boundary and holds
   # only a README; COMMON_HOST_SOURCES is not portable to it as it stands
   # (resolve.c needs the *at() family, child.c needs SIGCHLD, fork_wire.c needs
-  # SCM_RIGHTS, private.c needs a fork-inherited shared mapping). That archive is
-  # milestone M4 in docs/windows/build-system.md and brings the
-  # COMMON_HOST_SOURCES re-split with it. Everything downstream asks
+  # SCM_RIGHTS, private.c needs a fork-inherited shared mapping). That archive
+  # brings the COMMON_HOST_SOURCES re-split with it. Everything downstream asks
   # `if(TARGET hl-host-windows)` rather than testing the OS, so adding the arm
   # later is a one-place change.
   message(STATUS

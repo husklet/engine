@@ -20,8 +20,8 @@
 # Purely additive: false on Linux and Darwin, where the file is unchanged.
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   message(STATUS
-    "Windows host -- the e2e/checkpoint/perf gates are not registered "
-    "(see docs/windows/build-system.md M8).")
+    "Windows host -- the e2e/checkpoint/perf gates are not registered (they all "
+    "run a guest, and no Windows production engine exists yet).")
   return()
 endif()
 

@@ -9,15 +9,16 @@
 #
 # Inside an MSYS2 CLANG64 or UCRT64 shell no toolchain file is needed at all: the
 # `clang` on PATH already IS the intended host compiler, and a bare
-# `cmake -G Ninja -B build-win` works (DOCS.md 7.0 makes the same point for the
-# Linux and Darwin natives). This file exists to (a) pin the compiler when PATH
+# `cmake -G Ninja -B build-win` works, as it does for the Linux and Darwin
+# natives. This file exists to (a) pin the compiler when PATH
 # also carries MSVC or a stray Chocolatey LLVM, and (b) hold the static-runtime
 # link decision below, which is not a compiler-flag question and so has no home
 # in CMakeLists.txt's hl_engine_cflags.
 #
 # MSVC is not a supported alternative: the engine source is GNU C and three
-# load-bearing constructs (__attribute__((constructor)), file-scope __asm__,
-# __uint128_t) are rejected by it. See docs/windows/toolchain.md 1.
+# load-bearing constructs are rejected by it -- __attribute__((constructor)),
+# which is how production backends self-register; file-scope __asm__, which
+# carries the run_block/block_return trampolines; and __uint128_t.
 #
 # Usage (any shell, with clang on PATH or WINDOWS_X86_64_CC set):
 #     cmake -G Ninja -B build-win \
@@ -57,7 +58,7 @@ set(CMAKE_EXE_LINKER_FLAGS_INIT "-static")
 #  * -municode — it would require a wmain in src/runner/main.c and every
 #    tools/*_runner.c, threading wchar_t** through byte-oriented portable code.
 #    The problem it solves (non-ASCII argv) is a UTF-8 activeCodePage manifest's
-#    job, which is a per-target linker input. docs/windows/build-system.md 2.3.
+#    job, which is a per-target linker input.
 #  * CMAKE_EXECUTABLE_SUFFIX — CMake sets .exe itself.
 #  * CMAKE_FIND_ROOT_PATH_MODE_* — the two Linux files scope those to their cross
 #    case. This file has no cross case: a Windows host cross-compiled from

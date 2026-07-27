@@ -39,8 +39,8 @@
 # condition is false and the file continues exactly as before.
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   message(STATUS
-    "Windows host -- the compat matrix is not registered (no Windows production "
-    "engine; see docs/windows/build-system.md M8).")
+    "Windows host -- the compat matrix is not registered (there is no Windows "
+    "production engine to run it against yet).")
   return()
 endif()
 
