@@ -570,35 +570,68 @@ Files most likely to collide with concurrent work, and why:
 - `flake.nix` — `canRunGuests` was **renamed** to `hasCrateArchive` because the two ideas were only
   accidentally the same. A merge that reintroduces `canRunGuests` will silently re-gate the Rust outputs.
 
+### What IS done, as of the branch tip
+
+Everything the "not done" list below originally named has been closed. Recording it because the list was
+written when the interpreters were unfinished, and a reader who trusts the old text will re-do work:
+
+- **Both guest ISAs execute.** Compat is **2993/3013 = 99.34%**, measured per case with pinned binaries,
+  nothing sampled; 20 of 24 matrix suites fully green on both guest ISAs.
+- **Checkpoint is 82/82**, `checkpoint-io` 34/34, and **cross-backend restore works and is now tested**
+  (`ckpt-cross`, 11/11): an image captured by the interpreter and restored by the JIT, and the reverse. That
+  is the property the shared `struct cpu` exists for and nothing had ever exercised it.
+- **Engine-in-engine is a gate, not an experiment** — `nested.*`, five cells, including a three-engine chain
+  and the aarch64-hosts-x86_64 acceptance criterion. It skips loudly, never silently.
+- **`lower/*.c`'s 21 aborting stubs are gone**, the archive-closure defect behind them is fixed, and
+  `gate.archive-closure` now fails if it returns.
+- **A Stage-2 same-ISA transliterator exists** (off by default): 15.0× on compute, 351 ns → 23.4 ns per
+  block.
+- **The AArch64 host arm can be executed here** under `qemu-aarch64`, so "needs an aarch64 host" is no
+  longer a reason to leave something unverified. See `docs/emulated-aarch64.md` for what emulation does and
+  does not vouch for — notably **not** weak memory ordering.
+
 ### What is NOT done
-See the host table in `README.md`, which is deliberately conservative. The interpreter backends are the
-remaining work; `production.smoke-x86_64` and `production.smoke-aarch64` are the milestones. Do not mark
-the host "Supported" until the exact-golden compat matrices pass for both guest ISAs, which is what that
-word means everywhere else in this repo.
 
-Also outstanding, and tracked rather than hidden:
-
-- `checkpoint.x86_64.threads` is still the one remaining checkpoint failure (77/78), and it needs a
-  **design decision**. Note the non-PIE `LEA` fix in section 3.11 did NOT close it, although that fixture
-  forks after threading and so looked like a candidate: it still fails, consistently and in 2.2 s rather
-  than by timeout. The original diagnosis stands: the
-  x86-64 guest pins only its main stack, so anonymous guest mmaps -- which is what glibc pthread stacks are
-  -- get kernel-chosen host addresses, and a re-forked child restores after engine init when those VAs are
-  no longer reliably free. The aarch64 guest is immune only because its mmaps live in a biased window the
-  host never allocates from. It needs a reserved VA window for x86-64 anonymous guest mmaps, the way
-  `HL_CHECKPOINT` already pins the main stack. Deliberately not patched.
-- Nested engine-in-engine (an amd64 host interpreting the **AArch64 build of hl-engine**, which in turn
-  JIT-compiles an x86-64 guest) gets as far as the inner engine reaching `main`, parsing argv, writing its
-  usage to stdout and exiting 2 -- so the loader, libc startup, TLS and stdio all work through the
-  interpreter on a dynamically-linked PIE. With an inner guest it fails at `HL_STATUS_RESOURCE_LIMIT` during
-  the inner engine's own setup. Note the obvious suspect has been **ruled out**: a bare guest doing
-  `memfd_create` + `ftruncate(64 MiB)` + both `mmap` aliases + a `PROT_NONE` over-reserve + `MAP_FIXED` RWX
-  behaves identically to native under the interpreter.
-- `lower/*.c` is still worked around with 21 aborting stubs rather than fixed; see section 3.3.
-- The `perf-linux` and per-case-timeout items are handled: `perf-linux` is record-only on this host and all
-  six runners now scale their per-case budget from `HL_MATRIX_TIMEOUT_SCALE`. Neither weakens the aarch64
-  lanes, which are byte-identical.
+- **The host is still not "Supported"** in the README's sense, and should not be marked so until the
+  exact-golden compat matrices pass for both guest ISAs — that is what the word means everywhere else here.
+- **None of it is gated by CI on this host.** `cmake/CiLanes.cmake` still omits `Linux-x86_64` from
+  `HL_CI_COMPAT_HOSTS`, so `.github/workflows/linux-x86_64.yml` runs `unit`, `nested-engine` and the package
+  check — not the 3013 compat runs. The `emulated-aarch64` lane is registry-only until `qemu-aarch64` is in
+  the flake devShell.
+- **The reciprocal-estimate family** (`FRECPE`/`FRSQRTE`/`FRECPS`/`FRSQRTS`/`FRECPX`/`URECPE`/`URSQRTE`, 535
+  encodings) and `FCVTXN` report honestly rather than being implemented. They are **baseline Armv8.0**, so
+  no HWCAP gate excuses them; they need the ARM ARM's exact estimate tables, and writing those from memory
+  is the guess this branch's rules forbid.
+- **`arch_prctl(ARCH_GET_FS/GS)` is a guest-triggerable engine kill** — no accessibility guard, so an
+  unmapped destination exits 139 on *every* linkage where Linux returns `EFAULT`.
+- **An x86-64 guest's store into its own `.rodata` is silently dropped** where native and the aarch64 guest
+  both fault.
+- **`#D` on denormal inputs is missing for every SSE op on the aarch64 host** — declined with measured
+  numbers (14 fast-path instructions across ~40 sites), not overlooked.
+- **The non-PIE bias could be removed entirely on Linux.** It exists for macOS `__PAGEZERO`; Linux has no
+  such constraint. Doing it would retire the eight-instance defect family of §3.11-§3.16 **at source** and
+  admit 1285 of 1536 x86-64 fixtures to the transliterator, which refuses biased images. The single
+  highest-leverage change left.
+- **The undefined-flag divergences** (§3.12) still need a ruling: the corpus was built to a **QEMU** oracle,
+  and matching this silicon would either split the two backends or break a passing golden.
 - `isa-fuzz.aarch64-*` needs an ARM64 host as its differential oracle, so half the fuzz coverage is
   host-conditional. A green `isa-fuzz` on an amd64 host is **not** full coverage — on that host
   `isa-fuzz.x86_64-*` becomes the native-oracle lane for the first time, which is a gain, but the aarch64
   half is absent.
+
+### The methodological lesson, if you read nothing else
+
+Three separate results on this branch came from **replacing a plausible oracle with a measured one**, and
+each overturned something everyone believed:
+
+- A NaN-selection rule was copied from **qemu's softfloat** and the code comment said so — "oracle and
+  manual disagree here" — choosing the oracle. Measured against hardware across all 64 ordered NaN pairs,
+  the oracle was wrong on 24 of them and the *golden* had been right all along.
+- The unimplemented-instruction count was **9**, from a corpus scan. An encoding-space sweep found eleven
+  **silently mis-executed** encodings, a class the corpus scan cannot see at all (§3.14).
+- Two "not worth fixing" and one "already correct" judgement were reversed by probes; and one fix
+  (`2c94756a`'s `FRINTX` swap) was found to have *introduced* a defect, by a value kit built specifically to
+  discriminate it.
+
+The general rule this branch earned: **when a comment says the manual and an emulator disagree, the
+emulator is the suspect.**
