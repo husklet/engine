@@ -43,6 +43,25 @@
  * rather than handed to a child that would fault on the first dereference. A
  * context that is not an address at all (the scalar-in-a-pointer form) crosses
  * intact, and so does NULL.
+ *
+ * A caller whose context IS a graph of parent pointers therefore has to hand the
+ * child BYTES, and the launch channel below is how it does so. Two additions,
+ * both riding the mechanism that already exists:
+ *
+ *   - a byte payload, copied into the same inherited section the launch record
+ *     travels in and left mapped in the child for the life of the process. The
+ *     caller serialises its context, publishes the bytes, spawns with a NULL
+ *     entry_context, and rebuilds on the far side. Nothing here interprets the
+ *     bytes; the producer and the consumer are the same image, which is what
+ *     lets the encoding stay private to the caller.
+ *   - a shared mapping, handed over as a SECTION HANDLE on the inheritance list.
+ *     CreateProcess inherits handles, not views, so a parent's mapped address
+ *     means nothing to a child; the handle value crosses (an inherited handle
+ *     keeps its number) and the child maps a view of its own from it. This is
+ *     what lets a child write into a page the parent reads after the wait.
+ *
+ * Both are published immediately before the spawn and consumed by it, on the
+ * thread that spawns, so two concurrent spawns cannot take each other's payload.
  */
 #include "internal.h"
 
@@ -50,6 +69,7 @@
 #include <string.h>
 #include <errno.h>
 #include "../process.h"
+#include "launch.h"
 
 /*
  * The child looks for this one variable, consumes it, and deletes it from its
@@ -83,11 +103,35 @@ typedef struct hl_windows_spawn_record {
     uint64_t entry_offset;
     uint64_t entry_context;
     uint64_t image_size; /* the parent's SizeOfImage, checked against the child's */
+    /* Caller payload, stored immediately after this record inside the same
+     * section. Zero when the caller published none. */
+    uint64_t payload_size;
+    /* A section the child re-maps for itself, carried as a handle VALUE for the
+     * same reason the launch section's handle is: an inherited handle occupies
+     * the same numeric slot in the child. Zero means none was handed over. */
+    uint64_t shared_section;
+    uint64_t shared_size;
     uint32_t record_size;
     uint32_t child_id; /* stamped after CreateProcess, before ResumeThread */
     volatile LONG claimed;
     uint32_t reserved;
 } hl_windows_spawn_record;
+
+/* The launch channel's two halves. The parent's is per-thread and lives exactly
+ * from publish() to the spawn that consumes it; the child's is process-wide and
+ * is written once, before anything else in this process has run. */
+typedef struct hl_windows_launch_request {
+    const void *bytes; /* borrowed: the publisher owns them across the spawn */
+    size_t size;
+    hl_host_handle shared;
+} hl_windows_launch_request;
+
+static _Thread_local hl_windows_launch_request hl_windows_launch_pending;
+
+static const void *hl_windows_launch_bytes;
+static size_t hl_windows_launch_bytes_size;
+static void *hl_windows_launch_shared_view;
+static size_t hl_windows_launch_shared_view_size;
 
 /* --- small string helpers ---------------------------------------------------
  * Hand-rolled rather than taken from a library. wsprintfW would do the
@@ -180,6 +224,9 @@ static void hl_windows_process_bootstrap(void) {
     uint64_t nonce = 0;
     uint64_t entry_offset;
     uint64_t entry_context;
+    uint64_t payload_size;
+    uint64_t shared_section;
+    uint64_t shared_size;
     uint32_t cursor = 0;
     int32_t code;
     const DWORD length =
@@ -195,7 +242,9 @@ static void hl_windows_process_bootstrap(void) {
      * anything is called, so a number that is not our section fails a compare
      * instead of being trusted. */
     section = (HANDLE)(uintptr_t)handle_value;
-    record = MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(*record));
+    /* The whole section, not just the record: the caller's payload lives behind
+     * it and stays mapped for the life of this process. */
+    record = MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
     if (record == NULL) ExitProcess(HL_WINDOWS_EXIT_BOOTSTRAP);
     if (record->magic != HL_WINDOWS_SPAWN_MAGIC || record->record_size != (uint32_t)sizeof(*record) ||
         record->nonce != nonce) {
@@ -216,8 +265,30 @@ static void hl_windows_process_bootstrap(void) {
     }
     entry_offset = record->entry_offset;
     entry_context = record->entry_context;
-    (void)UnmapViewOfFile(record);
+    payload_size = record->payload_size;
+    shared_section = record->shared_section;
+    shared_size = record->shared_size;
+    /* Closing the section handle does not unmap the view, so the payload survives
+     * while the one reference this process no longer needs is released. */
+    if (payload_size != 0) {
+        hl_windows_launch_bytes = (const char *)(const void *)record + sizeof(*record);
+        hl_windows_launch_bytes_size = (size_t)payload_size;
+    } else {
+        (void)UnmapViewOfFile(record);
+    }
     (void)CloseHandle(section);
+
+    /* A view of the parent's shared page, mapped wherever this process has room:
+     * the parent's address for it means nothing here, which is exactly why the
+     * handle rather than the address is what crossed. */
+    if (shared_section != 0) {
+        const HANDLE shared = (HANDLE)(uintptr_t)shared_section;
+        void *view = MapViewOfFile(shared, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
+        if (view == NULL) ExitProcess(HL_WINDOWS_EXIT_BOOTSTRAP);
+        hl_windows_launch_shared_view = view;
+        hl_windows_launch_shared_view_size = (size_t)shared_size;
+        (void)CloseHandle(shared);
+    }
 
     /* The parent created this process in its own group so that a later
      * terminate() can direct a console control event at it alone. A new group
@@ -232,6 +303,16 @@ static void hl_windows_process_bootstrap(void) {
     ExitProcess((UINT)((uint32_t)code & 0xFFu));
 }
 
+const void *hl_host_windows_launch_payload(size_t *out_size) {
+    if (out_size != NULL) *out_size = hl_windows_launch_bytes_size;
+    return hl_windows_launch_bytes;
+}
+
+void *hl_host_windows_launch_shared(size_t *out_size) {
+    if (out_size != NULL) *out_size = hl_windows_launch_shared_view_size;
+    return hl_windows_launch_shared_view;
+}
+
 /* --- the parent side ---------------------------------------------------------
  *
  * Everything one spawn allocates, so that the twelve failure exits below have
@@ -239,12 +320,16 @@ static void hl_windows_process_bootstrap(void) {
  */
 typedef struct hl_windows_spawn_state {
     HANDLE section;
+    HANDLE shared; /* inheritable duplicate of the caller's shared section */
     hl_windows_spawn_record *record;
     WCHAR *image;
     WCHAR *command;
     WCHAR *environment;
     LPPROC_THREAD_ATTRIBUTE_LIST attributes;
-    HANDLE inherited[4]; /* the section, then the duplicated standard streams */
+    /* the launch section, the optional shared section, then the duplicated
+     * standard streams -- streams last, which is what lets the release below
+     * name them by counting back from the end */
+    HANDLE inherited[5];
     uint32_t inherited_count;
     uint32_t stream_count; /* how many of inherited[] are streams, i.e. owned dups */
 } hl_windows_spawn_state;
@@ -258,11 +343,53 @@ static void hl_windows_spawn_release(hl_windows_spawn_state *state) {
         free(state->attributes);
     }
     if (state->record != NULL) (void)UnmapViewOfFile(state->record);
+    if (state->shared != NULL) (void)CloseHandle(state->shared);
     if (state->section != NULL) (void)CloseHandle(state->section);
     free(state->environment);
     free(state->command);
     free(state->image);
     memset(state, 0, sizeof(*state));
+}
+
+hl_status hl_host_windows_launch_publish(const void *bytes, size_t size, hl_host_handle shared) {
+    if ((bytes == NULL) != (size == 0)) return HL_STATUS_INVALID_ARGUMENT;
+    hl_windows_launch_pending.bytes = bytes;
+    hl_windows_launch_pending.size = size;
+    hl_windows_launch_pending.shared = shared;
+    return HL_STATUS_OK;
+}
+
+/*
+ * The caller's shared mapping, duplicated inheritable.
+ *
+ * Duplicating rather than flipping HANDLE_FLAG_INHERIT on the memory group's own
+ * handle, for the reason the standard streams are duplicated: the group owns that
+ * handle and every other CreateProcess in this process would see the change.
+ * Only a mapping the memory group created SHARED has a section at all -- a
+ * private one is committed pages with no object behind them -- so a request to
+ * hand over a private mapping is refused rather than silently handed over empty.
+ */
+static hl_host_result hl_windows_spawn_share(hl_host_windows *host, hl_windows_spawn_state *state,
+                                             hl_host_handle mapping) {
+    const HANDLE self = GetCurrentProcess();
+    hl_windows_handle_entry *entry;
+    HANDLE source = NULL;
+    uint64_t size = 0;
+    hl_windows_lock(host);
+    entry = hl_windows_lookup_locked(host, mapping, HL_WINDOWS_HANDLE_MAPPING);
+    if (entry != NULL) {
+        source = entry->section;
+        size = entry->size;
+    }
+    hl_windows_unlock(host);
+    if (entry == NULL) return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (source == NULL) return hl_windows_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+    if (!DuplicateHandle(self, source, self, &state->shared, 0, TRUE, DUPLICATE_SAME_ACCESS))
+        return hl_windows_last_error_result();
+    state->record->shared_section = (uint64_t)(uintptr_t)state->shared;
+    state->record->shared_size = size;
+    state->inherited[state->inherited_count++] = state->shared;
+    return hl_windows_result(HL_STATUS_OK, 0, 0);
 }
 
 /* GetModuleFileNameW has no "how long is it" form: it truncates and reports the
@@ -401,14 +528,23 @@ static hl_host_result hl_windows_process_launch(hl_host_windows *host, hl_host_p
     const void *base = GetModuleHandleW(NULL);
     const uint64_t image_size = hl_windows_image_size(base);
     const uint64_t entry_offset = (uint64_t)((uintptr_t)entry - (uintptr_t)base);
+    /* Taken and cleared before the first failure exit: a publication belongs to
+     * exactly one spawn, and a spawn that fails must not leave it for the next. */
+    const hl_windows_launch_request request = hl_windows_launch_pending;
+    uint64_t section_size;
     uint32_t length;
     size_t command_size;
 
+    memset(&hl_windows_launch_pending, 0, sizeof(hl_windows_launch_pending));
     if (entry == NULL) return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     /* An entry point outside this image cannot be named by an offset from its
      * base, and this backend has no other way to name code to a fresh process. */
     if (image_size == 0 || entry_offset >= image_size) return hl_windows_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
     if (!hl_windows_context_crosses(entry_context)) return hl_windows_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+    /* The section is one 64-bit object and its size is a DWORD pair below, so a
+     * payload that cannot be described that way is refused rather than truncated. */
+    if (request.size > UINT64_C(0xFFFFFFFF)) return hl_windows_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    section_size = (uint64_t)sizeof(*state.record) + (uint64_t)request.size;
 
     memset(&state, 0, sizeof(state));
     memset(&startup, 0, sizeof(startup));
@@ -418,13 +554,14 @@ static hl_host_result hl_windows_process_launch(hl_host_windows *host, hl_host_p
     security.nLength = (DWORD)sizeof(security);
     security.lpSecurityDescriptor = NULL;
     security.bInheritHandle = TRUE;
-    state.section = CreateFileMappingW(INVALID_HANDLE_VALUE, &security, PAGE_READWRITE, 0, sizeof(*state.record), NULL);
+    state.section = CreateFileMappingW(INVALID_HANDLE_VALUE, &security, PAGE_READWRITE, (DWORD)(section_size >> 32),
+                                       (DWORD)(section_size & UINT64_C(0xFFFFFFFF)), NULL);
     if (state.section == NULL) {
         result = hl_windows_last_error_result();
         hl_windows_spawn_release(&state);
         return result;
     }
-    state.record = MapViewOfFile(state.section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(*state.record));
+    state.record = MapViewOfFile(state.section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, (SIZE_T)section_size);
     state.image = hl_windows_module_path();
     if (state.record == NULL || state.image == NULL) {
         result =
@@ -438,7 +575,11 @@ static hl_host_result hl_windows_process_launch(hl_host_windows *host, hl_host_p
     state.record->entry_offset = entry_offset;
     state.record->entry_context = (uint64_t)(uintptr_t)entry_context;
     state.record->image_size = image_size;
+    state.record->payload_size = (uint64_t)request.size;
     state.record->record_size = (uint32_t)sizeof(*state.record);
+    /* Copied, not referenced: the publisher owns its bytes only across this call,
+     * and after this memcpy the child's copy is the only one it depends on. */
+    if (request.size != 0) memcpy((char *)(void *)state.record + sizeof(*state.record), request.bytes, request.size);
 
     /* CreateProcessW may write to lpCommandLine, so it gets its own copy even
      * though the two strings are identical here. argv[0] is the image path,
@@ -462,6 +603,13 @@ static hl_host_result hl_windows_process_launch(hl_host_windows *host, hl_host_p
     }
 
     state.inherited[state.inherited_count++] = state.section;
+    if (request.shared != HL_HOST_HANDLE_INVALID) {
+        result = hl_windows_spawn_share(host, &state, request.shared);
+        if (result.status != HL_STATUS_OK) {
+            hl_windows_spawn_release(&state);
+            return result;
+        }
+    }
     (void)hl_windows_duplicate_streams(&state, &startup.StartupInfo);
 
     /* The documented two-call form: the first call always fails, and its purpose
