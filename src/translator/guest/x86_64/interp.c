@@ -724,6 +724,20 @@ static int interp_exit(struct cpu *cpu, uint64_t rip, uint64_t reason) {
     return STEP_END;
 }
 
+// Guest-access fault for an operand a helper touches AFTER the block returns -- the FXSAVE/FXRSTOR pair,
+// whose 512 bytes are written by x87state.c from the dispatch loop, outside the pad above. Same R_SOFTMISS
+// protocol the emitted memory guard uses (emit.c): the dispatcher either resolves a logical mapping and
+// retries or delivers the guest SIGSEGV with the right si_addr. rip stays on the instruction.
+static int interp_softmiss(struct cpu *cpu, uint64_t rip, uint64_t address, uint64_t width, uint32_t required) {
+    cpu->bus_ea = address;
+    cpu->soft_width = width;
+    cpu->soft_required = required;
+    cpu->rip = rip;
+    cpu->reason = R_SOFTMISS;
+    return STEP_END;
+}
+
+
 // Push/pop default to 64-bit in long mode; insn->opsize follows REX.W, so ask here instead. 66 narrows the
 // stack operand to 16 bits, but REX.W WINS over 66 (SDM vol 2 table 3-4): measured on silicon, `66 48 50`
 // moves RSP by 8 and stores 8 bytes, where this moved it by 2.
@@ -4240,6 +4254,74 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
     return STEP_SSE_UNHANDLED;
 }
 
+// ---- The XSAVE family (0F AE /4 XSAVE, /5 XRSTOR, /6 XSAVEOPT). ------------------------------------
+//
+// WHICH COMPONENTS THIS ENGINE MODELS. XCR0 is x87|SSE and nothing else -- XGETBV above reports 3, matching
+// cpuid.c's deliberately withheld AVX -- so RFBM = EDX:EAX & XCR0 can only ever name component 0 (x87) and
+// component 1 (SSE). Both are exactly the 512-byte legacy region hl_x86_fxsave/hl_x86_fxrstor already own,
+// there is no extended region at all, and XSTATE_BV therefore cannot claim a component that was not written.
+// (CPUID leaf 0xD is not reported either: leaf 0 caps max-leaf at 7. A guest that reads the enumeration
+// before using XSAVE finds no XSAVE bit in leaf 1 ECX and takes its FXSAVE path -- which is why glibc's
+// dynamic linker selects _dl_runtime_resolve_fxsave here, not _dl_runtime_resolve_xsave.)
+//
+// THE LAYOUT IS HARDWARE'S, measured byte for byte into a 0xAA-filled buffer (AMD Zen4; the SDM agrees):
+//   RFBM bit 0 (x87) writes [0,24) and [32,160)      RFBM bit 1 (SSE) writes [24,32) (MXCSR) and [160,416)
+//   [416,512) is written by neither component.
+//   The 64-byte header at 512 is NOT bulk-written: XSAVE read-modify-writes only the XSTATE_BV bits named
+//   by RFBM and leaves XCOMP_BV and the reserved bytes alone (byte 512 went 0xAA -> 0xAB, byte 513 stayed
+//   0xAA). Getting that wrong would corrupt a caller's XCOMP_BV.
+#define INTERP_XCR0 UINT64_C(3)
+
+// The legacy image as this engine's FXSAVE produces it, staged so a faulting store commits nothing.
+static void interp_xsave_legacy(struct cpu *cpu, uint8_t image[512]) {
+    uint64_t saved = cpu->x87_ea;
+    memset(image, 0, 512);
+    cpu->x87_ea = (uint64_t)(uintptr_t)image;
+    hl_x86_fxsave(cpu);
+    cpu->x87_ea = saved;
+    uint32_t mxcsr_mask = 0xffffu; // exactly the bits LDMXCSR keeps (case 0xAE below); hl_x86_fxsave leaves
+    memcpy(image + 28, &mxcsr_mask, 4); // this field untouched, and a zero mask reads as "nothing settable"
+}
+
+// XINUSE, derived rather than tracked: a component whose state EQUALS its initial configuration is in it.
+// The SDM permits either answer (an implementation may report 1 for a component that is at init), so the
+// derived form is legal and additionally agrees with silicon on the case guests test -- never touched.
+static uint64_t interp_xsave_xinuse(const uint8_t image[512]) {
+    uint64_t inuse = 0;
+    uint16_t fcw, fsw;
+    uint32_t mxcsr;
+    memcpy(&fcw, image + 0, 2);
+    memcpy(&fsw, image + 2, 2);
+    memcpy(&mxcsr, image + 24, 4);
+    int x87_init = fcw == 0x037fu && fsw == 0 && image[4] == 0; // abridged tag 0 == every register empty
+    for (unsigned i = 6; i < 24 && x87_init; i++)
+        x87_init = image[i] == 0;
+    for (unsigned i = 32; i < 160 && x87_init; i++)
+        x87_init = image[i] == 0;
+    int sse_init = mxcsr == 0x1f80u;
+    for (unsigned i = 160; i < 416 && sse_init; i++)
+        sse_init = image[i] == 0;
+    if (!x87_init) inuse |= 1;
+    if (!sse_init) inuse |= 2;
+    return inuse;
+}
+
+// The initial configuration of each component, for XRSTOR of a header whose XSTATE_BV bit is clear.
+static void interp_xsave_init(uint8_t image[512], uint64_t components) {
+    if (components & 1) {
+        uint16_t fcw = 0x037fu;
+        memset(image + 0, 0, 24);
+        memset(image + 32, 0, 128);
+        memcpy(image + 0, &fcw, 2);
+    }
+    if (components & 2) {
+        uint32_t mxcsr = 0x1f80u;
+        memcpy(image + 24, &mxcsr, 4);
+        memset(image + 160, 0, 256);
+    }
+}
+
+
 // The 0F (two-byte) opcode map.
 
 // The 0F-map SSE/SSE2 space; a residual gap then reports as "SSE", not a bare opcode byte.
@@ -4643,9 +4725,15 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
         return STEP_NEXT;
     }
 
-    // 0F AE: fences and the FXSAVE/MXCSR group
+    // 0F AE: fences, the FXSAVE/MXCSR group, the cache-line hints and the XSAVE family
     case 0xAE: {
         int sub = insn->reg & 7;
+        // PREFIX LEGALITY, measured on silicon: 66 admits only the /6 (CLWB) and /7 (CLFLUSHOPT) memory
+        // forms and #UDs every other encoding; every F3/F2 memory form #UDs (F3 /0../3 is the REGISTER-form
+        // RD/WRFSBASE, which this engine does not implement either). Executing them as the unprefixed
+        // encoding is how `66 0F AE /0` ran FXSAVE and wrote 512 bytes to a guest-chosen address.
+        if (insn->p66 && !(insn->is_mem && sub >= 6)) return interp_guest_trap(cpu, pc, 4 /*SIGILL*/, 2);
+        if ((insn->rep || insn->repne) && insn->is_mem) return interp_guest_trap(cpu, pc, 4, 2);
         if (sub >= 5 && !insn->is_mem) {
             // LFENCE/MFENCE/SFENCE: no-op under x86-TSO; interp_tso_fence is where a weak host would put
             // a real barrier, hence the call.
@@ -4653,12 +4741,94 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
             cpu->rip = next;
             return STEP_NEXT;
         }
+        if (insn->is_mem && (sub == 7 || (sub == 6 && insn->p66))) {
+            // CLFLUSH / CLFLUSHOPT / CLWB: nothing to do in a coherent model, but they still fault on an
+            // inaccessible line (measured: SIGSEGV), so touch the operand through the ordinary guarded load.
+            (void)interp_load(interp_ea(cpu, insn, next), 1);
+            cpu->rip = next;
+            return STEP_NEXT;
+        }
         if ((sub == 0 || sub == 1) && insn->is_mem) {
             // fxsave / fxrstor: the shared helper owns the layout. Arm the tag model here too -- a guest whose
             // FIRST FP instruction is FXSAVE must see an all-empty tag byte, not the disarmed 0xff.
             interp_x87_arm(cpu);
-            cpu->x87_ea = hl_x86_guest_pointer(interp_ea(cpu, insn, next));
+            uint64_t ea = interp_ea(cpu, insn, next);
+            if (ea & 15) return interp_guest_trap(cpu, pc, 11 /*#GP*/, 128 /*SI_KERNEL*/); // 16-byte operand
+            // x87state.c touches the 512 bytes from the DISPATCH loop, outside this block's fault pad, so
+            // an unmapped area killed the ENGINE (measured: 139). Prove it here instead.
+            uint64_t area = hl_x86_guest_pointer(ea);
+            int ok = sub == 0 ? hl_x86_guest_writable(area, 512) : hl_x86_guest_readable(area, 512);
+            if (!ok) return interp_softmiss(cpu, pc, area, 512, sub == 0 ? X86_SOFT_WRITE : X86_SOFT_READ);
+            cpu->x87_ea = area;
             return interp_exit(cpu, next, sub == 0 ? R_FXSAVE : R_FXRSTOR);
+        }
+        if (sub >= 4 && sub <= 6 && insn->is_mem) {
+            // XSAVE (/4), XRSTOR (/5), XSAVEOPT (/6). See the layout note above interp_xsave_legacy.
+            uint64_t rfbm = (((cpu->r[RDX] & 0xffffffffu) << 32) | (cpu->r[RAX] & 0xffffffffu)) & INTERP_XCR0;
+            uint64_t ea = interp_ea(cpu, insn, next);
+            if (ea & 63) return interp_guest_trap(cpu, pc, 11 /*#GP*/, 128 /*SI_KERNEL*/); // 64-byte area
+            uint8_t image[512];
+            if (sub == 5) { // XRSTOR
+                uint64_t bv, comp;
+                uint8_t reserved[40];
+                interp_load_bytes(ea + 512, &bv, 8);
+                interp_load_bytes(ea + 520, &comp, 8);
+                interp_load_bytes(ea + 528, reserved, 40);
+                // #GP on a header this engine cannot honour: a compacted image (XCOMP_BV != 0 -- XSAVEC and
+                // XSAVES are not advertised, so no guest can legitimately have produced one), a component
+                // outside XCR0, or a nonzero reserved field. Refusing beats restoring a fiction.
+                if (comp != 0 || (bv & ~INTERP_XCR0) != 0) return interp_guest_trap(cpu, pc, 11, 128);
+                for (unsigned i = 0; i < sizeof reserved; i++)
+                    if (reserved[i] != 0) return interp_guest_trap(cpu, pc, 11, 128);
+                interp_x87_arm(cpu);
+                interp_xsave_legacy(cpu, image); // components outside RFBM keep their current values
+                if (rfbm & 1) {
+                    if (bv & 1) {
+                        interp_load_bytes(ea + 0, image + 0, 24);
+                        interp_load_bytes(ea + 32, image + 32, 128);
+                    } else {
+                        interp_xsave_init(image, 1);
+                    }
+                }
+                if (rfbm & 2) {
+                    // MXCSR is loaded from the image whenever SSE is requested, XSTATE_BV[1] or not (SDM).
+                    interp_load_bytes(ea + 24, image + 24, 4);
+                    if (bv & 2)
+                        interp_load_bytes(ea + 160, image + 160, 256);
+                    else
+                        memset(image + 160, 0, 256);
+                }
+                uint64_t saved = cpu->x87_ea;
+                cpu->x87_ea = (uint64_t)(uintptr_t)image;
+                hl_x86_fxrstor(cpu);
+                cpu->x87_ea = saved;
+                cpu->rip = next;
+                return STEP_NEXT;
+            }
+            // XSAVE and XSAVEOPT. XSAVEOPT's whole point is that it MAY skip a component unmodified since
+            // the last XRSTOR, and MAY skip one that is at its initial configuration. Both are permissions,
+            // not obligations, and this engine tracks neither modification nor init state per component --
+            // so it performs the full save. That is architecturally legal and strictly conservative: it
+            // writes MORE than the optimized form ever would, never less, and the XSTATE_BV it leaves is the
+            // same one XSAVE leaves, so no consumer can tell the difference except by reading bytes it was
+            // already required to treat as undefined. Silently equating the two mnemonics without saying so
+            // is the part that would be wrong, not the behaviour.
+            interp_x87_arm(cpu);
+            interp_xsave_legacy(cpu, image);
+            if (rfbm & 1) {
+                interp_store_bytes(ea + 0, image + 0, 24);
+                interp_store_bytes(ea + 32, image + 32, 128);
+            }
+            if (rfbm & 2) {
+                interp_store_bytes(ea + 24, image + 24, 8);
+                interp_store_bytes(ea + 160, image + 160, 256);
+            }
+            uint64_t bv;
+            interp_load_bytes(ea + 512, &bv, 8);
+            bv = (bv & ~rfbm) | (rfbm & interp_xsave_xinuse(image));
+            interp_store_bytes(ea + 512, &bv, 8);
+            cpu->rip = next;
+            return STEP_NEXT;
         }
 #if defined(HL_HOST_CPU_X86_64)
         if ((sub == 2 || sub == 3) && insn->is_mem) {

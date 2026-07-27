@@ -27,6 +27,14 @@ void hl_x86_rep_set_store_commit(hl_x86_rep_store_commit_fn callback, hl_x86_rep
 void hl_x86_rep_set_access_validators(hl_x86_rep_access_fn readable, hl_x86_rep_access_fn writable,
                                       hl_x86_rep_access_special_fn special);
 
+/* The bound validators, published because the string ops are not the only guest
+ * accesses the engine performs outside a backend's fault pad: avx.c's do_avx /
+ * do_sse3b run from the dispatch loop and must prove an address the same way.
+ * Unbound (standalone translator, no engine under it) answers "valid" -- one
+ * flat address space, which is what the decoder's unit tests assume. */
+int hl_x86_guest_readable(uint64_t guest, size_t length);
+int hl_x86_guest_writable(uint64_t guest, size_t length);
+
 uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t bytes, int width, int backward,
                          struct cpu *cpu, uint64_t rip);
 uint64_t hl_x86_rep_stos(void *destination, uint64_t value, uint64_t count, int width, int backward, struct cpu *cpu,

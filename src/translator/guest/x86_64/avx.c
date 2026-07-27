@@ -1,9 +1,11 @@
 #include "avx.h"
 #include "cpu.h"
 #include "decoder.h"
+#include "rep_runtime.h" // the bound guest-access validators + X86_SOFT_READ/WRITE
 #include "../../../host/host_cpu.h" // HL_HOST_CPU_*: the half-precision converter forks per host CPU
 
 #include <fenv.h>
+#include <setjmp.h>
 #include <math.h>
 #if defined(HL_HOST_CPU_X86_64)
 #include <xmmintrin.h> // _mm_getcsr == STMXCSR: on this host the guest MXCSR IS the host MXCSR
@@ -159,16 +161,70 @@ static uint64_t avx_ea(const hl_x86_avx_state *state, struct cpu *c, struct insn
     return hl_x86_avx_address(state, a);
 }
 
-static int avx_memory_read(const hl_x86_avx_state *state, uint64_t guest, void *destination, size_t length) {
+// ---- The guest-access fault bracket. -----------------------------------------------------------------
+// do_avx/do_sse3b run from the DISPATCH LOOP, not from inside run_block, so neither backend's fault pad is
+// armed here: a host SIGSEGV on a guest-chosen address kills the ENGINE where hardware faults the GUEST.
+// Measured before this: `vmovdqu ymm0,[0x1000]` and `pshufb xmm0,[0x1000]` both exited 139 instead of
+// running the guest's SIGSEGV handler -- and the VEX gathers, whose address is base + a GUEST-DATA vector
+// element * scale, reach any host page at all.
+//
+// So nothing is dereferenced before it is proven, exactly as the string helpers do it (rep_runtime.c).
+// A rejected access ABANDONS the instruction with nothing committed and exits to the dispatcher with
+// R_SOFTMISS -- the same protocol emit.c's memory guard emits -- which either resolves a logical mapping
+// and retries or delivers the guest SIGSEGV with the right si_addr and si_code. cpu->rip stays ON the
+// instruction, so a retry re-executes it. The abandon is a plain longjmp, not a signal pad: the decision
+// is taken BEFORE the access, so no signal is ever raised and there is no mask to restore.
+static __thread jmp_buf g_avx_pad;
+static __thread struct cpu *g_avx_cpu; // the cpu the pad was armed for
+static __thread uint64_t g_avx_pc;     // the architectural PC of the instruction being emulated
+
+static void avx_abandon(uint64_t guest, uint64_t length, uint32_t required) {
+    struct cpu *c = g_avx_cpu;
+    c->bus_ea = guest;
+    c->soft_width = length;
+    c->soft_required = required;
+    c->rip = g_avx_pc;
+    c->reason = R_SOFTMISS;
+    longjmp(g_avx_pad, 1);
+}
+
+// #UD from an emulated instruction: SIGILL/ILL_ILLOPN with si_addr = the instruction, as interp.c raises it.
+static void avx_undefined(void) {
+    struct cpu *c = g_avx_cpu;
+    c->divop = 4u | (2u << 8); // (linux_signo | si_code<<8)
+    c->rip = g_avx_pc;
+    c->reason = R_TRAP;
+    longjmp(g_avx_pad, 1);
+}
+
+// Non-abandoning probe+transfer. 1 = done, 0 = the guest may not touch this span and NOTHING was copied.
+// The gathers need this form: a faulting element must still commit the elements that completed.
+static int avx_try_read(const hl_x86_avx_state *state, uint64_t guest, void *destination, size_t length) {
     int handled = state != NULL && state->memory_read != NULL ? state->memory_read(guest, destination, length) : 0;
-    if (handled == 0) memcpy(destination, (const void *)(uintptr_t)guest, length);
-    return handled >= 0;
+    if (handled < 0) return 0;
+    if (handled > 0) return 1;
+    if (!hl_x86_guest_readable(guest, length)) return 0;
+    memcpy(destination, (const void *)(uintptr_t)guest, length);
+    return 1;
+}
+
+static int avx_try_write(const hl_x86_avx_state *state, uint64_t guest, const void *source, size_t length) {
+    int handled = state != NULL && state->memory_write != NULL ? state->memory_write(guest, source, length) : 0;
+    if (handled < 0) return 0;
+    if (handled > 0) return 1;
+    if (!hl_x86_guest_writable(guest, length)) return 0;
+    memcpy((void *)(uintptr_t)guest, source, length);
+    return 1;
+}
+
+static int avx_memory_read(const hl_x86_avx_state *state, uint64_t guest, void *destination, size_t length) {
+    if (!avx_try_read(state, guest, destination, length)) avx_abandon(guest, length, X86_SOFT_READ);
+    return 1;
 }
 
 static int avx_memory_write(const hl_x86_avx_state *state, uint64_t guest, const void *source, size_t length) {
-    int handled = state != NULL && state->memory_write != NULL ? state->memory_write(guest, source, length) : 0;
-    if (handled == 0) memcpy((void *)(uintptr_t)guest, source, length);
-    return handled >= 0;
+    if (!avx_try_write(state, guest, source, length)) avx_abandon(guest, length, X86_SOFT_WRITE);
+    return 1;
 }
 
 // Read the r/m operand (register or memory) into buf as `wbytes` bytes.
@@ -689,7 +745,26 @@ static void aes_shiftrows(const uint8_t in[16], uint8_t out[16], int inv);
 static void aes_mixcolumns(uint8_t s[16], int inv);
 static inline int sat_s16(int v);
 
+static void do_avx(const hl_x86_avx_state *state, struct cpu *c);
+static void do_sse3b(const hl_x86_avx_state *state, struct cpu *c);
+
+// Arm the abandon pad, then emulate. A rejected guest access longjmps back here with *c already carrying
+// R_SOFTMISS (or R_TRAP for #UD) and cpu->rip left on the instruction.
 void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
+    g_avx_cpu = c;
+    g_avx_pc = c->rip;
+    if (setjmp(g_avx_pad) != 0) return;
+    do_avx(state, c);
+}
+
+void hl_x86_sse_run(const hl_x86_avx_state *state, struct cpu *c) {
+    g_avx_cpu = c;
+    g_avx_pc = c->rip;
+    if (setjmp(g_avx_pad) != 0) return;
+    do_sse3b(state, c);
+}
+
+static void do_avx(const hl_x86_avx_state *state, struct cpu *c) {
     struct insn I;
     hl_x86_decode(c->rip, &I);
     uint64_t next = c->rip + (uint64_t)I.len;
@@ -2152,11 +2227,26 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
         case 0x92:   // vgatherd{ps,pd}: 32-bit indices (same addressing; element bits are float)
         case 0x91:   // vpgatherq{d,q}: 64-bit (qword) indices
         case 0x93: { // vgatherq{ps,pd}: 64-bit indices
-            // AVX2 masked gather. VSIB: index is a VECTOR register (I.m_index) scaled by 1<<m_scale off a
-            // GPR base+disp. Mask = VEX.vvvv; per element the top bit selects "load", and the WHOLE mask
-            // register is zeroed afterwards (Intel SDM). elem = dst element size (W0=dword, W1=qword).
+            // AVX2 masked gather. VSIB: the index is a VECTOR register (I.m_index) scaled by 1<<m_scale off
+            // a GPR base+disp; the mask is VEX.vvvv, one element per destination element, tested on its top
+            // bit. elem = destination element size (W0=dword, W1=qword), isz = index element size.
+            //
+            // THE ADDRESS IS GUEST DATA: base + (int)index_element * scale spans the whole 64-bit space
+            // whatever the base register holds, so every element goes through the fault bracket above.
+            //
+            // RESTARTABILITY is what the mask semantics exist for, and it is exact here (measured on
+            // silicon: a gather whose 3rd element hits a guard page faults ONCE, and after the handler maps
+            // the page the completed elements are NOT re-gathered while the remaining ones read the page's
+            // new contents). So: clear each mask element as its element COMPLETES, and on a fault commit the
+            // partial destination and the partially cleared mask before abandoning -- rip is left on the
+            // instruction, so the retry gathers exactly the elements whose mask bit survived. The whole
+            // mask register is cleared only on full completion.
+            if (I.evex) goto avx_unimpl; // EVEX gathers mask on k1, not vvvv; emulating them as VEX is wrong
+            // #UD if any two of destination, index and mask are the same register (SDM); measured: SIGILL,
+            // ILL_ILLOPN. `c4 e2 78 91 04 8b` -- dest == mask == xmm0 -- is this case, not a memory fault.
+            if (rd == I.m_index || rd == vv || vv == I.m_index) avx_undefined();
             int elem = I.vex_w ? 8 : 4;
-            int isz = (op == 0x90 || op == 0x92) ? 4 : 8; // index element size
+            int isz = (op == 0x90 || op == 0x92) ? 4 : 8;
             int nlanes = (isz == 4) ? (W / elem) : (W / 8);
             int result_bytes = nlanes * elem;
             uint8_t idxv[64], mask[64];
@@ -2182,13 +2272,20 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                         memcpy(&index, idxv + i * 8, 8);
                     }
                     uint64_t addr = hl_x86_avx_address(state, base + (uint64_t)(index * scale));
-                    (void)avx_memory_read(state, addr, d + i * elem, (size_t)elem);
+                    if (!avx_try_read(state, addr, d + i * elem, (size_t)elem)) {
+                        // Suspended, not abandoned: elements < i are done and must survive. 64-byte writes,
+                        // so nothing this instruction has not touched moves (no upper-zeroing on a fault).
+                        avx_put(c, rd, d, 64);
+                        avx_put(c, vv, mask, 64);
+                        avx_abandon(addr, (uint64_t)elem, X86_SOFT_READ);
+                    }
                 }
+                memset(mask + i * elem, 0, (size_t)elem); // this element is complete
             }
             avx_put(c, rd, d, result_bytes); // dst above the result width is zeroed
             uint8_t zero[64];
             memset(zero, 0, 64);
-            avx_put(c, vv, zero, W); // the entire mask register is cleared after the gather
+            avx_put(c, vv, zero, W); // the entire mask register is cleared after a completed gather
             goto done;
         }
         case 0x2B: { // vpackusdw: signed dword -> unsigned word, saturate (per-128-lane; a low, b high)
@@ -3061,7 +3158,7 @@ static void sse42_mask(struct cpu *c, int res, int imm, int n) {
     memcpy(&c->v[0], out, 16); // XMM0 == c->v[0..1]; legacy SSE leaves the upper YMM bits intact
 }
 
-void hl_x86_sse_run(const hl_x86_avx_state *state, struct cpu *c) {
+static void do_sse3b(const hl_x86_avx_state *state, struct cpu *c) {
     struct insn I;
     hl_x86_decode(c->rip, &I);
     uint64_t next = c->rip + (uint64_t)I.len;

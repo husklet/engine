@@ -235,6 +235,17 @@ static int smc_on_write(uint64_t a) {
 // Each non-syscall case `continue`s the shared while-loop (so the shared `if (reason==R_TIER2) ...`
 // tail line never re-fires for x86). Verbatim from frontend/x86_64/dispatch.c. `break` exits the loop.
 #define G_DISPATCH_REASON(c)                                                                                           \
+    /* The C instruction emulators come FIRST and do not `continue` unconditionally: they run outside      \
+       run_block, so a guest access they reject leaves a NEW reason (R_SOFTMISS, or R_TRAP for an          \
+       emulated #UD) that the arms below have to see. rip = the insn; do_avx/do_sse3b advance it. */       \
+    if ((c)->reason == R_AVX) { /* VEX/EVEX AVX insn: emulate in C */                                                  \
+        hl_x86_avx_run(&g_avx_state, (c));                                                                             \
+        if ((c)->reason == R_AVX) continue;                                                                            \
+    }                                                                                                                  \
+    if ((c)->reason == R_SSE3B) { /* legacy 0F38/0F3A insn: emulate in C */                                            \
+        hl_x86_sse_run(&g_avx_state, (c));                                                                             \
+        if ((c)->reason == R_SSE3B) continue;                                                                          \
+    }                                                                                                                  \
     if ((c)->reason == R_SOFTMISS) {                                                                                   \
         if (soft_tlb_miss(c)) maybe_deliver_signal(c);                                                                 \
         continue;                                                                                                      \
@@ -264,14 +275,6 @@ static int smc_on_write(uint64_t a) {
         hl_x86_cpuid(c);                                                                                               \
         continue;                                                                                                      \
     } /* rip already = next */                                                                                         \
-    if ((c)->reason == R_AVX) { /* VEX/EVEX AVX insn: emulate in C; rip = the insn, do_avx advances it */              \
-        hl_x86_avx_run(&g_avx_state, (c));                                                                             \
-        continue;                                                                                                      \
-    }                                                                                                                  \
-    if ((c)->reason == R_SSE3B) { /* legacy 0F38/0F3A insn: emulate in C; rip = the insn, do_sse3b advances it */      \
-        hl_x86_sse_run(&g_avx_state, (c));                                                                             \
-        continue;                                                                                                      \
-    }                                                                                                                  \
     if ((c)->reason == R_REPSTR) {                                                                                     \
         hl_x86_rep_compare(c, g_nonpie_lo, g_nonpie_hi, g_nonpie_bias);                                                \
         continue;                                                                                                      \
@@ -304,6 +307,10 @@ static int smc_on_write(uint64_t a) {
         hl_x86_fxrstor(c);                                                                                             \
         continue;                                                                                                      \
     }                                                                                                                  \
+    if ((c)->reason == R_X87ENV) { /* fnstenv/fldenv m28, fnsave/frstor m108 (rip already = next) */                  \
+        hl_x86_x87_environment(c);                                                                                     \
+        continue;                                                                                                      \
+    }                                                          \
     /* #DE si_code. Linux/x86 reports FPE_INTDIV(1) for the #DE trap WHATEVER raised it -- a zero divisor              \
      * and a quotient overflow alike; this host's silicon is the oracle and tests/compat/completeness/                 \
      * x86_64/div_overflow.c holds its answer. Queueing FPE_INTOVF(2) here diverged for the JIT only:                  \

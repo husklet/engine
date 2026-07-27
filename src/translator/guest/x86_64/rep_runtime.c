@@ -23,6 +23,14 @@ void hl_x86_rep_set_access_validators(hl_x86_rep_access_fn readable, hl_x86_rep_
     g_rep_access_special = special;
 }
 
+int hl_x86_guest_readable(uint64_t guest, size_t length) {
+    return g_rep_readable == NULL || g_rep_readable(guest, length);
+}
+
+int hl_x86_guest_writable(uint64_t guest, size_t length) {
+    return g_rep_writable == NULL || g_rep_writable(guest, length);
+}
+
 static uint64_t rep_fault(struct cpu *cpu, uint64_t address, uint64_t width, uint32_t required, uint64_t rip,
                           uint64_t completed) {
     if (cpu != NULL) {

@@ -101,6 +101,17 @@ static inline int smc_seen(void) {
 // falls through to the R_BRANCH default and resumes at a PC nobody set -- and R_TIER2 must NOT take
 // dispatch.h's tier2_promote + `continue`, which without an emitted counter would loop on one block.
 #define G_DISPATCH_REASON(c)                                                                                           \
+    /* The C instruction emulators come FIRST and do not `continue` unconditionally: they run outside      \
+       run_block, so a guest access they reject leaves a NEW reason (R_SOFTMISS, or R_TRAP for an          \
+       emulated #UD) that the arms below have to see. rip = the insn; the callee advances it. */           \
+    if ((c)->reason == R_AVX) {                                                                                        \
+        hl_x86_avx_run(&g_avx_state, (c));                                                                             \
+        if ((c)->reason == R_AVX) continue;                                                                            \
+    }                                                                                                                  \
+    if ((c)->reason == R_SSE3B) {                                                                                      \
+        hl_x86_sse_run(&g_avx_state, (c));                                                                             \
+        if ((c)->reason == R_SSE3B) continue;                                                                          \
+    }                                                                                                                  \
     if ((c)->reason == R_SOFTMISS) {                                                                                   \
         if (soft_tlb_miss(c)) maybe_deliver_signal(c);                                                                 \
         continue;                                                                                                      \
@@ -121,14 +132,6 @@ static inline int smc_seen(void) {
     }                                                                                                                  \
     if ((c)->reason == R_CPUID) {                                                                                      \
         hl_x86_cpuid(c);                                                                                               \
-        continue;                                                                                                      \
-    }                                                                                                                  \
-    if ((c)->reason == R_AVX) { /* rip = the insn; callee advances it */                                                \
-        hl_x86_avx_run(&g_avx_state, (c));                                                                             \
-        continue;                                                                                                      \
-    }                                                                                                                  \
-    if ((c)->reason == R_SSE3B) { /* rip = the insn; callee advances it */                                              \
-        hl_x86_sse_run(&g_avx_state, (c));                                                                             \
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_REPSTR) { /* rep cmps/scas */                                                                  \
