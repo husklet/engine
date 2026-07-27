@@ -401,21 +401,34 @@ because no fixture in the corpus reaches it — which is the sharpest available 
 does and does not prove: it measures the corpus, not the ISA. The box is now open for the dot products only;
 everything else in it still reports honestly.
 
-### 3.15 x86-64 guest auxv defects, found during the aarch64 audit
+### 3.15 The discovery surfaces did not derive from one model
 
-`src/linux_abi/x86.c`:
+**All fixed** — `bb57d321` for the auxv, `05298926` for `/proc/cpuinfo` — but the shape is worth keeping,
+because the same mistake is available at every new surface.
 
-- **`AT_HWCAP` is hardcoded 0**, where a real kernel puts `CPUID.1:EDX`. Masked in practice because glibc
-  special-cases `getauxval(AT_HWCAP)` to return `GLRO(dl_hwcap)` from CPUID directly — which is why the
-  `auxval` fixture still reads `hwcap_nz=1`. Anything parsing `/proc/self/auxv` sees 0.
-- **`AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID` are hardcoded 0** while the aarch64 path uses `cuid()`/`cgid()`.
-  Live divergence: on this host an aarch64 guest sees 1000 and an x86-64 guest sees 0. The x86 side carries
-  a "container root" comment, so it reads as deliberate rather than a slip — but it is guest-visible and the
-  two guest ISAs disagree.
+`src/linux_abi/x86.c` hardcoded **`AT_HWCAP = 0`** where a real kernel puts `CPUID.1:EDX`, and hardcoded
+**`AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID` to 0** while the aarch64 path used `cuid()`/`cgid()`. The uid one
+carried a "container root" comment that was wrong about its own code: `cuid()`/`cgid()` *are* the container
+identity, and `container_init` seeds `g_ruid`/`g_euid` from them — so the engine told a guest `AT_UID=0`
+while **that same guest's `getuid()` returned 1000**. A contradiction inside one engine, not merely between
+two guest ISAs.
 
-And in `src/linux_abi/container/vfs.c:4998`: **`/proc/cpuinfo` reports `Features: fp asimd` only**, not
-derived from the CPU model, so it omits the aes/pmull/sha1/sha2/crc32/atomics the engine *does* advertise in
-`AT_HWCAP`. That contradicts `cpu.h`'s claim that every discovery surface derives from one model.
+`src/linux_abi/container/vfs.c` hardcoded `/proc/cpuinfo`'s `Features: fp asimd`, omitting the seven
+features the engine *does* advertise (aes, pmull, sha1, sha2, crc32, atomics, asimddp). The x86 branch was
+also a literal — merely hand-consistent with `hl_x86_cpuid` — so the real defect was that **neither branch
+derived**, and the x86 one was a latent divergence waiting for the next CPUID edit.
+
+Two things made this class survivable for so long, and both are now closed:
+
+- **The existing fixture could not see it.** `auxval` reads `getauxval(AT_HWCAP)`, which glibc answers from
+  its own `_dl_hwcap` computed from `CPUID` directly, so it read `hwcap_nz=1` no matter what the engine put
+  on the stack. `selfauxv` asserted only presence. `pf-cpumodel` now reads `/proc/self/auxv` **directly**
+  and checks both surfaces against the real `cpuid` instruction, in both directions.
+- **`hl_x86_cpuid()` was already the single model** and nothing was obliged to use it. Both surfaces now
+  derive from it, so `movbe` is absent because bit 22 is clear rather than because someone omitted it.
+
+`guest/aarch64/cpu.h` still exports the hwcap *value* but no `HWCAP_*` macros and no bit→name table, so the
+naming lives in two places. That is the remaining half.
 
 ### 3.16 A fifth non-PIE bias defect: `sigaltstack` inside a non-PIE image is not deliverable
 
