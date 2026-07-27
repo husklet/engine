@@ -379,7 +379,7 @@ static int cgid(void) {
     return g_gid >= 0 ? g_gid : (int)getgid();
 }
 
-#include <sys/xattr.h>
+#include "../host_fs.h"
 #include "owner.h"
 #define HL_MODE_XATTR "user.hl.mode"
 

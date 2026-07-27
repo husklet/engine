@@ -1,6 +1,6 @@
 // hl/linux_abi/container -- termios (Linux<->macOS) + NET-ns private loopback (127/8 -> AF_UNIX).
 
-#include <netdb.h> // container DNS: getaddrinfo/getnameinfo via the macOS host resolver (dns_* below)
+#include "../host_socket.h" // container DNS: getaddrinfo/getnameinfo via the macOS host resolver (dns_* below)
 
 #include "../shared.h"
 #include "../../host/libc_compat.h" // hl_compat_mkdir: the UCRT's mkdir takes no mode

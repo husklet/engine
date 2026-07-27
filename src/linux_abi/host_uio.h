@@ -19,17 +19,33 @@
  *     guest ABI, written down.  SHAPE.
  *
  *   - As an argument to a host readv/writev on an int fd.  That is the other
- *     population entirely, and it is blocked for the same reason the socket block
- *     is: on Windows a guest fd number names no host object, because the engine
- *     has no descriptor-to-HANDLE table.  The seam DOES carry readv/writev/
- *     readv_at/writev_at in the file group, keyed on an hl_host_handle, so these
- *     become REAL the moment that table exists -- there is no missing seam
- *     operation here, only a missing binding.  REFUSAL until then.
+ *     population entirely, and it splits by SEGMENT COUNT rather than by host.
  *
- * A loop of single-segment reads was considered for the second population and
- * rejected: POSIX writev is atomic with respect to the file offset on a regular
- * file and atomic up to PIPE_BUF on a pipe, a loop is neither, and a guest that
- * relies on either would see interleaving rather than an error.
+ * The split is where an earlier revision of this file was wrong, and the
+ * correction is worth recording because it was found by running a guest rather
+ * than by reading code.  That revision refused both calls outright on the
+ * grounds that "a guest fd number names no host object on Windows".  That is
+ * true of a descriptor the engine would have to open through the file seam, and
+ * false of the ones a guest actually starts with: the standard streams and
+ * everything the CRT opens ARE ordinary CRT descriptors here, and write(2) on
+ * them works.  The measured consequence of the blanket refusal was a guest whose
+ * write(1, "hi\n", 3) returned -ENOSYS -- because this layer routes every plain
+ * write through guest_fd_write, which uses writev.
+ *
+ * So:
+ *
+ *   - count <= 1 is REAL.  A one-segment vector is a plain read/write by
+ *     definition; there is no gather and therefore nothing to be atomic about.
+ *     This is not an approximation of writev, it IS writev for that input.
+ *
+ *   - count > 1 stays a REFUSAL, and the original reasoning is unchanged and
+ *     still correct: POSIX writev is atomic with respect to the file offset on a
+ *     regular file and atomic up to PIPE_BUF on a pipe.  A loop of writes is
+ *     neither, so a guest relying on either would see interleaving -- a wrong
+ *     answer -- instead of an error.  The seam already carries readv/writev/
+ *     readv_at/writev_at in the file group keyed on an hl_host_handle, so the
+ *     gather becomes REAL the moment the descriptor-to-HANDLE binding exists;
+ *     there is no missing seam operation here, only a missing binding.
  */
 
 #if !defined(_WIN32)
@@ -39,6 +55,7 @@
 #else /* Windows */
 
 #include <errno.h>
+#include <io.h>
 #include <stddef.h>
 #include <sys/types.h>
 
@@ -60,22 +77,37 @@ struct iovec {
 #define RWF_NOWAIT 0x00000008
 #define RWF_APPEND 0x00000010
 
-/* REFUSAL -- no descriptor-to-HANDLE table.  ENOSYS and not EBADF: EBADF would
- * tell the guest its descriptor is wrong, which it is not. */
+/* A zero-length transfer still has to reach the descriptor: write(fd, ., 0) is
+ * how a caller probes that fd is open for writing, and returning 0 without
+ * asking would answer that probe wrongly for a closed or read-only fd. */
+#define HL_LINUX_UIO_BASE(v, n) ((n) > 0 ? (v)[0].iov_base : NULL)
+#define HL_LINUX_UIO_LEN(v, n) ((n) > 0 ? (v)[0].iov_len : (size_t)0)
+
+/* REAL for one segment; REFUSAL above it -- see the header note.  ENOSYS and not
+ * EBADF for the refusal: EBADF would tell the guest its descriptor is wrong,
+ * which it is not.  EINVAL is reserved for a genuinely malformed count. */
 static inline ssize_t readv(int fd, const struct iovec *vectors, int count) {
-    (void)fd;
-    (void)vectors;
-    (void)count;
-    errno = ENOSYS;
-    return -1;
+    if (count < 0 || (count > 0 && vectors == NULL)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (count > 1) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return (ssize_t)_read(fd, HL_LINUX_UIO_BASE(vectors, count), (unsigned int)HL_LINUX_UIO_LEN(vectors, count));
 }
 
 static inline ssize_t writev(int fd, const struct iovec *vectors, int count) {
-    (void)fd;
-    (void)vectors;
-    (void)count;
-    errno = ENOSYS;
-    return -1;
+    if (count < 0 || (count > 0 && vectors == NULL)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (count > 1) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return (ssize_t)_write(fd, HL_LINUX_UIO_BASE(vectors, count), (unsigned int)HL_LINUX_UIO_LEN(vectors, count));
 }
 
 static inline ssize_t preadv(int fd, const struct iovec *vectors, int count, off_t offset) {

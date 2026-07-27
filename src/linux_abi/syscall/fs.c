@@ -825,14 +825,11 @@ static int procfd_follow_stat(const char *path, struct stat *status) {
         status->st_gid = (gid_t)typed.group;
         status->st_rdev = (dev_t)typed.special_device;
         status->st_size = (off_t)typed.size;
-        status->st_blocks = (blkcnt_t)typed.blocks_512;
-        status->st_blksize = 4096;
-        status->st_atimespec.tv_sec = (time_t)(typed.accessed_ns / UINT64_C(1000000000));
-        status->st_atimespec.tv_nsec = (long)(typed.accessed_ns % UINT64_C(1000000000));
-        status->st_mtimespec.tv_sec = (time_t)(typed.modified_ns / UINT64_C(1000000000));
-        status->st_mtimespec.tv_nsec = (long)(typed.modified_ns % UINT64_C(1000000000));
-        status->st_ctimespec.tv_sec = (time_t)(typed.changed_ns / UINT64_C(1000000000));
-        status->st_ctimespec.tv_nsec = (long)(typed.changed_ns % UINT64_C(1000000000));
+        HL_HOST_STAT_SET_BLOCKS(status, typed.blocks_512);
+        HL_HOST_STAT_SET_BLKSIZE(status, 4096);
+        HL_HOST_STAT_SET_ATIME(status, typed.accessed_ns / UINT64_C(1000000000), typed.accessed_ns % UINT64_C(1000000000));
+        HL_HOST_STAT_SET_MTIME(status, typed.modified_ns / UINT64_C(1000000000), typed.modified_ns % UINT64_C(1000000000));
+        HL_HOST_STAT_SET_CTIME(status, typed.changed_ns / UINT64_C(1000000000), typed.changed_ns % UINT64_C(1000000000));
         return 1;
     }
     return fstat(fd, status) == 0 ? 1 : -1;
@@ -4579,16 +4576,16 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // stx_size @40
         *(uint64_t *)(d + 40) = (uint64_t)s.st_size;
         // stx_blocks @48
-        *(uint64_t *)(d + 48) = (uint64_t)s.st_blocks;
+        *(uint64_t *)(d + 48) = HL_HOST_STAT_BLOCKS(&s);
         // stx_{atime,btime,ctime,mtime} @64/80/96/112: {s64 tv_sec; u32 tv_nsec} each 16 bytes
-        *(int64_t *)(d + 64) = (int64_t)s.st_atimespec.tv_sec;
-        *(uint32_t *)(d + 72) = (uint32_t)s.st_atimespec.tv_nsec;
+        *(int64_t *)(d + 64) = HL_HOST_STAT_ATIME_SEC(&s);
+        *(uint32_t *)(d + 72) = (uint32_t)HL_HOST_STAT_ATIME_NSEC(&s);
         *(int64_t *)(d + 80) = have_btime ? btime_sec : 0;
         *(uint32_t *)(d + 88) = have_btime ? btime_nsec : 0;
-        *(int64_t *)(d + 96) = (int64_t)s.st_ctimespec.tv_sec;
-        *(uint32_t *)(d + 104) = (uint32_t)s.st_ctimespec.tv_nsec;
-        *(int64_t *)(d + 112) = (int64_t)s.st_mtimespec.tv_sec;
-        *(uint32_t *)(d + 120) = (uint32_t)s.st_mtimespec.tv_nsec;
+        *(int64_t *)(d + 96) = HL_HOST_STAT_CTIME_SEC(&s);
+        *(uint32_t *)(d + 104) = (uint32_t)HL_HOST_STAT_CTIME_NSEC(&s);
+        *(int64_t *)(d + 112) = HL_HOST_STAT_MTIME_SEC(&s);
+        *(uint32_t *)(d + 120) = (uint32_t)HL_HOST_STAT_MTIME_NSEC(&s);
         // stx_rdev_major @128 / minor @132, stx_dev_major @136 / minor @140 -- decoded from the SAME raw
         // dev values fill_linux_stat packs into st_rdev/st_dev, so a caller sees identical major:minor.
         *(uint32_t *)(d + 128) = hl_linux_device_major((uint64_t)s.st_rdev);

@@ -1624,6 +1624,21 @@ static void uninstall_host_sigaltstack(void) {
 // exception port intercepts EXC_BAD_ACCESS before the POSIX guards) and HL_NOFASTHRM=1 keep the
 // byte-identical mach_vm_region path.
 #include <setjmp.h>
+#if defined(_WIN32)
+// The host fault primitive already owns this exact operation, pad and all: it arms its own landing site,
+// touches each page (with an atomic OR of zero when the caller asked about writes, so the access really is
+// a write and still cannot lose a concurrent update), and reports whether every page was reachable. Its
+// probe window is consulted by the vectored handler AFTER the engine classifier declines, which is the
+// same ordering the POSIX arm gets from calling hrm_fault_hook first -- a fault the engine can legitimately
+// serve is served, and only a genuinely unreachable page becomes the probe's answer.
+//
+// So there is nothing left for a second implementation to do, and the two thread-locals and the fault hook
+// below have no Windows arm at all. What the primitive additionally buys, which no POSIX arm can, is the
+// kernel-write hole: a kernel touching an inaccessible user page on the caller's behalf raises no exception
+// anywhere, so every host call that hands guest memory to the kernel has to make the pages good from user
+// mode first, and that is this same probe.
+#include "../host/windows/fault.h"
+#endif
 static _Thread_local sigjmp_buf g_hrm_jb;                   // probe return point (valid while g_hrm_hi != 0)
 static _Thread_local volatile uintptr_t g_hrm_lo, g_hrm_hi; // page range being probed; probing iff hi != 0
 static int g_hrm_slow = -1; // HL_NOFASTHRM=1 / crash diagnostics -> per-page mach_vm_region
@@ -1633,6 +1648,12 @@ static int g_hrm_slow = -1; // HL_NOFASTHRM=1 / crash diagnostics -> per-page ma
 // entry and siglongjmp(.,0) does not restore masks, so unblock it here or the NEXT probe fault would be
 // force-killed instead of caught. Returns 0 (fault not ours) in every other case.
 static int hrm_fault_hook(siginfo_t *si) {
+#if defined(_WIN32)
+    // Never claims anything: the probe window lives inside the host fault primitive, and its dispatcher
+    // tests it directly. A hook that answered here would be a second, stale copy of that window.
+    (void)si;
+    return 0;
+#else
     if (!g_hrm_hi) return 0;
     uintptr_t va = (uintptr_t)(si ? si->si_addr : NULL);
     if (va < g_hrm_lo || va >= g_hrm_hi) return 0; // not the probe access -> normal fault handling
@@ -1642,6 +1663,7 @@ static int hrm_fault_hook(siginfo_t *si) {
     sigaddset(&s, SIGBUS);
     pthread_sigmask(SIG_UNBLOCK, &s, NULL);
     siglongjmp(g_hrm_jb, 1); // never returns
+#endif
 }
 
 static int host_range_mapped(uintptr_t a, size_t len) {
@@ -1651,6 +1673,11 @@ static int host_range_mapped(uintptr_t a, size_t len) {
     // A guest PROT_NONE mapping is physically R+W under hl (see the g_gna registry above), so the page
     // probe below would call it mapped; the kernel's copy_to/from_user faults it. Reject up front.
     if (gna_hit((uint64_t)a, (uint64_t)len) || hl_linux_bus_hit((uint64_t)a, (uint64_t)len)) return 0;
+#if defined(_WIN32)
+    // The registry rejections above are still ours -- they encode guest-visible protection this host's
+    // page tables do not carry -- and everything below them is the host primitive's job.
+    return hl_windows_fault_probe((uint64_t)a, (uint64_t)len, 0);
+#else
     uintptr_t lo = a & ~(uintptr_t)0xfff;
     if (g_hrm_slow < 0) g_hrm_slow = 0;
     if (g_hrm_slow) {
@@ -1679,6 +1706,7 @@ static int host_range_mapped(uintptr_t a, size_t len) {
     g_hrm_lo = 0;
     g_hrm_hi = 0; // probe window closed (hook inert again)
     return ok;
+#endif
 }
 
 /* Prove that every guest-page fragment in a range accepts stores without ever
@@ -1691,7 +1719,16 @@ static int host_range_writable(uintptr_t a, size_t len) {
     if (end < a || gna_hit((uint64_t)a, (uint64_t)len) || gro_hit((uint64_t)a, (uint64_t)len) ||
         hl_linux_bus_hit((uint64_t)a, (uint64_t)len))
         return 0;
+#if defined(_WIN32)
+    // A WRITE probe, not the read probe host_range_mapped issues. Two things follow from that on this host
+    // and neither is available to the POSIX arm: a page that is mapped but not writable answers correctly
+    // without consulting any registry, and the page is left present and dirty -- which is what closes the
+    // kernel-write hole for the call this validation precedes, where a kernel store into a not-yet-good
+    // page fails with no exception raised anywhere and no handler entered.
+    return hl_windows_fault_probe((uint64_t)a, (uint64_t)len, 1);
+#else
     return host_range_mapped(a, len);
+#endif
 }
 
 static void abs_from_rel(struct timespec *abs, const struct timespec *ts) {

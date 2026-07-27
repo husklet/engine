@@ -22,10 +22,10 @@
 #include <time.h>
 #include <sys/time.h>
 #include "../../linux_abi/host_uio.h" // <sys/uio.h>, or the guest iovec layout where the host has none
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/un.h>
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_socket.h"
 #include "../../linux_abi/host_poll.h" // <poll.h>, or a typed absence where the host has no mixed-handle readiness
 #include "../../host/native_compat.h"
 #include "../../host/native_context.h"
@@ -36,10 +36,10 @@
 #include <mach/mach_vm.h> // Mach exception diagnostics; JIT mappings belong to src/host/macos
 #include <sys/event.h>
 #endif
-#include <termios.h>
-#include <sys/ioctl.h>
-#include <sys/resource.h>
-#include <sys/wait.h>
+#include "../../linux_abi/host_tty.h"
+#include "../../linux_abi/host_tty.h"
+#include "../../linux_abi/host_proc.h"
+#include "../../linux_abi/host_wait.h"
 #include <stdatomic.h>
 #include <dlfcn.h>
 

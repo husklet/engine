@@ -78,6 +78,78 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   hl_object(win_unity_probe_x86_64 src/core/target/x86_64.c
             FLAGS -D_GNU_SOURCE -O2 UNITY)
   set_target_properties(win_unity_probe_x86_64 PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+  # ---- the x86-64 Windows production engine -------------------------------
+  # Same composition as the Linux arm below -- unity target TU + lifecycle core
+  # + the six separately compiled provider TUs -- against the Windows host
+  # archive.  It is EXCLUDE_FROM_ALL for exactly as long as the probe above is
+  # non-empty: a `ninja` with no arguments must not start failing for everyone
+  # while the unity TU is still acquiring its host seams.  Ask for it by name.
+  #
+  # The aarch64 guest engine is deliberately absent.  Its unity TU has had no
+  # measurement on this host at all, and a target that has never been compiled
+  # is a claim, not a build product.
+  #
+  # -lpthread is winpthreads, the mingw-w64 pthread implementation, and it is
+  # NOT linked by default on this toolchain -- measured: the link fails on
+  # pthread_key_create/pthread_once/sched_yield without it. -lm is in the
+  # default runtime and is not repeated.
+  set(_win_prov environment provider/client provider/demux provider/files
+                provider/handles provider/namespace)
+  set(_win_prov_objs "")
+  foreach(p ${_win_prov})
+    string(REPLACE "/" "_" tn "win_prov_${p}")
+    hl_object(${tn} src/core/${p}.c FLAGS -D_GNU_SOURCE -O2)
+    set_target_properties(${tn} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    list(APPEND _win_prov_objs $<TARGET_OBJECTS:${tn}>)
+  endforeach()
+
+  hl_object(win_target_x86_64 src/core/target/x86_64.c
+            FLAGS -D_GNU_SOURCE -O2 UNITY)
+  # lifecycle-core: no -D_GNU_SOURCE, matching every other host's lane.
+  hl_object(win_life_x86_64 src/core/lifecycle.c
+            FLAGS -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2)
+  set_target_properties(win_target_x86_64 win_life_x86_64 PROPERTIES
+    EXCLUDE_FROM_ALL TRUE)
+
+  add_executable(hl-engine-windows-x86_64
+    $<TARGET_OBJECTS:win_target_x86_64>
+    $<TARGET_OBJECTS:win_life_x86_64>
+    ${_win_prov_objs})
+  # The three engine archives are mutually recursive; lld-link's PE driver is
+  # not used here (this is the GNU-style clang driver over ld.lld), so the
+  # explicit group is required exactly as it is for the Linux runner link.
+  target_link_libraries(hl-engine-windows-x86_64 PRIVATE
+    "$<LINK_GROUP:RESCAN,hl-engine,hl-translator,hl-linux-abi,hl-host-windows>"
+    pthread)
+  set_target_properties(hl-engine-windows-x86_64 PROPERTIES
+    EXCLUDE_FROM_ALL TRUE
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/windows-production)
+
+  # ---- tier-0 probe --------------------------------------------------------
+  # The engine above starts the guest in a CHILD process, and this host's spawn
+  # cannot yet carry the entry context to a cold child. The probe runs the same
+  # guest entry IN PROCESS, so the loader/translator/syscall half can be measured
+  # while the process half is built. Its own target TU object, because the target
+  # root defines main() and the probe supplies its own.
+  #
+  # A measurement tool, not a product: it is EXCLUDE_FROM_ALL and lands beside
+  # the engine rather than in bin/, and tools/windows/tier0_probe.c says why it
+  # must not be mistaken for one.
+  hl_object(win_target_x86_64_nomain src/core/target/x86_64.c
+            FLAGS -D_GNU_SOURCE -DHL_ENGINE_NO_MAIN=1 -O2 UNITY)
+  set_target_properties(win_target_x86_64_nomain PROPERTIES EXCLUDE_FROM_ALL TRUE)
+  add_executable(hl-tier0-probe-x86_64
+    tools/windows/tier0_probe.c
+    $<TARGET_OBJECTS:win_target_x86_64_nomain>
+    $<TARGET_OBJECTS:win_life_x86_64>
+    ${_win_prov_objs})
+  target_link_libraries(hl-tier0-probe-x86_64 PRIVATE hl_cpp_flags
+    "$<LINK_GROUP:RESCAN,hl-engine,hl-translator,hl-linux-abi,hl-host-windows>"
+    pthread)
+  set_target_properties(hl-tier0-probe-x86_64 PROPERTIES
+    EXCLUDE_FROM_ALL TRUE
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/windows-production)
   return()
 endif()
 

@@ -20,7 +20,13 @@ static void *elf_host_map(void *context, void *address, size_t length, uint32_t 
 }
 
 #include <stdatomic.h>
+/* <sys/ucontext.h> only where a ucontext_t comes from a system header. On a host
+ * with no signals there is no such header and no such type: native_context.h's
+ * cell for that host names the register file the fault primitive delivers
+ * instead, so it is the only include that is unconditional here. */
+#if !defined(_WIN32)
 #include <sys/ucontext.h>
+#endif
 #include "../host/native_context.h"
 
 #include "../host/range.h"
@@ -1274,6 +1280,62 @@ static void jit86_install_sync_fault_guards(void) {
 #ifndef HL_EMBEDDED_BUILD
 __attribute__((constructor)) static void jit86_sync_fault_guards_constructor(void) {
     jit86_install_sync_fault_guards();
+}
+#endif
+
+#if defined(_WIN32)
+#include "../host/windows/fault.h"
+/*
+ * The single classifier the host's vectored exception handler calls, standing in for all five sigactions
+ * the POSIX arms install.
+ *
+ * It does no classification of its own. The two guards above already are the classifier -- 200 lines of
+ * ordering that decides between a probe fault, an LDAPR/LSE alignment emulation, a non-PIE absolute-data
+ * fixup, a PROT_NONE registry hit, a read-only registry hit, self-modifying code, a lazy page grow, guest
+ * signal delivery, and a faithful guest termination -- and that ordering is not host-specific. Reproducing
+ * it against the host fault record would create a second copy that must stay in step with the first, and
+ * the two would diverge on exactly the rare path neither is tested on.
+ *
+ * So the record is translated INTO the shape the guards already read. That translation is nearly free
+ * because the host primitive reports kind and code as the Linux signal number and si_code for the pair; the
+ * only field it carries that no POSIX siginfo_t has is `access`, which says whether the instruction read,
+ * wrote or executed. si_addr says where, never whether, so sites that today infer write-ness ("a read would
+ * have been legal under this protection, so it must have been a write") could stop inferring here. They are
+ * left inferring for now: the inference is correct for both registries that use it, and changing it is a
+ * behaviour change to a shared path rather than a port.
+ *
+ * Two things this deliberately does NOT do:
+ *
+ *   - it never returns DECLINE after calling a guard. A guard that cannot serve the fault does not return:
+ *     it terminates the guest faithfully, or restores SIG_DFL and re-raises, which on this host aborts the
+ *     process. Returning RESUME after a guard returned therefore always means the guard fixed something.
+ *     Returning RESUME on a fault nobody fixed would re-execute the faulting instruction forever, and a
+ *     spin is a far worse failure than a crash.
+ *   - it takes no lock, allocates nothing and logs nothing on the fast path, because a vectored handler is
+ *     entered synchronously from the faulting instruction and may be inside a lock this thread already
+ *     holds. The guards obey the same rule; the lazy-map path calls only the host service's explicitly
+ *     signal-context-safe page repair for that reason.
+ */
+static int hl_windows_guest_fault(hl_windows_fault *fault, void *context) {
+    siginfo_t info;
+    (void)context;
+    memset(&info, 0, sizeof info);
+    info.si_signo = (int)fault->kind;
+    info.si_code = (int)fault->code;
+    info.si_addr = (fault->flags & HL_WINDOWS_FAULT_HAS_ADDRESS) ? (void *)(uintptr_t)fault->address : NULL;
+    switch (fault->kind) {
+    case HL_WINDOWS_FAULT_SEGV:
+    case HL_WINDOWS_FAULT_BUS: jit86_lazyguard((int)fault->kind, &info, fault->context); return HL_WINDOWS_FAULT_RESUME;
+    case HL_WINDOWS_FAULT_ILL:
+    case HL_WINDOWS_FAULT_FPE:
+    case HL_WINDOWS_FAULT_TRAP: jit86_syncguard((int)fault->kind, &info, fault->context); return HL_WINDOWS_FAULT_RESUME;
+    default:
+        /* Not a class any guard models -- a C++ throw, a debugger breakpoint the
+         * debugger owns, a language exception from a loaded DLL. Declining lets
+         * the frame-based handlers that DO own it run, which is the whole reason
+         * a vectored handler has a decline verdict at all. */
+        return HL_WINDOWS_FAULT_DECLINE;
+    }
 }
 #endif
 

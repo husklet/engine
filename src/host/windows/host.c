@@ -25,6 +25,9 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <io.h>
+#include <fcntl.h>
 
 /* --- results and error mapping --------------------------------------------- */
 
@@ -309,6 +312,27 @@ hl_status hl_host_windows_create(hl_host_windows **out_host, hl_host_services *o
     /* Diagnostics are UTF-8 byte spans. Without this a console interprets them
      * in its OEM code page and every non-ASCII message is mojibake. */
     (void)SetConsoleOutputCP(CP_UTF8);
+
+    /* The three inherited descriptors are put into BINARY mode, once, here.
+     *
+     * This CRT defaults them to text mode, which rewrites every '\n' the process
+     * writes into "\r\n" and strips '\r' on the way in. For a program that emits
+     * text that is a convenience; for this one it is corruption. Everything that
+     * crosses these descriptors is a byte span a GUEST produced or expects --
+     * a guest's write(2) is a byte count it will compare against the return
+     * value, and a translated executable, a tar stream or a checkpoint image
+     * passing through stdout must arrive byte-identical. Measured: a guest
+     * write(1, "hi\n", 3) reached the console as three bytes plus an injected
+     * carriage return, and reported 3, so the guest could not even detect it.
+     *
+     * Done at host creation rather than per write because the mode is a property
+     * of the descriptor, not of a call, and because every later writer -- the
+     * engine's own diagnostics included -- wants the same answer. The engine's
+     * diagnostics are LF-terminated after this, which every Windows console and
+     * every tool that reads a pipe handles. */
+    (void)_setmode(_fileno(stdin), _O_BINARY);
+    (void)_setmode(_fileno(stdout), _O_BINARY);
+    (void)_setmode(_fileno(stderr), _O_BINARY);
 
     out_services->abi = HL_HOST_SERVICES_ABI;
     out_services->size = sizeof(*out_services);

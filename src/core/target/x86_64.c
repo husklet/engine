@@ -37,7 +37,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
-#include <fcntl.h>
+#include "../../linux_abi/host_fd.h" // <fcntl.h> + <unistd.h>, or the descriptor vocabulary where the host has none
 #include "../../linux_abi/host_mman.h" // <sys/mman.h>, or the typed VM seam where the host has none
 #include <sys/stat.h>
 #include <pthread.h>
@@ -45,21 +45,22 @@
 #include <time.h>
 #include <sys/time.h>
 #include "../../linux_abi/host_uio.h" // <sys/uio.h>, or the guest iovec layout where the host has none
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/un.h>
-#include <arpa/inet.h>
-#include <sys/times.h>
-#include <sys/wait.h>
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_proc.h"
+#include "../../linux_abi/host_wait.h"
 #include "../../linux_abi/host_poll.h" // <poll.h>, or a typed absence where the host has no mixed-handle readiness
 #include "../../host/native_compat.h"
 #include "../../host/native_context.h"
 #include "../../linux_abi/logical_vma.h"
-#include <dirent.h>
-#include <signal.h>
-#include <termios.h>
-#include <sys/ioctl.h>
+#include "../../linux_abi/host_dirent.h" // <dirent.h>, or the Linux dirent shape where the host structure has no d_type
+#include "../../linux_abi/host_system.h"  // sysconf/major/minor/arc4random_buf/fork: the residue no single POSIX header owns
+#include "../../linux_abi/host_signal.h" // <signal.h>, or the Linux signal vocabulary where the host has no signals
+#include "../../linux_abi/host_tty.h"
+#include "../../linux_abi/host_tty.h"
 #include <stdatomic.h>
 
 #include "hl/engine.h"
@@ -922,6 +923,23 @@ static int engine_global_init(void) {
     g_prof = 0;
     g_fwdskip = 8;
     g_notier2x = 0;
+    extern void jit86_lazyguard(int, siginfo_t *, void *);
+#if defined(_WIN32)
+    // One process-wide vectored exception handler in place of two sigactions. It is not a preference: a
+    // deliberate probe read is issued from between translated blocks and an absolute-data fixup can fire
+    // from anywhere, so no frame-scoped mechanism spans the fault sites this engine actually has, while a
+    // vectored handler fires on every thread wherever the fault happened -- which is the property a POSIX
+    // signal handler has and the reason the classifier below is the SAME function the POSIX arms install.
+    //
+    // The classifier is fed a synthesized siginfo_t rather than being rewritten to speak the host fault
+    // record, because the host record's kind/code fields are already numerically the Linux signal number
+    // and si_code for the pair -- so the translation is a struct fill, and the alternative would be a
+    // second copy of a 200-line classifier that must stay in step with the first.
+    if (!hl_windows_fault_install(hl_windows_guest_fault, NULL)) {
+        fprintf(stderr, "hl-engine: unable to install the fault handler\n");
+        return 1;
+    }
+#else
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     // SA_ONSTACK only for the transliterator: it is the one backend whose HOST stack IS the guest stack, so
@@ -929,10 +947,10 @@ static int engine_global_init(void) {
     // the guest's signal never runs. The interpreter runs on its own host stack and does not need it, and
     // adding the flag there would change an existing lane for nothing.
     sa.sa_flags = SA_SIGINFO | (translit_enabled() ? SA_ONSTACK : 0);
-    extern void jit86_lazyguard(int, siginfo_t *, void *);
     sa.sa_sigaction = jit86_lazyguard;
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+#endif
     // Untrusted-guest isolation (the sentry process-split). OFF by default -> trusted path unchanged.
     g_untrusted = hl_option_get("HL_UNTRUSTED") != NULL;
     g_sentry_sandbox = hl_option_get("HL_SANDBOX") != NULL;

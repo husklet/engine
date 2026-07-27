@@ -1158,7 +1158,7 @@ static int memf_fstat(int fd, struct stat *s) { // real-file metadata, RAM size/
     if (fstat(fd, s) != 0) return -1;
     struct memf *m = g_memf[fd];
     s->st_size = (off_t)m->size;
-    s->st_blocks = (blkcnt_t)((m->size + 511) / 512);
+    HL_HOST_STAT_SET_BLOCKS(s, (m->size + 511) / 512);
     return 0;
 }
 

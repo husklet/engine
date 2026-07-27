@@ -87,34 +87,55 @@ static inline void *hl_host_uc_xmm(ucontext_t *context) {
 
 #define HL_HOST_UC_XMM(uc) hl_host_uc_xmm(uc)
 
-/* Windows / x86-64 -- host-neutral macros only, like the macOS/x86-64 arm above,
- * so the matrix stays total.
+/* Windows / x86-64.
  *
  * Windows has no ucontext_t and no signal-handler context at all. The equivalent
  * is a CONTEXT record, reached as EXCEPTION_POINTERS->ContextRecord inside a
  * vectored exception handler, and mutating it before returning
  * EXCEPTION_CONTINUE_EXECUTION is the analogue of editing a ucontext_t and
- * returning from a POSIX handler. So HL_HOST_UC_PC / HL_HOST_UC_SP are spelled
- * here over CONTEXT.Rip / CONTEXT.Rsp -- but note that the ARGUMENT TYPE differs
- * from every other arm: `uc` is a CONTEXT *, not a ucontext_t *. Making that
- * asymmetry disappear (a typed hl_host_context_t, or two accessor families) is a
- * host-contract decision, not a build-system one; it is owned by the
- * signals-and-faults work and must be settled before hl-host-windows exists.
+ * returning from a POSIX handler.
  *
- * No HL_HOST_HAS_X64_CONTEXT: the Linux/x86-64 arm's remaining surface is the
+ * The asymmetry the earlier revision of this cell flagged -- that `uc` would be
+ * a CONTEXT * here and a ucontext_t * everywhere else -- is settled by making
+ * ucontext_t NAME the CONTEXT record on this host. That is a typedef, not a
+ * shim: there is no competing ucontext_t on Windows to collide with, every
+ * consumer in this tree already writes `(ucontext_t *)native_context` over an
+ * opaque void *, and the object it points at genuinely IS the host's register
+ * file. The alternative -- a second accessor family, or an hl_host_context_t
+ * that every call site casts to -- would have added a spelling without adding a
+ * distinction.
+ *
+ * No HL_HOST_HAS_X64_CONTEXT. The Linux/x86-64 arm's remaining surface is the
  * gregset_t index family (HL_HOST_UC_GREGS + the REG_* re-exports) and an
- * fpregs->_xmm pointer, and a Windows CONTEXT has neither -- named fields and
- * XMM0..15 / XSAVE areas instead. Claiming the flag would make code that only
- * ever compiled against gregs indices try to compile here.
+ * fpregs->_xmm pointer; a Windows CONTEXT has neither -- named fields, and
+ * XMM0..15 inside the legacy FXSAVE image, instead. Claiming the flag would make
+ * code that only ever compiled against gregs indices try to compile here. Its
+ * one consumer today is the transliterator, which is inert off a Linux/x86-64
+ * host, so nothing is lost by the absence.
  *
- * DELIBERATELY includes no Windows header. These are textual macros, nothing
- * expands them on Windows today, and pulling <windows.h> into every translator
- * and linux_abi TU that includes this file (nine of them) to satisfy an unused
- * arm would be a large and gratuitous blast radius. Whichever TU first expands
- * them will be a Windows-host TU and will have included <windows.h> already. */
+ * This arm DOES need <windows.h>, because CONTEXT's fields are read and written
+ * and a field access needs the complete type. It arrives through the single
+ * umbrella that bounds the Win32 preprocessor vocabulary rather than directly --
+ * see that header for why the rest of this tree hand-declares Win32 entry points
+ * instead of including it. */
 #elif defined(_WIN32) && defined(HL_HOST_CPU_X86_64)
+#include "windows/win32.h"
+
+typedef CONTEXT ucontext_t;
+
 #define HL_HOST_UC_PC(uc) ((uc)->Rip)
 #define HL_HOST_UC_SP(uc) ((uc)->Rsp)
+
+/* Rax..R15 then Rip are consecutive DWORD64 members of CONTEXT in x86
+ * register-encoding order, so the flat "base + register number" idiom survives
+ * with the natural register numbers as indices. Deliberately NOT spelled
+ * HL_HOST_UC_GREGS: that name means a gregset_t indexed by REG_*, whose order is
+ * glibc's and is NOT the register-encoding order this returns. */
+static inline uint64_t *hl_host_uc_x64_regs(ucontext_t *context) {
+    return (uint64_t *)(void *)&context->Rax;
+}
+
+#define HL_HOST_UC_X64_REGS(uc) hl_host_uc_x64_regs(uc)
 
 #else
 #error "hl engine has no signal-context mapping for this host OS and CPU"

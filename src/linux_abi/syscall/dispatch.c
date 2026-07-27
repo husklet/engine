@@ -15,14 +15,14 @@ int g_rwx_guest;
 // fd semantics); every path argument is resolved through the container VFS jail. One sorted switch,
 // grouped by category. See docs/SYSCALLS.md for the per-syscall table.
 
-#include <sys/ipc.h>
-#include <sys/shm.h>
-#include <sys/sem.h>
-#include <sys/msg.h>
-#include <dirent.h>
+#include "../host_sysv.h"
+#include "../host_sysv.h"
+#include "../host_sysv.h"
+#include "../host_sysv.h"
+#include "../host_dirent.h" // <dirent.h>, or the Linux dirent shape where the host structure has no d_type
 #include <stdlib.h>
-#include <sys/times.h> // times(2): CPU accounting (struct tms is layout-compatible with Linux)
-#include <sys/mount.h> // host struct statfs -> translated to the Linux statfs layout
+#include "../host_proc.h" // times(2): CPU accounting (struct tms is layout-compatible with Linux)
+#include "../host_fs.h" // host struct statfs -> translated to the Linux statfs layout
 #include <time.h>      // sysinfo(2) uptime = now - host boot time
 #include "../errno.h"
 #include "../../host/directory.h"

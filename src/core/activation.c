@@ -31,7 +31,7 @@ typedef hl_host_linux hl_activation_host;
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
-#include <poll.h>
+#include "../linux_abi/host_poll.h"
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
@@ -39,9 +39,9 @@ typedef hl_host_linux hl_activation_host;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/ioctl.h>
-#include <sys/wait.h>
+#include "../linux_abi/host_socket.h"
+#include "../linux_abi/host_tty.h"
+#include "../linux_abi/host_wait.h"
 #if defined(__APPLE__)
 #include <util.h>
 #else

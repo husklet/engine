@@ -87,7 +87,39 @@ void emit32(uint32_t instruction) {
 // engine-side null dereference reportable. The pad is armed with savemask=0 and the one route that enters it
 // from a signal handler restores the mask itself -- see interp_restore_handler_mask.
 
-static __thread sigjmp_buf g_interp_fault_pad;
+/* The pad's TYPE is per host, because the escape is.
+ *
+ * On a POSIX host it is a sigjmp_buf and the escape is siglongjmp. On Windows
+ * neither exists: the CRT has no sigsetjmp, and plain longjmp is implemented
+ * over RtlUnwindEx -- taking it out of a vectored exception handler would mean
+ * unwinding through the kernel's exception dispatcher while dispatch is still in
+ * progress, which is not a supported operation on any Windows build. The host
+ * fault primitive supplies the replacement: the same ten words a mask-less
+ * sigsetjmp would have stored, restored either into the fault context (the
+ * handler route) or into the machine directly (the ordinary-code route). No
+ * unwinder is involved on either, which is the entire reason to prefer it. */
+#if defined(_WIN32)
+#include "../../../host/windows/fault.h"
+typedef hl_windows_fault_pad interp_fault_pad;
+/* Set by whichever route entered the pad, cleared before every arm. Volatile and
+ * thread-local because it is the ONE value that must be read afresh after the
+ * resume lands -- the arm macro clobbers every volatile register precisely so
+ * the compiler cannot cache something across the landing site. */
+static __thread volatile int g_interp_pad_taken;
+/* A statement expression, not a comma expression: the arm is inline asm, which
+ * is a statement and cannot appear as an operand. */
+#define INTERP_PAD_ARM(pad)                                                                                            \
+    __extension__({                                                                                                    \
+        g_interp_pad_taken = 0;                                                                                        \
+        HL_WINDOWS_FAULT_PAD_ARM(&(pad));                                                                              \
+        g_interp_pad_taken;                                                                                            \
+    })
+#else
+typedef sigjmp_buf interp_fault_pad;
+#define INTERP_PAD_ARM(pad) (sigsetjmp((pad), 0) != 0)
+#endif
+
+static __thread interp_fault_pad g_interp_fault_pad;
 static __thread int g_interp_pad_armed;             // a run_block landing pad is live
 static __thread volatile int g_interp_guest_access; // a guest access is in flight
 // The cpu run_block armed the pad for; the ledger check below has no siginfo.
@@ -113,7 +145,12 @@ static void interp_bus_ledger_check(uint64_t guest_address, uint64_t length) {
     g_interp_guest_access = 0;
     // The OTHER route into the pad, and the one that owes no mask restore: this runs on the ordinary
     // interpretation path (no signal was raised), so the host mask is already what run_block will resume on.
+#if defined(_WIN32)
+    g_interp_pad_taken = 1;
+    hl_windows_fault_pad_jump(&g_interp_fault_pad);
+#else
     siglongjmp(g_interp_fault_pad, 1);
+#endif
 }
 
 static inline void interp_access_begin(uint64_t guest_address, uint64_t length) {
@@ -160,6 +197,15 @@ int interp_signal_capture(struct cpu *cpu, void *native_context) {
 // compute CPU and 99.96% of the process's host syscalls (docs/amd64-host.md 3, 4 and 7.1) -- to
 // save a mask that only this rare path ever reads.
 static void interp_restore_handler_mask(void *native_context) {
+#if defined(_WIN32)
+    /* Nothing is owed. This host has no signal mask at all -- no per-thread
+     * blocked set, nothing the kernel auto-blocks at handler entry, and no
+     * sigreturn whose work could be skipped. The debt this function exists to
+     * repay is created by leaving a POSIX handler other than by returning; a
+     * vectored exception handler creates none. An empty body here is the honest
+     * answer, not a stub: there is no Windows call that would make it fuller. */
+    (void)native_context;
+#else
     if (native_context != NULL) {
         pthread_sigmask(SIG_SETMASK, &((ucontext_t *)native_context)->uc_sigmask, NULL);
         return;
@@ -175,6 +221,7 @@ static void interp_restore_handler_mask(void *native_context) {
     sigaddset(&fault, SIGFPE);
     sigaddset(&fault, SIGTRAP);
     pthread_sigmask(SIG_UNBLOCK, &fault, NULL);
+#endif
 }
 
 // The delivery path has already queued the signal and set R_BRANCH; just return from run_block.
@@ -182,7 +229,17 @@ void interp_signal_resume(struct cpu *cpu, void *native_context) {
     (void)cpu;
     if (!g_interp_pad_armed) return; // not ours; the caller re-raises (and returns, so sigreturn restores)
     interp_restore_handler_mask(native_context);
+#if defined(_WIN32)
+    // The handler route. Editing the context and returning HL_WINDOWS_FAULT_RESUME is what "return from
+    // the handler with a modified ucontext" means on this host -- so unlike the POSIX arm, this function
+    // RETURNS, and the resume happens when the dispatcher hands the edited context back to the kernel.
+    // A NULL context would mean a caller reached here without a fault, which cannot happen: the only
+    // entry is the fault classifier, and it declines an exception whose context it did not receive.
+    g_interp_pad_taken = 1;
+    if (native_context != NULL) hl_windows_fault_pad_restore((CONTEXT *)native_context, &g_interp_fault_pad);
+#else
     siglongjmp(g_interp_fault_pad, 1);
+#endif
 }
 
 // ---- Guest memory. Guest VA == host VA except that a non-PIE ET_EXEC's low link range is served at
@@ -530,6 +587,11 @@ static void interp_rm_write(struct cpu *cpu, const struct insn *insn, const inte
 // hashed spinlock.
 
 #define INTERP_SPLIT_LOCKS 256
+// Acquired and released with the C11 <stdatomic.h> spelling rather than the __atomic_* builtins the
+// rest of this file uses on PLAIN objects. The distinction is the object, not the host: these words
+// are _Atomic-qualified, and a compiler is entitled to reject an __atomic_* builtin applied to an
+// _Atomic lvalue (clang 22 does, with "address argument to atomic operation must be a pointer to
+// integer or pointer"). The generated code is identical; only the type check differs.
 static _Atomic unsigned g_interp_split_lock[INTERP_SPLIT_LOCKS];
 
 enum interp_rmw_kind {
@@ -626,14 +688,14 @@ static uint64_t interp_locked_rmw(uint64_t guest_address, int width, enum interp
         unsigned hash = (unsigned)((host_address >> 3) & (INTERP_SPLIT_LOCKS - 1));
         _Atomic unsigned *lock = &g_interp_split_lock[hash];
         uint64_t next_value;
-        while (__atomic_exchange_n(lock, 1u, __ATOMIC_ACQUIRE))
+        while (atomic_exchange_explicit(lock, 1u, memory_order_acquire))
             ; // an exchange always makes forward progress
         interp_access_begin(guest_address, (uint64_t)width);
         interp_copy_indivisible(&old, pointer, (unsigned)width);
         next_value = interp_rmw_apply(kind, old, operand, carry_in, width);
         interp_copy_indivisible(pointer, &next_value, (unsigned)width);
         interp_access_end();
-        __atomic_store_n(lock, 0u, __ATOMIC_RELEASE);
+        atomic_store_explicit(lock, 0u, memory_order_release);
     }
     if (kind != RMW_CMP && jit86_store_alias_observation_active())
         jit86_store_alias_changed(guest_address, (uint64_t)width);
@@ -1046,7 +1108,7 @@ static void run_block(struct cpu *cpu, void *code) {
     // host_range_mapped's probe pad in linux_abi/thread.c).
     int previous = g_interp_pad_armed;
     struct cpu *previous_cpu = g_interp_pad_cpu;
-    if (sigsetjmp(g_interp_fault_pad, 0) != 0) {
+    if (INTERP_PAD_ARM(g_interp_fault_pad)) {
         // A guest access was abandoned; both routes already set cpu->reason and left cpu->rip on it.
         g_interp_guest_access = 0;
         g_interp_pad_armed = previous;
@@ -4648,7 +4710,7 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
             } else { // split lock: hashed spinlock
                 unsigned hash = (unsigned)((host_address >> 3) & (INTERP_SPLIT_LOCKS - 1));
                 _Atomic unsigned *lock = &g_interp_split_lock[hash];
-                while (__atomic_exchange_n(lock, 1u, __ATOMIC_ACQUIRE))
+                while (atomic_exchange_explicit(lock, 1u, memory_order_acquire))
                     ;
                 observed = 0;
                 interp_copy_indivisible(&observed, pointer, (unsigned)width);
@@ -4656,7 +4718,7 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
                     interp_copy_indivisible(pointer, &source, (unsigned)width);
                     swapped = 1;
                 }
-                __atomic_store_n(lock, 0u, __ATOMIC_RELEASE);
+                atomic_store_explicit(lock, 0u, memory_order_release);
             }
             interp_access_end();
             if (swapped && jit86_store_alias_observation_active())

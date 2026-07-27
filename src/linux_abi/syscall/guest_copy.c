@@ -14,7 +14,7 @@
  */
 #include "../logical_vma.h"
 #include "../host_poll.h"
-#include <sys/ioctl.h>
+#include "../host_tty.h"
 
 #ifndef G_SMC_COPYOUT
 #error "target must define G_SMC_COPYOUT(guest_first, guest_last)"

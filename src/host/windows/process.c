@@ -48,6 +48,8 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include "../process.h"
 
 /*
  * The child looks for this one variable, consumes it, and deletes it from its
@@ -803,3 +805,24 @@ const hl_host_process_services hl_windows_process_services = {.abi = HL_HOST_PRO
                                                               .terminate = hl_windows_process_terminate,
                                                               .close = hl_windows_process_close,
                                                               .spawn_prepared = hl_windows_process_spawn_prepared};
+
+/*
+ * A pidfd-shaped watch on another process.
+ *
+ * REFUSAL, and the reason is the readiness boundary rather than the watch. The
+ * contract is a close-on-exec DESCRIPTOR that becomes persistently readable when
+ * the process exits -- Linux's pidfd_open(2). Windows has the watchable object
+ * (a process HANDLE is signalled on exit, permanently, which is the same
+ * edge-then-level shape) but no way to present it as a descriptor that joins the
+ * engine's readiness set, because that set is a mixed one and this host has no
+ * single call that waits on a mixed set. The same absence host_poll.h records.
+ *
+ * The typed process group already exposes wait-for-exit over the handle it
+ * created, so a caller that wants a child's status has a supported path; what is
+ * refused here is specifically the poll-alongside-everything-else form.
+ */
+int hl_host_process_open(pid_t pid) {
+    (void)pid;
+    errno = ENOSYS;
+    return -1;
+}

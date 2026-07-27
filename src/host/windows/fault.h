@@ -277,11 +277,12 @@ typedef struct hl_windows_fault_pad {
                          : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4",       \
                            "xmm5", "cc", "memory")
 
-/* Point the fault context at the pad's landing site. The caller returns
- * HL_WINDOWS_FAULT_RESUME afterwards; execution continues immediately after the
- * arm macro, with the callee-saved set and the stack as they were there. */
-static inline void hl_windows_fault_pad_resume(const hl_windows_fault *fault, const hl_windows_fault_pad *pad) {
-    CONTEXT *c = fault->context;
+/* Point a register file at the pad's landing site. The CONTEXT form is the one a
+ * fault handler wants; it is spelled over a bare CONTEXT * rather than over the
+ * fault record because a consumer that already holds the native context -- an
+ * engine resume path that takes `void *native_context` and knows what it is --
+ * should not have to manufacture an hl_windows_fault to reach it. */
+static inline void hl_windows_fault_pad_restore(CONTEXT *c, const hl_windows_fault_pad *pad) {
     c->Rip = (DWORD64)pad->rip;
     c->Rsp = (DWORD64)pad->rsp;
     c->Rbp = (DWORD64)pad->rbp;
@@ -292,6 +293,52 @@ static inline void hl_windows_fault_pad_resume(const hl_windows_fault *fault, co
     c->R13 = (DWORD64)pad->r13;
     c->R14 = (DWORD64)pad->r14;
     c->R15 = (DWORD64)pad->r15;
+}
+
+/* The caller returns HL_WINDOWS_FAULT_RESUME afterwards; execution continues
+ * immediately after the arm macro, with the callee-saved set and the stack as
+ * they were there. */
+static inline void hl_windows_fault_pad_resume(const hl_windows_fault *fault, const hl_windows_fault_pad *pad) {
+    hl_windows_fault_pad_restore(fault->context, pad);
+}
+
+/*
+ * Enter the pad from ORDINARY code -- no fault, no handler, no CONTEXT to edit.
+ *
+ * This is the second of the two routes a sigsetjmp pad has, and on a POSIX host
+ * both are siglongjmp. Here they must differ: the fault route edits a context
+ * the kernel is about to reload, and this one has to move the machine itself.
+ *
+ * It is still NOT longjmp. Win64 longjmp is implemented over RtlUnwindEx, which
+ * walks and unwinds the frames between here and the target, running whatever
+ * unwind handlers they carry. The frames in between are translated blocks and
+ * engine internals that own no cleanup and register no handlers, so every one of
+ * those unwind steps is work with nothing to do -- and any one of them lacking
+ * unwind data is a fatal RtlUnwindEx failure rather than a slow one. Restoring
+ * the ten words directly is both cheaper and unconditional.
+ *
+ * The pad pointer is pinned in rax, which is the one register the restore
+ * neither reads nor writes; rsp is loaded LAST, after every value has been read
+ * out of the pad, because the pad may itself live on the stack being switched
+ * away from. r11 carries the target -- volatile, so the callee-saved set the pad
+ * restores is complete when the jump is taken.
+ */
+__attribute__((noreturn)) static inline void hl_windows_fault_pad_jump(const hl_windows_fault_pad *pad) {
+    __asm__ __volatile__("movq 0(%0), %%r11\n\t"
+                         "movq 16(%0), %%rbp\n\t"
+                         "movq 24(%0), %%rbx\n\t"
+                         "movq 32(%0), %%rsi\n\t"
+                         "movq 40(%0), %%rdi\n\t"
+                         "movq 48(%0), %%r12\n\t"
+                         "movq 56(%0), %%r13\n\t"
+                         "movq 64(%0), %%r14\n\t"
+                         "movq 72(%0), %%r15\n\t"
+                         "movq 8(%0), %%rsp\n\t"
+                         "jmp *%%r11\n"
+                         :
+                         : "a"(pad)
+                         : "memory");
+    __builtin_unreachable();
 }
 
 /* --- the kernel-write hole ---------------------------------------------------

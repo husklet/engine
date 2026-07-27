@@ -2,7 +2,7 @@
 // One W^X MAP_JIT arena; blocks appended + chained (b/bl backpatch). Host-ISA engine state.
 
 // ---------------- JIT code cache ----------------
-#include <sys/mman.h>
+#include "../linux_abi/host_mman.h"
 #include "../../include/hl/log.h"
 #include "../host/clock.h"
 #include "../host/host_cpu.h"
@@ -669,11 +669,24 @@ typedef struct {
    ibtc_clear_lazy) instead of a COW-faulting memset, while still satisfying the
    16-byte alignment the atomic ldp/stp entry access requires. */
 #define IBTC_PAGE_ALIGN 65536u
-_Alignas(IBTC_PAGE_ALIGN) static ibtc_ent g_ibtc[IBTC_N];
+/* PE/COFF caps the alignment a section may request; the object-file field is a
+   4-bit log2 code whose largest value is 8192, so a 64 KiB _Alignas is a hard
+   compile error on this object format rather than a wasted-space trade-off.
+   Nothing correctness-bearing is lost: the 64 KiB figure buys the whole-pages
+   property MADV_DONTNEED wants, and MADV_DONTNEED is a Linux call this host
+   does not have -- the fork child on a PE host clears the table by writing it.
+   The 16-byte granule the atomic pair publish actually depends on is asserted
+   below and is satisfied by either value. */
+#if defined(_WIN32)
+#define IBTC_ALIGN 8192u
+#else
+#define IBTC_ALIGN IBTC_PAGE_ALIGN
+#endif
+_Alignas(IBTC_ALIGN) static ibtc_ent g_ibtc[IBTC_N];
 /* Both publish paths rest on this: AArch64's stp is single-copy atomic only within a 16-byte granule (a
    grown ibtc_ent silently reintroduces torn dispatch), and movdqa #GP-faults if misaligned. */
 _Static_assert(sizeof(ibtc_ent) == 16, "ibtc_ent must be one 16-byte granule for the atomic pair publish");
-_Static_assert(IBTC_PAGE_ALIGN % 16u == 0u, "the ibtc table's alignment must keep every entry 16-byte aligned");
+_Static_assert(IBTC_ALIGN % 16u == 0u, "the ibtc table's alignment must keep every entry 16-byte aligned");
 
 /* Wholesale-invalidate the inline-branch cache.  In a fork child the table is
    COW-inherited fully populated, so a memset first faults in every page (~190us

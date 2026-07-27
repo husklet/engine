@@ -10,9 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/wait.h>
+#include "host_socket.h"
+#include "host_socket.h"
+#include "host_wait.h"
 #include <unistd.h>
 
 #include "../host/child.h"
@@ -73,7 +73,7 @@
 // launch config, read once at --server startup. Guest-visible env + the per-request container env the
 // Cold-path launch options such as volumes, namespace, cwd, and published ports come from each client request.
 
-#include <sys/wait.h> // waitpid + W* status macros (also pulled in by sentry.c; idempotent)
+#include "host_wait.h" // waitpid + W* status macros (also pulled in by sentry.c; idempotent)
 
 extern char **environ;
 

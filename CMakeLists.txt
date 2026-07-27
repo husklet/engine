@@ -209,17 +209,27 @@ set(MACOS_HOST_SOURCES
   src/host/macos/range.c src/host/macos/system.c)
 
 # The Windows archive deliberately does NOT pull COMMON_HOST_SOURCES wholesale:
-# resolve.c needs the *at() family, child.c needs SIGCHLD, fork_wire.c needs
-# SCM_RIGHTS and private.c needs a fork-inherited shared mapping, none of which
-# this host has. sync.c is the one member that is portable -- its registry
-# bookkeeping is host independent and only its ~30-line primitive layer is
-# POSIX, which it now selects per host -- so it is listed on its own. The rest
-# arrive with the groups that need them.
+# resolve.c needs the *at() family and private.c needs a fork-inherited shared
+# mapping, neither of which this host has. sync.c and range.c are the two
+# members that are portable -- sync.c's registry bookkeeping is host independent
+# and only its ~30-line primitive layer is POSIX (selected per host); range.c is
+# pure arithmetic over the two per-host predicates in windows/range.c -- so both
+# are listed on their own.
+#
+# child.c and fork_wire.c are NOT the POSIX files: windows/child.c and
+# windows/fork_wire.c stand in their place, because SIGCHLD and SCM_RIGHTS have
+# no Windows analogue this group's signatures can carry. They are typed
+# absences, not implementations, and each states which of the two missing pieces
+# (the notification mechanism, or the descriptor it would be published on)
+# blocks it.
 set(WINDOWS_HOST_SOURCES
   src/host/windows/host.c src/host/windows/memory.c src/host/windows/clock.c
   src/host/windows/fault.c
   src/host/windows/ntpath.c src/host/windows/file.c src/host/windows/process.c
-  src/host/sync.c)
+  src/host/windows/range.c src/host/windows/system.c src/host/windows/directory.c
+  src/host/windows/child.c src/host/windows/fork_wire.c
+  src/host/windows/private.c src/host/windows/resolve.c src/host/windows/math.c
+  src/host/range.c src/host/file.c src/host/clock.c src/host/sync.c)
 
 # --- archives ---------------------------------------------------------------
 # Each links the engine flag interface PRIVATE so the exact ENGINE_CFLAGS apply.

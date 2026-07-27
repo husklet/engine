@@ -453,7 +453,8 @@ static void ovl_copy_xattrs(const char *src, const char *dst) {
 // Apply the lower's mode (incl S_ISUID/S_ISGID/S_ISVTX), atime/mtime and xattrs to a copied-up inode.
 static void ovl_copy_meta(const char *src, const char *dst, const struct stat *st) {
     chmod(dst, st->st_mode & 07777);
-    struct timespec ts[2] = {st->st_atimespec, st->st_mtimespec};
+    struct timespec ts[2] = {{(time_t)HL_HOST_STAT_ATIME_SEC(st), (long)HL_HOST_STAT_ATIME_NSEC(st)},
+                             {(time_t)HL_HOST_STAT_MTIME_SEC(st), (long)HL_HOST_STAT_MTIME_NSEC(st)}};
     utimensat(AT_FDCWD, dst, ts, AT_SYMLINK_NOFOLLOW);
     ovl_copy_xattrs(src, dst);
 }

@@ -36,7 +36,7 @@
 // statically-predicted-not-taken branch. Byte-identical to baseline by construction.
 
 #include <sched.h>
-#include <sys/wait.h>
+#include "host_wait.h"
 #include <stdatomic.h>
 
 #include "shared.h"

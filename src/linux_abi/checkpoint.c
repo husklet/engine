@@ -48,8 +48,8 @@
 // tree, then exits it. Restore: HL_RESTORE (or `--restore`) calls the restore path. Both directions carry
 // bytes over the socket activation handed the engine; the embedder owns the other end.
 
-#include <sys/wait.h>   // waitid/waitpid: coordinator peer-reap; multi-thread refusal probe
-#include <termios.h>    // the controlling terminal's line discipline is captured and replayed
+#include "host_wait.h"   // waitid/waitpid: coordinator peer-reap; multi-thread refusal probe
+#include "host_tty.h"    // the controlling terminal's line discipline is captured and replayed
 
 #include "../host/file.h"
 #include "../host/system.h"
@@ -735,7 +735,7 @@ static int ckpt_capture_socket_state(int fd, uint64_t identity, int require_quie
     state.local_size = local_size;
     if (state.guest_family == AF_UNIX && state.host_family == 0) {
         state.host_family = AF_UNIX;
-#if !defined(__linux__)
+#if defined(__APPLE__)
         ((struct sockaddr *)&state.local)->sa_len = (uint8_t)local_size;
 #endif
         ((struct sockaddr *)&state.local)->sa_family = AF_UNIX;
