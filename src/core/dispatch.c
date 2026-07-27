@@ -276,7 +276,7 @@ static void run_guest(struct cpu *c) {
         G_CKPT_POLL(c);
 #endif
         if (G_PC(c) == SIGRETURN_PC) {
-            do_sigreturn(c);
+            sigreturn_frame(c); // do_sigreturn + the non-PIE frame fold (linux_abi/signal.c)
             // A handler just returned: release exactly ITS deferred set (the signals that were pending when it
             // was entered) so they become deliverable again, then immediately deliver the next still-pending
             // signal BEFORE resuming the interrupted context -- a batch of signals unblocked together runs
@@ -293,7 +293,9 @@ static void run_guest(struct cpu *c) {
         }
         // A non-PIE image's un-relocated absolute jump lands on its (unmapped) low link vaddr; redirect it
         // into the biased image so we translate real code instead of faulting on the unmapped low address.
-        if (g_nonpie_lo && G_PC(c) >= g_nonpie_lo && G_PC(c) < g_nonpie_hi) G_PC(c) += g_nonpie_bias;
+        // (The one place the folded value is deliberately CARRIED rather than used and dropped: the running
+        // PC stays high, and pcrel_base/lea un-bias it again whenever an address is materialised.)
+        G_PC(c) = nonpie_fold(G_PC(c));
         // Frontend hook: top-of-loop debug instrumentation (x86-only; empty on aarch64).
         G_DISPATCH_DEBUG(c);
         // With threads, the WHOLE cache lookup is under the lock: an unlocked

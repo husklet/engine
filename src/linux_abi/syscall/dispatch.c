@@ -242,7 +242,7 @@ static ssize_t misc_copy_to(void *context, uint64_t destination, const void *sou
 // for PIE/static-PIE (g_nonpie_lo==0, the only state the test matrix ever sees) and for any pointer that is
 // already high (stack/heap/bss-above-bias) -> byte-identical there. Apply ONLY to pointer positions.
 static inline uint64_t nonpie_p(uint64_t a) {
-    return (g_nonpie_lo && a >= g_nonpie_lo && a < g_nonpie_hi) ? a + g_nonpie_bias : a;
+    return nonpie_fold(a); // thread.c owns the one fold; this is its historical name at the syscall seam
 }
 
 // Overlay: a metadata/rename syscall (chmod/chown/utimensat/rename) confines to the writable upper via

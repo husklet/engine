@@ -580,6 +580,15 @@ static void do_sigreturn(struct cpu *c);
 static int sigframe_capture_fault(struct cpu *c, void *ucv);
 static void sigframe_resume_dispatch(struct cpu *c, void *ucv);
 
+// The delivery fold's mirror: at a handler return the guest SP IS the ucontext the builder handed over, so
+// for a non-PIE alt stack inside the image it is a LOW link address the restore would dereference. Fold for
+// the read, and put the restored SP back into guest coordinates. Every rt_sigreturn goes through here.
+static void sigreturn_frame(struct cpu *c) {
+    G_SP(c) = nonpie_fold(G_SP(c));
+    do_sigreturn(c);
+    G_SP(c) = nonpie_unfold(G_SP(c));
+}
+
 static void maybe_deliver_signal(struct cpu *c) {
     // Two sources: g_pending (process-directed -- any thread may take it) and c->tpending (thread-directed
     // via tkill/tgkill -- only THIS thread). Consider both; coalescing a process- and thread-directed
@@ -667,7 +676,24 @@ static void maybe_deliver_signal(struct cpu *c) {
             }
             uint64_t flags = g_sigact[sig].flags;
             int synchronous = had_t && c->sync_signal == sig;
+            // Non-PIE coordinates (see thread.c): the frame builder writes the sigframe THROUGH the address
+            // it derives from the alt stack / current SP, so a `.bss` sigaltstack inside an ET_EXEC -- a LOW
+            // link vaddr whose bytes live at +bias -- killed the engine before the handler's first
+            // instruction. Fold the two inputs the base comes from, then put every address the builder hands
+            // BACK (SP, the siginfo and ucontext arguments, uc_stack.ss_sp) into guest coordinates again.
+            uint64_t alt_guest = c->alt_sp;
+            c->alt_sp = nonpie_fold(alt_guest);
+            G_SP(c) = nonpie_fold(G_SP(c));
             build_signal_frame(c, sig, synchronous);
+            c->alt_sp = alt_guest;
+            if (nonpie_unfold(G_A2(c)) != G_A2(c)) {
+                // uc_stack.ss_sp is at ucontext+16 on every Linux LP64 arch; the builder filled it from the
+                // folded alt_sp. Rewrite it while G_A2 still names the storage.
+                *(uint64_t *)(uintptr_t)(G_A2(c) + 16) = alt_guest;
+                G_SP(c) = nonpie_unfold(G_SP(c));
+                G_A1(c) = nonpie_unfold(G_A1(c));
+                G_A2(c) = nonpie_unfold(G_A2(c));
+            }
             // Record this handler frame's guest SP so a siglongjmp unwind (which never calls rt_sigreturn)
             // can be detected at the next delivery and the defer level released.
             if (c->sig_depth > 0) c->sig_frame_sp[c->sig_depth - 1] = G_SP(c);
@@ -848,7 +874,11 @@ static int deliver_guest_fault_hint(struct cpu *cpu_hint, int hostsig, siginfo_t
         return 0;
     }
     c->sync_signal = sig;
-    c->sync_address = si ? (uint64_t)si->si_addr : 0;
+    // si_addr is GUEST-visible (a handler compares it against its own pointers, and a fault-recovery
+    // handler resumes from it), but a hardware fault reports the STORAGE address -- so a fault inside a
+    // non-PIE image handed the guest an address it has no name for. Unfold it; thread.c has the rule.
+    // sync_code below deliberately keeps the raw host address: it asks the host mapping, not the guest.
+    c->sync_address = si ? nonpie_unfold((uint64_t)si->si_addr) : 0;
     // Linux distinguishes an unmapped address (SEGV_MAPERR) from a mapped
     // protection violation (SEGV_ACCERR).  JIT safepoint/guard handlers use
     // that distinction; a physically protected g_gna page is ACCERR even
@@ -873,7 +903,7 @@ static int deliver_guest_fault(int hostsig, siginfo_t *si, void *ucv) {
 static int raise_guest_bus(struct cpu *c) {
     if (g_sigact[7].handler <= 1) { guest_group_fatal(c, 7); }
     c->sync_signal = 7;
-    c->sync_address = c->fault_addr;
+    c->sync_address = nonpie_unfold(c->fault_addr); // guest-visible si_addr (see above)
     c->sync_code = 2; /* BUS_ADRERR */
     c->sigmask &= ~(1ull << 6);
     c->reason = R_BRANCH;
@@ -890,7 +920,7 @@ static int raise_guest_bus(struct cpu *c) {
 static int raise_guest_fetch_fault(struct cpu *c) {
     if (g_sigact[11].handler <= 1) { guest_group_fatal(c, 11); }
     c->sync_signal = 11;
-    c->sync_address = c->fault_addr;
+    c->sync_address = nonpie_unfold(c->fault_addr); // guest-visible si_addr (see above)
     c->sync_code = 2; /* SEGV_ACCERR */
     c->sigmask &= ~(1ull << 10);
     c->reason = R_BRANCH;
@@ -901,7 +931,7 @@ static int raise_guest_fetch_fault(struct cpu *c) {
 static int raise_guest_data_map_fault(struct cpu *c) {
     if (g_sigact[11].handler <= 1) guest_group_fatal(c, 11);
     c->sync_signal = 11;
-    c->sync_address = c->fault_addr;
+    c->sync_address = nonpie_unfold(c->fault_addr); // guest-visible si_addr (see above)
     c->sync_code = 1; /* SEGV_MAPERR */
     c->sigmask &= ~(1ull << 10);
     c->reason = R_BRANCH;

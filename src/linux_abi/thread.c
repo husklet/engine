@@ -330,6 +330,42 @@ static inline struct futex_bucket *fbk_of(const void *uaddr) {
 // PROF: fast (no-lock) wakes, slow (locked) wakes, eagain pre-checks
 static uint64_t g_futex_wake_fast, g_futex_wake_slow, g_futex_wait_n;
 
+// ===================== non-PIE coordinates: the one rule ========================================
+// A non-PIE ET_EXEC is mapped HIGH at +g_nonpie_bias (macOS __PAGEZERO forbids the low 4 GB; the
+// checkpoint arena wants a deterministic slot), but it carries no dynamic relocations, so every
+// address BAKED INTO IT stays at the LOW link vaddr. One image byte therefore has two names, and
+// which one is correct is not a judgement call:
+//
+//   GUEST (low) is canonical. Anything the guest can name, is handed, or asks about -- a baked
+//   pointer, a syscall argument, AT_PHDR/AT_ENTRY, a sigaltstack ss_sp, a /proc/self/maps row, a
+//   protection-registry key -- is the LOW value, because the fold is the loader's private business
+//   and nothing inside the guest knows it happened.
+//
+//   HOST (high) is STORAGE, and the only thing it is ever right for is one host dereference. Fold
+//   at the instant of the dereference and throw the result away; never store it, never return it,
+//   never key a registry on it.
+//
+// Eight defects on this branch were one half of that rule missed: rip-relative LEA and mov r64,imm32
+// materialising the wrong half; vfs.c and maps_phdr_segs dereferencing an unfolded AT_PHDR; a queued
+// signal delivered to an unfolded handler; the protection registries keyed HOST by the loader and GUEST
+// by mprotect; sigaltstack's ss_sp; a fault's si_addr handed back as storage.
+// nonpie_fold is total. nonpie_unfold is only for an address that is storage by construction -- a
+// hardware fault address, or a caller that already folded -- and is unambiguous only because the image
+// occupies [lo+bias,hi+bias), where no other guest mapping can be. Both inert for PIE (g_nonpie_lo == 0).
+// Tentatively defined here: thread.c is the earliest linux_abi member of the unity TU. dispatch.c's
+// nonpie_p is nonpie_fold under its historical name.
+static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
+
+static inline uint64_t nonpie_fold(uint64_t guest) {
+    return (g_nonpie_lo && guest >= g_nonpie_lo && guest < g_nonpie_hi) ? guest + g_nonpie_bias : guest;
+}
+
+static inline uint64_t nonpie_unfold(uint64_t storage) {
+    return (g_nonpie_lo && storage >= g_nonpie_lo + g_nonpie_bias && storage < g_nonpie_hi + g_nonpie_bias)
+               ? storage - g_nonpie_bias
+               : storage;
+}
+
 // ===================== guest PROT_NONE region registry ==========================================
 // hl maps every guest anon page R+W on the host (case 222 ORs in PROT_READ|WRITE) so that a later
 // mprotect-to-writable -- which hl no-ops, since the JIT never enforces guest page protection -- is
@@ -1295,6 +1331,7 @@ static void gna_clear_raw(uint64_t lo, uint64_t hi) {
 // True iff any byte of [a,a+len) lies in a tracked guest PROT_NONE region.
 static int gna_hit(uint64_t a, uint64_t len) {
     if (!len || __atomic_load_n(&g_ngna, __ATOMIC_ACQUIRE) == 0) return 0;
+    a = nonpie_unfold(a); // registry keys are guest coordinates; callers may hold either (see the rule above)
     uint64_t end = a + len;
     uint64_t generation = atomic_load_explicit(&g_gna_generation, memory_order_acquire);
     uint64_t first_page = a >> 12, last_page = (end - 1) >> 12;
@@ -1330,6 +1367,7 @@ static int gna_all(uint64_t a, uint64_t len) {
 // cannot express that (it is all-or-nothing), so the read family clamps its count with this instead.
 static uint64_t gna_prefix(uint64_t a, uint64_t len) {
     if (!len || __atomic_load_n(&g_ngna, __ATOMIC_ACQUIRE) == 0) return len;
+    a = nonpie_unfold(a); // guest-keyed registry; the return is a LENGTH, so the coordinate cancels
     uint64_t end = a + len;
     for (int i = 0; i < g_ngna; i++)
         if (a < g_gna[i].hi && end > g_gna[i].lo) {
@@ -1394,6 +1432,7 @@ static void gro_clear_raw(uint64_t lo, uint64_t hi) {
 
 static int gro_hit(uint64_t a, uint64_t len) {
     if (!len || __atomic_load_n(&g_ngro, __ATOMIC_ACQUIRE) == 0) return 0;
+    a = nonpie_unfold(a); // guest-keyed registry; a hardware fault address arrives in storage coordinates
     uint64_t end = a + len;
     // RETRY the seqlock instead of answering "read-only" while a writer is mid-update: any concurrent
     // mprotect/mmap (a peer's thread-stack allocation) otherwise EFAULTs an unrelated writable address.
@@ -2103,6 +2142,7 @@ static long futex_op(struct cpu *c, int *uaddr, const void *key, int op, int pri
 
 static void futex_wake_addr(uint64_t uaddr) {
     if (!uaddr) return;
+    uaddr = nonpie_fold(uaddr); // clear_child_tid is stored in guest coordinates; this is its deref
     // CLONE_CHILD_CLEARTID: zero the word then wake joiners (pthread_join FUTEX_WAITs on this word). A
     // DETACHED guest thread (e.g. musl's __unmapself) munmaps its OWN stack -- which also holds the thread
     // descriptor with this CLEARTID word -- and only THEN issues the exit syscall, so by the time we run
@@ -2465,7 +2505,7 @@ static void thread_exit_others(struct cpu *self) {
 // high-mapped list head. Translate each link before validating or dereferencing it; for PIE, heap, stack,
 // and mmap pointers this is an identity operation.
 static inline uint64_t robust_guest_to_host(uint64_t address) {
-    return (g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi) ? address + g_nonpie_bias : address;
+    return nonpie_fold(address);
 }
 
 static int robust_pin(uint64_t address, size_t length, uint32_t protection, hl_logical_vma_pin *pin, void **host) {
@@ -2522,7 +2562,10 @@ static void futex_robust_exit(struct cpu *c) {
     // Like clear-child-tid, Linux's kernel-driven robust-list wake has no FUTEX_PRIVATE_FLAG and uses the
     // shared key class. Keep it aligned with glibc's robust owner-death wait path.
     g_fbk_active = g_fbk;
-    uint64_t head = c->robust_list;
+    // The head is a guest pointer like every list entry below it (set_robust_list stores it unfolded).
+    // Left raw, an in-image head simply failed robust_copy_from and the whole walk was silently skipped --
+    // and the `entry == head` wrap test compared a folded entry against an unfolded head.
+    uint64_t head = robust_guest_to_host(c->robust_list);
     c->robust_list = 0;
     uint8_t head_copy[24];
     if (!head || !robust_copy_from(head_copy, head, sizeof(head_copy))) return;
@@ -2634,10 +2677,11 @@ static int spawn_thread(struct cpu *parent, uint64_t flags, uint64_t stack_top, 
     int tid = __sync_add_and_fetch(&g_next_tid, 1);
     // This thread's gettid() identity (see proc.c case 178): a unique id, distinct from the init's pid 1.
     child->tid = tid;
-    // CLONE_PARENT_SETTID
-    if ((flags & 0x00100000) && ptid) *(int *)ptid = tid;
-    // CLONE_CHILD_SETTID
-    if ((flags & 0x01000000) && ctid) *(int *)ctid = tid;
+    // CLONE_PARENT_SETTID / CLONE_CHILD_SETTID. clone(2)'s tid slots are ordinary guest pointers and a
+    // non-PIE guest may hand over a .bss one, so fold for the store (thread.c's rule); c->ctid keeps the
+    // guest value, and futex_wake_addr folds again at thread exit.
+    if ((flags & 0x00100000) && ptid) *(int *)nonpie_fold(ptid) = tid;
+    if ((flags & 0x01000000) && ctid) *(int *)nonpie_fold(ctid) = tid;
     // CLONE_CHILD_CLEARTID
     child->ctid = (flags & 0x00200000) ? ctid : 0;
     // robust list is per-thread and NOT inherited: a new thread starts empty and re-registers via

@@ -3,7 +3,7 @@
 // nr was handled, 0 otherwise. Included by service.c after service/io.c, before service() -- same TU scope.
 
 static inline uint64_t net_nonpie_p(uint64_t address) {
-    return (g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi) ? address + g_nonpie_bias : address;
+    return nonpie_fold(address);
 }
 
 // A zero-length datagram receive that asks for the sender address. macOS short-circuits any receive with

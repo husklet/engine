@@ -111,6 +111,11 @@ hl_guest_suite(SRC_DIR tests/compat/memory OUT_DIR ${HL_COMPAT}/memory
 hl_guest_named(${HL_COMPAT}/signals synchronous_fault_registers
   ${HL_TESTS}/compat/signals/synchronous_fault_registers.c
   LINKAGE nonpie FLAGS ${_gnu} LIBS ${_pt})
+# A signal frame built on a .bss alternate stack: the corpus was 100% static-PIE and its one
+# SA_ONSTACK case malloc'd its stack, so it missed both axes of findings 3.16 at once.
+hl_guest_named(${HL_COMPAT}/signals sigaltstack_nonpie_bss
+  ${HL_TESTS}/compat/signals/sigaltstack_nonpie_bss.c
+  LINKAGE nonpie FLAGS ${_gnu} LIBS ${_pt})
 hl_guest_suite(SRC_DIR tests/compat/signals OUT_DIR ${HL_COMPAT}/signals
   LINKAGE static-pie FLAGS ${_gnu} LIBS ${_pt}
   EXCLUDE_x86_64 sigurg_preempt sigurg_go_preempt)
@@ -253,6 +258,12 @@ endforeach()
 foreach(_c nonpie_vec repcmps_nopie nonpie_v8blob)
   hl_guest_binary(x86_64 ${HL_COMPAT}/core/regress/x86_64/${_c}
     ${HL_TESTS}/compat/core/regress/${_c}.c LINKAGE nonpie FLAGS ${_o2} LIBS ${_ptm})
+endforeach()
+# The guest-pointer surface audit runs on BOTH arches: the rebase allowlist is keyed on the canonical
+# syscall numbers, so a gap in it is one bug reachable two ways.
+foreach(_a ${HL_GUEST_ARCHES})
+  hl_guest_binary(${_a} ${HL_COMPAT}/core/regress/${_a}/nonpie_guest_ptrs
+    ${HL_TESTS}/compat/core/regress/nonpie_guest_ptrs.c LINKAGE nonpie FLAGS ${_o2} LIBS ${_ptm})
 endforeach()
 hl_guest_binary(aarch64 ${HL_COMPAT}/core/regress/aarch64/go_cgo_stackgrow_arm
   ${HL_TESTS}/compat/core/regress/go_cgo_stackgrow_arm LINKAGE copy)

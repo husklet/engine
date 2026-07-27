@@ -401,10 +401,13 @@ static void load_elf(const char *path, struct loaded *out) {
         uint64_t lo = (v + bias) & ~0xfffull;
         uint64_t hi = (v + bias + msz + 0xfffull) & ~0xfffull;
         if (hi > lo) {
+            // GUEST coordinates, not the storage address the bytes were copied to: thread.c's rule. The
+            // loader keyed these folded while mprotect keys them unfolded, so the two never met.
+            uint64_t glo = nonpie_unfold(lo), ghi = nonpie_unfold(hi - 1) + 1;
             if (rd32(ph + 4) & 2)
-                gro_clear(lo, hi);
+                gro_clear(glo, ghi);
             else
-                gro_add(lo, hi);
+                gro_add(glo, ghi);
         }
     }
     // W6A item 1: for a biased non-PIE Go image, rebase firstmoduledata so the runtime's findfunc()

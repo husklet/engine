@@ -16,7 +16,9 @@
 // (gna_hit, thread.c; fed by mmap/mprotect/munmap) up front. ONE helper so connect/bind/pselect/ppoll/...
 // all agree (consolidates three agents' duplicates).
 static int guest_bad_ptr(uintptr_t a, size_t len) {
-    return !host_range_mapped(a, len);
+    // The guest-facing predicate, so it answers about a GUEST address: fold to the storage the probe has to
+    // touch (thread.c's rule), exactly as guest_span does. host_range_mapped keeps its host-address contract.
+    return !host_range_mapped((uintptr_t)nonpie_fold((uint64_t)a), len);
 }
 
 static ssize_t svc_vm_iov_copy(const struct iovec *dst, unsigned long dcnt, const struct iovec *src,
@@ -1008,7 +1010,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // ET_EXEC addresses remain LOW in the Linux ABI while their storage is mapped at the engine's
             // HIGH bias. Keep all logical permission registries in guest coordinates, but use this translated
             // address for mapping validation and any safe host-side protection change.
-            uint64_t physical_a0 = (g_nonpie_lo && a0 >= g_nonpie_lo && a0 < g_nonpie_hi) ? a0 + g_nonpie_bias : a0;
+            uint64_t physical_a0 = nonpie_fold(a0);
             // Linux mm/mprotect.c rejects a start not aligned to the (guest) page size with EINVAL BEFORE
             // touching anything, so a bad-alignment probe must not read as success.
             if (a0 & (uint64_t)(guest_pagesz() - 1)) {
@@ -1030,9 +1032,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // NON-PIE: the ET_EXEC image is force-mapped HIGH (addr+g_nonpie_bias, __PAGEZERO forbids the low
             // 4 GB) but the guest still names its image by the LOW link vaddr -- static glibc's RELRO
             // mprotect(_dl_protect_relro) passes that low address, which is mapped only at the rebased VA. So
-            // a low-range miss must re-check at nonpie_p(a0) before ENOMEM (inert for PIE: nonpie_p == a0).
+            // a low-range miss must re-check at nonpie_fold(a0) before ENOMEM (inert for PIE: fold == a0).
             if (!hl_gmap_contains(a0, (uint64_t)a1) && !host_range_mapped((uintptr_t)a0, (size_t)a1)) {
-                // (open-coded nonpie_p: dispatch.c defines it AFTER this module in the TU)
                 if (physical_a0 == a0 || (!hl_gmap_contains(physical_a0, (uint64_t)a1) &&
                                           !host_range_mapped((uintptr_t)physical_a0, (size_t)a1))) {
                     G_RET(c) = (uint64_t)(-ENOMEM);

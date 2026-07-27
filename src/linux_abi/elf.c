@@ -848,10 +848,14 @@ static void load_elf(const char *path, struct loaded *out) {
                               ((fl & 1) ? HL_HOST_MEMORY_EXECUTE : 0);
         if (e > s) {
             elf_mprotect_besteffort(&image_mapping, (void *)s, e - s, protection, "image segment");
+            // The host mprotect above takes the STORAGE address; the read-only registry takes the GUEST
+            // one (thread.c's coordinate rule), which for a non-PIE is the low link vaddr. Registering it
+            // folded put the loader and the guest's own RELRO mprotect in two different coordinate systems.
+            uint64_t gs = nonpie_unfold(s), ge = nonpie_unfold(e - 1) + 1;
             if (fl & 2)
-                gro_clear(s, e);
+                gro_clear(gs, ge);
             else
-                gro_add(s, e);
+                gro_add(gs, ge);
         }
     }
     // for a non-PIE ET_EXEC the engine maps the image HIGH (+bias) but keeps every GUEST-VISIBLE

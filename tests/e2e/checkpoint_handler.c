@@ -24,12 +24,12 @@ static const char *g_release;
 static volatile sig_atomic_t g_failed;
 static volatile unsigned long g_handler_witness;
 static volatile sig_atomic_t g_handler_done;
-/* HEAP, not .bss. This fixture is non-PIE (hl_guest_pair's default linkage) and an alternate signal stack
- * inside a non-PIE image's .bss is not deliverable today -- the engine faults writing the handler frame to
- * the unbiased address. Reproducer and analysis are in docs/amd64-host-findings.md; that defect is in guest
- * signal delivery, not in checkpoint, so this case does not carry it. */
-static char *g_altstack;
+/* .bss, deliberately: this fixture is non-PIE (hl_guest_pair's default linkage), so the alternate stack
+ * lives at a LOW link vaddr inside the image while its bytes are mapped at +bias -- the stricter shape,
+ * and the one findings 3.16 was about. It was a heap stack until the frame builder's coordinate fold
+ * landed (linux_abi/signal.c). compat/signals/sigaltstack_nonpie_bss.c guards the plain-delivery case. */
 #define ALTSTACK_SIZE (1 << 16)
+static char g_altstack[ALTSTACK_SIZE] __attribute__((aligned(16)));
 
 static void fail(const char *why) {
     dprintf(STDERR_FILENO, "handler fixture: %s\n", why);
@@ -88,8 +88,6 @@ int main(int argc, char **argv) {
     if (argc != 2 || prepare_output(argv[1]) != 0) return 2;
     g_release = argv[1];
 
-    g_altstack = malloc(ALTSTACK_SIZE);
-    if (g_altstack == NULL) return 3;
     alternate.ss_sp = g_altstack;
     alternate.ss_size = ALTSTACK_SIZE;
     alternate.ss_flags = 0;

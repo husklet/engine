@@ -48,6 +48,13 @@ static int guest_span(uint64_t guest, size_t length, uint32_t protection, void *
         errno = EFAULT;
         return -1;
     }
+    /* These are the engine's copy_{to,from}_user, so this is exactly the "one host dereference" the non-PIE
+     * coordinate rule (thread.c) says to fold at.  Doing it HERE rather than at each caller is what stops
+     * the family recurring: dispatch.c's per-syscall pointer-argument allowlist has to name every syscall
+     * and every argument position, and a handler it forgets (clone's child_tid, set_tid_address,
+     * set_robust_list) dereferenced a low link vaddr.  Idempotent -- an already-rebased argument is above
+     * the link range -- so the allowlist stays correct and this is inert for PIE/static-PIE. */
+    guest = nonpie_fold(guest);
     *pin = (hl_logical_vma_pin){0};
 
     int logical = hl_logical_vma_pin_data(guest, length, protection, pin);
@@ -106,6 +113,7 @@ static ssize_t guest_copy_from(void *destination, uint64_t source, size_t length
 
 static ssize_t guest_copy_to(uint64_t destination, const void *source, size_t length) {
     size_t done = 0;
+    destination = nonpie_fold(destination); // the SMC key below is an EXECUTION address, i.e. the storage one
     while (done < length) {
         void *host;
         size_t span;
@@ -128,6 +136,7 @@ static ssize_t guest_copy_to(uint64_t destination, const void *source, size_t le
 static int guest_iov_range(uint64_t guest, size_t length, uint32_t protection, struct iovec *host_iov,
                            hl_logical_vma_pin *pins, uint64_t *guest_bases, size_t host_capacity, size_t *covered) {
     size_t done = 0, count = 0;
+    guest = nonpie_fold(guest); // guest_bases feed guest_smc_copyout, which is keyed on execution addresses
     while (done < length && count < host_capacity) {
         void *host;
         size_t span;
