@@ -2247,11 +2247,14 @@ static int interp_fp_process_nans(unsigned fmt, unsigned count, const uint64_t *
     return 0;
 }
 
-// On an INPUT: FPCR.FZ governs single/double, FPCR.FZ16 half. FPSR.IDC means "denormal AND discarded".
+// On an INPUT: FPCR.FZ governs single/double, FPCR.FZ16 half. FPSR.IDC means "denormal AND discarded" --
+// but only at single and double: FPUnpack's half-precision branch flushes with no InputDenorm exception,
+// so an FZ16 flush is SILENT. Measured across 15 half-precision forms this file already implemented:
+// every FZ16 flush reported IDC here and none did under qemu-aarch64.
 static uint64_t interp_fp_flush_input(uint64_t bits, unsigned fmt) {
     unsigned flush = fmt == INTERP_FP_H ? INTERP_FPCR_FZ16(g_interp_fpcr) : INTERP_FPCR_FZ(g_interp_fpcr);
     if (!flush || interp_fp_class(bits, fmt) != INTERP_FPC_DENORM) return bits;
-    interp_fpsr_raise(INTERP_FPSR_IDC);
+    if (fmt != INTERP_FP_H) interp_fpsr_raise(INTERP_FPSR_IDC);
     return bits & interp_fp_sign_mask(fmt);
 }
 
@@ -2585,6 +2588,199 @@ static uint64_t interp_fp_convert(unsigned from, unsigned to, uint64_t bits) {
         out = interp_fp_from_float(r);
     }
     return interp_fp_postprocess(to, out, raised);
+}
+
+// FCVTXN's FPRounding_ODD: truncate, then force the low bit whenever anything was lost, so a narrowing
+// never lands on a value a second narrowing could round the wrong way. Overflow gives the largest finite.
+// ODD replaces FPCR.RMode rather than composing with it, hence the (thread-local) override around the one
+// host conversion; DN and FZ still come from the guest's, so it is restored before postprocess.
+static uint64_t interp_fp_convert_odd(uint64_t bits) {
+    if (interp_fp_class(bits, INTERP_FP_D) >= INTERP_FPC_QNAN)
+        return interp_fp_convert_nan(bits, INTERP_FP_D, INTERP_FP_S);
+    bits = interp_fp_flush_input(bits, INTERP_FP_D);
+    double wide = interp_fp_to_double(bits);
+    uint64_t saved_fpcr = g_interp_fpcr;
+    g_interp_fpcr = (saved_fpcr & ~(UINT64_C(3) << 22)) | ((uint64_t)INTERP_RM_RZ << 22);
+    interp_fpenv env;
+    interp_fp_env_enter(&env);
+    volatile double x = wide;
+    volatile float r = (float)x;
+    unsigned raised = interp_fp_env_leave(&env);
+    g_interp_fpcr = saved_fpcr;
+    uint64_t out = interp_fp_from_float(r);
+    if (raised & INTERP_FPSR_IXC) out |= 1u;
+    return interp_fp_postprocess(INTERP_FP_S, out, raised);
+}
+
+// x86's RCPPS is an implementation-defined approximation, so this engine answers it exactly. AArch64's
+// estimates are the opposite: the ARM ARM specifies an 8-bit-mantissa table and the exact extraction, so
+// two conforming implementations agree bit for bit and an approximation -- however close -- is a wrong
+// answer. These two are the DDI 0487 shared pseudocode RecipEstimate/RecipSqrtEstimate transcribed; every
+// entry of the 256- and 384-entry tables they generate was read back off qemu-aarch64 through six
+// instruction paths (FRECPE.s/.d, URECPE, FRSQRTE.s/.d, URSQRTE), which agreed with each other and with
+// these, and tests/compat/completeness/aarch64/neon_recip.c re-checks all 640 on whatever CPU runs it.
+static unsigned interp_recip_estimate(unsigned a) {
+    a = a * 2u + 1u; // to nearest, in units of 1/512
+    unsigned b = (1u << 19) / a;
+    return (b + 1u) / 2u; // to nearest
+}
+
+static unsigned interp_recip_sqrt_estimate(unsigned a) {
+    a = a < 256u ? a * 2u + 1u : (((a >> 1) << 1) + 1u) * 2u; // 0.25..0.5 keeps its low bit, 0.5..1.0 drops it
+    uint64_t b = 512;
+    while ((uint64_t)a * (b + 1u) * (b + 1u) < (UINT64_C(1) << 28)) b++;
+    return (unsigned)((b + 1u) / 2u);
+}
+
+#define INTERP_FRAC52 ((UINT64_C(1) << 52) - 1u)
+
+// Both estimates renormalise the operand into a 52-bit fraction, take 8 bits of it through the table and
+// rebuild; the pseudocode spells the exponent arithmetic per format, and every constant is a bias multiple.
+static uint64_t interp_fp_recip_estimate(unsigned fmt, uint64_t a) {
+    a = interp_fp_flush_input(a, fmt);
+    unsigned mant = interp_fp_mant(fmt), cls = interp_fp_class(a, fmt), inf_exp = interp_fp_inf_exp(fmt);
+    int bias = interp_fp_bias(fmt);
+    uint64_t sign = a & interp_fp_sign_mask(fmt);
+    if (cls >= INTERP_FPC_QNAN) return interp_fp_process_nan(a, fmt);
+    if (cls == INTERP_FPC_INF) return sign;
+    if (cls == INTERP_FPC_ZERO) {
+        interp_fpsr_raise(INTERP_FPSR_DZC);
+        return sign | ((uint64_t)inf_exp << mant);
+    }
+    uint64_t frac = a & interp_fp_mant_mask(fmt);
+    int exp = (int)((a >> mant) & inf_exp);
+    // |x| < 2^-(bias+1) -- a denormal with its top two fraction bits clear -- reciprocates to an overflow.
+    if (exp == 0 && (frac >> (mant - 2u)) == 0) {
+        unsigned rmode = INTERP_FPCR_RMODE(g_interp_fpcr);
+        int to_inf = rmode == INTERP_RM_RN || (rmode == INTERP_RM_RP && !sign) || (rmode == INTERP_RM_RM && sign);
+        interp_fpsr_raise(INTERP_FPSR_OFC | INTERP_FPSR_IXC);
+        return sign | (to_inf ? ((uint64_t)inf_exp << mant)
+                              : (((uint64_t)(inf_exp - 1u) << mant) | interp_fp_mant_mask(fmt)));
+    }
+    // The mirror case: FZ turns a reciprocal that would be denormal into zero, Underflow and no Inexact.
+    if ((fmt == INTERP_FP_H ? INTERP_FPCR_FZ16(g_interp_fpcr) : INTERP_FPCR_FZ(g_interp_fpcr)) &&
+        exp >= 2 * bias - 1) {
+        interp_fpsr_raise(INTERP_FPSR_UFC);
+        return sign;
+    }
+    uint64_t fraction = frac << (52u - mant);
+    if (exp == 0) { // at most two shifts: a third would have been the overflow case above
+        if ((fraction >> 51) == 0) {
+            exp = -1;
+            fraction = (fraction << 2) & INTERP_FRAC52;
+        } else {
+            fraction = (fraction << 1) & INTERP_FRAC52;
+        }
+    }
+    unsigned estimate = interp_recip_estimate(256u + (unsigned)((fraction >> 44) & 0xFFu));
+    int result_exp = 2 * bias - 1 - exp;
+    fraction = (uint64_t)(estimate & 0xFFu) << 44;
+    // A result_exp the estimate pushed below the normal range comes back as an explicit leading one.
+    if (result_exp == 0) {
+        fraction = (UINT64_C(1) << 51) | (fraction >> 1);
+    } else if (result_exp == -1) {
+        fraction = (UINT64_C(1) << 50) | (fraction >> 2);
+        result_exp = 0;
+    }
+    return sign | ((uint64_t)(unsigned)result_exp << mant) | (fraction >> (52u - mant));
+}
+
+static uint64_t interp_fp_rsqrt_estimate(unsigned fmt, uint64_t a) {
+    a = interp_fp_flush_input(a, fmt);
+    unsigned mant = interp_fp_mant(fmt), cls = interp_fp_class(a, fmt), inf_exp = interp_fp_inf_exp(fmt);
+    uint64_t sign = a & interp_fp_sign_mask(fmt);
+    if (cls >= INTERP_FPC_QNAN) return interp_fp_process_nan(a, fmt);
+    if (cls == INTERP_FPC_ZERO) {
+        interp_fpsr_raise(INTERP_FPSR_DZC);
+        return sign | ((uint64_t)inf_exp << mant);
+    }
+    if (sign) { // -0 took the branch above; every other negative is Invalid, not a signed result
+        interp_fpsr_raise(INTERP_FPSR_IOC);
+        return interp_fp_default_nan(fmt);
+    }
+    if (cls == INTERP_FPC_INF) return 0;
+    uint64_t fraction = (a & interp_fp_mant_mask(fmt)) << (52u - mant);
+    int exp = (int)((a >> mant) & inf_exp);
+    if (exp == 0) { // no bound needed: a denormal has a set bit to normalise onto
+        while ((fraction >> 51) == 0) {
+            fraction = (fraction << 1) & INTERP_FRAC52;
+            exp--;
+        }
+        fraction = (fraction << 1) & INTERP_FRAC52;
+    }
+    // The exponent's PARITY survives the scaling, because a square root halves it: an odd one scales into
+    // 0.25..0.5 and indexes the table's lower half.
+    unsigned scaled = ((unsigned)exp & 1u) ? 128u + (unsigned)((fraction >> 45) & 0x7Fu)
+                                           : 256u + (unsigned)((fraction >> 44) & 0xFFu);
+    int result_exp = (3 * interp_fp_bias(fmt) - 1 - exp) / 2;
+    unsigned estimate = interp_recip_sqrt_estimate(scaled);
+    return ((uint64_t)(unsigned)result_exp << mant) | ((uint64_t)(estimate & 0xFFu) << (mant - 8u));
+}
+
+// FRECPX is NOT FRECPE: no table, no estimate. It reflects the exponent exactly and zeroes the mantissa,
+// which is what a range-reduction step needs. FZ never changes the answer -- the exponent comes from the
+// raw operand -- but flushing a denormal input still reports it at single and double.
+static uint64_t interp_fp_recpx(unsigned fmt, uint64_t a) {
+    unsigned mant = interp_fp_mant(fmt), inf_exp = interp_fp_inf_exp(fmt);
+    if (interp_fp_class(a, fmt) >= INTERP_FPC_QNAN) return interp_fp_process_nan(a, fmt);
+    (void)interp_fp_flush_input(a, fmt);
+    unsigned exp = (unsigned)((a >> mant) & inf_exp);
+    return (a & interp_fp_sign_mask(fmt)) | ((uint64_t)(exp == 0 ? inf_exp - 1u : (~exp & inf_exp)) << mant);
+}
+
+// URECPE / URSQRTE: the same two tables read as unsigned Q0.32 fixed point. No FPCR, no FPSR.
+static uint64_t interp_uint_recip_estimate(uint64_t a, int sqrt_form) {
+    uint32_t value = (uint32_t)a;
+    if (sqrt_form ? (value >> 30) == 0 : (value >> 31) == 0) return UINT64_C(0xFFFFFFFF);
+    unsigned estimate = sqrt_form ? interp_recip_sqrt_estimate(value >> 23) : interp_recip_estimate(value >> 23);
+    return (uint64_t)estimate << 23;
+}
+
+// FRECPS / FRSQRTS, the Newton-Raphson steps. Three things do not follow from the arithmetic: op1 is
+// NEGATED before the unpack, so a NaN operand propagates with its sign FLIPPED; 0*inf yields 2.0 or 1.5
+// rather than the Invalid a bare multiply would raise; and inf*finite yields a signed infinity directly.
+static uint64_t interp_fp_recip_step(unsigned fmt, uint64_t a, uint64_t b, int sqrt_form) {
+    unsigned mant = interp_fp_mant(fmt);
+    a ^= interp_fp_sign_mask(fmt);
+    a = interp_fp_flush_input(a, fmt);
+    b = interp_fp_flush_input(b, fmt);
+    uint64_t operands[2] = {a, b}, nan;
+    if (interp_fp_process_nans(fmt, 2, operands, &nan)) return nan;
+    unsigned class_a = interp_fp_class(a, fmt), class_b = interp_fp_class(b, fmt);
+    int inf_a = class_a == INTERP_FPC_INF, inf_b = class_b == INTERP_FPC_INF;
+    if ((inf_a && class_b == INTERP_FPC_ZERO) || (class_a == INTERP_FPC_ZERO && inf_b))
+        return sqrt_form ? (((uint64_t)interp_fp_bias(fmt) << mant) | (UINT64_C(1) << (mant - 1u)))
+                         : ((uint64_t)(interp_fp_bias(fmt) + 1) << mant);
+    if (inf_a || inf_b)
+        return ((a ^ b) & interp_fp_sign_mask(fmt)) | ((uint64_t)interp_fp_inf_exp(fmt) << mant);
+
+    // (3 - a*b)/2 is ONE rounding, so the halving must stay out of it: 1.5 + (a/2)*b is a single fma when
+    // a/2 is exact. When it is not, |a| is below 2^(2-bias) and |a*b| below 8, so halving afterwards
+    // neither overflows nor lands in the subnormals -- which halving 3 - a*b on its own can both do.
+    int prehalve = sqrt_form && ((a >> mant) & interp_fp_inf_exp(fmt)) >= 2u;
+    if (prehalve) a -= UINT64_C(1) << mant;
+    interp_fpenv env;
+    unsigned raised;
+    uint64_t out;
+    if (fmt == INTERP_FP_S) {
+        float left = interp_fp_to_float((uint32_t)a), right = interp_fp_to_float((uint32_t)b);
+        interp_fp_env_enter(&env);
+        volatile float x = left, y = right, r;
+        r = fmaf(x, y, sqrt_form ? (prehalve ? 1.5f : 3.0f) : 2.0f);
+        if (sqrt_form && !prehalve) r = r * 0.5f;
+        raised = interp_fp_env_leave(&env);
+        out = interp_fp_from_float(r);
+    } else {
+        double left = interp_fp_widen(a, fmt), right = interp_fp_widen(b, fmt);
+        interp_fp_env_enter(&env);
+        volatile double x = left, y = right, r;
+        r = fma(x, y, sqrt_form ? (prehalve ? 1.5 : 3.0) : 2.0);
+        if (sqrt_form && !prehalve) r = r * 0.5;
+        raised = interp_fp_env_leave(&env);
+        out = fmt == INTERP_FP_D ? interp_fp_from_double(r)
+                                 : interp_fp_half_from_double(r, INTERP_FPCR_RMODE(g_interp_fpcr), &raised);
+    }
+    return interp_fp_postprocess(fmt, out, raised);
 }
 
 // SatQ()'s out-of-range value; a 32-bit destination comes back sign-extended to 64.
@@ -3930,6 +4126,29 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         return INTERP_NEXT;
     }
 
+    // AdvSIMD two-register miscellaneous (FP16): the same operations at half precision, in a box of their
+    // own at bits[23:17] == 1111100 that the mask below does not reach. Only the members this file
+    // implements are decoded; the rest of the box (FABS/FNEG/FSQRT/FRINT*/FCVT*/FCMxx at .4H/.8H/H) has
+    // never been decoded here and keeps reporting rather than being guessed at.
+    if ((decode & 0x9FFE0C00u) == 0x0EF80800u) {
+        unsigned opcode = (insn >> 12) & 0x1Fu;
+        if (opcode != 0x1Du && !(opcode == 0x1Fu && !u && scalar))
+            return interp_undefined(cpu, insn, "AdvSIMD two-reg misc (FP16) -- unimplemented opcode");
+        interp_vec source = interp_vec_read(cpu, rn), result;
+        memset(result.byte, 0, sizeof result.byte);
+        for (unsigned lane = 0; lane < (scalar ? 1u : (q ? 8u : 4u)); lane++) {
+            uint64_t a = interp_vec_element(&source, INTERP_FP_H + 1u, lane), value;
+            if (opcode == 0x1Fu)
+                value = interp_fp_recpx(INTERP_FP_H, a); // FRECPX
+            else
+                value = u ? interp_fp_rsqrt_estimate(INTERP_FP_H, a) : interp_fp_recip_estimate(INTERP_FP_H, a);
+            interp_vec_set_element(&result, INTERP_FP_H + 1u, lane, value);
+        }
+        interp_vec_write(cpu, rd, result, q);
+        cpu->pc = gpc + 4;
+        return INTERP_NEXT;
+    }
+
     // AdvSIMD two-register misc
     if ((decode & 0x9F3E0C00u) == 0x0E200800u) {
         unsigned size = (insn >> 22) & 3u, opcode = (insn >> 12) & 0x1Fu;
@@ -3945,9 +4164,13 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             uint64_t saved_nzcv = cpu->nzcv; // see the note in the three-same FP block
             // FCVTL/FCVTN change the element width; sz names the NARROW format (0 half, 1 single).
             if (opcode == 0x16u || opcode == 0x17u) {
-                if (u && opcode == 0x16u)
-                    return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- FCVTXN");
-                if (high) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated FCVTL/FCVTN size");
+                // FCVTXN/FCVTXN2 is FCVTN with FPRounding_ODD, and exists only D -> S. U elsewhere in this
+                // pair spells the FEAT_FP8 widenings (F1CVTL/F2CVTL/BF1CVTL) and bit23 the BF16 narrowings,
+                // which were reaching FCVTL's code; there is no scalar FCVTL/FCVTN.
+                unsigned odd = u && opcode == 0x16u && (size & 1u);
+                if (high || (u && !odd) || (scalar && !odd))
+                    return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- BFCVTN/F1CVTL/F2CVTL/BF1CVTL or "
+                                                       "unallocated FCVTL/FCVTN/FCVTXN form");
                 unsigned narrow = (size & 1u) ? INTERP_FP_S : INTERP_FP_H, wide = narrow + 1u;
                 // The narrow side is 64 bits of elements; Q picks the half.
                 unsigned narrow_lanes = narrow == INTERP_FP_S ? 2u : 4u;
@@ -3958,12 +4181,14 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                         interp_vec_set_element(&result, wide + 1u, lane, interp_fp_convert(narrow, wide, element_bits));
                     }
                     interp_vec_write(cpu, rd, result, 1);
-                } else { // FCVTN / FCVTN2
+                } else { // FCVTN / FCVTN2 / FCVTXN / FCVTXN2
                     interp_vec packed;
                     memset(packed.byte, 0, sizeof packed.byte);
-                    for (unsigned lane = 0; lane < narrow_lanes; lane++) {
+                    for (unsigned lane = 0; lane < (scalar ? 1u : narrow_lanes); lane++) {
                         uint64_t element_bits = interp_vec_element(&source, wide + 1u, lane);
-                        interp_vec_set_element(&packed, narrow + 1u, lane, interp_fp_convert(wide, narrow, element_bits));
+                        interp_vec_set_element(&packed, narrow + 1u, lane,
+                                               odd ? interp_fp_convert_odd(element_bits)
+                                                   : interp_fp_convert(wide, narrow, element_bits));
                     }
                     if (!q) {
                         interp_vec_write(cpu, rd, packed, 0);
@@ -4023,24 +4248,31 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                     case 0x1B: // FCVTMS/FCVTMU or FCVTZS/FCVTZU
                         value = interp_fp_to_int(fmt, a, interp_fp_width(fmt), !u, high ? INTERP_RM_RZ : INTERP_RM_RM, 0);
                         break;
-                    case 0x1C: // FCVTAS/FCVTAU; URECPE/URSQRTE estimates
-                        if (high) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- URECPE/URSQRTE");
-                        value = interp_fp_to_int(fmt, a, interp_fp_width(fmt), !u, INTERP_RM_RA, 0);
+                    case 0x1C: // FCVTAS/FCVTAU at bit23 clear, URECPE/URSQRTE at set (.2S/.4S only)
+                        if (high) {
+                            if (fmt != INTERP_FP_S || scalar)
+                                return interp_undefined(cpu, insn,
+                                                        "AdvSIMD two-reg misc -- unallocated URECPE/URSQRTE form");
+                            value = interp_uint_recip_estimate(a, u);
+                        } else {
+                            value = interp_fp_to_int(fmt, a, interp_fp_width(fmt), !u, INTERP_RM_RA, 0);
+                        }
                         break;
-                    case 0x1D:
-                        // SCVTF/UCVTF; FRECPE/FRSQRTE are estimates, see FRECPS below.
-                        if (high) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- FRECPE/FRSQRTE");
-                        value = interp_fp_from_int(fmt, a, interp_fp_width(fmt), !u, INTERP_FPCR_RMODE(g_interp_fpcr),
-                                                  0);
+                    case 0x1D: // SCVTF/UCVTF at bit23 clear, FRECPE/FRSQRTE at set
+                        if (high)
+                            value = u ? interp_fp_rsqrt_estimate(fmt, a) : interp_fp_recip_estimate(fmt, a);
+                        else
+                            value = interp_fp_from_int(fmt, a, interp_fp_width(fmt), !u,
+                                                       INTERP_FPCR_RMODE(g_interp_fpcr), 0);
                         break;
-                    case 0x1F: // FSQRT (U == 1, bit23 set)
-                        // bit23 clear is FRINT64Z/FRINT64X (FEAT_FRINTTS), which shares this opcode and was
-                        // being executed as FSQRT.
-                        if (!u || !high)
+                    case 0x1F: // FSQRT is the VECTOR U == 1 form, FRECPX the SCALAR U == 0 one: allocated
+                               // exactly when u != scalar. bit23 clear is FRINT32Z/FRINT64Z/FRINT32X/FRINT64X
+                               // (FEAT_FRINTTS), which shares this opcode and was being executed as FSQRT.
+                        if (!high || (u != 0) == (scalar != 0))
                             return interp_undefined(cpu, insn,
                                                     "AdvSIMD two-reg misc -- FRINT32Z/FRINT64Z/FRINT32X/FRINT64X "
                                                     "or unallocated opcode 11111");
-                        value = interp_fp_sqrt(fmt, a);
+                        value = u ? interp_fp_sqrt(fmt, a) : interp_fp_recpx(fmt, a);
                         break;
                     default: return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unimplemented FP opcode");
                     }
@@ -4438,9 +4670,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                         break;
                     }
                     case 0x1E: value = interp_fp_minmax(fmt, a, b, !high, 0); break; // FMAX / FMIN
-                    case 0x1F:
-                        // FRECPS / FRSQRTS: a SINGLE rounding of (2 - a*b) or (3 - a*b)/2.
-                        return interp_undefined(cpu, insn, "AdvSIMD three same -- FRECPS/FRSQRTS");
+                    case 0x1F: value = interp_fp_recip_step(fmt, a, b, high); break; // FRECPS / FRSQRTS
                     default: return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated FP opcode");
                     }
                 } else {
