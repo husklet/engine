@@ -253,6 +253,9 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<File> {
 /// Only the tests for [`create_private_file`] and [`set_mode`] use this; it exists so that the
 /// private-file guarantee is a checked property rather than a property of one host's API.
 #[cfg(test)]
+// The mask is the documented spelling of "the group and other bits are clear". Clippy's suggested
+// `trailing_zeros() >= 6` computes the same answer and reads like a coincidence.
+#[allow(clippy::verbose_bit_mask)]
 pub(crate) fn is_owner_only(path: &Path) -> io::Result<bool> {
     Ok(std::fs::metadata(path)?.permissions().mode() & 0o077 == 0)
 }

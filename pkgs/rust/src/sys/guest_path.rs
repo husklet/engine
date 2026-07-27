@@ -169,7 +169,7 @@ mod tests {
     /// while being exactly the unnormalized input the check is documented to reject.
     #[test]
     fn unnormalized_separators_are_visible_at_the_byte_level() {
-        assert!(Path::new("a//b").components().count() == 2);
+        assert_eq!(Path::new("a//b").components().count(), 2);
         assert!(!is_normalized_relative(b"a//b"));
         assert!(!is_normalized_relative(b"a/"));
         assert!(!is_normalized_relative(b"/a"));

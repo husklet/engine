@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::TcpListener,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{Arc, OnceLock},
 };
@@ -16,12 +16,21 @@ use hl_engine::{
         Memory, MemoryRequirement, Metadata, NamespaceEntry, OpenHandle, OpenRequest, Protections,
         ProviderAuthority, ProviderId, ReadRequest, Readiness, ReadyState, Region,
         ResourceDescriptor, ResourceError, ResourceId, ServiceEntry, ServiceId,
-        ServiceRegistration, Sharing, SocketEntry, SymlinkEntry, WriteRequest,
+        ServiceRegistration, Sharing, SymlinkEntry, WriteRequest,
     },
     network::Namespace,
     spec::{NetworkMode, SpecErrorCategory, TreeSource, Version},
     Engine, Exit, Guest, HandlesAuthority, MachineSpec, ProcessIo,
 };
+
+// Only the three Unix-only socket-projection tests name this; see them for what Windows gives up.
+#[cfg(unix)]
+use hl_engine::extension::SocketEntry;
+
+#[path = "support/engine_env.rs"]
+mod engine_env;
+#[path = "support/host.rs"]
+mod host;
 
 #[test]
 fn isolated_network_accepts_an_opaque_shared_namespace_identity() {
@@ -179,6 +188,9 @@ fn bound_xattr_errno_probe(guest: Guest) -> &'static str {
 
 #[test]
 fn bound_descriptor_xattr_errors_use_linux_errno_values() {
+    if engine_env::skip_without_rootfs("bound_descriptor_xattr_errors_use_linux_errno_values") {
+        return;
+    }
     for guest in [Guest::Aarch64, Guest::X86_64] {
         let mut spec = MachineSpec::new(guest, bound_xattr_errno_probe(guest));
         spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
@@ -193,6 +205,8 @@ fn bound_descriptor_xattr_errors_use_linux_errno_values() {
     }
 }
 
+// Built only for `projected_socket_connects_to_the_granted_host_endpoint`, which is Unix-only.
+#[cfg(unix)]
 fn projected_socket_probe() -> &'static str {
     static PROBE: OnceLock<()> = OnceLock::new();
     PROBE.get_or_init(|| {
@@ -423,6 +437,10 @@ fn host_fixture(name: &str) -> PathBuf {
     path
 }
 
+// Unix-only: `sys::is_socket` answers a hard `false` on Windows because no Windows file has that
+// type, so socket projection can never validate there. Given up on Windows: the guarantee that a
+// projected endpoint must be a live host socket and not a same-named regular file.
+#[cfg(unix)]
 #[test]
 fn socket_projection_accepts_only_existing_unix_sockets() {
     use std::os::unix::net::UnixListener;
@@ -450,6 +468,11 @@ fn socket_projection_accepts_only_existing_unix_sockets() {
     );
 }
 
+// Unix-only: the guest connects to a real filesystem-bound host `AF_UNIX` socket. `std` exposes no
+// `UnixListener` on Windows and the crate refuses socket projection there outright. Given up on
+// Windows: end-to-end proof that a projected endpoint reaches the granted host listener and nothing
+// else.
+#[cfg(unix)]
 #[test]
 fn projected_socket_connects_to_the_granted_host_endpoint() {
     use std::os::unix::net::UnixListener;
@@ -515,6 +538,11 @@ fn device_projection_requires_and_accepts_a_registered_service() {
     );
 }
 
+// Unix-only for the same reason as the two socket cases above: the combination it asserts is built
+// around a projected host `AF_UNIX` endpoint. Given up on Windows: that a socket, a service-backed
+// device, provider memory and a controlling terminal validate as one launch rather than only one at
+// a time. The device, memory and terminal halves are each still checked separately below.
+#[cfg(unix)]
 #[test]
 fn facade_accepts_projected_endpoints_memory_terminal_and_live_signal_together() {
     use std::os::unix::net::UnixListener;
@@ -628,6 +656,10 @@ fn open_file_limit_cannot_enter_the_engine_private_descriptor_range() {
     assert_eq!(error.field, "resources.open_files");
 }
 
+// Linux-only: it re-executes itself under `prlimit(1)` and asserts the advertised handle ceiling
+// tracks `RLIMIT_NOFILE`. Neither the tool nor the limit exists on Windows (and `prlimit` is absent
+// on macOS). Given up off Linux: that the engine's private descriptor band is recomputed from the
+// host's soft limit rather than hard-coded.
 #[cfg(target_os = "linux")]
 #[test]
 fn capabilities_track_the_host_limit_and_preserve_a_private_interval() {
@@ -659,6 +691,9 @@ fn capabilities_track_the_host_limit_and_preserve_a_private_interval() {
 
 #[test]
 fn projected_directory_file_and_symlink_share_the_guest_vfs() {
+    if engine_env::skip_without_rootfs("projected_directory_file_and_symlink_share_the_guest_vfs") {
+        return;
+    }
     let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/sh");
     spec.process.argv.extend([
         "-c".into(),
@@ -686,6 +721,11 @@ run'"
 
 #[test]
 fn typed_overlay_merges_copies_up_and_whiteouts_without_materializing_the_lower() {
+    if engine_env::skip_without_rootfs(
+        "typed_overlay_merges_copies_up_and_whiteouts_without_materializing_the_lower",
+    ) {
+        return;
+    }
     let base = std::env::temp_dir().join(format!("hl-typed-overlay-{}", std::process::id()));
     let upper = base.join("upper");
     let work = base.join("work");
@@ -728,6 +768,11 @@ fn typed_overlay_merges_copies_up_and_whiteouts_without_materializing_the_lower(
 
 #[test]
 fn typed_overlay_executes_a_final_symlink_from_the_merged_namespace() {
+    if engine_env::skip_without_rootfs(
+        "typed_overlay_executes_a_final_symlink_from_the_merged_namespace",
+    ) {
+        return;
+    }
     let base = std::env::temp_dir().join(format!(
         "hl-overlay-executable-symlink-{}",
         std::process::id()
@@ -739,7 +784,7 @@ fn typed_overlay_executes_a_final_symlink_from_the_merged_namespace() {
     fs::create_dir_all(&links).unwrap();
     fs::create_dir_all(&upper).unwrap();
     fs::create_dir_all(&work).unwrap();
-    std::os::unix::fs::symlink("/bin/busybox", links.join("echo")).unwrap();
+    crate::host::symlink(Path::new("/bin/busybox"), &links.join("echo")).unwrap();
 
     let mut spec = MachineSpec::new(Guest::Aarch64, "/echo");
     spec.process.argv.push("OVERLAY_EXEC_LINK_OK".into());
@@ -772,13 +817,18 @@ fn typed_overlay_executes_a_final_symlink_from_the_merged_namespace() {
 
 #[test]
 fn concurrent_overlays_isolate_upper_state_and_confine_lower_symlinks() {
+    if engine_env::skip_without_rootfs(
+        "concurrent_overlays_isolate_upper_state_and_confine_lower_symlinks",
+    ) {
+        return;
+    }
     let base = std::env::temp_dir().join(format!("hl-overlay-isolation-{}", std::process::id()));
     let lower = base.join("lower");
     let secret = base.join("host-secret");
     let _ = fs::remove_dir_all(&base);
     fs::create_dir_all(&lower).unwrap();
     fs::write(&secret, "HOST_SECRET").unwrap();
-    std::os::unix::fs::symlink(&secret, lower.join("escape")).unwrap();
+    crate::host::symlink(&secret, &lower.join("escape")).unwrap();
 
     let launch = |name: &'static str| {
         let base = base.clone();
@@ -818,6 +868,11 @@ fn concurrent_overlays_isolate_upper_state_and_confine_lower_symlinks() {
 
 #[test]
 fn overlay_mmap_truncate_and_rename_share_one_copied_up_file() {
+    if engine_env::skip_without_guest_compiler(
+        "overlay_mmap_truncate_and_rename_share_one_copied_up_file",
+    ) {
+        return;
+    }
     let base = std::env::temp_dir().join(format!("hl-overlay-coherence-{}", std::process::id()));
     let tools = base.join("tools");
     let upper = base.join("upper");
@@ -852,6 +907,9 @@ fn overlay_mmap_truncate_and_rename_share_one_copied_up_file() {
 
 #[test]
 fn host_network_reaches_a_real_host_loopback_listener() {
+    if engine_env::skip_without_rootfs("host_network_reaches_a_real_host_loopback_listener") {
+        return;
+    }
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
@@ -931,6 +989,9 @@ fn concurrent_namespace_launches_are_isolated_and_revoked() {
                 .unwrap()
         })
     }
+    if engine_env::skip_without_rootfs("concurrent_namespace_launches_are_isolated_and_revoked") {
+        return;
+    }
     let first = launch(b"first");
     let second = launch(b"second");
     assert_eq!(first.join().unwrap(), Exit::Code(0));
@@ -939,13 +1000,16 @@ fn concurrent_namespace_launches_are_isolated_and_revoked() {
 
 #[test]
 fn read_only_host_file_and_directory_use_coherent_guest_path_operations() {
-    use std::os::unix::fs::symlink;
-
+    if engine_env::skip_without_rootfs(
+        "read_only_host_file_and_directory_use_coherent_guest_path_operations",
+    ) {
+        return;
+    }
     let host = host_fixture("coherent");
     let directory = host.join("directory");
     fs::create_dir(&directory).unwrap();
     fs::write(directory.join("alpha"), b"alpha").unwrap();
-    symlink("alpha", directory.join("link")).unwrap();
+    crate::host::symlink(Path::new("alpha"), &directory.join("link")).unwrap();
     let file = host.join("single");
     fs::write(&file, b"single").unwrap();
 
@@ -988,24 +1052,38 @@ link' && \
 
 #[test]
 fn host_bind_validation_rejects_writable_symlink_and_special_authority() {
-    use std::os::unix::{fs::symlink, net::UnixListener};
-
     let host = host_fixture("rejected");
     let file = host.join("file");
     fs::write(&file, b"value").unwrap();
+
+    // Built rather than listed, because the last two rows are not available on every host and the
+    // alternative -- one `#[cfg(unix)]` over the whole test -- would take the writable-bind
+    // rejection down with them, which every host can check.
+    let mut cases = vec![(file.clone(), BindAccess::ReadWrite)];
+
+    // A symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege on Windows. That is a
+    // property of the account the suite runs as, not of the crate, so the row is announced as
+    // dropped rather than failing the whole test on a box without it.
     let link = host.join("link");
-    symlink(&file, &link).unwrap();
-    let socket = host.join("socket");
-    let listener = UnixListener::bind(&socket).unwrap();
-    for (path, access, category) in [
-        (&file, BindAccess::ReadWrite, SpecErrorCategory::Unsupported),
-        (&link, BindAccess::ReadOnly, SpecErrorCategory::Unsupported),
-        (
-            &socket,
-            BindAccess::ReadOnly,
-            SpecErrorCategory::Unsupported,
+    match crate::host::symlink(&file, &link) {
+        Ok(()) => cases.push((link, BindAccess::ReadOnly)),
+        Err(error) => eprintln!(
+            "SKIP host_bind_validation_rejects_writable_symlink_and_special_authority \
+             (symlink case only): this host cannot create a symbolic link: {error}"
         ),
-    ] {
+    }
+
+    // Unix-only row: a real filesystem-bound `AF_UNIX` socket, which `std` cannot create on
+    // Windows. Given up there: that binding a socket as if it were a file is refused.
+    #[cfg(unix)]
+    let listener = {
+        let socket = host.join("socket");
+        let bound = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        cases.push((socket, BindAccess::ReadOnly));
+        bound
+    };
+
+    for (path, access) in cases {
         let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/true");
         spec.extensions
             .push(host_bind_extension(vec![HostBindEntry {
@@ -1015,22 +1093,29 @@ fn host_bind_validation_rejects_writable_symlink_and_special_authority() {
             }]));
         assert_eq!(
             Engine::new().validate(&spec).unwrap_err().category,
-            category
+            SpecErrorCategory::Unsupported,
+            "binding {} was not refused",
+            path.display()
         );
     }
+    // Unlink the socket before the directory goes, as the original did.
+    #[cfg(unix)]
     drop(listener);
     fs::remove_dir_all(host).unwrap();
 }
 
 #[test]
 fn host_directory_bind_cannot_escape_granted_authority_through_a_symlink() {
-    use std::os::unix::fs::symlink;
-
+    if engine_env::skip_without_rootfs(
+        "host_directory_bind_cannot_escape_granted_authority_through_a_symlink",
+    ) {
+        return;
+    }
     let host = host_fixture("authority");
     let granted = host.join("granted");
     fs::create_dir(&granted).unwrap();
     fs::write(host.join("secret"), b"must-not-be-visible").unwrap();
-    symlink("../secret", granted.join("escape")).unwrap();
+    crate::host::symlink(Path::new("../secret"), &granted.join("escape")).unwrap();
     let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/sh");
     spec.process.argv.extend([
         "-c".into(),
@@ -1058,6 +1143,11 @@ fn host_directory_bind_cannot_escape_granted_authority_through_a_symlink() {
 
 #[test]
 fn host_bind_observes_host_changes_and_concurrent_launches_remain_isolated() {
+    if engine_env::skip_without_rootfs(
+        "host_bind_observes_host_changes_and_concurrent_launches_remain_isolated",
+    ) {
+        return;
+    }
     let first = host_fixture("first");
     let second = host_fixture("second");
     fs::write(first.join("value"), b"before").unwrap();
@@ -1095,6 +1185,11 @@ fn host_bind_observes_host_changes_and_concurrent_launches_remain_isolated() {
 
 #[test]
 fn mutable_file_is_coherent_across_opens_fork_truncate_and_mmap() {
+    if engine_env::skip_without_guest_compiler(
+        "mutable_file_is_coherent_across_opens_fork_truncate_and_mmap",
+    ) {
+        return;
+    }
     let mut spec = MachineSpec::new(Guest::Aarch64, mutable_probe());
     spec.process.argv.push("/run/provider/mutable".into());
     spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
@@ -1162,6 +1257,11 @@ fn mutable_files_with_the_same_guest_path_are_isolated_between_launches() {
                 .wait()
                 .unwrap()
         })
+    }
+    if engine_env::skip_without_rootfs(
+        "mutable_files_with_the_same_guest_path_are_isolated_between_launches",
+    ) {
+        return;
     }
     let first = launch(b"first", "first-changed");
     let second = launch(b"second", "second-changed");
@@ -1272,6 +1372,9 @@ fn invalid_guest_process_data_fails_preflight() {
 
 #[test]
 fn typed_machine_spec_launches_through_the_existing_backend() {
+    if engine_env::skip_without_rootfs("typed_machine_spec_launches_through_the_existing_backend") {
+        return;
+    }
     let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/true");
     spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
     let machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
@@ -1280,6 +1383,11 @@ fn typed_machine_spec_launches_through_the_existing_backend() {
 
 #[test]
 fn typed_rootfs_preserves_delayed_process_substitution_across_fork_and_exec() {
+    if engine_env::skip_without_guest_compiler(
+        "typed_rootfs_preserves_delayed_process_substitution_across_fork_and_exec",
+    ) {
+        return;
+    }
     let mut spec = MachineSpec::new(Guest::Aarch64, procfd_fork_probe());
     spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
     let machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
@@ -1320,6 +1428,11 @@ fn typed_machines_cross_the_old_private_descriptor_ceiling_and_release_files() {
     // leaves the band too narrow the guest hits a genuine host resource limit, so state that
     // precondition and self-skip honestly instead of asserting something the host cannot satisfy.
     const REQUIRED: u64 = 4097 + 128;
+    if engine_env::skip_without_guest_compiler(
+        "typed_machines_cross_the_old_private_descriptor_ceiling_and_release_files",
+    ) {
+        return;
+    }
     let band = private_descriptor_band_width();
     if band < REQUIRED {
         eprintln!(
@@ -1340,6 +1453,11 @@ fn typed_machines_cross_the_old_private_descriptor_ceiling_and_release_files() {
 
 #[test]
 fn typed_close_clears_emulation_state_before_unix_stream_fd_reuse() {
+    if engine_env::skip_without_guest_compiler(
+        "typed_close_clears_emulation_state_before_unix_stream_fd_reuse",
+    ) {
+        return;
+    }
     let mut spec = MachineSpec::new(Guest::Aarch64, unix_stream_reuse_probe());
     spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
     let machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
@@ -1348,6 +1466,11 @@ fn typed_close_clears_emulation_state_before_unix_stream_fd_reuse() {
 
 #[test]
 fn internal_epoll_wake_never_overlaps_a_guest_unix_stream() {
+    if engine_env::skip_without_guest_compiler(
+        "internal_epoll_wake_never_overlaps_a_guest_unix_stream",
+    ) {
+        return;
+    }
     let mut spec = MachineSpec::new(Guest::Aarch64, epoll_wake_socket_collision_probe());
     spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
     let machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
@@ -1734,6 +1857,11 @@ impl Memory for TestMemory {
 
 #[test]
 fn provider_memory_is_allocated_with_launch_authority_and_released_after_exit() {
+    if engine_env::skip_without_rootfs(
+        "provider_memory_is_allocated_with_launch_authority_and_released_after_exit",
+    ) {
+        return;
+    }
     let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/true");
     spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
     spec.extensions.push(memory_extension());
@@ -1866,6 +1994,11 @@ fn handle_services_require_launch_scoped_authority_and_reject_unadvertised_opera
 
 #[test]
 fn typed_handles_authority_runs_a_real_projected_service_guest() {
+    if engine_env::skip_without_guest_compiler(
+        "typed_handles_authority_runs_a_real_projected_service_guest",
+    ) {
+        return;
+    }
     let source = std::env::temp_dir().join(format!("hl-provider-basic-{}.c", std::process::id()));
     fs::write(&source, r#"
 #include <fcntl.h>
@@ -1932,6 +2065,11 @@ int main(int argc, char **argv) {
 
 #[test]
 fn projected_directory_exposes_a_service_backed_device_to_a_real_guest() {
+    if engine_env::skip_without_rootfs(
+        "projected_directory_exposes_a_service_backed_device_to_a_real_guest",
+    ) {
+        return;
+    }
     let base =
         std::env::temp_dir().join(format!("hl-provider-device-overlay-{}", std::process::id()));
     let upper = base.join("upper");
@@ -2013,6 +2151,9 @@ fn projected_directory_exposes_a_service_backed_device_to_a_real_guest() {
 
 #[test]
 fn controlling_terminal_and_projected_service_run_together() {
+    if engine_env::skip_without_rootfs("controlling_terminal_and_projected_service_run_together") {
+        return;
+    }
     let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/sh");
     spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
     spec.process.argv.extend([

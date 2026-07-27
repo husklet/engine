@@ -12,6 +12,9 @@
 //! These tests therefore exercise the committed archive the way a downstream
 //! consumer does: they launch a guest through it.
 
+#[path = "support/engine_env.rs"]
+mod engine_env;
+
 use hl_engine::{Engine, Exit, Guest};
 use std::path::{Path, PathBuf};
 
@@ -28,6 +31,9 @@ fn fixture(name: &str) -> PathBuf {
 /// backends, with a spawn error instead of a typed guest exit.
 #[test]
 fn committed_archive_launches_a_guest_on_both_backends() {
+    if engine_env::skip_without_guest("committed_archive_launches_a_guest_on_both_backends") {
+        return;
+    }
     let engine = Engine::new();
     for (guest, fixture_name) in [
         (Guest::Aarch64, "exit42-aarch64"),
