@@ -119,7 +119,7 @@ static void x87_top_add(struct cpu *cpu, int delta) {
 // FLD m80. A push onto a non-empty slot is #IS overflow: TOP still moves and the destination is destroyed.
 void hl_x86_x87_load_ext80(struct cpu *cpu) {
     double value = hl_x86_ext80_load((const uint8_t *)(uintptr_t)cpu->x87_ea);
-    int overflow = !hl_x87_phys_empty(cpu->fptop, (int)((cpu->fptop - 1) & 7));
+    int overflow = hl_x87_phys_live(cpu->fptop, (int)((cpu->fptop - 1) & 7));
     x87_top_add(cpu, -1);
     if (overflow) {
         x87_stack_fault(cpu, 1);

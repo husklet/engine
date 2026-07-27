@@ -157,7 +157,7 @@ int interp_signal_capture(struct cpu *cpu, void *native_context) {
 // ordering (mask first, __longjmp second).
 //
 // The savemask=1 this replaces cost an rt_sigprocmask syscall on EVERY guest basic block -- 271.7 ns, 44% of
-// compute CPU and 99.96% of the process's host syscalls (docs/amd64-host-performance.md 3, 4 and 7.1) -- to
+// compute CPU and 99.96% of the process's host syscalls (docs/amd64-host.md 3, 4 and 7.1) -- to
 // save a mask that only this rare path ever reads.
 static void interp_restore_handler_mask(void *native_context) {
     if (native_context != NULL) {
@@ -275,7 +275,7 @@ static uint64_t interp_ea(const struct cpu *cpu, const struct insn *insn, uint64
 // A non-PIE rip-relative LEA must yield the LOW link address: it MATERIALISES a pointer compared against
 // the image's baked LOW pointers, and a HIGH value silently disagrees -- glibc's __malloc_fork_lock_parent
 // then self-deadlocks on main_arena.mutex. Un-biases materialisation only; ACCESSES stay rebiased by
-// hl_x86_guest_pointer. Guards as in lower/mov.c (docs/amd64-host-findings.md 3.11): 64-bit opsize (32-bit
+// hl_x86_guest_pointer. Guards as in lower/mov.c (docs/amd64-host.md 3.11): 64-bit opsize (32-bit
 // truncates to the low value anyway); rip-relative; target inside the link range; Go images narrowed to the
 // type section, since code LEAs (`LEAQ asyncPreempt(SB)`) need HIGH for findfunc.
 static uint64_t interp_lea_value(const struct cpu *cpu, const struct insn *insn, uint64_t next) {
@@ -2663,7 +2663,7 @@ static int interp_x87_live(struct cpu *cpu, int a, int b) {
 // with the indefinite, destroying what was there (measured: 9x `fld1` from FNINIT leaves fsw=3a41 and
 // ST(0) = ffffc000000000000000).
 static void interp_x87_push(struct cpu *cpu, double value) {
-    int overflow = !hl_x87_phys_empty(cpu->fptop, (int)((cpu->fptop - 1) & 7));
+    int overflow = hl_x87_phys_live(cpu->fptop, (int)((cpu->fptop - 1) & 7));
     interp_x87_top_add(cpu, -1);
     if (overflow) {
         interp_x87_stack_fault(cpu, 1);

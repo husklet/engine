@@ -36,6 +36,14 @@ static inline void hl_x87_phys_mark(uint64_t *fptop, int slot, int empty) {
     *fptop = empty ? (*fptop | bit) : (*fptop & ~bit);
 }
 
+// NOT !hl_x87_phys_empty(). Disarmed means "no tag information", so it must answer NEITHER empty nor live:
+// a push overflow test written as !empty would fire on every push into a disarmed cpu, which is the
+// pre-tag-word behaviour inverted rather than preserved.
+static inline int hl_x87_phys_live(uint64_t fptop, int slot) {
+    if (!hl_x87_tags_modelled() || !(fptop & HL_X87_ARMED)) return 0;
+    return !hl_x87_phys_empty(fptop, slot);
+}
+
 // FXSAVE's abridged tag byte: bit i = physical register i is NOT empty. 0xff when unmodelled.
 static inline uint8_t hl_x87_abridged_tag(uint64_t fptop) {
     if (!hl_x87_tags_modelled() || !(fptop & HL_X87_ARMED)) return 0xff;
