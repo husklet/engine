@@ -200,9 +200,11 @@ Engine-in-engine is a gate rather than a habit (`nested.*`, five cells). The acc
 aarch64 engine hosting an x86-64 engine hosting a guest — passes, and so does a three-engine chain that
 puts an aarch64 host through engine-in-engine on a machine with no aarch64 hardware.
 
-`qemu-aarch64` is available here, so the AArch64 host arm is no longer unexecutable on this box; see
-`docs/emulated-aarch64.md` for exactly what emulation vouches for and what it does not. That lane is
-registry-only until the defects it found are fixed and qemu is in the devShell.
+`qemu-aarch64` is in the flake devShell, so the AArch64 host arm is executed on this box and two of its
+three cells are **CI-gated** (`emulated-aarch64-gated`). See `docs/emulated-aarch64.md` for exactly what
+emulation vouches for and what it does not — notably **not** weak memory ordering. The third cell stays
+ungated because it is genuinely red: it caught three x87 defects in the shipped AArch64 JIT that had
+shipped in a commit which fixed only the x86-host arm.
 
 What remains is in `docs/amd64-host-findings.md` §3.12 onward: a short list of named defects, each with a
 reproducer, plus the Stage 2 transliterator of §3.1 above. Performance is measured, not guessed —

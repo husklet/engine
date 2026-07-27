@@ -515,6 +515,45 @@ defect there. So the open follow-up is not "match hardware", it is **confirm the
 to bits the SDM marks undefined**, one bit at a time, against native. If anything defined is in that set, it
 is a real bug and this ruling does not cover it.
 
+### 3.18 The non-PIE bias family, retired at the source
+
+§3.11, §3.12 (entries 2 and 3), §3.16 and the two instances `45542ced` found are **eight symptoms of one
+line of loader code**, and that line was never required on this host.
+
+**Why the bias existed.** One reason, and it is a macOS reason: `__PAGEZERO` reserves the low 4 GB of a
+Darwin process, so an `ET_EXEC` linked at `0x400000` cannot be mapped where it says it belongs and the
+loader put it at a kernel-chosen high address. Everything downstream — `nonpie_fold`/`nonpie_unfold`, the
+`nonpie_fixup` SIGSEGV re-server, `pcrel_base`'s `ADR`/`ADRP` un-biasing, `lower/mov.c`'s rip-relative `LEA`
+rewrite, `emit_bias` on every JIT memory access, `hl_x86_guest_pointer` on every interpreter access,
+`go_rebase_nonpie`, the blind `.data`/`.data.rel.ro` word re-relocation, the syscall-argument fold table,
+the `mmap`-hint suppression in `mem.c` — exists to paper over that one displacement. The second motive the
+comments cite, "the checkpoint arena wants a deterministic slot", is satisfied *better* by the link address,
+which is fixed by the ELF rather than merely reproducible.
+
+**What changed.** `linux_abi/thread.c` now states the placement rule once (`HL_NONPIE_LINK_PLACEMENT` and
+`nonpie_place_at_link_address`) and both loaders call it: on Linux an `ET_EXEC` is reserved at
+`[p_vaddr_min, +span)` with `MAP_FIXED_NOREPLACE`, never `MAP_FIXED`. `g_nonpie_*` is then armed on
+`bias != 0` rather than on `etype == 2`, so on Linux the whole family is inert **by construction** rather
+than by every future author remembering it. `vm.mmap_min_addr` is 64 KiB, both guest ISAs link at
+`0x400000`, and the engine is a PIE at `ET_DYN_BASE`, so the range is free; if it ever is not, the loader
+falls back to the biased placement and the machinery behaves exactly as it does today.
+
+**The machinery stays compiled in, on purpose.** `ckpt_meta` records `nonpie_lo/hi/bias` and restore replays
+the mappings the capture wrote, so a checkpoint captured folded restores folded on a Linux engine and needs
+no format version bump in either direction. Making the fold a compile-time no-op on Linux would silently
+mis-restore those images.
+
+**What it bought.** The Stage-2 transliterator refuses `g_nonpie_lo != 0` outright; it now accepts 1292 of
+1542 x86-64 fixtures that were previously declined at every block — a `-static -no-pie` `busyloop` goes from
+0 % host blocks to 100 % and 9.7x, `isa/x86_64/go_goro_x86` to 99.8 % and 23.2x. On an AArch64 *Linux* host
+the same change removes `emit_bias`'s runtime compare-and-branch from every memory access of a non-PIE
+guest; that host is not measurable from here.
+
+**What it did not buy, and this is the point.** No golden moved. Not one compat golden encodes a guest image
+address, because guest-visible addresses were always the LOW link values — that *is* the coordinate rule of
+§3.11. The change moves storage, and storage was never observable. A family that produced eight
+several-hours-each defects turned out to have a blast radius of zero on the corpus.
+
 ## 4. Documentation that misleads
 
 These cost real time on this task and will cost it again.
@@ -622,25 +661,73 @@ written when the interpreters were unfinished, and a reader who trusts the old t
 - **The AArch64 host arm can be executed here** under `qemu-aarch64`, so "needs an aarch64 host" is no
   longer a reason to leave something unverified. See `docs/emulated-aarch64.md` for what emulation does and
   does not vouch for — notably **not** weak memory ordering.
+- **`arch_prctl(ARCH_GET_FS/GS)` no longer kills the engine.** It stored through a raw guest pointer with
+  neither a bias fold nor an accessibility guard; measured pre-fix, a non-PIE `.bss` destination exited 139
+  and `(void*)-1` exited 139 on static, static-PIE *and* dynamic, where Linux returns `EFAULT`. The
+  translator cannot ask `linux_abi` (DOCS.md §3.3), so `hl_x86_legacy_context` now carries an `access_ok`
+  callback the way `hl_x86_avx_state` carries its memory ops. The same audit closed `time`'s `tloc`,
+  `utime`/`utimes`/`futimesat`'s times buffers, and `select`'s `timeval` — which had **no fold either**, a
+  ninth member of the bias family. `completeness/arch-prctl-ptrs` pins all of it.
+- **The two non-PIE pointer-argument rebase tables are one.** `service_local`'s (134 cases) and the sentry
+  trust boundary's (38) were maintained side by side and each had cases the other lacked: the sentry knew
+  `ioctl`/`sendfile`/`splice`/`copy_file_range`/`get+setsockopt`/`memfd_create` and the in-out `socklen_t`
+  of `accept`/`accept4`/`getsockname`/`getpeername`/`recvfrom`, none of which `service_local` folded at all.
+  The union (141 cases) now lives in `src/linux_abi/syscall/nonpie_args.h`; the sentry's subset is
+  **derived**, `nonpie_rebase_args(nr, a)` applied under `sentry_forwarded(nr)`, because anything it does
+  not forward reaches `service_local` and is folded there.
+- **Legacy `RCPPS`/`RCPSS`/`RSQRTPS`/`RSQRTSS` (`0F 52`, `0F 53`) are lowered on the aarch64 host.** They
+  are baseline SSE1 and used to abort with `UNIMPL 0F opcode 0x53`; only the VEX forms existed.
+  **The value question is settled once for both encodings: the exact reciprocal, not the hardware
+  estimate.** The SDM specifies only `|relerr| <= 1.5*2^-12` and never a value, and the exact result meets
+  it with error 0. There is no single hardware answer to copy — the 12-bit table is microarchitecture-
+  specific, unlike `VRCP14PS`, which *is* defined — so "match hardware" means "match one vendor's ROM", and
+  a guest depending on the raw bits already breaks when moved between native x86 parts. This is the same
+  distinction that made the *opposite* call correct for NaN propagation: there, hardware **was** the
+  architecture and qemu was the wrong oracle; here it is not. Measured on this host (Zen 4, legacy and VEX
+  bit-identical over 8192 sampled encodings): `rcpps` worst relative error `2^-11.63`, `rsqrtps` `2^-11.92`.
+  On the aarch64 host `FRECPE` is an 8-bit estimate — *outside* the x86 bound — so it would need a Newton
+  step regardless, at which point exact is simpler and strictly closer. Flags: measured to raise **nothing**
+  for any input class, so `FPSR` is parked across the `FSQRT`/`FDIV` that stand in for the table. Fixing
+  this also exposed and closed a latent VEX defect: `vrsqrtps` of a negative returned ARM's positive default
+  NaN `7fc00000` on the aarch64 host where native and the x86-64 host both give x86's negative indefinite
+  `ffc00000`. `completeness/sse-rcp` pins the architectural contract (bound, specials, scalar merge, no
+  exception) rather than a vendor table.
 
 ### What is NOT done
 
 - **The host is still not "Supported"** in the README's sense, and should not be marked so until the
   exact-golden compat matrices pass for both guest ISAs — that is what the word means everywhere else here.
-- **None of it is gated by CI on this host.** `cmake/CiLanes.cmake` still omits `Linux-x86_64` from
-  `HL_CI_COMPAT_HOSTS`, so `.github/workflows/linux-x86_64.yml` runs `unit`, `nested-engine` and the package
-  check — not the 3013 compat runs. The `emulated-aarch64` lane is registry-only until `qemu-aarch64` is in
-  the flake devShell.
+- **The compat corpus is not gated by CI on this host.** `cmake/CiLanes.cmake` still omits `Linux-x86_64`
+  from `HL_CI_COMPAT_HOSTS`, so `.github/workflows/linux-x86_64.yml` runs `unit`, `nested-engine`,
+  `emulated-aarch64-gated` and the package check — not the 3013 compat runs. The four-step sequence for
+  fixing that is written into the comment at the decision site; the part easy to get wrong is that
+  **declaring the token alone turns I20 off**, leaving that workflow with no structural guard.
+- **`emulated.completeness` is red and deliberately ungated** — `FRSTOR` (`DD /4`) is not lowered on the
+  AArch64 host, and `FPREM` and precision control diverge there. All three arrived with `5d28c1ca`, which
+  fixed the x86-host arm only; **the AArch64 arm shipped in the same commit without ever running.**
 - **The reciprocal-estimate family** (`FRECPE`/`FRSQRTE`/`FRECPS`/`FRSQRTS`/`FRECPX`/`URECPE`/`URSQRTE`, 535
   encodings) and `FCVTXN` report honestly rather than being implemented. They are **baseline Armv8.0**, so
   no HWCAP gate excuses them; they need the ARM ARM's exact estimate tables, and writing those from memory
   is the guess this branch's rules forbid.
-- **`arch_prctl(ARCH_GET_FS/GS)` is a guest-triggerable engine kill** — no accessibility guard, so an
-  unmapped destination exits 139 on *every* linkage where Linux returns `EFAULT`.
 - **An x86-64 guest's store into its own `.rodata` is silently dropped** where native and the aarch64 guest
-  both fault.
+  both fault. Root cause confirmed against HEAD, and it is neither `45542ced` nor `9b14c9bc`: the x86-64
+  loader **registers** its read-only `PT_LOAD`s in the `g_gro` registry (`src/linux_abi/x86.c:406-410`) but
+  never `mprotect`s them, and then force-opens the whole image `R|W|X` (`x86.c:476-478`). The aarch64
+  loader does the real protect (`src/linux_abi/elf.c:850`) and has no such re-open, which is the whole
+  difference. `gro_hit` therefore says "read-only" while the page is physically writable, so the handler
+  branch that would deliver the fault (`x86.c:1162`) is unreachable for image segments and no translator
+  store path consults the registry. Two companions the fix needs: `nonpie_fixup` (`x86.c:822-933`) emulates
+  the store without consulting `gro_hit` and runs *before* that branch (`x86.c:1146`) — same ordering hole
+  in `elf.c:581` vs `elf.c:594`; and `FSRV_RESTORE_PREP/DONE` must stop being no-ops for x86-64
+  (`src/linux_abi/fork.c:109-114`) or the fork-server pristine-image `memcpy` faults once `.text` is `R+X`.
 - **`#D` on denormal inputs is missing for every SSE op on the aarch64 host** — declined with measured
   numbers (14 fast-path instructions across ~40 sites), not overlooked.
+- **The x86-64 host's legacy `0F 52`/`0F 53` still return the hardware estimate**, because
+  `src/translator/guest/x86_64/interp.c:2352` serves them with the native `_mm_rcp_ps`/`_mm_rsqrt_ps`. The
+  decision above says exact everywhere, so that one line is the remaining inconsistency: the same guest
+  binary gets the vendor table on the x86-64 host and the exact value on the aarch64 host, and legacy
+  disagrees with VEX *within* the x86-64 host. It is a two-line change in a file this pass did not own.
+  A raw-bit-pattern golden for these opcodes cannot be added until it lands.
 - **The non-PIE bias could be removed entirely on Linux.** It exists for macOS `__PAGEZERO`; Linux has no
   such constraint. Doing it would retire the eight-instance defect family of §3.11-§3.16 **at source** and
   admit 1285 of 1536 x86-64 fixtures to the transliterator, which refuses biased images. The single
