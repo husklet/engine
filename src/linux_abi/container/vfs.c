@@ -2,6 +2,7 @@
 // (lower/upper + copy-up + whiteout + merged readdir), and /proc + /sys synthesis.
 
 #include "../open_plan.h"
+#include "../page.h" // hl_linux_host_page_size
 #include "../shared.h"
 #include "../../host/libc_compat.h" // hl_compat_mkdir: the UCRT's mkdir takes no mode
 #include "../../host/file.h"
@@ -233,11 +234,20 @@ static size_t g_rootfs_canon_len;
 // fd -> host path it was opened with (dir-fd confinement + cache)
 static char g_fdpath[HL_NFD][192];
 // overlay: dir-fd -> its GUEST path (for merged getdents); "" = not an overlay dir
-static char g_ovldir[1024][192];
+//
+// Sized [HL_NFD], like every other fd-indexed table in this file. It was [1024] until an audit found the
+// two spellings live side by side: the close path clamps to `fd < 1024` (the #215 fix -- close_range() from
+// glibc's fd sanitize walks to 65535 and an unguarded store went wild into BSS), while the OPEN paths in
+// syscall/fs.c guard with `< HL_NFD` and so wrote past the end for any fd in [1024, HL_NFD). Both spellings
+// cannot be right. HL_NFD is the correct one because it is the bound the rest of the fd tables use and the
+// bound the guest's descriptor numbers actually observe; clamping the writers to 1024 instead would silently
+// stop tagging overlay directories and O_PATH descriptors above 1024, turning a memory bug into a behaviour
+// bug. BSS cost matches g_fdpath[HL_NFD][192], which is already this size and demand-zero.
+static char g_ovldir[HL_NFD][192];
 // O_PATH: fd opened with Linux O_PATH -- it names a file (fstat / *at dirfd / fchdir) but is NOT open for
 // I/O, so read/write/pread/pwrite/readv/writev through it must fail EBADF (macOS has no O_PATH; we open a
 // normal read fd for the metadata ops and gate the I/O family on this flag). 1 = O_PATH.
-static uint8_t g_opath[1024];
+static uint8_t g_opath[HL_NFD];
 // Synthesized /proc text files are backed by mkstemp(), so the host fd is O_RDWR even though Linux exposes
 // procfs regular files as read-only for file-status queries. 1 = force F_GETFL access mode to O_RDONLY.
 static uint8_t g_proc_text_ro[HL_NFD];
@@ -3052,8 +3062,7 @@ static unsigned long long self_rss_bytes(void); // defined after hl_get_procinfo
 // reads. Caching the first sample forever made statm claim that a faulted
 // 32 MiB mapping consumed zero pages and that munmap never released anything.
 static void self_vm_bytes(unsigned long long *rss, unsigned long long *vsize) {
-    long pg = sysconf(_SC_PAGESIZE);
-    unsigned long long pgsz = pg > 0 ? (unsigned long long)pg : 4096;
+    unsigned long long pgsz = (unsigned long long)hl_linux_host_page_size();
     unsigned long long r = (self_rss_bytes() / pgsz) * pgsz;
     unsigned long long v;
     if (r < pgsz) r = pgsz;
@@ -3144,8 +3153,7 @@ static int proc_stat_text(char *b, size_t n) {
     int hpgrp = (int)getpgid(0), hsid = (int)getsid(0);
     int gpgrp = (g_init_hostpid && hpgrp == g_init_hostpid) ? 1 : hpgrp;
     int gsid = (g_init_hostpid && hsid == g_init_hostpid) ? 1 : hsid;
-    long pg = sysconf(_SC_PAGESIZE);
-    unsigned long pgsz = pg > 0 ? (unsigned long)pg : 4096;
+    unsigned long pgsz = (unsigned long)hl_linux_host_page_size();
     unsigned long long vm_rss, vm_vsize;
     self_vm_bytes(&vm_rss, &vm_vsize);
     unsigned long rss_pg = (unsigned long)(vm_rss / pgsz);
@@ -4356,8 +4364,7 @@ static int proc_stat_pid_text(char *b, size_t n, int gp, int host) {
     int psess = (hsid > 0) ? ((g_init_hostpid && hsid == g_init_hostpid) ? 1 : hsid) : gp;
     long hz = sysconf(_SC_CLK_TCK);
     if (hz <= 0) hz = 100;
-    long pg = sysconf(_SC_PAGESIZE);
-    unsigned long pgsz = pg > 0 ? (unsigned long)pg : 4096;
+    unsigned long pgsz = (unsigned long)hl_linux_host_page_size();
     unsigned long long utime = ok ? pi.utime_ns * (unsigned long long)hz / 1000000000ULL : 0;
     unsigned long long stime = ok ? pi.stime_ns * (unsigned long long)hz / 1000000000ULL : 0;
     unsigned long rss_pg = ok ? (unsigned long)(pi.rss / pgsz) : 0;
@@ -4470,8 +4477,7 @@ static int proc_statm_common(char *b, size_t n, unsigned long size_pg, unsigned 
 }
 
 static int proc_statm_text(char *b, size_t n) { // our own pid
-    long pg = sysconf(_SC_PAGESIZE);
-    unsigned long pgsz = pg > 0 ? (unsigned long)pg : 4096;
+    unsigned long pgsz = (unsigned long)hl_linux_host_page_size();
     unsigned long long vm_rss, vm_vsize;
     self_vm_bytes(&vm_rss, &vm_vsize);
     unsigned long rss_pg = (unsigned long)(vm_rss / pgsz);
@@ -4482,8 +4488,7 @@ static int proc_statm_text(char *b, size_t n) { // our own pid
 
 static int proc_statm_pid_text(char *b, size_t n, int host) { // a peer -- real host-backed RSS
     struct hl_procinfo pi;
-    long pg = sysconf(_SC_PAGESIZE);
-    unsigned long pgsz = pg > 0 ? (unsigned long)pg : 4096;
+    unsigned long pgsz = (unsigned long)hl_linux_host_page_size();
     unsigned long rss_pg = hl_get_procinfo(host, &pi) ? (unsigned long)(pi.rss / pgsz) : 0;
     unsigned long overhead_pg = (unsigned long)((128ULL << 20) / pgsz);
     return proc_statm_common(b, n, rss_pg + overhead_pg, rss_pg);

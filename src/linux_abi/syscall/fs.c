@@ -222,7 +222,9 @@ static void tty_ctl_restore(const sigset_t *saved) {
 // e.g. PG_VERSION -> "base/5 is not a valid data directory" on the first client connect).
 // nm/ty are heap-allocated by overlay_readdir (it grows them to the real entry count -- no 1024 cap, so
 // large directories no longer truncate) and owned until freed (ovldents_free). Indexed DIRECTLY by
-// guest fd (the getdents call site guarantees fd in [0,1024)); a former 16-slot table with slot-0 eviction
+// guest fd (the getdents call site guards `fd < HL_NFD`, which is why this table is [HL_NFD] -- the comment
+// used to claim [0,1024) and the table used to be [1024], and the call site never agreed); a former 16-slot
+// table with slot-0 eviction
 // broke deep `find`: a recursive walk keeps one open dir fd per level, so past 16 concurrent overlay dirs
 // an ancestor's snapshot was evicted and its next getdents re-snapshotted from pos 0 -> re-descended the
 // same subtree forever (loop threshold was exactly depth 16).
@@ -231,7 +233,7 @@ static struct {
     int n, pos;
     char (*nm)[256];
     uint8_t *ty;
-} g_ovldents[1024];
+} g_ovldents[HL_NFD]; // [HL_NFD], not [1024]: case 61 below guards with `fd < HL_NFD` before indexing this.
 
 static void ovldents_free(int i) {
     free(g_ovldents[i].nm);
@@ -243,14 +245,14 @@ static void ovldents_free(int i) {
 }
 
 static void ovldents_drop(int fd) {
-    if (fd >= 0 && fd < 1024 && g_ovldents[fd].taken) ovldents_free(fd);
+    if (fd >= 0 && fd < HL_NFD && g_ovldents[fd].taken) ovldents_free(fd);
 }
 
 // rewinddir/seekdir on an overlay-merged dir: reset the replay cursor. pos<=0 (or out of range) restarts
 // from the top; an untaken snapshot is left alone (the next getdents re-snapshots from 0). Forward-declared
 // in vfs.c for the lseek handler (io.c), which is compiled into this TU before fs.c.
 static void ovldents_rewind(int fd, int pos) {
-    if (fd < 0 || fd >= 1024 || !g_ovldents[fd].taken) return;
+    if (fd < 0 || fd >= HL_NFD || !g_ovldents[fd].taken) return;
     g_ovldents[fd].pos = (pos > 0 && pos <= g_ovldents[fd].n) ? pos : 0;
 }
 
@@ -424,17 +426,15 @@ static void fd_reset_emul(int fd) {
             g_fd_pushback[fd] = NULL;
             g_fd_pb_len[fd] = 0;
         }
-        // g_ovldir/g_opath are sized [1024], NOT [HL_NFD] (see the io.c read guards, all `fd < 1024`). The
-        // enclosing `fd < HL_NFD` guard is too loose for these two: close_range(first, ~0U) — glibc's fd
-        // sanitize, which erl_child_setup runs before every port fork — is clamped to fd 65535 and calls
-        // fd_reset_emul() for EVERY fd in the range, so an unguarded g_ovldir[fd][0]/g_opath[fd] write here
-        // stored WILD into BSS for any fd >= 1024 (fd*192 bytes past g_ovldir). That intermittently hit an
-        // unmapped page (SIGSEGV/SIGBUS -> a hang when g_in_service re-faults, or SIGILL after it corrupted
-        // engine state into a wild control-flow jump) — the #215 "beam.smp fork+exec control-flow corruption".
-        if (fd < 1024) {
-            g_ovldir[fd][0] = 0;
-            g_opath[fd] = 0;
-        }
+        // g_ovldir/g_opath are now [HL_NFD] like every other table here, so the enclosing `fd < HL_NFD`
+        // guard covers them and the historical `fd < 1024` clamp is gone. That clamp was the #215 fix
+        // ("beam.smp fork+exec control-flow corruption"): close_range(first, ~0U) — glibc's fd sanitize, which
+        // erl_child_setup runs before every port fork — is clamped to fd 65535 and calls fd_reset_emul() for
+        // EVERY fd in that range, so an unguarded store past the old [1024] bound went wild into BSS. It fixed
+        // the close path only; the OPEN paths below still guarded with `< HL_NFD` against the same [1024]
+        // arrays. Resizing the arrays is what makes every guard in the file agree.
+        g_ovldir[fd][0] = 0;
+        g_opath[fd] = 0;
         g_devfull[fd] = 0;
         g_devseed[fd] = 0;
         g_devtty[fd] = 0;
@@ -3602,7 +3602,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // getdents64
     case 61: {
         int fd = (int)a0;
-        if (fd >= 0 && fd < 1024 && !g_ovldir[fd][0] && g_fdpath[fd][0]) {
+        if (fd >= 0 && fd < HL_NFD && !g_ovldir[fd][0] && g_fdpath[fd][0]) {
             char guest_directory[4200];
             uint32_t provider_cursor = 0;
             guest_from_host(g_fdpath[fd], guest_directory, sizeof guest_directory);

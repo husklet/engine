@@ -1,6 +1,7 @@
 // hl/linux_abi -- threads & futex (clone -> pthread; per-thread cpu; futex via condvars).
 
 #include "../host/range.h"
+#include "page.h" // hl_linux_host_map_granularity
 #include "../host/system.h"
 #include "bus.h"
 #include "logical_vma.h"
@@ -896,7 +897,7 @@ static void filemap_resize_identity(uint64_t device, uint64_t inode, uint64_t ol
             if (!mapping->shared) {
                 mapping->follow_lo = old_accessible;
                 mapping->follow_hi = new_accessible;
-                long hp = sysconf(_SC_PAGESIZE);
+                long hp = (long)hl_linux_host_map_granularity();
                 uint64_t cursor = old_accessible;
                 while (hp > 0 && cursor < new_accessible) {
                     uint64_t absolute = mapping->lo + cursor;

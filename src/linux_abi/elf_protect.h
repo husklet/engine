@@ -4,7 +4,7 @@
 #include "hl/host_services.h"
 
 #include <stdint.h>
-#include <sys/mman.h>
+#include "host_mman.h"
 #include <unistd.h>
 
 // THE LOADER'S PROTECTION CONTRACT, stated once because the two loaders each holding half of it is what

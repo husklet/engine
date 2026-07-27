@@ -112,7 +112,7 @@ static ssize_t pread_retry(int fd, void *buffer, size_t length, off_t offset) {
 }
 
 static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int fd, off_t off) {
-    size_t hp = (size_t)getpagesize();
+    size_t hp = hl_linux_host_map_granularity();
     uint64_t lo = a0, hi = a0 + a1;
     uint64_t ilo = (lo + hp - 1) & ~((uint64_t)hp - 1); // first fully-covered host page
     uint64_t ihi = hi & ~((uint64_t)hp - 1);            // end of last fully-covered host page
@@ -197,7 +197,7 @@ static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int f
 
 // The guest's page size (as it sees via AT_PAGESZ / sysconf(_SC_PAGESIZE)).  Read it from auxv after
 // stack construction; before that exists, fall back to the Linux ABI constant, never the host mapping
-// granularity.  Host mmap alignment paths use getpagesize() explicitly.
+// granularity.  Host mmap alignment paths use hl_linux_host_map_granularity() explicitly.
 static size_t guest_pagesz(void) {
     for (int i = 0; i + 16 <= g_auxv_len; i += 16) {
         uint64_t t, v;
@@ -301,7 +301,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         //     aborts on CHECK(0 == munmap)). So release only the whole HOST pages lying ENTIRELY inside
         //     [a0, a0+len); the partial edge pages stay mapped. The guest's logical unmap still succeeds
         //     (return 0) -- matching Linux, which never faults an unmap of a partial/already-unmapped range.
-        size_t hp = (size_t)getpagesize();
+        size_t hp = hl_linux_host_map_granularity();
         uint64_t physical_address = 0, physical_length = 0;
         int has_physical = hl_gmap_find_physical(a0, &physical_address, &physical_length);
         int complete = (full == (uint64_t)a1 || full == (uint64_t)a1 + 0x10000) &&
@@ -461,7 +461,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // shrink/grow/relocate logic below, where a same-size/shrink FIXED stays coherent via the shared
             // file exactly as before (LTP mremap06 moves a MAP_SHARED sub-mapping this way).
             if (anon_prot_if_contained(a0, (size_t)a1) >= 0) {
-                size_t hp = (size_t)getpagesize();
+                size_t hp = hl_linux_host_map_granularity();
                 void *r;
                 if ((a4 & (hp - 1)) == 0) {
                     r = mmap((void *)a4, (size_t)a2 + guard, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE,
@@ -672,7 +672,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 prot &= ~PROT_EXEC;
             }
         }
-        size_t hp = (size_t)getpagesize();
+        size_t hp = hl_linux_host_map_granularity();
         void *r = MAP_FAILED;
         int off_emul = 0;
         void *physical_mapping = NULL;
@@ -1230,7 +1230,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     // so sub-host-page granularity is coarser than a real 4 KB kernel, but residency of the covering
     // page is faithful.) Untouched trailing bytes (the guest zero-filled its vector) stay 0 = absent.
     case 232: {
-        size_t hps = (size_t)getpagesize(); // host mmap granularity (16 KB on Apple Silicon)
+        size_t hps = hl_linux_host_map_granularity(); // 16 KB on Apple Silicon, 64 KB on Windows
         size_t gps = guest_pagesz();        // page size the GUEST believes in (AT_PAGESZ: 4 KB on both ISAs)
         size_t len = (size_t)a1;
         // Linux mincore requires a page-aligned start address -> EINVAL otherwise (align to the GUEST page
@@ -1412,7 +1412,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // holds a live tiny string span -> the "heap corruption"). Fix: MAP_FIXED-remap only the
                 // host-page-aligned INTERIOR (safe physical release + zero); zero the partial edge host pages
                 // with memset over EXACTLY the requested bytes, never remapping a page shared with a neighbour.
-                size_t hp = (size_t)getpagesize();
+                size_t hp = hl_linux_host_map_granularity();
                 uint64_t lo = a0, hi = a0 + a1;
                 uint64_t ilo = (lo + hp - 1) & ~((uint64_t)hp - 1); // first fully-covered host page
                 uint64_t ihi = hi & ~((uint64_t)hp - 1);            // end of last fully-covered host page

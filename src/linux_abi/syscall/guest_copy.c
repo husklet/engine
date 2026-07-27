@@ -13,7 +13,7 @@
  * mapping quiescence boundary.
  */
 #include "../logical_vma.h"
-#include <poll.h>
+#include "../host_poll.h"
 #include <sys/ioctl.h>
 
 #ifndef G_SMC_COPYOUT

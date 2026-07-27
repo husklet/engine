@@ -14,19 +14,19 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/mman.h>
+#include "../../linux_abi/host_mman.h" // <sys/mman.h>, or the typed VM seam where the host has none
 #include <sys/stat.h>
 #include <pthread.h>
 #include <errno.h>
 #include <limits.h>
 #include <time.h>
 #include <sys/time.h>
-#include <sys/uio.h>
+#include "../../linux_abi/host_uio.h" // <sys/uio.h>, or the guest iovec layout where the host has none
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/un.h>
-#include <poll.h>
+#include "../../linux_abi/host_poll.h" // <poll.h>, or a typed absence where the host has no mixed-handle readiness
 #include "../../host/native_compat.h"
 #include "../../host/native_context.h"
 #include <signal.h>

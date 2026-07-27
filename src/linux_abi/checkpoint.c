@@ -1973,7 +1973,7 @@ static int ckpt_dump_self_locked(struct cpu *c, const char *group) {
     }
     struct ckpt_sink_stream *fp = NULL, *ff = NULL;
     int ok = 0;
-    size_t pagesz = (size_t)getpagesize();
+    size_t pagesz = hl_linux_host_map_granularity();
 
     struct ckpt_meta m;
     memset(&m, 0, sizeof m);
@@ -2473,7 +2473,7 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
             int seed = ckpt_restore_backing_seed(procdir, reg.backing_object, seed_size);
             if (seed < 0 ||
                 hl_logical_vma_global_restore_shared(reg.addr, reg.glen, (uint32_t)reg.prot, seed,
-                                                     reg.backing_offset, (size_t)getpagesize()) != 0) {
+                                                     reg.backing_offset, hl_linux_host_map_granularity()) != 0) {
                 fprintf(stderr, "[restore] cannot rebuild logical guest region %llx+%llx: %s\n",
                         (unsigned long long)reg.addr, (unsigned long long)reg.glen, strerror(errno));
                 goto fail;

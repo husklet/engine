@@ -461,7 +461,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     // An O_PATH fd names a file but is not open for I/O -- Linux rejects the read/write family through it
     // with EBADF (fs/read_write.c). It stays valid as a dirfd for *at() and for fstat/fchdir (served by
     // svc_fs), so only the I/O syscalls are gated here.
-    if ((int)a0 >= 0 && (int)a0 < 1024 && g_opath[(int)a0]) {
+    if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_opath[(int)a0]) {
         switch (nr) {
         case 63:
         case 64:
@@ -600,7 +600,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // plain path or a merged snapshot in the overlay path -- neither moves when the guest lseeks its
         // own fd. glibc rewinddir()/seekdir() ARE exactly this lseek, so redirect it here or the
         // enumeration never restarts (the readdir-dtype xfail: rewinddir's 2nd pass saw 0 entries).
-        if ((int)a0 >= 0 && (int)a0 < 1024 && g_nlower && g_ovldir[(int)a0][0]) {
+        if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_nlower && g_ovldir[(int)a0][0]) {
             if (whence == 0 /*SEEK_SET*/) {
                 ovldents_rewind((int)a0, (int)(off_t)a1);
                 G_RET(c) = (uint64_t)a1;
@@ -2135,8 +2135,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             if (lcmd == 1031) {
                 int want = (int)a2;
-                long pg = sysconf(_SC_PAGESIZE);
-                if (pg <= 0) pg = 4096;
+                long pg = (long)hl_linux_host_page_size();
                 int rounded = (int)(((want + pg - 1) / pg) * pg);
                 if (rounded < (int)pg) rounded = (int)pg;
                 if ((int)a0 >= 0 && (int)a0 < HL_NFD) g_pipesz[(int)a0] = rounded;

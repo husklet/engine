@@ -948,7 +948,7 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         int mflags = MAP_SHARED;
         if (shmaddr) {
             uintptr_t a = (uintptr_t)shmaddr;
-            size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+            size_t pg = hl_linux_host_map_granularity();
             if (flag & L_SHM_RND)
                 a &= ~(uintptr_t)(pg - 1);
             else if (a & (pg - 1)) {
