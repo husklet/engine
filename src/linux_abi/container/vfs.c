@@ -1457,13 +1457,20 @@ static int root_handle_bind(const char *path) {
     const hl_host_posix_attachment_services *attachment;
     hl_host_result root;
     hl_host_result canonical;
-    hl_host_result borrowed;
+    hl_host_result borrowed = {0};
     char canonical_path[sizeof g_rootfs_canon];
 
-    if (g_host_services == NULL || g_host_services->file == NULL ||
-        g_host_services->posix_attachment == NULL || path == NULL || path[0] == '\0')
-        return -1;
+    if (g_host_services == NULL || g_host_services->file == NULL || path == NULL || path[0] == '\0') return -1;
     file = g_host_services->file;
+    // The native twin is an OPTIONAL POSIX adapter (HL_HOST_CAP_POSIX_ATTACHMENT): a host with no native
+    // descriptor to hand out leaves g_root_fd unbound rather than failing the pin, because the pin is a GATE
+    // and not a functional dependency for a bare guest -- jail_routed_at() is identically 0 without a rootfs
+    // and without a volume, so the confined walk (the only consumer of the native root) is never entered, and
+    // the guest ELF already loads through the typed lane (image.c). Every remaining g_root_fd reader is
+    // -1-safe: jail_pick()/jail_pick_idx() hand it back for equality tests (dispatch.c, overlay.c) or into
+    // resolve_at's explicit `root_fd < 0 && !g_rootfs` fallback, engine_fd_reloc() ignores a slot that does
+    // not equal the target fd, and engine_fd_vacate_range()/exec_fd_is_engine() filter on >= 0. A rootfs DOES
+    // need the walk; root_native_require() below refuses it there, naming what is missing.
     attachment = g_host_services->posix_attachment;
     root = file->open_relative(g_host_services->context, HL_HOST_HANDLE_CWD, path, strlen(path),
                                HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_PATH_ONLY, 0, 0);
@@ -1472,18 +1479,20 @@ static int root_handle_bind(const char *path) {
                            (hl_host_bytes){(unsigned char *)canonical_path, sizeof(canonical_path) - 1});
     if (canonical.status != HL_STATUS_OK || canonical.value >= sizeof(canonical_path)) goto fail_root;
     canonical_path[canonical.value] = '\0';
-    borrowed = attachment->borrow_file_at_least(g_host_services->context, root.value, 1u << 20);
-    if (borrowed.status != HL_STATUS_OK)
-        borrowed = attachment->borrow_file_at_least(g_host_services->context, root.value, 64);
-    if (borrowed.status != HL_STATUS_OK || borrowed.value > INT_MAX) goto fail_root;
-    if (g_root_fd >= 0 && attachment->release(g_host_services->context, (uint64_t)(unsigned)g_root_fd).status !=
-                              HL_STATUS_OK)
-        goto fail_borrowed;
+    if (attachment != NULL) {
+        borrowed = attachment->borrow_file_at_least(g_host_services->context, root.value, 1u << 20);
+        if (borrowed.status != HL_STATUS_OK)
+            borrowed = attachment->borrow_file_at_least(g_host_services->context, root.value, 64);
+        if (borrowed.status != HL_STATUS_OK || borrowed.value > INT_MAX) goto fail_root;
+        if (g_root_fd >= 0 && attachment->release(g_host_services->context, (uint64_t)(unsigned)g_root_fd).status !=
+                                  HL_STATUS_OK)
+            goto fail_borrowed;
+    }
     if (g_root_handle != HL_HOST_HANDLE_INVALID &&
         file->close(g_host_services->context, g_root_handle).status != HL_STATUS_OK)
         goto fail_borrowed;
     g_root_handle = root.value;
-    g_root_fd = (int)borrowed.value;
+    if (attachment != NULL) g_root_fd = (int)borrowed.value;
     if (g_rootfs != NULL) {
         memcpy(g_rootfs_canon, canonical_path, (size_t)canonical.value + 1);
         g_rootfs_canon_len = (size_t)canonical.value;
@@ -1491,9 +1500,23 @@ static int root_handle_bind(const char *path) {
     return 0;
 
 fail_borrowed:
-    (void)attachment->release(g_host_services->context, borrowed.value);
+    if (attachment != NULL) (void)attachment->release(g_host_services->context, borrowed.value);
 fail_root:
     (void)file->close(g_host_services->context, root.value);
+    return -1;
+}
+
+// A rootfs is the one shape that genuinely requires the native root: every container path syscall runs the
+// confined per-component walk (resolve_at -> jail_pick_idx), which starts from g_root_fd and has no typed
+// arm yet. Refuse the container HERE, naming the missing capability, instead of letting root_handle_bind
+// fail for every guest (which is what blocked a bare launch) or letting resolve_at return a bare -EPERM from
+// its `root_fd < 0` arm once per path syscall. Unreachable on Linux/macOS: both advertise
+// HL_HOST_CAP_POSIX_ATTACHMENT (linux/host.c, macos/host.c), so root_handle_bind always binds g_root_fd.
+static int root_native_require(const char *path) {
+    if (g_root_fd >= 0) return 0;
+    fprintf(stderr, "hl-engine: rootfs %s needs a native root descriptor; this host does not implement the "
+                    "optional POSIX attachment services\n",
+            path);
     return -1;
 }
 
