@@ -198,11 +198,32 @@ static inline void interp_tso_fence(void) {
 #endif
 }
 
+// ONE host access per guest access. With a RUNTIME size, memcpy is a CALL into glibc, whose 4..7 and 8..15
+// paths copy head and tail separately -- the same address twice at n == 4 and n == 8 -- so a guest store
+// landed TWICE and resurrected whatever a peer guest thread had committed to that word in between. Measured
+// on the aarch64 guest as a spinlock admitting two holders; ~1e-4 of racing CASes silently undone. Packed
+// structs, not casts: a guest access need not be aligned, and this must stay one instruction at every -O
+// level, not only where the optimiser inlines a constant-size memcpy.
+struct interp_una8 { uint8_t v; } __attribute__((packed));
+struct interp_una16 { uint16_t v; } __attribute__((packed));
+struct interp_una32 { uint32_t v; } __attribute__((packed));
+struct interp_una64 { uint64_t v; } __attribute__((packed));
+
+static void interp_copy_indivisible(void *destination, const void *source, unsigned bytes) {
+    switch (bytes) {
+    case 1: *(struct interp_una8 *)destination = *(const struct interp_una8 *)source; return;
+    case 2: *(struct interp_una16 *)destination = *(const struct interp_una16 *)source; return;
+    case 4: *(struct interp_una32 *)destination = *(const struct interp_una32 *)source; return;
+    case 8: *(struct interp_una64 *)destination = *(const struct interp_una64 *)source; return;
+    default: memcpy(destination, source, bytes); return; // 3/5/6/7: no guest access is this width
+    }
+}
+
 static uint64_t interp_load(uint64_t guest_address, int width) {
     uint64_t value = 0;
     const void *host = (const void *)(uintptr_t)hl_x86_guest_pointer(guest_address);
     interp_access_begin(guest_address, (uint64_t)width);
-    memcpy(&value, host, (size_t)width);
+    interp_copy_indivisible(&value, host, (unsigned)width);
     interp_access_end();
     interp_tso_fence();
     return value;
@@ -212,7 +233,7 @@ static void interp_store(uint64_t guest_address, int width, uint64_t value) {
     void *host = (void *)(uintptr_t)hl_x86_guest_pointer(guest_address);
     interp_tso_fence();
     interp_access_begin(guest_address, (uint64_t)width);
-    memcpy(host, &value, (size_t)width);
+    interp_copy_indivisible(host, &value, (unsigned)width);
     interp_access_end();
     // Stores into an emulated MAP_SHARED mapping (or an executable alias) must be queued for
     // jit86_smc_commit before a syscall lets a peer observe them.
@@ -608,9 +629,9 @@ static uint64_t interp_locked_rmw(uint64_t guest_address, int width, enum interp
         while (__atomic_exchange_n(lock, 1u, __ATOMIC_ACQUIRE))
             ; // an exchange always makes forward progress
         interp_access_begin(guest_address, (uint64_t)width);
-        memcpy(&old, pointer, (size_t)width);
+        interp_copy_indivisible(&old, pointer, (unsigned)width);
         next_value = interp_rmw_apply(kind, old, operand, carry_in, width);
-        memcpy(pointer, &next_value, (size_t)width);
+        interp_copy_indivisible(pointer, &next_value, (unsigned)width);
         interp_access_end();
         __atomic_store_n(lock, 0u, __ATOMIC_RELEASE);
     }
@@ -4630,9 +4651,9 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
                 while (__atomic_exchange_n(lock, 1u, __ATOMIC_ACQUIRE))
                     ;
                 observed = 0;
-                memcpy(&observed, pointer, (size_t)width);
+                interp_copy_indivisible(&observed, pointer, (unsigned)width);
                 if ((observed & interp_mask(width)) == (accumulator & interp_mask(width))) {
-                    memcpy(pointer, &source, (size_t)width);
+                    interp_copy_indivisible(pointer, &source, (unsigned)width);
                     swapped = 1;
                 }
                 __atomic_store_n(lock, 0u, __ATOMIC_RELEASE);
