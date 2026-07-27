@@ -1,6 +1,22 @@
 #define _POSIX_C_SOURCE 200809L
 #include "dns.h"
 
+/* Warming the host resolver is a prewarm, not a service: it resolves one throwaway name so that the lazy
+ * work a first getaddrinfo() performs -- loading the resolver's shared objects, reading the system
+ * configuration, and on macOS initializing the Foundation string classes underneath it -- has already
+ * happened by the time the guest is confined and can no longer reach any of it.
+ *
+ * Windows has no <netdb.h> and therefore no getaddrinfo() outside Winsock, which the portable layers do not
+ * initialize. There is nothing to prewarm here and nothing this can approximate: the guest-facing resolver
+ * path for this host does not exist yet. The absence is the whole implementation below -- deliberately a
+ * no-op rather than a degraded resolve, because a prewarm has no result a caller can observe and a partial
+ * one would only move the same first-call cost, never a correctness answer. */
+#if defined(_WIN32)
+
+void hl_linux_dns_prepare(void) {}
+
+#else
+
 #include <netdb.h>
 #include <pthread.h>
 #if defined(__APPLE__)
@@ -72,3 +88,5 @@ static void prepare_host_resolver(void) {
 void hl_linux_dns_prepare(void) {
     (void)pthread_once(&dns_preparation, prepare_host_resolver);
 }
+
+#endif

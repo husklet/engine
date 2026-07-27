@@ -4,6 +4,70 @@
 
 #include "checkpoint_channel.h"
 
+/* The checkpoint transport is not a protocol that happens to use POSIX; it IS four POSIX mechanisms.
+ * The broker is an AF_UNIX socketpair, engine processes announce themselves by passing a live descriptor
+ * over SCM_RIGHTS, the per-process channel is re-created after fork() because a shared stream socket would
+ * interleave two processes' frames, and the trigger is a memfd mapped MAP_SHARED so every fork descendant
+ * polls one counter with a plain load. Windows has none of the four, and the descriptor-passing half is
+ * already declared absent for this host: fork_wire.c, which sends and receives those descriptors, is left
+ * out of the Windows host archive for exactly that reason.
+ *
+ * So the feature is guarded whole rather than emulated. Every entry point still exists, and each reports
+ * the absence in its own already-defined failure channel -- the -1 that callers handle when no broker was
+ * published or a connect failed -- so nothing here can be mistaken for a checkpoint that was taken. A named
+ * pipe plus DuplicateHandle could carry this protocol one day; that is a transport to design, not a spelling
+ * to shim, and inventing half of it here would produce a channel that accepts requests and captures nothing. */
+#if defined(_WIN32)
+
+void hl_ckpt_channel_publish(int broker) { (void)broker; }
+int hl_ckpt_channel_broker(void) { return -1; }
+int hl_ckpt_channel_adopt(const char *broker, const char *trigger) {
+    (void)broker;
+    (void)trigger;
+    return -1;
+}
+int hl_ckpt_channel_acquire(void) { return -1; }
+int hl_ckpt_channel_call(hl_ckpt_request *request, const char *name, const void *payload, hl_ckpt_reply *reply,
+                         void *out, size_t capacity) {
+    (void)request;
+    (void)name;
+    (void)payload;
+    (void)reply;
+    (void)out;
+    (void)capacity;
+    return -1;
+}
+void hl_ckpt_trigger_publish(int descriptor) { (void)descriptor; }
+int hl_ckpt_trigger_descriptor(void) { return -1; }
+int hl_ckpt_broker_pair(int *out_parent, int *out_child) {
+    if (out_parent != NULL) *out_parent = -1;
+    if (out_child != NULL) *out_child = -1;
+    return -1;
+}
+int hl_ckpt_broker_accept(int broker, int timeout_ms, uint64_t *out_host_pid) {
+    (void)broker;
+    (void)timeout_ms;
+    (void)out_host_pid;
+    return -1;
+}
+int hl_ckpt_trigger_create(int *out_descriptor, void **out_mapping) {
+    if (out_descriptor != NULL) *out_descriptor = -1;
+    if (out_mapping != NULL) *out_mapping = NULL;
+    return -1;
+}
+/* A trigger that was never created has no generation to advance. Zero is what a NULL mapping already
+ * returns on every host, so a caller that skipped the failed create() sees one answer everywhere. */
+uint32_t hl_ckpt_trigger_bump(void *mapping) {
+    (void)mapping;
+    return 0;
+}
+void hl_ckpt_trigger_destroy(void *mapping, int descriptor) {
+    (void)mapping;
+    (void)descriptor;
+}
+
+#else
+
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -260,3 +324,5 @@ void hl_ckpt_trigger_destroy(void *mapping, int descriptor) {
     if (mapping != NULL) (void)munmap(mapping, sizeof(uint32_t));
     if (descriptor >= 0) (void)close(descriptor);
 }
+
+#endif

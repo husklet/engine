@@ -1,8 +1,10 @@
+#define _POSIX_C_SOURCE 200809L
 #include "shm.h"
+
+#include "../../host/libc_compat.h"
 
 #include <stdio.h>
 #include <string.h>
-#include <sys/stat.h>
 
 /*
  * /dev/shm is a tmpfs DIRECTORY on Linux, and the guest sees it as one: it lists it, stats it, and opens
@@ -17,7 +19,8 @@ static const char *shm_dir(const char *root, const char *namespace_key, char *ou
                      : snprintf(output, capacity, "/tmp/.hl-shm-%s",
                                 namespace_key != NULL && namespace_key[0] ? namespace_key : "unscoped");
     if (length < 0 || (size_t)length >= capacity) return NULL;
-    mkdir(output, 01777); // idempotent; the guest may reach a segment before anything created the directory
+    // Idempotent; the guest may reach a segment before anything created the directory.
+    hl_compat_mkdir(output, 01777);
     return output;
 }
 

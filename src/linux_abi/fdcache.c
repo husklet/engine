@@ -6,8 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <unistd.h>
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#endif
 
 #define MCACHE_N 8192
 #define RCACHE_N 8192
@@ -191,12 +193,32 @@ static void oc_reset(void);
 // counter; a fresh `docker exec` is a NEW hl process = its own tree = its own counter (correct per-container
 // isolation). Falls back to a private local counter if the mmap fails (degrades to per-process
 // behaviour, never crashes).
+/* One page that survives fork(2) as ONE physical counter rather than a copy per child. This is the only
+ * mapping in this file that the typed memory seam does not create, and the reason is ordering, not spelling:
+ * map_anonymous(HL_HOST_MEMORY_SHARED) expresses it exactly, but the counter has to exist before the guest's
+ * first fork and the caller below is a load-time constructor that runs before any host is bound. Routing it
+ * as-is would hand every host the private-counter fallback and silently drop cross-process coherence on
+ * Linux and macOS, which is a worse trade than leaving one call unrouted. Binding a host earlier than the
+ * constructor is the fix; until then this stays the single named exception.
+ *
+ * On a host without fork(2) the sharing has nothing to share WITH -- one process is the whole tree, so a
+ * private counter is not a degraded shared one, it is the same object. NULL therefore selects the local
+ * counter that the mmap failure path already selects, rather than pretending a page was mapped. */
+static _Atomic uint32_t *fdcache_forkshared_counter(void) {
+#if defined(_WIN32)
+    return NULL;
+#else
+    void *m = mmap(NULL, sizeof(_Atomic uint32_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+    return m == MAP_FAILED ? NULL : (_Atomic uint32_t *)m;
+#endif
+}
+
 void hl_fdcache_runtime_init(void) {
     if (g_res_epoch_ptr != &g_fdcache.resolver_epoch_local) return;
-    void *m = mmap(NULL, sizeof(_Atomic uint32_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
-    if (m != MAP_FAILED) {
-        atomic_store((_Atomic uint32_t *)m, 1);
-        g_res_epoch_ptr = (_Atomic uint32_t *)m;
+    _Atomic uint32_t *shared = fdcache_forkshared_counter();
+    if (shared != NULL) {
+        atomic_store(shared, 1);
+        g_res_epoch_ptr = shared;
     }
 }
 
