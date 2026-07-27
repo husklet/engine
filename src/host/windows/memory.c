@@ -847,7 +847,22 @@ static hl_host_result hl_windows_memory_repair_code(void *context, hl_host_code_
  * faulting thread, so it takes no lock, allocates nothing, logs nothing, touches
  * no ownership registry and branches on return values only -- never on
  * GetLastError(). VirtualProtect and VirtualAlloc are thin kernel32 -> ntdll ->
- * syscall stubs that touch no CRT state and take no loader lock.
+ * syscall stubs that touch no CRT state and take no loader lock, and both are
+ * ordinary statically bound imports, so calling them cannot trigger the first
+ * resolution of a delay-loaded thunk while the loader lock is held.
+ *
+ * The safety argument is structural rather than a list of async-signal-safe
+ * calls: a vectored handler is only ever entered synchronously, from a faulting
+ * instruction, on the faulting thread, so there is no "interrupted mid-malloc"
+ * hazard to be safe against. What remains is same-thread lock recursion, which
+ * is why the ban on locks is kept verbatim even though the POSIX reason for it
+ * does not apply.
+ *
+ * The one Win32-only obligation: every call here overwrites the thread's last
+ * error, which is a TEB field the faulting instruction stream may be about to
+ * read. It is saved and restored around the whole ladder. (The handler boundary
+ * does the same, so this is belt and braces for a caller reaching the callback
+ * by some other route.)
  *
  * The ladder is the exact analogue of the POSIX one. Step two claims a vacant
  * range without replacement: VirtualAlloc with MEM_RESERVE over an already
@@ -856,18 +871,175 @@ static hl_host_result hl_windows_memory_repair_code(void *context, hl_host_code_
  * only the requested page, so step three normalizes the page protection.
  */
 static int hl_windows_memory_repair_signal_page(void *context, uint64_t address, uint64_t size, uint32_t protection) {
+    DWORD saved_error;
     DWORD native;
     DWORD previous = 0;
     void *page;
+    int repaired;
     (void)context;
     if (address == 0 || address > UINTPTR_MAX || size != HL_WINDOWS_PAGE_SIZE ||
         (address & (HL_WINDOWS_PAGE_SIZE - 1u)) != 0 || !hl_windows_protection_valid(protection))
         return 0;
+    saved_error = GetLastError();
     page = (void *)(uintptr_t)address;
     native = hl_windows_page_protection(protection);
-    if (VirtualProtect(page, (SIZE_T)size, native, &previous)) return 1;
-    if (VirtualAlloc(page, (SIZE_T)size, MEM_RESERVE | MEM_COMMIT, native) == NULL) return 0;
-    return VirtualProtect(page, (SIZE_T)size, native, &previous) != 0;
+    if (VirtualProtect(page, (SIZE_T)size, native, &previous)) {
+        repaired = 1;
+    } else if (VirtualAlloc(page, (SIZE_T)size, MEM_RESERVE | MEM_COMMIT, native) == NULL) {
+        repaired = 0;
+    } else {
+        repaired = VirtualProtect(page, (SIZE_T)size, native, &previous) != 0;
+    }
+    SetLastError(saved_error);
+    return repaired;
+}
+
+/* --- address-keyed operations ------------------------------------------------ */
+
+/* True while any live mapping handle covers a byte of [low, high). Both aliases
+ * of a dual-alias code mapping count, because releasing either one out from
+ * under its owner is exactly the failure this guard exists to prevent. */
+static int hl_windows_range_owned_locked(const hl_host_windows *host, uintptr_t low, uintptr_t high) {
+    uint32_t index;
+    for (index = 0; index < host->handle_capacity; ++index) {
+        const hl_windows_handle_entry *entry = &host->handles[index];
+        if (entry->kind != HL_WINDOWS_HANDLE_MAPPING || entry->size == 0) continue;
+        if (entry->address != NULL) {
+            const uintptr_t owned = (uintptr_t)entry->address;
+            if (low < owned + (uintptr_t)entry->size && owned < high) return 1;
+        }
+        if (entry->executable_address != NULL) {
+            const uintptr_t owned = (uintptr_t)entry->executable_address;
+            if (low < owned + (uintptr_t)entry->size && owned < high) return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Bounds and type of the one NT allocation containing `inside`, or 0 when that
+ * address is free. VirtualQuery reports one protection run at a time and only
+ * AllocationBase ties the runs of a single allocation together, so the end has
+ * to be walked for rather than read off. MEM_RELEASE is defined on an
+ * allocation, which is precisely why the caller needs these bounds.
+ */
+static uint64_t hl_windows_allocation_extent(void *inside, char **out_base, DWORD *out_type) {
+    MEMORY_BASIC_INFORMATION info;
+    char *base;
+    char *cursor;
+    if (VirtualQuery(inside, &info, sizeof(info)) != sizeof(info) || info.State == MEM_FREE ||
+        info.AllocationBase == NULL)
+        return 0;
+    base = info.AllocationBase;
+    *out_type = info.Type;
+    cursor = base;
+    for (;;) {
+        char *next;
+        if (VirtualQuery(cursor, &info, sizeof(info)) != sizeof(info)) break;
+        if (info.State == MEM_FREE || (char *)info.AllocationBase != base) break;
+        next = (char *)info.BaseAddress + info.RegionSize;
+        if (next <= cursor) break; /* a zero-length run would spin; NT never reports one */
+        cursor = next;
+    }
+    *out_base = base;
+    return (uint64_t)(cursor - base);
+}
+
+/*
+ * munmap over a range the engine holds no mapping handle for.
+ *
+ * The ownership refusal is decided over every live handle BEFORE anything is
+ * unmapped, so a busy range is left exactly as it was found rather than partly
+ * retired -- an address-keyed caller can never strand an owning handle over a
+ * hole. A range with no mapping at all succeeds, which is what munmap does.
+ *
+ * Retiring is then per NT allocation. An allocation covered whole is released
+ * outright -- UnmapViewOfFile for a section view, MEM_RELEASE for private pages.
+ * An allocation covered only in part is split with MEM_PRESERVE_PLACEHOLDER and
+ * the split-off placeholder released, which is the hole punch for private pages.
+ * NT refuses that split on a mapped view, and there is no way around it here: a
+ * view can only be taken apart by an owner that still knows its section handle
+ * and the section offsets of the surviving head and tail, and by construction
+ * this entry point has neither. That refusal is reported as the mapped Win32
+ * error class -- it is never rounded up to success.
+ */
+static hl_host_result hl_windows_memory_unmap_address(void *context, uint64_t address, uint64_t size) {
+    hl_host_windows *host = context;
+    hl_status status = HL_STATUS_OK;
+    char *cursor;
+    char *end;
+    if (address == 0 || size == 0 || size > SIZE_MAX || address > UINTPTR_MAX ||
+        address % HL_WINDOWS_PAGE_SIZE != 0 || size % HL_WINDOWS_PAGE_SIZE != 0 ||
+        size > (uint64_t)UINTPTR_MAX - address)
+        return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    cursor = (char *)(uintptr_t)address;
+    end = cursor + (uintptr_t)size;
+    hl_windows_lock(host);
+    if (hl_windows_range_owned_locked(host, (uintptr_t)cursor, (uintptr_t)end)) {
+        hl_windows_unlock(host);
+        return hl_windows_result(HL_STATUS_BUSY, 0, 0);
+    }
+    while (cursor < end && status == HL_STATUS_OK) {
+        char *base = NULL;
+        DWORD type = 0;
+        const uint64_t extent = hl_windows_allocation_extent(cursor, &base, &type);
+        char *clip_high;
+        if (extent == 0) {
+            /* Vacant. Step over the whole free run rather than a page at a time. */
+            MEMORY_BASIC_INFORMATION info;
+            char *next;
+            if (VirtualQuery(cursor, &info, sizeof(info)) != sizeof(info)) break;
+            next = (char *)info.BaseAddress + info.RegionSize;
+            if (next <= cursor) break;
+            cursor = next;
+            continue;
+        }
+        clip_high = base + extent < end ? base + extent : end;
+        if (cursor == base && clip_high == base + extent) {
+            const BOOL released = type == MEM_MAPPED ? UnmapViewOfFile(base) : VirtualFree(base, 0, MEM_RELEASE);
+            if (!released) status = hl_windows_status_from_error(GetLastError());
+        } else if (!hl_windows_split_release(cursor, (uint64_t)(clip_high - cursor))) {
+            status = hl_windows_status_from_error(GetLastError());
+        }
+        cursor = base + extent;
+    }
+    hl_windows_unlock(host);
+    return hl_windows_result(status, 0, 0);
+}
+
+/*
+ * VirtualLock is the nearest primitive Windows has to mlock, and it is NOT the
+ * same operation: it faults the range in and adds it to the process working set,
+ * charged against the working-set minimum, but it does not pin the pages against
+ * reclaim -- the memory manager may still trim them. So this reports
+ * HL_HOST_WIRE_WORKING_SET rather than HL_HOST_WIRE_RESIDENT. Saying RESIDENT
+ * here would be the one thing the kind field exists to prevent: the caller would
+ * read a guarantee out of a success that this host never made.
+ *
+ * The size follows VirtualLock's own rule and covers every page the range
+ * touches. The usual failure is ERROR_WORKING_SET_QUOTA when the requested range
+ * exceeds the process working-set minimum; it is reported rather than papered
+ * over with SetProcessWorkingSetSize, because silently enlarging the caller's
+ * working set is a policy decision this layer does not get to make.
+ */
+static hl_host_result hl_windows_memory_wire_range(void *context, uint64_t address, uint64_t size, uint32_t flags) {
+    (void)context;
+    if (address == 0 || size == 0 || size > SIZE_MAX || address > UINTPTR_MAX || flags != 0 ||
+        address % HL_WINDOWS_PAGE_SIZE != 0 || size > (uint64_t)UINTPTR_MAX - address)
+        return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (!VirtualLock((void *)(uintptr_t)address, (SIZE_T)size)) return hl_windows_last_error_result();
+    return hl_windows_result(HL_STATUS_OK, 0, (uint64_t)HL_HOST_WIRE_WORKING_SET);
+}
+
+/* The inverse, and it reports the same kind: what is being undone is a working-set
+ * addition, not a residency pin. */
+static hl_host_result hl_windows_memory_unwire_range(void *context, uint64_t address, uint64_t size) {
+    (void)context;
+    if (address == 0 || size == 0 || size > SIZE_MAX || address > UINTPTR_MAX ||
+        address % HL_WINDOWS_PAGE_SIZE != 0 || size > (uint64_t)UINTPTR_MAX - address)
+        return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (!VirtualUnlock((void *)(uintptr_t)address, (SIZE_T)size)) return hl_windows_last_error_result();
+    return hl_windows_result(HL_STATUS_OK, 0, (uint64_t)HL_HOST_WIRE_WORKING_SET);
 }
 
 const hl_host_memory_services hl_windows_memory_services = {HL_HOST_MEMORY_ABI,
@@ -885,4 +1057,7 @@ const hl_host_memory_services hl_windows_memory_services = {HL_HOST_MEMORY_ABI,
                                                             hl_windows_memory_unmap_range,
                                                             hl_windows_memory_map_anonymous,
                                                             hl_windows_memory_discard,
-                                                            hl_windows_memory_repair_signal_page};
+                                                            hl_windows_memory_repair_signal_page,
+                                                            hl_windows_memory_unmap_address,
+                                                            hl_windows_memory_wire_range,
+                                                            hl_windows_memory_unwire_range};

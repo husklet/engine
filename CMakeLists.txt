@@ -217,6 +217,7 @@ set(MACOS_HOST_SOURCES
 # arrive with the groups that need them.
 set(WINDOWS_HOST_SOURCES
   src/host/windows/host.c src/host/windows/memory.c src/host/windows/clock.c
+  src/host/windows/fault.c
   src/host/windows/ntpath.c src/host/windows/file.c src/host/windows/process.c
   src/host/sync.c)
 

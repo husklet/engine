@@ -13,6 +13,7 @@ owned by the Linux ABI rather than a host passthrough.
 | `internal.h` | the host struct, the handle table types, the region model, the KernelBase and ntdll entry points |
 | `host.c` | handle table, Win32 error mapping, `log`, the `sync` bridge, create/destroy |
 | `memory.c` | the whole memory group, over `VirtualAlloc2` / `MapViewOfFile3` / `UnmapViewOfFile2` placeholders |
+| `fault.h` / `fault.c` | fault interception: the process-wide VEH, exception→fault classification, context accessors, resume, the `longjmp` replacement pad |
 | `clock.c` | the whole clock group |
 | `ntpath.c` | NTSTATUS mapping, the UTF-8/UTF-16 boundary, the pinned-root resolver, the symlink format |
 | `file.c` | the whole file group, over `NtCreateFile` with `OBJECT_ATTRIBUTES.RootDirectory` |
@@ -45,3 +46,14 @@ the signal number in `detail`: Windows cannot deliver a catchable signal to anot
 
 `src/host/sync.c` is shared: its registry bookkeeping is host independent and only its primitive layer is
 per-host, so this backend selects the `SRWLOCK` arm there rather than carrying a copy.
+
+`fault.h` is the fault-interception seam and is **not** part of `hl_host_services`; it is a primitive the
+fault path links against directly. One process-wide vectored handler is installed at engine init, classifies
+an exception into a Linux-shaped `(signal, si_code, address, access)` tuple, and hands it to one installed
+callback that mutates the `CONTEXT` and asks either to resume or to decline. `__try`/`__except` is not an
+option on this toolchain — it compiles and segfaults — and no frame-scoped mechanism covers the fault sites
+the engine actually has. Two things that follow and are easy to get wrong: `longjmp` out of the handler is
+forbidden (Win64 implements it over `RtlUnwindEx`, which from inside a vectored handler means unwinding
+through in-progress kernel dispatch), so `HL_WINDOWS_FAULT_PAD_ARM` plus a context edit replaces it; and a
+**kernel** write into an inaccessible page raises nothing at all, so `hl_windows_fault_probe` must fault the
+range in from user mode before any host path hands guest memory to a kernel call.
