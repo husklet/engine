@@ -597,6 +597,516 @@ static inline int renameatx_np(int old_directory, const char *old_path, int new_
 #ifndef SIGINFO
 #define SIGINFO (SIGRTMIN + 7)
 #endif
+#elif defined(_WIN32)
+/* ===================== Windows (mingw-w64 / UCRT) =========================
+ *
+ * Third arm of the same fork, and it exists for the same reason the Linux arm
+ * does: Darwin is this tree's lingua franca, so the vocabulary above -- struct
+ * kevent, the EVFILT_/EV_/NOTE_ constants, the hl_native_* wrappers -- is what
+ * every caller compiles against unconditionally.  A host that lacks the
+ * underlying kernel object still has to present the words, or the spelling
+ * leaks upward into target roots.  That is the file's whole job.
+ *
+ * Three kinds of entry live below and they are labelled where they appear:
+ *   REAL      -- a genuine Windows implementation of the same operation.
+ *   SHAPE     -- a synthesized type or constant with no behaviour of its own,
+ *                present so the callers compile (exactly what the Linux arm
+ *                does for kqueue).
+ *   REFUSAL   -- returns -1 with a specific errno.  Never a quiet success, and
+ *                never a constant chosen to let a call compile and then do
+ *                something other than what its name says.
+ *
+ * Deliberately NOT here: the POSIX descriptor vocabulary (fcntl/F_*, openat and
+ * the *at family, AT_FDCWD, O_CLOEXEC/O_DIRECTORY, mmap/PROT_*, the socket and
+ * poll constants).  Both other arms get those from the system headers, not from
+ * this file; inventing them here would be a new layer wearing this one's name,
+ * and an honest version of most of them needs the Windows backend's
+ * descriptor->HANDLE table, which a header included by the guest-target TU must
+ * not reach into. */
+#include <errno.h>
+#include <io.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+
+/* Win32 entry points are declared by hand rather than by including <windows.h>.
+ * This header is pulled into the guest-target unity TU, and <windows.h> would
+ * drop macros named ERROR, IN, OUT, min and max -- plus a second file-status
+ * vocabulary -- into the same TU that defines the guest ABI.  Only the five
+ * functions the bodies below actually call are named, with the ABI types
+ * spelled out (HANDLE is void *, DWORD is unsigned long, BOOL is int, WCHAR is
+ * wchar_t on this target).  Skipped when <windows.h> did get included first, so
+ * the two declarations can never drift apart. */
+#ifndef _WINDOWS_
+__declspec(dllimport) unsigned long __stdcall GetLastError(void);
+__declspec(dllimport) unsigned long __stdcall GetFinalPathNameByHandleW(void *file, wchar_t *path,
+                                                                        unsigned long capacity, unsigned long flags);
+__declspec(dllimport) int __stdcall MoveFileExW(const wchar_t *existing, const wchar_t *replacement,
+                                                unsigned long flags);
+__declspec(dllimport) int __stdcall MultiByteToWideChar(unsigned int page, unsigned long flags, const char *bytes,
+                                                        int byte_count, wchar_t *wide, int wide_count);
+__declspec(dllimport) int __stdcall WideCharToMultiByte(unsigned int page, unsigned long flags, const wchar_t *wide,
+                                                        int wide_count, char *bytes, int byte_count,
+                                                        const char *fallback, int *used_fallback);
+#endif
+
+#define HL_NATIVE_WIN_UTF8 65001u
+#define HL_NATIVE_WIN_REPLACE_EXISTING 0x1ul
+
+/* Win32 status -> errno.  Small on purpose: only the codes the three REAL
+ * bodies below can actually produce are listed, and anything else becomes EIO
+ * rather than a guess.  The backend keeps its own, wider map because it also
+ * reports the raw status in hl_host_result.detail; nothing here has a detail
+ * channel to report into, so precision stops at the errno. */
+static inline int hl_native_win_errno(unsigned long status) {
+    switch (status) {
+    case 2ul:
+    case 3ul: return ENOENT;
+    case 5ul: return EACCES;
+    case 6ul: return EBADF;
+    case 8ul:
+    case 14ul: return ENOMEM;
+    case 17ul: return EXDEV;
+    case 32ul: return EBUSY;
+    case 80ul:
+    case 183ul: return EEXIST;
+    case 87ul: return EINVAL;
+    case 122ul:
+    case 206ul: return ENAMETOOLONG;
+    case 145ul: return ENOTEMPTY;
+    default: return EIO;
+    }
+}
+
+/* Paths cross this boundary as UTF-8 and Win32 wants UTF-16.  The ...A entry
+ * points would do the conversion themselves but through the process ANSI code
+ * page, which is only UTF-8 when a manifest says so -- a link-time property no
+ * header can assume.  Converting explicitly makes the encoding a property of
+ * this call instead. */
+static inline wchar_t *hl_native_win_widen(const char *text) {
+    int count = MultiByteToWideChar(HL_NATIVE_WIN_UTF8, 0ul, text, -1, NULL, 0);
+    wchar_t *wide;
+    if (count <= 0) {
+        errno = EILSEQ;
+        return NULL;
+    }
+    wide = (wchar_t *)malloc((size_t)count * sizeof(*wide));
+    if (wide == NULL) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    if (MultiByteToWideChar(HL_NATIVE_WIN_UTF8, 0ul, text, -1, wide, count) != count) {
+        free(wide);
+        errno = EILSEQ;
+        return NULL;
+    }
+    return wide;
+}
+
+/* renameat2's flag values, same as the Linux arm: renameatx_np below consumes
+ * them directly, so callers keep passing the guest's numbering and never learn
+ * that Darwin's RENAME_SWAP/RENAME_EXCL spell them differently. */
+#define HL_NATIVE_RENAME_NOREPLACE 1u
+#define HL_NATIVE_RENAME_EXCHANGE 2u
+
+/* SHAPE.  Windows has no sparse-file whence: allocated-range discovery is
+ * FSCTL_QUERY_ALLOCATED_RANGES, not an lseek mode.  These carry the Linux
+ * numbering so a later FSCTL-backed implementation needs no respelling, and
+ * because the UCRT's _lseeki64 validates origin against {SET,CUR,END} and
+ * returns EINVAL for anything else -- a call that reaches the CRT with one of
+ * these fails loudly instead of seeking somewhere plausible and wrong. */
+#define HL_NATIVE_SEEK_DATA 3
+#define HL_NATIVE_SEEK_HOLE 4
+
+/* SHAPE.  Verbatim from the Linux arm, and for the identical reason: the event
+ * callers in linux_abi/syscall/event.c are compiled unconditionally and speak
+ * kqueue.  Windows has no kqueue and no epoll; its readiness engine is the host
+ * backend's pollset (an IOCP plus a wake event and a timer queue), which is
+ * keyed by hl_host_handle rather than by an int descriptor.  Binding kqueue()
+ * to it needs the backend's descriptor->handle table, so the two functions
+ * below refuse rather than approximate -- but the vocabulary still has to
+ * exist here or every caller stops compiling. */
+struct kevent {
+    uintptr_t ident;
+    int16_t filter;
+    uint16_t flags;
+    uint32_t fflags;
+    intptr_t data;
+    void *udata;
+};
+
+#define EVFILT_READ (-1)
+#define EVFILT_WRITE (-2)
+#define EVFILT_VNODE (-4)
+#define EVFILT_TIMER (-7)
+#define EVFILT_USER (-10)
+#define EV_ADD UINT16_C(0x0001)
+#define EV_DELETE UINT16_C(0x0002)
+#define EV_ENABLE UINT16_C(0x0004)
+#define EV_ONESHOT UINT16_C(0x0010)
+#define EV_CLEAR UINT16_C(0x0020)
+#define EV_EOF UINT16_C(0x8000)
+#define EV_ERROR UINT16_C(0x4000)
+#define NOTE_DELETE UINT32_C(0x0001)
+#define NOTE_WRITE UINT32_C(0x0002)
+#define NOTE_EXTEND UINT32_C(0x0004)
+#define NOTE_ATTRIB UINT32_C(0x0008)
+#define NOTE_LINK UINT32_C(0x0010)
+#define NOTE_RENAME UINT32_C(0x0020)
+#define NOTE_REVOKE UINT32_C(0x0040)
+#define NOTE_TRIGGER UINT32_C(0x01000000)
+#define NOTE_NSECONDS UINT32_C(0x00000004)
+// macOS-only hint (minimal power-aware timer coalescing); inert here, as it is in the Linux arm.
+#define NOTE_CRITICAL UINT32_C(0x00000020)
+
+#define EV_SET(event, identifier, event_filter, event_flags, event_fflags, event_data, event_udata)                  \
+    (*(event) = (struct kevent){(uintptr_t)(identifier), (int16_t)(event_filter), (uint16_t)(event_flags),          \
+                                (uint32_t)(event_fflags), (intptr_t)(event_data), (void *)(event_udata)})
+
+/* REFUSAL. */
+static inline int kqueue(void) {
+    errno = ENOTSUP;
+    return -1;
+}
+
+/* REFUSAL.  Unreachable in practice -- kqueue() never yields a descriptor, so
+ * every caller has already failed by the time it would call this -- but a
+ * definition has to exist, and EBADF is the honest answer to a descriptor that
+ * cannot name a queue. */
+static inline int kevent(int descriptor, const struct kevent *changes, int change_count, struct kevent *events,
+                         int event_count, const struct timespec *timeout) {
+    (void)descriptor;
+    (void)changes;
+    (void)change_count;
+    (void)events;
+    (void)event_count;
+    (void)timeout;
+    errno = EBADF;
+    return -1;
+}
+
+/* No queue exists to alias, relocate or release, so these have nothing to do.
+ * That is the same reasoning the Darwin arm gives for its empty bodies (there
+ * the descriptor is a real kernel object dup2 moves by itself); only the Linux
+ * arm needs bookkeeping, because only it keeps a side table. */
+static inline void hl_native_kqueue_close(int descriptor) { (void)descriptor; }
+static inline void hl_native_kqueue_duplicate(int source, int destination) {
+    (void)source;
+    (void)destination;
+}
+static inline void hl_native_kqueue_relocate(int source, int destination) {
+    (void)source;
+    (void)destination;
+}
+
+/* REAL.  GetFinalPathNameByHandleW is the Windows answer to Darwin's
+ * F_GETPATH and Linux's /proc/self/fd readlink: it walks the open file object
+ * back to a path.  VOLUME_NAME_DOS|FILE_NAME_NORMALIZED is flags 0, and the
+ * result always carries the \\?\ prefix, which is a Win32 parsing marker rather
+ * than part of the name -- callers here compare and re-open these strings, so
+ * it is stripped (and the \\?\UNC\ form folded back to \\server\share). */
+static inline int hl_native_fd_path(int descriptor, char *path, size_t capacity) {
+    wchar_t inline_buffer[512];
+    wchar_t *buffer = inline_buffer;
+    wchar_t *start;
+    void *handle;
+    unsigned long count;
+    int written;
+    int capped;
+    if (path == NULL || capacity == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    handle = (void *)(intptr_t)_get_osfhandle(descriptor);
+    if (handle == (void *)(intptr_t)-1 || handle == NULL) {
+        errno = EBADF;
+        return -1;
+    }
+    count = GetFinalPathNameByHandleW(handle, buffer, (unsigned long)(sizeof(inline_buffer) / sizeof(*inline_buffer)),
+                                      0ul);
+    if (count >= sizeof(inline_buffer) / sizeof(*inline_buffer)) {
+        buffer = (wchar_t *)malloc(((size_t)count + 1u) * sizeof(*buffer));
+        if (buffer == NULL) {
+            errno = ENOMEM;
+            return -1;
+        }
+        count = GetFinalPathNameByHandleW(handle, buffer, count + 1ul, 0ul);
+    }
+    if (count == 0ul) {
+        int saved = hl_native_win_errno(GetLastError());
+        if (buffer != inline_buffer) free(buffer);
+        errno = saved;
+        return -1;
+    }
+    start = buffer;
+    if (count >= 4ul && start[0] == L'\\' && start[1] == L'\\' && start[2] == L'?' && start[3] == L'\\') {
+        if (count >= 8ul && (start[4] == L'U' || start[4] == L'u') && (start[5] == L'N' || start[5] == L'n') &&
+            (start[6] == L'C' || start[6] == L'c') && start[7] == L'\\') {
+            start += 6;
+            start[0] = L'\\';
+            start[1] = L'\\';
+        } else {
+            start += 4;
+        }
+    }
+    capped = capacity > (size_t)INT_MAX ? INT_MAX : (int)capacity;
+    written = WideCharToMultiByte(HL_NATIVE_WIN_UTF8, 0ul, start, -1, path, capped, NULL, NULL);
+    if (written <= 0) {
+        unsigned long status = GetLastError();
+        if (buffer != inline_buffer) free(buffer);
+        path[0] = '\0';
+        errno = status == 122ul ? ENAMETOOLONG : EILSEQ;
+        return -1;
+    }
+    if (buffer != inline_buffer) free(buffer);
+    return 0;
+}
+
+/* REFUSAL.  Darwin's O_EVTONLY is an open mode that grants no data access and
+ * so does not keep the file from being unlinked; Windows has no open mode with
+ * that property, and its change notification is a directory HANDLE driving
+ * ReadDirectoryChangesW -- an object the backend owns and which is not a
+ * descriptor at all.  Same answer the Linux arm gives, for the same reason. */
+static inline int hl_native_open_watch(const char *path) {
+    (void)path;
+    errno = ENOTSUP;
+    return -1;
+}
+
+/* REAL, and the real answer is "nothing to do".  Windows has no SIGPIPE: a send
+ * on a connection the peer has reset returns WSAECONNRESET to the caller rather
+ * than raising a signal, so there is no per-socket suppression to install and 0
+ * is the truthful result, not a stub that skipped the work. */
+static inline int hl_native_set_no_sigpipe(int descriptor) {
+    (void)descriptor;
+    return 0;
+}
+
+/* REAL.  st_ctime in the UCRT's struct stat is the file's CREATION time, not
+ * the POSIX inode-change time -- the one field where the Windows spelling is
+ * closer to Darwin's st_birthtimespec than to POSIX's. Whole seconds only, so
+ * tv_nsec is 0 rather than fabricated.  NTFS records it; a FAT volume leaves it
+ * zero, which is what the filesystem itself reports. */
+static inline int hl_native_birthtime(const struct stat *status, struct timespec *time) {
+    time->tv_sec = (time_t)status->st_ctime;
+    time->tv_nsec = 0;
+    return 0;
+}
+
+/* REFUSAL, whole family.  NTFS does have extended attributes -- the EA stream
+ * behind NtSetEaFile/NtQueryEaFile -- but they are not reachable from the CRT
+ * and their shape is not Linux's: names are upper-cased, capped at 254 bytes,
+ * the whole set must fit one buffer, and there is no user./trusted./security.
+ * prefix rule for a guest to key off.  Alternate data streams are the usual
+ * suggestion and are the wrong object entirely: a stream is a file, unbounded
+ * in size, enumerated by a different API, and it survives a copy under
+ * different rules than an attribute does.
+ *
+ * ENOTSUP is not a placeholder here.  It is exactly what Linux returns for a
+ * filesystem carrying no extended-attribute support, so a guest that gets it
+ * has been told something true and already knows how to handle it -- which a
+ * silent empty listing would not be. */
+static inline int hl_native_setxattr(const char *path, const char *name, const void *value, size_t size, int position,
+                                    int options) {
+    (void)path;
+    (void)name;
+    (void)value;
+    (void)size;
+    (void)position;
+    (void)options;
+    errno = ENOTSUP;
+    return -1;
+}
+static inline int hl_native_fsetxattr(int fd, const char *name, const void *value, size_t size, int position,
+                                     int options) {
+    (void)fd;
+    (void)name;
+    (void)value;
+    (void)size;
+    (void)position;
+    (void)options;
+    errno = ENOTSUP;
+    return -1;
+}
+static inline ssize_t hl_native_getxattr(const char *path, const char *name, void *value, size_t size, int position,
+                                        int options) {
+    (void)path;
+    (void)name;
+    (void)value;
+    (void)size;
+    (void)position;
+    (void)options;
+    errno = ENOTSUP;
+    return -1;
+}
+static inline ssize_t hl_native_fgetxattr(int fd, const char *name, void *value, size_t size, int position,
+                                         int options) {
+    (void)fd;
+    (void)name;
+    (void)value;
+    (void)size;
+    (void)position;
+    (void)options;
+    errno = ENOTSUP;
+    return -1;
+}
+static inline ssize_t hl_native_listxattr(const char *path, char *list, size_t size, int options) {
+    (void)path;
+    (void)list;
+    (void)size;
+    (void)options;
+    errno = ENOTSUP;
+    return -1;
+}
+static inline int hl_native_removexattr(const char *path, const char *name, int options) {
+    (void)path;
+    (void)name;
+    (void)options;
+    errno = ENOTSUP;
+    return -1;
+}
+#define XATTR_NOFOLLOW 1
+#ifndef ENOATTR
+#define ENOATTR ENODATA
+#endif
+
+/* O_SYMLINK is deliberately NOT defined on this arm, and the two call sites in
+ * linux_abi/syscall/fs.c will keep failing to compile until a Windows open path
+ * exists.  That is the point: the flag means "open the link node itself", the
+ * only Windows expression of it is FILE_FLAG_OPEN_REPARSE_POINT on
+ * CreateFile/NtCreateFile, and the UCRT's open() has no bit for it.  Any value
+ * put here would either be ignored by _open -- silently following the symlink,
+ * which is precisely the bug the flag exists to prevent -- or rejected, which a
+ * constant cannot signal.  A compile error is the only honest refusal available
+ * to a macro. */
+
+/* REAL for the two reachable cases, REFUSAL for the third.
+ *
+ * A negative directory descriptor is the AT_FDCWD sentinel on every host this
+ * tree targets (-2 on Darwin, -100 on Linux); a non-negative one names an open
+ * directory, and resolving that to a path needs the backend's handle table.
+ * Exchange has no Windows primitive at all -- NTFS offers replace-or-not, never
+ * swap -- so it refuses rather than emulating a swap through a temporary name,
+ * which would not be atomic and would leave debris on a crash.
+ *
+ * MoveFileExW without MOVEFILE_REPLACE_EXISTING already fails with
+ * ERROR_ALREADY_EXISTS when the target is present, so NOREPLACE is native here
+ * rather than a check-then-act. */
+static inline int renameatx_np(int old_directory, const char *old_path, int new_directory, const char *new_path,
+                               unsigned flags) {
+    wchar_t *old_wide;
+    wchar_t *new_wide;
+    int moved;
+    unsigned long status;
+    if (old_directory >= 0 || new_directory >= 0 || (flags & HL_NATIVE_RENAME_EXCHANGE) != 0) {
+        errno = ENOSYS;
+        return -1;
+    }
+    old_wide = hl_native_win_widen(old_path);
+    if (old_wide == NULL) return -1;
+    new_wide = hl_native_win_widen(new_path);
+    if (new_wide == NULL) {
+        free(old_wide);
+        return -1;
+    }
+    moved = MoveFileExW(old_wide, new_wide,
+                        (flags & HL_NATIVE_RENAME_NOREPLACE) != 0 ? 0ul : HL_NATIVE_WIN_REPLACE_EXISTING);
+    status = moved != 0 ? 0ul : GetLastError();
+    free(old_wide);
+    free(new_wide);
+    if (moved != 0) return 0;
+    errno = hl_native_win_errno(status);
+    return -1;
+}
+
+/* SHAPE.  These two name host signals the engine sends to its OWN threads --
+ * cache.c's stop-the-world and thread.c's blocking-syscall interrupt -- picked
+ * on Darwin because the guest signal map never targets 7 or 29.  Windows has no
+ * signal delivery to a thread at all; the equivalent mechanism is
+ * SuspendThread/QueueUserAPC in the host backend.
+ *
+ * The numbers are above NSIG (23) ON PURPOSE.  The UCRT's signal() and
+ * winpthreads' pthread_kill both validate the signal number against NSIG, so
+ * every call reaching the CRT with one of these fails with EINVAL instead of
+ * landing on some other signal's disposition.  A value inside the valid range
+ * would compile the same and quietly hijack SIGABRT or SIGBREAK. */
+#ifndef SIGEMT
+#define SIGEMT 32
+#endif
+#ifndef SIGINFO
+#define SIGINFO 33
+#endif
+
+/* SHAPE.  The POSIX type codes for a symlink and a socket.  0xA000 and 0xC000
+ * are the two values _S_IFMT (0xF000) leaves unused by the UCRT, whose st_mode
+ * only ever carries FIFO/CHR/DIR/BLK/REG -- so adopting the POSIX numbering
+ * costs nothing and collides with nothing.
+ *
+ * Read the limit plainly: the predicate is exactly as good as whatever filled
+ * st_mode, and the UCRT's own stat() never sets either bit.  It reports a
+ * reparse point as a regular file.  So on today's tree every S_ISLNK() here
+ * answers false, and a Windows stat path that wants symlink awareness has to
+ * set S_IFLNK itself -- these definitions are the place for it to put the
+ * answer, not a claim that the answer is already correct. */
+#ifndef S_IFLNK
+#define S_IFLNK 0xA000
+#endif
+#ifndef S_IFSOCK
+#define S_IFSOCK 0xC000
+#endif
+#ifndef S_ISLNK
+#define S_ISLNK(mode) (((mode) & S_IFMT) == S_IFLNK)
+#endif
+#ifndef S_ISSOCK
+#define S_ISSOCK(mode) (((mode) & S_IFMT) == S_IFSOCK)
+#endif
+
+/* REAL, and the choice between two right-looking numbers matters.  Windows has
+ * a 4 KiB PAGE size and a 64 KiB ALLOCATION granularity, and they are used for
+ * different things: protection changes act on pages, but a reservation can only
+ * be placed, split or replaced on a 64 KiB boundary.
+ *
+ * Every caller of getpagesize() in this tree means the second one -- it is the
+ * host mmap reconciliation unit (mem.c's mmap/mprotect/mincore alignment,
+ * checkpoint.c's image page size), which is why an Apple Silicon host already
+ * answers 16384 here while the guest ABI stays at 4096.  Returning 4096 would
+ * let those paths compute placements the Windows mapper must then reject.
+ *
+ * 65536 matches the granularity the Windows backend asserts at startup.  One
+ * caller is merely coarsened rather than corrected by it: the translator's
+ * self-modifying-code guard protects a page at a time and would work at 4096
+ * too, so it over-protects and takes some extra traps.  That is a cost, not a
+ * correctness break, and it is the right direction to be wrong in. */
+static inline int getpagesize(void) { return 65536; }
+
+/* REAL.  Pure byte swaps, and that is the whole point of defining them here:
+ * their only declaration on Windows is in <winsock2.h>, which would pull the
+ * entire Winsock struct vocabulary (sockaddr, its own fd_set, timeval) into a
+ * TU whose job is marshalling the GUEST's ABI structures of the same names.
+ * Four inline swaps cost nothing and foreclose that collision.  Guarded on the
+ * Winsock include markers so a TU that legitimately needs sockets keeps the
+ * real declarations and never sees a conflicting one. */
+#if !defined(_WINSOCK2API_) && !defined(_WINSOCKAPI_)
+static inline unsigned short htons(unsigned short value) { return __builtin_bswap16(value); }
+static inline unsigned short ntohs(unsigned short value) { return __builtin_bswap16(value); }
+static inline unsigned int htonl(unsigned int value) { return __builtin_bswap32(value); }
+static inline unsigned int ntohl(unsigned int value) { return __builtin_bswap32(value); }
+#endif
+
+/* st_atimespec / st_mtimespec / st_ctimespec are deliberately NOT aliased.
+ * The Linux arm can do it with three #defines because glibc's struct stat
+ * carries st_atim as a real struct timespec; the UCRT's carries st_atime as a
+ * bare time_t and has no sub-second field, and no macro can rename a scalar
+ * member into one with .tv_sec and .tv_nsec.  st_blocks and st_blksize are
+ * absent for the same reason -- the UCRT's struct stat has neither.
+ *
+ * So the guest-stat encoder keeps failing to compile on this arm, and it should:
+ * the fix is a Windows file-status path that fills a structure with the fields
+ * the encoder needs (the information exists -- FILE_BASIC_INFORMATION carries
+ * 100 ns timestamps and FILE_STANDARD_INFORMATION the allocated size), not a
+ * rename that would silently truncate every timestamp to whole seconds. */
 #endif
 
 #endif
