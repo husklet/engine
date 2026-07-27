@@ -1067,7 +1067,11 @@ static int svc_event(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint6
         // never toggle the (cross-process-shared) fd flags. The guest's real EFD_NONBLOCK intent is tracked
         // in g_eventfd_gnb and honoured by the read path (poll() when the guest wants to block). See the
         // g_eventfd_gnb note in vfs.c.
-        fcntl(fds[0], F_SETFL, O_NONBLOCK);
+        // Record whether the host honoured it. A host with no per-descriptor status-flag channel refuses,
+        // and the drain/wait paths in io.c must know: their "read until it stops returning bytes" idiom
+        // terminates only on a non-blocking read end, and on a blocking one the first drain of an empty
+        // pipe never returns. See g_eventfd_readend_nb.
+        g_eventfd_readend_nb = fcntl(fds[0], F_SETFL, O_NONBLOCK) == 0;
         // writes to the eventfd go to fds[1]; the counter + sema-flag live alongside.
         // Defensive: the accumulating-counter arena is bound once per process (eventfd_count_init, from a
         // cold hl_run_linux_guest or the fork-server prewarm parent). If it is somehow still NULL, indexing

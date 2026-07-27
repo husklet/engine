@@ -5,6 +5,44 @@
 // (dup/dup3/fcntl/pipe2/sendfile/splice/tee/copy_file_range/fsync/etc). Returns 1 if nr was handled, 0 otherwise.
 // Included by service.c after service/helpers.c, before service() — same TU scope (globals + helpers).
 
+// Whether this host could actually put an eventfd's readiness-pipe READ END into O_NONBLOCK. It is a
+// property of the host, not of a descriptor, so one scalar answers for every eventfd: the creation path
+// (eventfd2) issues one F_SETFL and records whether it was honoured. Hosts whose descriptors carry a
+// status-flag channel record 1 here and keep the byte-identical drain/wait they always had.
+//
+// Where it is 0 the difference is not a nicety. The emulation's drains are written as "read until the read
+// returns <= 0", which terminates only because the read end is non-blocking; on a host that cannot set that
+// flag the very first drain of an EMPTY pipe blocks the calling thread forever, and every eventfd read()
+// performs a drain -- so a guest that merely writes 1 and reads it back never returns. Optimistic default:
+// a host that never creates an eventfd never touches this, and the first eventfd2 corrects it.
+static int g_eventfd_readend_nb = 1;
+
+// Remove the eventfd readiness byte, if one is there.  `signalled` is the caller's knowledge of whether the
+// pipe holds a byte right now, and it is exact rather than a guess: every mutation of the {counter, pipe}
+// pair is made under g_eventfd_lock and every one of them leaves the pipe holding AT MOST ONE byte, present
+// exactly when the counter is positive (creation writes one iff initval > 0; the write path drains and
+// re-writes one; the read path drains and re-writes one iff the counter is still positive). So on a host
+// with no non-blocking read end, "counter was positive on entry" is precisely "there is one byte to take",
+// and taking exactly that many bytes cannot block.
+//
+// The two hosts differ only in HOW the same bytes are removed, never in how many end up removed, so a
+// descriptor whose read end really is non-blocking follows the loop it always followed.
+//
+// ONE NAMED RESIDUAL, and it is bounded to a host that has neither half of the pair. g_eventfd_lock is
+// process-private, so the "at most one byte" invariant is only best-effort across a fork -- two processes
+// sharing the counter and the inherited pipe can both read a positive counter and both try to take the one
+// byte, and on a blocking read end the loser parks instead of seeing EAGAIN. That cannot happen where the
+// read end is non-blocking, which is every host that shares an eventfd across a fork today; the counter's
+// cross-process sharing was already documented as best-effort for the same reason.
+static void eventfd_drain_readiness(int rfd, int signalled) {
+    char buffer[64];
+    if (g_eventfd_readend_nb) {
+        while (read(rfd, buffer, sizeof buffer) > 0) {}
+        return;
+    }
+    if (signalled && read(rfd, buffer, 1) < 0) {}
+}
+
 static int eventfd_peer_owner(int fd) {
     if (fd < 0) return -1;
     for (int i = 0; i < HL_NFD; i++)
@@ -1120,21 +1158,28 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             pthread_mutex_lock(&g_eventfd_lock);
             while (g_eventfd_count[eslot] == 0) {
                 if (eventfd_guest_nb(rfd)) {
-                    // Guest asked for non-blocking. The read end is ALWAYS host-O_NONBLOCK now, so no flag
-                    // toggle is needed (the toggle used to race a cross-process reader — the spurious-EAGAIN
-                    // bug). Drain any stale readiness byte so a level-triggered epoll won't report the fd
-                    // ready-forever, then return EAGAIN.
-                    char stale[64];
-                    while (read(rfd, stale, sizeof stale) > 0) {}
+                    // Guest asked for non-blocking. No flag toggle is needed either way (the toggle used to
+                    // race a cross-process reader — the spurious-EAGAIN bug): where the read end is
+                    // host-O_NONBLOCK there is nothing to toggle, and where it is not, the drain below takes
+                    // a counted byte rather than probing for one. Drain any stale readiness byte so a
+                    // level-triggered epoll won't report the fd ready-forever, then return EAGAIN. The
+                    // counter is zero on this branch, so the pair's invariant says no byte is owed and a
+                    // host with a blocking read end takes none.
+                    eventfd_drain_readiness(rfd, 0);
                     pthread_mutex_unlock(&g_eventfd_lock);
                     G_RET(c) = (uint64_t)(-EAGAIN);
                     goto eventfd_read_done;
                 }
-                // Guest wants to block. The read end is O_NONBLOCK (a raw read would EAGAIN, not wait), so
-                // wait for a writer's 0->positive edge with poll(), then consume one readiness byte.
+                // Guest wants to block. Where the read end is O_NONBLOCK a raw read would EAGAIN rather than
+                // wait, so the wait is poll()'s and the read that follows only consumes the byte. Where it is
+                // NOT -- a host with no per-descriptor status-flag channel, which is also a host whose poll()
+                // over a mixed descriptor set does not exist -- that same one-byte read IS the wait, and it
+                // is the right one: it parks the thread on exactly the pipe a writer signals through.
                 pthread_mutex_unlock(&g_eventfd_lock);
-                struct pollfd pf = {.fd = rfd, .events = POLLIN, .revents = 0};
-                poll(&pf, 1, -1); // block until a writer signals 0->positive
+                if (g_eventfd_readend_nb) {
+                    struct pollfd pf = {.fd = rfd, .events = POLLIN, .revents = 0};
+                    poll(&pf, 1, -1); // block until a writer signals 0->positive
+                }
                 char b;
                 if (read(rfd, &b, 1) < 0) {} // consume one readiness byte (non-blocking; EAGAIN is fine)
                 pthread_mutex_lock(&g_eventfd_lock);
@@ -1148,10 +1193,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 v = g_eventfd_count[eslot];
                 g_eventfd_count[eslot] = 0;
             }
-            // re-sync the pipe to "counter > 0": drain it, then re-signal one byte if still positive. The
-            // read end is permanently O_NONBLOCK, so drain directly with no flag toggle (no cross-process race).
-            char buf[64];
-            while (read(rfd, buf, sizeof buf) > 0) {}
+            // re-sync the pipe to "counter > 0": drain it, then re-signal one byte if still positive. Drain
+            // directly with no flag toggle either way (no cross-process race). This branch is reached only
+            // with a positive counter, so exactly one byte is owed.
+            eventfd_drain_readiness(rfd, 1);
             if (g_eventfd_count[eslot] > 0) {
                 char b = 1;
                 if (write(g_eventfd_peer[rfd] - 1, &b, 1) < 0) {}
@@ -1264,6 +1309,9 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = (uint64_t)(-EAGAIN);
                 break;
             }
+            // Captured before the bump: it is the drain's "is a readiness byte outstanding" predicate, and
+            // after the bump the counter can no longer answer that question.
+            int was_signalled = g_eventfd_count[eslot] > 0;
             g_eventfd_count[eslot] += add;
             // Linux wakes epoll edge-triggered waiters on EVERY write, not just the 0->positive transition.
             // A waker eventfd that is never drained (mio/tokio's cross-thread wakeup) would otherwise lose
@@ -1271,11 +1319,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             // never re-fires and a blocked epoll_wait hangs forever. Drain the pipe to exactly one fresh byte
             // so each write produces a new readable edge, bounded even when the reader never keeps up.
             if (add > 0) {
-                // The read end is permanently O_NONBLOCK, so drain to exactly one fresh byte with no flag
-                // toggle. The old toggle mutated the cross-process-shared fd flags and a concurrent reader in
-                // another process observed the transient O_NONBLOCK -> spurious EAGAIN.
-                char buf[64];
-                while (read(wfd, buf, sizeof buf) > 0) {}
+                // Drain to exactly one fresh byte with no flag toggle. The old toggle mutated the
+                // cross-process-shared fd flags and a concurrent reader in another process observed the
+                // transient O_NONBLOCK -> spurious EAGAIN.
+                eventfd_drain_readiness(wfd, was_signalled);
                 char b = 1;
                 if (write(g_eventfd_peer[wfd] - 1, &b, 1) < 0) {}
             }
