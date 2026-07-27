@@ -1,0 +1,175 @@
+name: Windows x86-64
+
+# The x86_64 Windows HOST lane. One workflow file per host token, as I13/I14
+# require and as I20 now enforces by iterating HL_CI_HOSTS rather than testing a
+# literal.
+#
+# SCOPE, stated as what this job PROVES and what it does not, because a lane
+# that claims coverage it does not have is worse than no lane:
+#
+#   proves   the tree configures with mingw-w64 clang; the two host-neutral
+#            archives that currently compile still compile; the shell-backed CI
+#            metadata gates run; and the built Windows binaries import nothing
+#            that would kill a cloned process.
+#   does NOT the engine does not link here yet, no guest executes here, and no
+#            compat, production, checkpoint, lifecycle or perf lane exists on
+#            this host. None of them is listed below, and none may be added
+#            before it has been measured green on this runner.
+#
+# This host declares NO LANE. Windows-x86_64 is absent from HL_CI_HOSTS and
+# there is no HL_CI_DIRECT_WINDOWS, so nothing here is selected by label; every
+# ctest call below names its cases. cmake/CiLanes.cmake carries the one thing
+# that has to become true before a lane can be declared, and the guards that are
+# already waiting for it.
+#
+# NO compat shard, and none may be added while Windows-x86_64 is absent from
+# HL_CI_COMPAT_HOSTS: I20 requires a non-compat host's workflow to name no lane
+# at all, and the sharded matrix job and the HL_CI_COMPAT_HOSTS entry have to
+# land in the same change -- declaring the token is what turns I20 off, so a
+# workflow that shards nothing while exempt has no structural guard left.
+#
+# publish.yml deliberately does not need this job, and P1 still pins
+# `needs: [linux, mac]`: a release ships nothing built here.
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # As linux.yml and linux-x86_64.yml: a main commit keeps its own group so
+  # every main commit gets a verdict; other refs coalesce by ref.
+  group: windows-x86-64-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+defaults:
+  run:
+    # Git Bash, which is what lets tools/*.sh and the HL_BASH_EXECUTABLE-driven
+    # CTest cases run unmodified. It ships awk, which those scripts need.
+    shell: bash
+
+jobs:
+  windows-x86-64:
+    runs-on: windows-2025
+    # Two static archives and five CTest cases; the pacman install dominates.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      # MSYS2's CLANG64 environment: clang, lld, compiler-rt and the LLVM
+      # binutils. llvm-readobj is not optional here -- it is what reads the PE
+      # import tables for the gate at the end of this job.
+      #
+      # Known weakness, recorded rather than hidden: MSYS2's repository is
+      # rolling, so the compiler can change under this lane between two runs of
+      # the same commit and produce a failure that is not about the change under
+      # test. A pinned, SHA-256-verified llvm-mingw tarball would fix that and
+      # is the right end state; it is a separate change with its own
+      # verification, and pinning the wrong thing quietly is worse than a stated
+      # weakness.
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: CLANG64
+          update: false
+          # inherit, so the runner's own cmake, ninja and git stay on PATH and
+          # only the toolchain comes from MSYS2.
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-lld
+            mingw-w64-clang-x86_64-compiler-rt
+
+      - name: Put the CLANG64 toolchain on PATH
+        timeout-minutes: 2
+        run: echo "${{ steps.msys2.outputs.msys2-location }}/clang64/bin" >> "$GITHUB_PATH"
+
+      # Runner facts as a ::notice, because the job-log endpoint needs admin
+      # rights and a toolchain-version difference is the first thing anyone will
+      # want when this lane disagrees with a developer's box. tools/ci_env.sh is
+      # deliberately not used: it reads /proc/meminfo and /sys/fs/cgroup and
+      # would print "memory: ? bytes" here, which is worse than saying less.
+      - name: Runner environment
+        timeout-minutes: 5
+        run: |
+          {
+            printf 'runner: windows-2025\n'
+            printf 'clang: %s\n' "$(clang --version | head -1)"
+            printf 'cmake: %s\n' "$(cmake --version | head -1)"
+            printf 'ninja: %s\n' "$(ninja --version)"
+            printf 'readobj: %s\n' "$(llvm-readobj --version | tr '\n' ' ')"
+            printf 'bash: %s\n' "$(bash --version | head -1)"
+          } | tee /tmp/env.txt
+          printf '::notice title=Windows runner environment::%s\n' "$(tr '\n' ' ' < /tmp/env.txt)"
+
+      # The toolchain file pins the compiler when PATH also carries MSVC (it
+      # does on a hosted image) and holds the -static link decision.
+      - name: Configure (CMake)
+        timeout-minutes: 10
+        run: |
+          cmake -G Ninja -B build-ci \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/x86_64-windows.cmake
+
+      # ONLY the targets that compile today, named one by one rather than a bare
+      # `ninja`. A blanket build would fail on the archives that do not compile
+      # yet and say nothing about whether these two regressed -- and adding
+      # `-k 0` to paper over that would make the step's verdict meaningless.
+      # Add a target here when it builds; that is the milestone, and this list
+      # is the record of it.
+      - name: Build the archives that compile
+        timeout-minutes: 20
+        run: |
+          set -e
+          cmake --build build-ci --target hl-translator
+          cmake --build build-ci --target hl-host-fake
+          test -f build-ci/libhl-translator.a
+          test -f build-ci/libhl-host-fake.a
+          llvm-nm --print-armap build-ci/libhl-translator.a > /dev/null
+
+      # NO `ctest -L unit` STEP, and the omission is the point.
+      #
+      # Windows-x86_64 is not in HL_CI_HOSTS and no lane is declared for it, so
+      # there is no label this host owns. Running `-L unit` anyway would be
+      # claiming a lane: on this host that label also selects rust.clippy, which
+      # fails because pkgs/rust/build.rs refuses the host triple -- a
+      # build-script panic, not a lint verdict. A workflow step that is red for
+      # a reason unrelated to what it claims to test is worse than no step.
+      #
+      # So the cases that DO pass here are named individually, one ctest call
+      # each, every one with --no-tests=error -- which is what makes a renamed
+      # or deleted case fail this step instead of silently selecting nothing
+      # (`ctest` exits 0 on an empty selection, which is the whole reason I15
+      # and gate.ci-lane-parity exist). Replace this step with `-L unit` in the
+      # same change that declares the token; cmake/CiLanes.cmake records what
+      # has to be true first.
+      - name: Test the host-neutral CI metadata gates
+        timeout-minutes: 10
+        run: |
+          set -e
+          for t in unit.ci-workflow-invariants unit.publish-gating; do
+            ctest --test-dir build-ci -R "^$t\$" --no-tests=error --output-on-failure ||
+              { printf '::error title=Windows CI metadata gate::%s failed\n' "$t"; exit 1; }
+          done
+
+      # The gate this job exists for, and its own step so its verdict is legible
+      # in the checks list rather than buried in a lane summary. -V rather than
+      # --output-on-failure: CTest prints NOTHING for a skipped test, and this
+      # gate reports SKIPPED while nothing it can inspect has been built --
+      # which this lane must keep saying out loud rather than count as a pass.
+      #
+      # What it asserts: every PE image and archive built above imports (or
+      # references) only KERNEL32, ntdll and the api-ms-win-* apisets. A USER32
+      # import loads IMM32, whose DLL_THREAD_DETACH handler access-violates
+      # inside a process cloned by RtlCloneUserProcess -- which is how guest
+      # fork() is served on this host. The crash needs a guest to fork and THEN
+      # create and join a thread, so it appears in JVM/Go/Node workloads and
+      # never in a smoke test. That is why it is gated at build time.
+      - name: Gate the Windows import surface
+        timeout-minutes: 5
+        run: |
+          ctest --test-dir build-ci -R '^gate\.windows-imports$' --no-tests=error -V ||
+            { printf '::error title=Windows import surface::a built binary imports a DLL outside the KERNEL32/ntdll/api-ms-win-* allowlist; it would crash after a guest fork\n'; exit 1; }

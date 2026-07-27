@@ -349,16 +349,32 @@ static int run_suite(const char *engine, const char *binary_root, const char *su
                 passed++;
             continue;
         }
-        /* `excluded-macos` is a PER-ENGINE disposition: the case is skipped only on the Mach-O macOS
-           engine (matrix_runner.c). This runner always drives the ELF Linux production engine, so it must
-           RUN excluded-macos rows as active -- otherwise Linux would silently lose coverage of them. Every
-           other excluded-* disposition drops out on both engines. */
-        int macos_only = strcmp(fields[11], "excluded-macos") == 0;
-        if ((strncmp(fields[11], "excluded-", 9) == 0 && !macos_only) || !has_token(fields[4], architecture)) {
+        /* `excluded-macos` and `excluded-windows` are PER-ENGINE dispositions: each is skipped only on the
+           engine whose object format it names (tools/matrix_runner.c sniffs that format). This runner
+           always drives the ELF Linux production engine, so it must RUN both as active -- otherwise Linux
+           would silently lose coverage of them. Every other excluded-* disposition drops out everywhere.
+
+           Field 12 holds exactly ONE token, so "excluded on macOS AND on Windows" is unspellable today. A
+           comma is rejected rather than mis-parsed: `excluded-macos,excluded-windows` matches neither
+           per-engine arm, falls into the generic `excluded-` arm, and would be skipped HERE too, silently
+           deleting the Linux coverage the per-engine mechanism exists to keep. Widening the column to a
+           comma-separated set is a small change here and in matrix_runner.c, to be made the day a row needs
+           it; until then this error is the guard. */
+        if (strchr(fields[11], ',') != NULL) {
+            fprintf(stderr,
+                    "linux-matrix: %s: disposition `%s` holds more than one token; column 12 is a single "
+                    "token and a comma would silently skip this case on the Linux engine too\n",
+                    fields[0], fields[11]);
+            free(line);
+            fclose(file);
+            return 1;
+        }
+        int host_specific = strcmp(fields[11], "excluded-macos") == 0 || strcmp(fields[11], "excluded-windows") == 0;
+        if ((strncmp(fields[11], "excluded-", 9) == 0 && !host_specific) || !has_token(fields[4], architecture)) {
             excluded++;
             continue;
         }
-        if ((strcmp(fields[11], "active") != 0 && !macos_only) || parse_exit(fields[8], &expected_exit) != 0) {
+        if ((strcmp(fields[11], "active") != 0 && !host_specific) || parse_exit(fields[8], &expected_exit) != 0) {
             fprintf(stderr, "linux-matrix: invalid active row %s\n", fields[0]);
             free(line);
             fclose(file);

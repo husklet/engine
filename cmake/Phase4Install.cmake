@@ -221,6 +221,104 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND HL_BUILD_TESTS)
     LABELS "unit;gate" WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
+# --- gate.windows-imports ---------------------------------------------------
+# The Windows sibling of gate.archive-closure: same species (a binutils sweep
+# over what this build produced, in the `unit` lane), opposite host, and a much
+# sharper reason. cmake/CheckPeImports.cmake carries the full argument; the
+# short form is that a USER32 import loads IMM32, whose DLL_THREAD_DETACH
+# handler access-violates inside a process cloned by RtlCloneUserProcess -- 50
+# of 50 runs with the import, 0 of 50 without, in two otherwise byte-identical
+# binaries. It cannot be caught at runtime by anything this project runs: the
+# fault needs a guest to fork AND THEN create and join a thread, which is a JVM
+# or a Go runtime, never a smoke test.
+#
+# Registered here rather than in a Windows test file because there is no
+# Windows test file: cmake/Phase3Units.cmake returns early on this host and
+# cmake/Phase3Gates.cmake is not even included. Phase4Install is the one place
+# that is unconditionally included on every host AND already owns a gate of
+# exactly this shape.
+#
+# CMake script mode, not a shell script, because bash is OPTIONAL on Windows
+# (CMakeLists.txt found it non-REQUIRED for exactly this host) and a gate that
+# disappears with the shell is not a gate.
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND HL_BUILD_TESTS)
+  # Not REQUIRED: a missing tool must fail the TEST, loudly, with the reason --
+  # not the configure of three other agents' working trees. The script names
+  # all three candidates when it finds none.
+  find_program(HL_READOBJ_EXECUTABLE NAMES llvm-readobj)
+  find_program(HL_PE_OBJDUMP_EXECUTABLE NAMES llvm-objdump objdump)
+  if(DEFINED CMAKE_NM AND NOT CMAKE_NM STREQUAL "")
+    set(HL_PE_NM_EXECUTABLE ${CMAKE_NM})
+  else()
+    find_program(HL_PE_NM_EXECUTABLE NAMES llvm-nm nm)
+  endif()
+
+  # Layer 1's subjects: every PE image this project SHIPS. hl_lint is
+  # deliberately absent -- it is a developer tool that is never cloned, and
+  # gating it would invite an allowlist edit for a non-engine reason.
+  set(_pe_images "")
+  foreach(_t hl-engine-runner hl-engine-windows-aarch64 hl-engine-windows-x86_64)
+    if(TARGET ${_t})
+      list(APPEND _pe_images $<TARGET_FILE:${_t}>)
+    endif()
+  endforeach()
+
+  # Layer 2's subjects: the archives that feed those links. This is what gives
+  # the gate teeth BEFORE anything links, which is where the port is today --
+  # an archive that references wsprintfW is a link that will import USER32.
+  set(_pe_archives "")
+  foreach(_t hl-translator hl-host-fake hl-engine hl-linux-abi hl-host-windows)
+    if(TARGET ${_t})
+      list(APPEND _pe_archives $<TARGET_FILE:${_t}>)
+    endif()
+  endforeach()
+  if(_pe_images STREQUAL "" AND _pe_archives STREQUAL "")
+    message(FATAL_ERROR
+      "gate.windows-imports has no subject: no PE image target and no archive "
+      "target exists in this configure. That is not a Windows-port milestone, "
+      "it is a broken target list -- fix it rather than dropping the gate.")
+  endif()
+  # `|`, not `;`: a semicolon inside an add_test() argument is a list separator
+  # and would arrive as separate argv entries.
+  list(JOIN _pe_images "|" _pe_images_arg)
+  list(JOIN _pe_archives "|" _pe_archives_arg)
+
+  add_test(NAME gate.windows-imports
+    COMMAND ${CMAKE_COMMAND}
+      -DHL_PE_IMAGES=${_pe_images_arg}
+      -DHL_PE_ARCHIVES=${_pe_archives_arg}
+      -DHL_READOBJ=${HL_READOBJ_EXECUTABLE}
+      -DHL_OBJDUMP=${HL_PE_OBJDUMP_EXECUTABLE}
+      -DHL_NM=${HL_PE_NM_EXECUTABLE}
+      -DHL_SKIP_CODE=77
+      -P ${CMAKE_SOURCE_DIR}/cmake/CheckPeImports.cmake)
+  # SKIP_RETURN_CODE, so "nothing was built to inspect" reports as NOT RUN
+  # rather than as a pass. A green tick would assert that the import surface was
+  # audited when it was not, and a lane that reports coverage it does not have
+  # is worse than a lane that reports none.
+  set_tests_properties(gate.windows-imports PROPERTIES
+    LABELS "unit;gate" SKIP_RETURN_CODE 77
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
+
+# --- gate.ci-lane-parity, for a host with no guest corpus --------------------
+# CMakeLists.txt includes cmake/LaneParity.cmake only under HL_HAVE_GUEST_CC.
+# That condition is a proxy: it is right for Linux and Darwin, whose declared
+# lane lists are mostly guest-backed suites, and wrong for a host whose declared
+# list contains none of them -- there the corpus is irrelevant and the effect is
+# that the ONE guard against a declared-but-empty lane is missing on exactly the
+# newest, least-proven host. A token in HL_CI_HOSTS with nothing counting its
+# lanes is a declaration, not a check.
+#
+# LaneParity.cmake now decides for itself (it reads HL_CI_HOSTS and returns
+# early when this host's token is undeclared, or when the guest-backed lanes it
+# would have to count are absent), so this only has to reach it. The condition
+# is the exact complement of CMakeLists.txt's, so the file is included once and
+# never twice; when that include site is relaxed, delete this block.
+if(HL_BUILD_TESTS AND NOT HL_HAVE_GUEST_CC)
+  include(${CMAKE_CURRENT_LIST_DIR}/LaneParity.cmake)
+endif()
+
 # --- package-test: install into a staging root, link a consumer, run it -----
 # The Makefile does this by re-invoking itself with DESTDIR; the CMake form
 # runs `cmake --install` into a staging prefix from a driver script so the

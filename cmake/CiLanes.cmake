@@ -27,6 +27,37 @@ set(HL_CI_HOSTS
   Darwin-aarch64
 )
 
+# Windows-x86_64 is NOT declared, and this records exactly why, because the
+# guards around it are already in place and the omission would otherwise read as
+# one of them having been forgotten.
+#
+# In place and verified on a Windows host: tools/check_lane_parity.sh has a
+# Windows arm selecting HL_CI_{SHARDED,DIRECT,REGISTRY}_WINDOWS;
+# cmake/LaneParity.cmake registers gate.ci-lane-parity on the real condition
+# (this host's token is declared here) instead of on the presence of guest cross
+# compilers, which a Windows host can never have and which has nothing to do
+# with whether its lanes are countable; tools/check_ci_workflows.sh's I20
+# iterates HL_CI_HOSTS through a token -> workflow map instead of testing the
+# literal Linux-x86_64, so a new token gets the shards-nothing guarantee
+# automatically; and its new I21 fails a token declared here with no lanes in
+# the three lists above. .github/workflows/windows-x86_64.yml exists.
+#
+# The one thing missing is a lane that is non-empty AND GREEN there.
+# HL_CI_DIRECT_WINDOWS would have to be `unit`, and `ctest -L unit` on a Windows
+# host is red: cmake/RustLint.cmake registers rust.fmt and rust.clippy with
+# LABELS "unit;rust" wherever cargo is on PATH, cargo is on PATH on a hosted
+# Windows runner, and rust.clippy fails there -- pkgs/rust/build.rs refuses the
+# host triple, so the failure is a build-script panic rather than a lint
+# verdict. rust.fmt passes. Everything else in the label passes:
+# unit.ci-workflow-invariants, unit.publish-gating and gate.windows-imports.
+#
+# Declaring the token while that holds would declare a red lane, which is the
+# one thing this file exists to stop. Resolve the crate's Windows story first --
+# note the C build here is mingw-w64 (x86_64-w64-windows-gnu) while rustup's
+# default host is x86_64-pc-windows-msvc, so this is not only a missing archive
+# -- then add the token, HL_CI_DIRECT_WINDOWS with `unit`, and the empty
+# SHARDED/REGISTRY lists in one change. Everything else is already waiting.
+
 # Host tokens whose workflow shards the compat matrix. I19 requires cross-host
 # parity only between these; I20 requires a host NOT named here to shard nothing.
 #

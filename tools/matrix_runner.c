@@ -367,30 +367,78 @@ static int valid_environment(const char *text) {
     return 1;
 }
 
-/* The compat matrix runs against two production engines: the ELF Linux engine (test-linux-production-typed)
-   and the Mach-O macOS engine (e2e-compat). A handful of cases exercise behavior the macOS engine cannot
-   emulate (deliberate PROT_NONE non-enforcement, Darwin-absent child-subreaper, netns bridging, deep JIT
-   re-translate). Those are marked `excluded-macos` so they are skipped ONLY when the engine binary under
-   test is Mach-O, while the Linux engine still runs and enforces them -- no Linux coverage is lost. */
-static int engine_is_macho(const char *engine_path) {
+/* The compat matrix runs against production engines of more than one object format: the ELF Linux engine
+   (test-linux-production-typed), the Mach-O macOS engine (e2e-compat), and eventually a PE Windows engine.
+   A handful of cases exercise behavior the macOS engine cannot emulate (deliberate PROT_NONE
+   non-enforcement, Darwin-absent child-subreaper, netns bridging, deep JIT re-translate). Those are marked
+   `excluded-macos` so they are skipped ONLY when the engine binary under test is Mach-O, while the other
+   engines still run and enforce them -- no coverage is lost anywhere else.
+
+   This used to be a BOOLEAN, `engine_is_macho`, whose default arm was `return 1`: ELF meant Linux and
+   ANYTHING ELSE meant macOS. A PE image starts `4D 5A` ("MZ"), so a Windows engine classified itself as
+   macOS and silently inherited every excluded-macos row -- ~60 cases across the manifests, skipped on the
+   first day the lane existed, under a reason (no OFD locks, no F_SETPIPE_SZ, no child-subreaper, BSD pipe
+   semantics) that describes Darwin and says nothing whatever about NT. A silent misclassification that
+   presents as a green lane is the exact failure this project keeps writing down as unacceptable, so the
+   default arm is gone: an unrecognised magic is fatal and names the path and the four bytes it read. */
+typedef enum { ENGINE_ELF, ENGINE_MACHO, ENGINE_PE } engine_format;
+
+static int engine_format_of(const char *engine_path, engine_format *out) {
     unsigned char magic[4] = {0};
     int fd = open(engine_path, O_RDONLY);
     ssize_t got;
-    if (fd < 0) return 0;
+    if (fd < 0) {
+        fprintf(stderr, "matrix-runner: cannot open engine %s to identify its object format\n", engine_path);
+        return 1;
+    }
     got = read(fd, magic, sizeof(magic));
     (void)close(fd);
-    if (got != (ssize_t)sizeof(magic)) return 0;
-    /* ELF -> Linux engine; anything else (Mach-O 0xFEEDFACF / fat 0xCAFEBABE) -> treat as macOS. */
-    if (magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F') return 0;
+    if (got != (ssize_t)sizeof(magic)) {
+        fprintf(stderr, "matrix-runner: engine %s is shorter than a 4-byte magic\n", engine_path);
+        return 1;
+    }
+    if (magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F') {
+        *out = ENGINE_ELF;
+        return 0;
+    }
+    /* Mach-O 64/32 and their byte-swapped forms, plus the universal (fat) magic. */
+    if ((magic[0] == 0xcf && magic[1] == 0xfa && magic[2] == 0xed && magic[3] == 0xfe) ||
+        (magic[0] == 0xce && magic[1] == 0xfa && magic[2] == 0xed && magic[3] == 0xfe) ||
+        (magic[0] == 0xfe && magic[1] == 0xed && magic[2] == 0xfa && magic[3] == 0xcf) ||
+        (magic[0] == 0xfe && magic[1] == 0xed && magic[2] == 0xfa && magic[3] == 0xce) ||
+        (magic[0] == 0xca && magic[1] == 0xfe && magic[2] == 0xba && magic[3] == 0xbe) ||
+        (magic[0] == 0xbe && magic[1] == 0xba && magic[2] == 0xfe && magic[3] == 0xca)) {
+        *out = ENGINE_MACHO;
+        return 0;
+    }
+    if (magic[0] == 0x4d && magic[1] == 0x5a) { /* "MZ" */
+        *out = ENGINE_PE;
+        return 0;
+    }
+    fprintf(stderr,
+            "matrix-runner: %s is not an ELF, Mach-O or PE image (magic %02x %02x %02x %02x). The manifest's "
+            "per-engine exclusions are keyed on the object format, so guessing one would silently apply "
+            "another host's exclusion set. Refusing to run.\n",
+            engine_path, magic[0], magic[1], magic[2], magic[3]);
     return 1;
 }
 
+static const char *engine_format_name(engine_format format) {
+    switch (format) {
+    case ENGINE_ELF: return "ELF";
+    case ENGINE_MACHO: return "Mach-O";
+    case ENGINE_PE: return "PE";
+    }
+    return "?";
+}
+
 static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *case_count, size_t *excluded,
-                         int host_macho) {
+                         engine_format host_format) {
     char path[1024];
     char *line = NULL;
     size_t capacity = 0;
     ssize_t size;
+    size_t undisposed = 0;
     FILE *file;
     if (snprintf(path, sizeof(path), "%s/manifest.tsv", root) >= (int)sizeof(path)) return 1;
     file = fopen(path, "r");
@@ -433,15 +481,47 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
             (*case_count)++;
             continue;
         }
-        /* excluded-macos is per-engine: it drops out only on the Mach-O (macOS) engine; on the ELF
-           (Linux) engine it is parsed and run exactly like an active case so Linux keeps enforcing it. */
+        /* Field 12 is the disposition, and it holds exactly ONE token.
+         *
+         * `excluded-macos` and `excluded-windows` are PER-ENGINE: each drops out only on the engine whose
+         * object format it names, and is parsed and run exactly like an active case on every other engine,
+         * so no other host loses coverage. Every other `excluded-*` token drops everywhere.
+         *
+         * THE ONE-TOKEN CONSTRAINT, recorded here because this is where it bites. There is no way to spell
+         * "excluded on macOS AND on Windows": the obvious `excluded-macos,excluded-windows` would match
+         * neither per-engine arm, fall into the generic `excluded-` arm, and be skipped on ALL THREE
+         * engines -- silently deleting Linux coverage, which is the exact loss the per-engine mechanism was
+         * built to prevent. `excluded-known-bug` has the same effect and is not a substitute for the same
+         * reason. So a comma is rejected outright below rather than mis-parsed. Widening the column to a
+         * comma-separated SET is a small parser change here and in tools/linux_matrix.c, and it should be
+         * made the day the first row needs it -- not before, since a format nothing exercises is a format
+         * nothing tests. Until then the loud parse error is the guard. */
+        if (strchr(fields[11], ',') != NULL) {
+            fprintf(stderr,
+                    "matrix-runner: %s: disposition `%s` holds more than one token. Column 12 is a single "
+                    "token; a comma here would be read as an unknown `excluded-*` and skip the case on the "
+                    "Linux engine too. Widen the parser in both runners first.\n",
+                    fields[0], fields[11]);
+            goto invalid_reported;
+        }
         int macos_only = strcmp(fields[11], "excluded-macos") == 0;
-        if (strncmp(fields[11], "excluded-", 9) == 0 && !(macos_only && !host_macho)) {
+        int windows_only = strcmp(fields[11], "excluded-windows") == 0;
+        /* Runs here unless this engine is the one the token names. Note what this does NOT do: it does not
+         * treat a macOS exclusion as covering Windows. The macOS set is Darwin-shaped -- no OFD locks, no
+         * F_SETPIPE_SZ, no child-subreaper, BSD pipe semantics -- and says nothing about NT, where the
+         * engine emulates rather than passes through. A PE engine therefore RUNS every excluded-macos row,
+         * and if one of them is genuinely impossible on NT that has to be argued for and written down as
+         * its own excluded-windows row. Inheriting another host's skips would hide ~60 cases behind a
+         * reason that does not apply, on the first day the lane exists. */
+        int runs_here = (macos_only && host_format != ENGINE_MACHO) || (windows_only && host_format != ENGINE_PE);
+        if (strncmp(fields[11], "excluded-", 9) == 0 && !runs_here) {
             (*excluded)++;
             continue;
         }
+        /* Count what a PE engine is inheriting-but-not-honouring, so the runner can say so out loud. */
+        if (macos_only && host_format == ENGINE_PE) undisposed++;
         if (*case_count == CASE_MAX) goto overflow;
-        if ((strcmp(fields[11], "active") != 0 && !macos_only) || !relative_path(fields[2]) ||
+        if ((strcmp(fields[11], "active") != 0 && !runs_here) || !relative_path(fields[2]) ||
             !relative_path(fields[9]) || strncmp(fields[9], "expected/", 9) != 0 ||
             (strcmp(fields[6], "-") != 0 && strncmp(fields[6], "argv:", 5) != 0) || !valid_environment(fields[7]) ||
             parse_exit(fields[8], &cases[*case_count].expected_exit) != 0)
@@ -474,11 +554,22 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
             goto invalid;
         (*case_count)++;
     }
+    /* Loud, every run, because the alternative is a silently smaller lane. These cases carry a Darwin
+     * exclusion and NO Windows disposition, so the PE engine runs them; some may well be legitimate
+     * excluded-windows rows and some may be real defects, and nobody can tell which from a green tick. */
+    if (undisposed != 0)
+        fprintf(stderr,
+                "matrix-runner: %s: %zu case(s) are excluded on macOS and carry no Windows disposition. This "
+                "PE engine RUNS them -- a Darwin exclusion is not a Windows one. If one is genuinely "
+                "impossible on NT, give it its own excluded-windows row with a reason; do not widen the "
+                "macOS row.\n",
+                path, undisposed);
     free(line);
     fclose(file);
     return *case_count == 0;
 invalid:
     fprintf(stderr, "matrix-runner: invalid manifest row near active case %zu\n", *case_count + 1);
+invalid_reported:
     free(line);
     fclose(file);
     return 1;
@@ -1190,6 +1281,7 @@ int main(int argc, char **argv) {
     unsigned long repetitions = 1;
     unsigned long repetition;
     resource_baseline baseline;
+    engine_format host_format;
     if (install_interrupt_handlers() != 0) return 1;
     /* Before any case runs, so a malformed scale is one line at the top of the log instead of a verdict. */
     if (load_timeout_scale() != 0) return 2;
@@ -1219,7 +1311,27 @@ int main(int argc, char **argv) {
                         "scratch; use a build directory outside /tmp\n");
         return 2;
     }
-    if (load_manifest(argv[6], cases, &count, &excluded, engine_is_macho(argv[2])) != 0) return 1;
+    /* The disposition of a manifest row is keyed on the OBJECT FORMAT of the engine under test, so the
+     * format has to be identified before a single row is parsed -- and identified, not guessed. Both
+     * engines are sniffed rather than only the aarch64 one, because "both engines are the same format" was
+     * an assumption nothing checked; a mixed pair would silently apply one host's exclusion set to the
+     * other's engine. */
+    {
+        engine_format aarch64_format;
+        engine_format x86_64_format;
+        if (engine_format_of(argv[2], &aarch64_format) != 0) return 2;
+        if (engine_format_of(argv[4], &x86_64_format) != 0) return 2;
+        if (aarch64_format != x86_64_format) {
+            fprintf(stderr,
+                    "matrix-runner: the two engines are different object formats (%s: %s, %s: %s). The "
+                    "manifest's per-engine exclusions are one set for both, so this pairing would apply one "
+                    "host's skips to the other host's engine.\n",
+                    argv[2], engine_format_name(aarch64_format), argv[4], engine_format_name(x86_64_format));
+            return 2;
+        }
+        host_format = aarch64_format;
+    }
+    if (load_manifest(argv[6], cases, &count, &excluded, host_format) != 0) return 1;
     baseline = resource_measure();
     for (index = 0; index < count; ++index) {
         if (interrupted_signal != 0) return 128 + interrupted_signal;

@@ -3,11 +3,46 @@
 # success, so this test is the permanent guard against a renamed or deleted
 # label silently turning a workflow step green.
 #
-# GuestFixtures.cmake intentionally omits all guest-backed suites when the cross
-# compilers are unavailable (notably checks.*.unit). In that reduced registry
-# there are no compatibility lanes to compare. The full CI CMake build runs
-# inside `nix develop`, has both compilers, and registers this gate.
-if(NOT HL_HAVE_GUEST_CC)
+# WHEN THIS GATE APPLIES. The condition used to be a bare `HL_HAVE_GUEST_CC`,
+# and that was a proxy standing in for the real question. The real question is
+# "can this host's DECLARED lane set be non-empty here", and the guest cross
+# compilers answer it only for the hosts whose declared set contains
+# guest-backed lanes -- which is Linux and Darwin, where the lists carry compat,
+# production, checkpoint and perf. GuestFixtures.cmake omits all of those
+# without the compilers, so on a reduced registry there is genuinely nothing to
+# compare and skipping is correct.
+#
+# It answers it WRONGLY for a host whose declared set contains no guest-backed
+# lane at all. There the guest compilers are irrelevant and the proxy silently
+# removes the only structural guard the host has -- a token declared in
+# HL_CI_HOSTS with gate.ci-lane-parity absent is a declaration nothing checks,
+# which is precisely the hole this gate exists to fill.
+#
+# So: ask CiLanes.cmake directly. It is a file of plain set() calls, and this is
+# the first consumer to include() it rather than parse it textually -- the two
+# shell guards still parse, so keep the format literal for them.
+include(${CMAKE_CURRENT_LIST_DIR}/CiLanes.cmake)
+set(_hl_host_token ${CMAKE_SYSTEM_NAME}-${HL_HOST_ARCH})
+if(NOT _hl_host_token IN_LIST HL_CI_HOSTS)
+  # An undeclared host has no lane lists, and check_lane_parity.sh refuses such
+  # a token with exit 2 rather than checking nothing. Not an error: it is the
+  # state of every host before its first declaration.
+  message(STATUS
+    "${_hl_host_token} is not declared in HL_CI_HOSTS -- gate.ci-lane-parity is "
+    "not registered. Declaring the token and registering this gate is ONE "
+    "change: a token whose lanes nothing counts is worse than no token.")
+  return()
+endif()
+
+# The guest-backed lanes are declared for Linux and Darwin, so those two still
+# need the corpus before their declared set can be non-empty. A host that
+# declares none does not.
+if(NOT HL_HAVE_GUEST_CC AND
+   (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
+  message(STATUS
+    "no guest cross compilers -- gate.ci-lane-parity is not registered, because "
+    "this host's declared lanes include guest-backed suites that the reduced "
+    "registry does not contain")
   return()
 endif()
 

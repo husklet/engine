@@ -248,6 +248,21 @@ invariants)
 		done
 	}
 	# One workflow file per HOST TOKEN (HL_CI_HOSTS in cmake/CiLanes.cmake).
+	# The mapping is not derivable from the token -- linux.yml and mac.yml
+	# predate the (OS, CPU) token and are not named for one -- so it is stated
+	# here, once, with a violating default arm. Every check below that needs
+	# "the workflow for host X" goes through this rather than a literal, which
+	# is what stops a new host from being invisible to a guard that was written
+	# when there were two.
+	workflow_for() {
+		case "$1" in
+		Linux-aarch64) printf '%s\n' "$wfdir/linux.yml" ;;
+		Linux-x86_64) printf '%s\n' "$wfdir/linux-x86_64.yml" ;;
+		Darwin-aarch64) printf '%s\n' "$wfdir/mac.yml" ;;
+		Windows-x86_64) printf '%s\n' "$wfdir/windows-x86_64.yml" ;;
+		*) return 1 ;;
+		esac
+	}
 	check_shards "$wfdir/mac.yml" "$(lanes_in HL_CI_SHARDED_DARWIN)" I13 || exit 1
 	check_shards "$wfdir/linux.yml" "$(lanes_in HL_CI_SHARDED_LINUX)" I14 || exit 1
 
@@ -342,10 +357,49 @@ invariants)
 	done
 	# I20: a host token absent from HL_CI_COMPAT_HOSTS shards nothing, so its
 	# workflow must name no lane. I13/I14 cannot see this -- each looks at one
-	# other file. It stops applying once the token is declared.
-	if ! has Linux-x86_64 "$compat_hosts"; then
-		check_shards "$wfdir/linux-x86_64.yml" "" I20 || parity=1
-	fi
+	# other file. It stops applying to a host once that host's token is added
+	# to HL_CI_COMPAT_HOSTS, which is why that addition must land in the same
+	# change as the sharded matrix job it turns the guard off for.
+	#
+	# This used to test the literal `Linux-x86_64`, which meant the guard was
+	# not off for a new host -- it had never been ON. A third token could be
+	# declared, get a workflow, and be checked by nothing at all: not by I13 or
+	# I14 (hardcoded to two files), and not by I20 (hardcoded to one token).
+	# Iterating is what makes the guarantee automatic for every future host.
+	for host in $hosts; do
+		wf=$(workflow_for "$host") || {
+			printf 'VIOLATION: I20 `%s` is in HL_CI_HOSTS but workflow_for() in %s maps no workflow file to it; a host token no guard can locate is unguarded\n' \
+				"$host" "$0" >&2
+			parity=1
+			continue
+		}
+		if [ ! -f "$wf" ]; then
+			printf 'VIOLATION: I20 `%s` is declared in HL_CI_HOSTS but %s does not exist; one workflow file per host token\n' \
+				"$host" "$wf" >&2
+			parity=1
+			continue
+		fi
+		# I21: a declared host must declare lanes. gate.ci-lane-parity proves
+		# each declared lane is a NON-EMPTY CTest selection, but it can only do
+		# that ON that host -- so it is exactly the check that is missing while
+		# a new host has no runner, or has one whose configure drops the gate.
+		# This runs on Linux and macOS on every push, so the wiring of a host
+		# token is guarded from the moment it is written, by machines that
+		# already exist. Empty here means check_lane_parity.sh would exit 1 with
+		# "parsed no lanes" the first time the new runner ran it.
+		os=${host%%-*}
+		upper=$(printf '%s\n' "$os" | tr 'a-z' 'A-Z')
+		declared=$(lanes_in "HL_CI_SHARDED_$upper"
+			lanes_in "HL_CI_DIRECT_$upper"
+			lanes_in "HL_CI_REGISTRY_$upper")
+		if [ -z "$declared" ]; then
+			printf 'VIOLATION: I21 `%s` is declared in HL_CI_HOSTS but HL_CI_{SHARDED,DIRECT,REGISTRY}_%s declare no lane between them; the token would be checked by nothing\n' \
+				"$host" "$upper" >&2
+			parity=1
+		fi
+		has "$host" "$compat_hosts" && continue
+		check_shards "$wf" "" I20 || parity=1
+	done
 	[ "$parity" -eq 0 ] || exit 1
 
 	# I15: `ctest -L <label>` EXITS 0 when the label matches nothing. Every

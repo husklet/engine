@@ -47,6 +47,17 @@ Darwin)
 		lanes_in HL_CI_DIRECT_DARWIN
 		lanes_in HL_CI_REGISTRY_DARWIN)
 	;;
+Windows)
+	# Two of these three are empty today and that is not a defect: a Windows
+	# host shards no compat lane (no guest corpus can be built or supplied
+	# there yet) and registers no guest-backed suite to reserve. The union is
+	# what must be non-empty, and the check below enforces exactly that -- so
+	# the first Windows declaration has to carry a real, green lane in
+	# HL_CI_DIRECT_WINDOWS rather than an empty placeholder.
+	labels=$(lanes_in HL_CI_SHARDED_WINDOWS
+		lanes_in HL_CI_DIRECT_WINDOWS
+		lanes_in HL_CI_REGISTRY_WINDOWS)
+	;;
 *)
 	printf 'lane-parity: unsupported host OS %s\n' "$os" >&2
 	exit 2
