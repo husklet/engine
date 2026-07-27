@@ -176,10 +176,32 @@ static void interp_signal_resume(struct cpu *c, void *ucontext) {
 #error "the aarch64 interpreter backend assumes a little-endian host"
 #endif
 
+// ONE host access per guest access. With a RUNTIME size, memcpy is a CALL into glibc, whose 4..7 and 8..15
+// paths copy head and tail separately -- `mov %ecx,(%rdi)` then `mov %esi,-4(%rdi,%rdx)`, THE SAME ADDRESS
+// at n == 4, and likewise the 8-byte pair at n == 8. A guest store therefore landed TWICE, and a value a
+// peer guest thread committed to that word between the two writes was resurrected by the second: measured
+// directly on the host, ~1e-4 of the CASes that raced such a copy were silently undone. Packed structs, not
+// casts: a guest access need not be aligned, and this must stay one instruction at every -O level, not only
+// where the optimiser happens to inline a constant-size memcpy.
+struct interp_una8 { uint8_t v; } __attribute__((packed));
+struct interp_una16 { uint16_t v; } __attribute__((packed));
+struct interp_una32 { uint32_t v; } __attribute__((packed));
+struct interp_una64 { uint64_t v; } __attribute__((packed));
+
+static void interp_copy_indivisible(void *destination, const void *source, unsigned bytes) {
+    switch (bytes) {
+    case 1: *(struct interp_una8 *)destination = *(const struct interp_una8 *)source; return;
+    case 2: *(struct interp_una16 *)destination = *(const struct interp_una16 *)source; return;
+    case 4: *(struct interp_una32 *)destination = *(const struct interp_una32 *)source; return;
+    case 8: *(struct interp_una64 *)destination = *(const struct interp_una64 *)source; return;
+    default: memcpy(destination, source, bytes); return; // 3/5/6/7: no guest access is this width
+    }
+}
+
 static int interp_read_guest(uint64_t address, void *destination, unsigned bytes) {
     uint64_t host = interp_guest_pointer(address);
     interp_access_begin(address, bytes, 0);
-    memcpy(destination, (const void *)(uintptr_t)host, bytes);
+    interp_copy_indivisible(destination, (const void *)(uintptr_t)host, bytes);
     interp_access_end();
     return 1;
 }
@@ -187,7 +209,7 @@ static int interp_read_guest(uint64_t address, void *destination, unsigned bytes
 static int interp_write_guest(uint64_t address, const void *source, unsigned bytes) {
     uint64_t host = interp_guest_pointer(address);
     interp_access_begin(address, bytes, 1);
-    memcpy((void *)(uintptr_t)host, source, bytes);
+    interp_copy_indivisible((void *)(uintptr_t)host, source, bytes);
     interp_access_end();
     return 1;
 }
