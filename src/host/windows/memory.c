@@ -313,6 +313,24 @@ static void hl_windows_release_overlapping_locked(hl_host_windows *host, hl_host
  * with either private committed pages or a pagefile section view. Shared by
  * reserve() and map_anonymous(); the only difference between them is that
  * reserve() never places at a fixed address.
+ *
+ * The extent is rounded up to whole pages before any Win32 call, because the
+ * placeholder pair disagrees with itself about a partial one. Measured:
+ * MEM_RESERVE_PLACEHOLDER silently rounds a 0x10D40 reservation up to an
+ * 0x11000 NT region and reports success, while the MEM_REPLACE_PLACEHOLDER that
+ * has to consume it insists on covering the placeholder exactly and answers
+ * ERROR_INVALID_PARAMETER for the 0x10D40 the caller asked for. The
+ * fixed-address arm fails one step earlier and just as hard: splitting the tail
+ * off the enclosing granule at an unaligned bound is the same refusal.
+ *
+ * So an unrounded length made every anonymous mapping whose size was not a
+ * multiple of the page size fail outright -- which is most of them, since a
+ * caller allocating a struct or a TLS block asks for its exact size. mmap(2)
+ * rounds the length up to a page and callers rely on that everywhere, so the
+ * rounding belongs here rather than in each of them. The extra pages are real
+ * and owned, so the entry records the rounded extent; only what is REPORTED
+ * back stays the caller's own length, which is what mmap(2) does and what the
+ * guest-map registry checks against.
  */
 static hl_host_result hl_windows_claim_anonymous(hl_host_windows *host, hl_host_handle handle, uint64_t address,
                                                  uint64_t size, uint64_t alignment, uint32_t protection,
@@ -322,10 +340,13 @@ static hl_host_result hl_windows_claim_anonymous(hl_host_windows *host, hl_host_
     void *placeholder;
     void *claimed;
     HANDLE section = NULL;
+    uint64_t extent = hl_windows_round_up(size, HL_WINDOWS_PAGE_SIZE);
+    if (extent < size || extent > SIZE_MAX || (address != 0 && extent > (uint64_t)UINTPTR_MAX - address))
+        return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     hl_windows_lock(host);
     if (placement == HL_HOST_MEMORY_FIXED)
-        hl_windows_release_overlapping_locked(host, handle, (uintptr_t)address, (uintptr_t)(address + size));
-    placeholder = hl_windows_reserve_placeholder(&host->api, (void *)(uintptr_t)address, size, alignment);
+        hl_windows_release_overlapping_locked(host, handle, (uintptr_t)address, (uintptr_t)(address + extent));
+    placeholder = hl_windows_reserve_placeholder(&host->api, (void *)(uintptr_t)address, extent, alignment);
     if (placeholder == NULL) {
         hl_host_result failure = hl_windows_last_error_result();
         hl_windows_unlock(host);
@@ -338,20 +359,20 @@ static hl_host_result hl_windows_claim_anonymous(hl_host_windows *host, hl_host_
          * otherwise fail. The section is created and fully mapped in this one
          * call, so the eager SEC_COMMIT charge that punishes unmapped sections
          * does not arise. */
-        section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE, (DWORD)(size >> 32),
-                                     (DWORD)(size & UINT64_C(0xFFFFFFFF)), NULL);
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE, (DWORD)(extent >> 32),
+                                     (DWORD)(extent & UINT64_C(0xFFFFFFFF)), NULL);
         if (section == NULL) {
             hl_host_result failure = hl_windows_last_error_result();
             (void)VirtualFree(placeholder, 0, MEM_RELEASE);
             hl_windows_unlock(host);
             return failure;
         }
-        claimed = host->api.map_view_of_file3(section, GetCurrentProcess(), placeholder, 0, (SIZE_T)size,
+        claimed = host->api.map_view_of_file3(section, GetCurrentProcess(), placeholder, 0, (SIZE_T)extent,
                                               MEM_REPLACE_PLACEHOLDER, hl_windows_page_protection(protection), NULL, 0);
     } else {
         /* MEM_COMMIT pages read as zero, which is what the contract promises and
          * what hl_linux_memory_create relies on instead of memset()ing. */
-        claimed = host->api.virtual_alloc2(NULL, placeholder, (SIZE_T)size,
+        claimed = host->api.virtual_alloc2(NULL, placeholder, (SIZE_T)extent,
                                            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
                                            hl_windows_page_protection(protection), NULL, 0);
     }
@@ -364,7 +385,7 @@ static hl_host_result hl_windows_claim_anonymous(hl_host_windows *host, hl_host_
     }
     entry = hl_windows_lookup_locked(host, handle, HL_WINDOWS_HANDLE_MAPPING);
     region.offset = 0;
-    region.size = size;
+    region.size = extent;
     region.section_offset = 0;
     region.state = section != NULL ? (uint32_t)HL_WINDOWS_REGION_VIEW : (uint32_t)HL_WINDOWS_REGION_COMMIT;
     region.protection = protection;
@@ -379,7 +400,7 @@ static hl_host_result hl_windows_claim_anonymous(hl_host_windows *host, hl_host_
         return hl_windows_result(entry == NULL ? HL_STATUS_INVALID_ARGUMENT : HL_STATUS_OUT_OF_MEMORY, 0, 0);
     }
     entry->address = claimed;
-    entry->size = size;
+    entry->size = extent;
     entry->section = section;
     entry->section_owned = section != NULL ? 1u : 0u;
     hl_windows_unlock(host);
@@ -1007,6 +1028,157 @@ static hl_host_result hl_windows_memory_unmap_address(void *context, uint64_t ad
     return hl_windows_result(status, 0, 0);
 }
 
+/* True while any live CODE mapping (either alias of a dual-alias pair) covers a
+ * byte of [low, high). Narrower than hl_windows_range_owned_locked on purpose:
+ * an address-keyed re-protect is refused only over code, where the protection is
+ * an engine invariant made of the alias pair plus the W^X gate and the caller
+ * holds neither handle. Every other owned range is the ordinary mprotect case. */
+static int hl_windows_code_range_owned_locked(const hl_host_windows *host, uintptr_t low, uintptr_t high) {
+    uint32_t index;
+    for (index = 0; index < host->handle_capacity; ++index) {
+        const hl_windows_handle_entry *entry = &host->handles[index];
+        if (entry->kind != HL_WINDOWS_HANDLE_MAPPING || entry->size == 0 || entry->executable_address == NULL) continue;
+        if (entry->address != NULL) {
+            const uintptr_t owned = (uintptr_t)entry->address;
+            if (low < owned + (uintptr_t)entry->size && owned < high) return 1;
+        }
+        {
+            const uintptr_t owned = (uintptr_t)entry->executable_address;
+            if (low < owned + (uintptr_t)entry->size && owned < high) return 1;
+        }
+    }
+    return 0;
+}
+
+/* Page-align an address-keyed span the way mprotect(2) and msync(2) do: the
+ * address must already be aligned, the length is rounded up. Zero when the
+ * request cannot be expressed. Deliberately unlike unmap_address's exact-multiple
+ * rule -- rounding an unmap up destroys pages the caller never named, rounding a
+ * protect or a flush up only touches pages it was going to leave intact. */
+static int hl_windows_address_span(uint64_t address, uint64_t size, uintptr_t *low, uint64_t *span) {
+    uint64_t rounded;
+    if (address == 0 || size == 0 || address > UINTPTR_MAX || address % HL_WINDOWS_PAGE_SIZE != 0) return 0;
+    rounded = size + (HL_WINDOWS_PAGE_SIZE - 1u);
+    if (rounded < size) return 0;
+    rounded = hl_windows_round_down(rounded, HL_WINDOWS_PAGE_SIZE);
+    if (rounded > SIZE_MAX || rounded > (uint64_t)UINTPTR_MAX - address) return 0;
+    *low = (uintptr_t)address;
+    *span = rounded;
+    return 1;
+}
+
+/*
+ * mprotect over a range the engine holds no mapping handle for.
+ *
+ * VirtualProtect refuses a range that crosses two NT allocations, where mprotect
+ * spans anything, so the range is walked one allocation at a time -- the same
+ * walk unmap_address does, and for the same reason: only AllocationBase ties the
+ * protection runs of one allocation together. A sub-range that is entirely free
+ * is skipped rather than failed, because there is nothing there whose protection
+ * could be wrong; mprotect over a hole is ENOMEM on Linux, but this entry point
+ * exists for callers holding only an address and its Linux counterpart is
+ * likewise permissive about the tail of a partially-mapped request.
+ */
+static hl_host_result hl_windows_memory_protect_address(void *context, uint64_t address, uint64_t size,
+                                                        uint32_t protection) {
+    hl_host_windows *host = context;
+    hl_status status = HL_STATUS_OK;
+    DWORD native;
+    uintptr_t low;
+    uint64_t span;
+    char *cursor;
+    char *end;
+    if (!hl_windows_protection_valid(protection) || !hl_windows_address_span(address, size, &low, &span))
+        return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    native = hl_windows_page_protection(protection);
+    cursor = (char *)low;
+    end = cursor + (uintptr_t)span;
+    hl_windows_lock(host);
+    /* Decided over every live code mapping BEFORE anything changes, so a refused
+     * range is left exactly as it was found. */
+    if (hl_windows_code_range_owned_locked(host, low, (uintptr_t)end)) {
+        hl_windows_unlock(host);
+        return hl_windows_result(HL_STATUS_BUSY, 0, 0);
+    }
+    while (cursor < end && status == HL_STATUS_OK) {
+        MEMORY_BASIC_INFORMATION info;
+        char *next;
+        char *clip_high;
+        DWORD previous = 0;
+        if (VirtualQuery(cursor, &info, sizeof(info)) != sizeof(info)) {
+            status = hl_windows_status_from_error(GetLastError());
+            break;
+        }
+        next = (char *)info.BaseAddress + info.RegionSize;
+        if (next <= cursor) break; /* NT never reports a zero-length run; a spin here would not end */
+        clip_high = next < end ? next : end;
+        if (info.State != MEM_FREE && info.State != MEM_RESERVE &&
+            !VirtualProtect(cursor, (SIZE_T)(clip_high - cursor), native, &previous))
+            status = hl_windows_status_from_error(GetLastError());
+        cursor = clip_high;
+    }
+    hl_windows_unlock(host);
+    return hl_windows_result(status, 0, 0);
+}
+
+/*
+ * msync over a range the engine holds no mapping handle for.
+ *
+ * Only section views carry anything to write back, so the walk flushes the
+ * MEM_MAPPED runs and steps over the rest -- private and free pages are a
+ * success with nothing done, which is what the contract permits. A durable flush
+ * additionally waits on the backing file, and the file handle is only reachable
+ * through a live mapping entry that covers the run; a view this process does not
+ * own gets the queued write-back FlushViewOfFile already performed. INVALIDATE
+ * has no Windows counterpart: a view is coherent with the section by
+ * construction, so there is no stale copy to drop.
+ */
+static hl_host_result hl_windows_memory_sync_address(void *context, uint64_t address, uint64_t size, uint32_t flags) {
+    hl_host_windows *host = context;
+    hl_status status = HL_STATUS_OK;
+    uintptr_t low;
+    uint64_t span;
+    char *cursor;
+    char *end;
+    if ((flags & ~(uint32_t)(HL_HOST_MEMORY_SYNC_ASYNC | HL_HOST_MEMORY_SYNC_INVALIDATE)) != 0 ||
+        !hl_windows_address_span(address, size, &low, &span))
+        return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    cursor = (char *)low;
+    end = cursor + (uintptr_t)span;
+    hl_windows_lock(host);
+    while (cursor < end && status == HL_STATUS_OK) {
+        MEMORY_BASIC_INFORMATION info;
+        char *next;
+        char *clip_high;
+        if (VirtualQuery(cursor, &info, sizeof(info)) != sizeof(info)) {
+            status = hl_windows_status_from_error(GetLastError());
+            break;
+        }
+        next = (char *)info.BaseAddress + info.RegionSize;
+        if (next <= cursor) break;
+        clip_high = next < end ? next : end;
+        if (info.State == MEM_COMMIT && info.Type == MEM_MAPPED &&
+            !FlushViewOfFile(cursor, (SIZE_T)(clip_high - cursor)))
+            status = hl_windows_status_from_error(GetLastError());
+        cursor = clip_high;
+    }
+    if (status == HL_STATUS_OK && (flags & HL_HOST_MEMORY_SYNC_ASYNC) == 0) {
+        uint32_t index;
+        for (index = 0; index < host->handle_capacity && status == HL_STATUS_OK; ++index) {
+            const hl_windows_handle_entry *entry = &host->handles[index];
+            uintptr_t owned;
+            if (entry->kind != HL_WINDOWS_HANDLE_MAPPING || entry->size == 0 || entry->section_file == NULL ||
+                entry->address == NULL)
+                continue;
+            owned = (uintptr_t)entry->address;
+            if (low >= owned + (uintptr_t)entry->size || owned >= (uintptr_t)end) continue;
+            if (!FlushFileBuffers(entry->section_file)) status = hl_windows_status_from_error(GetLastError());
+        }
+    }
+    hl_windows_unlock(host);
+    return hl_windows_result(status, 0, 0);
+}
+
 /*
  * VirtualLock is the nearest primitive Windows has to mlock, and it is NOT the
  * same operation: it faults the range in and adds it to the process working set,
@@ -1035,8 +1207,8 @@ static hl_host_result hl_windows_memory_wire_range(void *context, uint64_t addre
  * addition, not a residency pin. */
 static hl_host_result hl_windows_memory_unwire_range(void *context, uint64_t address, uint64_t size) {
     (void)context;
-    if (address == 0 || size == 0 || size > SIZE_MAX || address > UINTPTR_MAX ||
-        address % HL_WINDOWS_PAGE_SIZE != 0 || size > (uint64_t)UINTPTR_MAX - address)
+    if (address == 0 || size == 0 || size > SIZE_MAX || address > UINTPTR_MAX || address % HL_WINDOWS_PAGE_SIZE != 0 ||
+        size > (uint64_t)UINTPTR_MAX - address)
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if (!VirtualUnlock((void *)(uintptr_t)address, (SIZE_T)size)) return hl_windows_last_error_result();
     return hl_windows_result(HL_STATUS_OK, 0, (uint64_t)HL_HOST_WIRE_WORKING_SET);
@@ -1060,4 +1232,6 @@ const hl_host_memory_services hl_windows_memory_services = {HL_HOST_MEMORY_ABI,
                                                             hl_windows_memory_repair_signal_page,
                                                             hl_windows_memory_unmap_address,
                                                             hl_windows_memory_wire_range,
-                                                            hl_windows_memory_unwire_range};
+                                                            hl_windows_memory_unwire_range,
+                                                            hl_windows_memory_protect_address,
+                                                            hl_windows_memory_sync_address};

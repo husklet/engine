@@ -1628,9 +1628,14 @@ static void uninstall_host_sigaltstack(void) {
 // The host fault primitive already owns this exact operation, pad and all: it arms its own landing site,
 // touches each page (with an atomic OR of zero when the caller asked about writes, so the access really is
 // a write and still cannot lose a concurrent update), and reports whether every page was reachable. Its
-// probe window is consulted by the vectored handler AFTER the engine classifier declines, which is the
-// same ordering the POSIX arm gets from calling hrm_fault_hook first -- a fault the engine can legitimately
-// serve is served, and only a genuinely unreachable page becomes the probe's answer.
+// probe window is consulted by the vectored handler BEFORE the engine classifier runs, which is exactly the
+// ordering the POSIX arm gets from calling hrm_fault_hook first -- a probe fault is the probe's answer and
+// nothing else's, so it can never be mis-served as a lazy mapping or reach guest-signal delivery.
+//
+// Measured, and the reason that ordering is stated rather than assumed: consulting the window after a
+// DECLINE instead is not equivalent, because the engine's classifier has no decline for a fault it cannot
+// serve -- it terminates the guest. A probe of an unmapped page (an mprotect hole check, a syscall's EFAULT
+// check) killed the process before the window was reached.
 //
 // So there is nothing left for a second implementation to do, and the two thread-locals and the fault hook
 // below have no Windows arm at all. What the primitive additionally buys, which no POSIX arm can, is the

@@ -15,6 +15,13 @@
  * is a complete group answering honestly, not a gap: a filesystem FIFO and a
  * guest uid have no Windows spelling at all, and file.c says why at each.
  *
+ * SYNC is complete at its current ABI on the same footing. The mutexes and the
+ * fork trio are real; the parking trio is wired to the shared registry, whose
+ * Windows arm reports a typed NOT_SUPPORTED for the wait itself because the
+ * process-shared scope has no address-keyed primitive here. Leaving those three
+ * pointers NULL instead would not have been the honest option -- it fails
+ * validation for the whole group, which takes the mutexes down with it.
+ *
  * PROCESS is advertised on the same footing: all five callbacks are real over
  * CreateProcess, and the two inputs that have no Windows meaning -- an entry
  * context that is a pointer into the parent's private memory, and a request to
@@ -237,6 +244,26 @@ static hl_host_result hl_windows_fork_complete(void *context) {
     return hl_host_sync_fork_complete(host->sync);
 }
 
+/* The parking trio is the shared registry's, exactly as on the other backends:
+ * the waiter table, the interruption record and the deadline arithmetic are
+ * host-independent, and only the address-keyed wait underneath differs. */
+static hl_host_result hl_windows_park(void *context, uint64_t waiter, uint32_t scope, uint64_t key, const void *address,
+                                      uint64_t expected, uint32_t compare_size, uint64_t deadline_ns) {
+    hl_host_windows *host = context;
+    return hl_host_sync_park(host->sync, waiter, scope, key, address, expected, compare_size, deadline_ns);
+}
+
+static hl_host_result hl_windows_unpark(void *context, uint32_t scope, uint64_t key, const void *address,
+                                        uint32_t count) {
+    hl_host_windows *host = context;
+    return hl_host_sync_unpark(host->sync, scope, key, address, count);
+}
+
+static hl_host_result hl_windows_interrupt_park(void *context, uint64_t waiter) {
+    hl_host_windows *host = context;
+    return hl_host_sync_interrupt_park(host->sync, waiter);
+}
+
 /* --- construction ----------------------------------------------------------- */
 
 static int hl_windows_resolve_kernelbase(hl_windows_kernelbase *api) {
@@ -266,9 +293,9 @@ static int hl_windows_resolve_kernelbase(hl_windows_kernelbase *api) {
 hl_status hl_host_windows_create(hl_host_windows **out_host, hl_host_services *out_services) {
     static const hl_host_log_services log = {HL_HOST_LOG_ABI, sizeof(log), hl_windows_log};
     static const hl_host_sync_services sync = {
-        HL_HOST_SYNC_ABI,        sizeof(sync),           hl_windows_mutex_create, hl_windows_mutex_lock,
-        hl_windows_mutex_unlock, hl_windows_mutex_close, hl_windows_fork_prepare, hl_windows_fork_complete,
-        hl_windows_fork_complete};
+        HL_HOST_SYNC_ABI,         sizeof(sync),           hl_windows_mutex_create, hl_windows_mutex_lock,
+        hl_windows_mutex_unlock,  hl_windows_mutex_close, hl_windows_fork_prepare, hl_windows_fork_complete,
+        hl_windows_fork_complete, hl_windows_park,        hl_windows_unpark,       hl_windows_interrupt_park};
     SYSTEM_INFO info;
     hl_host_windows *host;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;

@@ -261,6 +261,34 @@ static LONG CALLBACK hl_windows_veh(EXCEPTION_POINTERS *pointers) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    /* A deliberate probe of the faulting address is answered BEFORE the engine
+     * classifier runs, never after it.
+     *
+     * The ordering is the whole point and it is the POSIX arm's: every signal
+     * handler on the run path calls the probe hook first, ahead of the non-PIE
+     * fixup and the lazy zero-page grower, so that a probe fault can never be
+     * mis-served as a lazy mapping -- which would turn a guest EFAULT into a
+     * bogus success -- and never reaches guest-signal delivery. Testing the
+     * window after a decline instead only looks equivalent: the engine's
+     * classifier does not HAVE a decline for a fault it cannot serve. It
+     * terminates the guest or re-raises, so a probe of an unmapped address --
+     * exactly what an mprotect ENOMEM check or a syscall's EFAULT check issues
+     * -- killed the process before the window was ever consulted.
+     *
+     * Only this thread's own window can claim a fault, and only for an address
+     * inside it, so a genuine guest fault at an unrelated address is untouched. */
+    if (g_probe.active != 0 && (fault.flags & HL_WINDOWS_FAULT_HAS_ADDRESS) != 0 &&
+        (fault.flags & HL_WINDOWS_FAULT_NONCONTINUABLE) == 0 &&
+        (fault.kind == HL_WINDOWS_FAULT_SEGV || fault.kind == HL_WINDOWS_FAULT_BUS) &&
+        fault.address >= (uint64_t)g_probe.low && fault.address < (uint64_t)g_probe.high) {
+        g_probe.active = 0;
+        g_probe.failed = 1;
+        hl_windows_fault_pad_resume(&fault, &g_probe.pad);
+        (void)__atomic_fetch_add(&g_resumed, 1u, __ATOMIC_RELAXED);
+        SetLastError(saved_error);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
     handler = __atomic_load_n(&g_handler, __ATOMIC_ACQUIRE);
     verdict = HL_WINDOWS_FAULT_DECLINE;
     if (handler != NULL) verdict = handler(&fault, g_handler_context);
@@ -269,24 +297,6 @@ static LONG CALLBACK hl_windows_veh(EXCEPTION_POINTERS *pointers) {
      * EXCEPTION_NONCONTINUABLE_EXCEPTION, so the refusal is enforced here rather
      * than trusted to every handler. */
     if (verdict == HL_WINDOWS_FAULT_RESUME && (fault.flags & HL_WINDOWS_FAULT_NONCONTINUABLE) == 0) {
-        (void)__atomic_fetch_add(&g_resumed, 1u, __ATOMIC_RELAXED);
-        SetLastError(saved_error);
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-
-    /* The handler declined. If this thread is inside a deliberate probe of the
-     * faulting address, the fault is the probe's answer rather than a crash:
-     * unwind to the pad so the probe reports "unreachable" to its caller. This
-     * is the same shape as a POSIX probe read that longjmps out of its handler,
-     * with the jump replaced by a register-set restore because unwinding out of
-     * a vectored handler is not a supported operation on this host. */
-    if (g_probe.active != 0 && (fault.flags & HL_WINDOWS_FAULT_HAS_ADDRESS) != 0 &&
-        (fault.flags & HL_WINDOWS_FAULT_NONCONTINUABLE) == 0 &&
-        (fault.kind == HL_WINDOWS_FAULT_SEGV || fault.kind == HL_WINDOWS_FAULT_BUS) &&
-        fault.address >= (uint64_t)g_probe.low && fault.address < (uint64_t)g_probe.high) {
-        g_probe.active = 0;
-        g_probe.failed = 1;
-        hl_windows_fault_pad_resume(&fault, &g_probe.pad);
         (void)__atomic_fetch_add(&g_resumed, 1u, __ATOMIC_RELAXED);
         SetLastError(saved_error);
         return EXCEPTION_CONTINUE_EXECUTION;
