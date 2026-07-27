@@ -1,12 +1,16 @@
 #if defined(__APPLE__)
 #define _DARWIN_C_SOURCE
 #endif
+/* _POSIX_C_SOURCE selects the POSIX 2008 surface this runner uses on Linux and Darwin. mingw-w64 keys its
+ * own declarations off __STRICT_ANSI__ instead and hides part of them when a POSIX level is asserted, so the
+ * Windows arm asks for nothing and takes the toolchain's default surface. */
+#if !defined(_WIN32)
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -17,13 +21,101 @@
 #include <sys/statfs.h>
 #endif
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
+#if defined(_WIN32)
+#include <direct.h>
+#include <io.h>
+#include <windows.h>
+#else
+#include <poll.h>
+#include <sys/wait.h>
+
 #include "launch.h"
+#endif
 
 #include "hl/config.h"
+
+/* ---------------------------------------------------------------------------
+ * Host portability shims.
+ *
+ * The runner drives three production engines (ELF, Mach-O, PE) and therefore
+ * has to run on three hosts. Everything below is a spelling difference only:
+ * where a host genuinely cannot answer a question the difference is handled at
+ * the call site, loudly, not hidden behind a macro that returns a plausible
+ * lie. The one deliberate exception is O_CLOEXEC/O_NOINHERIT, which is a pure
+ * rename of the same guarantee.
+ * ------------------------------------------------------------------------- */
+#if defined(_WIN32)
+/* NT opens in text mode by default, which rewrites \n as \r\n on the way out and
+ * swallows \r on the way in. Every comparison this runner makes is byte-exact
+ * against a golden captured on Linux, so a text-mode descriptor would fail the
+ * whole corpus for a reason that has nothing to do with the guest. */
+#define HL_O_BINARY _O_BINARY
+#if !defined(O_CLOEXEC)
+#define O_CLOEXEC _O_NOINHERIT
+#endif
+#define hl_mkdir(path, mode) _mkdir(path)
+/* read()/write() here take an `unsigned int` count, not a size_t. Every request this runner makes is
+ * bounded by OUTPUT_MAX (1 MiB) or a 64 KiB stack buffer, so the narrowing is provably lossless -- but it is
+ * spelled out rather than left to an implicit conversion warning nobody reads. */
+#define HL_IO_COUNT(bytes) ((unsigned)(bytes))
+/* No symlinks are created inside a scratch tree, so lstat's only distinguishing
+ * behaviour is unreachable here. */
+#define lstat stat
+/* Windows has no wait status word: the child's exit code IS the status, and a
+ * process killed by the job object below reports the code the kill supplied.
+ * The runner only consults these after a normal completion (run_guest returns
+ * non-zero for every other outcome), so an exit code above 255 -- a structured
+ * exception, e.g. 0xC0000005 -- simply cannot match an expected exit in [0,255]
+ * and is printed verbatim by the diagnostic. */
+#define WIFEXITED(status) (1)
+#define WEXITSTATUS(status) (status)
+#if !defined(R_OK)
+#define R_OK 4
+#endif
+#if !defined(W_OK)
+#define W_OK 2
+#endif
+
+/* mingw-w64 supplies mkstemp, mkdtemp and the whole <dirent.h> family, but not
+ * getline. This is the POSIX 2008 contract, no more: grow the caller's buffer,
+ * keep the newline, return the byte count or -1 at end of file. */
+static ssize_t hl_getline(char **line, size_t *capacity, FILE *file) {
+    size_t used = 0;
+    if (line == NULL || capacity == NULL || file == NULL) return -1;
+    if (*line == NULL || *capacity == 0) {
+        char *fresh = realloc(*line, 256);
+        if (fresh == NULL) return -1;
+        *line = fresh;
+        *capacity = 256;
+    }
+    for (;;) {
+        int character = fgetc(file);
+        if (character == EOF) {
+            if (used == 0) return -1;
+            break;
+        }
+        if (used + 2u > *capacity) {
+            size_t grown = *capacity * 2u;
+            char *fresh = realloc(*line, grown);
+            if (fresh == NULL) return -1;
+            *line = fresh;
+            *capacity = grown;
+        }
+        (*line)[used++] = (char)character;
+        if (character == '\n') break;
+    }
+    (*line)[used] = 0;
+    return (ssize_t)used;
+}
+#define getline hl_getline
+#else
+#define HL_O_BINARY 0
+#define hl_mkdir(path, mode) mkdir(path, mode)
+#define HL_IO_COUNT(bytes) (bytes)
+#endif
 
 /* CASE_MAX bounds the fixed cases[] array in main(); overflow is the harness's limit, not a parse error. */
 enum { CASE_MAX = 256, FIELD_MAX = 512, OUTPUT_MAX = 1024 * 1024, ERROR_MAX = 64 * 1024, TIMEOUT_MS = 120000 };
@@ -87,12 +179,24 @@ static int load_timeout_scale(void) {
 }
 
 /*
- * The stall detector; see docs/ci-green.md, "What re-arms the hang detector the scale disarmed".
+ * The stall detector.
  * progress := captured stdout/stderr grew, OR the process tree consumed CPU -- both needed, and neither may
- * come from this runner's pipes (remote_supervisor.c heartbeats stderr every 250ms). Walk the tree by parent
+ * come from this runner's pipes (the remote supervisor heartbeats stderr every 250ms). Walk the tree by parent
  * link, not process group: the supervisor puts the engine in a group of its OWN. Unanswerable counts as
  * progress -- missing evidence must never manufacture a hang. The budget is the UNSCALED per-case budget
  * floored at STALL_FLOOR_MS, so at scale 1 it is >= the wall budget and this detector is inert.
+ *
+ * "UNANSWERABLE COUNTS AS PROGRESS" IS A POSIX-ARM RULE AND IT DOES NOT CROSS TO WINDOWS. It is safe on
+ * Linux, where /proc is the CPU source and its absence means the runner is somewhere it was never meant to
+ * be; and it is deliberate on Darwin, where there is no per-tree accounting at all and the detector is
+ * simply off, which is no worse than the day before it was written. On Windows it would be neither: the CPU
+ * source is a job object this runner CREATED and owns, so a query that fails is a defect in this runner or a
+ * handle it has lost, not a host that cannot answer -- and a detector that answers "progress" to every such
+ * failure is not a weaker detector, it is an ABSENT one wearing a detector's name. That is exactly the
+ * five-hour-hang hole this code exists to close, so the Windows arm treats an unanswerable CPU source as a
+ * FAILURE OF THE CASE (run_guest status 4, with the Win32 error named), and refuses to start the suite at all
+ * if the source cannot be read once before the first case runs. See windows_job_cpu_ticks() and
+ * windows_stall_source_selftest() below.
  */
 enum { STALL_FLOOR_MS = 60000, STALL_SAMPLE_MS = 1000, STALL_PROCESS_MAX = 4096 };
 
@@ -176,12 +280,78 @@ static long long tree_cpu_ticks(long root) {
         if (rows[index].descends) total += (long long)rows[index].ticks;
     return total;
 }
-#else
+#elif !defined(_WIN32)
 static long long tree_cpu_ticks(long root) {
     (void)root;
     /* No portable per-tree CPU accounting; off beats output-only, which would make a Darwin lane stricter
        than it is today. */
     return -1;
+}
+#endif
+
+#if defined(_WIN32)
+/* CPU consumed by every process in the case's job object, in 100ns units, or -1 with `error` set to the
+ * Win32 code. This is a STRICTLY BETTER source than the /proc walk it replaces, and the difference is worth
+ * stating because it is what lets the Windows arm be strict where the Linux arm cannot be:
+ *
+ *   * it is exact. The Linux walk enumerates /proc and reconstructs descent from parent links, which loses a
+ *     process that exits between readdir and open and truncates at STALL_PROCESS_MAX. A job object is
+ *     kernel-maintained containment: every descendant is in it by construction, including ones this runner
+ *     never saw.
+ *   * it does not forget. TotalUserTime/TotalKernelTime accumulate the time of processes that have ALREADY
+ *     EXITED, so a case that churns short-lived children still reads as progress. The tick sum does not.
+ *   * it cannot be escaped. A guest that calls setsid/setpgid walks out of a process group; nothing short of
+ *     a breakaway limit (which is not set) leaves a job.
+ *
+ * Monotone, so a sum that has not moved proves no process in the tree ran. */
+static long long windows_job_cpu_ticks(HANDLE job, unsigned long *error) {
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
+    DWORD returned = 0;
+    memset(&accounting, 0, sizeof accounting);
+    if (job == NULL) {
+        *error = ERROR_INVALID_HANDLE;
+        return -1;
+    }
+    if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &accounting, sizeof accounting,
+                                   &returned) ||
+        returned != sizeof accounting) {
+        *error = GetLastError();
+        return -1;
+    }
+    *error = 0;
+    return (long long)((unsigned long long)accounting.TotalUserTime.QuadPart +
+                       (unsigned long long)accounting.TotalKernelTime.QuadPart);
+}
+
+/* Read the stall detector's CPU source ONCE, from an empty job this runner just made, before any case runs.
+ * An empty job answers 0, not an error, so the only way this fails is that the primitive itself is
+ * unavailable -- and finding that out here costs one line at the top of the log, whereas finding it out per
+ * case costs a corpus of failures that all say the same thing. Nothing is inferred from success beyond "the
+ * query works": the per-case query is still checked every time it is made. */
+static int windows_stall_source_selftest(void) {
+    HANDLE job = CreateJobObjectW(NULL, NULL);
+    unsigned long error = 0;
+    long long ticks;
+    if (job == NULL) {
+        fprintf(stderr,
+                "matrix-runner: cannot create a job object (error %lu). The job object is this runner's "
+                "process-group equivalent AND the stall detector's CPU source; without it a runaway case has "
+                "no kill switch and a hung case is not detectable. Refusing to run rather than running with an "
+                "inert hang detector.\n",
+                GetLastError());
+        return 1;
+    }
+    ticks = windows_job_cpu_ticks(job, &error);
+    (void)CloseHandle(job);
+    if (ticks < 0) {
+        fprintf(stderr,
+                "matrix-runner: the stall detector's CPU source is unreadable on this host: "
+                "QueryInformationJobObject(JobObjectBasicAccountingInformation) failed with error %lu on an "
+                "empty job. Refusing to run rather than running with an inert hang detector.\n",
+                error);
+        return 1;
+    }
+    return 0;
 }
 #endif
 
@@ -222,6 +392,7 @@ static void scratch_note(void) {
             scratch_base_used);
 }
 
+#if !defined(_WIN32)
 static uint64_t capture_bytes(const char *output_path, const char *error_path) {
     struct stat status;
     uint64_t total = 0;
@@ -229,6 +400,7 @@ static uint64_t capture_bytes(const char *output_path, const char *error_path) {
     if (stat(error_path, &status) == 0 && status.st_size > 0) total += (uint64_t)status.st_size;
     return total;
 }
+#endif
 
 #ifndef AARCH64_DYNAMIC_LOADER
 #define AARCH64_DYNAMIC_LOADER ""
@@ -265,6 +437,28 @@ typedef struct resource_baseline {
     long threads;
 } resource_baseline;
 
+#if defined(_WIN32)
+/* sig_atomic_t is the right type for both arms: the console control handler runs on a thread of its own
+ * rather than on this one, but the only thing crossing is a flag and a HANDLE, and the HANDLE is published
+ * before the child is resumed and cleared after it is waited for. */
+static volatile sig_atomic_t interrupted_signal;
+static HANDLE volatile active_job;
+
+/* Ctrl-C / Ctrl-Break / console close / logoff / shutdown. Killing the JOB rather than the child is the
+ * point: it takes the engine, the guest, and anything either of them started, which `kill(-pid)` only
+ * approximates and only until something calls setsid. Returning FALSE lets the default handler run, so the
+ * runner still dies -- this hook exists to make sure it does not leave a guest behind when it does. */
+static BOOL WINAPI interrupt_runner(DWORD control_type) {
+    HANDLE job = active_job;
+    interrupted_signal = (sig_atomic_t)(control_type == CTRL_C_EVENT ? 2 : 15);
+    if (job != NULL) (void)TerminateJobObject(job, 1);
+    return FALSE;
+}
+
+static int install_interrupt_handlers(void) {
+    return SetConsoleCtrlHandler(interrupt_runner, TRUE) ? 0 : 1;
+}
+#else
 static volatile sig_atomic_t interrupted_signal;
 static volatile sig_atomic_t active_group;
 
@@ -282,6 +476,7 @@ static int install_interrupt_handlers(void) {
     return sigaction(SIGINT, &action, NULL) != 0 || sigaction(SIGTERM, &action, NULL) != 0 ||
            sigaction(SIGHUP, &action, NULL) != 0;
 }
+#endif
 
 static long count_directory_entries(const char *path) {
 #if defined(__linux__)
@@ -305,9 +500,20 @@ static resource_baseline resource_measure(void) {
 
 static int resources_restored(resource_baseline baseline, const suite_case *item) {
     resource_baseline current = resource_measure();
+#if defined(_WIN32)
+    /* There is no wait(-1) here: NT has no notion of "any child", and a process handle this runner did not
+     * open is not waitable at all. The leak this check is looking for cannot survive anyway -- every case
+     * runs inside a job object created with KILL_ON_JOB_CLOSE, so closing the job at the end of the case
+     * terminates anything the engine left running, whether or not this runner ever knew about it. That is a
+     * stronger guarantee than the POSIX arm's, which only reports the leak. What it is NOT is a measurement,
+     * so nothing is claimed: `clean` here means "structurally impossible", and the descriptor and thread
+     * counts stay unmeasured (-1) exactly as they are on Darwin. */
+    int child_clean = 1;
+#else
     int child_status;
     pid_t child = waitpid(-1, &child_status, WNOHANG);
     int child_clean = child < 0 && errno == ECHILD;
+#endif
     int descriptor_clean = baseline.descriptors < 0 || current.descriptors == baseline.descriptors;
     int thread_clean = baseline.threads < 0 || current.threads == baseline.threads;
     if (child_clean && descriptor_clean && thread_clean) return 1;
@@ -324,9 +530,16 @@ static int resources_restored(resource_baseline baseline, const suite_case *item
 }
 
 static uint64_t monotonic_ms(void) {
+#if defined(_WIN32)
+    /* GetTickCount64, not clock_gettime: mingw-w64's clock_gettime lives in libwinpthread, and every use
+     * here is a millisecond difference against a deadline. 64-bit, so it does not wrap, and monotonic by
+     * definition -- a wall-clock source would let an NTP step forward look like a case that timed out. */
+    return (uint64_t)GetTickCount64();
+#else
     struct timespec value;
     if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0;
     return (uint64_t)value.tv_sec * UINT64_C(1000) + (uint64_t)value.tv_nsec / UINT64_C(1000000);
+#endif
 }
 
 static int relative_path(const char *path) {
@@ -383,9 +596,18 @@ static int valid_environment(const char *text) {
    default arm is gone: an unrecognised magic is fatal and names the path and the four bytes it read. */
 typedef enum { ENGINE_ELF, ENGINE_MACHO, ENGINE_PE } engine_format;
 
+/* A host may serve one guest ISA and not the other: the Windows lane has a PE engine for x86_64 guests and
+ * NO aarch64 engine at all (cmake/Phase2Production.cmake declares one target, not two). Spelling that as the
+ * literal engine path `-` is the honest way to say it, and the ONLY thing it is allowed to do is make the
+ * absence explicit -- load_manifest() below refuses a suite that contains a case for the missing ISA rather
+ * than skipping it. A silently narrower lane that still reports "all cases passed" is the failure this
+ * runner keeps being rewritten to prevent; passing `-` to a suite that needs the ISA is a hard error naming
+ * the first case that needs it. */
+static int engine_absent(const char *engine_path) { return strcmp(engine_path, "-") == 0; }
+
 static int engine_format_of(const char *engine_path, engine_format *out) {
     unsigned char magic[4] = {0};
-    int fd = open(engine_path, O_RDONLY);
+    int fd = open(engine_path, O_RDONLY | HL_O_BINARY);
     ssize_t got;
     if (fd < 0) {
         fprintf(stderr, "matrix-runner: cannot open engine %s to identify its object format\n", engine_path);
@@ -432,8 +654,24 @@ static const char *engine_format_name(engine_format format) {
     return "?";
 }
 
+/* Refuse, by name, the first case that needs an ISA this host has no engine for. Called after a row's `isa`
+ * has been decided and before it is counted, so the message can say which case and which ISA. */
+static int isa_servable(const suite_case *item, int have_aarch64, int have_x86_64, const char *manifest_path) {
+    const char *missing = NULL;
+    if (item->isa != ISA_X86_64 && !have_aarch64) missing = "aarch64";
+    if (item->isa != ISA_AARCH64 && !have_x86_64) missing = "x86_64";
+    if (missing == NULL) return 1;
+    fprintf(stderr,
+            "matrix-runner: %s: case `%s` runs on %s, and this invocation was given `-` for the %s engine -- "
+            "there is no engine on this host that can run it. A suite is run whole or not at all: dropping the "
+            "case would report a green suite that silently covers less than its manifest says. Register only "
+            "suites every one of whose cases this host can serve.\n",
+            manifest_path, item->name, missing, missing);
+    return 0;
+}
+
 static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *case_count, size_t *excluded,
-                         engine_format host_format) {
+                         engine_format host_format, int have_aarch64, int have_x86_64) {
     char path[1024];
     char *line = NULL;
     size_t capacity = 0;
@@ -478,6 +716,7 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
                 snprintf(cases[*case_count].expected, sizeof(cases[*case_count].expected), "%s", fields[4]) >=
                     (int)sizeof(cases[*case_count].expected))
                 goto invalid;
+            if (!isa_servable(&cases[*case_count], have_aarch64, have_x86_64, path)) goto invalid_reported;
             (*case_count)++;
             continue;
         }
@@ -552,6 +791,7 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
             snprintf(cases[*case_count].expected, sizeof(cases[*case_count].expected), "%s", fields[9]) >=
                 (int)sizeof(cases[*case_count].expected))
             goto invalid;
+        if (!isa_servable(&cases[*case_count], have_aarch64, have_x86_64, path)) goto invalid_reported;
         (*case_count)++;
     }
     /* Loud, every run, because the alternative is a silently smaller lane. These cases carry a Darwin
@@ -584,6 +824,7 @@ overflow:
     return 1;
 }
 
+#if !defined(_WIN32)
 static int drain(int fd, unsigned char *buffer, size_t *size, size_t limit, int *eof) {
     for (;;) {
         ssize_t count;
@@ -601,13 +842,14 @@ static int drain(int fd, unsigned char *buffer, size_t *size, size_t limit, int 
         if (errno != EINTR) return 1;
     }
 }
+#endif
 
 static int read_capture(const char *path, unsigned char *buffer, size_t limit, size_t *size) {
-    int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC | HL_O_BINARY);
     *size = 0;
     if (descriptor < 0) return 1;
     while (*size < limit) {
-        ssize_t count = read(descriptor, buffer + *size, limit - *size);
+        ssize_t count = read(descriptor, buffer + *size, HL_IO_COUNT(limit - *size));
         if (count > 0) {
             *size += (size_t)count;
             continue;
@@ -633,6 +875,7 @@ static int read_capture(const char *path, unsigned char *buffer, size_t limit, s
     return 1;
 }
 
+#if !defined(_WIN32)
 static void terminate(pid_t child) {
     const struct timespec tick = {0, 10000000};
     (void)kill(-child, SIGTERM);
@@ -648,6 +891,7 @@ static void terminate(pid_t child) {
 done:
     if (active_group == (sig_atomic_t)child) active_group = 0;
 }
+#endif
 
 typedef struct config_wire {
     hl_launch_config config;
@@ -658,7 +902,7 @@ typedef struct config_wire {
 static int write_full(int fd, const void *buffer, size_t size) {
     const unsigned char *cursor = buffer;
     while (size != 0) {
-        ssize_t written = write(fd, cursor, size);
+        ssize_t written = write(fd, cursor, HL_IO_COUNT(size));
         if (written < 0) {
             if (errno == EINTR) continue;
             return 1;
@@ -669,6 +913,29 @@ static int write_full(int fd, const void *buffer, size_t size) {
     return 0;
 }
 
+#if defined(_WIN32)
+/* The process domain namespaces a launch's SysV keys, abstract sockets and network namespace against every
+ * other launch on the machine; what it needs is uniqueness, not secrecy. BCryptGenRandom would be the
+ * cryptographic answer and would put bcrypt.dll in this tool's import table; ProcessPrng likewise. Neither
+ * is warranted for a collision domain, so the two words are mixed from three sources that cannot all repeat
+ * across two runs on one host: the boot-relative performance counter (different every call), the process id,
+ * and a per-call counter (different within one process even if the counter has not ticked). */
+static int process_domain(uint64_t identity[2]) {
+    static uint64_t sequence;
+    LARGE_INTEGER counter;
+    FILETIME now;
+    uint64_t stamp;
+    if (!QueryPerformanceCounter(&counter)) return -1;
+    GetSystemTimeAsFileTime(&now);
+    stamp = ((uint64_t)now.dwHighDateTime << 32) | (uint64_t)now.dwLowDateTime;
+    sequence++;
+    identity[0] = (uint64_t)counter.QuadPart ^ (stamp * UINT64_C(0x9e3779b97f4a7c15));
+    identity[1] = ((uint64_t)GetCurrentProcessId() << 32) ^ (sequence * UINT64_C(0xc2b2ae3d27d4eb4f)) ^ stamp;
+    /* The launch config rejects an all-zero domain, and a zero here would be a silent collision with every
+     * other zero rather than a diagnosable failure. */
+    return (identity[0] | identity[1]) != 0 ? 0 : -1;
+}
+#else
 static int process_domain(uint64_t identity[2]) {
     unsigned char *output = (unsigned char *)identity;
     size_t offset = 0;
@@ -688,6 +955,7 @@ static int process_domain(uint64_t identity[2]) {
     if (close(descriptor) != 0) return -1;
     return (identity[0] | identity[1]) != 0 ? 0 : -1;
 }
+#endif
 
 static void remove_tree(const char *path) {
     DIR *directory = opendir(path);
@@ -825,7 +1093,7 @@ static int make_config(const char *binary_root, const char *guest, const char *a
             if (scratch != NULL && strcmp(cursor, "HL_PCACHE_DIR") == 0) {
                 if (snprintf(isolated_cache, sizeof isolated_cache, "%s/pcache", scratch) >=
                         (int)sizeof isolated_cache ||
-                    mkdir(isolated_cache, 0700) != 0)
+                    hl_mkdir(isolated_cache, 0700) != 0)
                     return 1;
                 option_value = isolated_cache;
             }
@@ -871,9 +1139,19 @@ static int make_config(const char *binary_root, const char *guest, const char *a
     if (snprintf(path, 1024, "%s/.matrix-config-XXXXXX", binary_root) >= 1024) return 1;
     fd = mkstemp(path);
     if (fd < 0) return 1;
+#if defined(_WIN32)
+    /* mingw-w64's mkstemp already creates with _S_IREAD|_S_IWRITE and no sharing beyond this process; there
+     * is no fchmod, and the POSIX mode bits it would set have no NT meaning. The file is a launch config in
+     * the build tree, not a secret. */
+    (void)_setmode(fd, _O_BINARY);
+    if (write_full(fd, &wire.config, sizeof wire.config) == 0 && write_full(fd, wire.pool, wire.used) == 0 &&
+        close(fd) == 0)
+        return 0;
+#else
     if (fchmod(fd, 0600) == 0 && write_full(fd, &wire.config, sizeof wire.config) == 0 &&
         write_full(fd, wire.pool, wire.used) == 0 && close(fd) == 0)
         return 0;
+#endif
     result = errno;
     if (fd >= 0) (void)close(fd);
     (void)unlink(path);
@@ -881,6 +1159,50 @@ static int make_config(const char *binary_root, const char *guest, const char *a
     return 1;
 }
 
+/*
+ * Everything a case needs on disk before a process exists: a private scratch directory (which is also the
+ * guest's /tmp), the two capture files inside it, and the typed launch config. Shared by both supervision
+ * arms, so a change to the workspace cannot apply to one host and not the other. On failure nothing is left
+ * behind and the caller returns 1.
+ */
+static int open_case_workspace(const char *binary_root, const char *guest, const char *argument,
+                               const char *rootfs, const char *environment, char scratch[1024],
+                               char capture_output[1200], char capture_error[1200], char config_path[1024]) {
+    /*
+     * The guest scratch is mapped as the guest's /tmp volume, so its backing
+     * filesystem determines whether statx-btime, memfd seals, and related
+     * tmpfs-only behaviour are observable. By default we place it under
+     * binary_root (the case dir in the build tree), which keeps local `make`
+     * on a tmpfs tree correct. On CI where the build tree lives on ext4, the
+     * scratch base can be overridden with HL_MATRIX_SCRATCH_DIR pointing at a
+     * mounted tmpfs. The override is a HOST path; the engine's guest-side
+     * special-casing of /tmp and /dev/shm does not apply to it.
+     */
+    const char *scratch_base = getenv("HL_MATRIX_SCRATCH_DIR");
+    int requested = scratch_base != NULL && scratch_base[0] != 0, rejected = 0;
+    struct stat base_stat;
+    if (!requested || stat(scratch_base, &base_stat) != 0 || !S_ISDIR(base_stat.st_mode) ||
+        access(scratch_base, W_OK) != 0) {
+        rejected = requested;
+        scratch_base = binary_root;
+    }
+    scratch_observe(scratch_base, requested && !rejected, rejected);
+    if (snprintf(scratch, sizeof(char[1024]), "%s/.matrix-scratch-XXXXXX", scratch_base) >= 1024 ||
+        mkdtemp(scratch) == NULL)
+        return 1;
+    if (snprintf(capture_output, sizeof(char[1200]), "%s/stdout", scratch) >= 1200 ||
+        snprintf(capture_error, sizeof(char[1200]), "%s/stderr", scratch) >= 1200) {
+        remove_tree(scratch);
+        return 1;
+    }
+    if (make_config(binary_root, guest, argument, rootfs, environment, scratch, config_path) != 0) {
+        remove_tree(scratch);
+        return 1;
+    }
+    return 0;
+}
+
+#if !defined(_WIN32)
 static int run_guest(const char *bridge, const char *engine, const char *guest, const char *argument,
                      const char *rootfs, const char *environment, const char *binary_root, capture *result) {
     int output_pipe[2], error_pipe[2], output_eof = 0, error_eof = 0, exited = 0;
@@ -892,39 +1214,9 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
     result->output = malloc(OUTPUT_MAX);
     result->error = malloc(ERROR_MAX);
     if (result->output == NULL || result->error == NULL || pipe(output_pipe) != 0 || pipe(error_pipe) != 0) return 1;
-    {
-        /*
-         * The guest scratch is mapped as the guest's /tmp volume, so its backing
-         * filesystem determines whether statx-btime, memfd seals, and related
-         * tmpfs-only behaviour are observable. By default we place it under
-         * binary_root (the case dir in the build tree), which keeps local `make`
-         * on a tmpfs tree correct. On CI where the build tree lives on ext4, the
-         * scratch base can be overridden with HL_MATRIX_SCRATCH_DIR pointing at a
-         * mounted tmpfs. The override is a HOST path; the engine's guest-side
-         * special-casing of /tmp and /dev/shm does not apply to it.
-         */
-        const char *scratch_base = getenv("HL_MATRIX_SCRATCH_DIR");
-        int requested = scratch_base != NULL && scratch_base[0] != 0, rejected = 0;
-        struct stat base_stat;
-        if (!requested || stat(scratch_base, &base_stat) != 0 || !S_ISDIR(base_stat.st_mode) ||
-            access(scratch_base, W_OK) != 0) {
-            rejected = requested;
-            scratch_base = binary_root;
-        }
-        scratch_observe(scratch_base, requested && !rejected, rejected);
-        if (snprintf(scratch, sizeof scratch, "%s/.matrix-scratch-XXXXXX", scratch_base) >= (int)sizeof scratch ||
-            mkdtemp(scratch) == NULL)
-            return 1;
-    }
-    if (snprintf(capture_output, sizeof capture_output, "%s/stdout", scratch) >= (int)sizeof capture_output ||
-        snprintf(capture_error, sizeof capture_error, "%s/stderr", scratch) >= (int)sizeof capture_error) {
-        remove_tree(scratch);
+    if (open_case_workspace(binary_root, guest, argument, rootfs, environment, scratch, capture_output, capture_error,
+                            config_path) != 0)
         return 1;
-    }
-    if (make_config(binary_root, guest, argument, rootfs, environment, scratch, config_path) != 0) {
-        remove_tree(scratch);
-        return 1;
-    }
     {
         const char *slash = strrchr(engine, '/');
         size_t directory_size = slash == NULL ? 0 : (size_t)(slash - engine);
@@ -1039,6 +1331,249 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
     remove_tree(scratch);
     return 0;
 }
+#else
+/* ---------------------------------------------------------------------------
+ * The Windows supervision arm.
+ *
+ * Same contract as the POSIX arm above, primitive for primitive:
+ *
+ *   fork + execlp   -> CreateProcessA, created SUSPENDED so the job below can
+ *                      contain it before it runs a single instruction.
+ *   setpgid         -> a job object. Strictly stronger: a job cannot be escaped
+ *                      by setsid/setpgid, contains grandchildren the runner
+ *                      never saw, and KILL_ON_JOB_CLOSE makes "the case is over"
+ *                      and "nothing it started survives" the same event.
+ *   waitpid(WNOHANG)-> WaitForSingleObject(process, 0) + GetExitCodeProcess.
+ *   kill(-pid, ...) -> TerminateJobObject. One call, whole tree, no grace-then-
+ *                      force dance: the child here is an engine being abandoned,
+ *                      not a service being asked to shut down.
+ *   pipe + poll     -> NOTHING. The engine's stdout and stderr are handed the
+ *                      capture FILES directly. On POSIX those pipes exist to keep
+ *                      a remote supervisor's forwarded stream flowing; there is
+ *                      no supervisor on this host, and the capture files were
+ *                      always the authoritative bytes (read_capture() overwrites
+ *                      whatever the pipes drained). Redirecting straight to them
+ *                      removes a copy and the deadlock class that comes with it.
+ *   /proc CPU walk  -> the job's own accounting, which is exact rather than
+ *                      reconstructed. See windows_job_cpu_ticks().
+ *
+ * ONE BEHAVIOURAL DIFFERENCE, stated rather than smoothed over: an unreadable
+ * CPU source FAILS THE CASE here (status 4). It does not count as progress.
+ * ------------------------------------------------------------------------- */
+
+/* Job + process for one case. The job is created before the process and closed after it, so the window in
+   which a guest exists outside a job is exactly zero instructions wide. */
+typedef struct windows_child {
+    HANDLE job;
+    HANDLE process;
+    HANDLE thread;
+} windows_child;
+
+static void windows_child_close(windows_child *child) {
+    if (child->thread != NULL) (void)CloseHandle(child->thread);
+    /* Closing the last handle to a KILL_ON_JOB_CLOSE job terminates everything still in it. */
+    if (child->process != NULL) (void)CloseHandle(child->process);
+    if (child->job != NULL) (void)CloseHandle(child->job);
+    child->thread = NULL;
+    child->process = NULL;
+    child->job = NULL;
+}
+
+static void windows_child_terminate(windows_child *child) {
+    if (child->job != NULL) {
+        (void)TerminateJobObject(child->job, 1);
+        if (child->process != NULL) (void)WaitForSingleObject(child->process, 5000);
+    }
+    if (active_job == child->job) active_job = NULL;
+    windows_child_close(child);
+}
+
+/* Captured bytes read from the OPEN handles rather than by stat()ing the paths. NT updates a file's
+   directory entry lazily, so a path-based size can lag the writes an engine has already made -- and a size
+   that lags is a size that has not changed, which the stall detector would read as "no output". */
+static uint64_t windows_capture_bytes(HANDLE output, HANDLE error) {
+    LARGE_INTEGER size;
+    uint64_t total = 0;
+    if (output != INVALID_HANDLE_VALUE && GetFileSizeEx(output, &size) && size.QuadPart > 0)
+        total += (uint64_t)size.QuadPart;
+    if (error != INVALID_HANDLE_VALUE && GetFileSizeEx(error, &size) && size.QuadPart > 0)
+        total += (uint64_t)size.QuadPart;
+    return total;
+}
+
+/* A capture file opened for the CHILD to write: inheritable, and opened for append so two handles onto the
+   same file (there are not, but the engine may reopen its own stderr) cannot rewind each other. */
+static HANDLE windows_capture_open(const char *path) {
+    SECURITY_ATTRIBUTES inheritable = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
+    return CreateFileA(path, FILE_APPEND_DATA | GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable,
+                       CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+}
+
+/* `<engine> --configfile <config>`, quoted. CreateProcess takes one string and re-splits it with the CRT's
+   rules, so every argument is quoted unconditionally: build directories on this host routinely contain a
+   space, and an unquoted path silently becomes two arguments and an engine that reports a missing file. */
+static int windows_command_line(const char *engine, const char *config_path, char *out, size_t limit) {
+    int written = snprintf(out, limit, "\"%s\" --configfile \"%s\"", engine, config_path);
+    return written < 0 || (size_t)written >= limit;
+}
+
+static int run_guest(const char *bridge, const char *engine, const char *guest, const char *argument,
+                     const char *rootfs, const char *environment, const char *binary_root, capture *result) {
+    char config_path[1024], scratch[1024], capture_output[1200], capture_error[1200], command[2600];
+    uint64_t deadline, stall_budget = stall_timeout_ms(), stall_bytes = 0, stall_stamp, stall_sampled;
+    long long stall_ticks = -1;
+    unsigned long cpu_error = 0;
+    windows_child child = {NULL, NULL, NULL};
+    STARTUPINFOA startup;
+    PROCESS_INFORMATION process;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    HANDLE output_handle = INVALID_HANDLE_VALUE, error_handle = INVALID_HANDLE_VALUE;
+    DWORD exit_code = 0;
+    int outcome = 1;
+    memset(result, 0, sizeof(*result));
+    result->output = malloc(OUTPUT_MAX);
+    result->error = malloc(ERROR_MAX);
+    if (result->output == NULL || result->error == NULL) return 1;
+    /* There is no `mac` forwarder on this host and no hl-remote-supervisor built for it, so the only bridge
+       this arm can honour is the direct one. Refuse anything else by name rather than ignoring it: a lane
+       configured to forward somewhere, silently running locally instead, would report the wrong machine's
+       results. */
+    if (strcmp(bridge, "env") != 0) {
+        fprintf(stderr,
+                "matrix-runner: bridge `%s` is not available on this host. The Windows arm launches the engine "
+                "directly (there is no forwarder and no remote supervisor here), so `env` is the only bridge it "
+                "can honour; running locally under another bridge's name would attribute these results to the "
+                "wrong machine.\n",
+                bridge);
+        return 1;
+    }
+    if (open_case_workspace(binary_root, guest, argument, rootfs, environment, scratch, capture_output, capture_error,
+                            config_path) != 0)
+        return 1;
+    if (windows_command_line(engine, config_path, command, sizeof command) != 0) goto cleanup;
+    output_handle = windows_capture_open(capture_output);
+    error_handle = windows_capture_open(capture_error);
+    if (output_handle == INVALID_HANDLE_VALUE || error_handle == INVALID_HANDLE_VALUE) goto cleanup;
+    child.job = CreateJobObjectW(NULL, NULL);
+    if (child.job == NULL) goto cleanup;
+    memset(&limits, 0, sizeof limits);
+    /* The kill switch, and the reason a runaway case cannot outlive its case: whatever the engine started,
+       closing this job ends. */
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(child.job, JobObjectExtendedLimitInformation, &limits, sizeof limits))
+        goto cleanup;
+    memset(&startup, 0, sizeof startup);
+    memset(&process, 0, sizeof process);
+    startup.cb = sizeof startup;
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = output_handle;
+    startup.hStdError = error_handle;
+    /* CREATE_SUSPENDED, then assign, then resume. Assigning after the child is already running leaves a
+       window in which it can spawn a grandchild that is outside the job -- which would be both an escaped
+       kill switch and a hole in the CPU accounting the stall detector reads. CREATE_NEW_PROCESS_GROUP keeps
+       a console Ctrl-C from reaching the engine directly; this runner's handler kills the job instead, so
+       there is exactly one path by which a case dies. */
+    if (!CreateProcessA(NULL, command, NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP, NULL, NULL,
+                        &startup, &process))
+        goto cleanup;
+    child.process = process.hProcess;
+    child.thread = process.hThread;
+    if (!AssignProcessToJobObject(child.job, child.process)) {
+        windows_child_terminate(&child);
+        goto cleanup;
+    }
+    active_job = child.job;
+    if (ResumeThread(child.thread) == (DWORD)-1) {
+        windows_child_terminate(&child);
+        goto cleanup;
+    }
+    deadline = monotonic_ms() + case_timeout_ms();
+    stall_stamp = monotonic_ms();
+    stall_sampled = stall_stamp;
+    for (;;) {
+        uint64_t now = monotonic_ms();
+        DWORD waited;
+        if (interrupted_signal != 0 || now >= deadline) {
+            windows_child_terminate(&child);
+            outcome = 2;
+            goto cleanup;
+        }
+        if (stall_budget != 0 && now - stall_sampled >= STALL_SAMPLE_MS) {
+            uint64_t bytes = windows_capture_bytes(output_handle, error_handle);
+            long long ticks = windows_job_cpu_ticks(child.job, &cpu_error);
+            stall_sampled = now;
+            if (ticks < 0) {
+                /* THE line this arm exists for. The POSIX walk treats an unanswerable host as progress
+                   because on Linux that means /proc is gone and on Darwin it means the source never
+                   existed. Here the source is a job object this process created and still holds a handle
+                   to, so a failure is a real defect -- and answering "progress" to it would silently
+                   disarm the detector for the rest of the run, which is the five-hour hang this code was
+                   written to make impossible. Fail the case, name the error, keep going. */
+                windows_child_terminate(&child);
+                (void)read_capture(capture_output, result->output, OUTPUT_MAX, &result->output_size);
+                (void)read_capture(capture_error, result->error, ERROR_MAX, &result->error_size);
+                outcome = 4;
+                goto cleanup;
+            }
+            if (bytes != stall_bytes || ticks != stall_ticks) {
+                stall_bytes = bytes;
+                stall_ticks = ticks;
+                stall_stamp = now;
+            } else if (now - stall_stamp >= stall_budget) {
+                windows_child_terminate(&child);
+                /* Unlike the wall-clock path, recover what the guest DID print: a hang is diagnosed from
+                   where it got to. */
+                (void)read_capture(capture_output, result->output, OUTPUT_MAX, &result->output_size);
+                (void)read_capture(capture_error, result->error, ERROR_MAX, &result->error_size);
+                outcome = 3;
+                goto cleanup;
+            }
+        }
+        /* 10ms, matching the POSIX poll tick, so the deadline and stall sampling have the same granularity
+           on both hosts. */
+        waited = WaitForSingleObject(child.process, 10);
+        if (waited == WAIT_OBJECT_0) break;
+        if (waited != WAIT_TIMEOUT) {
+            windows_child_terminate(&child);
+            goto cleanup;
+        }
+    }
+    if (!GetExitCodeProcess(child.process, &exit_code)) {
+        windows_child_terminate(&child);
+        goto cleanup;
+    }
+    result->wait_status = (int)exit_code;
+    active_job = NULL;
+    /* Handles closed before the captures are read: the engine is gone, and a still-open inheritable write
+       handle would keep the file's last extent uncommitted on some filesystems. */
+    windows_child_close(&child);
+    (void)CloseHandle(output_handle);
+    (void)CloseHandle(error_handle);
+    output_handle = INVALID_HANDLE_VALUE;
+    error_handle = INVALID_HANDLE_VALUE;
+    if (read_capture(capture_output, result->output, OUTPUT_MAX, &result->output_size) != 0 ||
+        read_capture(capture_error, result->error, ERROR_MAX, &result->error_size) != 0)
+        outcome = 1;
+    else
+        outcome = 0;
+cleanup:
+    if (outcome == 4)
+        fprintf(stderr,
+                "matrix-runner: the stall detector could not read the case's job-object CPU accounting "
+                "(QueryInformationJobObject error %lu). Treating this as a FAILURE of the case: an "
+                "unreadable CPU source makes the hang detector inert, and an inert hang detector is how a "
+                "hung case becomes a lane that runs until CI's own wall clock kills it.\n",
+                cpu_error);
+    if (output_handle != INVALID_HANDLE_VALUE) (void)CloseHandle(output_handle);
+    if (error_handle != INVALID_HANDLE_VALUE) (void)CloseHandle(error_handle);
+    windows_child_close(&child);
+    active_job = NULL;
+    (void)unlink(config_path); /* Engine normally unlinks immediately; covers pre-launch failure. */
+    remove_tree(scratch);
+    return outcome;
+}
+#endif
 
 static int read_file(const char *path, unsigned char **data, size_t *size) {
     FILE *file = fopen(path, "rb");
@@ -1053,9 +1588,9 @@ static int read_file(const char *path, unsigned char **data, size_t *size) {
 
 static int copy_file(const char *source, const char *destination) {
     unsigned char buffer[64 * 1024];
-    int input = open(source, O_RDONLY), output = -1;
+    int input = open(source, O_RDONLY | HL_O_BINARY), output = -1;
     if (input < 0) return 1;
-    output = open(destination, O_WRONLY | O_CREAT | O_EXCL, 0755);
+    output = open(destination, O_WRONLY | O_CREAT | O_EXCL | HL_O_BINARY, 0755);
     if (output < 0) {
         close(input);
         return 1;
@@ -1071,7 +1606,7 @@ static int copy_file(const char *source, const char *destination) {
             return 1;
         }
         while (offset < (size_t)count) {
-            ssize_t written = write(output, buffer + offset, (size_t)count - offset);
+            ssize_t written = write(output, buffer + offset, HL_IO_COUNT((size_t)count - offset));
             if (written < 0) {
                 if (errno == EINTR) continue;
                 close(input);
@@ -1089,7 +1624,7 @@ static int make_parents(char *path) {
     for (cursor = path + 1; *cursor != 0; ++cursor) {
         if (*cursor != '/') continue;
         *cursor = 0;
-        if (mkdir(path, 0755) != 0 && errno != EEXIST) return 1;
+        if (hl_mkdir(path, 0755) != 0 && errno != EEXIST) return 1;
         *cursor = '/';
     }
     return 0;
@@ -1107,15 +1642,16 @@ static int stage_rootfs(const char *binary_root, const char *guest, const char *
         snprintf(dev, sizeof dev, "%s/dev", rootfs) >= (int)sizeof dev ||
         snprintf(pts, sizeof pts, "%s/dev/pts", rootfs) >= (int)sizeof pts ||
         snprintf(tmp, sizeof tmp, "%s/tmp", rootfs) >= (int)sizeof tmp ||
-        snprintf(staged, sizeof staged, "%s/bin/guest", rootfs) >= (int)sizeof staged || mkdir(bin, 0755) != 0 ||
-        mkdir(dev, 0755) != 0 || mkdir(pts, 0755) != 0 || mkdir(tmp, 01777) != 0 || copy_file(guest, staged) != 0)
+        snprintf(staged, sizeof staged, "%s/bin/guest", rootfs) >= (int)sizeof staged || hl_mkdir(bin, 0755) != 0 ||
+        hl_mkdir(dev, 0755) != 0 || hl_mkdir(pts, 0755) != 0 || hl_mkdir(tmp, 01777) != 0 ||
+        copy_file(guest, staged) != 0)
         return 1;
     if (mapping_data) {
         unsigned char bytes[12288];
         int descriptor;
         memset(bytes, 0x2a, sizeof(bytes));
         if (snprintf(data, sizeof data, "%s/data", rootfs) >= (int)sizeof data) return 1;
-        descriptor = open(data, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        descriptor = open(data, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | HL_O_BINARY, 0600);
         if (descriptor < 0 || write(descriptor, bytes, sizeof(bytes)) != (ssize_t)sizeof(bytes) ||
             close(descriptor) != 0)
             return 1;
@@ -1193,6 +1729,16 @@ static const char *stall_reason(void) {
     return text;
 }
 
+#if defined(_WIN32)
+/* A third verdict, distinct from both "hung" and "timed out": the detector itself could not answer. The
+   detail is already on stderr from run_guest; this is the one-line reason that lands in the per-case
+   summary and, on CI, in the ::error annotation. */
+static const char *stall_unanswerable_reason(void) {
+    return "STALL DETECTOR UNANSWERABLE: the case's job-object CPU accounting could not be read, so a hang "
+           "would have been undetectable for the rest of this run";
+}
+#endif
+
 static int run_one(const suite_case *item, const char *bridge, const char *engine, const char *binary_root,
                    const char *suite_root, const char *isa, capture *result) {
     char guest[1024], expected_path[1024], binary[256], rootfs[1024] = {0};
@@ -1260,6 +1806,9 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
         diagnostic(item, isa,
                    status == 2   ? timeout_reason()
                    : status == 3 ? stall_reason()
+#if defined(_WIN32)
+                   : status == 4 ? stall_unanswerable_reason()
+#endif
                                  : "exit/stdout mismatch",
                    result);
         free(expected);
@@ -1282,9 +1831,15 @@ int main(int argc, char **argv) {
     unsigned long repetition;
     resource_baseline baseline;
     engine_format host_format;
+    int have_aarch64, have_x86_64;
     if (install_interrupt_handlers() != 0) return 1;
     /* Before any case runs, so a malformed scale is one line at the top of the log instead of a verdict. */
     if (load_timeout_scale() != 0) return 2;
+#if defined(_WIN32)
+    /* Also before any case runs: prove the hang detector's CPU source answers at all. A detector that
+       silently cannot see CPU is worse than no detector, because the lane still claims to have one. */
+    if (windows_stall_source_selftest() != 0) return 2;
+#endif
     if (argc == 8) {
         only = argv[7];
     } else if (argc == 9 || argc == 10) {
@@ -1316,11 +1871,19 @@ int main(int argc, char **argv) {
      * engines are sniffed rather than only the aarch64 one, because "both engines are the same format" was
      * an assumption nothing checked; a mixed pair would silently apply one host's exclusion set to the
      * other's engine. */
+    have_aarch64 = !engine_absent(argv[2]);
+    have_x86_64 = !engine_absent(argv[4]);
+    if (!have_aarch64 && !have_x86_64) {
+        fprintf(stderr, "matrix-runner: both engines were given as `-`; there is nothing to run\n");
+        return 2;
+    }
     {
         engine_format aarch64_format;
         engine_format x86_64_format;
-        if (engine_format_of(argv[2], &aarch64_format) != 0) return 2;
-        if (engine_format_of(argv[4], &x86_64_format) != 0) return 2;
+        if (have_aarch64 && engine_format_of(argv[2], &aarch64_format) != 0) return 2;
+        if (have_x86_64 && engine_format_of(argv[4], &x86_64_format) != 0) return 2;
+        if (!have_aarch64) aarch64_format = x86_64_format;
+        if (!have_x86_64) x86_64_format = aarch64_format;
         if (aarch64_format != x86_64_format) {
             fprintf(stderr,
                     "matrix-runner: the two engines are different object formats (%s: %s, %s: %s). The "
@@ -1331,7 +1894,7 @@ int main(int argc, char **argv) {
         }
         host_format = aarch64_format;
     }
-    if (load_manifest(argv[6], cases, &count, &excluded, host_format) != 0) return 1;
+    if (load_manifest(argv[6], cases, &count, &excluded, host_format, have_aarch64, have_x86_64) != 0) return 1;
     baseline = resource_measure();
     for (index = 0; index < count; ++index) {
         if (interrupted_signal != 0) return 128 + interrupted_signal;

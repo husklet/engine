@@ -164,30 +164,35 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     message(STATUS "  ${_l}")
   endforeach()
 
-  # The corpus is present and current -- and still nothing on Windows consumes
-  # it. Phase3Compat.cmake and Phase3Gates.cmake each return at their OWN
-  # Windows guard (there is no Windows production engine to run a guest
-  # against), so setting HL_HAVE_GUEST_CC here declares zero fixtures while
-  # still reaching CMakeLists.txt's compat-engines target, whose dependencies
-  # -- hl-engine-linux-aarch64, hl-engine-linux-x86_64, matrix-runner,
-  # forkserver-runner -- no Windows configure defines. Measured: configure and
-  # generate both succeed and the default build is unaffected, but
-  # `ninja compat-engines` then dies with
-  #     ninja: error: 'hl-engine-linux-aarch64', needed by
-  #                   'CMakeFiles/compat-engines', missing and no known rule
-  # A build directory that advertises a target which cannot be built, for a
-  # corpus that was not declared, is the half-enabled state to avoid.
+  # The corpus is present and current, and there IS now something on Windows
+  # that consumes it: cmake/Phase3Compat.cmake declares every compat fixture
+  # here (staged from this cache, not compiled), builds matrix-runner and
+  # linux-matrix -- the two host runners whose process supervision has been
+  # ported -- and cmake/Phase3Gates.cmake registers the x86_64 production
+  # sweeps. Both are behind HL_WINDOWS_GUEST_LANES, which is OFF until the
+  # engine can start a guest; the fixtures and runners build either way, since
+  # having them built is what makes the engine measurable at all.
   #
-  # So the default stays FALSE, with the remaining blockers named rather than
-  # left to be rediscovered. -DHL_GUEST_TESTS=ON is the deliberate opt-in for
-  # whoever lands those three changes.
+  # The one thing still missing is `compat-engines`: CMakeLists.txt names
+  # hl-engine-linux-{aarch64,x86_64} and forkserver-runner in it, none of which
+  # a Windows configure defines, so the target is not declared on this host
+  # (CMakeLists.txt guards it) and `ninja compat-engines` is simply absent
+  # rather than present-and-unbuildable. Shard targets are unaffected: the
+  # per-suite compat-<label>-fixtures targets are declared here as usual.
+  #
+  # The default stays FALSE anyway. That is NOT about the consumers any more --
+  # it is about cost and blast radius. Declaring 3,233 staging rules doubles a
+  # Windows configure, and the supported Windows configuration is still the
+  # libraries plus the host unit lane; a developer who wants the corpus asks for
+  # it. -DHL_GUEST_TESTS=ON is that request.
   if(NOT HL_GUEST_TESTS STREQUAL "ON")
     message(STATUS
-      "Guest fixtures stay DISABLED on Windows: the corpus is ready, but the "
-      "suites that consume it are not. Phase3Compat and Phase3Gates still return "
-      "at their own Windows guard, and there is no Windows production engine for "
-      "them to run a fixture against. Once those are addressed, "
-      "-DHL_GUEST_TESTS=ON consumes this corpus.")
+      "Guest fixtures stay OFF by default on Windows -- not because nothing "
+      "consumes them (Phase3Compat now stages the whole corpus here and builds "
+      "matrix-runner and linux-matrix), but because 3,233 staging rules are not "
+      "what a default Windows build is for. -DHL_GUEST_TESTS=ON consumes this "
+      "corpus; add -DHL_WINDOWS_GUEST_LANES=ON to also register the x86_64 "
+      "guest lanes once the engine can start a guest.")
     return()
   endif()
   set(HL_HAVE_GUEST_CC TRUE)

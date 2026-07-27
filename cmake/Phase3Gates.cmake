@@ -18,10 +18,89 @@
 # guard for it to do either.
 #
 # Purely additive: false on Linux and Darwin, where the file is unchanged.
+#
+# ---------------------------------------------------------------------------
+# THE WINDOWS ARM. What is registered here and what is not:
+#
+#   REGISTERED (behind HL_WINDOWS_GUEST_LANES; see cmake/Phase3Compat.cmake for
+#   why that switch exists and what has to be measured before it is turned on):
+#   the production.full-x86_64.* sweeps. These are the right shape for a host
+#   with ONE guest engine. linux-matrix selects on the manifest's own ISA column
+#   and runs each case as a bare `<engine> <guest>` launch, so it needs neither
+#   an aarch64 engine nor a supervisor nor a typed launch config -- and it
+#   reports what it skipped, per suite, in its own summary line. The x86_64 legs
+#   of all 22 compat suites plus soak are therefore reachable here even though
+#   only one compat suite can register through matrix-runner.
+#
+#   NOT REGISTERED, each for its own reason and none of them "we did not get to
+#   it":
+#     * every e2e, lifecycle, dynamic-e2e, nested, pty, stdio, dir and rootfs
+#       gate -- their runners (tools/e2e_runner.c, tools/bridge_runner.c,
+#       tools/config_e2e_runner.c, ...) are POSIX process supervisors that have
+#       not been ported, and cmake/Phase3Compat.cmake does not build them here.
+#     * every checkpoint gate -- checkpoint-tree-runner needs Linux-only
+#       primitives, and checkpoint/restore has no Windows arm at all.
+#     * the perf and bench lanes -- perf-runner is POSIX, and a timing lane on a
+#       host whose engine cannot yet start a guest would measure nothing.
+#     * production.smoke-* -- tools/linux_production_smoke.c is POSIX.
+#     * production.matrix -- its 24 by-name triples include e2e-built fixtures
+#       that sections 1-2 below declare, and those sections are not reached on
+#       this host.
+#     * the whole aarch64 half of every sweep above. There is no aarch64 Windows
+#       engine (cmake/Phase2Production.cmake declares one target), so a
+#       production.full-aarch64.* lane would be a name with nothing behind it.
+#
+# Sections 1-2 (the e2e/perf/checkpoint guest fixtures) are still not reached:
+# nothing registered above consumes them, and declaring ~600 more staging rules
+# for a lane that does not exist is cost without a claim.
+# ---------------------------------------------------------------------------
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-  message(STATUS
-    "Windows host -- the e2e/checkpoint/perf gates are not registered (they all "
-    "run a guest, and no Windows production engine exists yet).")
+  if(NOT HL_WINDOWS_GUEST_LANES)
+    message(STATUS
+      "Windows host -- the production sweeps are wired but not registered "
+      "(-DHL_WINDOWS_GUEST_LANES=ON); the e2e/checkpoint/perf gates need host "
+      "runners that are still POSIX-only.")
+    return()
+  endif()
+  # The same suite list the Linux lane sweeps, x86_64 only.
+  set(_win_suites
+    abi:tests/compat/abi  abi-corpus:tests/compat/abi/corpus  libc:tests/compat/libc
+    completeness:tests/compat/completeness  posix:tests/compat/posix
+    syscall:tests/compat/syscall  network:tests/compat/network
+    procfs:tests/compat/procfs  memory:tests/compat/memory
+    filesystem:tests/compat/filesystem  signals:tests/compat/signals
+    process:tests/compat/process  time:tests/compat/time
+    core/abi:tests/compat/core/abi  core/workload:tests/compat/core/workload
+    core/syscall:tests/compat/core/syscall  core/regress:tests/compat/core/regress
+    ipc:tests/compat/ipc  threads:tests/compat/threads
+    isolation:tests/compat/isolation  syscall_edges:tests/compat/syscall_edges)
+  foreach(_pair ${_win_suites})
+    string(REPLACE ":" ";" _p ${_pair})
+    list(GET _p 0 _dir)
+    list(GET _p 1 _srcdir)
+    string(REPLACE "/" "-" _label ${_dir})
+    add_test(NAME production.full-x86_64.${_label}
+      COMMAND $<TARGET_FILE:linux-matrix> --suite ${HL_ENGINE_X86_64}
+              ${HL_COMPAT}/${_dir}/x86_64 ${CMAKE_SOURCE_DIR}/${_srcdir})
+    set_tests_properties(production.full-x86_64.${_label} PROPERTIES
+      LABELS "production;production-full;production-full-x86_64"
+      RESOURCE_LOCK hl-guest TIMEOUT 3600 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    hl_matrix_timeout_scale(production.full-x86_64.${_label})
+  endforeach()
+  add_test(NAME production.full-x86_64.isa
+    COMMAND $<TARGET_FILE:linux-matrix> --suite ${HL_ENGINE_X86_64}
+            ${HL_COMPAT}/isa/x86_64 ${CMAKE_SOURCE_DIR}/tests/compat/isa/x86_64)
+  set_tests_properties(production.full-x86_64.isa PROPERTIES
+    LABELS "production;production-full;production-full-x86_64"
+    RESOURCE_LOCK hl-guest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  hl_matrix_timeout_scale(production.full-x86_64.isa)
+  add_test(NAME production.full-x86_64.soak
+    COMMAND $<TARGET_FILE:linux-matrix> --suite ${HL_ENGINE_X86_64}
+            ${CMAKE_BINARY_DIR}/soak/x86_64 ${CMAKE_SOURCE_DIR}/tests/soak)
+  set_tests_properties(production.full-x86_64.soak PROPERTIES
+    LABELS "production;production-full;production-full-x86_64"
+    RESOURCE_LOCK hl-guest RUN_SERIAL TRUE TIMEOUT 3600 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  hl_matrix_timeout_scale(production.full-x86_64.soak)
   return()
 endif()
 
