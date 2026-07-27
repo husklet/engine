@@ -10,10 +10,10 @@ and the public `hl/ir.h` + `hl/codegen.h` headers were deleted: `hl_codegen_*` h
 and the 17-opcode IR could express neither production frontend (no flags, no vectors, no atomics, no syscalls).
 A symmetric `host/<cpu>/codegen.c` per host CPU reads exactly like the production lowering pipeline, and it is
 not one: the engine's guest frontends under `src/translator/guest/` emit host machine code **directly**. That
-misreading cost real time; see `docs/amd64-host-findings.md` §3 for the history.
+misreading cost real time; see `docs/amd64-host.md` §3 for the history.
 
 `asm.h`'s only consumer is `../../guest/x86_64/translit/`, the same-ISA transliterator
-(`docs/amd64-host-translit.md`). It encodes the fixed vocabulary that transliterator needs at block boundaries
+(`docs/amd64-host.md`). It encodes the fixed vocabulary that transliterator needs at block boundaries
 — `%gs`-relative loads and stores, `movabs`, `pushfq`, `jcc rel32`, the guest-stack accesses a `CALL`/`RET`
 performs. It does **not** encode guest instructions: those are copied verbatim, which is the whole point of the
 diagonal.

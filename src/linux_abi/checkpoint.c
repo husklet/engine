@@ -1821,7 +1821,7 @@ static int ckpt_dump_pages(struct ckpt_sink *sink, struct ckpt_sink_stream *f, s
         reg.prot = ckpt_region_prot(addr, glen);
         // is_gna is a WHOLE-REGION claim (restore gna_adds the whole region), so ask it as one: gna_hit's
         // first-page test is true of every glibc pthread stack guard, which poisoned whole stacks on restore
-        // -> -EFAULT in pthread_join's futex -> abort. docs/amd64-host-findings.md 3.8.
+        // -> -EFAULT in pthread_join's futex -> abort. docs/amd64-host.md 3.8.
         reg.is_gna = gna_all(addr, glen ? glen : 1);
         pthread_mutex_lock(&g_filemap_lock);
         for (int map_index = 0; map_index < g_nfilemap; map_index++) {

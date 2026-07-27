@@ -190,7 +190,7 @@ A separate IR and per-host-CPU lowering pipeline (`include/hl/ir.h`, `include/hl
 live here. It was clean-room bootstrap scaffolding that the transferred production frontends superseded within a day;
 its 17-opcode IR could express neither frontend, and `hl_codegen_*`/`hl_ir_*` had no caller anywhere in `src/`. It was
 deleted, because the shape of the tree — a symmetric `host/<cpu>/codegen.c` per host CPU — read like the production
-lowering path and repeatedly cost readers time. `docs/amd64-host-findings.md` §3 keeps the history.
+lowering path and repeatedly cost readers time. `docs/amd64-host.md` §2 keeps the history.
 
 What remains under `src/translator/host/` is `aarch64/asm.{c,h}`, the ARM64 instruction assembler (`hl_a64_*`) the
 production JIT actually uses, covered by `unit.a64_asm`.
@@ -533,7 +533,7 @@ These lanes run guests through the `build/linux-production` engines, so they nee
 backend for. Today that is **AArch64 only** — on an x86-64 Linux host the tests are registered (the guest fixtures and
 the CTest registry are host-CPU-neutral, which is what `gate.ci-lane-parity` checks) but cannot pass until the x86-64
 translator backends land. `production.smoke-x86_64` is the cheapest end-to-end proof and the milestone to watch;
-`docs/amd64-host.md` section 6 tracks it.
+`docs/amd64-host.md` §7 tracks it.
 
 On a Linux/AArch64 host:
 

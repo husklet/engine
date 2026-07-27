@@ -4,7 +4,7 @@
 # EMULATION, NOT HARDWARE. This lane exists because the aarch64 host arm is
 # built on an x86_64 CI host but never executed there, so JIT changes ship
 # unrun. qemu-aarch64 executes them. What that is and is not worth is measured
-# in docs/emulated-aarch64.md -- read it before trusting or distrusting a
+# in docs/amd64-host.md -- read it before trusting or distrusting a
 # result. In one line: it vouches for instruction semantics, the W^X arena and
 # signal handling; it does NOT vouch for weak memory ordering or timing.
 #
@@ -80,7 +80,7 @@ for isa in aarch64 x86_64; do
 done
 
 # Print the emulator version: it is the lane's oracle, pinned by flake.lock, and a
-# result is only comparable to docs/emulated-aarch64.md's table alongside it.
+# result is only comparable to docs/amd64-host.md's table alongside it.
 printf 'emulated-aarch64: %s under %s (%s)\n' "$(basename -- "$suitedir")" "$qemu" \
 	"$("$qemu" --version 2>/dev/null | head -1)"
 exec "$runner" env \

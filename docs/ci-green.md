@@ -47,7 +47,7 @@ Every disposition above is keyed on the **engine** under test. These two are key
 **host CPU**, which only became a second axis when x86-64 Linux became a host. Neither guest
 frontend has an amd64 back end — both emit ARM64 — so that host's execution backend interprets rather
 than emits. `docs/amd64-host.md` predicted "roughly 10-50x"; measured, the cost is
-**3.4x to 605x, geometric mean 26.6x** (`docs/amd64-host-performance.md` §2, engine-vs-native CPU time
+**3.4x to 605x, geometric mean 26.6x** (`docs/amd64-host.md` §2, engine-vs-native CPU time
 on the thirteen perf payloads). The prediction holds for the middle of the distribution and not at
 either end: kernel-bound cases are 3-12x because the host kernel does the work in both columns, and
 guest-execution-bound cases are 94-605x. Two gates were calibrated against a JIT and cannot be read
@@ -155,7 +155,7 @@ commits to enforcing them.
 This paragraph used to say that enforced on an interpreter "all thirteen cases per guest ISA fail".
 That is measurably false and the number was never taken: **five of the thirteen pass the AArch64-host
 JIT thresholds unchanged** — `startup`, `translation`, `ipc-throughput`, `fork-stress`, `warm-cache` —
-**and four more are within 3x** (`docs/amd64-host-performance.md` §2, run through `perf-runner` itself
+**and four more are within 3x** (`docs/amd64-host.md` §2, run through `perf-runner` itself
 with the real `PERF_LIMIT_*` pairs applied, so it is the lane's own verdict). `cmake/Phase3Gates.cmake`
 was corrected in `2e1b90bb`; this is the same fix.
 
@@ -226,7 +226,7 @@ manifests at `fe722e2c` measured 2632/3013 (case, guest-ISA) runs passing — 87
 is superseded.** A second sweep after the fixes landed, same method and same completeness against
 pinned binaries, measures **2993/3013 — 99.34%** (aarch64 guest 1488/1496, x86-64 guest
 1505/1517), with **20 of the 24 suites fully green on both guest ISAs**; the residue is
-`completeness`, `core-regress`, `process` and `procfs`. `docs/amd64-host-findings.md` §3.10 is
+`completeness`, `core-regress`, `process` and `procfs`. `docs/amd64-host.md` §3.10 is
 the record. Still a snapshot, not a gate: re-measure before quoting it.
 
 `linux-x86_64.yml` gates `ctest -L unit` (twice — once sandboxed through `.#checks.x86_64-linux.unit`,
@@ -238,7 +238,7 @@ used to deny.
 
 The `emulated-aarch64-gated` step is the one lane that closed a gap of its own, and it is
 **emulation**: it runs the cross-built aarch64 host arm under `qemu-user` on this x86-64 runner,
-because CI otherwise never executes that arm anywhere. `docs/emulated-aarch64.md` is the category
+because CI otherwise never executes that arm anywhere. `docs/amd64-host.md` is the category
 list — weak memory ordering is explicitly *not* vouched for, since qemu-user inherits this host's
 stronger model, so a missing barrier in the IBTC or STW paths passes there and can still fail on
 silicon. It does not substitute for an aarch64 runner and does not touch the 3013 runs above.

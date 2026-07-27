@@ -103,7 +103,7 @@ Two consequences, one fixed and one open.
 and the reason is that the interpreter backend and the JIT backend must be able to read each other's guest
 state. The `ckpt-cross` lane (`tools/checkpoint_cross_gate.sh`, `cmake/Phase3Gates.cmake` section 9c)
 tests that directly: capture with one host backend, restore with the other, both directions, both guest ISAs.
-It is skip-gated on `qemu-aarch64` plus the cross tree, and shares `docs/emulated-aarch64.md`'s boundary.
+It is skip-gated on `qemu-aarch64` plus the cross tree, and shares `docs/amd64-host.md`'s boundary.
 
 Measured: 11/11 green, including the `cycle` double round-trip in both directions. The x86_64
 `interp-to-jit` threads cell is deliberately not registered — it fails on the address-space collision above,

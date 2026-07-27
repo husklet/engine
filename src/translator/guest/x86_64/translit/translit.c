@@ -22,10 +22,10 @@
 // address has no bits above 32, add the bias) and un-biases address MATERIALISATION (lower/mov.c,
 // interp_lea_value) in the opposite direction. Verbatim copying can express NEITHER: a copied instruction
 // carries its own addressing mode, and there is no place to put the fold. Six separate bugs on this branch
-// came from getting one direction of that rule wrong (docs/amd64-host-findings.md 3.11, 3.12, 3.16), so the
+// came from getting one direction of that rule wrong (docs/amd64-host.md 3.11, 3.12, 3.16), so the
 // transliterator does not attempt it: g_nonpie_lo != 0 declines the image outright and every block runs on
 // the interpreter, which already implements both directions. This is a refusal, not an implementation --
-// see docs/amd64-host-translit.md for what it costs and what would lift it.
+// see docs/amd64-host.md for what it costs and what would lift it.
 
 #include "../../../host/x86_64/asm.h"
 

@@ -22,7 +22,7 @@ guest ISAs. Linux x86-64 is not there yet, and the table says only what is prove
   runs, per case, nothing sampled, binaries pinned, in an isolated worktree — **99.84% pass** (aarch64 guest
   1500/1503, x86-64 guest 1531/1533), with zero cross-ISA output divergence. The five residual legs are
   four environmental (a `nice ≤ 5` precondition the harness does not enforce) and one real defect, named
-  with a reproducer in [`docs/amd64-host-findings.md`](docs/amd64-host-findings.md) §3.12.
+  in [`docs/amd64-host.md`](docs/amd64-host.md) §7.
 - **The compat corpus is not gated by CI here yet**: `cmake/CiLanes.cmake` still excludes this host from the
   compat shards. `.github/workflows/linux-x86_64.yml` does gate `unit`, `nested-engine`,
   `emulated-aarch64-gated` and the package check.
@@ -32,23 +32,21 @@ guest ISAs. Linux x86-64 is not there yet, and the table says only what is prove
   build is absent.
 - Guest execution there is **interpreted** by default. Measured overhead is not one number: **3.4× on
   kernel-bound work, 94–605× on guest-execution-bound work** (median 25.3×), so the `perf-linux` lane is
-  record-only rather than threshold-enforcing — see
-  [`docs/amd64-host-performance.md`](docs/amd64-host-performance.md), where the single largest cost turned
-  out to be a host syscall per guest basic block rather than the interpretation itself.
+  record-only rather than threshold-enforcing. The single largest cost turned out to be a host syscall per
+  guest basic block rather than the interpretation itself.
 - An **x86-64 same-ISA transliterator** exists behind `HL_X86_TRANSLIT=1` (`-DHL_TRANSLIT=ON` moves the
   default), giving **15× on compute** — 351 ns → 23.4 ns per guest block — and 9.7×–23× on the fixtures it
   used to refuse. It is off by default and falls back to the interpreter **per block**, so anything it does
-  not handle costs speed rather than correctness. It declines guest `%fs`, SSE/AVX and x87 today; see
-  [`docs/amd64-host-translit.md`](docs/amd64-host-translit.md). The **aarch64** guest is still interpreted
-  and always will be on this host without a new backend — that quadrant is cross-ISA.
+  not handle costs speed rather than correctness. It declines guest `%fs`, SSE/AVX and x87 today. The
+  **aarch64** guest is still interpreted and always will be on this host without a new backend — that
+  quadrant is cross-ISA.
 - The AArch64 host arm can be **executed** on an x86-64 box under `qemu-aarch64`, which is how several
-  defects in the shipped AArch64 JIT were confirmed rather than merely inferred.
-  [`docs/emulated-aarch64.md`](docs/emulated-aarch64.md) states precisely what emulation vouches for and
-  what it does not — notably not weak memory ordering.
+  defects in the shipped AArch64 JIT were confirmed rather than merely inferred — and two of the three
+  emulated cells are CI-gated. Emulation does **not** vouch for weak memory ordering.
 
-[`docs/amd64-host.md`](docs/amd64-host.md) explains the seam, the (host CPU × guest ISA) matrix and the staging;
-[`docs/amd64-host-findings.md`](docs/amd64-host-findings.md) records the defects that work turned up and what a
-reviewer needs to know. Windows is a reserved boundary with no code.
+[`docs/amd64-host.md`](docs/amd64-host.md) is the single record for this work: the seam, the
+(host CPU × guest ISA) matrix, measured performance, what emulation proves, every defect found, what is
+still missing, and merge guidance. Windows is a reserved boundary with no code.
 
 ```sh
 cargo add hl-engine

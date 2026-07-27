@@ -475,7 +475,7 @@ set(HL_PERF_OP_SAMPLES 7  CACHE STRING "perf samples for OS-op cases")
 # as a threshold met; --label is not.
 #
 # The reason is NOT that the thresholds are all unreachable here. Measured
-# (docs/amd64-host-performance.md section 2): five of the thirteen x86_64 cases PASS the JIT
+# (docs/amd64-host.md section 2): five of the thirteen x86_64 cases PASS the JIT
 # thresholds unchanged and four more are within 3x, so docs/ci-green.md's "all thirteen cases
 # fail" is false and must be corrected there too. What rules the five out is MARGIN against
 # this host's measured load spread of ~1.9x (compute: 348s/run loaded vs 184s median):
@@ -501,7 +501,7 @@ option(HL_PERF_ENFORCE
 # runs x measured median x 1.9 (this host's measured load spread) x 1.25 headroom:
 #   x86_64  11 x 184.0s x 1.9 x 1.25 = 4807 -> 4800
 #   aarch64 11 x 135.6s x 1.9 x 1.25 = 3542 -> 3600   (1492s unloaded: 17% margin, i.e. flaky)
-# Numbers from docs/amd64-host-performance.md section 2. Interpreting host only: on a JIT host
+# Numbers from docs/amd64-host.md section 2. Interpreting host only: on a JIT host
 # the case is ~1s and 1800s stays the tighter hang bound.
 if(HL_HOST_ARCH STREQUAL "x86_64")
   set(PERF_TIMEOUT_compute_x86_64  4800)
@@ -826,7 +826,7 @@ hl_nested_case(${_nest_foreign}-${_nest_foreign}-${HL_HOST_ARCH}
 # cells run the SAME compat suites against the cross tree's engines under
 # qemu-aarch64, on the host that builds them.
 #
-# EMULATION, NOT HARDWARE, and the name says so. docs/emulated-aarch64.md records
+# EMULATION, NOT HARDWARE, and the name says so. docs/amd64-host.md records
 # what the fidelity probes established: instruction semantics, the dual-alias W^X
 # arena, signal delivery and uc_mcontext are vouched for; weak memory ordering and
 # timing are NOT, because qemu-user inherits the x86 host's stronger model. A green
@@ -889,7 +889,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND HL_HOST_ARCH STREQUAL "x86_64")
   # chose, and under qemu one of them (a MAP_SHARED guest region) names a range qemu-user
   # reserves and does not expose, so restore's MAP_FIXED takes it and the next access is
   # SEGV_ACCERR. Whether a real aarch64 host collides there is unknown, so per
-  # docs/emulated-aarch64.md's own rule the cell is unproven in both directions rather than
+  # docs/amd64-host.md's own rule the cell is unproven in both directions rather than
   # a defect to gate on. The underlying engine gap -- restore MAP_FIXEDs saved guest VAs
   # unconditionally -- is real on every host and recorded in docs/checkpoint-restore-io.md.
   function(hl_checkpoint_cross isa direction fixture scenario)

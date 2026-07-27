@@ -139,7 +139,7 @@ static int interp_signal_capture(struct cpu *c, void *ucontext) {
 // ordering (mask first, __longjmp second).
 //
 // The savemask=1 this replaces cost an rt_sigprocmask syscall on EVERY guest basic block -- 271.7 ns, 44% of
-// compute CPU and 99.96% of the process's host syscalls (docs/amd64-host-performance.md 3, 4 and 7.1) -- to
+// compute CPU and 99.96% of the process's host syscalls (docs/amd64-host.md 3, 4 and 7.1) -- to
 // save a mask that only this rare path ever reads.
 static void interp_restore_handler_mask(void *ucontext) {
     if (ucontext != NULL) {
@@ -5346,7 +5346,7 @@ static void *translate_block(uint64_t gpc) {
 
 // run_block / block_return: the dispatcher's boundary; interp_dispatch.h defines G_OWN_TRAMPOLINES so
 // core/dispatch.c calls these instead of emitting its AArch64 pair. `static` is load-bearing --
-// visibility("hidden") leaves the symbol STB_GLOBAL in a static link (docs/amd64-host-findings.md 3.7), the
+// visibility("hidden") leaves the symbol STB_GLOBAL in a static link (docs/amd64-host.md 3.7), the
 // dual archive links BOTH target objects, and namespace.h does not rename these two.
 static void run_block(struct cpu *cpu, void *code);
 static void block_return(void);

@@ -26,7 +26,7 @@ normative; this file is a navigation aid.
   intermediate representation and no host-neutral lowering seam a new host CPU could select.
   `src/translator/host/aarch64/asm.{c,h}` is the ARM64 instruction assembler they emit through.
   DOCS.md 3.3 has the detail. (An unused IR + per-host-CPU lowering pipeline used to sit under
-  `src/translator/host/<cpu>/codegen.c`; it was deleted — docs/amd64-host-findings.md 3.1.)
+  `src/translator/host/<cpu>/codegen.c`; it was deleted — docs/amd64-host.md 3.1.)
 - **Activation** (`src/core/activation.c`) — the config-file/embedded supervisor launch
   path; initializes subsystems and delegates into the core runtime.
 
@@ -139,7 +139,7 @@ and `src/core/target/x86_64.c`, selecting the JIT files or `guest/<isa>/interp.c
    (`guest/aarch64/translate.c`), the rip-relative `lea` rewrite (`guest/x86_64/lower/mov.c`),
    `interp_lea_value` (`guest/x86_64/interp.c`) — and `call_return_pc` / `interp_call_return_pc`
    is the sibling rule for pushed return addresses. Omitting either fails as a hang inside glibc,
-   several frames from the cause: docs/amd64-host-findings.md 3.11.
+   several frames from the cause: docs/amd64-host.md 3.11.
 5. **Signal-context extraction.** `src/host/native_context.h` is an (OS × CPU) matrix.
    `HL_HOST_UC_PC`/`HL_HOST_UC_SP` are total; everything else sits behind
    `HL_HOST_HAS_A64_CONTEXT` or `HL_HOST_HAS_X64_CONTEXT` and needs a host-neutral counterpart.
@@ -156,7 +156,7 @@ prevent.
 
 - `docs/amd64-host.md` — the host-CPU seam, the (host CPU × guest ISA) matrix, and why each cell
   starts as an interpreter before a transliterator.
-- `docs/amd64-host-findings.md` — the defects and the traps. 3.11 (the non-PIE
+- `docs/amd64-host.md` — the defects and the traps. 3.11 (the non-PIE
   address-materialisation obligation) and 3.7 (`visibility("hidden")` is not local linkage) are
   the two that bite a new backend first.
-- `docs/amd64-host-architecture.md` — the proposed cleanups, with risk and sequencing.
+- `docs/amd64-host.md` — the proposed cleanups, with risk and sequencing.

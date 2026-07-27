@@ -173,7 +173,7 @@ __attribute__((naked)) static void block_return(void) {
 // return replays the previous block's cpu->reason and spins the dispatcher on a PC that never moves. Not
 // hl_fatal_report(): it returns to its caller to unwind, and there is nothing here to unwind to. `static` is
 // load-bearing -- the dual activation archive links both target objects and namespace.h does not rename these
-// two (docs/amd64-host-findings.md §3.7). A backend with its own boundary defines G_OWN_TRAMPOLINES instead.
+// two (docs/amd64-host.md §3.7). A backend with its own boundary defines G_OWN_TRAMPOLINES instead.
 static void run_block(struct cpu *cpu, void *code) {
     (void)cpu;
     (void)code;
