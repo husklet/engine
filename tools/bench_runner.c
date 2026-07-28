@@ -120,6 +120,7 @@
 #define MAX_COLS 32
 #define LINE 4096
 #define MAX_PROCESS_ARGS 32
+#define DEFAULT_PATH_SIZE (LINE + 128)
 
 /* ------------------------------------------------------------------ options */
 typedef struct {
@@ -205,7 +206,7 @@ static int is_execu(const char *p) {
 
 /* Fill defaults for binary/engine from root+arch when not overridden. */
 static void ctx_defaults(ctx_t *c) {
-    static char bpath[LINE], epath[LINE];
+    static char bpath[DEFAULT_PATH_SIZE], epath[DEFAULT_PATH_SIZE];
     if (!c->binary) {
         snprintf(bpath, sizeof(bpath), "%s/build/perf/combined-bench-%s", c->root, c->gnu);
         c->binary = bpath;
@@ -743,12 +744,12 @@ static int cmd_report(int argc, char **argv) {
     printf("%-14s", "phase");
     for (int c = 0; c < ncol; ++c) {
         char lbl[48];
-        snprintf(lbl, sizeof(lbl), "%s/%s", cols[c].env, cols[c].arch);
+        snprintf(lbl, sizeof(lbl), "%.*s/%.*s", 31, cols[c].env, 15, cols[c].arch);
         printf(" %14s", lbl);
     }
     for (int c = 0; c < ncol; ++c) {
         char lbl[48];
-        snprintf(lbl, sizeof(lbl), "x:%s", cols[c].env);
+        snprintf(lbl, sizeof(lbl), "x:%.*s", 31, cols[c].env);
         printf(" %9s", lbl);
     }
     printf("\n");
