@@ -229,10 +229,19 @@ struct hl_ipc_ctrl {
     struct hl_msg_queue msg[HL_IPC_MSGMNI];
 };
 
+// The width of `mtype`, the leading member of the guest's struct msgbuf, and therefore the offset at which
+// every msgsnd/msgrcv payload begins. It is the GUEST's `long` -- 8 bytes on every guest this engine
+// targets -- and NOT the host's, which is why it is spelled out rather than taken from the host `long`: on an
+// LLP64 host `long` is 4 bytes, so that spelling read the payload from offset 4 of an 8-byte header and
+// wrote it back to the same wrong place. Send and receive were consistently wrong, so a round trip still
+// returned the caller's own bytes and the ordinary msgsnd/msgrcv case looked correct; what it actually
+// moved was four bytes of the type word plus the first half of the body.
+#define HL_IPC_MSG_TYPE_SIZE ((size_t)8)
+
 // A message queue's backing object: a slot ring + free list. head/tail are the FIFO order; msgrcv may
 // unlink any matching slot from the middle.
 struct hl_ipc_msg_slot {
-    long mtype;
+    int64_t mtype;
     uint32_t size;
     int32_t next;
     uint8_t data[HL_MSG_MAX_SIZE];
@@ -1665,24 +1674,24 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        uint8_t *message = malloc(sizeof(long) + msgsz);
+        uint8_t *message = malloc(HL_IPC_MSG_TYPE_SIZE + msgsz);
         if (!message) {
             G_RET(c) = (uint64_t)(-ENOMEM);
             break;
         }
-        if (guest_copy_from(message, a1, sizeof(long) + msgsz) != (ssize_t)(sizeof(long) + msgsz)) {
+        if (guest_copy_from(message, a1, HL_IPC_MSG_TYPE_SIZE + msgsz) != (ssize_t)(HL_IPC_MSG_TYPE_SIZE + msgsz)) {
             free(message);
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        long mtype;
+        int64_t mtype;
         memcpy(&mtype, message, sizeof(mtype));
         if (mtype < 1) {
             free(message);
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        const uint8_t *body = message + sizeof(long);
+        const uint8_t *body = message + HL_IPC_MSG_TYPE_SIZE;
         int did_wait = 0;
         for (;;) {
             hl_ipc_lock(&C->lock);
@@ -1757,14 +1766,14 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     case 188: { // msgrcv(msqid, msgp, msgsz, msgtyp, msgflg)
         int id = (int)a0;
         size_t msgsz = (size_t)a2;
-        long msgtyp = (long)a3;
+        int64_t msgtyp = (int64_t)a3;
         int flag = (int)a4;
         C = hl_ipc_ctrl();
         if (!C) {
             G_RET(c) = (uint64_t)(-EINVAL);
             break;
         }
-        if (guest_accessible_prefix(a1, sizeof(long) + msgsz, PROT_WRITE) != sizeof(long) + msgsz) {
+        if (guest_accessible_prefix(a1, HL_IPC_MSG_TYPE_SIZE + msgsz, PROT_WRITE) != HL_IPC_MSG_TYPE_SIZE + msgsz) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
@@ -1824,15 +1833,15 @@ static int svc_sysv(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                     break;
                 }
                 size_t copy = sl->size > msgsz ? msgsz : sl->size;
-                uint8_t *message = malloc(sizeof(long) + copy);
+                uint8_t *message = malloc(HL_IPC_MSG_TYPE_SIZE + copy);
                 if (!message) {
                     hl_ipc_unlock(&C->lock);
                     G_RET(c) = (uint64_t)(-ENOMEM);
                     break;
                 }
-                memcpy(message, &sl->mtype, sizeof(long));
-                if (copy) memcpy(message + sizeof(long), sl->data, copy);
-                if (guest_copy_to(a1, message, sizeof(long) + copy) != (ssize_t)(sizeof(long) + copy)) {
+                memcpy(message, &sl->mtype, HL_IPC_MSG_TYPE_SIZE);
+                if (copy) memcpy(message + HL_IPC_MSG_TYPE_SIZE, sl->data, copy);
+                if (guest_copy_to(a1, message, HL_IPC_MSG_TYPE_SIZE + copy) != (ssize_t)(HL_IPC_MSG_TYPE_SIZE + copy)) {
                     free(message);
                     hl_ipc_unlock(&C->lock);
                     G_RET(c) = (uint64_t)(-EFAULT);

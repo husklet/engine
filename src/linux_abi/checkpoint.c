@@ -48,6 +48,7 @@
 // tree, then exits it. Restore: HL_RESTORE (or `--restore`) calls the restore path. Both directions carry
 // bytes over the socket activation handed the engine; the embedder owns the other end.
 
+#include "host_fd.h"     // the null-device spelling behind the placeholder descriptors below
 #include "host_wait.h"   // waitid/waitpid: coordinator peer-reap; multi-thread refusal probe
 #include "host_tty.h"    // the controlling terminal's line discipline is captured and replayed
 
@@ -3369,7 +3370,7 @@ static int ckpt_restore_fds_dir(const char *procdir) {
                         free(image);
                         return -1;
                     }
-                    int shadow = open("/dev/null", O_RDONLY | ((r.descriptor_flags & FD_CLOEXEC) ? O_CLOEXEC : 0));
+                    int shadow = open(HL_LINUX_HOST_NULL_DEVICE, O_RDONLY | ((r.descriptor_flags & FD_CLOEXEC) ? O_CLOEXEC : 0));
                     if (shadow < 0 || (shadow != r.gfd && dup2(shadow, r.gfd) < 0)) {
                         fprintf(stderr, "[restore] inotify %d cannot reserve native shadow: %s\n", r.gfd,
                                 strerror(errno));
@@ -4239,7 +4240,7 @@ static int ckpt_restore_right_prepare(const struct ckpt_fd *record) {
         // closed AFTER the guest's own descriptors are dup2'd into place, so a low number destroys whichever
         // guest descriptor now owns it (it landed on 4, a socketpair endpoint). Hoist it into the private
         // high band, like every other queued right.
-        int placeholder = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        int placeholder = open(HL_LINUX_HOST_NULL_DEVICE, O_RDONLY | O_CLOEXEC);
         if (placeholder < 0) return -1;
         fd = hl_host_process_fd_private_adopt(placeholder);
         if (fd < 0) {

@@ -1062,7 +1062,7 @@ static int bound_shadow_activate(void) {
         }
         return 0;
     }
-    opened = open("/dev/null", O_RDWR | O_CLOEXEC);
+    opened = open(HL_LINUX_HOST_NULL_DEVICE, O_RDWR | O_CLOEXEC);
     if (opened < 0) return -1;
     g_bound_sentinel = bound_private_dup(opened, 64);
     if (g_bound_sentinel < 0) {

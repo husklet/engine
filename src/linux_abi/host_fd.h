@@ -116,6 +116,30 @@
  *     the ELOOP predicted here.  Both are wrong; it is now 38.
  */
 
+/*
+ * The HOST's spelling of the null device, for the several places in this layer
+ * that open it to MINT A DESCRIPTOR rather than to read or write anything --
+ * the mq_open broker's queue handle, the pidfd fallback, the bound-shadow
+ * sentinel, the checkpoint placeholders.  Each of those needs a real, closeable,
+ * pollable descriptor that owns no data, and the null device is the cheapest one
+ * on every host.
+ *
+ * It is here rather than at each call site because it is not the same string
+ * everywhere: Windows' null device is the reserved DOS name NUL, and it is not
+ * reachable as "/dev/null" from the CRT at all -- an open of that path is an
+ * ordinary ENOENT.  That single missing name is what made every one of those
+ * call sites fail on this host, and none of them is about /dev being absent.
+ *
+ * NOT for the guest-visible /dev/null, which is a different question with a
+ * different answer: container/vfs.c maps the guest's path and must keep saying
+ * "/dev/null", because that is the name the GUEST is asking about.
+ */
+#if !defined(_WIN32)
+#define HL_LINUX_HOST_NULL_DEVICE "/dev/null"
+#else
+#define HL_LINUX_HOST_NULL_DEVICE "NUL"
+#endif
+
 #if !defined(_WIN32)
 
 #include <fcntl.h>

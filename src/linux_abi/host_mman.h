@@ -66,17 +66,31 @@
 #else /* Windows */
 
 #include "fdhandle.h"
+#include "host_fd.h" /* openat()/unlink()/AT_FDCWD/O_CLOEXEC for the shm backing below */
 #include "hl/host_services.h"
 
+#include <direct.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <io.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/types.h>
 
 /* Defined later in the same target TU (src/core/target/{x86_64,aarch64}.c).
  * Declaring a static function ahead of its definition is what src/linux_abi/
  * elf_protect.h already relies on for the same accessor. */
 static const hl_host_services *effective_host_services(void);
+
+/* Defined later in the same TU by src/host/native_compat.h, which the target
+ * unit includes after this file.  Same forward-static arrangement, and for the
+ * same reason: this header must not include that one (they are different layers
+ * and native_compat.h says so in its own note), but the operation it needs --
+ * "the path of an already-open descriptor" -- is REAL there on this host and
+ * exists nowhere else. */
+static int hl_native_fd_path(int descriptor, char *path, size_t capacity);
 
 /* ---- SHAPE: protection bits.  Linux values. ---------------------------- */
 #define PROT_NONE 0x0
@@ -161,8 +175,29 @@ static inline uint32_t hl_linux_host_protection(int protection) {
  * file.  The caller has an int fd -- so this used to be population (2)'s
  * refusal, "the engine has no descriptor-to-HANDLE table yet".  It has one now
  * (fdhandle.h), and a BOUND descriptor is therefore REAL through map_file(),
- * which is the same operation down to the offset and the sharing flag.  An
- * unbound descriptor still refuses, because the number still names nothing.
+ * which is the same operation down to the offset and the sharing flag.
+ *
+ * AN UNBOUND DESCRIPTOR IS NOW REAL TOO, through a transient handle, and the
+ * reason it is sound is specific rather than general.  On this host the
+ * overwhelmingly common descriptor is the UCRT's own -- host_fd.h's openat()
+ * produces one for every guest open and files only an AMBIENT binding, which
+ * carries state and no handle.  Refusing those meant no guest could mmap a file
+ * it had opened, which is most of what a file-backed mmap is for.  So a miss
+ * asks the host for the descriptor's PATH (hl_native_fd_path, which is
+ * GetFinalPathNameByHandleW walking the open file object back to a name) and
+ * opens that path through the file group for the duration of the call.
+ *
+ * The transient handle is closed as soon as map_file returns, and that is not a
+ * lifetime shortcut -- it is the same fact the discard() note below rests on.
+ * MapViewOfFile3 has already succeeded by then; the view holds the section and
+ * the section holds the file, so neither this handle nor the caller's descriptor
+ * is load-bearing afterwards.  Nothing is left open and nothing leaks.
+ *
+ * Two honest limits.  Re-opening by name is not the same act as mapping the
+ * descriptor: a file that has been unlinked, or whose name this process may no
+ * longer open, is refused here where a real mmap would succeed.  And a
+ * descriptor with no name at all -- a pipe, a console -- has no path to reopen,
+ * which is correct, because neither is mappable.
  *
  * The file case ends in the same discard() as the anonymous one and for the
  * same reason: munmap() below is address-keyed, unmap_address() refuses any
@@ -176,8 +211,9 @@ static inline void *hl_linux_host_map_file(void *address, size_t length, int pro
     hl_host_file_mapping mapping = {HL_HOST_FILE_MAPPING_ABI, sizeof(mapping), 0, 0, 0, 0};
     hl_host_result result;
     hl_host_handle file;
+    int transient = 0;
     uint32_t seam_flags = (flags & MAP_SHARED) ? HL_HOST_MEMORY_SHARED : HL_HOST_MEMORY_PRIVATE;
-    if (!hl_fdhandle_lookup(fd, &file) || host == NULL || host->memory == NULL || host->memory->map_file == NULL) {
+    if (host == NULL || host->memory == NULL || host->memory->map_file == NULL) {
         errno = ENOSYS;
         return MAP_FAILED;
     }
@@ -185,12 +221,32 @@ static inline void *hl_linux_host_map_file(void *address, size_t length, int pro
         errno = EINVAL;
         return MAP_FAILED;
     }
+    if (!hl_fdhandle_lookup(fd, &file)) {
+        /* Ambient descriptor: reopen its name for the duration of the call. */
+        char path[4096];
+        uint32_t access = HL_HOST_FILE_READ;
+        if ((protection & PROT_WRITE) && (flags & MAP_SHARED)) access |= HL_HOST_FILE_WRITE;
+        if (host->file == NULL || host->file->open_relative == NULL || host->file->close == NULL ||
+            hl_native_fd_path(fd, path, sizeof path) != 0) {
+            errno = ENOSYS;
+            return MAP_FAILED;
+        }
+        result = host->file->open_relative(host->context, HL_HOST_HANDLE_CWD, path, strlen(path), access, 0, 0);
+        if (result.status != HL_STATUS_OK) {
+            errno = hl_fdhandle_errno(result.status);
+            return MAP_FAILED;
+        }
+        file = result.value;
+        transient = 1;
+    }
     if (flags & MAP_FIXED_NOREPLACE)
         seam_flags |= HL_HOST_MEMORY_FIXED_NOREPLACE;
     else if (flags & MAP_FIXED)
         seam_flags |= HL_HOST_MEMORY_FIXED;
     result = host->memory->map_file(host->context, file, (uint64_t)(uintptr_t)address, (uint64_t)offset,
                                     (uint64_t)length, hl_linux_host_protection(protection), seam_flags, &mapping);
+    /* The view now owns everything it needs; see the note above. */
+    if (transient) (void)host->file->close(host->context, file);
     if (result.status != HL_STATUS_OK) {
         errno = hl_fdhandle_errno(result.status);
         return MAP_FAILED;
@@ -337,7 +393,13 @@ static inline void *mremap(void *address, size_t old_length, size_t new_length, 
     return MAP_FAILED;
 }
 
-/* REFUSAL -- population (2).  All three produce a descriptor. */
+/* REFUSAL -- population (2), and the only one of the three that is still in it.
+ * memfd_create's whole point is an ANONYMOUS descriptor with no name anywhere in
+ * any namespace, which is the one thing the backing below cannot be: a file has
+ * a name by construction.  Windows' nearest object, a pagefile-backed section,
+ * is also nameless when unnamed -- but it is a section and not a descriptor, and
+ * the sealing family (F_ADD_SEALS) that is memfd's reason to exist has no
+ * Windows counterpart at all. */
 static inline int memfd_create(const char *name, unsigned int flags) {
     (void)name;
     (void)flags;
@@ -345,18 +407,105 @@ static inline int memfd_create(const char *name, unsigned int flags) {
     return -1;
 }
 
+/*
+ * The host directory POSIX shared-memory objects are backed by.
+ *
+ * /dev/shm is the Linux spelling and this host has no such thing, so the
+ * subtree is given a real host directory -- exactly the choice
+ * src/linux_abi/container/shm.c already made for the /dev/shm the GUEST sees,
+ * which it backs with a per-namespace directory under /tmp.  This is the same
+ * decision for the objects the ENGINE creates for itself, and keeping the two
+ * conventions alike is the point: one place to look, one thing to clear.
+ *
+ * A single flat directory is not a simplification of the POSIX namespace, it IS
+ * the POSIX namespace: shm_open names are flat by specification, which is why
+ * the separator folding below can never let one escape.
+ */
+#define HL_LINUX_SHM_DIRECTORY "/tmp/.hl-ipc"
+
+static inline const char *hl_linux_shm_backing(const char *name, char *output, size_t capacity) {
+    size_t index;
+    size_t prefix = sizeof(HL_LINUX_SHM_DIRECTORY) - 1u;
+    int written;
+    if (name == NULL || output == NULL) {
+        errno = EINVAL;
+        return NULL;
+    }
+    /* A POSIX shm name is conventionally written with a leading slash, and that
+       slash is not a directory step -- "/foo" and "foo" name the same object. */
+    if (name[0] == '/') ++name;
+    if (name[0] == '\0' || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    /* Idempotent, and attempted on every call rather than once: a caller may
+       reach an object before anything has created the directory, and this layer
+       has no initialisation point of its own that is guaranteed to run first. */
+    (void)_mkdir("/tmp");
+    (void)_mkdir(HL_LINUX_SHM_DIRECTORY);
+    written = snprintf(output, capacity, "%s/%s", HL_LINUX_SHM_DIRECTORY, name);
+    if (written < 0 || (size_t)written >= capacity) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    /* Fold every separator in the NAME part, so no name can name a directory
+       above the backing one.  The prefix itself is left alone. */
+    for (index = prefix + 1u; output[index] != '\0'; ++index)
+        if (output[index] == '/' || output[index] == '\\') output[index] = '_';
+    return output;
+}
+
+/*
+ * REAL, over a file, and the choice of backing is the substance of this entry
+ * rather than an implementation detail.
+ *
+ * The alternative considered and rejected was a NAMED WINDOWS SECTION in a
+ * per-session object directory -- which is what a Windows-native shared memory
+ * object is, and what a study of flinux's substrate proposes.  It is the wrong
+ * primitive here, for a reason that is about lifetime and not about effort:
+ *
+ *   - A Windows section name lives exactly as long as some handle to the section
+ *     is open.  Close the last handle and the name is gone -- even with a view
+ *     still mapped, which is the case that matters.  POSIX shm and System V shm
+ *     both specify the OPPOSITE: the object outlives every attachment and every
+ *     process, and is removed only by shm_unlink / IPC_RMID.  The engine's SysV
+ *     emulation depends on that directly (syscall/sysv.c opens the control block
+ *     by name from an UNRELATED process, which is the property that makes an id
+ *     namespace shared at all), so a section would need some process to hold a
+ *     keepalive handle for the lifetime of the namespace -- and there is no such
+ *     process, because every guest process is allowed to exit.
+ *
+ *   - A file already has exactly the lifetime System V wants, on every host, with
+ *     no keepalive and no new contract.  Nothing had to be added to
+ *     hl_host_shared_memory_services: the file group already opens, truncates,
+ *     unlinks and maps, and map_file's shared path over a file HANDLE is already
+ *     implemented and already exercised.
+ *
+ * So the descriptor this returns is the UCRT's own, exactly as host_fd.h's
+ * openat() produces, and ftruncate/close/unlink on it are the CRT's -- already
+ * REAL on this host.  The mapping is the ambient path in hl_linux_host_map_file
+ * above.  There is no second object and no second position anywhere.
+ *
+ * ONE DIFFERENCE THAT IS NOT SYNTHESIZABLE, stated rather than hidden: Windows
+ * refuses to delete a file that still has a live section mapping it, so a
+ * shm_unlink issued while another process still has the object MAPPED fails
+ * where Linux would succeed and defer.  The engine's own SysV path does not hit
+ * this -- it already defers IPC_RMID until nattch reaches zero, which is Linux's
+ * own rule -- and the cost when it is hit is a file left behind in the backing
+ * directory, not a wrong answer to the guest.
+ */
 static inline int shm_open(const char *name, int flags, mode_t mode) {
-    (void)name;
-    (void)flags;
-    (void)mode;
-    errno = ENOSYS;
-    return -1;
+    char path[512];
+    if (hl_linux_shm_backing(name, path, sizeof path) == NULL) return -1;
+    /* O_CLOEXEC matches glibc's shm_open, which does not leak the object's
+       descriptor across an exec; the object itself survives in the namespace. */
+    return openat(AT_FDCWD, path, flags | O_CLOEXEC, mode);
 }
 
 static inline int shm_unlink(const char *name) {
-    (void)name;
-    errno = ENOSYS;
-    return -1;
+    char path[512];
+    if (hl_linux_shm_backing(name, path, sizeof path) == NULL) return -1;
+    return unlink(path);
 }
 
 #endif /* _WIN32 */

@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include "host_fd.h"
 #include "host_poll.h"
 #include <signal.h>
 #include <stdint.h>
@@ -364,7 +365,7 @@ static int hl_server_main(int argc, char **argv) {
         // cover not just the shared ld.so+startup but the per-APPLET code paths too, we run a small
         // UNION of common busybox applets -- COW lets every later warm worker inherit all of them.
         // The pristine image is restored between runs so each applet starts from clean memory.
-        int devnull = open("/dev/null", O_WRONLY);
+        int devnull = open(HL_LINUX_HOST_NULL_DEVICE, O_WRONLY);
         int sv1 = dup(1), sv2 = dup(2);
         if (devnull >= 0) {
             dup2(devnull, 1);

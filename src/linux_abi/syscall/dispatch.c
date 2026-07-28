@@ -15,6 +15,11 @@ int g_rwx_guest;
 // fd semantics); every path argument is resolved through the container VFS jail. One sorted switch,
 // grouped by category. See docs/SYSCALLS.md for the per-syscall table.
 
+/* The descriptor vocabulary, for HL_LINUX_HOST_NULL_DEVICE below and in the
+   fragments this file includes. Named here rather than left to the enclosing
+   target unit: only the x86-64 one includes it, so relying on that made this
+   file compile in one target and not the other. */
+#include "../host_fd.h"
 #include "../host_sysv.h"
 #include "../host_sysv.h"
 #include "../host_sysv.h"
@@ -369,7 +374,7 @@ static int pidfd_make(pid_t pid) {
         }
         return watched;
     }
-    int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    int fd = open(HL_LINUX_HOST_NULL_DEVICE, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
     if (pidfd_register(fd, pid) != 0) { // table full: fail cleanly instead of leaking an unresolvable fd
         close(fd);
