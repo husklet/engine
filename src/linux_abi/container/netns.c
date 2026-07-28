@@ -4204,6 +4204,21 @@ static int net_ioctl(int fd, unsigned long rq, uint8_t *arg, int64_t *out) {
 static uint8_t g_dns_sock[HL_NFD]; // fd -> 1 if this fd is an intercepted, socketpair-backed DNS socket
 static int g_dns_peer[HL_NFD];     // fd -> engine-held socketpair end we write synthesized responses into
 
+static void synthetic_reply_send(int fd, const void *data, size_t size, int stream) {
+    int flags = MSG_DONTWAIT;
+#if defined(__linux__)
+    flags |= MSG_NOSIGNAL;
+#endif
+    ssize_t sent;
+    do
+        sent = send(g_dns_peer[fd], data, size, flags);
+    while (sent < 0 && errno == EINTR);
+    if (stream && sent != (ssize_t)size) {
+        close(g_dns_peer[fd]);
+        g_dns_peer[fd] = -1;
+    }
+}
+
 // DNS interception is off under HL_NET_ISOLATE: the isolated network has no resolver, so
 // :53 to 127.0.0.11 is left to fall through to the (dead) host loopback and name resolution fails, matching.
 static int g_dns_off = -1;
@@ -4248,6 +4263,7 @@ static int dns_swap(int fd, int stream) {
     if (fl >= 0 && (fl & O_NONBLOCK)) fcntl(fd, F_SETFL, O_NONBLOCK);
     if (df >= 0 && (df & FD_CLOEXEC)) fcntl(fd, F_SETFD, FD_CLOEXEC);
     fcntl(sv[1], F_SETFD, FD_CLOEXEC); // engine end never leaks across a guest execve
+    (void)hl_native_set_no_sigpipe(sv[1]);
     g_dns_peer[fd] = sv[1];
     g_dns_sock[fd] = 1;
     return 0;
@@ -4285,6 +4301,7 @@ static int icmp_swap(int fd) {
     if (fl >= 0 && (fl & O_NONBLOCK)) fcntl(fd, F_SETFL, O_NONBLOCK);
     if (df >= 0 && (df & FD_CLOEXEC)) fcntl(fd, F_SETFD, FD_CLOEXEC);
     fcntl(sv[1], F_SETFD, FD_CLOEXEC);
+    (void)hl_native_set_no_sigpipe(sv[1]);
     g_dns_peer[fd] = sv[1];
     g_icmp_sock[fd] = 1;
     return 0;
@@ -4332,7 +4349,7 @@ static int icmp_try_send(int fd, const uint8_t *input, size_t size, const uint8_
     if (icmp[0] == 8) icmp[0] = 0;
     icmp[2] = icmp[3] = 0;
     *(uint16_t *)(icmp + 2) = icmp_checksum(icmp, size);
-    (void)write(g_dns_peer[fd], reply, reply_size);
+    synthetic_reply_send(fd, reply, reply_size, 0);
     *result = (int64_t)size;
     return 1;
 }
@@ -4629,8 +4646,7 @@ static int64_t dns_send(int fd, const uint8_t *buf, size_t len, int stream) {
         rl += 2;
     }
     if (fd >= 0 && fd < HL_NFD && g_dns_sock[fd] && g_dns_peer[fd] >= 0) {
-        ssize_t w = write(g_dns_peer[fd], resp, (size_t)rl);
-        (void)w;
+        synthetic_reply_send(fd, resp, (size_t)rl, stream);
     }
     return (int64_t)len;
 }
