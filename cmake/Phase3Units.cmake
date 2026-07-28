@@ -153,6 +153,8 @@ hl_unit(limits              LIBS ${_abi} SINGLE LINK -pthread)
 hl_unit(options_environment NO_LIBS
                             SOURCES src/core/options.c src/core/environment.c
                             FLAGS -UHL_ENABLE_LOGGING -DHL_ENABLE_LOGGING=1)
+hl_unit(tool_process NO_LIBS SOURCES tools/process.c
+        FLAGS -D_POSIX_C_SOURCE=200809L)
 
 # Cases compiled straight against a handful of .c files (no archive at all).
 hl_unit(resolve      SOURCES src/host/resolve.c)

@@ -12,11 +12,9 @@
  * execution and are directly comparable across environments.
  *
  * ENVIRONMENTS are pluggable "providers". Each is a struct with function
- * pointers for the four steps (setup/transfer/run/teardown); adding an
- * environment = add one struct to the PROVIDERS[] registry. For every backend
- * here the work reduces to "build a shell command that runs the guest and
- * emits PHASE lines", so `run` popen()s that command; setup/teardown are
- * available for providers that need provisioning.
+ * pointers for setup/run/teardown; adding an environment means adding one
+ * struct to the PROVIDERS registry. Providers construct argv directly and the
+ * runner executes it without a host shell.
  *
  *   native     direct run on this host (host arch only; orbstack = alias)
  *   qemu       qemu-<arch> <binary>                          (qemu-user)
@@ -69,7 +67,7 @@
  *   # NOTE Apple clang != gcc, so treat its absolute us as compiler-comparable
  *   # only, not a drop-in for the gcc-built linux cells.
  *   # the two tables, each column as a multiple of hl-engine for its arch:
- *   $R report --baseline hl-engine results/*.csv
+ *   $R report --baseline hl-engine results/<csv-files>
  *   # (or --baseline native to read everything relative to native arm.)
  *
  * On an actual amd64 host, run the same with --arch amd64 and --env native to
@@ -115,11 +113,13 @@
 #include <unistd.h>
 
 #include "config.h"
+#include "process.h"
 
 #define MAX_PHASES 32
 #define MAX_REPEATS 128
 #define MAX_COLS 32
 #define LINE 4096
+#define MAX_PROCESS_ARGS 32
 
 /* ------------------------------------------------------------------ options */
 typedef struct {
@@ -133,6 +133,35 @@ typedef struct {
     const char *image;    /* docker image */
     char root[LINE];      /* repo root */
 } ctx_t;
+
+typedef struct {
+    char *argv[MAX_PROCESS_ARGS];
+    size_t argc;
+    char **owned_prefix;
+    const char *stdin_path;
+    char endpoint[LINE];
+    char platform[64];
+} invocation_t;
+
+static int invocation_append(invocation_t *invocation, const char *argument) {
+    if (invocation->argc + 1 >= MAX_PROCESS_ARGS) return -1;
+    invocation->argv[invocation->argc++] = (char *)argument;
+    invocation->argv[invocation->argc] = NULL;
+    return 0;
+}
+
+static int invocation_prefix(invocation_t *invocation, const char *prefix) {
+    size_t count = 0;
+    if (hl_process_split_prefix(prefix, &invocation->owned_prefix, &count) != 0) return -1;
+    for (size_t index = 0; index < count; index++)
+        if (invocation_append(invocation, invocation->owned_prefix[index]) != 0) return -1;
+    return 0;
+}
+
+static void invocation_clear(invocation_t *invocation) {
+    hl_process_free_argv(invocation->owned_prefix);
+    memset(invocation, 0, sizeof(*invocation));
+}
 
 /* Repo root from /proc/self/exe: build/tools/bench-runner -> up 3. */
 static void detect_root(char *out, size_t n) {
@@ -202,8 +231,7 @@ typedef struct provider {
     const char *name;
     /* reachable: 1 if this env can run ctx on this host; writes a reason. */
     int (*reachable)(const ctx_t *, char *reason, size_t n);
-    /* build_cmd: shell command that runs the guest and prints PHASE lines. */
-    int (*build_cmd)(const ctx_t *, char *out, size_t n);
+    int (*build)(const ctx_t *, invocation_t *);
     int (*setup)(const ctx_t *);    /* optional, may be NULL */
     int (*teardown)(const ctx_t *); /* optional, may be NULL */
 } provider_t;
@@ -231,8 +259,8 @@ static int native_reach(const ctx_t *c, char *r, size_t n) {
     return 1;
 }
 
-static int native_cmd(const ctx_t *c, char *out, size_t n) {
-    return snprintf(out, n, "%s", c->binary) < (int)n ? 0 : -1;
+static int native_build(const ctx_t *c, invocation_t *invocation) {
+    return invocation_append(invocation, c->binary);
 }
 
 /* ---- qemu-user ---- */
@@ -251,9 +279,8 @@ static int which_ok(const char *bin) {
         const char *end = strchr(path, ':');
         size_t length = end ? (size_t)(end - path) : strlen(path);
         char candidate[LINE];
-        int written = length == 0
-                          ? snprintf(candidate, sizeof(candidate), "./%s", bin)
-                          : snprintf(candidate, sizeof(candidate), "%.*s/%s", (int)length, path, bin);
+        int written = length == 0 ? snprintf(candidate, sizeof(candidate), "./%s", bin)
+                                  : snprintf(candidate, sizeof(candidate), "%.*s/%s", (int)length, path, bin);
         if (written > 0 && written < (int)sizeof(candidate) && access(candidate, X_OK) == 0) return 1;
         if (!end) break;
         path = end + 1;
@@ -274,8 +301,9 @@ static int qemu_reach(const ctx_t *c, char *r, size_t n) {
     return 1;
 }
 
-static int qemu_cmd(const ctx_t *c, char *out, size_t n) {
-    return snprintf(out, n, "%s %s", qemu_of(c), c->binary) < (int)n ? 0 : -1;
+static int qemu_build(const ctx_t *c, invocation_t *invocation) {
+    if (invocation_append(invocation, qemu_of(c)) != 0) return -1;
+    return invocation_append(invocation, c->binary);
 }
 
 /* ---- hl-engine (single worker) ---- */
@@ -292,22 +320,34 @@ static int hl_reach(const ctx_t *c, char *r, size_t n) {
     return 1;
 }
 
-static int hl_cmd(const ctx_t *c, char *out, size_t n) {
-    return snprintf(out, n, "%s %s", c->engine, c->binary) < (int)n ? 0 : -1;
+static int hl_build(const ctx_t *c, invocation_t *invocation) {
+    if (invocation_append(invocation, c->engine) != 0) return -1;
+    return invocation_append(invocation, c->binary);
 }
 
 /* ---- docker (native-in-container) ---- */
+static int docker_prefix(const ctx_t *c, invocation_t *invocation) {
+    if (invocation_prefix(invocation, docker_cmd()) != 0) return -1;
+    if (!c->sock) return 0;
+    int written = snprintf(invocation->endpoint, sizeof(invocation->endpoint), "unix://%s", c->sock);
+    if (written < 0 || written >= (int)sizeof(invocation->endpoint)) return -1;
+    if (invocation_append(invocation, "-H") != 0) return -1;
+    return invocation_append(invocation, invocation->endpoint);
+}
+
 static int docker_reach(const ctx_t *c, char *r, size_t n) {
     if (!is_execu(c->binary)) {
         snprintf(r, n, "guest binary missing: %s", c->binary);
         return 0;
     }
-    char probe[LINE];
-    if (c->sock)
-        snprintf(probe, sizeof(probe), "%s -H unix://%s version >/dev/null 2>&1", docker_cmd(), c->sock);
-    else
-        snprintf(probe, sizeof(probe), "%s version >/dev/null 2>&1", docker_cmd());
-    if (system(probe) != 0) {
+    invocation_t invocation = {0};
+    hl_process_result_t result;
+    int run_error = docker_prefix(c, &invocation);
+    if (run_error == 0) run_error = invocation_append(&invocation, "version");
+    if (run_error == 0) run_error = hl_process_run(invocation.argv, NULL, 1, NULL, NULL, &result);
+    int reachable = run_error == 0 && result.exec_errno == 0 && result.exited && result.exit_code == 0;
+    invocation_clear(&invocation);
+    if (!reachable) {
         snprintf(r, n, "docker not reachable via '%s'%s%s", docker_cmd(), c->sock ? " sock=" : "",
                  c->sock ? c->sock : "");
         return 0;
@@ -316,29 +356,30 @@ static int docker_reach(const ctx_t *c, char *r, size_t n) {
     return 1;
 }
 
-static int docker_cmd_build(const ctx_t *c, char *out, size_t n) {
-    /* Stream the guest binary in over stdin (no bind-mount). On OrbStack the
-     * host `mac docker` daemon rewrites bind-mount paths (the Linux path does
-     * not exist on the mac side), so `-v <linux-dir>:/b` silently mounts the
-     * wrong thing. Piping the binary via stdin sidesteps the mount boundary
-     * entirely: `cat` writes it to /b inside the container, chmod +x, run it.
-     * The guest is a static-PIE binary, so it needs no libs from the image. */
-    const char *hopt1 = c->sock ? " -H unix://" : "";
-    const char *hopt2 = c->sock ? c->sock : "";
-    return snprintf(out, n,
-                    "%s%s%s run --rm -i --platform linux/%s %s "
-                    "sh -c 'cat >/b && chmod +x /b && /b' < %s",
-                    docker_cmd(), hopt1, hopt2, arch_to_docker(c->arch), docker_image(c), c->binary) < (int)n
-               ? 0
-               : -1;
+static int docker_build(const ctx_t *c, invocation_t *invocation) {
+    int written = snprintf(invocation->platform, sizeof(invocation->platform), "linux/%s", arch_to_docker(c->arch));
+    if (written < 0 || written >= (int)sizeof(invocation->platform) || docker_prefix(c, invocation) != 0) return -1;
+    const char *arguments[] = {
+        "run",
+        "--rm",
+        "-i",
+        "--platform",
+        invocation->platform,
+        docker_image(c),
+        "sh",
+        "-c",
+        "cat >/b && chmod +x /b && /b",
+    };
+    for (size_t index = 0; index < sizeof(arguments) / sizeof(arguments[0]); index++)
+        if (invocation_append(invocation, arguments[index]) != 0) return -1;
+    invocation->stdin_path = c->binary;
+    return 0;
 }
 
 static const provider_t PROVIDERS[] = {
-    {"native", native_reach, native_cmd, NULL, NULL},
-    {"orbstack", native_reach, native_cmd, NULL, NULL}, /* alias: native on an OrbStack machine */
-    {"docker", docker_reach, docker_cmd_build, NULL, NULL},
-    {"qemu", qemu_reach, qemu_cmd, NULL, NULL},
-    {"hl-engine", hl_reach, hl_cmd, NULL, NULL},
+    {"native", native_reach, native_build, NULL, NULL}, {"orbstack", native_reach, native_build, NULL, NULL},
+    {"docker", docker_reach, docker_build, NULL, NULL}, {"qemu", qemu_reach, qemu_build, NULL, NULL},
+    {"hl-engine", hl_reach, hl_build, NULL, NULL},
 };
 static const int NPROV = (int)(sizeof(PROVIDERS) / sizeof(PROVIDERS[0]));
 static const char *ARCHES[] = {"arm64", "amd64"};
@@ -385,13 +426,18 @@ static uint64_t umax(const uint64_t *v, int n) {
     return m;
 }
 
-/* run one repeat via popen, append parsed phases into acc[] (order stable). */
-static int run_once(const char *cmd, phase_acc_t *acc, int *nph) {
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
-    char line[LINE];
+static int run_once(const invocation_t *invocation, phase_acc_t *acc, int *nph) {
+    hl_process_result_t result;
+    char *output = NULL;
+    if (hl_process_run((char *const *)invocation->argv, invocation->stdin_path, 0, &output, NULL, &result) != 0)
+        return -1;
+    if (result.exec_errno != 0 || !result.exited || result.exit_code != 0) {
+        free(output);
+        return -2;
+    }
     int seen = 0;
-    while (fgets(line, sizeof(line), fp)) {
+    char *save = NULL;
+    for (char *line = strtok_r(output, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
         char name[64];
         unsigned long long us = 0, ok = 0;
         if (sscanf(line, "PHASE %63s us=%llu ok=%llu", name, &us, &ok) == 3) {
@@ -413,9 +459,16 @@ static int run_once(const char *cmd, phase_acc_t *acc, int *nph) {
             seen++;
         }
     }
-    int rc = pclose(fp);
-    if (rc != 0) return -2;
+    free(output);
     return seen > 0 ? 0 : -3;
+}
+
+static void print_invocation(const invocation_t *invocation) {
+    fprintf(stderr, "   argv:");
+    for (size_t index = 0; index < invocation->argc; index++)
+        fprintf(stderr, " [%s]", invocation->argv[index]);
+    if (invocation->stdin_path) fprintf(stderr, " < [%s]", invocation->stdin_path);
+    fputc('\n', stderr);
 }
 
 static int ensure_parent_dir(const char *path) {
@@ -501,23 +554,26 @@ static int cmd_run(int argc, char **argv) {
         fprintf(stderr, "error: setup failed\n");
         return 1;
     }
-    char cmd[LINE];
-    if (p->build_cmd(&c, cmd, sizeof(cmd)) != 0) {
-        fprintf(stderr, "error: command too long\n");
+    invocation_t invocation = {0};
+    if (p->build(&c, &invocation) != 0) {
+        invocation_clear(&invocation);
+        fprintf(stderr, "error: too many or invalid process arguments\n");
         return 1;
     }
-    fprintf(stderr, "   cmd: %s\n", cmd);
+    print_invocation(&invocation);
 
     phase_acc_t acc[MAX_PHASES];
     int nph = 0;
     for (int r = 0; r < repeats; ++r) {
-        int rc = run_once(cmd, acc, &nph);
+        int rc = run_once(&invocation, acc, &nph);
         if (rc != 0) {
             fprintf(stderr, "error: repeat %d failed (rc=%d)\n", r, rc);
             if (p->teardown) p->teardown(&c);
+            invocation_clear(&invocation);
             return 1;
         }
     }
+    invocation_clear(&invocation);
     if (p->teardown) p->teardown(&c);
     if (nph == 0) {
         fprintf(stderr, "error: no PHASE output\n");

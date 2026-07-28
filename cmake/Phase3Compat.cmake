@@ -347,8 +347,13 @@ endif()
 hl_tool(linux-production-smoke tools/linux_production_smoke.c)
 hl_tool(linux-matrix           tools/linux_matrix.c)
 # bench-runner does many benign width conversions; -Wconversion is dropped.
-add_executable(bench-runner tools/bench_runner.c tools/config.c)
-target_compile_options(bench-runner PRIVATE -O2 -g -std=gnu11 -Wall -Wextra)
+add_executable(bench-runner
+  tools/bench_runner.c
+  tools/config.c
+  tools/process.c)
+target_compile_options(bench-runner PRIVATE
+  -O2 -g -std=gnu11 -Wall -Wextra
+  -D_POSIX_C_SOURCE=200809L)
 set_target_properties(bench-runner PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tools)
 

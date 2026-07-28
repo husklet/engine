@@ -86,6 +86,7 @@ set(_hl_lint_args
   --source-dir "${CMAKE_SOURCE_DIR}/include"
   --source-file "${CMAKE_SOURCE_DIR}/tools/config.c"
   --source-file "${CMAKE_SOURCE_DIR}/tools/bench_runner.c"
+  --source-file "${CMAKE_SOURCE_DIR}/tools/process.c"
   --source-file "${CMAKE_SOURCE_DIR}/tools/matrix_runner.c"
   --include-dir "${CMAKE_SOURCE_DIR}/include"
   --include-dir "${CMAKE_SOURCE_DIR}/src"
@@ -123,8 +124,6 @@ endforeach()
 foreach(_cli_file IN LISTS _hl_lint_cli_stdio_files)
   list(APPEND _hl_lint_args --allow-stdio-file "${_cli_file}")
 endforeach()
-list(APPEND _hl_lint_args --allow-shell-file "tools/bench_runner.c")
-
 add_custom_target(hl-lint
   COMMAND $<TARGET_FILE:hl_lint> ${_hl_lint_args}
   DEPENDS hl_lint
