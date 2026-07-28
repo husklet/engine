@@ -2435,6 +2435,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             ssize_t hn =
                 (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, hcap, engine_metadata, &cerr) : 0;
             if (hn < 0) {
+                HL_LOGF(&g_jit_log, HL_LOG_TAG_NETWORK,
+                        "sendmsg-cmsg fd=%d guest_bytes=%zu translate_error=%d peer_native=%d",
+                        (int)a0, gcl, cerr ? cerr : EINVAL, !engine_metadata);
                 cmsg_tmpfds_close();
                 cmsg_seq_finish(0);
                 cmsg_event_finish(0);
@@ -2473,6 +2476,14 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                                         : sendmsg((int)a0, &mh, msgflags_l2m((int)a2)))
                             : recvmsg((int)a0, &mh, msgflags_l2m((int)a2));
         } while (r < 0 && SVC_EINTR_RESTART(c));
+        int message_errno = r < 0 ? errno : 0;
+        if (gc && gcl) {
+            HL_LOGF(&g_jit_log, HL_LOG_TAG_NETWORK,
+                    "%s-cmsg fd=%d guest_capacity=%zu host_bytes=%zu result=%lld errno=%d flags=%#x peer_native=%d",
+                    nr == 211 ? "sendmsg" : "recvmsg", (int)a0, gcl,
+                    (size_t)mh.msg_controllen, (long long)r, message_errno, mh.msg_flags,
+                    (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_native_peer[(int)a0]);
+        }
         if (nr == 211) cmsg_tmpfds_close();
         if (nr == 211) cmsg_seq_finish(r >= 0);
         if (nr == 211) cmsg_event_finish(r >= 0);
