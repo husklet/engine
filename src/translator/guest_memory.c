@@ -51,6 +51,21 @@ int hl_guest_memory_write(uint64_t guest, const void *source, size_t length) {
     return g_ops->write(guest, source, length);
 }
 
+int hl_guest_memory_pin_data(uint64_t guest, size_t length, hl_guest_memory_access access, hl_guest_memory_pin *pin) {
+    if (pin == NULL || length == 0 || guest > UINT64_MAX - length) return -1;
+    *pin = (hl_guest_memory_pin){0};
+    if (g_ops != NULL && g_ops->pin != NULL) return g_ops->pin(guest, length, access, pin);
+    pin->host = (void *)(uintptr_t)guest;
+    pin->contiguous = length;
+    return 0;
+}
+
+void hl_guest_memory_unpin_data(hl_guest_memory_pin *pin) {
+    if (pin == NULL) return;
+    if (g_ops != NULL && g_ops->unpin != NULL) g_ops->unpin(pin);
+    *pin = (hl_guest_memory_pin){0};
+}
+
 int hl_guest_memory_indirect(void) {
     return g_ops != NULL && g_ops->indirect != NULL && g_ops->indirect();
 }

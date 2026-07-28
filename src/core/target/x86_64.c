@@ -217,10 +217,35 @@ static int jit86_guest_memory_write(uint64_t guest, const void *source, size_t l
     return 1;
 }
 
+static int jit86_guest_memory_pin(uint64_t guest, size_t length, hl_guest_memory_access access,
+                                  hl_guest_memory_pin *pin) {
+    hl_logical_vma_pin logical_pin = {0};
+    uint32_t required = access == HL_GUEST_MEMORY_WRITE ? HL_LOGICAL_VMA_WRITE : HL_LOGICAL_VMA_READ;
+    int logical = hl_logical_vma_pin_data(guest, length, required, &logical_pin);
+    if (logical < 0) return -1;
+    pin->host = logical_pin.host;
+    pin->contiguous = logical_pin.contiguous;
+    pin->token = logical_pin.token;
+    return logical;
+}
+
+static void jit86_guest_memory_unpin(hl_guest_memory_pin *pin) {
+    if (pin->token == NULL) return;
+    hl_logical_vma_pin logical_pin = {.token = pin->token};
+    hl_logical_vma_unpin(&logical_pin);
+}
+
 static const hl_guest_memory_ops g_guest_memory_ops = {
-    hl_logical_vma_resolve_exec,          jit86_guest_memory_read, jit86_guest_memory_write,
-    hl_logical_vma_global_active,         hl_x86_guest_pointer,    hl_logical_vma_resolve_exec_span,
-    hl_logical_vma_global_exec_generation};
+    .resolve_exec = hl_logical_vma_resolve_exec,
+    .read = jit86_guest_memory_read,
+    .write = jit86_guest_memory_write,
+    .indirect = hl_logical_vma_global_active,
+    .host_pointer = hl_x86_guest_pointer,
+    .exec_span = hl_logical_vma_resolve_exec_span,
+    .exec_generation = hl_logical_vma_global_exec_generation,
+    .pin = jit86_guest_memory_pin,
+    .unpin = jit86_guest_memory_unpin,
+};
 
 // Host-CPU fork: an AArch64 host takes the x86-64 -> ARM64 translator below (register model at the top of
 // this file); any other takes interp.c, which decodes x86-64 directly. Both share struct cpu: it is the

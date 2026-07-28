@@ -5,16 +5,25 @@
 #include <stddef.h>
 #include <stdint.h>
 
+typedef enum {
+    HL_GUEST_MEMORY_READ = 1,
+    HL_GUEST_MEMORY_WRITE = 2,
+} hl_guest_memory_access;
+
+typedef struct {
+    void *host;
+    size_t contiguous;
+    void *token;
+} hl_guest_memory_pin;
+
 /*
  * Guest-address indirection seam.
  *
  * A guest address is not always a host address: the Linux ABI's logical-VMA
  * ledger (linux_abi/logical_vma.c) can move it, and a biased non-PIE image
  * moves it again (core/target/x86_64.c's window).  The translator has to honor
- * both, and DOCS.md section 3 forbids it from calling either -- engine ->
- * translator and engine -> Linux ABI are arrows, translator -> Linux ABI is
- * not.  So the engine binds the accessors here, exactly as it already binds
- * hl_x86_avx_state and the guest-fetch direct validator.
+ * both without depending on the engine or Linux ABI, so the engine binds the
+ * accessors here.
  *
  * Unbound is the honest standalone default and every entry is optional: a
  * translator with no engine under it sees one flat address space where a guest
@@ -41,6 +50,10 @@ typedef struct hl_guest_memory_ops {
     /* Address of that generation counter.  A cached span is revalidated against
        it on every use, so no mapping transition has to notify anyone. */
     const _Atomic uint64_t *(*exec_generation)(void);
+    /* Stable data span.  The return value has the same tri-state as read/write;
+       unpin releases any lifetime token acquired by pin. */
+    int (*pin)(uint64_t guest, size_t length, hl_guest_memory_access access, hl_guest_memory_pin *pin);
+    void (*unpin)(hl_guest_memory_pin *pin);
 } hl_guest_memory_ops;
 
 void hl_guest_memory_bind(const hl_guest_memory_ops *ops);
@@ -56,6 +69,8 @@ int hl_guest_memory_resolve_exec_span(uint64_t guest, size_t length, uint64_t *g
 extern const _Atomic uint64_t *hl_guest_memory_generation;
 int hl_guest_memory_read(uint64_t guest, void *destination, size_t length);
 int hl_guest_memory_write(uint64_t guest, const void *source, size_t length);
+int hl_guest_memory_pin_data(uint64_t guest, size_t length, hl_guest_memory_access access, hl_guest_memory_pin *pin);
+void hl_guest_memory_unpin_data(hl_guest_memory_pin *pin);
 int hl_guest_memory_indirect(void);
 uint64_t hl_guest_memory_host_pointer(uint64_t guest);
 

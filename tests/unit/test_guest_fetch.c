@@ -30,11 +30,15 @@ static int direct_fetch_valid(uint64_t address, size_t length) {
 
 // What core/target/*.c binds; the translator itself never names the ledger.
 static const hl_guest_memory_ops g_ledger_ops = {
-    hl_logical_vma_resolve_exec,          NULL, NULL, NULL, NULL, hl_logical_vma_resolve_exec_span,
-    hl_logical_vma_global_exec_generation};
+    .resolve_exec = hl_logical_vma_resolve_exec,
+    .exec_span = hl_logical_vma_resolve_exec_span,
+    .exec_generation = hl_logical_vma_global_exec_generation,
+};
 
 // The same table without the span seam: the memo must stay off, not guess.
-static const hl_guest_memory_ops g_unmemoised_ops = {hl_logical_vma_resolve_exec, NULL, NULL, NULL, NULL, NULL, NULL};
+static const hl_guest_memory_ops g_unmemoised_ops = {
+    .resolve_exec = hl_logical_vma_resolve_exec,
+};
 
 int main(void) {
     int descriptor = scratch_fd();
