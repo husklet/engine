@@ -3,6 +3,9 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 static int failures;
 
@@ -76,8 +79,13 @@ static void test_missing_executable(void) {
     HlLintProcessResult result;
     expect(hl_lint_process_run(argv, 0, &result) < 0,
            "missing executable is a spawn failure");
-    expect(result.platform_error == ENOENT,
-           "missing executable preserves ENOENT");
+#ifdef _WIN32
+    expect(result.platform_error == ERROR_FILE_NOT_FOUND ||
+               result.platform_error == ERROR_PATH_NOT_FOUND,
+           "missing executable preserves the Windows error");
+#else
+    expect(result.platform_error == ENOENT, "missing executable preserves ENOENT");
+#endif
     expect(result.exit_code == -1,
            "spawn failure is distinct from child exit");
     hl_lint_process_result_destroy(&result);

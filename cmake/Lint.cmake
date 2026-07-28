@@ -53,9 +53,15 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/linter/src/hl_lint.c")
   return()
 endif()
 
+if(WIN32)
+  set(_hl_lint_process_source linter/src/process_windows.c)
+else()
+  set(_hl_lint_process_source linter/src/process_posix.c)
+endif()
+
 add_executable(hl_lint
   linter/src/hl_lint.c
-  linter/src/process_posix.c)
+  ${_hl_lint_process_source})
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(hl_lint PRIVATE
@@ -136,7 +142,7 @@ if(HL_BUILD_TESTS)
 
   add_executable(hl_lint_process_test
     linter/tests/test_process.c
-    linter/src/process_posix.c)
+    ${_hl_lint_process_source})
   target_include_directories(hl_lint_process_test PRIVATE
     "${CMAKE_SOURCE_DIR}/linter/src")
   set_target_properties(hl_lint_process_test PROPERTIES

@@ -2,7 +2,8 @@
 
 `hl-lint` runs clang-format, clang-tidy, cppcheck, and deterministic C policy
 checks. The driver launches analyzers directly, without a shell, and bounds
-captured output.
+captured output. Native POSIX and Windows backends preserve argument boundaries
+and merge analyzer output in emission order.
 
 Run the repository check:
 
