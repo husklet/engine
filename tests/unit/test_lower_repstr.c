@@ -22,6 +22,7 @@ static uint64_t committed_size[16];
 static unsigned committed_count;
 static uintptr_t readable_until = UINTPTR_MAX;
 static uintptr_t writable_until = UINTPTR_MAX;
+static int logical_active;
 
 static int range_ends_before(uint64_t address, size_t length, uintptr_t limit) {
     return address <= UINTPTR_MAX && length <= UINTPTR_MAX - (uintptr_t)address && (uintptr_t)address + length <= limit;
@@ -48,7 +49,7 @@ static void store_committed(uint64_t address, uint64_t size) {
 }
 
 int hl_logical_vma_global_active(void) {
-    return 0;
+    return logical_active;
 }
 
 int hl_logical_vma_pin_data(uint64_t address, size_t length, unsigned access, hl_logical_vma_pin *pin) {
@@ -215,6 +216,19 @@ static int check_copy_semantics(void) {
     HL_CHECK(committed_count == 1);
     HL_CHECK(committed_address[0] == (uint64_t)(uintptr_t)(observed + 4) && committed_size[0] == 4);
     observe_stores = 0;
+
+    uint8_t logical_source[4096];
+    uint8_t logical_destination[sizeof(logical_source)] = {0};
+    memset(logical_source, 0x5a, sizeof(logical_source));
+    logical_active = 1;
+    observe_stores = 1;
+    committed_count = 0;
+    HL_CHECK(hl_x86_rep_movs(logical_destination, logical_source, sizeof(logical_source), 1, 0, NULL, 0) ==
+             sizeof(logical_source));
+    HL_CHECK(memcmp(logical_destination, logical_source, sizeof(logical_source)) == 0);
+    HL_CHECK(committed_count == 1 && committed_size[0] == sizeof(logical_source));
+    observe_stores = 0;
+    logical_active = 0;
     return 0;
 }
 

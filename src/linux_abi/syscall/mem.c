@@ -891,7 +891,25 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             acct_publish_mem(); // publish the refunded charge into this process's cross-process slot
         }
         if (r != MAP_FAILED) {
-            if (a3 & 0x10) filemap_unmap((uint64_t)r, (uint64_t)r + (uint64_t)a1);
+            if (a3 & 0x10) {
+                uint64_t replaced_first = (uint64_t)r;
+                uint64_t replaced_last = replaced_first + (uint64_t)a1;
+                /*
+                 * MAP_FIXED replaces every prior guest VMA in its requested
+                 * range. Keep every ownership ledger at that same shape
+                 * before appending the replacement. In particular, leaving
+                 * the old gmap entry at the same base made a later munmap
+                 * find its synthetic 64 KiB compatibility tail and release
+                 * live mappings installed after it.
+                 */
+                hl_gmap_unmap_range(replaced_first, replaced_last);
+                anon_split_unmap(replaced_first, replaced_last);
+                filemap_unmap(replaced_first, replaced_last);
+                futex_shared_unmap(replaced_first, replaced_last);
+                wipefork_del(replaced_first, replaced_last - replaced_first);
+                dontfork_del(replaced_first, replaced_last - replaced_first);
+                hl_gmap_lock_remove(replaced_first, replaced_last - replaced_first);
+            }
             if (!bus_prepared && !mapping_prepared) gbus_clear((uint64_t)r, (uint64_t)r + (uint64_t)a1 + guard);
             if (physical_mapping != NULL)
                 hl_gmap_add_physical((uint64_t)r, (uint64_t)a1 + guard, (uint64_t)physical_mapping,

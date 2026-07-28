@@ -20,6 +20,8 @@ typedef struct hl_logical_vma_view {
     uint64_t guest_first;
     uint64_t guest_last;
     uint64_t host_delta;
+    uint64_t backing;
+    uint64_t backing_offset;
     uint32_t protection;
     uint32_t flags;
 } hl_logical_vma_view;

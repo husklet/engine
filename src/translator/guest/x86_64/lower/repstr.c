@@ -78,7 +78,57 @@ uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes,
                   (g_rep_writable != NULL && !g_rep_writable(dlo, (size_t)nbytes));
     if (hl_logical_vma_global_active() || special) {
         uint64_t n = nbytes / (unsigned)w;
-        for (uint64_t i = 0; i < n; ++i) {
+        uint64_t completed = 0;
+        /*
+         * The common logical-VMA case is a page-sized copy between disjoint
+         * shared and ordinary memory. Pin and copy each contiguous span once;
+         * the former byte-at-a-time path took three ledger mutex operations
+         * per byte and serialized Chrome's renderer and network processes.
+         */
+        if (!df) {
+            while (completed < n) {
+                uint64_t moved = completed * (uint64_t)w;
+                uint64_t remaining = nbytes - moved;
+                uint64_t dg = (uint64_t)(uintptr_t)dst + moved;
+                uint64_t sg = (uint64_t)(uintptr_t)src + moved;
+                hl_logical_vma_pin dpin = {0}, spin = {0};
+                int sr = hl_logical_vma_pin_data(sg, (size_t)remaining, HL_LOGICAL_VMA_READ, &spin);
+                if (sr < 0) {
+                    if (sr > 0) hl_logical_vma_unpin(&spin);
+                    return rep_fault(cpu, sg, (uint64_t)w, X86_SOFT_READ, rip, completed);
+                }
+                if (sr == 0 && g_rep_readable != NULL && !g_rep_readable(sg, spin.contiguous)) {
+                    goto element_copy;
+                }
+                int dr = hl_logical_vma_pin_data(dg, (size_t)remaining, HL_LOGICAL_VMA_WRITE, &dpin);
+                if (dr < 0) {
+                    if (dr > 0) hl_logical_vma_unpin(&dpin);
+                    hl_logical_vma_unpin(&spin);
+                    return rep_fault(cpu, dg, (uint64_t)w, X86_SOFT_WRITE, rip, completed);
+                }
+                if (dr == 0 && g_rep_writable != NULL && !g_rep_writable(dg, dpin.contiguous)) {
+                    hl_logical_vma_unpin(&spin);
+                    goto element_copy;
+                }
+                size_t chunk = spin.contiguous < dpin.contiguous ? spin.contiguous : dpin.contiguous;
+                if (chunk > remaining) chunk = (size_t)remaining;
+                chunk -= chunk % (size_t)w;
+                uintptr_t sh = (uintptr_t)spin.host;
+                uintptr_t dh = (uintptr_t)dpin.host;
+                int overlap = chunk == 0 || (dh < sh + chunk && sh < dh + chunk);
+                if (!overlap) {
+                    memcpy(dpin.host, spin.host, chunk);
+                    if (g_rep_store_commit != NULL) g_rep_store_commit(dg, chunk);
+                    completed += chunk / (size_t)w;
+                }
+                hl_logical_vma_unpin(&dpin);
+                hl_logical_vma_unpin(&spin);
+                if (overlap) break;
+            }
+            if (completed == n) return n;
+        }
+    element_copy:
+        for (uint64_t i = completed; i < n; ++i) {
             uint64_t step = i * (uint64_t)w;
             uint64_t dg = (uint64_t)(uintptr_t)(df ? dst - step : dst + step);
             uint64_t sg = (uint64_t)(uintptr_t)(df ? src - step : src + step);

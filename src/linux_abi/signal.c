@@ -1051,11 +1051,27 @@ static void sig_diag_sync_reraise(int sig, int ls, siginfo_t *si, void *ucv) {
 }
 
 static void sig_diag_raise_default(struct cpu *c, int sig) {
+#if G_GPC_HASH_SHIFT == 0
+    fprintf(stderr,
+            "[HLDBG] fatal-default pid=%d sig=%d pc=%#llx addr=%#llx handler=%#llx "
+            "fault=%#llx rax=%#llx rcx=%#llx rdx=%#llx rbx=%#llx rsp=%#llx rbp=%#llx "
+            "rsi=%#llx rdi=%#llx argv=%s\n",
+            (int)getpid(), sig, (unsigned long long)(c ? G_PC(c) : 0),
+            (unsigned long long)(c ? c->sync_address : 0),
+            (unsigned long long)((sig >= 1 && sig <= 64) ? g_sigact[sig].handler : 0),
+            (unsigned long long)(c ? c->fault_addr : 0),
+            (unsigned long long)(c ? c->r[RAX] : 0), (unsigned long long)(c ? c->r[RCX] : 0),
+            (unsigned long long)(c ? c->r[RDX] : 0), (unsigned long long)(c ? c->r[RBX] : 0),
+            (unsigned long long)(c ? c->r[RSP] : 0), (unsigned long long)(c ? c->r[RBP] : 0),
+            (unsigned long long)(c ? c->r[RSI] : 0), (unsigned long long)(c ? c->r[RDI] : 0),
+            g_fault_cmdline);
+#else
     fprintf(stderr, "[HLDBG] fatal-default pid=%d sig=%d pc=%#llx addr=%#llx handler=%#llx argv=%s\n",
             (int)getpid(), sig, (unsigned long long)(c ? G_PC(c) : 0),
             (unsigned long long)(c ? c->sync_address : 0),
             (unsigned long long)((sig >= 1 && sig <= 64) ? g_sigact[sig].handler : 0),
             g_fault_cmdline);
+#endif
     // An engine-internal diagnostic for a guest taking a fatal-default signal. It must NEVER reach the
     // guest's own stderr fd, so route it through the engine's tagged logging facility (HL_LOG_TAG_SIGNAL)
     // exactly like every other engine diagnostic -- gated on the HL_LOG selector and compiled out entirely

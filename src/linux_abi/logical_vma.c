@@ -97,7 +97,14 @@ static void publish_locked(hl_logical_vma_ledger *ledger, hl_logical_vma_snapsho
         const hl_logical_vma_entry *entry = &ledger->entries[index];
         uint64_t host_first = (uint64_t)(uintptr_t)entry->backing->mapping + entry->backing_offset;
         snapshot->views[index] = (hl_logical_vma_view){
-            entry->guest_first, entry->guest_last, host_first - entry->guest_first, entry->protection, entry->flags};
+            entry->guest_first,
+            entry->guest_last,
+            host_first - entry->guest_first,
+            (uint64_t)(uintptr_t)entry->backing,
+            entry->backing_offset,
+            entry->protection,
+            entry->flags,
+        };
         backings[index] = entry->backing;
         backing_get(backings[index]);
     }
@@ -886,17 +893,29 @@ int hl_logical_vma_visit_exec_aliases(uint64_t guest_first, uint64_t guest_last,
     int overflow = 0;
     int matched = 0;
     (void)pthread_once(&g_logical_vmas_once, global_init);
-    pthread_mutex_lock(&g_logical_vmas.lock);
-    for (size_t source = 0; source < g_logical_vmas.count; ++source) {
-        const hl_logical_vma_entry *sv = &g_logical_vmas.entries[source];
+    hl_logical_vma_snapshot *snapshot =
+        atomic_load_explicit(&g_logical_vmas.current, memory_order_acquire);
+    if (snapshot == NULL) return 0;
+    size_t source = 0;
+    size_t high = snapshot->count;
+    while (source < high) {
+        size_t middle = source + (high - source) / 2;
+        if (snapshot->views[middle].guest_last <= guest_first)
+            source = middle + 1;
+        else
+            high = middle;
+    }
+    for (; source < snapshot->count; ++source) {
+        const hl_logical_vma_view *sv = &snapshot->views[source];
+        if (sv->guest_first >= guest_last) break;
         uint64_t first = guest_first > sv->guest_first ? guest_first : sv->guest_first;
         uint64_t last = guest_last < sv->guest_last ? guest_last : sv->guest_last;
         if (last <= first) continue;
         matched = 1;
         uint64_t source_offset = sv->backing_offset + (first - sv->guest_first);
         uint64_t source_last = source_offset + (last - first);
-        for (size_t alias = 0; alias < g_logical_vmas.count; ++alias) {
-            const hl_logical_vma_entry *av = &g_logical_vmas.entries[alias];
+        for (size_t alias = 0; alias < snapshot->count; ++alias) {
+            const hl_logical_vma_view *av = &snapshot->views[alias];
             if (av->backing != sv->backing || !(av->protection & HL_LOGICAL_VMA_EXEC)) continue;
             uint64_t alias_offset = av->backing_offset;
             uint64_t alias_last = alias_offset + (av->guest_last - av->guest_first);
@@ -922,7 +941,6 @@ int hl_logical_vma_visit_exec_aliases(uint64_t guest_first, uint64_t guest_last,
         }
         if (overflow) break;
     }
-    pthread_mutex_unlock(&g_logical_vmas.lock);
     if (overflow)
         visitor(0, UINT64_MAX, opaque);
     else
