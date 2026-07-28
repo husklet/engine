@@ -745,6 +745,18 @@ static void aes_shiftrows(const uint8_t in[16], uint8_t out[16], int inv);
 static void aes_mixcolumns(uint8_t s[16], int inv);
 static inline int sat_s16(int v);
 
+static uint64_t simd_element_mask(int size) {
+    return (UINT64_C(1) << (size * 8)) - 1u;
+}
+
+static uint64_t simd_element_negate(uint64_t value, int size) {
+    return (UINT64_C(0) - value) & simd_element_mask(size);
+}
+
+static int simd_element_negative(uint64_t value, int size) {
+    return (value & (UINT64_C(1) << (size * 8 - 1))) != 0;
+}
+
 static void do_avx(const hl_x86_avx_state *state, struct cpu *c);
 static void do_sse3b(const hl_x86_avx_state *state, struct cpu *c);
 
@@ -1872,13 +1884,10 @@ static void do_avx(const hl_x86_avx_state *state, struct cpu *c) {
             avx_get_rm(state, c, &I, next, W, b);
             int es = (op == 0x08) ? 1 : (op == 0x09) ? 2 : 4;
             for (int i = 0; i < W; i += es) {
-                int64_t x = 0, y = 0;
+                uint64_t x = 0, y = 0;
                 memcpy(&x, a + i, (size_t)es);
                 memcpy(&y, b + i, (size_t)es);
-                int sh = 64 - es * 8;
-                x = (x << sh) >> sh;
-                y = (y << sh) >> sh; // sign-extend both
-                int64_t o = (y < 0) ? -x : (y == 0) ? 0 : x;
+                uint64_t o = simd_element_negative(y, es) ? simd_element_negate(x, es) : y == 0 ? 0 : x;
                 memcpy(d + i, &o, (size_t)es);
             }
             avx_put(c, rd, d, W);
@@ -1903,11 +1912,9 @@ static void do_avx(const hl_x86_avx_state *state, struct cpu *c) {
             avx_get_rm(state, c, &I, next, W, b);
             int es = (op == 0x1C) ? 1 : (op == 0x1D) ? 2 : 4;
             for (int i = 0; i < W; i += es) {
-                int64_t x = 0;
+                uint64_t x = 0;
                 memcpy(&x, b + i, (size_t)es);
-                int sh = 64 - es * 8;
-                x = (x << sh) >> sh;
-                int64_t o = x < 0 ? -x : x;
+                uint64_t o = simd_element_negative(x, es) ? simd_element_negate(x, es) : x;
                 memcpy(d + i, &o, (size_t)es);
             }
             avx_put(c, rd, d, W);
@@ -3452,27 +3459,15 @@ static void do_sse3b(const hl_x86_avx_state *state, struct cpu *c) {
         case 0x08:
         case 0x09:
         case 0x0A: { // psign b/w/d
-            if (op == 0x08) {
-                int8_t a[16], b[16], o[16];
-                memcpy(a, D, 16);
-                memcpy(b, s, 16);
-                for (int i = 0; i < 16; i++)
-                    o[i] = b[i] < 0 ? -a[i] : b[i] == 0 ? 0 : a[i];
-                memcpy(r, o, 16);
-            } else if (op == 0x09) {
-                int16_t a[8], b[8], o[8];
-                memcpy(a, D, 16);
-                memcpy(b, s, 16);
-                for (int i = 0; i < 8; i++)
-                    o[i] = b[i] < 0 ? -a[i] : b[i] == 0 ? 0 : a[i];
-                memcpy(r, o, 16);
-            } else {
-                int32_t a[4], b[4], o[4];
-                memcpy(a, D, 16);
-                memcpy(b, s, 16);
-                for (int i = 0; i < 4; i++)
-                    o[i] = b[i] < 0 ? -a[i] : b[i] == 0 ? 0 : a[i];
-                memcpy(r, o, 16);
+            int es = op == 0x08 ? 1 : op == 0x09 ? 2 : 4;
+            for (int i = 0; i < 16; i += es) {
+                uint64_t value = 0, control = 0;
+                memcpy(&value, D + i, (size_t)es);
+                memcpy(&control, s + i, (size_t)es);
+                uint64_t output = simd_element_negative(control, es) ? simd_element_negate(value, es)
+                                  : control == 0                     ? 0
+                                                                     : value;
+                memcpy(r + i, &output, (size_t)es);
             }
             break;
         }
@@ -3488,23 +3483,12 @@ static void do_sse3b(const hl_x86_avx_state *state, struct cpu *c) {
         case 0x1C:
         case 0x1D:
         case 0x1E: { // pabs b/w/d (single source: r/m)
-            if (op == 0x1C) {
-                int8_t a[16];
-                memcpy(a, s, 16);
-                for (int i = 0; i < 16; i++)
-                    r[i] = (uint8_t)(a[i] < 0 ? -a[i] : a[i]);
-            } else if (op == 0x1D) {
-                int16_t a[8], o[8];
-                memcpy(a, s, 16);
-                for (int i = 0; i < 8; i++)
-                    o[i] = (int16_t)(a[i] < 0 ? -a[i] : a[i]);
-                memcpy(r, o, 16);
-            } else {
-                int32_t a[4], o[4];
-                memcpy(a, s, 16);
-                for (int i = 0; i < 4; i++)
-                    o[i] = a[i] < 0 ? -a[i] : a[i];
-                memcpy(r, o, 16);
+            int es = op == 0x1C ? 1 : op == 0x1D ? 2 : 4;
+            for (int i = 0; i < 16; i += es) {
+                uint64_t value = 0;
+                memcpy(&value, s + i, (size_t)es);
+                uint64_t output = simd_element_negative(value, es) ? simd_element_negate(value, es) : value;
+                memcpy(r + i, &output, (size_t)es);
             }
             break;
         }

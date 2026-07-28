@@ -26,11 +26,23 @@ TGT int main(void) {
   for (int i = 0; i < 16; i++) { w[i] = (int16_t)(i * 777 - 3000); w2[i] = (int16_t)(i * -555 + 2000); }
   for (int i = 0; i < 32; i++) { b1[i] = (int8_t)(i * 7 - 60); b2[i] = (int8_t)(i * -5 + 40); }
   for (int i = 0; i < 8; i++) { d1[i] = i * 111111 - 400000; d2[i] = i * -99999 + 300000; }
+  int8_t bmin[32], bcontrol[32];
+  int16_t wmin[16], wcontrol[16];
+  int32_t dmin[8], dcontrol[8];
+  memcpy(bmin, b1, sizeof(bmin)); memcpy(bcontrol, b2, sizeof(bcontrol));
+  memcpy(wmin, w, sizeof(wmin)); memcpy(wcontrol, w2, sizeof(wcontrol));
+  memcpy(dmin, d1, sizeof(dmin)); memcpy(dcontrol, d2, sizeof(dcontrol));
+  bmin[0] = INT8_MIN; bcontrol[0] = -1;
+  wmin[0] = INT16_MIN; wcontrol[0] = -1;
+  dmin[0] = INT32_MIN; dcontrol[0] = -1;
   uint8_t o[32];
 #if defined(__x86_64__)
   __m256i W = _mm256_loadu_si256((void *)w), W2 = _mm256_loadu_si256((void *)w2);
   __m256i B = _mm256_loadu_si256((void *)b1), B2 = _mm256_loadu_si256((void *)b2);
   __m256i D = _mm256_loadu_si256((void *)d1), D2 = _mm256_loadu_si256((void *)d2);
+  __m256i BM = _mm256_loadu_si256((void *)bmin), BC = _mm256_loadu_si256((void *)bcontrol);
+  __m256i WM = _mm256_loadu_si256((void *)wmin), WC = _mm256_loadu_si256((void *)wcontrol);
+  __m256i DM = _mm256_loadu_si256((void *)dmin), DC = _mm256_loadu_si256((void *)dcontrol);
 #define OUT(x) do { _mm256_storeu_si256((void *)o, (x)); mixb(o, 32); } while (0)
   OUT(_mm256_hadd_epi16(W, W2));
   OUT(_mm256_hadd_epi32(D, D2));
@@ -38,12 +50,12 @@ TGT int main(void) {
   OUT(_mm256_hsub_epi16(W, W2));
   OUT(_mm256_hsub_epi32(D, D2));
   OUT(_mm256_hsubs_epi16(W, W2));
-  OUT(_mm256_sign_epi8(B, B2));
-  OUT(_mm256_sign_epi16(W, W2));
-  OUT(_mm256_sign_epi32(D, D2));
-  OUT(_mm256_abs_epi8(B));
-  OUT(_mm256_abs_epi16(W));
-  OUT(_mm256_abs_epi32(D));
+  OUT(_mm256_sign_epi8(BM, BC));
+  OUT(_mm256_sign_epi16(WM, WC));
+  OUT(_mm256_sign_epi32(DM, DC));
+  OUT(_mm256_abs_epi8(BM));
+  OUT(_mm256_abs_epi16(WM));
+  OUT(_mm256_abs_epi32(DM));
   OUT(_mm256_maddubs_epi16(B, B2));
   OUT(_mm256_mulhrs_epi16(W, W2));
 #else
@@ -74,19 +86,21 @@ TGT int main(void) {
   PH16(w, w2, 1, 1);  // hsubs_epi16
   // psign b/w/d: es
 #define PSIGN(av, sv, es) do { const uint8_t *aa = (const uint8_t *)(av), *bb = (const uint8_t *)(sv); \
-    for (int i = 0; i < 32; i += (es)) { int64_t x = 0, y = 0; memcpy(&x, aa + i, (es)); memcpy(&y, bb + i, (es)); \
-      int sh = 64 - (es) * 8; x = (x << sh) >> sh; y = (y << sh) >> sh; int64_t oo = (y < 0) ? -x : (y == 0) ? 0 : x; \
+    for (int i = 0; i < 32; i += (es)) { uint64_t x = 0, y = 0; memcpy(&x, aa + i, (es)); memcpy(&y, bb + i, (es)); \
+      uint64_t mask = (UINT64_C(1) << ((es) * 8)) - 1, sign = UINT64_C(1) << ((es) * 8 - 1); \
+      uint64_t oo = (y & sign) ? (UINT64_C(0) - x) & mask : y == 0 ? 0 : x; \
       memcpy(o + i, &oo, (es)); } mixb(o, 32); } while (0)
-  PSIGN(b1, b2, 1); // sign_epi8
-  PSIGN(w, w2, 2);  // sign_epi16
-  PSIGN(d1, d2, 4); // sign_epi32
+  PSIGN(bmin, bcontrol, 1); // sign_epi8
+  PSIGN(wmin, wcontrol, 2);  // sign_epi16
+  PSIGN(dmin, dcontrol, 4); // sign_epi32
   // pabs b/w/d
 #define PABS(sv, es) do { const uint8_t *bb = (const uint8_t *)(sv); \
-    for (int i = 0; i < 32; i += (es)) { int64_t x = 0; memcpy(&x, bb + i, (es)); int sh = 64 - (es) * 8; \
-      x = (x << sh) >> sh; int64_t oo = x < 0 ? -x : x; memcpy(o + i, &oo, (es)); } mixb(o, 32); } while (0)
-  PABS(b1, 1); // abs_epi8
-  PABS(w, 2);  // abs_epi16
-  PABS(d1, 4); // abs_epi32
+    for (int i = 0; i < 32; i += (es)) { uint64_t x = 0; memcpy(&x, bb + i, (es)); \
+      uint64_t mask = (UINT64_C(1) << ((es) * 8)) - 1, sign = UINT64_C(1) << ((es) * 8 - 1); \
+      uint64_t oo = (x & sign) ? (UINT64_C(0) - x) & mask : x; memcpy(o + i, &oo, (es)); } mixb(o, 32); } while (0)
+  PABS(bmin, 1); // abs_epi8
+  PABS(wmin, 2);  // abs_epi16
+  PABS(dmin, 4); // abs_epi32
   // maddubs: src1 unsigned bytes, src2 signed bytes -> saturated words
   { const uint8_t *aa = (const uint8_t *)b1, *bb = (const uint8_t *)b2;
     for (int lane = 0; lane < 32; lane += 16) { int16_t oo[8];
