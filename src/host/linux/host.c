@@ -2149,7 +2149,10 @@ static hl_host_result hl_linux_file_resolve_beneath(void *context, hl_host_handl
 static hl_host_result hl_linux_file_open_beneath(void *context, hl_host_handle root, const char *path, size_t path_size,
                                                  uint32_t access, uint32_t creation, uint32_t permissions,
                                                  uint32_t policy) {
-    hl_host_file_resolution resolved;
+    hl_host_file_resolution resolved = {
+        .parent = HL_HOST_HANDLE_INVALID,
+        .target = HL_HOST_HANDLE_INVALID,
+    };
     hl_host_result result;
     if (path == NULL || path_size == 0 || path[0] == '/' || memchr(path, '\0', path_size) != NULL ||
         (policy & ~(uint32_t)(HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS)) != 0)

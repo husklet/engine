@@ -3,6 +3,13 @@
 #include <errno.h>
 #include <string.h>
 
+static void uname_field(char destination[65], const char *source) {
+    size_t length = 0;
+    while (length < 64u && source[length] != 0)
+        length++;
+    memcpy(destination, source, length);
+}
+
 int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, const uint64_t arguments[6],
                            int64_t *guest_result) {
     uint64_t address = arguments[0];
@@ -10,11 +17,11 @@ int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, cons
     switch (number) {
     case 160: {
         char output[6 * 65] = {0};
-        strcpy(output, "Linux");
-        strcpy(output + 65, context->hostname[0] ? context->hostname : "jit");
-        strcpy(output + 130, "6.1.0");
-        strcpy(output + 195, "#1 jit");
-        strcpy(output + 260, context->machine);
+        uname_field(output, "Linux");
+        uname_field(output + 65, context->hostname[0] ? context->hostname : "jit");
+        uname_field(output + 130, "6.1.0");
+        uname_field(output + 195, "#1 jit");
+        uname_field(output + 260, context->machine);
         if (context->copy_to(context->callback_context, address, output, sizeof output) != sizeof output) {
             *guest_result = -EFAULT;
             break;
@@ -24,6 +31,10 @@ int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, cons
     }
     case 161: {
         int length = (int)size;
+        if (context->hostname == NULL || context->hostname_capacity == 0) {
+            *guest_result = -EINVAL;
+            break;
+        }
         if (length > 64) length = 64;
         if (length > 0) {
             char hostname[64];

@@ -70,6 +70,18 @@ int main(void) {
         strcpy(hostname, "box");
         HL_CHECK(hl_linux_misc_dispatch(&context, 160, arguments, &result) == 1 && result == 0);
         HL_CHECK(strcmp((char *)output + 66, "box") == 0);
+        {
+            char machine[80];
+            memset(hostname, 'h', sizeof(hostname) - 1u);
+            hostname[sizeof(hostname) - 1u] = 0;
+            memset(machine, 'm', sizeof(machine) - 1u);
+            machine[sizeof(machine) - 1u] = 0;
+            context.machine = machine;
+            HL_CHECK(hl_linux_misc_dispatch(&context, 160, arguments, &result) == 1 && result == 0);
+            HL_CHECK(memcmp(output + 66, hostname, 64) == 0 && output[130] == 0);
+            HL_CHECK(memcmp(output + 261, machine, 64) == 0 && output[325] == 0);
+            context.machine = "aarch64";
+        }
 
         state.allow_mapping = 0;
         memset(output, 0x7b, sizeof(output));
@@ -91,6 +103,9 @@ int main(void) {
         HL_CHECK(hl_linux_misc_dispatch(&context, 161, arguments, &result) == 1 && result == -EFAULT);
         HL_CHECK(strcmp(hostname, name) == 0);
         state.allow_mapping = 1;
+        context.hostname_capacity = 0;
+        HL_CHECK(hl_linux_misc_dispatch(&context, 161, arguments, &result) == 1 && result == -EINVAL);
+        context.hostname_capacity = sizeof(hostname);
     }
 
     {

@@ -6,7 +6,7 @@
 static hl_host_result hl_fake_result(hl_fake_host *fake, uint64_t value) {
     hl_host_result result = {HL_STATUS_OK, 0, value, 0};
     if (fake->next_failure != HL_STATUS_OK) {
-        result.status = fake->next_failure;
+        result.status = (int32_t)fake->next_failure;
         fake->next_failure = HL_STATUS_OK;
     }
     return result;
