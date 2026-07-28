@@ -72,8 +72,19 @@ checkout_at () {
     if [ -n "$PATCH" ] && [ "$tag" = head ]; then
         # Head column = baseline + exactly this patch. Applied on top of BASE, not
         # HEAD_REF, so the diff between the two columns is the patch alone.
-        git checkout -q -f "$BASE" || { echo "FATAL: checkout $BASE failed"; return 1; }
-        git apply "$PATCH" || { echo "FATAL: $PATCH does not apply to $BASE"; return 1; }
+        git checkout -q -f "$BASE" || { echo "FATAL: checkout $BASE failed"; exit 1; }
+        # exit, not return: a caller that only checks build_at's status prints an
+        # EMPTY head column and then compares steps 2-5 against a build directory
+        # that was never created -- which reads as "no differences" and is the
+        # exact silent pass this script exists to prevent. The default BASE is the
+        # branch point, and a patch cut against a later HEAD will not apply to it,
+        # so this fires often and must fire hard.
+        git apply "$PATCH" || {
+            echo "FATAL: $PATCH does not apply to BASE=$BASE."
+            echo "       A patch cut against current HEAD needs the commit it was cut from:"
+            echo "           HL_PATCH=$PATCH $0 \$(git rev-parse --short HEAD)"
+            exit 1
+        }
     else
         git checkout -q -f "$ref" || { echo "FATAL: checkout $ref failed"; return 1; }
     fi
