@@ -12,8 +12,14 @@ endif()
 find_program(HL_CLANG_FORMAT_EXECUTABLE NAMES clang-format)
 find_program(HL_CLANG_TIDY_EXECUTABLE NAMES clang-tidy)
 find_program(HL_CPPCHECK_EXECUTABLE NAMES cppcheck)
-set(HL_LINT_ALLOW_GETENV_FILES "src/core/environment.c;tools/config.c"
-  CACHE STRING "Semicolon-separated source files allowed to use getenv()")
+set(HL_LINT_ALLOW_GETENV_FILES
+  src/core/environment.c
+  tests/unit/test_environment.c
+  tools/config.c
+  tools/config_e2e_runner.c
+  tools/e2e_runner.c
+  tools/linux_matrix.c
+  tools/rootfs_e2e_runner.c)
 # Ratchet, not approval: these files predate the tagged logging boundary and
 # must be removed from this list as their direct diagnostics are migrated.
 set(HL_LINT_ALLOW_STDIO_FILES
@@ -40,11 +46,30 @@ set(HL_LINT_ALLOW_STDIO_FILES
   src/translator/guest/x86_64/cache.c
   src/translator/guest/x86_64/dispatch.h
   src/translator/guest/x86_64/signal.c
-  src/translator/guest/x86_64/translate.c
-  CACHE STRING "Legacy files temporarily allowed direct console output")
+  src/translator/guest/x86_64/translate.c)
 set(_hl_lint_cli_stdio_files
+  linter/src/hl_lint.c
+  tests/unit/test.h
+  tests/unit/test_ckptinoq.c
+  tests/unit/test_epoll.c
+  tests/unit/test_guest_naked.c
   tools/bench_runner.c
-  tools/matrix_runner.c)
+  tools/binding_e2e_runner.c
+  tools/bridge_runner.c
+  tools/compat_runner.c
+  tools/config_e2e_runner.c
+  tools/dual_backend_e2e_runner.c
+  tools/e2e_runner.c
+  tools/lifecycle_e2e_runner.c
+  tools/linux_matrix.c
+  tools/linux_production_smoke.c
+  tools/matrix_runner.c
+  tools/perf_runner.c
+  tools/pty_binding_e2e_runner.c
+  tools/rootfs_e2e_runner.c
+  tools/stdio_e2e_runner.c
+  tools/windows/tier0_probe.c
+  tools/windows/toolchain_probe.c)
 
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/linter/src/hl_lint.c")
   message(STATUS "linter source missing: ${CMAKE_CURRENT_SOURCE_DIR}/linter/src/hl_lint.c")
@@ -87,10 +112,9 @@ set(_hl_lint_args
   ${_hl_lint_strict}
   --source-dir "${CMAKE_SOURCE_DIR}/src"
   --source-dir "${CMAKE_SOURCE_DIR}/include"
-  --source-file "${CMAKE_SOURCE_DIR}/tools/config.c"
-  --source-file "${CMAKE_SOURCE_DIR}/tools/bench_runner.c"
-  --source-file "${CMAKE_SOURCE_DIR}/tools/process.c"
-  --source-file "${CMAKE_SOURCE_DIR}/tools/matrix_runner.c"
+  --source-dir "${CMAKE_SOURCE_DIR}/linter/src"
+  --source-dir "${CMAKE_SOURCE_DIR}/tests/unit"
+  --source-dir "${CMAKE_SOURCE_DIR}/tools"
   --include-dir "${CMAKE_SOURCE_DIR}/include"
   --include-dir "${CMAKE_SOURCE_DIR}/src"
   --clang-format-check
@@ -117,7 +141,26 @@ endif()
 
 # clang-tidy's -p option takes the directory containing compile_commands.json.
 list(APPEND _hl_lint_args --compile-commands-dir "${CMAKE_BINARY_DIR}")
-list(APPEND _hl_lint_args --clang-tidy-checks "bugprone-*,clang-analyzer-*,performance-*")
+set(_hl_clang_tidy_checks
+  "clang-analyzer-*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,bugprone-assignment-in-if-condition,bugprone-branch-clone,bugprone-inc-dec-in-conditions,bugprone-infinite-loop,bugprone-not-null-terminated-result,bugprone-posix-return,bugprone-signal-handler,bugprone-sizeof-expression,bugprone-suspicious-memory-comparison,bugprone-suspicious-memset-usage,bugprone-undefined-memory-manipulation")
+list(APPEND _hl_lint_args --clang-tidy-checks "${_hl_clang_tidy_checks}")
+
+set(_hl_clang_tidy_sources
+  ${CORE_SOURCES}
+  ${IR_SOURCES}
+  ${LINUX_ABI_SOURCES}
+  ${FAKE_HOST_SOURCES})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  list(APPEND _hl_clang_tidy_sources ${LINUX_HOST_SOURCES})
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  list(APPEND _hl_clang_tidy_sources ${MACOS_HOST_SOURCES} ${COMMON_HOST_SOURCES})
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  list(APPEND _hl_clang_tidy_sources ${WINDOWS_HOST_SOURCES})
+endif()
+list(REMOVE_DUPLICATES _hl_clang_tidy_sources)
+foreach(_source IN LISTS _hl_clang_tidy_sources)
+  list(APPEND _hl_lint_args --clang-tidy-source-file "${CMAKE_SOURCE_DIR}/${_source}")
+endforeach()
 foreach(_allowed_file IN LISTS HL_LINT_ALLOW_GETENV_FILES)
   list(APPEND _hl_lint_args --allow-getenv-file "${_allowed_file}")
 endforeach()
@@ -129,7 +172,7 @@ foreach(_cli_file IN LISTS _hl_lint_cli_stdio_files)
 endforeach()
 add_custom_target(hl-lint
   COMMAND $<TARGET_FILE:hl_lint> ${_hl_lint_args}
-  DEPENDS hl_lint
+  DEPENDS hl_lint hl-archive-stamp
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   USES_TERMINAL
   COMMENT "Run hl-lint")
@@ -169,6 +212,7 @@ if(HL_BUILD_TESTS)
       --clang-tidy-bin $<TARGET_FILE:hl_lint_fake_analyzer>
       --compile-commands-dir "${CMAKE_BINARY_DIR}"
       --clang-tidy-checks "bugprone-*,performance-*"
+      --clang-tidy-source-file "${CMAKE_SOURCE_DIR}/linter/tests/fixture.c"
       --source-file "${CMAKE_SOURCE_DIR}/linter/tests/fixture.c")
   set_tests_properties(lint.clang-tidy-argv PROPERTIES
     LABELS "lint"

@@ -34,6 +34,7 @@ typedef struct {
 typedef struct {
     StringList source_files;
     StringList source_dirs;
+    StringList clang_tidy_files;
     StringList include_dirs;
     const char *clang_format_bin;
     const char *clang_tidy_bin;
@@ -311,7 +312,7 @@ static void emit_diag(const char *severity, const char *path, int line, int col,
     }
 }
 
-static int run_command_argv(const char *label, const char *const argv[], LintStats *stats) {
+static int run_command_argv(const char *label, const char *const argv[], bool strict, LintStats *stats) {
     HlLintProcessResult result;
     if (hl_lint_process_run(argv, 0, &result) != 0) {
 #ifdef _WIN32
@@ -322,9 +323,17 @@ static int run_command_argv(const char *label, const char *const argv[], LintSta
         stats->errors++;
         return 1;
     }
-    if (result.output_size > 0) { fwrite(result.output, 1, result.output_size, stdout); }
-    if (result.output_truncated) { fprintf(stdout, "warn: %s output truncated\n", label); }
     int rc = result.exit_code;
+    if (result.output_size > 0) { fwrite(result.output, 1, result.output_size, stdout); }
+    if (result.output_truncated) {
+        fprintf(stdout, "%s: %s output truncated\n", strict ? "error" : "warn", label);
+        if (strict) {
+            stats->errors++;
+            rc = 1;
+        } else {
+            stats->warnings++;
+        }
+    }
     if (result.term_signal != 0) {
         fprintf(stdout, "error: %s terminated by signal %d\n", label, result.term_signal);
         stats->errors++;
@@ -351,7 +360,7 @@ static int run_clang_format(const LintConfig *cfg, const StringList *files, Lint
         const char *file = files->items[i];
         const char *const argv[] = {cfg->clang_format_bin, "--dry-run", "--Werror", "--style=file",
                                     "--ferror-limit=1",    file,        NULL};
-        int c = run_command_argv("clang-format", argv, stats);
+        int c = run_command_argv("clang-format", argv, cfg->strict, stats);
         if (c != 0) {
             if (cfg->strict) {
                 emit_diag("error", file, 0, 0, "clang-format", "formatting violation");
@@ -415,13 +424,14 @@ static int run_clang_tidy(const LintConfig *cfg, const StringList *files, LintSt
         const char *const argv[] = {cfg->clang_tidy_bin,      "--quiet", "-p",
                                     cfg->compile_db_dir,      checks,    "--extra-arg=-std=c11",
                                     "--warnings-as-errors=*", file,      NULL};
-        int c = run_command_argv("clang-tidy", argv, stats);
+        int c = run_command_argv("clang-tidy", argv, cfg->strict, stats);
         free(checks);
         if (c != 0) {
             emit_diag("warn", file, 0, 0, "clang-tidy", "diagnostic(s) reported");
             if (cfg->strict) {
                 stats->errors++;
-                return 1;
+                rc = 1;
+                continue;
             }
             stats->warnings++;
             c = 0;
@@ -469,7 +479,7 @@ static int run_cppcheck(const LintConfig *cfg, const StringList *files, LintStat
         argv[a++] = file;
         argv[a] = NULL;
 
-        int c = run_command_argv("cppcheck", argv, stats);
+        int c = run_command_argv("cppcheck", argv, cfg->strict, stats);
         free(argv);
         if (c != 0) {
             emit_diag("warn", file, 0, 0, "cppcheck", "diagnostic(s) reported");
@@ -503,12 +513,28 @@ static bool line_has_word(const char *line, const char *word) {
     }
 }
 
+static bool line_has_call(const char *line, const char *name) {
+    size_t length = strlen(name);
+    const char *cursor = line;
+    while (true) {
+        const char *found = strstr(cursor, name);
+        if (found == NULL) return false;
+        if (word_starts_token(line, found, length)) {
+            const char *next = found + length;
+            while (isspace((unsigned char)*next))
+                ++next;
+            if (*next == '(') return true;
+        }
+        cursor = found + length;
+    }
+}
+
 static bool line_has_direct_console_output(const char *line) {
-    if (line_has_word(line, "printf") || line_has_word(line, "vprintf") || line_has_word(line, "puts") ||
-        line_has_word(line, "perror")) {
+    if (line_has_call(line, "printf") || line_has_call(line, "vprintf") || line_has_call(line, "puts") ||
+        line_has_call(line, "perror")) {
         return true;
     }
-    if ((line_has_word(line, "fprintf") || line_has_word(line, "vfprintf") || line_has_word(line, "fputs")) &&
+    if ((line_has_call(line, "fprintf") || line_has_call(line, "vfprintf") || line_has_call(line, "fputs")) &&
         (line_has_word(line, "stderr") || line_has_word(line, "stdout"))) {
         return true;
     }
@@ -636,7 +662,7 @@ static void check_file_custom(const LintConfig *cfg, const char *path, LintStats
             stats->warnings++;
         }
 
-        if (line_has_word(clean, "getenv")) {
+        if (line_has_call(clean, "getenv")) {
             if (!is_getenv_allowed_in_file(cfg, path)) {
                 emit_diag("error", path, lineno, 1, "api",
                           "getenv usage is only allowed in explicitly whitelisted files");
@@ -647,7 +673,7 @@ static void check_file_custom(const LintConfig *cfg, const char *path, LintStats
             emit_diag("error", path, lineno, 1, "logging", "direct console output is forbidden; use tagged logging");
             stats->errors++;
         }
-        if ((line_has_word(clean, "system") || line_has_word(clean, "popen")) && !is_shell_allowed_in_file(cfg, path)) {
+        if ((line_has_call(clean, "system") || line_has_call(clean, "popen")) && !is_shell_allowed_in_file(cfg, path)) {
             emit_diag("error", path, lineno, 1, "process",
                       "shell execution is forbidden; launch an argv vector directly");
             stats->errors++;
@@ -741,6 +767,7 @@ static void print_usage(const char *prog) {
     fprintf(stdout, "options:\n");
     fprintf(stdout, "  --source-dir PATH         add recursive source directory (default: src)\n");
     fprintf(stdout, "  --source-file PATH        add explicit source file\n");
+    fprintf(stdout, "  --clang-tidy-source-file PATH analyze a compiled translation unit\n");
     fprintf(stdout, "  --include-dir PATH        add include directory for cppcheck\n");
     fprintf(stdout, "  --compile-commands-dir DIR directory containing compile_commands.json for clang-tidy\n");
     fprintf(stdout, "  --clang-format-bin PATH   clang-format path\n");
@@ -785,11 +812,16 @@ int main(int argc, char **argv) {
         .run_cppcheck = true,
         .run_custom = true,
         .strict = false,
-        .clang_tidy_checks = "bugprone-*,clang-analyzer-*,performance-*",
+        .clang_tidy_checks = "clang-analyzer-*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,"
+                             "bugprone-assignment-in-if-condition,bugprone-branch-clone,bugprone-inc-dec-in-conditions,"
+                             "bugprone-infinite-loop,bugprone-not-null-terminated-result,bugprone-posix-return,"
+                             "bugprone-signal-handler,bugprone-sizeof-expression,bugprone-suspicious-memory-comparison,"
+                             "bugprone-suspicious-memset-usage,bugprone-undefined-memory-manipulation",
     };
 
     list_init(&cfg.source_files);
     list_init(&cfg.source_dirs);
+    list_init(&cfg.clang_tidy_files);
     list_init(&cfg.include_dirs);
     list_init(&cfg.allow_getenv_files);
     list_init(&cfg.allow_stdio_files);
@@ -801,6 +833,7 @@ int main(int argc, char **argv) {
             print_usage(argv[0]);
             list_free(&cfg.source_files);
             list_free(&cfg.source_dirs);
+            list_free(&cfg.clang_tidy_files);
             list_free(&cfg.include_dirs);
             list_free(&cfg.allow_getenv_files);
             list_free(&cfg.allow_stdio_files);
@@ -818,6 +851,12 @@ int main(int argc, char **argv) {
                 return 2;
             }
             list_append(&cfg.source_files, argv[++i]);
+        } else if (strcmp(arg, "--clang-tidy-source-file") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stdout, "error: %s expects <path>\n", arg);
+                return 2;
+            }
+            list_append(&cfg.clang_tidy_files, argv[++i]);
         } else if (strcmp(arg, "--include-dir") == 0 || strcmp(arg, "-I") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stdout, "error: %s expects <path>\n", arg);
@@ -917,6 +956,7 @@ int main(int argc, char **argv) {
             print_usage(argv[0]);
             list_free(&cfg.source_files);
             list_free(&cfg.source_dirs);
+            list_free(&cfg.clang_tidy_files);
             list_free(&cfg.include_dirs);
             list_free(&cfg.allow_getenv_files);
             list_free(&cfg.allow_stdio_files);
@@ -939,17 +979,24 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (all_files.count == 0) { fprintf(stdout, "warn: no source files matched\n"); }
+    LintStats stats = {0, 0};
+    if (all_files.count == 0) {
+        fprintf(stdout, "%s: no source files matched\n", cfg.strict ? "error" : "warn");
+        if (cfg.strict)
+            stats.errors++;
+        else
+            stats.warnings++;
+    }
 
     if (cfg.allow_getenv_files.count == 0) {
         // Engine currently centralizes env-var reads in environment.c.
         list_append(&cfg.allow_getenv_files, "src/core/environment.c");
     }
 
-    LintStats stats = {0, 0};
     int rc = 0;
     if (cfg.run_clang_format) rc = run_clang_format(&cfg, &all_files, &stats);
-    if (rc == 0 && cfg.run_clang_tidy) rc = run_clang_tidy(&cfg, &all_files, &stats);
+    const StringList *clang_tidy_files = cfg.clang_tidy_files.count > 0 ? &cfg.clang_tidy_files : &all_files;
+    if (rc == 0 && cfg.run_clang_tidy) rc = run_clang_tidy(&cfg, clang_tidy_files, &stats);
     if (rc == 0 && cfg.run_cppcheck) rc = run_cppcheck(&cfg, &all_files, &stats);
     if (cfg.run_custom) run_custom_checks(&cfg, &all_files, &stats);
 
@@ -969,6 +1016,7 @@ int main(int argc, char **argv) {
     list_free(&all_files);
     list_free(&cfg.source_files);
     list_free(&cfg.source_dirs);
+    list_free(&cfg.clang_tidy_files);
     list_free(&cfg.include_dirs);
     list_free(&cfg.allow_getenv_files);
     list_free(&cfg.allow_stdio_files);

@@ -268,8 +268,7 @@
               "-DHL_LINT=ON"
               "-DHL_LINT_STRICT=OFF"
             ];
-            # Keep it fast: only run the lint target. Warnings are useful,
-            # but non-fatal unless strict mode is explicitly enabled.
+            # Strict mode becomes the CI gate after the existing findings are cleared.
             ninjaFlags = [ "hl-lint" ];
             installPhase = "touch $out";
           };
