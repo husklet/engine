@@ -19,9 +19,7 @@ set(HL_LINT_ALLOW_GETENV_FILES "src/core/environment.c"
 set(HL_LINT_ALLOW_STDIO_FILES
   src/core/checkpoint_channel.c
   src/core/dispatch.c
-  src/core/lifecycle.c
   src/core/target/aarch64.c
-  src/core/target/run.c
   src/core/target/x86_64.c
   src/linux_abi/checkpoint.c
   src/linux_abi/container/netns.c

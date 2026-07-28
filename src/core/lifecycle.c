@@ -7,7 +7,6 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
 #ifndef HL_PRODUCTION_GUEST_ISA
 #error HL_PRODUCTION_GUEST_ISA is required
@@ -176,13 +175,8 @@ static hl_status hl_production_finish_process(const hl_host_services *host, hl_h
     result->guest_status = HL_STATUS_CORRUPT;
     result->detail = record.magic == HL_ENGINE_CHILD_RESULT_MAGIC ? sizeof(record) : 0;
     if (record.magic != HL_ENGINE_CHILD_RESULT_MAGIC ||
-        record.version != HL_ENGINE_CHILD_RESULT_VERSION || waited->detail != HL_HOST_PROCESS_EXIT_CODE) {
-        fprintf(stderr,
-                "hl-engine: invalid child result magic=%llx version=%u wait-kind=%llu wait-value=%llu\n",
-                (unsigned long long)record.magic, record.version, (unsigned long long)waited->detail,
-                (unsigned long long)waited->value);
+        record.version != HL_ENGINE_CHILD_RESULT_VERSION || waited->detail != HL_HOST_PROCESS_EXIT_CODE)
         return HL_STATUS_CORRUPT;
-    }
     if (record.engine_status != HL_STATUS_OK) {
         if (record.engine_status < HL_STATUS_INVALID_ARGUMENT || record.engine_status > HL_STATUS_ADDRESS_IN_USE)
             return HL_STATUS_CORRUPT;
@@ -200,11 +194,8 @@ static hl_status hl_production_finish_process(const hl_host_services *host, hl_h
         return HL_STATUS_OK;
     }
     if (record.kind != HL_ENGINE_CHILD_RESULT_EXIT || (uint32_t)record.guest_status > 255u ||
-        waited->value != (uint32_t)record.guest_status) {
-        fprintf(stderr, "hl-engine: child result mismatch guest=%d wait=%llu engine=%d\n", record.guest_status,
-                (unsigned long long)waited->value, record.engine_status);
+        waited->value != (uint32_t)record.guest_status)
         return HL_STATUS_CORRUPT;
-    }
     result->kind = HL_ENGINE_EXIT_CODE;
     result->guest_status = record.guest_status;
     result->detail = 0;
