@@ -32,7 +32,9 @@ int hl_host_address_mapped(uintptr_t address) {
 int hl_host_region_query(uintptr_t address, hl_host_region *region) {
     FILE *maps;
     char line[512];
-    if (region == NULL || (maps = fopen("/proc/self/maps", "r")) == NULL) return 0;
+    if (region == NULL) return 0;
+    maps = fopen("/proc/self/maps", "r");
+    if (maps == NULL) return 0;
     while (fgets(line, sizeof line, maps) != NULL) {
         unsigned long long start;
         unsigned long long end;

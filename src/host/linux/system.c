@@ -50,7 +50,9 @@ int hl_host_system_read(hl_host_system_info *info, hl_host_cpu_ticks *cores, siz
     FILE *file;
     char line[512];
     uint32_t core_count = 0;
-    if (info == NULL || (core_capacity != 0 && cores == NULL) || (file = fopen("/proc/stat", "r")) == NULL) return 0;
+    if (info == NULL || (core_capacity != 0 && cores == NULL)) return 0;
+    file = fopen("/proc/stat", "r");
+    if (file == NULL) return 0;
     memset(info, 0, sizeof *info);
     while (fgets(line, sizeof line, file) != NULL) {
         if (strncmp(line, "cpu ", 4) == 0) {
@@ -77,7 +79,8 @@ static uint64_t hl_linux_boot_time(void) {
     FILE *file;
     char line[512];
     if (cached != 0) return cached;
-    if ((file = fopen("/proc/stat", "r")) == NULL) return 0;
+    file = fopen("/proc/stat", "r");
+    if (file == NULL) return 0;
     while (fgets(line, sizeof line, file) != NULL) {
         unsigned long long boot;
         if (sscanf(line, "btime %llu", &boot) == 1) {
@@ -103,7 +106,8 @@ int hl_host_process_read(int64_t pid, hl_host_process_info *info) {
     uint64_t boot_time_seconds;
     if (info == NULL || pid <= 0) return 0;
     snprintf(path, sizeof path, "/proc/%lld/stat", (long long)pid);
-    if ((file = fopen(path, "r")) == NULL) return 0;
+    file = fopen(path, "r");
+    if (file == NULL) return 0;
     if (fgets(line, sizeof line, file) == NULL) {
         fclose(file);
         return 0;
@@ -199,23 +203,26 @@ int hl_host_process_fds(int64_t pid, hl_host_process_fd *entries, size_t capacit
     snprintf(path, sizeof path, "/proc/%lld/fd", (long long)pid);
     directory = opendir(path);
     if (directory == NULL) return 0;
-    while ((item = readdir(directory)) != NULL) {
+    item = readdir(directory);
+    while (item != NULL) {
         char *end = NULL;
         long descriptor;
         errno = 0;
         descriptor = strtol(item->d_name, &end, 10);
-        if (errno != 0 || end == item->d_name || *end != '\0' || descriptor < 0 || descriptor > INT32_MAX) continue;
-        if (total < capacity) {
-            entries[total].descriptor = (int32_t)descriptor;
-            entries[total].kind = HL_HOST_FD_OTHER;
-            entries[total].flags = hl_host_process_fd_private_is(pid, process.start_time_ns, (int)descriptor)
-                                       ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE
-                                       : 0;
-            entries[total].reserved = 0;
-            entries[total].stable_device = 0;
-            entries[total].stable_object = 0;
+        if (errno == 0 && end != item->d_name && *end == '\0' && descriptor >= 0 && descriptor <= INT32_MAX) {
+            if (total < capacity) {
+                entries[total].descriptor = (int32_t)descriptor;
+                entries[total].kind = HL_HOST_FD_OTHER;
+                entries[total].flags = hl_host_process_fd_private_is(pid, process.start_time_ns, (int)descriptor)
+                                           ? HL_HOST_PROCESS_FD_ENGINE_PRIVATE
+                                           : 0;
+                entries[total].reserved = 0;
+                entries[total].stable_device = 0;
+                entries[total].stable_object = 0;
+            }
+            total++;
         }
-        total++;
+        item = readdir(directory);
     }
     closedir(directory);
     *count = total;
@@ -237,21 +244,24 @@ int hl_host_process_peers(hl_host_process_peer *entries, size_t capacity, size_t
     self_path[self_length] = '\0';
     directory = opendir("/proc");
     if (directory == NULL) return 0;
-    while ((item = readdir(directory)) != NULL) {
+    item = readdir(directory);
+    while (item != NULL) {
         char *end = NULL;
         long long value;
         hl_host_process_info info;
         ssize_t length;
         errno = 0;
         value = strtoll(item->d_name, &end, 10);
-        if (errno != 0 || end == item->d_name || *end != '\0' || value <= 0 || value == getpid() ||
-            !hl_host_process_read(value, &info) || info.session != self_info.session)
-            continue;
-        snprintf(link, sizeof link, "/proc/%lld/exe", value);
-        length = readlink(link, path, PATH_MAX);
-        if (length != self_length || memcmp(path, self_path, (size_t)self_length) != 0) continue;
-        if (total < capacity) entries[total].identity = value;
-        total++;
+        if (errno == 0 && end != item->d_name && *end == '\0' && value > 0 && value != getpid() &&
+            hl_host_process_read(value, &info) && info.session == self_info.session) {
+            snprintf(link, sizeof link, "/proc/%lld/exe", value);
+            length = readlink(link, path, PATH_MAX);
+            if (length == self_length && memcmp(path, self_path, (size_t)self_length) == 0) {
+                if (total < capacity) entries[total].identity = value;
+                total++;
+            }
+        }
+        item = readdir(directory);
     }
     closedir(directory);
     *count = total;
