@@ -86,6 +86,8 @@
 
 #else /* Windows */
 
+#include "../host/process.h" /* the backend's process table, for kill() below */
+
 #include <errno.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -505,19 +507,30 @@ static inline int sigaltstack(const stack_t *stack, stack_t *previous) {
     return -1;
 }
 
-/* REFUSAL.  kill(2)/killpg(2)/tgkill(2): send a signal to a process, a process
- * group, or a thread.  Windows can terminate a process by handle
- * (TerminateProcess) but cannot deliver an arbitrary signal number to one, and
- * there is no host process table wired to this layer -- a pid here is a guest
- * pid that names no host object yet, the same gap host_mman.h records for
- * descriptors.  Approximating kill(pid, SIGKILL) with a terminate while
- * refusing every other signal would be a half-truth with a worse shape than a
- * whole refusal, because the caller cannot tell which half it got. */
+/* PARTLY REAL.  kill(2): send a signal to a process.  The host process table
+ * this used to lack now exists -- the clone that implements guest fork(2) fills
+ * it -- so the two halves of kill can be separated instead of refused together.
+ *
+ *   Signal 0 is REAL.  It sends nothing; it asks whether a pid names a process
+ *   this caller could signal, and that question Windows can answer.  It is also
+ *   the half that was actually being used: the container registry's membership
+ *   check, its /proc enumeration and its stale-marker pruning are all kill(p, 0)
+ *   probes, and under the whole refusal every one of them read "dead" for a
+ *   process that was alive.
+ *
+ *   SIGKILL is REAL, because TerminateProcess IS SIGKILL: immediate,
+ *   unmaskable, no handler, and the exit code it mints is decoded back into
+ *   WIFSIGNALED(SIGKILL) by the same reap that decodes every other death.
+ *
+ *   Every other signal is still REFUSED.  Nothing on this host delivers a
+ *   catchable signal to another process, and terminating a process that may have
+ *   installed a handler would report a death the guest asked to be able to
+ *   prevent.  The earlier note's objection -- that a caller cannot tell which
+ *   half it got -- is answered by the split being on the SIGNAL NUMBER, which
+ *   the caller chose: a guest asking for SIGKILL always gets a kill, a guest
+ *   asking for SIGUSR1 always gets ENOSYS, and neither ever gets the other. */
 static inline int kill(pid_t pid, int signo) {
-    (void)pid;
-    (void)signo;
-    errno = ENOSYS;
-    return -1;
+    return hl_host_windows_kill(pid, signo);
 }
 
 static inline int killpg(pid_t pgrp, int signo) {

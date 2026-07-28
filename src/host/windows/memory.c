@@ -852,15 +852,152 @@ static hl_host_result hl_windows_memory_reserve_code(void *context, uint64_t siz
     return hl_windows_result(HL_STATUS_OK, registered.value, 0);
 }
 
-/* There is no fork on this host, so there is no fork child and this entry point
- * is unreachable. hl_host_services_validate still requires it non-NULL whenever
- * CODE_MAPPING is advertised. */
+/*
+ * The fork child's code arena.
+ *
+ * This runs exactly once per guest fork(2), in the child, before it executes a
+ * single translated instruction -- which makes it the first host call a cloned
+ * process makes, and that is why the registry lock is re-initialised here rather
+ * than somewhere more obvious. A peer thread of the parent may have held that
+ * lock at the clone instant and no thread survives to release it, so the only
+ * correct move is to overwrite it. Safe for the same reason it is necessary: a
+ * clone carries exactly one thread, so nothing else in this process can be
+ * inside the registry. The POSIX backends do the identical thing to their
+ * registry mutex at the identical point.
+ *
+ * Only preserve == 0 is served, and the refusal of preserve != 0 is a
+ * correctness statement rather than an omission. The arena is a pagefile-backed
+ * SECTION mapped twice, and a section view survives this host's clone genuinely
+ * shared -- measured, in both directions. So the child does not inherit a
+ * private copy of the parent's code cache; it inherits the parent's code cache
+ * itself, and the first block it translates would be written into memory the
+ * parent is executing. A fresh section is therefore mandatory, and once the
+ * backing object is new the old contents are worthless: their host addresses are
+ * gone, which is precisely what preserve == 0 means.
+ *
+ * (The alias COUPLING does survive the clone -- the child can emit through the
+ * inherited RW view and execute the result through the inherited RX view -- so
+ * nothing here is working around a broken clone. What is being avoided is two
+ * processes sharing one writable code cache.)
+ *
+ * The inherited views are unmapped rather than torn down through
+ * hl_windows_entry_teardown, because teardown closes the section handle and this
+ * child does not have one: a section created with default security is not
+ * inheritable, so the numeric slot the parent's handle occupied is EMPTY here.
+ * Closing it would at best fail and at worst close whatever a later CreateFileW
+ * was given that value.
+ */
 static hl_host_result hl_windows_memory_repair_code(void *context, hl_host_code_mapping *mapping, uint32_t preserve) {
-    (void)context;
-    (void)preserve;
+    hl_host_windows *host = context;
+    hl_windows_handle_entry *entry;
+    hl_windows_region region;
+    HANDLE section = NULL;
+    void *writable = NULL;
+    void *executable = NULL;
+    void *inherited_writable;
+    void *inherited_executable;
+    uint64_t size;
+    uint64_t alignment;
+
     if (mapping == NULL || mapping->abi != 1 || mapping->size < sizeof(*mapping))
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    return hl_windows_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+    InitializeSRWLock(&host->lock);
+    if (preserve != 0) return hl_windows_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+
+    hl_windows_lock(host);
+    entry = hl_windows_lookup_locked(host, mapping->handle, HL_WINDOWS_HANDLE_MAPPING);
+    if (entry == NULL || entry->size == 0 || entry->address == NULL) {
+        hl_windows_unlock(host);
+        return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    }
+    size = entry->size;
+    inherited_writable = entry->address;
+    inherited_executable = entry->executable_address;
+
+    if (inherited_executable == NULL || inherited_executable == inherited_writable) {
+        /* The single-alias fallback arena is private committed memory, not a
+         * section view, so the clone gave this child its own copy-on-write copy
+         * at the same address. Nothing is shared and nothing needs rebuilding;
+         * the caller re-binds to the addresses it already had and starts with an
+         * empty block map. */
+        hl_windows_unlock(host);
+        mapping->writable_address = (uint64_t)(uintptr_t)inherited_writable;
+        mapping->executable_address = (uint64_t)(uintptr_t)inherited_writable;
+        mapping->mapped_size = size;
+        return hl_windows_result(HL_STATUS_OK, mapping->handle, 0);
+    }
+
+    /* The alignment the arena was reserved with is not recorded on the entry.
+     * It does not need to be: the translator asks only for host-page alignment,
+     * so that the two aliases differ by whole pages and their delta is a
+     * constant, and every request at or below the reservation granule takes the
+     * same plain VirtualAlloc2 path in the reservation helper. Naming the
+     * granule therefore reproduces the create path exactly rather than
+     * approximating it. */
+    alignment = HL_WINDOWS_ALLOCATION_GRANULARITY;
+    section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE, (DWORD)(size >> 32),
+                                 (DWORD)(size & UINT64_C(0xFFFFFFFF)), NULL);
+    if (section != NULL) {
+        void *writable_placeholder = hl_windows_reserve_placeholder(&host->api, NULL, size, alignment);
+        void *executable_placeholder =
+            writable_placeholder == NULL ? NULL : hl_windows_reserve_placeholder(&host->api, NULL, size, alignment);
+        if (executable_placeholder != NULL) {
+            writable = host->api.map_view_of_file3(section, GetCurrentProcess(), writable_placeholder, 0, (SIZE_T)size,
+                                                   MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0);
+            executable = host->api.map_view_of_file3(section, GetCurrentProcess(), executable_placeholder, 0,
+                                                     (SIZE_T)size, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READ, NULL, 0);
+        }
+        if (writable == NULL && writable_placeholder != NULL) (void)VirtualFree(writable_placeholder, 0, MEM_RELEASE);
+        if (executable == NULL && executable_placeholder != NULL)
+            (void)VirtualFree(executable_placeholder, 0, MEM_RELEASE);
+    }
+    if (writable == NULL || executable == NULL) {
+        const hl_host_result failure = hl_windows_last_error_result();
+        if (writable != NULL) (void)UnmapViewOfFile(writable);
+        if (section != NULL) CloseHandle(section);
+        hl_windows_unlock(host);
+        /* The inherited arena is left exactly as it was. It is the parent's and
+         * this child must not use it, but the caller treats a failure here as
+         * fatal to the child, so leaving it mapped is strictly safer than
+         * leaving a hole a stale pointer could be dereferenced through. */
+        return failure;
+    }
+
+    region.offset = 0;
+    region.size = size;
+    region.section_offset = 0;
+    region.state = (uint32_t)HL_WINDOWS_REGION_VIEW;
+    region.protection = HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE;
+    /* The inherited region vector is this child's own copy-on-write copy of the
+     * parent's, so it can be freed and rebuilt like any private allocation. */
+    free(entry->regions);
+    entry->regions = NULL;
+    entry->region_count = 0;
+    entry->region_capacity = 0;
+    if (hl_windows_regions_insert(entry, 0, &region) != HL_STATUS_OK) {
+        (void)UnmapViewOfFile(writable);
+        (void)UnmapViewOfFile(executable);
+        CloseHandle(section);
+        hl_windows_unlock(host);
+        return hl_windows_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
+    }
+    entry->address = writable;
+    entry->executable_address = executable;
+    entry->section = section;
+    entry->section_owned = 1u;
+    entry->size = size;
+    hl_windows_unlock(host);
+
+    /* Last, and outside nothing that could still fail: drop this child's views
+     * of the PARENT's section. Until these two calls the parent's code cache is
+     * writable from here. */
+    (void)UnmapViewOfFile(inherited_executable);
+    (void)UnmapViewOfFile(inherited_writable);
+
+    mapping->writable_address = (uint64_t)(uintptr_t)writable;
+    mapping->executable_address = (uint64_t)(uintptr_t)executable;
+    mapping->mapped_size = size;
+    return hl_windows_result(HL_STATUS_OK, mapping->handle, 0);
 }
 
 /*

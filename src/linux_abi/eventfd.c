@@ -39,10 +39,23 @@ static int eventfd_services(const hl_host_services *host) {
            host->counter != NULL && host->sync != NULL;
 }
 
+/* The kernel's two size rules are deliberately ASYMMETRIC (fs/eventfd.c):
+ *
+ *     eventfd_read  rejects count <  8, and transfers exactly one 8-byte
+ *                   counter into a larger buffer, returning 8. Bytes past the
+ *                   counter are left untouched.
+ *     eventfd_write rejects count != 8. A 9- or 16-byte write is EINVAL and
+ *                   must not reach the counter.
+ *
+ * Reading is the side that differs, because the kernel copies a fixed-size
+ * object out rather than filling the buffer. Requiring an exact 8 on read turns
+ * the ordinary `read(efd, &u64_in_a_wider_struct, sizeof struct)` idiom into
+ * EINVAL, which is a failure no caller anticipates -- the counter is never
+ * consumed and the descriptor looks permanently broken. */
 static int64_t eventfd_read(void *opaque, void *buffer, size_t size) {
     eventfd_object *object = opaque;
     hl_host_result result;
-    if (size != sizeof(uint64_t)) return -HL_LINUX_EINVAL;
+    if (size < sizeof(uint64_t)) return -HL_LINUX_EINVAL;
     result = object->host->counter->read(object->host->context, object->counter);
     if (result.status != HL_STATUS_OK) return eventfd_error((hl_status)result.status);
     memcpy(buffer, &result.value, sizeof(result.value));
@@ -60,10 +73,17 @@ static int64_t eventfd_write(void *opaque, const void *buffer, size_t size) {
     return result.status == HL_STATUS_OK ? (int64_t)sizeof(value) : eventfd_error((hl_status)result.status);
 }
 
+/* An eventfd is backed by an anonymous inode, and the kernel builds every one of
+ * those with S_IFREG | S_IRUSR | S_IWUSR and a link count of one. So fstat on an
+ * eventfd reports a zero-length REGULAR file -- not a FIFO, which is what a
+ * pipe-backed emulation reports and what code testing S_ISFIFO would wrongly
+ * conclude. Reporting no type bits at all is worse still: S_ISREG, S_ISFIFO and
+ * S_ISCHR are then all false and the descriptor matches no file type. */
 static int64_t eventfd_status(void *opaque, hl_linux_file_status *status) {
     (void)opaque;
     memset(status, 0, sizeof(*status));
-    status->mode = 0600u;
+    status->mode = HL_LINUX_S_IFREG | 0600u;
+    status->link_count = 1;
     return 0;
 }
 

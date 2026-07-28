@@ -358,7 +358,13 @@ static int sig_l2m(int s) {
 }
 
 static int sig_m2l(int s) {
-#if defined(__linux__)
+/* _WIN32 joins the identity arm, not the BSD table. There is no host signal
+ * numbering to translate FROM on that host: nothing delivers a host signal
+ * there, and the only status words that reach this function are ones this
+ * engine minted itself in Linux numbering (the backend's reap decodes an NT
+ * exception status straight into a Linux signo). Running them through the BSD
+ * table would renumber e.g. 30 -> 10 for no host that ever said 30. */
+#if defined(__linux__) || defined(_WIN32)
     return s;
 #else
     static const unsigned char T[32] = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  7,  11, 31, 13, 14, 15,

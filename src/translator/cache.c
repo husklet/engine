@@ -1761,6 +1761,21 @@ static int jit_after_fork(void) {
        is never preservable). */
     if (g_pcache && !g_threaded && g_dualmap) preserve = 1;
 #endif
+#elif defined(_WIN32)
+    /* Windows joins the Linux default, and for a reason that is stronger here
+       than there.  The dual-alias arena is a pagefile-backed SECTION mapped
+       twice, and this host's address-space clone carries a section view as a
+       GENUINELY SHARED view -- not a copy-on-write copy.  So a fork child does
+       not merely inherit a snapshot of the parent's code cache; it inherits the
+       parent's code cache itself, and the first block it translated would be
+       written into memory the parent is executing.  The child must therefore get
+       a new backing object, and once the backing object is new the inherited
+       host addresses are gone -- which is exactly preserve = 0.  The single-
+       alias fallback arena is private committed memory and IS copy-on-write, but
+       it takes the same branch: with no way to tell a preserved arena from a
+       rebuilt one at this level, the conservative answer is the correct one and
+       the cost is a re-translate the child would have paid anyway. */
+    preserve = 0;
 #else
     preserve = !g_threaded || !g_dualmap;
 #endif

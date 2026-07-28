@@ -150,7 +150,8 @@
 
 #else /* Windows */
 
-#include "fdhandle.h" /* the descriptor -> host-handle table this file's REALs go through */
+#include "../host/process.h" /* the backend's process bridge, for getppid() below */
+#include "fdhandle.h"        /* the descriptor -> host-handle table this file's REALs go through */
 
 #include <direct.h> /* _mkdir: the UCRT puts it here, not in <io.h> */
 #include <errno.h>
@@ -955,12 +956,22 @@ static inline int setregid(gid_t real_group, gid_t effective_group) {
  * getpid() to decide whether this process WAS a session leader, and getppid()
  * against g_init_hostpid to decide whether it is the container init's child.
  * Every one of those tests is a comparison, so an invented pid would not fail
- * -- it would answer, wrongly and quietly.  getppid() is recoverable from
- * ntdll's PROCESS_BASIC_INFORMATION and belongs to the backend.
+ * -- it would answer, wrongly and quietly.
+ *
+ * getppid() is the exception, and it is REAL: it was already named here as
+ * recoverable from ntdll's PROCESS_BASIC_INFORMATION and belonging to the
+ * backend, and now that guest fork(2) creates real parents it has a real
+ * question to answer.  One difference from Linux is worth knowing at the call
+ * sites: Windows does not re-parent an orphan, so a child whose parent has
+ * exited reports the dead parent's id where Linux would report 1.
  */
 static inline pid_t getppid(void) {
-    errno = ENOSYS;
-    return (pid_t)-1;
+    const int parent = hl_host_windows_parent_pid();
+    if (parent < 0) {
+        errno = ENOSYS;
+        return (pid_t)-1;
+    }
+    return (pid_t)parent;
 }
 
 static inline pid_t getpgrp(void) {

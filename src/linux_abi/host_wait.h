@@ -34,22 +34,28 @@
  *   32-bit DWORD from GetExitCodeProcess with no signal, no stop, and no core
  *   bit in it.
  *
- *   THE CALLS ARE REFUSALS.  Nothing wires Windows process reaping to this
- *   layer yet.  The pieces exist on the host side (a HANDLE, WaitForSingle-
- *   Object, GetExitCodeProcess) and the host seam already models a process exit
- *   as a kind plus a value -- the Linux and macOS host backends fill
- *   process_exit_kind/process_exit_value that way -- but the layer here holds a
- *   pid_t, and on Windows a pid is not a process handle: you cannot wait on one
- *   without first opening it, and nothing in this layer owns that handle table.
- *   That is the same population-(2) gap host_mman.h names for descriptors, one
- *   namespace over.
+ *   THE CALLS ARE REAL, THROUGH A BRIDGE.  The pieces were always on the host
+ *   side (a HANDLE, WaitForMultipleObjects, GetExitCodeProcess), and what was
+ *   missing was ownership: the layer here holds a pid_t, and on Windows a pid is
+ *   not a process handle -- you cannot wait on one without first opening it, and
+ *   nothing in this layer owns a handle table.  So the table lives in the
+ *   backend, next to the clone that fills it, and these calls forward to it.
+ *   That is the same shape host_fd.h uses for descriptors: the vocabulary is
+ *   here, the object table is one layer down.
  *
- *   What a refusal must NOT be here is 0 or the requested pid.  waitpid()
- *   returning 0 means "WNOHANG, nothing to report", which turns every reaper
- *   loop into a spin; returning the pid with an uninitialised status word hands
- *   the guest a fabricated death.  ECHILD is nearly as bad as either -- it is
- *   the specific, load-bearing answer "you have no such child", which a shell
- *   or a runtime treats as authoritative.  ENOSYS it is.
+ *   Three Linux behaviours this layer keeps and the bridge does not have to
+ *   know about: the option-word validation that must precede any child lookup,
+ *   the WCOREDUMP bit synthesized from the GUEST's RLIMIT_CORE, and the
+ *   signal-death relay that reconstructs a WIFSIGNALED status out of a child
+ *   that actually _exit()ed.  All three are syscall/proc.c's wait4, unchanged.
+ *
+ *   What the bridge must never answer is 0 or the requested pid for a request it
+ *   could not serve.  waitpid() returning 0 means "WNOHANG, nothing to report",
+ *   which turns every reaper loop into a spin; returning the pid with an
+ *   unwritten status word hands the guest a fabricated death.  ECHILD is
+ *   reserved for its real meaning -- the load-bearing "you have no such child" a
+ *   shell treats as authoritative -- and is returned only when the child table
+ *   genuinely holds no match.
  */
 
 #if !defined(_WIN32)
@@ -67,11 +73,14 @@
  *                    Owning them there rather than here keeps ONE definition of
  *                    each; <sys/wait.h> gets them from elsewhere on a POSIX
  *                    host too. */
+/* And the backend's child table, which is the object half of these calls. */
+#include "../host/process.h"
 #include "host_proc.h"
 #include "host_signal.h"
 
 #include <errno.h>
 #include <stddef.h>
+#include <string.h>
 #include <sys/types.h>
 
 /* ---- SHAPE: wait option bits.  Linux values. ----------------------------
@@ -117,51 +126,69 @@
  * accepts it. */
 typedef enum { P_ALL = 0, P_PID = 1, P_PGID = 2, P_PIDFD = 3 } idtype_t;
 
-/* ---- REFUSAL: the reaping calls.  See the header note. ------------------ */
+/* ---- REAL: the reaping calls, over the backend's child table. -----------
+ *
+ * WUNTRACED and WCONTINUED are accepted and never satisfied, which is honest
+ * rather than lazy: this host has no job control, a cloned child cannot be
+ * stopped and continued, and there is therefore no stop or continue event for
+ * such a wait to report.  A guest that passes them gets the same answer it would
+ * get on Linux from a child that never stopped.
+ *
+ * The rusage pointer is filled with zeroes rather than left alone.  Windows has
+ * per-process CPU numbers but the accounting seam that would carry them is a
+ * refusal (host_proc.h's getrusage), and a well-formed all-zero rusage is a
+ * plausible reading for a child that used nothing -- while an untouched caller
+ * buffer would expose whatever was on the stack. */
+
+static inline pid_t wait4(pid_t pid, int *status, int options, struct rusage *usage) {
+    const int reaped = hl_host_windows_waitpid(pid, status, options);
+    if (usage != NULL && reaped > 0) memset(usage, 0, sizeof(*usage));
+    return (pid_t)reaped;
+}
 
 static inline pid_t waitpid(pid_t pid, int *status, int options) {
-    (void)pid;
-    (void)status;
-    (void)options;
-    errno = ENOSYS;
-    return (pid_t)-1;
+    return wait4(pid, status, options, NULL);
 }
 
 static inline pid_t wait(int *status) {
-    (void)status;
-    errno = ENOSYS;
-    return (pid_t)-1;
+    return wait4((pid_t)-1, status, 0, NULL);
 }
 
 static inline pid_t wait3(int *status, int options, struct rusage *usage) {
-    (void)status;
-    (void)options;
-    (void)usage;
-    errno = ENOSYS;
-    return (pid_t)-1;
+    return wait4((pid_t)-1, status, options, usage);
 }
 
-static inline pid_t wait4(pid_t pid, int *status, int options, struct rusage *usage) {
-    (void)pid;
-    (void)status;
-    (void)options;
-    (void)usage;
-    errno = ENOSYS;
-    return (pid_t)-1;
-}
-
-/* REFUSAL.  waitid additionally reports through a siginfo_t, and leaving that
- * buffer untouched on failure is part of the contract the callers rely on:
+/* REAL, over the same reap.  The siginfo contract is the delicate part:
  * syscall/rare.c memsets its siginfo before the call and tests si_pid != 0
- * afterwards to decide whether a child was actually reaped, so a refusal reads
- * as "no reap" there and never as a phantom one. */
+ * afterwards to decide whether a child was actually reaped, so si_pid must stay
+ * zero for "nothing to report" (a WNOHANG miss) and must be written only when a
+ * child really was collected.
+ *
+ * P_PGID is served as P_ALL for the same reason the bridge serves a negative
+ * pid that way: this host has no guest process groups.  P_PIDFD never arrives --
+ * rare.c resolves a pidfd to a pid and calls with P_PID. */
 static inline int waitid(idtype_t type, id_t id, siginfo_t *info, int options) {
-    (void)type;
-    (void)id;
-    (void)info;
-    (void)options;
-    errno = ENOSYS;
-    return -1;
+    int status = 0;
+    int reaped;
+    if (type == P_PIDFD) {
+        errno = EINVAL;
+        return -1;
+    }
+    reaped = hl_host_windows_waitpid(type == P_PID ? (pid_t)id : (pid_t)-1, &status, options);
+    if (reaped < 0) return -1;
+    if (reaped == 0) return 0; /* WNOHANG, nothing to report: info stays as the caller left it */
+    if (info != NULL) {
+        info->si_signo = SIGCHLD;
+        info->si_pid = (pid_t)reaped;
+        if (WIFSIGNALED(status)) {
+            info->si_code = CLD_KILLED;
+            info->si_status = WTERMSIG(status);
+        } else {
+            info->si_code = CLD_EXITED;
+            info->si_status = WEXITSTATUS(status);
+        }
+    }
+    return 0;
 }
 
 #endif /* _WIN32 */

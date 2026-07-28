@@ -974,3 +974,442 @@ int hl_host_process_open(pid_t pid) {
     errno = ENOSYS;
     return -1;
 }
+
+/* ==========================================================================
+ * Guest fork(2).
+ *
+ * The file header above says the launch callbacks are not an address-space
+ * clone and that guest fork(2) is a different problem. This is that problem,
+ * solved here because it is the same namespace -- a child process and a way to
+ * wait for it -- and because putting it anywhere else would mean a second
+ * process table.
+ *
+ * The primitive is ntdll's RtlCloneUserProcess, which is the NT kernel's own
+ * fork: it duplicates the address space copy-on-write and returns twice, once
+ * in the parent with a handle and a client id, once on the calling thread of a
+ * brand new process with STATUS_PROCESS_CLONED. Only the calling thread is
+ * carried over, which is exactly fork(2)'s rule, so the engine's existing
+ * fork-child repair hooks -- written for that rule on the POSIX hosts -- apply
+ * here unchanged.
+ *
+ * Four properties this depends on, each measured against this engine's real
+ * process shape (a live dual-alias JIT arena, shared ledger sections, peer
+ * threads holding locks, __thread storage, a dirty private heap) before a line
+ * of this was written:
+ *
+ *   - every region lands at a byte-identical virtual address in the child, so
+ *     the engine's pointer globals -- which are copied verbatim -- stay valid;
+ *   - pagefile-backed section views (CreateFileMappingW + MapViewOfFile3, which
+ *     is how every shared ledger arena and the JIT arena are built here) survive
+ *     the clone GENUINELY SHARED, in both directions;
+ *   - an inherited handle keeps its numeric value, so no handle fixup is
+ *     needed; a non-inheritable one leaves an EMPTY slot rather than a stale
+ *     object;
+ *   - threads created inside the clone work, provided the image does not import
+ *     USER32 (IMM32's thread-detach handler access-violates in a clone). That is
+ *     why the import gate exists and why this file hand-rolls the string helpers
+ *     above rather than calling wsprintfW.
+ *
+ * The function is resolved by name rather than imported. ntdll is permitted to
+ * this image, but RtlCloneUserProcess is in no import library the toolchain
+ * ships, and GetProcAddress on an already-resident module costs one lookup once.
+ */
+
+#define HL_WINDOWS_CLONE_INHERIT_HANDLES 0x00000002u
+#define HL_WINDOWS_STATUS_PROCESS_CLONED ((LONG)0x00000129)
+
+/* CLIENT_ID and RTL_USER_PROCESS_INFORMATION, spelled locally: winternl.h does
+ * not declare the second at all, and owning the declaration keeps the layout
+ * visible at the one place it matters. A ULONG followed by pointers, so the
+ * natural 64-bit padding is exactly what ntdll writes. */
+typedef struct hl_windows_client_id {
+    HANDLE unique_process;
+    HANDLE unique_thread;
+} hl_windows_client_id;
+
+typedef struct hl_windows_clone_information {
+    ULONG length;
+    HANDLE process;
+    HANDLE thread;
+    hl_windows_client_id client;
+    /* SECTION_IMAGE_INFORMATION. Never read here, but ntdll fills it, so the
+     * space has to exist and has to be large enough: the 64-bit layout is 0x48
+     * bytes and this is 128. */
+    ULONG_PTR image_information[16];
+} hl_windows_clone_information;
+
+typedef LONG(NTAPI *hl_windows_clone_process_fn)(ULONG, void *, void *, HANDLE, hl_windows_clone_information *);
+
+/*
+ * The child table. A fixed array rather than a growing one for two reasons that
+ * both come from the clone: it must be usable from a child that has just
+ * appeared with no allocator invariant re-established, and it must not add dirty
+ * pages to the address space -- untouched BSS costs nothing to clone, and clone
+ * cost is linear in dirty bytes.
+ *
+ * Capacity is a real limit: a guest holding this many unreaped children gets
+ * EAGAIN from fork, which is the errno Linux gives when it hits RLIMIT_NPROC.
+ */
+#define HL_WINDOWS_CHILD_CAPACITY 1024u
+
+typedef struct hl_windows_child {
+    DWORD id;
+    HANDLE process;
+    unsigned char used;
+} hl_windows_child;
+
+static hl_windows_child hl_windows_children[HL_WINDOWS_CHILD_CAPACITY];
+static SRWLOCK hl_windows_children_lock = SRWLOCK_INIT;
+/* Rotates the scan start so a guest with more than MAXIMUM_WAIT_OBJECTS live
+ * children cannot starve the ones past the first 64. */
+static unsigned hl_windows_child_cursor;
+
+static hl_windows_clone_process_fn hl_windows_clone_process(void) {
+    static hl_windows_clone_process_fn resolved;
+    HMODULE ntdll;
+    if (resolved != NULL) return resolved;
+    /* ntdll is mapped into every process before any user code runs, so this is a
+     * lookup and never a load -- which matters, because LoadLibrary does not
+     * work inside a clone. */
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == NULL) return NULL;
+    resolved = (hl_windows_clone_process_fn)(void *)GetProcAddress(ntdll, "RtlCloneUserProcess");
+    return resolved;
+}
+
+/*
+ * The child's first act. No lock is taken and none can be: a peer thread of the
+ * parent may have held this lock at the clone instant and no thread survives to
+ * release it, so the only correct move is to overwrite it. That is safe for the
+ * same reason it is necessary -- a clone carries exactly one thread, so nothing
+ * else in this process can be looking at the table.
+ *
+ * The entries are dropped rather than closed. A process handle is created
+ * non-inheritable, so in the child the numeric slot is EMPTY, not a live
+ * duplicate; CloseHandle on it would at best fail and at worst close whatever a
+ * later CreateFileW happened to be given that value. Dropping is also the right
+ * SEMANTICS: a fork child does not inherit its parent's children, and a wait in
+ * the child must answer ECHILD for them.
+ */
+void hl_host_windows_fork_child_reset(void) {
+    unsigned index;
+    InitializeSRWLock(&hl_windows_children_lock);
+    for (index = 0; index < HL_WINDOWS_CHILD_CAPACITY; index++) {
+        hl_windows_children[index].used = 0;
+        hl_windows_children[index].process = NULL;
+        hl_windows_children[index].id = 0;
+    }
+    hl_windows_child_cursor = 0;
+}
+
+int hl_host_windows_fork(void) {
+    const hl_windows_clone_process_fn clone = hl_windows_clone_process();
+    hl_windows_clone_information information;
+    unsigned slot;
+    LONG status;
+
+    if (clone == NULL) {
+        errno = ENOSYS;
+        return -1;
+    }
+    /* The bookkeeping slot is claimed BEFORE the clone. Claiming it afterwards
+     * would mean discovering the table was full with a child already running,
+     * and the only way out of that is to kill a process the caller never learned
+     * about. The child inherits the claim and immediately discards the whole
+     * table, so the reservation costs it nothing. */
+    AcquireSRWLockExclusive(&hl_windows_children_lock);
+    for (slot = 0; slot < HL_WINDOWS_CHILD_CAPACITY; slot++)
+        if (!hl_windows_children[slot].used) break;
+    if (slot == HL_WINDOWS_CHILD_CAPACITY) {
+        ReleaseSRWLockExclusive(&hl_windows_children_lock);
+        errno = EAGAIN;
+        return -1;
+    }
+    hl_windows_children[slot].used = 1;
+    hl_windows_children[slot].process = NULL;
+    hl_windows_children[slot].id = 0;
+    ReleaseSRWLockExclusive(&hl_windows_children_lock);
+
+    memset(&information, 0, sizeof information);
+    /* No NO_SYNCHRONIZE: the default takes the loader, PEB, heap and TLS locks
+     * around the clone, which is what leaves the child's ntdll state consistent
+     * when a peer thread was inside one of them. It is measurably cheaper too. */
+    status = clone(HL_WINDOWS_CLONE_INHERIT_HANDLES, NULL, NULL, NULL, &information);
+
+    if (status == HL_WINDOWS_STATUS_PROCESS_CLONED) {
+        hl_host_windows_fork_child_reset();
+        return 0;
+    }
+    if (status < 0) {
+        AcquireSRWLockExclusive(&hl_windows_children_lock);
+        hl_windows_children[slot].used = 0;
+        ReleaseSRWLockExclusive(&hl_windows_children_lock);
+        /* Every documented failure of this call is a resource one, and EAGAIN is
+         * what fork(2) reports for all of them. */
+        errno = EAGAIN;
+        return -1;
+    }
+    AcquireSRWLockExclusive(&hl_windows_children_lock);
+    hl_windows_children[slot].id = (DWORD)(ULONG_PTR)information.client.unique_process;
+    hl_windows_children[slot].process = information.process;
+    ReleaseSRWLockExclusive(&hl_windows_children_lock);
+    /* The initial thread handle is not kept: the process handle is what carries
+     * exit and it is what a wait needs. */
+    if (information.thread != NULL) (void)CloseHandle(information.thread);
+    return (int)(DWORD)(ULONG_PTR)information.client.unique_process;
+}
+
+/*
+ * A Windows exit code is a bare DWORD -- no signal, no stop, no core bit -- so
+ * the Linux status word is built here rather than decoded. hl_windows_exit_signal
+ * is the same decoder the typed process group uses, so a child killed through
+ * terminate() and a child reaped through the wait below agree about what
+ * happened.
+ *
+ * The core bit is deliberately NOT set: whether a Linux death dumps core is a
+ * function of the GUEST's RLIMIT_CORE, and the ABI layer's wait4 synthesizes it
+ * from exactly that after this returns. Setting it here would be guessing over
+ * the top of an answer that is already correct.
+ */
+static int hl_windows_wait_status(DWORD code) {
+    uint64_t signal_number = 0;
+    if (hl_windows_exit_signal(code, &signal_number)) return (int)(signal_number & 0x7fu);
+    return (int)((code & 0xffu) << 8);
+}
+
+/* Collect the exit of one slot whose process object is already signalled. Called
+ * with the lock held, and re-validates the slot because two guest threads can
+ * observe the same child exit while only one of them may reap it.
+ *
+ * `release` is WNOWAIT inverted: a peeking wait reads the status and leaves the
+ * entry, so the same child can be reaped again afterwards. Windows makes that
+ * free -- the process object stays signalled and its exit code stays readable
+ * for as long as a handle is held -- which is exactly the zombie that WNOWAIT
+ * asks not to be released. */
+static int hl_windows_reap_locked(unsigned slot, DWORD expected_id, int release, int *status) {
+    HANDLE object;
+    DWORD code = 0;
+    if (!hl_windows_children[slot].used || hl_windows_children[slot].id != expected_id) return 0;
+    object = hl_windows_children[slot].process;
+    if (!GetExitCodeProcess(object, &code)) code = HL_WINDOWS_EXIT_BOOTSTRAP;
+    if (release) {
+        hl_windows_children[slot].used = 0;
+        hl_windows_children[slot].process = NULL;
+        hl_windows_children[slot].id = 0;
+        (void)CloseHandle(object);
+    }
+    *status = hl_windows_wait_status(code);
+    return 1;
+}
+
+/* How long a blocking wait sits on one snapshot of the child set before taking
+ * another. It is not a latency floor: a child that exits signals its process
+ * object and wakes the wait immediately. It bounds only how long a wait can miss
+ * a child a PEER guest thread forked after the snapshot was taken, and how long
+ * a child past the first MAXIMUM_WAIT_OBJECTS goes unpolled. */
+#define HL_WINDOWS_WAIT_SLICE_MS 100u
+
+/* The option word is the GUEST's, i.e. Linux's, spelled here rather than taken
+ * from a header: the ABI layer forwards its own translated option bits straight
+ * through, and this backend must read them with Linux's numbering. Only WNOHANG
+ * is actionable. WUNTRACED and WCONTINUED are accepted and never satisfied
+ * because a cloned child cannot be stopped or continued on this host, so there
+ * is no such event for a wait to report. */
+#define HL_WINDOWS_WNOHANG 0x00000001
+/* WNOWAIT: report the child without releasing it, so a later wait sees it again. */
+#define HL_WINDOWS_WNOWAIT 0x01000000
+
+int hl_host_windows_waitpid(pid_t pid, int *status, int options) {
+    /*
+     * Negative and zero pids name process GROUPS, and this host's group model is
+     * degenerate rather than absent: setpgid is a refusal here, so no guest
+     * process ever leaves the group it was launched in and every group the guest
+     * believes it created contains exactly its leader. Read that way both forms
+     * have an exact answer rather than an approximation.
+     *
+     *   pid <  -1  -- "any child in group -pid". That group is the single
+     *                 process -pid, so this is a wait for exactly that child.
+     *   pid == 0   -- "any child in MY group". Every child is still in it,
+     *                 because none of them could leave it, so this is "any".
+     */
+    const int any = pid == 0 || pid == -1;
+    const pid_t target = pid < -1 ? -pid : pid;
+    for (;;) {
+        HANDLE waitset[MAXIMUM_WAIT_OBJECTS];
+        unsigned slots[MAXIMUM_WAIT_OBJECTS];
+        DWORD identifiers[MAXIMUM_WAIT_OBJECTS];
+        DWORD count = 0;
+        unsigned candidates = 0;
+        unsigned step;
+        unsigned start;
+        DWORD waited;
+        int reaped_status = 0;
+
+        AcquireSRWLockExclusive(&hl_windows_children_lock);
+        start = hl_windows_child_cursor;
+        for (step = 0; step < HL_WINDOWS_CHILD_CAPACITY; step++) {
+            const unsigned index = (start + step) % HL_WINDOWS_CHILD_CAPACITY;
+            if (!hl_windows_children[index].used) continue;
+            if (!any && hl_windows_children[index].id != (DWORD)target) continue;
+            candidates++;
+            if (count < MAXIMUM_WAIT_OBJECTS) {
+                waitset[count] = hl_windows_children[index].process;
+                slots[count] = index;
+                identifiers[count] = hl_windows_children[index].id;
+                count++;
+            }
+        }
+        hl_windows_child_cursor = (start + 1u) % HL_WINDOWS_CHILD_CAPACITY;
+        ReleaseSRWLockExclusive(&hl_windows_children_lock);
+
+        if (candidates == 0) {
+            /* The load-bearing answer: "you have no such child". A shell or a
+             * runtime treats it as authoritative and stops reaping. */
+            errno = ECHILD;
+            return -1;
+        }
+        /* A zero timeout first, unconditionally, so an already-exited child is
+         * collected without a trip through the scheduler and so WNOHANG costs
+         * exactly one call. */
+        waited = WaitForMultipleObjects(count, waitset, FALSE, 0);
+        if (waited == WAIT_TIMEOUT) {
+            if (options & HL_WINDOWS_WNOHANG) return 0;
+            waited = WaitForMultipleObjects(count, waitset, FALSE, HL_WINDOWS_WAIT_SLICE_MS);
+            if (waited == WAIT_TIMEOUT) continue;
+        }
+        if (waited >= WAIT_OBJECT_0 && waited < WAIT_OBJECT_0 + count) {
+            const DWORD index = waited - WAIT_OBJECT_0;
+            int taken;
+            AcquireSRWLockExclusive(&hl_windows_children_lock);
+            taken = hl_windows_reap_locked(slots[index], identifiers[index], (options & HL_WINDOWS_WNOWAIT) == 0,
+                                           &reaped_status);
+            ReleaseSRWLockExclusive(&hl_windows_children_lock);
+            if (!taken) continue; /* a peer guest thread reaped it first */
+            if (status != NULL) *status = reaped_status;
+            return (int)identifiers[index];
+        }
+        /* WAIT_FAILED. The only route here is a handle that is no longer a
+         * process, which this table cannot produce, so report it as the absence
+         * it effectively is rather than spinning on it. */
+        errno = ECHILD;
+        return -1;
+    }
+}
+
+/*
+ * kill(2), honestly partial.
+ *
+ * Signal 0 is the whole liveness half of kill and it is REAL here: the container
+ * registry's membership checks, its /proc enumeration and its stale-marker
+ * pruning are all kill(pid, 0) probes, and they were the visible cost of the
+ * previous whole-file refusal -- every one of them read "dead" for a live
+ * process. It answers for any host pid, not only this process's children,
+ * because that is what those probes ask.
+ *
+ * SIGKILL is REAL because TerminateProcess is genuinely SIGKILL: immediate,
+ * unmaskable, no handler, and the exit code it mints round-trips back through
+ * the wait above as WIFSIGNALED(SIGKILL).
+ *
+ * Every other signal is REFUSED, which is the same judgement the previous whole
+ * refusal made and for the same reason: this host cannot deliver a catchable
+ * signal to another process, and terminating a process that may have installed a
+ * handler would report a death the guest asked to be able to prevent. A caller
+ * that gets ENOSYS can tell which half it got; one that gets a fabricated kill
+ * cannot.
+ */
+int hl_host_windows_kill(pid_t pid, int signo) {
+    HANDLE object;
+    unsigned index;
+    int owned = 0;
+    /*
+     * kill(-pgid, sig) resolves to the single process -pgid, for the reason the
+     * wait above spells out: setpgid is a refusal on this host, so a guest
+     * process group is exactly its leader and signalling the group is
+     * signalling that one process. Delivering to it is therefore complete, not
+     * partial -- and the alternative, the ESRCH this used to return, is what
+     * left a parent tearing down a child's private group blocked forever in the
+     * wait that follows.
+     *
+     * kill(0, sig) and kill(-1, sig) do NOT arrive here: the ABI layer routes
+     * both through the container registry, which is what keeps a broadcast
+     * inside this container instead of reaching every process the user owns.
+     */
+    if (pid < -1) pid = -pid;
+    if (pid <= 0) {
+        errno = ESRCH;
+        return -1;
+    }
+    if (signo != 0 && signo != 9) {
+        errno = ENOSYS;
+        return -1;
+    }
+    if ((DWORD)pid == GetCurrentProcessId()) {
+        if (signo == 0) return 0;
+        errno = ENOSYS; /* self-signalling belongs to the guest signal machinery */
+        return -1;
+    }
+    AcquireSRWLockExclusive(&hl_windows_children_lock);
+    for (index = 0; index < HL_WINDOWS_CHILD_CAPACITY; index++) {
+        if (hl_windows_children[index].used && hl_windows_children[index].id == (DWORD)pid) {
+            owned = 1;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&hl_windows_children_lock);
+    /* An unreaped child of ours is alive-or-zombie either way, and a zombie
+     * answers signal 0 on Linux, so the table is consulted before the OS is: a
+     * child that has exited but not been waited for still has a pid here. */
+    if (owned && signo == 0) return 0;
+
+    object = OpenProcess(signo == 0 ? PROCESS_QUERY_LIMITED_INFORMATION : PROCESS_TERMINATE, FALSE, (DWORD)pid);
+    if (object == NULL) {
+        const DWORD error = GetLastError();
+        errno = (error == ERROR_ACCESS_DENIED) ? EPERM : ESRCH;
+        return -1;
+    }
+    if (signo == 0) {
+        DWORD code = 0;
+        const BOOL queried = GetExitCodeProcess(object, &code);
+        (void)CloseHandle(object);
+        if (queried && code != STILL_ACTIVE) {
+            /* Exited and not ours to reap: the pid names nothing a signal could
+             * reach, which is ESRCH rather than a live process. */
+            errno = ESRCH;
+            return -1;
+        }
+        return 0;
+    }
+    if (!TerminateProcess(object, HL_WINDOWS_EXIT_SIGNAL_BASE + 9u)) {
+        const DWORD error = GetLastError();
+        (void)CloseHandle(object);
+        errno = (error == ERROR_ACCESS_DENIED) ? EPERM : ESRCH;
+        return -1;
+    }
+    (void)CloseHandle(object);
+    return 0;
+}
+
+/*
+ * getppid(2). NtQueryInformationProcess(ProcessBasicInformation) carries the
+ * creating process id, which is what Windows holds instead of a parent link. It
+ * is not maintained: it names the process that created this one whether or not
+ * that process still exists. Linux re-parents an orphan onto init and reports 1;
+ * this reports the original id. The difference is visible only to an orphan, and
+ * the truth this host holds beats a fabricated 1 for every process.
+ */
+int hl_host_windows_parent_pid(void) {
+    typedef LONG(NTAPI * hl_windows_query_process_fn)(HANDLE, ULONG, void *, ULONG, ULONG *);
+    static hl_windows_query_process_fn resolved;
+    PROCESS_BASIC_INFORMATION basic;
+    ULONG written = 0;
+    if (resolved == NULL) {
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll == NULL) return -1;
+        resolved = (hl_windows_query_process_fn)(void *)GetProcAddress(ntdll, "NtQueryInformationProcess");
+        if (resolved == NULL) return -1;
+    }
+    memset(&basic, 0, sizeof basic);
+    if (resolved(GetCurrentProcess(), 0u /* ProcessBasicInformation */, &basic, (ULONG)sizeof basic, &written) < 0)
+        return -1;
+    return (int)(DWORD)(ULONG_PTR)basic.InheritedFromUniqueProcessId;
+}

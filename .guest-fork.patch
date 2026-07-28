@@ -1,0 +1,1004 @@
+diff --git a/src/host/process.h b/src/host/process.h
+index 60ea4333..7948498d 100644
+--- a/src/host/process.h
++++ b/src/host/process.h
+@@ -7,4 +7,41 @@
+ // The caller owns the descriptor. Returns -1 with errno set when the host cannot watch pid.
+ int hl_host_process_open(pid_t pid);
+ 
++#if defined(_WIN32)
++/*
++ * Guest fork(2) and its reaping half, for the one host that has no POSIX
++ * spelling of either.
++ *
++ * These are the bridge the ABI layer's <sys/wait.h> replacement could not build
++ * for itself: that layer holds a pid_t, and on Windows a pid names no waitable
++ * object -- you cannot wait on one without first opening it, and the layer owns
++ * no handle table. The backend does, so the table lives there and these four
++ * entry points are what the layer calls instead of fork/waitpid/kill/getppid.
++ *
++ * They are errno-shaped rather than hl_host_result-shaped on purpose. Every
++ * caller is a POSIX call being emulated, the errno values are part of what is
++ * being emulated (ECHILD in particular is load-bearing to a shell), and routing
++ * them through the typed result only to translate back would lose the
++ * distinctions the callers act on.
++ */
++
++/* Clone this process. 0 in the child, the child's pid in the parent, -1/errno on
++ * failure. Only the calling thread is carried into the child. */
++int hl_host_windows_fork(void);
++
++/* Reap a child of this process. Returns the reaped pid and stores a LINUX status
++ * word, 0 for WNOHANG with nothing to report, -1/errno otherwise. */
++int hl_host_windows_waitpid(pid_t pid, int *status, int options);
++
++/* Signal 0 (liveness) and SIGKILL are real; every other signal is ENOSYS. */
++int hl_host_windows_kill(pid_t pid, int signo);
++
++/* The creating process id, or -1. Not maintained across the parent's death. */
++int hl_host_windows_parent_pid(void);
++
++/* Drop every inherited child record. Called by hl_host_windows_fork on the child
++ * side; exposed so a child that arrives by some other route can do the same. */
++void hl_host_windows_fork_child_reset(void);
++#endif
++
+ #endif
+diff --git a/src/host/windows/memory.c b/src/host/windows/memory.c
+index 1d8ea6b6..fe0863f7 100644
+--- a/src/host/windows/memory.c
++++ b/src/host/windows/memory.c
+@@ -852,15 +852,152 @@ static hl_host_result hl_windows_memory_reserve_code(void *context, uint64_t siz
+     return hl_windows_result(HL_STATUS_OK, registered.value, 0);
+ }
+ 
+-/* There is no fork on this host, so there is no fork child and this entry point
+- * is unreachable. hl_host_services_validate still requires it non-NULL whenever
+- * CODE_MAPPING is advertised. */
++/*
++ * The fork child's code arena.
++ *
++ * This runs exactly once per guest fork(2), in the child, before it executes a
++ * single translated instruction -- which makes it the first host call a cloned
++ * process makes, and that is why the registry lock is re-initialised here rather
++ * than somewhere more obvious. A peer thread of the parent may have held that
++ * lock at the clone instant and no thread survives to release it, so the only
++ * correct move is to overwrite it. Safe for the same reason it is necessary: a
++ * clone carries exactly one thread, so nothing else in this process can be
++ * inside the registry. The POSIX backends do the identical thing to their
++ * registry mutex at the identical point.
++ *
++ * Only preserve == 0 is served, and the refusal of preserve != 0 is a
++ * correctness statement rather than an omission. The arena is a pagefile-backed
++ * SECTION mapped twice, and a section view survives this host's clone genuinely
++ * shared -- measured, in both directions. So the child does not inherit a
++ * private copy of the parent's code cache; it inherits the parent's code cache
++ * itself, and the first block it translates would be written into memory the
++ * parent is executing. A fresh section is therefore mandatory, and once the
++ * backing object is new the old contents are worthless: their host addresses are
++ * gone, which is precisely what preserve == 0 means.
++ *
++ * (The alias COUPLING does survive the clone -- the child can emit through the
++ * inherited RW view and execute the result through the inherited RX view -- so
++ * nothing here is working around a broken clone. What is being avoided is two
++ * processes sharing one writable code cache.)
++ *
++ * The inherited views are unmapped rather than torn down through
++ * hl_windows_entry_teardown, because teardown closes the section handle and this
++ * child does not have one: a section created with default security is not
++ * inheritable, so the numeric slot the parent's handle occupied is EMPTY here.
++ * Closing it would at best fail and at worst close whatever a later CreateFileW
++ * was given that value.
++ */
+ static hl_host_result hl_windows_memory_repair_code(void *context, hl_host_code_mapping *mapping, uint32_t preserve) {
+-    (void)context;
+-    (void)preserve;
++    hl_host_windows *host = context;
++    hl_windows_handle_entry *entry;
++    hl_windows_region region;
++    HANDLE section = NULL;
++    void *writable = NULL;
++    void *executable = NULL;
++    void *inherited_writable;
++    void *inherited_executable;
++    uint64_t size;
++    uint64_t alignment;
++
+     if (mapping == NULL || mapping->abi != 1 || mapping->size < sizeof(*mapping))
+         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+-    return hl_windows_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
++    InitializeSRWLock(&host->lock);
++    if (preserve != 0) return hl_windows_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
++
++    hl_windows_lock(host);
++    entry = hl_windows_lookup_locked(host, mapping->handle, HL_WINDOWS_HANDLE_MAPPING);
++    if (entry == NULL || entry->size == 0 || entry->address == NULL) {
++        hl_windows_unlock(host);
++        return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
++    }
++    size = entry->size;
++    inherited_writable = entry->address;
++    inherited_executable = entry->executable_address;
++
++    if (inherited_executable == NULL || inherited_executable == inherited_writable) {
++        /* The single-alias fallback arena is private committed memory, not a
++         * section view, so the clone gave this child its own copy-on-write copy
++         * at the same address. Nothing is shared and nothing needs rebuilding;
++         * the caller re-binds to the addresses it already had and starts with an
++         * empty block map. */
++        hl_windows_unlock(host);
++        mapping->writable_address = (uint64_t)(uintptr_t)inherited_writable;
++        mapping->executable_address = (uint64_t)(uintptr_t)inherited_writable;
++        mapping->mapped_size = size;
++        return hl_windows_result(HL_STATUS_OK, mapping->handle, 0);
++    }
++
++    /* The alignment the arena was reserved with is not recorded on the entry.
++     * It does not need to be: the translator asks only for host-page alignment,
++     * so that the two aliases differ by whole pages and their delta is a
++     * constant, and every request at or below the reservation granule takes the
++     * same plain VirtualAlloc2 path in the reservation helper. Naming the
++     * granule therefore reproduces the create path exactly rather than
++     * approximating it. */
++    alignment = HL_WINDOWS_ALLOCATION_GRANULARITY;
++    section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE, (DWORD)(size >> 32),
++                                 (DWORD)(size & UINT64_C(0xFFFFFFFF)), NULL);
++    if (section != NULL) {
++        void *writable_placeholder = hl_windows_reserve_placeholder(&host->api, NULL, size, alignment);
++        void *executable_placeholder =
++            writable_placeholder == NULL ? NULL : hl_windows_reserve_placeholder(&host->api, NULL, size, alignment);
++        if (executable_placeholder != NULL) {
++            writable = host->api.map_view_of_file3(section, GetCurrentProcess(), writable_placeholder, 0, (SIZE_T)size,
++                                                   MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0);
++            executable = host->api.map_view_of_file3(section, GetCurrentProcess(), executable_placeholder, 0,
++                                                     (SIZE_T)size, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READ, NULL, 0);
++        }
++        if (writable == NULL && writable_placeholder != NULL) (void)VirtualFree(writable_placeholder, 0, MEM_RELEASE);
++        if (executable == NULL && executable_placeholder != NULL)
++            (void)VirtualFree(executable_placeholder, 0, MEM_RELEASE);
++    }
++    if (writable == NULL || executable == NULL) {
++        const hl_host_result failure = hl_windows_last_error_result();
++        if (writable != NULL) (void)UnmapViewOfFile(writable);
++        if (section != NULL) CloseHandle(section);
++        hl_windows_unlock(host);
++        /* The inherited arena is left exactly as it was. It is the parent's and
++         * this child must not use it, but the caller treats a failure here as
++         * fatal to the child, so leaving it mapped is strictly safer than
++         * leaving a hole a stale pointer could be dereferenced through. */
++        return failure;
++    }
++
++    region.offset = 0;
++    region.size = size;
++    region.section_offset = 0;
++    region.state = (uint32_t)HL_WINDOWS_REGION_VIEW;
++    region.protection = HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE;
++    /* The inherited region vector is this child's own copy-on-write copy of the
++     * parent's, so it can be freed and rebuilt like any private allocation. */
++    free(entry->regions);
++    entry->regions = NULL;
++    entry->region_count = 0;
++    entry->region_capacity = 0;
++    if (hl_windows_regions_insert(entry, 0, &region) != HL_STATUS_OK) {
++        (void)UnmapViewOfFile(writable);
++        (void)UnmapViewOfFile(executable);
++        CloseHandle(section);
++        hl_windows_unlock(host);
++        return hl_windows_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
++    }
++    entry->address = writable;
++    entry->executable_address = executable;
++    entry->section = section;
++    entry->section_owned = 1u;
++    entry->size = size;
++    hl_windows_unlock(host);
++
++    /* Last, and outside nothing that could still fail: drop this child's views
++     * of the PARENT's section. Until these two calls the parent's code cache is
++     * writable from here. */
++    (void)UnmapViewOfFile(inherited_executable);
++    (void)UnmapViewOfFile(inherited_writable);
++
++    mapping->writable_address = (uint64_t)(uintptr_t)writable;
++    mapping->executable_address = (uint64_t)(uintptr_t)executable;
++    mapping->mapped_size = size;
++    return hl_windows_result(HL_STATUS_OK, mapping->handle, 0);
+ }
+ 
+ /*
+diff --git a/src/host/windows/process.c b/src/host/windows/process.c
+index a0e00258..6f063849 100644
+--- a/src/host/windows/process.c
++++ b/src/host/windows/process.c
+@@ -974,3 +974,442 @@ int hl_host_process_open(pid_t pid) {
+     errno = ENOSYS;
+     return -1;
+ }
++
++/* ==========================================================================
++ * Guest fork(2).
++ *
++ * The file header above says the launch callbacks are not an address-space
++ * clone and that guest fork(2) is a different problem. This is that problem,
++ * solved here because it is the same namespace -- a child process and a way to
++ * wait for it -- and because putting it anywhere else would mean a second
++ * process table.
++ *
++ * The primitive is ntdll's RtlCloneUserProcess, which is the NT kernel's own
++ * fork: it duplicates the address space copy-on-write and returns twice, once
++ * in the parent with a handle and a client id, once on the calling thread of a
++ * brand new process with STATUS_PROCESS_CLONED. Only the calling thread is
++ * carried over, which is exactly fork(2)'s rule, so the engine's existing
++ * fork-child repair hooks -- written for that rule on the POSIX hosts -- apply
++ * here unchanged.
++ *
++ * Four properties this depends on, each measured against this engine's real
++ * process shape (a live dual-alias JIT arena, shared ledger sections, peer
++ * threads holding locks, __thread storage, a dirty private heap) before a line
++ * of this was written:
++ *
++ *   - every region lands at a byte-identical virtual address in the child, so
++ *     the engine's pointer globals -- which are copied verbatim -- stay valid;
++ *   - pagefile-backed section views (CreateFileMappingW + MapViewOfFile3, which
++ *     is how every shared ledger arena and the JIT arena are built here) survive
++ *     the clone GENUINELY SHARED, in both directions;
++ *   - an inherited handle keeps its numeric value, so no handle fixup is
++ *     needed; a non-inheritable one leaves an EMPTY slot rather than a stale
++ *     object;
++ *   - threads created inside the clone work, provided the image does not import
++ *     USER32 (IMM32's thread-detach handler access-violates in a clone). That is
++ *     why the import gate exists and why this file hand-rolls the string helpers
++ *     above rather than calling wsprintfW.
++ *
++ * The function is resolved by name rather than imported. ntdll is permitted to
++ * this image, but RtlCloneUserProcess is in no import library the toolchain
++ * ships, and GetProcAddress on an already-resident module costs one lookup once.
++ */
++
++#define HL_WINDOWS_CLONE_INHERIT_HANDLES 0x00000002u
++#define HL_WINDOWS_STATUS_PROCESS_CLONED ((LONG)0x00000129)
++
++/* CLIENT_ID and RTL_USER_PROCESS_INFORMATION, spelled locally: winternl.h does
++ * not declare the second at all, and owning the declaration keeps the layout
++ * visible at the one place it matters. A ULONG followed by pointers, so the
++ * natural 64-bit padding is exactly what ntdll writes. */
++typedef struct hl_windows_client_id {
++    HANDLE unique_process;
++    HANDLE unique_thread;
++} hl_windows_client_id;
++
++typedef struct hl_windows_clone_information {
++    ULONG length;
++    HANDLE process;
++    HANDLE thread;
++    hl_windows_client_id client;
++    /* SECTION_IMAGE_INFORMATION. Never read here, but ntdll fills it, so the
++     * space has to exist and has to be large enough: the 64-bit layout is 0x48
++     * bytes and this is 128. */
++    ULONG_PTR image_information[16];
++} hl_windows_clone_information;
++
++typedef LONG(NTAPI *hl_windows_clone_process_fn)(ULONG, void *, void *, HANDLE, hl_windows_clone_information *);
++
++/*
++ * The child table. A fixed array rather than a growing one for two reasons that
++ * both come from the clone: it must be usable from a child that has just
++ * appeared with no allocator invariant re-established, and it must not add dirty
++ * pages to the address space -- untouched BSS costs nothing to clone, and clone
++ * cost is linear in dirty bytes.
++ *
++ * Capacity is a real limit: a guest holding this many unreaped children gets
++ * EAGAIN from fork, which is the errno Linux gives when it hits RLIMIT_NPROC.
++ */
++#define HL_WINDOWS_CHILD_CAPACITY 1024u
++
++typedef struct hl_windows_child {
++    DWORD id;
++    HANDLE process;
++    unsigned char used;
++} hl_windows_child;
++
++static hl_windows_child hl_windows_children[HL_WINDOWS_CHILD_CAPACITY];
++static SRWLOCK hl_windows_children_lock = SRWLOCK_INIT;
++/* Rotates the scan start so a guest with more than MAXIMUM_WAIT_OBJECTS live
++ * children cannot starve the ones past the first 64. */
++static unsigned hl_windows_child_cursor;
++
++static hl_windows_clone_process_fn hl_windows_clone_process(void) {
++    static hl_windows_clone_process_fn resolved;
++    HMODULE ntdll;
++    if (resolved != NULL) return resolved;
++    /* ntdll is mapped into every process before any user code runs, so this is a
++     * lookup and never a load -- which matters, because LoadLibrary does not
++     * work inside a clone. */
++    ntdll = GetModuleHandleW(L"ntdll.dll");
++    if (ntdll == NULL) return NULL;
++    resolved = (hl_windows_clone_process_fn)(void *)GetProcAddress(ntdll, "RtlCloneUserProcess");
++    return resolved;
++}
++
++/*
++ * The child's first act. No lock is taken and none can be: a peer thread of the
++ * parent may have held this lock at the clone instant and no thread survives to
++ * release it, so the only correct move is to overwrite it. That is safe for the
++ * same reason it is necessary -- a clone carries exactly one thread, so nothing
++ * else in this process can be looking at the table.
++ *
++ * The entries are dropped rather than closed. A process handle is created
++ * non-inheritable, so in the child the numeric slot is EMPTY, not a live
++ * duplicate; CloseHandle on it would at best fail and at worst close whatever a
++ * later CreateFileW happened to be given that value. Dropping is also the right
++ * SEMANTICS: a fork child does not inherit its parent's children, and a wait in
++ * the child must answer ECHILD for them.
++ */
++void hl_host_windows_fork_child_reset(void) {
++    unsigned index;
++    InitializeSRWLock(&hl_windows_children_lock);
++    for (index = 0; index < HL_WINDOWS_CHILD_CAPACITY; index++) {
++        hl_windows_children[index].used = 0;
++        hl_windows_children[index].process = NULL;
++        hl_windows_children[index].id = 0;
++    }
++    hl_windows_child_cursor = 0;
++}
++
++int hl_host_windows_fork(void) {
++    const hl_windows_clone_process_fn clone = hl_windows_clone_process();
++    hl_windows_clone_information information;
++    unsigned slot;
++    LONG status;
++
++    if (clone == NULL) {
++        errno = ENOSYS;
++        return -1;
++    }
++    /* The bookkeeping slot is claimed BEFORE the clone. Claiming it afterwards
++     * would mean discovering the table was full with a child already running,
++     * and the only way out of that is to kill a process the caller never learned
++     * about. The child inherits the claim and immediately discards the whole
++     * table, so the reservation costs it nothing. */
++    AcquireSRWLockExclusive(&hl_windows_children_lock);
++    for (slot = 0; slot < HL_WINDOWS_CHILD_CAPACITY; slot++)
++        if (!hl_windows_children[slot].used) break;
++    if (slot == HL_WINDOWS_CHILD_CAPACITY) {
++        ReleaseSRWLockExclusive(&hl_windows_children_lock);
++        errno = EAGAIN;
++        return -1;
++    }
++    hl_windows_children[slot].used = 1;
++    hl_windows_children[slot].process = NULL;
++    hl_windows_children[slot].id = 0;
++    ReleaseSRWLockExclusive(&hl_windows_children_lock);
++
++    memset(&information, 0, sizeof information);
++    /* No NO_SYNCHRONIZE: the default takes the loader, PEB, heap and TLS locks
++     * around the clone, which is what leaves the child's ntdll state consistent
++     * when a peer thread was inside one of them. It is measurably cheaper too. */
++    status = clone(HL_WINDOWS_CLONE_INHERIT_HANDLES, NULL, NULL, NULL, &information);
++
++    if (status == HL_WINDOWS_STATUS_PROCESS_CLONED) {
++        hl_host_windows_fork_child_reset();
++        return 0;
++    }
++    if (status < 0) {
++        AcquireSRWLockExclusive(&hl_windows_children_lock);
++        hl_windows_children[slot].used = 0;
++        ReleaseSRWLockExclusive(&hl_windows_children_lock);
++        /* Every documented failure of this call is a resource one, and EAGAIN is
++         * what fork(2) reports for all of them. */
++        errno = EAGAIN;
++        return -1;
++    }
++    AcquireSRWLockExclusive(&hl_windows_children_lock);
++    hl_windows_children[slot].id = (DWORD)(ULONG_PTR)information.client.unique_process;
++    hl_windows_children[slot].process = information.process;
++    ReleaseSRWLockExclusive(&hl_windows_children_lock);
++    /* The initial thread handle is not kept: the process handle is what carries
++     * exit and it is what a wait needs. */
++    if (information.thread != NULL) (void)CloseHandle(information.thread);
++    return (int)(DWORD)(ULONG_PTR)information.client.unique_process;
++}
++
++/*
++ * A Windows exit code is a bare DWORD -- no signal, no stop, no core bit -- so
++ * the Linux status word is built here rather than decoded. hl_windows_exit_signal
++ * is the same decoder the typed process group uses, so a child killed through
++ * terminate() and a child reaped through the wait below agree about what
++ * happened.
++ *
++ * The core bit is deliberately NOT set: whether a Linux death dumps core is a
++ * function of the GUEST's RLIMIT_CORE, and the ABI layer's wait4 synthesizes it
++ * from exactly that after this returns. Setting it here would be guessing over
++ * the top of an answer that is already correct.
++ */
++static int hl_windows_wait_status(DWORD code) {
++    uint64_t signal_number = 0;
++    if (hl_windows_exit_signal(code, &signal_number)) return (int)(signal_number & 0x7fu);
++    return (int)((code & 0xffu) << 8);
++}
++
++/* Collect the exit of one slot whose process object is already signalled. Called
++ * with the lock held, and re-validates the slot because two guest threads can
++ * observe the same child exit while only one of them may reap it.
++ *
++ * `release` is WNOWAIT inverted: a peeking wait reads the status and leaves the
++ * entry, so the same child can be reaped again afterwards. Windows makes that
++ * free -- the process object stays signalled and its exit code stays readable
++ * for as long as a handle is held -- which is exactly the zombie that WNOWAIT
++ * asks not to be released. */
++static int hl_windows_reap_locked(unsigned slot, DWORD expected_id, int release, int *status) {
++    HANDLE object;
++    DWORD code = 0;
++    if (!hl_windows_children[slot].used || hl_windows_children[slot].id != expected_id) return 0;
++    object = hl_windows_children[slot].process;
++    if (!GetExitCodeProcess(object, &code)) code = HL_WINDOWS_EXIT_BOOTSTRAP;
++    if (release) {
++        hl_windows_children[slot].used = 0;
++        hl_windows_children[slot].process = NULL;
++        hl_windows_children[slot].id = 0;
++        (void)CloseHandle(object);
++    }
++    *status = hl_windows_wait_status(code);
++    return 1;
++}
++
++/* How long a blocking wait sits on one snapshot of the child set before taking
++ * another. It is not a latency floor: a child that exits signals its process
++ * object and wakes the wait immediately. It bounds only how long a wait can miss
++ * a child a PEER guest thread forked after the snapshot was taken, and how long
++ * a child past the first MAXIMUM_WAIT_OBJECTS goes unpolled. */
++#define HL_WINDOWS_WAIT_SLICE_MS 100u
++
++/* The option word is the GUEST's, i.e. Linux's, spelled here rather than taken
++ * from a header: the ABI layer forwards its own translated option bits straight
++ * through, and this backend must read them with Linux's numbering. Only WNOHANG
++ * is actionable. WUNTRACED and WCONTINUED are accepted and never satisfied
++ * because a cloned child cannot be stopped or continued on this host, so there
++ * is no such event for a wait to report. */
++#define HL_WINDOWS_WNOHANG 0x00000001
++/* WNOWAIT: report the child without releasing it, so a later wait sees it again. */
++#define HL_WINDOWS_WNOWAIT 0x01000000
++
++int hl_host_windows_waitpid(pid_t pid, int *status, int options) {
++    /*
++     * Negative and zero pids name process GROUPS, and this host's group model is
++     * degenerate rather than absent: setpgid is a refusal here, so no guest
++     * process ever leaves the group it was launched in and every group the guest
++     * believes it created contains exactly its leader. Read that way both forms
++     * have an exact answer rather than an approximation.
++     *
++     *   pid <  -1  -- "any child in group -pid". That group is the single
++     *                 process -pid, so this is a wait for exactly that child.
++     *   pid == 0   -- "any child in MY group". Every child is still in it,
++     *                 because none of them could leave it, so this is "any".
++     */
++    const int any = pid == 0 || pid == -1;
++    const pid_t target = pid < -1 ? -pid : pid;
++    for (;;) {
++        HANDLE waitset[MAXIMUM_WAIT_OBJECTS];
++        unsigned slots[MAXIMUM_WAIT_OBJECTS];
++        DWORD identifiers[MAXIMUM_WAIT_OBJECTS];
++        DWORD count = 0;
++        unsigned candidates = 0;
++        unsigned step;
++        unsigned start;
++        DWORD waited;
++        int reaped_status = 0;
++
++        AcquireSRWLockExclusive(&hl_windows_children_lock);
++        start = hl_windows_child_cursor;
++        for (step = 0; step < HL_WINDOWS_CHILD_CAPACITY; step++) {
++            const unsigned index = (start + step) % HL_WINDOWS_CHILD_CAPACITY;
++            if (!hl_windows_children[index].used) continue;
++            if (!any && hl_windows_children[index].id != (DWORD)target) continue;
++            candidates++;
++            if (count < MAXIMUM_WAIT_OBJECTS) {
++                waitset[count] = hl_windows_children[index].process;
++                slots[count] = index;
++                identifiers[count] = hl_windows_children[index].id;
++                count++;
++            }
++        }
++        hl_windows_child_cursor = (start + 1u) % HL_WINDOWS_CHILD_CAPACITY;
++        ReleaseSRWLockExclusive(&hl_windows_children_lock);
++
++        if (candidates == 0) {
++            /* The load-bearing answer: "you have no such child". A shell or a
++             * runtime treats it as authoritative and stops reaping. */
++            errno = ECHILD;
++            return -1;
++        }
++        /* A zero timeout first, unconditionally, so an already-exited child is
++         * collected without a trip through the scheduler and so WNOHANG costs
++         * exactly one call. */
++        waited = WaitForMultipleObjects(count, waitset, FALSE, 0);
++        if (waited == WAIT_TIMEOUT) {
++            if (options & HL_WINDOWS_WNOHANG) return 0;
++            waited = WaitForMultipleObjects(count, waitset, FALSE, HL_WINDOWS_WAIT_SLICE_MS);
++            if (waited == WAIT_TIMEOUT) continue;
++        }
++        if (waited >= WAIT_OBJECT_0 && waited < WAIT_OBJECT_0 + count) {
++            const DWORD index = waited - WAIT_OBJECT_0;
++            int taken;
++            AcquireSRWLockExclusive(&hl_windows_children_lock);
++            taken = hl_windows_reap_locked(slots[index], identifiers[index], (options & HL_WINDOWS_WNOWAIT) == 0,
++                                           &reaped_status);
++            ReleaseSRWLockExclusive(&hl_windows_children_lock);
++            if (!taken) continue; /* a peer guest thread reaped it first */
++            if (status != NULL) *status = reaped_status;
++            return (int)identifiers[index];
++        }
++        /* WAIT_FAILED. The only route here is a handle that is no longer a
++         * process, which this table cannot produce, so report it as the absence
++         * it effectively is rather than spinning on it. */
++        errno = ECHILD;
++        return -1;
++    }
++}
++
++/*
++ * kill(2), honestly partial.
++ *
++ * Signal 0 is the whole liveness half of kill and it is REAL here: the container
++ * registry's membership checks, its /proc enumeration and its stale-marker
++ * pruning are all kill(pid, 0) probes, and they were the visible cost of the
++ * previous whole-file refusal -- every one of them read "dead" for a live
++ * process. It answers for any host pid, not only this process's children,
++ * because that is what those probes ask.
++ *
++ * SIGKILL is REAL because TerminateProcess is genuinely SIGKILL: immediate,
++ * unmaskable, no handler, and the exit code it mints round-trips back through
++ * the wait above as WIFSIGNALED(SIGKILL).
++ *
++ * Every other signal is REFUSED, which is the same judgement the previous whole
++ * refusal made and for the same reason: this host cannot deliver a catchable
++ * signal to another process, and terminating a process that may have installed a
++ * handler would report a death the guest asked to be able to prevent. A caller
++ * that gets ENOSYS can tell which half it got; one that gets a fabricated kill
++ * cannot.
++ */
++int hl_host_windows_kill(pid_t pid, int signo) {
++    HANDLE object;
++    unsigned index;
++    int owned = 0;
++    /*
++     * kill(-pgid, sig) resolves to the single process -pgid, for the reason the
++     * wait above spells out: setpgid is a refusal on this host, so a guest
++     * process group is exactly its leader and signalling the group is
++     * signalling that one process. Delivering to it is therefore complete, not
++     * partial -- and the alternative, the ESRCH this used to return, is what
++     * left a parent tearing down a child's private group blocked forever in the
++     * wait that follows.
++     *
++     * kill(0, sig) and kill(-1, sig) do NOT arrive here: the ABI layer routes
++     * both through the container registry, which is what keeps a broadcast
++     * inside this container instead of reaching every process the user owns.
++     */
++    if (pid < -1) pid = -pid;
++    if (pid <= 0) {
++        errno = ESRCH;
++        return -1;
++    }
++    if (signo != 0 && signo != 9) {
++        errno = ENOSYS;
++        return -1;
++    }
++    if ((DWORD)pid == GetCurrentProcessId()) {
++        if (signo == 0) return 0;
++        errno = ENOSYS; /* self-signalling belongs to the guest signal machinery */
++        return -1;
++    }
++    AcquireSRWLockExclusive(&hl_windows_children_lock);
++    for (index = 0; index < HL_WINDOWS_CHILD_CAPACITY; index++) {
++        if (hl_windows_children[index].used && hl_windows_children[index].id == (DWORD)pid) {
++            owned = 1;
++            break;
++        }
++    }
++    ReleaseSRWLockExclusive(&hl_windows_children_lock);
++    /* An unreaped child of ours is alive-or-zombie either way, and a zombie
++     * answers signal 0 on Linux, so the table is consulted before the OS is: a
++     * child that has exited but not been waited for still has a pid here. */
++    if (owned && signo == 0) return 0;
++
++    object = OpenProcess(signo == 0 ? PROCESS_QUERY_LIMITED_INFORMATION : PROCESS_TERMINATE, FALSE, (DWORD)pid);
++    if (object == NULL) {
++        const DWORD error = GetLastError();
++        errno = (error == ERROR_ACCESS_DENIED) ? EPERM : ESRCH;
++        return -1;
++    }
++    if (signo == 0) {
++        DWORD code = 0;
++        const BOOL queried = GetExitCodeProcess(object, &code);
++        (void)CloseHandle(object);
++        if (queried && code != STILL_ACTIVE) {
++            /* Exited and not ours to reap: the pid names nothing a signal could
++             * reach, which is ESRCH rather than a live process. */
++            errno = ESRCH;
++            return -1;
++        }
++        return 0;
++    }
++    if (!TerminateProcess(object, HL_WINDOWS_EXIT_SIGNAL_BASE + 9u)) {
++        const DWORD error = GetLastError();
++        (void)CloseHandle(object);
++        errno = (error == ERROR_ACCESS_DENIED) ? EPERM : ESRCH;
++        return -1;
++    }
++    (void)CloseHandle(object);
++    return 0;
++}
++
++/*
++ * getppid(2). NtQueryInformationProcess(ProcessBasicInformation) carries the
++ * creating process id, which is what Windows holds instead of a parent link. It
++ * is not maintained: it names the process that created this one whether or not
++ * that process still exists. Linux re-parents an orphan onto init and reports 1;
++ * this reports the original id. The difference is visible only to an orphan, and
++ * the truth this host holds beats a fabricated 1 for every process.
++ */
++int hl_host_windows_parent_pid(void) {
++    typedef LONG(NTAPI * hl_windows_query_process_fn)(HANDLE, ULONG, void *, ULONG, ULONG *);
++    static hl_windows_query_process_fn resolved;
++    PROCESS_BASIC_INFORMATION basic;
++    ULONG written = 0;
++    if (resolved == NULL) {
++        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
++        if (ntdll == NULL) return -1;
++        resolved = (hl_windows_query_process_fn)(void *)GetProcAddress(ntdll, "NtQueryInformationProcess");
++        if (resolved == NULL) return -1;
++    }
++    memset(&basic, 0, sizeof basic);
++    if (resolved(GetCurrentProcess(), 0u /* ProcessBasicInformation */, &basic, (ULONG)sizeof basic, &written) < 0)
++        return -1;
++    return (int)(DWORD)(ULONG_PTR)basic.InheritedFromUniqueProcessId;
++}
+diff --git a/src/linux_abi/host_fd.h b/src/linux_abi/host_fd.h
+index 70bdac79..109d20c6 100644
+--- a/src/linux_abi/host_fd.h
++++ b/src/linux_abi/host_fd.h
+@@ -150,7 +150,8 @@
+ 
+ #else /* Windows */
+ 
+-#include "fdhandle.h" /* the descriptor -> host-handle table this file's REALs go through */
++#include "../host/process.h" /* the backend's process bridge, for getppid() below */
++#include "fdhandle.h"        /* the descriptor -> host-handle table this file's REALs go through */
+ 
+ #include <direct.h> /* _mkdir: the UCRT puts it here, not in <io.h> */
+ #include <errno.h>
+@@ -955,12 +956,22 @@ static inline int setregid(gid_t real_group, gid_t effective_group) {
+  * getpid() to decide whether this process WAS a session leader, and getppid()
+  * against g_init_hostpid to decide whether it is the container init's child.
+  * Every one of those tests is a comparison, so an invented pid would not fail
+- * -- it would answer, wrongly and quietly.  getppid() is recoverable from
+- * ntdll's PROCESS_BASIC_INFORMATION and belongs to the backend.
++ * -- it would answer, wrongly and quietly.
++ *
++ * getppid() is the exception, and it is REAL: it was already named here as
++ * recoverable from ntdll's PROCESS_BASIC_INFORMATION and belonging to the
++ * backend, and now that guest fork(2) creates real parents it has a real
++ * question to answer.  One difference from Linux is worth knowing at the call
++ * sites: Windows does not re-parent an orphan, so a child whose parent has
++ * exited reports the dead parent's id where Linux would report 1.
+  */
+ static inline pid_t getppid(void) {
+-    errno = ENOSYS;
+-    return (pid_t)-1;
++    const int parent = hl_host_windows_parent_pid();
++    if (parent < 0) {
++        errno = ENOSYS;
++        return (pid_t)-1;
++    }
++    return (pid_t)parent;
+ }
+ 
+ static inline pid_t getpgrp(void) {
+diff --git a/src/linux_abi/host_signal.h b/src/linux_abi/host_signal.h
+index 16572a98..2a5780bf 100644
+--- a/src/linux_abi/host_signal.h
++++ b/src/linux_abi/host_signal.h
+@@ -86,6 +86,8 @@
+ 
+ #else /* Windows */
+ 
++#include "../host/process.h" /* the backend's process table, for kill() below */
++
+ #include <errno.h>
+ #include <setjmp.h>
+ #include <signal.h>
+@@ -505,19 +507,30 @@ static inline int sigaltstack(const stack_t *stack, stack_t *previous) {
+     return -1;
+ }
+ 
+-/* REFUSAL.  kill(2)/killpg(2)/tgkill(2): send a signal to a process, a process
+- * group, or a thread.  Windows can terminate a process by handle
+- * (TerminateProcess) but cannot deliver an arbitrary signal number to one, and
+- * there is no host process table wired to this layer -- a pid here is a guest
+- * pid that names no host object yet, the same gap host_mman.h records for
+- * descriptors.  Approximating kill(pid, SIGKILL) with a terminate while
+- * refusing every other signal would be a half-truth with a worse shape than a
+- * whole refusal, because the caller cannot tell which half it got. */
++/* PARTLY REAL.  kill(2): send a signal to a process.  The host process table
++ * this used to lack now exists -- the clone that implements guest fork(2) fills
++ * it -- so the two halves of kill can be separated instead of refused together.
++ *
++ *   Signal 0 is REAL.  It sends nothing; it asks whether a pid names a process
++ *   this caller could signal, and that question Windows can answer.  It is also
++ *   the half that was actually being used: the container registry's membership
++ *   check, its /proc enumeration and its stale-marker pruning are all kill(p, 0)
++ *   probes, and under the whole refusal every one of them read "dead" for a
++ *   process that was alive.
++ *
++ *   SIGKILL is REAL, because TerminateProcess IS SIGKILL: immediate,
++ *   unmaskable, no handler, and the exit code it mints is decoded back into
++ *   WIFSIGNALED(SIGKILL) by the same reap that decodes every other death.
++ *
++ *   Every other signal is still REFUSED.  Nothing on this host delivers a
++ *   catchable signal to another process, and terminating a process that may have
++ *   installed a handler would report a death the guest asked to be able to
++ *   prevent.  The earlier note's objection -- that a caller cannot tell which
++ *   half it got -- is answered by the split being on the SIGNAL NUMBER, which
++ *   the caller chose: a guest asking for SIGKILL always gets a kill, a guest
++ *   asking for SIGUSR1 always gets ENOSYS, and neither ever gets the other. */
+ static inline int kill(pid_t pid, int signo) {
+-    (void)pid;
+-    (void)signo;
+-    errno = ENOSYS;
+-    return -1;
++    return hl_host_windows_kill(pid, signo);
+ }
+ 
+ static inline int killpg(pid_t pgrp, int signo) {
+diff --git a/src/linux_abi/host_system.h b/src/linux_abi/host_system.h
+index b168c91b..0f7b4c99 100644
+--- a/src/linux_abi/host_system.h
++++ b/src/linux_abi/host_system.h
+@@ -28,6 +28,8 @@
+ 
+ #else /* Windows */
+ 
++#include "../host/process.h" /* the backend's clone/reap/kill bridge, for fork() below */
++
+ #include <errno.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -155,14 +157,19 @@ static inline void arc4random_buf(void *buffer, size_t bytes) {
+     }
+ }
+ 
+-/* REFUSAL.  fork(2) has no Windows equivalent that this layer can reach: the
+- * process group's spawn is a cold CreateProcess, which shares no address space
+- * with its parent, and the address-space clone that does exist on this host
+- * (RtlCloneUserProcess) is not wired to this layer.  -1/ENOSYS is what a caller
+- * already handles; returning 0 would run the child path in the parent. */
++/* REAL.  fork(2) over the address-space clone this host does have.
++ *
++ * The clone is RtlCloneUserProcess and it is fork's shape exactly: a
++ * copy-on-write duplicate of the whole address space at byte-identical
++ * addresses, returning twice, carrying only the calling thread.  What it is NOT
++ * is the process group's spawn -- that is a cold CreateProcess with no shared
++ * address space, and it is a different call for a different purpose.
++ *
++ * Everything past the return is unchanged from the POSIX hosts: the child runs
++ * the same fork-child repair hooks, because those hooks were written for the
++ * only-the-calling-thread-survives rule and that rule is what a clone gives. */
+ static inline int fork(void) {
+-    errno = ENOSYS;
+-    return -1;
++    return hl_host_windows_fork();
+ }
+ 
+ /* REFUSAL.  fmemopen and open_memstream produce a FILE * over memory. The CRT
+diff --git a/src/linux_abi/host_wait.h b/src/linux_abi/host_wait.h
+index 7c6f8622..ea431842 100644
+--- a/src/linux_abi/host_wait.h
++++ b/src/linux_abi/host_wait.h
+@@ -34,22 +34,28 @@
+  *   32-bit DWORD from GetExitCodeProcess with no signal, no stop, and no core
+  *   bit in it.
+  *
+- *   THE CALLS ARE REFUSALS.  Nothing wires Windows process reaping to this
+- *   layer yet.  The pieces exist on the host side (a HANDLE, WaitForSingle-
+- *   Object, GetExitCodeProcess) and the host seam already models a process exit
+- *   as a kind plus a value -- the Linux and macOS host backends fill
+- *   process_exit_kind/process_exit_value that way -- but the layer here holds a
+- *   pid_t, and on Windows a pid is not a process handle: you cannot wait on one
+- *   without first opening it, and nothing in this layer owns that handle table.
+- *   That is the same population-(2) gap host_mman.h names for descriptors, one
+- *   namespace over.
++ *   THE CALLS ARE REAL, THROUGH A BRIDGE.  The pieces were always on the host
++ *   side (a HANDLE, WaitForMultipleObjects, GetExitCodeProcess), and what was
++ *   missing was ownership: the layer here holds a pid_t, and on Windows a pid is
++ *   not a process handle -- you cannot wait on one without first opening it, and
++ *   nothing in this layer owns a handle table.  So the table lives in the
++ *   backend, next to the clone that fills it, and these calls forward to it.
++ *   That is the same shape host_fd.h uses for descriptors: the vocabulary is
++ *   here, the object table is one layer down.
+  *
+- *   What a refusal must NOT be here is 0 or the requested pid.  waitpid()
+- *   returning 0 means "WNOHANG, nothing to report", which turns every reaper
+- *   loop into a spin; returning the pid with an uninitialised status word hands
+- *   the guest a fabricated death.  ECHILD is nearly as bad as either -- it is
+- *   the specific, load-bearing answer "you have no such child", which a shell
+- *   or a runtime treats as authoritative.  ENOSYS it is.
++ *   Three Linux behaviours this layer keeps and the bridge does not have to
++ *   know about: the option-word validation that must precede any child lookup,
++ *   the WCOREDUMP bit synthesized from the GUEST's RLIMIT_CORE, and the
++ *   signal-death relay that reconstructs a WIFSIGNALED status out of a child
++ *   that actually _exit()ed.  All three are syscall/proc.c's wait4, unchanged.
++ *
++ *   What the bridge must never answer is 0 or the requested pid for a request it
++ *   could not serve.  waitpid() returning 0 means "WNOHANG, nothing to report",
++ *   which turns every reaper loop into a spin; returning the pid with an
++ *   unwritten status word hands the guest a fabricated death.  ECHILD is
++ *   reserved for its real meaning -- the load-bearing "you have no such child" a
++ *   shell treats as authoritative -- and is returned only when the child table
++ *   genuinely holds no match.
+  */
+ 
+ #if !defined(_WIN32)
+@@ -67,11 +73,14 @@
+  *                    Owning them there rather than here keeps ONE definition of
+  *                    each; <sys/wait.h> gets them from elsewhere on a POSIX
+  *                    host too. */
++/* And the backend's child table, which is the object half of these calls. */
++#include "../host/process.h"
+ #include "host_proc.h"
+ #include "host_signal.h"
+ 
+ #include <errno.h>
+ #include <stddef.h>
++#include <string.h>
+ #include <sys/types.h>
+ 
+ /* ---- SHAPE: wait option bits.  Linux values. ----------------------------
+@@ -117,51 +126,69 @@
+  * accepts it. */
+ typedef enum { P_ALL = 0, P_PID = 1, P_PGID = 2, P_PIDFD = 3 } idtype_t;
+ 
+-/* ---- REFUSAL: the reaping calls.  See the header note. ------------------ */
++/* ---- REAL: the reaping calls, over the backend's child table. -----------
++ *
++ * WUNTRACED and WCONTINUED are accepted and never satisfied, which is honest
++ * rather than lazy: this host has no job control, a cloned child cannot be
++ * stopped and continued, and there is therefore no stop or continue event for
++ * such a wait to report.  A guest that passes them gets the same answer it would
++ * get on Linux from a child that never stopped.
++ *
++ * The rusage pointer is filled with zeroes rather than left alone.  Windows has
++ * per-process CPU numbers but the accounting seam that would carry them is a
++ * refusal (host_proc.h's getrusage), and a well-formed all-zero rusage is a
++ * plausible reading for a child that used nothing -- while an untouched caller
++ * buffer would expose whatever was on the stack. */
++
++static inline pid_t wait4(pid_t pid, int *status, int options, struct rusage *usage) {
++    const int reaped = hl_host_windows_waitpid(pid, status, options);
++    if (usage != NULL && reaped > 0) memset(usage, 0, sizeof(*usage));
++    return (pid_t)reaped;
++}
+ 
+ static inline pid_t waitpid(pid_t pid, int *status, int options) {
+-    (void)pid;
+-    (void)status;
+-    (void)options;
+-    errno = ENOSYS;
+-    return (pid_t)-1;
++    return wait4(pid, status, options, NULL);
+ }
+ 
+ static inline pid_t wait(int *status) {
+-    (void)status;
+-    errno = ENOSYS;
+-    return (pid_t)-1;
++    return wait4((pid_t)-1, status, 0, NULL);
+ }
+ 
+ static inline pid_t wait3(int *status, int options, struct rusage *usage) {
+-    (void)status;
+-    (void)options;
+-    (void)usage;
+-    errno = ENOSYS;
+-    return (pid_t)-1;
++    return wait4((pid_t)-1, status, options, usage);
+ }
+ 
+-static inline pid_t wait4(pid_t pid, int *status, int options, struct rusage *usage) {
+-    (void)pid;
+-    (void)status;
+-    (void)options;
+-    (void)usage;
+-    errno = ENOSYS;
+-    return (pid_t)-1;
+-}
+-
+-/* REFUSAL.  waitid additionally reports through a siginfo_t, and leaving that
+- * buffer untouched on failure is part of the contract the callers rely on:
++/* REAL, over the same reap.  The siginfo contract is the delicate part:
+  * syscall/rare.c memsets its siginfo before the call and tests si_pid != 0
+- * afterwards to decide whether a child was actually reaped, so a refusal reads
+- * as "no reap" there and never as a phantom one. */
++ * afterwards to decide whether a child was actually reaped, so si_pid must stay
++ * zero for "nothing to report" (a WNOHANG miss) and must be written only when a
++ * child really was collected.
++ *
++ * P_PGID is served as P_ALL for the same reason the bridge serves a negative
++ * pid that way: this host has no guest process groups.  P_PIDFD never arrives --
++ * rare.c resolves a pidfd to a pid and calls with P_PID. */
+ static inline int waitid(idtype_t type, id_t id, siginfo_t *info, int options) {
+-    (void)type;
+-    (void)id;
+-    (void)info;
+-    (void)options;
+-    errno = ENOSYS;
+-    return -1;
++    int status = 0;
++    int reaped;
++    if (type == P_PIDFD) {
++        errno = EINVAL;
++        return -1;
++    }
++    reaped = hl_host_windows_waitpid(type == P_PID ? (pid_t)id : (pid_t)-1, &status, options);
++    if (reaped < 0) return -1;
++    if (reaped == 0) return 0; /* WNOHANG, nothing to report: info stays as the caller left it */
++    if (info != NULL) {
++        info->si_signo = SIGCHLD;
++        info->si_pid = (pid_t)reaped;
++        if (WIFSIGNALED(status)) {
++            info->si_code = CLD_KILLED;
++            info->si_status = WTERMSIG(status);
++        } else {
++            info->si_code = CLD_EXITED;
++            info->si_status = WEXITSTATUS(status);
++        }
++    }
++    return 0;
+ }
+ 
+ #endif /* _WIN32 */
+diff --git a/src/linux_abi/signal.c b/src/linux_abi/signal.c
+index d8b1d06a..b3d888ad 100644
+--- a/src/linux_abi/signal.c
++++ b/src/linux_abi/signal.c
+@@ -358,7 +358,13 @@ static int sig_l2m(int s) {
+ }
+ 
+ static int sig_m2l(int s) {
+-#if defined(__linux__)
++/* _WIN32 joins the identity arm, not the BSD table. There is no host signal
++ * numbering to translate FROM on that host: nothing delivers a host signal
++ * there, and the only status words that reach this function are ones this
++ * engine minted itself in Linux numbering (the backend's reap decodes an NT
++ * exception status straight into a Linux signo). Running them through the BSD
++ * table would renumber e.g. 30 -> 10 for no host that ever said 30. */
++#if defined(__linux__) || defined(_WIN32)
+     return s;
+ #else
+     static const unsigned char T[32] = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  7,  11, 31, 13, 14, 15,
+diff --git a/src/translator/cache.c b/src/translator/cache.c
+index 10c98bc4..cc27fec7 100644
+--- a/src/translator/cache.c
++++ b/src/translator/cache.c
+@@ -1761,6 +1761,21 @@ static int jit_after_fork(void) {
+        is never preservable). */
+     if (g_pcache && !g_threaded && g_dualmap) preserve = 1;
+ #endif
++#elif defined(_WIN32)
++    /* Windows joins the Linux default, and for a reason that is stronger here
++       than there.  The dual-alias arena is a pagefile-backed SECTION mapped
++       twice, and this host's address-space clone carries a section view as a
++       GENUINELY SHARED view -- not a copy-on-write copy.  So a fork child does
++       not merely inherit a snapshot of the parent's code cache; it inherits the
++       parent's code cache itself, and the first block it translated would be
++       written into memory the parent is executing.  The child must therefore get
++       a new backing object, and once the backing object is new the inherited
++       host addresses are gone -- which is exactly preserve = 0.  The single-
++       alias fallback arena is private committed memory and IS copy-on-write, but
++       it takes the same branch: with no way to tell a preserved arena from a
++       rebuilt one at this level, the conservative answer is the correct one and
++       the cost is a re-translate the child would have paid anyway. */
++    preserve = 0;
+ #else
+     preserve = !g_threaded || !g_dualmap;
+ #endif

@@ -5,6 +5,7 @@
 #endif
 #include "../object.h"
 #include "../epoll.h"
+#include "../eventfd.h"
 #include "../watch.h"
 #include "../bus.h"
 #include "../../core/provider/files.h"
@@ -2452,6 +2453,76 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     int source_bound = !g_bound_source_native && bound_snapshot(a0, &source);
 #if defined(_WIN32)
     if (!g_bound_source_native && bound_socket_route(c, nr, a0, a1, a2, a3)) return 1;
+    /* eventfd2 over the typed counter provider.
+     *
+     * Windows only. The emulated eventfd is a host pipe pair plus a counter in a
+     * shared arena, and on a host with no pipe there is nothing under it; the
+     * typed provider is a real counter object with the kernel's own semantics.
+     * Every other host keeps the emulation, which is mature and cross-process,
+     * so this arm is deliberately not taken there.
+     *
+     * The shadow-descriptor reservation is the same one inotify_init1 does below
+     * and for the same reason: the object lives only in the typed box table, so
+     * without a real kernel descriptor holding the identical number a later
+     * non-bound open is handed that number and silently aliases the eventfd.
+     *
+     * Flag validation matches fs/eventfd.c -- only EFD_SEMAPHORE, EFD_CLOEXEC
+     * and EFD_NONBLOCK, everything else EINVAL. glibc's EventFD probe calls
+     * eventfd2(0, ~0) and REQUIRES it to fail, so a permissive mask here is a
+     * feature-detection lie rather than a harmless leniency. */
+    if (nr == 19 && g_linux_box != NULL) {
+        const uint64_t semaphore = UINT64_C(0x1), nonblock = UINT64_C(0x800), cloexec = UINT64_C(0x80000);
+        struct fdvis_reservation fdvis;
+        hl_linux_fd_reservation reservation;
+        hl_status status;
+        int shadow;
+        if ((a1 & ~(semaphore | nonblock | cloexec)) != 0) {
+            G_RET(c) = (uint64_t)(int64_t)-EINVAL;
+            return 1;
+        }
+        shadow = bound_shadow_reserve(0);
+        if (shadow < 0) {
+            G_RET(c) = (uint64_t)(int64_t)-(int64_t)errno;
+            return 1;
+        }
+        if (shadow >= guest_nofile_cur()) {
+            close(shadow);
+            G_RET(c) = (uint64_t)(int64_t)-EMFILE;
+            return 1;
+        }
+        if (proc_fdvis_reserve(&fdvis) != 0) {
+            close(shadow);
+            G_RET(c) = (uint64_t)(int64_t)-ENOSPC;
+            return 1;
+        }
+        for (;;) {
+            status = hl_linux_fd_reserve_at(g_linux_box, (hl_linux_fd)shadow, &reservation);
+            if (status != HL_STATUS_ALREADY_EXISTS) break;
+            close(shadow);
+            shadow = bound_shadow_reserve(shadow + 1);
+            if (shadow < 0 || shadow >= guest_nofile_cur()) break;
+        }
+        if (status != HL_STATUS_OK || shadow < 0 || shadow >= guest_nofile_cur()) {
+            if (shadow >= 0) close(shadow);
+            proc_fdvis_reservation_cancel(&fdvis);
+            G_RET(c) = (uint64_t)(int64_t)-EMFILE;
+            return 1;
+        }
+        /* The token only proves the slot is free; the installer publishes it. */
+        (void)hl_linux_fd_cancel(g_linux_box, &reservation);
+        result = hl_linux_eventfd_create_at(g_linux_box, (hl_linux_fd)shadow, a0,
+                                            (uint32_t)(((a1 & semaphore) != 0 ? HL_LINUX_EVENTFD_SEMAPHORE : 0u) |
+                                                       ((a1 & nonblock) != 0 ? HL_LINUX_EVENTFD_NONBLOCK : 0u)),
+                                            (a1 & cloexec) != 0 ? HL_LINUX_FD_CLOEXEC : 0);
+        if (result < 0) {
+            close(shadow);
+            proc_fdvis_reservation_cancel(&fdvis);
+        } else {
+            proc_fdvis_reservation_publish(&fdvis, (int)result, HL_HOST_FD_OTHER, 0, 0);
+        }
+        G_RET(c) = (uint64_t)result;
+        return 1;
+    }
 #endif
     if (nr == 26 && g_linux_box != NULL) {
         bound_inotify_provider *provider;

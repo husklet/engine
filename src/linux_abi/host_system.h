@@ -28,6 +28,8 @@
 
 #else /* Windows */
 
+#include "../host/process.h" /* the backend's clone/reap/kill bridge, for fork() below */
+
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -155,14 +157,19 @@ static inline void arc4random_buf(void *buffer, size_t bytes) {
     }
 }
 
-/* REFUSAL.  fork(2) has no Windows equivalent that this layer can reach: the
- * process group's spawn is a cold CreateProcess, which shares no address space
- * with its parent, and the address-space clone that does exist on this host
- * (RtlCloneUserProcess) is not wired to this layer.  -1/ENOSYS is what a caller
- * already handles; returning 0 would run the child path in the parent. */
+/* REAL.  fork(2) over the address-space clone this host does have.
+ *
+ * The clone is RtlCloneUserProcess and it is fork's shape exactly: a
+ * copy-on-write duplicate of the whole address space at byte-identical
+ * addresses, returning twice, carrying only the calling thread.  What it is NOT
+ * is the process group's spawn -- that is a cold CreateProcess with no shared
+ * address space, and it is a different call for a different purpose.
+ *
+ * Everything past the return is unchanged from the POSIX hosts: the child runs
+ * the same fork-child repair hooks, because those hooks were written for the
+ * only-the-calling-thread-survives rule and that rule is what a clone gives. */
 static inline int fork(void) {
-    errno = ENOSYS;
-    return -1;
+    return hl_host_windows_fork();
 }
 
 /* REFUSAL.  fmemopen and open_memstream produce a FILE * over memory. The CRT
