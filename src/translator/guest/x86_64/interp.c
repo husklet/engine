@@ -753,7 +753,7 @@ static void *translate_block(uint64_t gpc) {
     block->guest_end = gpc + 1;
     block->host_entry_off = 0;
     block->host_len = 0;
-    if (translit_build(block, gpc) == NULL) g_translit_declines++;
+    (void)translit_build(block, gpc);
     // host == body (no prologue to skip). SOURCE range [gpc, guest_end) so SMC invalidation finds it by
     // address -- a transliterated block caches guest BYTES and so owns the range it copied, where an
     // interpreted one re-decodes and needs only its entry.
@@ -1126,17 +1126,12 @@ static void run_block(struct cpu *cpu, void *code) {
     // MAP_SHARED alias mid-run must stop executing verbatim stores, and the descriptor is still a valid
     // interpreter block, so falling back costs nothing but speed.
     if (block->host_entry_off != 0 && translit_image_ok() && translit_bind_cpu(cpu)) {
-        g_translit_runs++;
         translit_run(cpu, block);
     } else {
-        g_translit_interp_runs++;
         interp_execute(cpu);
     }
     g_interp_pad_armed = previous;
     g_interp_pad_cpu = previous_cpu;
-    // exit_group/exit never returns from service(), so the fallback-rate report has no later hook.
-    if (translit_stats_wanted() && cpu->reason == R_SYSCALL && (cpu->r[RAX] == 231 || cpu->r[RAX] == 60))
-        translit_report();
 }
 
 static void block_return(void) {

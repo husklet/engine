@@ -93,27 +93,17 @@ static void translit_flags_out(struct cpu *cpu, uint64_t flags) {
 
 // ---- the switch
 //
-// Compiled in unconditionally so both backends are reachable from one binary; HL_X86_TRANSLIT selects at
-// run time and HL_TRANSLIT_DEFAULT (cmake -DHL_TRANSLIT=ON) moves the default. Off means the interpreter
-// lane is byte-identical to what it was.
+// HL_TRANSLIT selects the same-ISA backend at build time.
 #ifndef HL_TRANSLIT_DEFAULT
 #define HL_TRANSLIT_DEFAULT 0
 #endif
 
-static int g_translit_enabled = -1; // -1 = not yet read
-static uint64_t g_translit_blocks, g_translit_insns, g_translit_declines;
-static uint64_t g_translit_runs, g_translit_interp_runs;
-
 static int translit_enabled(void) {
-    if (g_translit_enabled < 0) {
 #if defined(__linux__) && defined(HL_HOST_CPU_X86_64)
-        const char *value = getenv("HL_X86_TRANSLIT");
-        g_translit_enabled = value != NULL ? (value[0] != '0' && value[0] != 0) : HL_TRANSLIT_DEFAULT;
+    return HL_TRANSLIT_DEFAULT;
 #else
-        g_translit_enabled = 0;
+    return 0;
 #endif
-    }
-    return g_translit_enabled;
 }
 
 #if defined(__linux__) && defined(HL_HOST_CPU_X86_64)
@@ -413,8 +403,6 @@ static void *translit_build(struct interp_block *block, uint64_t gpc) {
     block->host_len = (uint32_t)(a->cursor - start);
     block->guest_end = pc;
     g_cp = a->cursor;
-    g_translit_blocks++;
-    g_translit_insns += (uint64_t)count;
     return start;
 }
 
@@ -428,30 +416,6 @@ static void translit_run(struct cpu *cpu, struct interp_block *block) {
     translit_flags_out(cpu, cpu->mmscratch[0]);
 }
 
-// HL_X86_TRANSLIT_STATS=1: the fallback rate, without which no speed number from this backend means
-// anything. `blocks` counts dispatcher entries served by host code, `interp` those served by the
-// interpreter -- the ratio is the honest denominator.
-static int g_translit_stats = -1;
-
-static int translit_stats_wanted(void) {
-    if (g_translit_stats < 0) {
-        const char *want = getenv("HL_X86_TRANSLIT_STATS");
-        g_translit_stats = want != NULL && want[0] != '0' && want[0] != 0;
-    }
-    return g_translit_stats;
-}
-
-static void translit_report(void) {
-    static int reported;
-    if (!translit_stats_wanted() || reported) return;
-    reported = 1;
-    unsigned long long total = (unsigned long long)(g_translit_runs + g_translit_interp_runs);
-    fprintf(stderr, "[translit] built=%llu insns=%llu declined=%llu | executed: host=%llu interp=%llu (%.1f%% host)\n",
-            (unsigned long long)g_translit_blocks, (unsigned long long)g_translit_insns,
-            (unsigned long long)g_translit_declines, (unsigned long long)g_translit_runs,
-            (unsigned long long)g_translit_interp_runs, total ? 100.0 * (double)g_translit_runs / (double)total : 0.0);
-}
-
 // cpu->r[] index -> ucontext greg index, for reconstructing guest state from a fault inside emitted code.
 static const int g_translit_greg[16] = {HL_HOST_UC_REG_RAX, HL_HOST_UC_REG_RCX, HL_HOST_UC_REG_RDX, HL_HOST_UC_REG_RBX,
                                         HL_HOST_UC_REG_RSP, HL_HOST_UC_REG_RBP, HL_HOST_UC_REG_RSI, HL_HOST_UC_REG_RDI,
@@ -463,7 +427,7 @@ static const int g_translit_greg[16] = {HL_HOST_UC_REG_RAX, HL_HOST_UC_REG_RCX, 
 // map (cache.c) recovers the faulting guest RIP. Block-granular cpu->rip is the fallback when the bounded
 // map has wrapped -- the same fallback the AArch64 JIT takes.
 static int translit_signal_capture(struct cpu *cpu, void *native_context) {
-    if (native_context == NULL || !g_translit_blocks) return 0;
+    if (native_context == NULL || !translit_enabled()) return 0;
     ucontext_t *uc = (ucontext_t *)native_context;
     uint64_t host_pc = (uint64_t)HL_HOST_UC_PC(uc);
     if (!jit_pc_in_retained_cache(host_pc)) return 0;
@@ -502,13 +466,6 @@ static void translit_run(struct cpu *cpu, struct interp_block *block) {
 static int translit_signal_capture(struct cpu *cpu, void *native_context) {
     (void)cpu;
     (void)native_context;
-    return 0;
-}
-
-static void translit_report(void) {
-}
-
-static int translit_stats_wanted(void) {
     return 0;
 }
 

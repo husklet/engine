@@ -388,8 +388,6 @@ static int translit_enabled(void) {
     return 0;
 }
 
-static void translit_report(void) {
-}
 #else
 // interp.c defines the same names emit.c/translate.c/cache.c do, so everything below is host-identical.
 #include "../../translator/guest/x86_64/interp.c"
@@ -1095,7 +1093,6 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
     if (g_untrusted) sentry_shutdown(); // signal quit + waitpid (reap, no orphan)
     if (g_fast_count)
         fprintf(stderr, "[fastsys] enabled=%d inline-served=%llu\n", g_fastsys, (unsigned long long)g_fast_count);
-    translit_report();
     if (g_prof)
         fprintf(stderr, "[prof] dispatcher round-trips=%llu  IBTC fills=%llu  (IBTC %s)\n",
                 (unsigned long long)g_disp_n, (unsigned long long)g_ibtc_fill, g_noibtc ? "OFF" : "ON");

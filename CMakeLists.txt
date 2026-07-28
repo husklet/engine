@@ -115,10 +115,8 @@ endif()
 set(HL_DEBUG_LOGGING "0" CACHE STRING "HL_ENABLE_LOGGING value")
 
 # --- x86-64 same-ISA transliterator -----------------------------------------
-# Always COMPILED (so one binary reaches both backends and HL_X86_TRANSLIT=1 selects at run time); this
-# only moves the default. OFF because the interpreter is the correct-by-construction lane and the
-# transliterator is additive -- see docs/amd64-host.md. Inert on any host that is not x86-64.
-option(HL_TRANSLIT "default the x86-64 guest to the same-ISA transliterator instead of the interpreter" OFF)
+# Inert on hosts other than x86-64.
+option(HL_TRANSLIT "use the x86-64 same-ISA transliterator instead of the interpreter" OFF)
 
 # --- flags in ONE place, as INTERFACE libraries (no directory-scope leakage) -
 # Interface libs are used instead of add_compile_options() so that Phase-2
