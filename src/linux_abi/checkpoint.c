@@ -5060,13 +5060,17 @@ static int ckpt_prepare_restore_socket_states(void) {
             (state->udp_local_port != 0 || state->lo_port != 0 || state->br_port != 0)) {
             char virtual_path[200];
             if (state->udp_local_port != 0) {
-                if (state->udp_local_interface != 0)
-                    br_path((int)state->udp_local_interface - 1, state->udp_local_ip, (uint16_t)state->udp_local_port,
-                            virtual_path, sizeof virtual_path);
-                else
+                if (state->udp_local_interface != 0) {
+                    if (br_path((int)state->udp_local_interface - 1, state->udp_local_ip,
+                                (uint16_t)state->udp_local_port, virtual_path, sizeof virtual_path) != 0)
+                        return -1;
+                } else {
                     lo_path((uint16_t)state->udp_local_port, virtual_path, sizeof virtual_path);
+                }
             } else if (state->br_port != 0) {
-                br_path(state->br_interface, state->br_ip, (uint16_t)state->br_port, virtual_path, sizeof virtual_path);
+                if (br_path((int)state->br_interface - 1, state->br_ip, (uint16_t)state->br_port, virtual_path,
+                            sizeof virtual_path) != 0)
+                    return -1;
             } else {
                 lo_tcp_path((uint16_t)state->lo_port, state->lo_v6only, virtual_path, sizeof virtual_path);
             }

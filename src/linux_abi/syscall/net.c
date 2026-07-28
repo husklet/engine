@@ -818,7 +818,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         if (bridge_v6_any) bridge_interface = 0;
         if (bridge_enabled && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_stream[(int)a0] && bridge_interface >= 0) {
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
-            if (p == 0) p = br_alloc_ephemeral(bridge_interface); // bind(:0) -> a real, round-trippable port
+            if (p == 0 && br_alloc_ephemeral(bridge_interface, &p) != 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
             int bridge_v6only = 0;
             if (br6_any_is(sa, (socklen_t)a2)) {
                 socklen_t option_length = sizeof bridge_v6only;
@@ -826,10 +829,13 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     bridge_v6only = 0;
             }
             char up[200];
-            if (bridge_v6only)
-                br_v6only_path(bridge_interface, g_netif[bridge_interface].ip, p, up, sizeof up);
-            else
-                br_path(bridge_interface, g_netif[bridge_interface].ip, p, up, sizeof up);
+            int path_status = bridge_v6only
+                                  ? br_v6only_path(bridge_interface, g_netif[bridge_interface].ip, p, up, sizeof up)
+                                  : br_path(bridge_interface, g_netif[bridge_interface].ip, p, up, sizeof up);
+            if (path_status != 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
             struct sockaddr_un un;
             if (unix_addr_set(&un, up) < 0) {
                 G_RET(c) = (uint64_t)(-errno);
@@ -1232,9 +1238,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // is why a 0.0.0.0 server was unreachable via 127.0.0.1 with a user network attached),
                 // so swap in a FRESH AF_UNIX fd before the retry -- exactly as the br_connect loop does.
                 char bp[200];
-                br_path(0, g_netif[0].ip, p, bp, sizeof bp);
                 struct sockaddr_un bu;
-                if (unix_addr_set(&bu, bp) < 0 || lo_swap((int)a0) < 0) {
+                if (br_path(0, g_netif[0].ip, p, bp, sizeof bp) != 0 || unix_addr_set(&bu, bp) < 0 ||
+                    lo_swap((int)a0) < 0) {
                     r = -1;
                 } else if (sock_internal_connect_prepare((int)a0) != 0) {
                     r = -1;
@@ -1298,8 +1304,13 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             int udp_interface;
             uint32_t udp_ip;
             uint16_t udp_port;
-            if (udp_switch_destination(sa, (socklen_t)a2, &udp_interface, &udp_ip, &udp_port, udp_path,
-                                       sizeof udp_path)) {
+            int udp_route = udp_switch_destination(sa, (socklen_t)a2, &udp_interface, &udp_ip, &udp_port, udp_path,
+                                                   sizeof udp_path);
+            if (udp_route < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+            if (udp_route > 0) {
                 if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
                     G_RET(c) = (uint64_t)(-errno);
                     break;
@@ -1316,7 +1327,10 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             uint32_t dip = *(uint32_t *)(sa + 4);
             uint16_t p = ntohs(*(uint16_t *)(sa + 2));
             char up[200];
-            br_path(connect_interface, dip, p, up, sizeof up);
+            if (br_path(connect_interface, dip, p, up, sizeof up) != 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
             struct sockaddr_un un;
             if (unix_addr_set(&un, up) < 0) {
                 G_RET(c) = (uint64_t)(-errno);
@@ -1713,7 +1727,11 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             int udp_route = a4 ? udp_switch_destination((const uint8_t *)a4, (socklen_t)a5, &udp_interface, &udp_ip,
                                                         &udp_port, udp_path, sizeof udp_path)
                                : udp_switch_peer_path((int)a0, udp_path, sizeof udp_path);
-            if (udp_route) {
+            if (udp_route < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+            if (udp_route > 0) {
                 if (!a4) udp_interface = (int)g_udp_peer_interface[(int)a0] - 1;
                 if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
                     G_RET(c) = (uint64_t)(-errno);
@@ -2371,8 +2389,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             int udp_interface;
             uint32_t udp_ip;
             uint16_t udp_port;
-            if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0] &&
-                udp_switch_destination(gname, gnamelen, &udp_interface, &udp_ip, &udp_port, ud_host, sizeof ud_host)) {
+            int udp_route = (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0]
+                                ? udp_switch_destination(gname, gnamelen, &udp_interface, &udp_ip, &udp_port, ud_host,
+                                                         sizeof ud_host)
+                                : 0;
+            if (udp_route < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+            if (udp_route > 0) {
                 if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
                     G_RET(c) = (uint64_t)(-errno);
                     break;
@@ -2394,9 +2419,13 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     mh.msg_namelen = hl;
                 }
             }
-        } else if (nr == 211 && !gname && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0] &&
-                   udp_switch_peer_path((int)a0, ud_host, sizeof ud_host)) {
-            ud_route = 1;
+        } else if (nr == 211 && !gname && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0]) {
+            int udp_route = udp_switch_peer_path((int)a0, ud_host, sizeof ud_host);
+            if (udp_route < 0) {
+                G_RET(c) = (uint64_t)(-errno);
+                break;
+            }
+            ud_route = udp_route > 0;
         } else if (nr == 212 && gname && gnamelen) { // recvmsg: receive into host scratch
             mh.msg_name = &nss;
             mh.msg_namelen = sizeof nss;
@@ -2698,9 +2727,15 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 int udp_interface;
                 uint32_t udp_ip;
                 uint16_t udp_port;
-                if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0] &&
-                    udp_switch_destination(gname, gnamelen, &udp_interface, &udp_ip, &udp_port, ud_host,
-                                           sizeof ud_host)) {
+                int udp_route = (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0]
+                                    ? udp_switch_destination(gname, gnamelen, &udp_interface, &udp_ip, &udp_port,
+                                                             ud_host, sizeof ud_host)
+                                    : 0;
+                if (udp_route < 0) {
+                    err = errno;
+                    break;
+                }
+                if (udp_route > 0) {
                     // AF_INET(6) dest over the private-loopback switch: resolve to the peer AF_UNIX path
                     // and send there (mirrors sendto/sendmsg cases 206/211).
                     if (udp_switch_ensure_source((int)a0, udp_interface) < 0) {
@@ -2718,9 +2753,13 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                         mh.msg_namelen = hl;
                     }
                 }
-            } else if (nr == 269 && !gname && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0] &&
-                       udp_switch_peer_path((int)a0, ud_host, sizeof ud_host)) {
-                ud_route = 1; // connected UDP over the switch: send to the recorded peer AF_UNIX path
+            } else if (nr == 269 && !gname && (int)a0 >= 0 && (int)a0 < HL_NFD && g_sock_dgram[(int)a0]) {
+                int udp_route = udp_switch_peer_path((int)a0, ud_host, sizeof ud_host);
+                if (udp_route < 0) {
+                    err = errno;
+                    break;
+                }
+                ud_route = udp_route > 0; // connected UDP over the switch: send to the recorded peer AF_UNIX path
             } else if (nr == 243 && gname && gnamelen) { // recvmmsg: receive into host scratch
                 mh.msg_name = &nss;
                 mh.msg_namelen = sizeof nss;

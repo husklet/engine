@@ -2426,15 +2426,32 @@ static int lo_any_is(const uint8_t *sa, socklen_t l) {
 }
 
 // rendezvous path for <ip_be>:<port> under the shared per-network dir
-static void br_path(int interface, uint32_t ip_be, uint16_t port, char *out, size_t n) {
+static int br_path(int interface, uint32_t ip_be, uint16_t port, char *out, size_t n) {
+    if (out == NULL || n == 0 || interface < 0 || interface >= g_netif_count) {
+        if (out != NULL && n != 0) out[0] = 0;
+        errno = EINVAL;
+        return -1;
+    }
     const uint8_t *b = (const uint8_t *)&ip_be;
-    snprintf(out, n, "%s/%u.%u.%u.%u:%u", g_netif[interface].path, b[0], b[1], b[2], b[3], (unsigned)port);
+    int size = snprintf(out, n, "%s/%u.%u.%u.%u:%u", g_netif[interface].path, b[0], b[1], b[2], b[3], (unsigned)port);
+    if (size < 0 || (size_t)size >= n) {
+        out[0] = 0;
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
 }
 
-static void br_v6only_path(int interface, uint32_t ip_be, uint16_t port, char *out, size_t n) {
-    br_path(interface, ip_be, port, out, n);
+static int br_v6only_path(int interface, uint32_t ip_be, uint16_t port, char *out, size_t n) {
+    if (br_path(interface, ip_be, port, out, n) != 0) return -1;
     size_t length = strlen(out);
-    if (length < n) snprintf(out + length, n - length, ".v6only");
+    int size = snprintf(out + length, n - length, ".v6only");
+    if (size < 0 || (size_t)size >= n - length) {
+        out[0] = 0;
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
 }
 
 // A wildcard listener belongs to every attached interface, not just eth0. The switch transport is one
@@ -2443,17 +2460,15 @@ static void br_v6only_path(int interface, uint32_t ip_be, uint16_t port, char *o
 // udp_ref and therefore disappear only when the final dup/fork reference closes.
 static int br_alias_wildcard_listener(int fd, int primary, uint16_t port, int v6only) {
     char target[200];
-    if (v6only)
-        br_v6only_path(primary, g_netif[primary].ip, port, target, sizeof target);
-    else
-        br_path(primary, g_netif[primary].ip, port, target, sizeof target);
+    int target_status = v6only ? br_v6only_path(primary, g_netif[primary].ip, port, target, sizeof target)
+                               : br_path(primary, g_netif[primary].ip, port, target, sizeof target);
+    if (target_status != 0) return -1;
     for (uint8_t interface = 0; interface < g_netif_count; interface++) {
         if ((int)interface == primary) continue;
         char alias[200];
-        if (v6only)
-            br_v6only_path(interface, g_netif[interface].ip, port, alias, sizeof alias);
-        else
-            br_path(interface, g_netif[interface].ip, port, alias, sizeof alias);
+        int alias_status = v6only ? br_v6only_path(interface, g_netif[interface].ip, port, alias, sizeof alias)
+                                  : br_path(interface, g_netif[interface].ip, port, alias, sizeof alias);
+        if (alias_status != 0) return -1;
         unlink(alias);
         if (symlink(target, alias) < 0) return -1;
         if (udp_ref_add_alias(fd, alias) < 0) {
@@ -2467,18 +2482,26 @@ static int br_alias_wildcard_listener(int fd, int primary, uint16_t port, int v6
 }
 
 // bind(:0) on the bridge -> a free, round-trippable ephemeral port keyed by OUR ip (cf. lo_alloc_ephemeral)
-static uint16_t br_alloc_ephemeral(int interface) {
+static int br_alloc_ephemeral(int interface, uint16_t *port) {
     static uint16_t next;
+    if (port == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
     if (next < 1024) next = (uint16_t)(20000 + (getpid() & 0x3fff));
     for (int tries = 0; tries < 45000; tries++) {
         uint16_t cand = next++;
         if (next < 1024) next = 1024;
         if (cand < 1024) continue;
         char path[200];
-        br_path(interface, g_netif[interface].ip, cand, path, sizeof path);
-        if (access(path, F_OK) != 0) return cand;
+        if (br_path(interface, g_netif[interface].ip, cand, path, sizeof path) != 0) return -1;
+        if (access(path, F_OK) != 0) {
+            *port = cand;
+            return 0;
+        }
     }
-    return 0;
+    errno = EADDRINUSE;
+    return -1;
 }
 
 // report the VIRTUAL AF_INET <ip_be>:<port> (not the AF_UNIX path) back to the guest
@@ -2715,7 +2738,7 @@ static void fwd_maybe_start(int fd) {
     char upath[200];
     if (g_br_port[fd]) {
         cport = g_br_port[fd];
-        br_path((int)g_br_interface[fd] - 1, g_br_ip[fd], cport, upath, sizeof upath);
+        if (br_path((int)g_br_interface[fd] - 1, g_br_ip[fd], cport, upath, sizeof upath) != 0) return;
     } else if (g_lo_port[fd]) {
         cport = g_lo_port[fd];
         lo_tcp_path(cport, g_lo_v6only[fd], upath, sizeof upath);
@@ -2780,14 +2803,18 @@ static int udp_swap(int fd) {
 // The pathname is also the sender identity returned by recvfrom/recvmsg, so replies need no side table.
 static int udp_switch_bind(int fd, int interface, uint32_t ip, uint16_t port) {
     char path[200];
-    if (!port) port = interface >= 0 ? br_alloc_ephemeral(interface) : lo_alloc_ephemeral();
+    if (!port && interface >= 0) {
+        if (br_alloc_ephemeral(interface, &port) != 0) return -1;
+    } else if (!port) {
+        port = lo_alloc_ephemeral();
+    }
     if (!port) {
         errno = EADDRINUSE;
         return -1;
     }
-    if (interface >= 0)
-        br_path(interface, ip, port, path, sizeof path);
-    else
+    if (interface >= 0) {
+        if (br_path(interface, ip, port, path, sizeof path) != 0) return -1;
+    } else
         lo_path(port, path, sizeof path);
     struct sockaddr_un un;
     if (unix_addr_set(&un, path) < 0) return -1;
@@ -2830,7 +2857,7 @@ static int udp_switch_destination(const uint8_t *sa, socklen_t len, int *interfa
     }
     *interface = br_on() ? br_for_ip(*ip) : -1;
     if (*interface >= 0) {
-        br_path(*interface, *ip, *port, path, capacity);
+        if (br_path(*interface, *ip, *port, path, capacity) != 0) return -1;
         return 1;
     }
     return 0;
@@ -2842,9 +2869,9 @@ static int udp_switch_destination(const uint8_t *sa, socklen_t len, int *interfa
 static int udp_switch_peer_path(int fd, char *path, size_t capacity) {
     if (fd < 0 || fd >= HL_NFD || !g_udp_peer_port[fd]) return 0;
     int interface = (int)g_udp_peer_interface[fd] - 1;
-    if (interface >= 0)
-        br_path(interface, g_udp_peer_ip[fd], g_udp_peer_port[fd], path, capacity);
-    else
+    if (interface >= 0) {
+        if (br_path(interface, g_udp_peer_ip[fd], g_udp_peer_port[fd], path, capacity) != 0) return -1;
+    } else
         lo_path(g_udp_peer_port[fd], path, capacity);
     return 1;
 }
@@ -2855,7 +2882,13 @@ static int udp_switch_peer_path(int fd, char *path, size_t capacity) {
 // unconnected host socket and leaking EDESTADDRREQ to applications such as BusyBox nc.
 static int udp_switch_write(int fd, const struct iovec *iov, int iov_count, int64_t *result) {
     char path[200];
-    if (fd < 0 || fd >= HL_NFD || !g_sock_dgram[fd] || !udp_switch_peer_path(fd, path, sizeof path)) return 0;
+    if (fd < 0 || fd >= HL_NFD || !g_sock_dgram[fd]) return 0;
+    int route = udp_switch_peer_path(fd, path, sizeof path);
+    if (route < 0) {
+        *result = -errno;
+        return 1;
+    }
+    if (route == 0) return 0;
     int interface = (int)g_udp_peer_interface[fd] - 1;
     if (udp_switch_ensure_source(fd, interface) < 0) {
         *result = -errno;
@@ -3083,7 +3116,7 @@ static void udp_fwd_maybe_start(int fd) {
     char upath[200];
     if (g_br_port[fd]) {
         cport = g_br_port[fd];
-        br_path((int)g_br_interface[fd] - 1, g_br_ip[fd], cport, upath, sizeof upath);
+        if (br_path((int)g_br_interface[fd] - 1, g_br_ip[fd], cport, upath, sizeof upath) != 0) return;
     } else if (g_lo_port[fd]) {
         cport = g_lo_port[fd];
         lo_path(cport, upath, sizeof upath);
@@ -3123,7 +3156,10 @@ static int udp_bind_maybe(int fd, const uint8_t *sa, socklen_t l, int64_t *out) 
         cport = ntohs(*(const uint16_t *)(sa + 2));
         if (cport == 0 || !pm_published(cport)) return 0; // only explicit, published ports get switched
         myip = g_netif[interface].ip;
-        br_path(interface, myip, cport, up, sizeof up); // we always listen on OUR endpoint IP
+        if (br_path(interface, myip, cport, up, sizeof up) != 0) {
+            *out = -errno;
+            return 1;
+        }
     } else if (lo_on() && lo_is(sa, l)) {
         cport = ntohs(*(const uint16_t *)(sa + 2));
         if (cport == 0 || !pm_published(cport)) return 0;
