@@ -45,9 +45,9 @@ static void hl_linux_unlock(hl_linux_abi *linux_abi) {
 }
 
 static const hl_host_sync_services *hl_linux_sync(const hl_linux_abi *linux_abi) {
-    const hl_host_services *host;
-    if (linux_abi == NULL || (host = linux_abi->host) == NULL || (host->capabilities & HL_HOST_CAP_SYNC) == 0 ||
-        host->sync == NULL || host->sync->abi != HL_HOST_SYNC_ABI || host->sync->size < sizeof(*host->sync))
+    const hl_host_services *host = linux_abi == NULL ? NULL : linux_abi->host;
+    if (host == NULL || (host->capabilities & HL_HOST_CAP_SYNC) == 0 || host->sync == NULL ||
+        host->sync->abi != HL_HOST_SYNC_ABI || host->sync->size < sizeof(*host->sync))
         return NULL;
     return host->sync;
 }
@@ -142,9 +142,9 @@ static int64_t hl_linux_error(hl_status status) {
 }
 
 static const hl_host_file_services *hl_linux_files(const hl_linux_abi *linux_abi) {
-    const hl_host_services *host;
-    if (linux_abi == NULL || (host = linux_abi->host) == NULL || (host->capabilities & HL_HOST_CAP_FILE) == 0 ||
-        host->file == NULL || host->file->abi != HL_HOST_FILE_ABI || host->file->size < sizeof(*host->file))
+    const hl_host_services *host = linux_abi == NULL ? NULL : linux_abi->host;
+    if (host == NULL || (host->capabilities & HL_HOST_CAP_FILE) == 0 || host->file == NULL ||
+        host->file->abi != HL_HOST_FILE_ABI || host->file->size < sizeof(*host->file))
         return NULL;
     return host->file;
 }
@@ -587,9 +587,10 @@ hl_status hl_linux_abi_spawn(hl_linux_abi *linux_abi, hl_host_process_entry entr
     hl_status completed;
     if (linux_abi == NULL || linux_abi->abi != HL_LINUX_ABI_VERSION || entry == NULL || out_process == NULL)
         return HL_STATUS_INVALID_ARGUMENT;
-    if (linux_abi->host == NULL || (linux_abi->host->capabilities & HL_HOST_CAP_PROCESS) == 0 ||
-        (processes = linux_abi->host->process) == NULL || processes->abi != HL_HOST_PROCESS_ABI ||
-        processes->size < sizeof(*processes) || processes->spawn_prepared == NULL)
+    processes = linux_abi->host == NULL ? NULL : linux_abi->host->process;
+    if (linux_abi->host == NULL || (linux_abi->host->capabilities & HL_HOST_CAP_PROCESS) == 0 || processes == NULL ||
+        processes->abi != HL_HOST_PROCESS_ABI || processes->size < sizeof(*processes) ||
+        processes->spawn_prepared == NULL)
         return HL_STATUS_NOT_SUPPORTED;
     *out_process = HL_HOST_HANDLE_INVALID;
     plan.abi = HL_LINUX_ABI_VERSION;

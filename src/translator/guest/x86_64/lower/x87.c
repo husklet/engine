@@ -180,7 +180,7 @@ void hl_x86_x87_indefinite(int vd) {
     e_movconst(20, HL_X87_INDEFINITE_BITS);
     e_fmov_to_d(23, 20);
     e_subi_s(31, 22, 0, 1);
-    emit32(0x1E600C00u | (23 << 16) | (0u << 12) | (vd << 5) | vd); // fcsel dvd, dvd, d23, eq
+    emit32(0x1E600C00u | (23u << 16) | ((uint32_t)vd << 5) | (uint32_t)vd); // fcsel dvd, dvd, d23, eq
 }
 
 // Tag ST(i) empty (FFREE) or live, without touching TOP or the data register.
@@ -282,9 +282,9 @@ void hl_x86_x87_narrow(int vd) {
     e_rrr(A_SUB, 17, 17, 21, 1, 0);
     e_lsl_i(17, 17, 52, 1);
     e_fmov_to_d(22, 17);
-    emit32(0x1E600800u | (22 << 16) | (vd << 5) | 22); // fmul d22, dvd, d22   (exponent -> 1023, exact)
-    emit32(0x1E624000u | (22 << 5) | 22);              // fcvt s22, d22        (the 24-bit rounding, and #P)
-    emit32(0x1E22C000u | (22 << 5) | 22);              // fcvt d22, s22
+    emit32(0x1E600800u | (22u << 16) | ((uint32_t)vd << 5) | 22u); // fmul d22, dvd, d22
+    emit32(0x1E624000u | (22 << 5) | 22);                          // fcvt s22, d22        (the 24-bit rounding, and #P)
+    emit32(0x1E22C000u | (22 << 5) | 22);                          // fcvt d22, s22
     e_lsl_i(17, 21, 52, 1);
     e_fmov_to_d(23, 17);
     emit32(0x1E600800u | (23 << 16) | (22 << 5) | 22); // fmul d22, d22, d23   (exact)
@@ -300,7 +300,7 @@ void hl_x86_x87_narrow(int vd) {
     e_csel(17, 17, 16, 1 /*NE*/, 1); // otherwise the round trip never happened
     emit32(0xD51B4420u | 17);        // msr fpsr, x17
     e_subi_s(31, 20, 0, 1);
-    emit32(0x1E600C00u | (vd << 16) | (1u << 12) | (22 << 5) | vd); // fcsel dvd, d22, dvd, ne
+    emit32(0x1E600C00u | ((uint32_t)vd << 16) | (1u << 12) | (22u << 5) | (uint32_t)vd);
 }
 
 #undef FP_STATIC
@@ -320,7 +320,7 @@ void hl_x86_x87_narrow(int vd) {
 // stamped: "result is NaN AND no input was NaN". PRE runs while both inputs are still live (the
 // ARM forms are destructive, so the mask cannot be built afterwards); POST runs on the result.
 // Scratch: v22/v23, which nothing in the D8-DF lowering (v16/v17/v18/v20 only) uses.
-#define FCMEQd(d, n, m) emit32(0x5E60E400u | ((m) << 16) | ((n) << 5) | (d)) /* FCMEQ Dd,Dn,Dm */
+#define FCMEQd(d, n, m) emit32(0x5E60E400u | ((uint32_t)(m) << 16) | ((uint32_t)(n) << 5) | (uint32_t)(d))
 
 void hl_x86_x87_dnan_pre(int n, int m) {
     FCMEQd(22, n, n);                                  // d22 = (n == n)   (all-ones iff n is NOT NaN)
@@ -332,7 +332,7 @@ void hl_x86_x87_dnan_post(int d) {
     FCMEQd(23, d, d);                                    // d23 = (result == result)
     emit32(0x0E601C00u | (23 << 16) | (22 << 5) | 22);   // BIC v22.8b -> ordered inputs AND NaN result
     emit32(0x4F005400u | (127u << 16) | (22 << 5) | 22); // SHL v22.2d, v22, #63 -> the sign bit, or 0
-    emit32(0x0EA01C00u | (22 << 16) | ((d) << 5) | (d)); // ORR v_d.8b -> stamp x86's negative indefinite
+    emit32(0x0EA01C00u | (22u << 16) | ((uint32_t)d << 5) | (uint32_t)d);
 }
 
 // FSCALE: ST0 = ST0 * 2^trunc(ST1). Build 2^n straight into the double exponent field; clamping the
@@ -398,9 +398,9 @@ void hl_x86_x87_extract(void) {
 // sign-magnitude, so this is NOT `result > original` (measured: -2.5 under RC=down gives -3 with C1=1).
 // vr = the rounded value, vo = the original. Clobbers x20/x21/x23 and v20/v21; preserves x22.
 void hl_x86_x87_rounded_up(int vr, int vo) {
-    emit32(0x1E60C000u | (vr << 5) | 20);         // fabs d20, dvr
-    emit32(0x1E60C000u | (vo << 5) | 21);         // fabs d21, dvo
-    emit32(0x1E602000u | (21 << 16) | (20 << 5)); // fcmp d20, d21
+    emit32(0x1E60C000u | ((uint32_t)vr << 5) | 20u); // fabs d20, dvr
+    emit32(0x1E60C000u | ((uint32_t)vo << 5) | 21u); // fabs d21, dvo
+    emit32(0x1E602000u | (21 << 16) | (20 << 5));    // fcmp d20, d21
     e_cset(20, 12 /*GT*/, 1);
     e_ldr(21, 28, OFF_FPSW);
     e_movconst(23, 0x200);
