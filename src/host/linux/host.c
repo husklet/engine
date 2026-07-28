@@ -215,7 +215,7 @@ static void hl_linux_process_changed_wait(hl_host_linux *host, uint64_t deadline
 }
 
 static hl_host_result hl_linux_result(hl_status status, uint64_t value, uint64_t detail) {
-    return (hl_host_result){status, 1, value, detail};
+    return (hl_host_result){(int32_t)status, 1, value, detail};
 }
 
 static hl_status hl_linux_status_from_errno(int error) {
