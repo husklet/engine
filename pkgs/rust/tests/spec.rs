@@ -1855,6 +1855,58 @@ fn handles_extension() -> ExtensionSpec {
     }
 }
 
+#[test]
+fn provider_launch_returns_before_a_piped_stdin_read_completes() {
+    let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/sh");
+    spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
+    spec.process.argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "read line; printf 'read:%s\\n' \"$line\"".into(),
+    ];
+    spec.extensions.push(handles_extension());
+
+    let mut authority = HandlesAuthority::new();
+    authority
+        .grant(
+            ProviderId::new("engine.handles").unwrap(),
+            Arc::new(BasicHandles {
+                closes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        )
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut machine = Engine::new()
+        .spawn_with_authority(
+            spec,
+            ProcessIo {
+                stdin: hl_engine::Stdio::Piped,
+                stdout: hl_engine::Stdio::Piped,
+                stderr: hl_engine::Stdio::Null,
+            },
+            authority,
+        )
+        .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "launch waited for guest stdin"
+    );
+
+    machine
+        .take_stdin()
+        .unwrap()
+        .write_all(b"provider-input\n")
+        .unwrap();
+    let mut output = String::new();
+    machine
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(machine.wait().unwrap(), Exit::Code(0));
+    assert_eq!(output, "read:provider-input\n");
+}
+
 fn memory_extension() -> ExtensionSpec {
     ExtensionSpec {
         provider: ProviderId::new("engine.handles").unwrap(),
