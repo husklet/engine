@@ -798,7 +798,9 @@ void hl_fdcache_generation_poll(void) {
 }
 
 void hl_fdcache_fd_setpath(int fd, const char *p) {
-    if (fd >= 0 && (size_t)fd < g_fdcache.binding.fd_capacity && p && strlen(p) < HL_FDCACHE_PATH_CAPACITY)
+    if (fd < 0 || (size_t)fd >= g_fdcache.binding.fd_capacity) return;
+    g_fdcache.binding.fd_paths[fd][0] = 0;
+    if (p && strlen(p) < HL_FDCACHE_PATH_CAPACITY)
         (void)fdcache_copy_string(g_fdcache.binding.fd_paths[fd], HL_FDCACHE_PATH_CAPACITY, p);
 }
 

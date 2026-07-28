@@ -3504,12 +3504,6 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 opened = bound_relocate_lowest(opened);
                 if (opened >= 0 && have_typed_host_path) {
                     hl_fdcache_fd_setpath((int)opened, typed_host_path);
-                    // Relative *at operations resolve a guest dirfd through the
-                    // same canonical path table used by native descriptors.
-                    // A provider-backed directory previously skipped this tag,
-                    // so openat(dirfd, "child") fell back to the process cwd.
-                    if (opened < HL_NFD)
-                        snprintf(g_fdpath[(int)opened], sizeof g_fdpath[(int)opened], "%s", typed_host_path);
                     if ((lf & 3) || (lf & 0x40) || (lf & 0x200)) {
                         HL_LOGF(&g_jit_log, HL_LOG_TAG_FS, "open-cache-evict path=%s typed=1 created=%d",
                                 typed_host_path, typed_created);

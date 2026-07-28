@@ -209,7 +209,7 @@ int main(void) {
         hl_fdcache_fd_setpath(2, maximum);
         HL_CHECK(memcmp(fd_paths[2], maximum, sizeof(maximum)) == 0);
         hl_fdcache_fd_setpath(2, oversized);
-        HL_CHECK(memcmp(fd_paths[2], maximum, sizeof(maximum)) == 0);
+        HL_CHECK(fd_paths[2][0] == 0);
     }
     hl_fdcache_fd_clear(2);
     HL_CHECK(fd_paths[2][0] == 0);
