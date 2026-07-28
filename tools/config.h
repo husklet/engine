@@ -9,5 +9,6 @@ const char *hl_tool_config_log_selector(void);
 const char *hl_tool_config_matrix_scratch(void);
 const char *hl_tool_config_docker_command(void);
 const char *hl_tool_config_docker_image(void);
+const char *hl_tool_config_path(void);
 
 #endif

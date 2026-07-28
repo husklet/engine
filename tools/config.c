@@ -40,3 +40,8 @@ const char *hl_tool_config_docker_image(void) {
     const char *value = environment_value("DOCKER_IMAGE");
     return value != NULL ? value : "debian:stable-slim";
 }
+
+const char *hl_tool_config_path(void) {
+    const char *value = environment_value("PATH");
+    return value != NULL ? value : "";
+}

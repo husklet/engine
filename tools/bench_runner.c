@@ -244,9 +244,21 @@ static const char *qemu_of(const ctx_t *c) {
 }
 
 static int which_ok(const char *bin) {
-    char cmd[LINE];
-    snprintf(cmd, sizeof(cmd), "command -v %s >/dev/null 2>&1", bin);
-    return system(cmd) == 0;
+    if (!bin || !*bin) return 0;
+    if (strchr(bin, '/')) return access(bin, X_OK) == 0;
+    const char *path = hl_tool_config_path();
+    while (*path) {
+        const char *end = strchr(path, ':');
+        size_t length = end ? (size_t)(end - path) : strlen(path);
+        char candidate[LINE];
+        int written = length == 0
+                          ? snprintf(candidate, sizeof(candidate), "./%s", bin)
+                          : snprintf(candidate, sizeof(candidate), "%.*s/%s", (int)length, path, bin);
+        if (written > 0 && written < (int)sizeof(candidate) && access(candidate, X_OK) == 0) return 1;
+        if (!end) break;
+        path = end + 1;
+    }
+    return 0;
 }
 
 static int qemu_reach(const ctx_t *c, char *r, size_t n) {
