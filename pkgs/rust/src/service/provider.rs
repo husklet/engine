@@ -188,9 +188,9 @@ impl ProviderDispatcher {
                             .metadata()
                             .map(|value| {
                                 Reply::Stat(ServiceStat {
-                                    mode: value.mode,
-                                    uid: value.uid,
-                                    gid: value.gid,
+                                    mode: value.metadata.mode,
+                                    uid: value.metadata.uid,
+                                    gid: value.metadata.gid,
                                     size: value.size,
                                 })
                             })

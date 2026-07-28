@@ -1,4 +1,4 @@
-use crate::api::extension::ServiceId;
+use crate::api::extension::{Metadata, ServiceId};
 use crate::provider::LinuxError;
 use std::{collections::BTreeSet, time::SystemTime};
 
@@ -103,9 +103,7 @@ pub enum SeekOrigin {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HandleMetadata {
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
+    pub metadata: Metadata,
     pub size: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

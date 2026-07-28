@@ -1582,9 +1582,11 @@ impl OpenHandle for BasicHandle {
 
     fn metadata(&self) -> Result<hl_engine::extension::HandleMetadata, LinuxError> {
         Ok(hl_engine::extension::HandleMetadata {
-            mode: 0o666,
-            uid: 0,
-            gid: 0,
+            metadata: hl_engine::extension::Metadata {
+                mode: 0o666,
+                uid: 0,
+                gid: 0,
+            },
             size: 0,
         })
     }

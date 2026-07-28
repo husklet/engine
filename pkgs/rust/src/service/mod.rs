@@ -163,9 +163,11 @@ mod tests {
         }
         fn metadata(&self) -> Result<crate::extension::HandleMetadata, LinuxError> {
             Ok(crate::extension::HandleMetadata {
-                mode: 0o660,
-                uid: 10,
-                gid: 20,
+                metadata: crate::extension::Metadata {
+                    mode: 0o660,
+                    uid: 10,
+                    gid: 20,
+                },
                 size: self.bytes.lock().unwrap().len() as u64,
             })
         }
