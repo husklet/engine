@@ -41,6 +41,9 @@ host-wide freezes. Preserve them during engine refactors:
       usable for shared-memory requests; a renderer must not observe `broker_posix` `EPIPE`.
 - [ ] Terminating an exec updates its observable state and reaps its descendants; a killed Chrome process
       never remains `Running` or leaves an unowned translated process tree.
+- [ ] Each launch inside a shared process domain has a durable tree identity inherited across fork, exec,
+      `setsid`, and reparenting. The API can terminate and wait for that tree without terminating unrelated
+      launches in the same domain; the handle remains valid after the initial process exits.
 - [ ] Signal submission and process completion remain distinct: termination is complete only after wait
       status is observable and descendants are reaped, not when the signal request returns.
 
