@@ -244,11 +244,20 @@ static void *serve(void *opaque) {
     put16(ready + 6, READY);
     ready[20] = 1;
     if (exact(p->fd, ready, sizeof(ready), 1) != 0) return (void *)2;
-    put32(cursor, UINT32_C(0x80000003));
+    put32(cursor, UINT32_C(0xc0000003));
     cursor += 4;
     cursor = namespace_entry(cursor, 2, 0, 0755, "/run/domain", NULL);
+    put32(cursor, 0);
+    put32(cursor + 4, 0);
+    cursor += 8;
     cursor = namespace_entry(cursor, 1, 77, 0660, "/run/domain/control", NULL);
+    put32(cursor, 0);
+    put32(cursor + 4, 0);
+    cursor += 8;
     cursor = namespace_entry(cursor, 3, 0, 0777, "/run/domain/current", "control");
+    put32(cursor, 0);
+    put32(cursor + 4, 0);
+    cursor += 8;
     if (frame(p->fd, NAMESPACE_INSTALL, 0, namespace, (uint32_t)(cursor - namespace)) != 0) return (void *)3;
     if (receive(p->fd, &kind, &id, payload, sizeof(payload), &size) != 0 || kind != NAMESPACE_READY) return (void *)4;
     for (;;) {

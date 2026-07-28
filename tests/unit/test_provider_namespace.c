@@ -55,32 +55,39 @@ int main(void) {
     unsigned char *cursor = wire;
     const hl_provider_node *node;
     uint64_t generation;
+    /* Unversioned namespace wires are obsolete and rejected. */
     put32(&cursor, 1);
     entry(&cursor, 9, "/run/provider");
+    HL_CHECK(hl_provider_namespace_install(&namespace, wire, (size_t)(cursor - wire), 4, 128) == -EPROTO);
+    cursor = wire;
+    put32(&cursor, UINT32_C(0xc0000001));
+    device_v3(&cursor, HL_PROVIDER_NODE_SERVICE, 9, "/run/provider", 0, 0);
     HL_CHECK(hl_provider_namespace_install(&namespace, wire, (size_t)(cursor - wire), 4, 128) == 0);
     node = hl_provider_namespace_resolve(&namespace, "/run/provider", 13);
     HL_CHECK(node != NULL && node->service == 9 && node->mode == 0660 && node->uid == 10 && node->gid == 20);
     generation = namespace.generation;
 
     cursor = invalid;
-    put32(&cursor, 2);
-    entry(&cursor, 1, "/run/provider");
-    entry(&cursor, 2, "/run/provider/child");
+    put32(&cursor, UINT32_C(0xc0000002));
+    device_v3(&cursor, HL_PROVIDER_NODE_SERVICE, 1, "/run/provider", 0, 0);
+    device_v3(&cursor, HL_PROVIDER_NODE_SERVICE, 2, "/run/provider/child", 0, 0);
     HL_CHECK(hl_provider_namespace_install(&namespace, invalid, (size_t)(cursor - invalid), 4, 128) == -EEXIST);
     HL_CHECK(namespace.generation == generation && namespace.count == 1 &&
              hl_provider_namespace_resolve(&namespace, "/run/provider", 13) != NULL);
 
     cursor = invalid;
-    put32(&cursor, 1);
-    entry(&cursor, 3, "/run/../escape");
+    put32(&cursor, UINT32_C(0xc0000001));
+    device_v3(&cursor, HL_PROVIDER_NODE_SERVICE, 3, "/run/../escape", 0, 0);
     HL_CHECK(hl_provider_namespace_install(&namespace, invalid, (size_t)(cursor - invalid), 4, 128) == -EINVAL);
     HL_CHECK(namespace.generation == generation && namespace.count == 1);
 
     cursor = wire;
-    put32(&cursor, UINT32_C(0x80000003));
-    entry_v2(&cursor, HL_PROVIDER_NODE_DIRECTORY, 0, "/run/domain", NULL);
-    entry_v2(&cursor, HL_PROVIDER_NODE_SERVICE, 44, "/run/domain/control", NULL);
+    put32(&cursor, UINT32_C(0xc0000003));
+    device_v3(&cursor, HL_PROVIDER_NODE_DIRECTORY, 0, "/run/domain", 0, 0);
+    device_v3(&cursor, HL_PROVIDER_NODE_SERVICE, 44, "/run/domain/control", 0, 0);
     entry_v2(&cursor, HL_PROVIDER_NODE_SYMLINK, 0, "/run/domain/current", "control");
+    put32(&cursor, 0);
+    put32(&cursor, 0);
     HL_CHECK(hl_provider_namespace_install(&namespace, wire, (size_t)(cursor - wire), 4, 128) == 0);
     node = hl_provider_namespace_resolve(&namespace, "/run/domain", 11);
     HL_CHECK(node != NULL && node->kind == HL_PROVIDER_NODE_DIRECTORY && node->service == 0);
