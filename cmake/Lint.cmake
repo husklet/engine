@@ -85,3 +85,48 @@ add_custom_target(hl-lint
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   USES_TERMINAL
   COMMENT "Run hl-lint")
+
+if(HL_BUILD_TESTS)
+  add_executable(hl_lint_fake_analyzer
+    linter/tests/fake_analyzer.c)
+  set_target_properties(hl_lint_fake_analyzer PROPERTIES
+    OUTPUT_NAME "hl lint fake analyzer"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+
+  add_test(NAME lint.clang-tidy-argv
+    COMMAND $<TARGET_FILE:hl_lint>
+      --strict
+      --skip-clang-format
+      --skip-cppcheck
+      --skip-custom
+      --clang-tidy-bin $<TARGET_FILE:hl_lint_fake_analyzer>
+      --compile-commands-dir "${CMAKE_BINARY_DIR}"
+      --clang-tidy-checks "bugprone-*,performance-*"
+      --source-file "${CMAKE_SOURCE_DIR}/linter/tests/fixture.c")
+  set_tests_properties(lint.clang-tidy-argv PROPERTIES
+    LABELS "lint"
+    PASS_REGULAR_EXPRESSION "fake-analyzer: clang-tidy argv ok")
+
+  add_test(NAME lint.cppcheck-argv
+    COMMAND $<TARGET_FILE:hl_lint>
+      --strict
+      --skip-clang-format
+      --skip-clang-tidy
+      --skip-custom
+      --cppcheck-bin $<TARGET_FILE:hl_lint_fake_analyzer>
+      --include-dir "${CMAKE_SOURCE_DIR}/include"
+      --source-file "${CMAKE_SOURCE_DIR}/linter/tests/fixture.c")
+  set_tests_properties(lint.cppcheck-argv PROPERTIES
+    LABELS "lint"
+    PASS_REGULAR_EXPRESSION "fake-analyzer: cppcheck argv ok")
+
+  foreach(_case IN ITEMS clean warning-nonstrict warning-strict error usage)
+    add_test(NAME lint.exit-${_case}
+      COMMAND "${CMAKE_COMMAND}"
+        -DHL_LINT=$<TARGET_FILE:hl_lint>
+        -DHL_LINT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+        -DHL_LINT_CASE=${_case}
+        -P "${CMAKE_SOURCE_DIR}/linter/tests/assert_exit.cmake")
+    set_tests_properties(lint.exit-${_case} PROPERTIES LABELS "lint")
+  endforeach()
+endif()

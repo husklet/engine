@@ -1,0 +1,60 @@
+if(NOT DEFINED HL_LINT OR NOT DEFINED HL_LINT_SOURCE_DIR OR NOT DEFINED HL_LINT_CASE)
+  message(FATAL_ERROR "HL_LINT, HL_LINT_SOURCE_DIR and HL_LINT_CASE are required")
+endif()
+
+set(_common
+  --skip-clang-format
+  --skip-clang-tidy
+  --skip-cppcheck)
+
+if(HL_LINT_CASE STREQUAL "clean")
+  set(_expected 0)
+  set(_pattern "warnings=0 errors=0")
+  set(_args
+    ${_common}
+    --strict
+    --source-file "${HL_LINT_SOURCE_DIR}/linter/tests/fixture.c")
+elseif(HL_LINT_CASE STREQUAL "warning-nonstrict")
+  set(_expected 0)
+  set(_pattern "warnings=2 \\(non-fatal\\)")
+  set(_args
+    ${_common}
+    --max-line-length 8
+    --source-file "${HL_LINT_SOURCE_DIR}/linter/tests/fixture.c")
+elseif(HL_LINT_CASE STREQUAL "warning-strict")
+  set(_expected 1)
+  set(_pattern "strict mode enabled")
+  set(_args
+    ${_common}
+    --strict
+    --max-line-length 8
+    --source-file "${HL_LINT_SOURCE_DIR}/linter/tests/fixture.c")
+elseif(HL_LINT_CASE STREQUAL "error")
+  set(_expected 1)
+  set(_pattern "getenv usage is only allowed in explicitly whitelisted files")
+  set(_args
+    ${_common}
+    --source-file "${HL_LINT_SOURCE_DIR}/linter/tests/getenv_fixture.c")
+elseif(HL_LINT_CASE STREQUAL "usage")
+  set(_expected 2)
+  set(_pattern "unknown option")
+  set(_args --not-a-real-option)
+else()
+  message(FATAL_ERROR "unknown lint exit test case: ${HL_LINT_CASE}")
+endif()
+
+execute_process(
+  COMMAND "${HL_LINT}" ${_args}
+  RESULT_VARIABLE _status
+  OUTPUT_VARIABLE _output
+  ERROR_VARIABLE _error)
+
+if(NOT _status EQUAL _expected)
+  message(FATAL_ERROR
+    "${HL_LINT_CASE}: expected exit ${_expected}, got ${_status}\n${_output}${_error}")
+endif()
+
+if(NOT "${_output}${_error}" MATCHES "${_pattern}")
+  message(FATAL_ERROR
+    "${HL_LINT_CASE}: output did not match `${_pattern}`\n${_output}${_error}")
+endif()

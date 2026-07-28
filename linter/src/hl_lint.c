@@ -263,10 +263,16 @@ static int run_clang_format(const LintConfig *cfg, const StringList *files, Lint
 
     for (size_t i = 0; i < files->count; i++) {
         const char *file = files->items[i];
+        char *qbin = shell_quote(cfg->clang_format_bin);
         char *qfile = shell_quote(file);
-        if (!qfile) return 1;
+        if (!qbin || !qfile) {
+            free(qbin);
+            free(qfile);
+            return 1;
+        }
         char *cmd = xdup_format("%s --dry-run --Werror --style=file --ferror-limit=1 %s 2>&1",
-                                cfg->clang_format_bin, qfile);
+                                qbin, qfile);
+        free(qbin);
         free(qfile);
         if (!cmd) {
             fprintf(stdout, "error: out of memory building clang-format command\n");
@@ -324,17 +330,24 @@ static int run_clang_tidy(const LintConfig *cfg, const StringList *files, LintSt
     for (size_t i = 0; i < files->count; i++) {
         const char *file = files->items[i];
         if (!has_ext(file, ".c")) continue;
+        char *qbin = shell_quote(cfg->clang_tidy_bin);
         char *qfile = shell_quote(file);
-        if (!qfile) return 1;
+        if (!qbin || !qfile) {
+            free(qbin);
+            free(qfile);
+            return 1;
+        }
         char *qdb = shell_quote(cfg->compile_db_dir);
         if (!qdb) {
+            free(qbin);
             free(qfile);
             return 1;
         }
         char *checks = shell_quote(cfg->clang_tidy_checks ? cfg->clang_tidy_checks : "bugprone-*,clang-analyzer-*,performance-*");
         char *cmd = xdup_format(
             "%s --quiet -p %s --checks=%s --extra-arg=-std=c11 --warnings-as-errors='*' %s 2>&1",
-            cfg->clang_tidy_bin, qdb, checks, qfile);
+            qbin, qdb, checks, qfile);
+        free(qbin);
         free(qfile);
         free(qdb);
         free(checks);
@@ -376,8 +389,13 @@ static int run_cppcheck(const LintConfig *cfg, const StringList *files, LintStat
         if (!has_ext(file, ".c") && !has_ext(file, ".h")) continue;
 
         size_t base_len = 0;
+        char *qbin = shell_quote(cfg->cppcheck_bin);
+        if (!qbin) {
+            return 1;
+        }
         char *cmd = xdup_format("%s --quiet --std=c11 --enable=warning,performance,style,portability,information "
-                                "--inconclusive --suppress=missingIncludeSystem --error-exitcode=1", cfg->cppcheck_bin);
+                                "--inconclusive --suppress=missingIncludeSystem --error-exitcode=1", qbin);
+        free(qbin);
         if (!cmd) {
             fprintf(stdout, "error: out of memory building cppcheck command\n");
             return 1;
