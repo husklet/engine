@@ -1,11 +1,5 @@
 #include "hl/host_services.h"
 
-#include <stddef.h>
-
-static int hl_has_field(uint32_t size, size_t offset, size_t field_size) {
-    return size >= offset && (size_t)size - offset >= field_size;
-}
-
 static int hl_valid_group(const void *group, uint32_t abi, size_t size) {
     const uint32_t *header = group;
     return group != NULL && header[0] == abi && header[1] >= size;
@@ -18,8 +12,7 @@ static int hl_valid_file_group(const hl_host_file_services *file) {
 hl_status hl_host_services_validate(const hl_host_services *services, uint64_t required_capabilities) {
     if (services == NULL) return HL_STATUS_INVALID_ARGUMENT;
     if (services->abi != HL_HOST_SERVICES_ABI) return HL_STATUS_ABI_MISMATCH;
-    if (!hl_has_field(services->size, offsetof(hl_host_services, log), sizeof(services->log)))
-        return HL_STATUS_ABI_MISMATCH;
+    if (services->size < sizeof(*services)) return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & required_capabilities) != required_capabilities) return HL_STATUS_NOT_SUPPORTED;
     if ((services->capabilities & HL_HOST_CAP_MEMORY) != 0) {
         const hl_host_memory_services *memory = services->memory;
@@ -62,14 +55,13 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->file->path == NULL || services->file->standard_stream == NULL || services->file->readlink == NULL ||
          services->file->set_owner == NULL || services->file->resolve_beneath == NULL ||
          services->file->sync_range == NULL || services->file->sync_filesystem == NULL ||
-         services->file->open_beneath == NULL ||
-         (services->file->abi == HL_HOST_FILE_ABI &&
-          (services->file->allocate_range == NULL || services->file->filesystem_metadata == NULL ||
-           services->file->set_permissions == NULL || services->file->set_times == NULL ||
-           services->file->read_directory == NULL || services->file->make_directory == NULL ||
-           services->file->make_symlink == NULL || services->file->make_link == NULL ||
-           services->file->make_fifo == NULL || services->file->validate_private_regular == NULL ||
-           services->file->store_private_atomic == NULL || services->file->validate_private_directory == NULL))))
+         services->file->open_beneath == NULL || services->file->allocate_range == NULL ||
+         services->file->filesystem_metadata == NULL || services->file->set_permissions == NULL ||
+         services->file->set_times == NULL || services->file->read_directory == NULL ||
+         services->file->make_directory == NULL || services->file->make_symlink == NULL ||
+         services->file->make_link == NULL || services->file->make_fifo == NULL ||
+         services->file->validate_private_regular == NULL || services->file->store_private_atomic == NULL ||
+         services->file->validate_private_directory == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_PROCESS) != 0 &&
         (!hl_valid_group(services->process, HL_HOST_PROCESS_ABI, sizeof(*services->process)) ||
@@ -98,16 +90,14 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->shared_memory->resize == NULL || services->shared_memory->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_SYNC) != 0 &&
-        (!hl_has_field(services->size, offsetof(hl_host_services, sync), sizeof(services->sync)) ||
-         !hl_valid_group(services->sync, HL_HOST_SYNC_ABI, sizeof(*services->sync)) ||
+        (!hl_valid_group(services->sync, HL_HOST_SYNC_ABI, sizeof(*services->sync)) ||
          services->sync->mutex_create == NULL || services->sync->mutex_lock == NULL ||
          services->sync->mutex_unlock == NULL || services->sync->mutex_close == NULL ||
          services->sync->fork_prepare == NULL || services->sync->fork_parent == NULL ||
          services->sync->fork_child == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_COUNTER) != 0 &&
-        (!hl_has_field(services->size, offsetof(hl_host_services, counter), sizeof(services->counter)) ||
-         !hl_valid_group(services->counter, HL_HOST_COUNTER_ABI, sizeof(*services->counter)) ||
+        (!hl_valid_group(services->counter, HL_HOST_COUNTER_ABI, sizeof(*services->counter)) ||
          services->counter->create == NULL || services->counter->read == NULL || services->counter->write == NULL ||
          services->counter->get_flags == NULL || services->counter->set_flags == NULL ||
          services->counter->duplicate == NULL || services->counter->readiness == NULL ||
@@ -115,29 +105,25 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->counter->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_TRANSFER) != 0 &&
-        (!hl_has_field(services->size, offsetof(hl_host_services, transfer), sizeof(services->transfer)) ||
-         !hl_valid_group(services->transfer, HL_HOST_TRANSFER_ABI, sizeof(*services->transfer)) ||
+        (!hl_valid_group(services->transfer, HL_HOST_TRANSFER_ABI, sizeof(*services->transfer)) ||
          services->transfer->channel_pair == NULL || services->transfer->send == NULL ||
          services->transfer->receive == NULL || services->transfer->duplicate == NULL ||
          services->transfer->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_DIRECTORY) != 0 &&
-        (!hl_has_field(services->size, offsetof(hl_host_services, directory), sizeof(services->directory)) ||
-         !hl_valid_group(services->directory, HL_HOST_DIRECTORY_ABI, sizeof(*services->directory)) ||
+        (!hl_valid_group(services->directory, HL_HOST_DIRECTORY_ABI, sizeof(*services->directory)) ||
          services->directory->create == NULL || services->directory->add == NULL ||
          services->directory->modify == NULL || services->directory->remove == NULL ||
          services->directory->read == NULL || services->directory->duplicate == NULL ||
          services->directory->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_WATCH) != 0 &&
-        (!hl_has_field(services->size, offsetof(hl_host_services, watch), sizeof(services->watch)) ||
-         !hl_valid_group(services->watch, HL_HOST_WATCH_ABI, sizeof(*services->watch)) ||
+        (!hl_valid_group(services->watch, HL_HOST_WATCH_ABI, sizeof(*services->watch)) ||
          services->watch->open == NULL || services->watch->query == NULL || services->watch->drain == NULL ||
          services->watch->close == NULL))
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_STREAM) != 0 &&
-        (!hl_has_field(services->size, offsetof(hl_host_services, stream), sizeof(services->stream)) ||
-         !hl_valid_group(services->stream, HL_HOST_STREAM_ABI, sizeof(*services->stream)) ||
+        (!hl_valid_group(services->stream, HL_HOST_STREAM_ABI, sizeof(*services->stream)) ||
          services->stream->pipe_pair == NULL || services->stream->read == NULL || services->stream->write == NULL ||
          services->stream->duplicate == NULL || services->stream->close == NULL ||
          services->stream->set_status_flags == NULL || services->stream->readiness == NULL ||

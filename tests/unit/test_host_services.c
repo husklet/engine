@@ -77,6 +77,7 @@ int main(void) {
     hl_host_clock_services malformed_clock;
     hl_host_sync_services malformed_sync;
     hl_host_memory_services malformed_memory;
+    hl_host_network_services malformed_network;
     hl_host_transfer_services malformed_transfer;
     hl_host_file_services malformed_file;
     hl_host_result directory;
@@ -95,6 +96,26 @@ int main(void) {
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_TRANSFER) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_STREAM) == HL_STATUS_OK);
     HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_FILE) == HL_STATUS_OK);
+    truncated = services;
+    truncated.size = sizeof(truncated) - 1;
+    HL_CHECK(hl_host_services_validate(&truncated, 0) == HL_STATUS_ABI_MISMATCH);
+    malformed_memory = *services.memory;
+    --malformed_memory.abi;
+    truncated = services;
+    truncated.memory = &malformed_memory;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+    memset(&malformed_network, 0xff, sizeof(malformed_network));
+    malformed_network.abi = 0;
+    malformed_network.size = sizeof(malformed_network);
+    truncated = services;
+    truncated.capabilities |= HL_HOST_CAP_NETWORK;
+    truncated.network = &malformed_network;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_NETWORK) == HL_STATUS_ABI_MISMATCH);
+    malformed_sync = *services.sync;
+    --malformed_sync.abi;
+    truncated = services;
+    truncated.sync = &malformed_sync;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_SYNC) == HL_STATUS_ABI_MISMATCH);
     {
         hl_host_result source = hl_fake_host_file_create(&fake);
         hl_host_result clone;
