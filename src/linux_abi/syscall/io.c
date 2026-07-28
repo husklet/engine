@@ -54,6 +54,22 @@ static int eventfd_peer_is_engine_fd(int fd) {
     return eventfd_peer_owner(fd) >= 0;
 }
 
+static int proc_text_replace(int descriptor, const char *text, size_t size) {
+    size_t written = 0;
+    while (written < size) {
+        ssize_t result = pwrite(descriptor, text + written, size - written, (off_t)written);
+        if (result < 0) {
+            if (errno == EINTR) continue;
+            return -errno;
+        }
+        if (result == 0) return -EIO;
+        written += (size_t)result;
+    }
+    if (ftruncate(descriptor, (off_t)size) != 0) return -errno;
+    if (lseek(descriptor, (off_t)size, SEEK_SET) < 0) return -errno;
+    return 0;
+}
+
 static void eventfd_peer_vacate(int fd) {
     int owner = eventfd_peer_owner(fd);
     if (owner < 0) return;
@@ -1354,12 +1370,14 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = (uint64_t)(-EINVAL);
                 break;
             }
-            g_proc_oom_score_adj = (int)parsed;
             char rendered[32];
-            int rendered_size = snprintf(rendered, sizeof rendered, "%d\n", g_proc_oom_score_adj);
-            (void)ftruncate(wfd, 0);
-            (void)pwrite(wfd, rendered, (size_t)rendered_size, 0);
-            (void)lseek(wfd, rendered_size, SEEK_SET);
+            int rendered_size = snprintf(rendered, sizeof rendered, "%ld\n", parsed);
+            int replaced = proc_text_replace(wfd, rendered, (size_t)rendered_size);
+            if (replaced != 0) {
+                G_RET(c) = (uint64_t)replaced;
+                break;
+            }
+            g_proc_oom_score_adj = (int)parsed;
             G_RET(c) = a2;
             break;
         }
@@ -1381,13 +1399,17 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             name[take] = 0;
             char *nl = strchr(name, '\n');
             if (nl) *nl = 0;
-            snprintf(g_procname, sizeof g_procname, "%.15s", name);
-            set_guest_comm_name(g_procname, c->tid == 0);
+            char normalized[sizeof g_procname];
+            snprintf(normalized, sizeof normalized, "%.15s", name);
             char rendered[32];
-            int rendered_size = snprintf(rendered, sizeof rendered, "%s\n", g_procname);
-            (void)ftruncate(wfd, 0);
-            (void)pwrite(wfd, rendered, (size_t)rendered_size, 0);
-            (void)lseek(wfd, rendered_size, SEEK_SET);
+            int rendered_size = snprintf(rendered, sizeof rendered, "%s\n", normalized);
+            int replaced = proc_text_replace(wfd, rendered, (size_t)rendered_size);
+            if (replaced != 0) {
+                G_RET(c) = (uint64_t)replaced;
+                break;
+            }
+            memcpy(g_procname, normalized, sizeof g_procname);
+            set_guest_comm_name(g_procname, c->tid == 0);
             G_RET(c) = a2; // Linux consumes the whole write even when it truncated the stored name
             break;
         }

@@ -21,14 +21,26 @@ int main(void) {
     long adj = adj_read ? atol(b) : 100000;
     int adj_ok = adj_read && adj >= -1000 && adj <= 1000;
 
-    // write-back: set a known value and read it back.
     int wrote = 0;
-    int fd = open("/proc/self/oom_score_adj", O_WRONLY);
-    if (fd >= 0) { wrote = write(fd, "250\n", 4) == 4; close(fd); }
+    int same_fd = 0;
+    int fd = open("/proc/self/oom_score_adj", O_RDWR);
+    if (fd >= 0) {
+        int peer = dup(fd);
+        wrote = write(fd, "250\n", 4) == 4 && lseek(fd, 0, SEEK_SET) == 0 && write(fd, "-7\n", 3) == 3;
+        if (wrote && peer >= 0 && lseek(fd, 0, SEEK_SET) == 0) {
+            ssize_t n = read(peer, b, sizeof b - 1);
+            if (n >= 0) {
+                b[n] = 0;
+                same_fd = strcmp(b, "-7\n") == 0;
+            }
+        }
+        if (peer >= 0) close(peer);
+        close(fd);
+    }
     int rb_ok = 0;
-    if (wrote && pf_read("/proc/self/oom_score_adj", b, sizeof b) > 0) rb_ok = atol(b) == 250;
+    if (wrote && pf_read("/proc/self/oom_score_adj", b, sizeof b) > 0) rb_ok = atol(b) == -7;
 
-    int ok = score_ok && adj_ok && wrote && rb_ok;
+    int ok = score_ok && adj_ok && wrote && same_fd && rb_ok;
     printf("selfoom ok=%d\n", ok);
     return 0;
 }
