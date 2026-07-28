@@ -101,30 +101,27 @@ impl Event {
         if self.fields.len() > l.fields as usize {
             return Err(Error::Limit);
         }
-        let mut o = Vec::new();
-        u32p(&mut o, MAGIC);
-        u16p(&mut o, VERSION);
-        u16p(&mut o, self.kind as u16);
-        u64p(&mut o, self.host_monotonic_ns);
-        u64p(&mut o, self.guest_time_ns);
-        o.extend(self.correlation_id.to_le_bytes());
-        u64p(&mut o, self.machine);
-        optional(&mut o, self.process);
-        optional(&mut o, self.thread);
-        u64p(&mut o, self.lost_before);
+        let mut writer = Writer::new();
+        writer.u32(MAGIC);
+        writer.u16(VERSION);
+        writer.u16(self.kind as u16);
+        writer.u64(self.host_monotonic_ns);
+        writer.u64(self.guest_time_ns);
+        writer.extend(&self.correlation_id.to_le_bytes());
+        writer.u64(self.machine);
+        writer.optional(self.process);
+        writer.optional(self.thread);
+        writer.u64(self.lost_before);
         match self.registers {
             Some(ref r) => {
-                o.push(1);
-                u64p(&mut o, r.guest_pc);
-                u64p(&mut o, r.stack_pointer);
-                u64p(&mut o, r.flags);
+                writer.byte(1);
+                writer.u64(r.guest_pc);
+                writer.u64(r.stack_pointer);
+                writer.u64(r.flags);
             }
-            None => o.push(0),
+            None => writer.byte(0),
         }
-        u16p(
-            &mut o,
-            u16::try_from(self.fields.len()).map_err(|_| Error::Limit)?,
-        );
+        writer.u16(u16::try_from(self.fields.len()).map_err(|_| Error::Limit)?);
         for f in &self.fields {
             if f.value.len() > l.field_bytes as usize {
                 return Err(Error::Limit);
@@ -132,14 +129,14 @@ impl Event {
             if f.privacy as u8 > l.maximum_privacy as u8 {
                 return Err(Error::Privacy);
             }
-            bytes(&mut o, f.name.as_bytes())?;
-            o.push(f.privacy as u8);
-            bytes(&mut o, &f.value)?;
+            writer.bytes(f.name.as_bytes())?;
+            writer.byte(f.privacy as u8);
+            writer.bytes(&f.value)?;
         }
-        if o.len() > l.event_bytes as usize {
+        if writer.len() > l.event_bytes as usize {
             return Err(Error::Limit);
         }
-        Ok(o)
+        Ok(writer.finish())
     }
     /// Decodes one bounded event.
     ///
@@ -214,29 +211,59 @@ impl Event {
         })
     }
 }
-fn u16p(o: &mut Vec<u8>, v: u16) {
-    o.extend(v.to_le_bytes());
-}
-fn u32p(o: &mut Vec<u8>, v: u32) {
-    o.extend(v.to_le_bytes());
-}
-fn u64p(o: &mut Vec<u8>, v: u64) {
-    o.extend(v.to_le_bytes());
-}
-fn optional(o: &mut Vec<u8>, v: Option<u64>) {
-    match v {
-        Some(v) => {
-            o.push(1);
-            u64p(o, v);
+
+struct Writer(Vec<u8>);
+
+impl Writer {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn byte(&mut self, value: u8) {
+        self.0.push(value);
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.extend(&value.to_le_bytes());
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.extend(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.extend(&value.to_le_bytes());
+    }
+
+    fn optional(&mut self, value: Option<u64>) {
+        match value {
+            Some(value) => {
+                self.byte(1);
+                self.u64(value);
+            }
+            None => self.byte(0),
         }
-        None => o.push(0),
+    }
+
+    fn bytes(&mut self, value: &[u8]) -> Result<(), Error> {
+        self.u32(u32::try_from(value.len()).map_err(|_| Error::Limit)?);
+        self.extend(value);
+        Ok(())
+    }
+
+    fn extend(&mut self, value: &[u8]) {
+        self.0.extend_from_slice(value);
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.0
     }
 }
-fn bytes(o: &mut Vec<u8>, v: &[u8]) -> Result<(), Error> {
-    u32p(o, u32::try_from(v.len()).map_err(|_| Error::Limit)?);
-    o.extend(v);
-    Ok(())
-}
+
 struct Reader<'a> {
     b: &'a [u8],
     p: usize,
