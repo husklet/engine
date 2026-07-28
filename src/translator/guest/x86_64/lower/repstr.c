@@ -66,8 +66,10 @@ uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes,
     uint64_t span = nbytes - (uint64_t)w;
     uint64_t dlo = (uint64_t)(uintptr_t)dst - (df ? span : 0);
     uint64_t slo = (uint64_t)(uintptr_t)src - (df ? span : 0);
-    int special = g_rep_access_special != NULL &&
-                  (g_rep_access_special(slo, (size_t)nbytes, 0) || g_rep_access_special(dlo, (size_t)nbytes, 1));
+    int special = (g_rep_access_special != NULL &&
+                   (g_rep_access_special(slo, (size_t)nbytes, 0) || g_rep_access_special(dlo, (size_t)nbytes, 1))) ||
+                  (g_rep_readable != NULL && !g_rep_readable(slo, (size_t)nbytes)) ||
+                  (g_rep_writable != NULL && !g_rep_writable(dlo, (size_t)nbytes));
     if (hl_logical_vma_global_active() || special) {
         uint64_t n = nbytes / (unsigned)w;
         for (uint64_t i = 0; i < n; ++i) {
@@ -116,7 +118,10 @@ uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes,
         }
         return n;
     }
-    if (dst <= src || dst >= src + nbytes) { // disjoint, or forward-safe (dst before src)
+    uintptr_t dst_address = (uintptr_t)dst;
+    uintptr_t src_address = (uintptr_t)src;
+    if (dst_address <= src_address ||
+        dst_address - src_address >= nbytes) { // disjoint, or forward-safe (dst before src)
         memcpy(dst, src, nbytes);
         return nbytes / (unsigned)w;
     }
