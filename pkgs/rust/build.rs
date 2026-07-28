@@ -41,39 +41,57 @@ const HOSTS: &[Host] = &[
     Host {
         triple: "x86_64-pc-windows-msvc",
         archive: "hl-engine.lib",
-        // Nothing from the Unix row applies -- `m` in particular has no Windows counterpart, since
-        // the math functions live in the UCRT. These are import libraries, so they are emitted as
-        // `dylib=`: asking rustc for `static=ntdll` would make it look for `libntdll.a`.
+        // MEASURED, not predicted. This list used to be a guess at what the host services layer
+        // would need, with a note to replace it once an archive existed to read symbols from. One
+        // does now, and the guess was too large by four entries. Taking the archive's undefined
+        // symbols and subtracting its defined ones leaves 201 externals, and every one of them is
+        // either a UCRT symbol (which rustc already links for this target), a compiler-rt builtin
+        // (`__divti3`, `__udivti3`, `__modti3` -- the __int128 helpers -- and `__chkstk`, all
+        // supplied by Rust's own compiler_builtins), or an import from exactly two libraries:
         //
-        //   ntdll           the sub-Win32 surface: NtCreateFile, NtQueryInformationProcess,
-        //                   NtMapViewOfSection, NtSuspendProcess
-        //   kernel32        the bulk of Win32: CreateFileW, VirtualAlloc2, MapViewOfFile3,
-        //                   QueryPerformanceCounter, CreateProcessW, job objects. rustc's own link
-        //                   line already includes it; naming it is not depending on that
-        //   ws2_32          sockets, for the guest ABI's socket surface and the provider channel
-        //   synchronization WaitOnAddress / WakeByAddressSingle / WakeByAddressAll, the
-        //                   futex-shaped primitive the host sync layer needs. An umbrella library
-        //                   forwarding to api-ms-win-core-synchronization-l1-2-0.dll; Windows 8+
-        //   advapi32        tokens and ACLs: OpenProcessToken, the DACL entry points this crate's
-        //                   own private-file support uses, privilege adjustment
-        //   bcrypt          BCryptGenRandom, for the secure host entropy the crate advertises
+        //   kernel32  everything the host backend touches directly: VirtualAlloc/VirtualProtect,
+        //             CreateFileMappingW/MapViewOfFile, CreateProcessW and the ProcThreadAttribute
+        //             family, TlsAlloc, the SRWLOCK and CONDITION_VARIABLE primitives, the
+        //             vectored exception handler, QueryPerformanceCounter. rustc's own link line
+        //             already includes it; naming it is not depending on that.
+        //   bcrypt    BCryptGenRandom -- the secure host entropy the crate advertises, and the
+        //             source of the random suffix in the seam's mkstemp/mkdtemp.
+        //   oldnames  the POSIX SPELLINGS of the UCRT's own functions: open, close, read, write,
+        //             dup, dup2, isatty, getpid, access, chdir, getcwd, unlink, lseek, umask.
+        //             The UCRT declares all of these (its headers alias them when
+        //             _CRT_DECLARE_NONSTDC_NAMES is on, which is the default) but its import
+        //             library exports only the underscore-prefixed _open, _close and so on.
+        //             oldnames.lib is the shim of weak aliases that maps one to the other, and
+        //             without it the link fails with ~20 LNK2019s naming __imp_close and friends
+        //             -- which read like a missing system library rather than a missing alias.
         //
-        // `mincore` and `onecore` are deliberately absent. Both are umbrella import libraries for
-        // OneCore-targeted binaries; linking one into a desktop static archive replaces the
-        // individual libraries rather than supplementing them, and `mincore` in particular is
-        // superseded. Add one only if a OneCore/Store target is actually wanted.
+        // Deliberately REMOVED, each for a measured reason rather than a stylistic one:
         //
-        // This list is a prediction from what the host services layer covers and what the crate
-        // advertises -- there is no Windows archive yet to read `nm` output from. Replace it with
-        // the first archive's actual undefined symbols rather than growing it speculatively.
-        system_libraries: &[
-            "ntdll",
-            "kernel32",
-            "ws2_32",
-            "synchronization",
-            "advapi32",
-            "bcrypt",
-        ],
+        //   ntdll           not imported at all. The host backend reaches NtCreateFile,
+        //                   NtQueryInformationFile and the rest through GetProcAddress into a
+        //                   function-pointer table, so the archive carries no static reference to
+        //                   ntdll and linking its import library resolves nothing.
+        //   ws2_32          no socket call reaches this archive; the Windows host has no socket
+        //                   seam yet. The crate's OWN Winsock calls keep it on the link line --
+        //                   src/sys/windows.rs marks that extern block #[link(name = "ws2_32")].
+        //   advapi32        same: the token and ACL entry points are the crate's, not the
+        //                   archive's, and that extern block names the library itself.
+        //   synchronization WaitOnAddress is not used. The futex-shaped primitive the host sync
+        //                   layer needs is served by SRWLOCK/CONDITION_VARIABLE out of kernel32.
+        //
+        // `mincore` and `onecore` remain absent for the original reason: both are umbrella import
+        // libraries for OneCore-targeted binaries, and linking one into a desktop static archive
+        // replaces the individual libraries rather than supplementing them.
+        //
+        // These are import libraries, so they are emitted as `dylib=`: asking rustc for
+        // `static=kernel32` would make it look for `libkernel32.a`. `m` has no counterpart --
+        // the math functions live in the UCRT.
+        //
+        // This is measured against an archive that does NOT yet contain the activation layer
+        // (src/core/activation.c has no Windows arm). That layer spawns processes and passes
+        // handles, so it may add to this list; grow it from the archive's symbols then, the same
+        // way, rather than pre-emptively.
+        system_libraries: &["kernel32", "bcrypt", "oldnames"],
         refresh: "windows",
     },
 ];

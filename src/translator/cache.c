@@ -677,7 +677,19 @@ typedef struct {
    does not have -- the fork child on a PE host clears the table by writing it.
    The 16-byte granule the atomic pair publish actually depends on is asserted
    below and is satisfied by either value. */
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(_MSC_VER)
+/* MSVC-ABI Windows caps this a second time, and for a different reason than the
+   object-format one above. 8192 IS representable in the section header, and
+   ld.lld accepts it by raising the image's section alignment to match; link.exe
+   does not -- its default /ALIGN is one 4 KiB page, and an object asking for
+   more is the hard error "LNK1164: section alignment greater than /ALIGN
+   value", raised in whatever consumer links the archive rather than here.
+   Raising /ALIGN instead was rejected: it is a property of every downstream
+   image, not of this object, so it would make the engine archive impossible to
+   link without a flag no consumer can be expected to pass. The 16-byte granule
+   the atomic pair publish depends on is unaffected, and is asserted below. */
+#define IBTC_ALIGN 4096u
+#elif defined(_WIN32)
 #define IBTC_ALIGN 8192u
 #else
 #define IBTC_ALIGN IBTC_PAGE_ALIGN

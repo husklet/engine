@@ -11,6 +11,9 @@
 #
 #   --linux       build+install this host CPU's NATIVE {aarch64,x86_64}-unknown-
 #                 linux-gnu archive (needs a Linux host)
+#   --windows     build+install x86_64-pc-windows-msvc (needs a Windows host with
+#                 clang and the Visual Studio Build Tools). NOT part of the
+#                 no-flags default and NOT covered by --all: see the note below.
 #   --darwin      build+install aarch64-apple-darwin (needs Darwin, or the `mac`
 #                 bridge over a shared checkout)
 #   --emit PATH   with --darwin: write the built archive to PATH instead of
@@ -23,7 +26,21 @@
 # behaviour.
 #
 # PUBLISHED is narrower than SUPPORTED: only the two aarch64 archives are in
-# PROVENANCE.md; the x86_64 Linux one is a LOCAL build product.
+# PROVENANCE.md; the x86_64 Linux one and the Windows one are LOCAL build
+# products.
+#
+# The Windows archive is local for a reason that will not change soon, so it is
+# worth stating rather than leaving to be rediscovered. It is ~24 MB, the same
+# order as the other two, and crates.io's limit is 10 MiB COMPRESSED for the
+# whole package; the two published archives already bring that to ~4.9 MB, and a
+# third leaves no room. It is also not yet publishable on its own terms: it is
+# built without src/core/activation.c, which has no Windows arm, so it is
+# missing the nine hl_activation_* entry points pkgs/rust/src/ffi.rs declares and
+# any link against it from Rust fails on exactly those names. Hence: buildable
+# on demand, never committed (pkgs/rust/assets/lib/.gitignore whitelists only
+# the two published archives), and absent from --all and from the no-flags
+# default so that a routine refresh on a Unix host cannot be blamed for skipping
+# it.
 #
 # Split flow: on the mac, `--darwin --emit /somewhere/libhl-engine.a`; carry the
 # file over; on the Linux host, `--linux` then `--darwin --from <file>` then
@@ -40,6 +57,7 @@ cd "$root"
 
 do_linux=0
 do_darwin=0
+do_windows=0
 do_provenance=0
 darwin_from=
 darwin_emit=
@@ -49,7 +67,9 @@ while [ "$#" -gt 0 ]; do
 	case $1 in
 	--linux) do_linux=1 ;;
 	--darwin) do_darwin=1 ;;
+	--windows) do_windows=1 ;;
 	--provenance) do_provenance=1 ;;
+	# --windows is deliberately NOT here; see the header note.
 	--all) do_linux=1 do_darwin=1 do_provenance=1 ;;
 	--from)
 		shift
@@ -74,7 +94,7 @@ while [ "$#" -gt 0 ]; do
 	shift
 done
 
-if [ "$do_linux$do_darwin$do_provenance" = "000" ]; then
+if [ "$do_linux$do_darwin$do_windows$do_provenance" = "0000" ]; then
 	do_linux=1
 	do_darwin=1
 	do_provenance=1
@@ -115,8 +135,10 @@ linux_asset=pkgs/rust/assets/lib/$linux_target/libhl-engine.a
 darwin_asset=pkgs/rust/assets/lib/aarch64-apple-darwin/libhl-engine.a
 # What PROVENANCE.md certifies and `cargo publish` ships; never host-derived.
 published_linux_asset=pkgs/rust/assets/lib/aarch64-unknown-linux-gnu/libhl-engine.a
+windows_asset=pkgs/rust/assets/lib/x86_64-pc-windows-msvc/hl-engine.lib
 linux_build=$BUILD/crate-archive-linux
 mac_build=$BUILD/crate-archive-macos
+windows_build=$BUILD/crate-archive-windows
 
 # Publish through a sibling file, then rename. Most importantly, the Darwin
 # copy, inspection, and rename all happen on the Mac: a Linux copy from the
@@ -139,6 +161,31 @@ if [ "$do_linux" = 1 ]; then
 	tools/validate_crate_archive.sh "$linux_target" "$linux_asset.tmp"
 	mv -f "$linux_asset.tmp" "$linux_asset"
 	tools/validate_crate_archive.sh "$linux_target" "$linux_asset"
+fi
+
+if [ "$do_windows" = 1 ]; then
+	case "$(uname -s)" in
+	MINGW* | MSYS* | CYGWIN* | Windows_NT) ;;
+	*)
+		printf 'refresh-crate-archives: --windows needs a Windows host; this one is %s\n' \
+			"$(uname -s)" >&2
+		printf 'refresh-crate-archives: the archive is MSVC-ABI COFF and needs the VS Build Tools\n' >&2
+		exit 1
+		;;
+	esac
+	printf 'refresh-crate-archives: building the x86_64-pc-windows-msvc archive\n'
+	# The MSVC-ABI toolchain, NOT cmake/toolchains/x86_64-windows.cmake: rustup's
+	# default host triple here is x86_64-pc-windows-msvc, and a mingw-w64 archive
+	# cannot be linked into that ABI at all.
+	"$CMAKE" -S "$root" -B "$windows_build" -G Ninja \
+		-DCMAKE_TOOLCHAIN_FILE="$root/cmake/toolchains/x86_64-windows-msvc.cmake" \
+		-DHL_BUILD_TESTS=OFF
+	"$NINJA" -C "$windows_build" hl-engine-crate-archive
+	mkdir -p "$(dirname -- "$windows_asset")"
+	install -m 0644 "$windows_build/package/windows-x86_64/hl-engine.lib" "$windows_asset.tmp"
+	tools/validate_crate_archive.sh x86_64-pc-windows-msvc "$windows_asset.tmp"
+	mv -f "$windows_asset.tmp" "$windows_asset"
+	printf 'refresh-crate-archives: installed %s (local only; not published)\n' "$windows_asset"
 fi
 
 if [ "$do_darwin" = 1 ] && [ -z "$darwin_from" ]; then

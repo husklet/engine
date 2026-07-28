@@ -5,6 +5,7 @@ set -euo pipefail
 if [ "$#" -ne 2 ]; then
 	printf 'usage: %s <host-triple> <archive>\n' "$0" >&2
 	printf '  host-triple: aarch64-apple-darwin | {aarch64,x86_64}-unknown-linux-gnu\n' >&2
+	printf '               | x86_64-pc-windows-msvc\n' >&2
 	exit 2
 fi
 
@@ -21,11 +22,75 @@ target_arch=${target%%-*}
 case "$target" in
 aarch64-apple-darwin) target_os=darwin ;;
 aarch64-unknown-linux-gnu | x86_64-unknown-linux-gnu) target_os=linux ;;
+x86_64-pc-windows-msvc) target_os=windows ;;
 *)
 	printf 'validate-crate-archive: unknown host triple %s\n' "$target" >&2
 	exit 2
 	;;
 esac
+
+# The Windows archive is checked STRUCTURALLY only, on any host, and never
+# link-tested. Two reasons, and the second is the one that matters:
+#
+#   * the tools differ. It is an MSVC-format COFF archive, so `nm` and `ar` are
+#     llvm-nm and llvm-ar, and the linker is link.exe -- none of which the Linux
+#     or Darwin lanes have, and the deferral machinery below is built around the
+#     ELF/Mach-O pair.
+#   * there is nothing to link it INTO yet. The link test the other two hosts run
+#     compiles tools/dual_backend_e2e_runner.c against the archive, and that
+#     runner needs the activation entry points. src/core/activation.c has no
+#     Windows arm, so this archive does not contain them and the test would fail
+#     for a reason that has nothing to do with the archive's integrity.
+#
+# So: format, members, and the three required symbols. Restore the link test in
+# the same shape as the others once the archive carries an activation layer.
+if [ "$target_os" = windows ]; then
+	[ -s "$archive" ] || {
+		printf 'validate-crate-archive: missing or empty archive: %s\n' "$archive" >&2
+		exit 1
+	}
+	[ "$(head -c 8 "$archive")" = '!<arch>' ] || {
+		printf 'validate-crate-archive: %s is not an ar archive\n' "$archive" >&2
+		exit 1
+	}
+	nm_tool=${HL_LLVM_NM:-llvm-nm}
+	if command -v "$nm_tool" >/dev/null 2>&1; then
+		# tr -d '\r': llvm-nm terminates lines CRLF on a Windows host, so a
+		# `$`-anchored match against a symbol name never fires and every
+		# required symbol is reported missing while being plainly present.
+		symbols=$("$nm_tool" --defined-only "$archive" 2>/dev/null | tr -d '\r')
+		[ -n "$symbols" ] || {
+			printf 'validate-crate-archive: %s defines no symbols\n' "$archive" >&2
+			exit 1
+		}
+		# A here-string rather than `printf ... | grep -q`. Under `set -o
+		# pipefail` that pipeline reports FAILURE on success: grep -q exits the
+		# moment it matches, printf takes EPIPE, and the pipeline's status is
+		# printf's. Every symbol was then reported missing while being present,
+		# which is the most misleading direction for this check to fail in.
+		for symbol in hl_engine_create hl_host_process_open hl_production_clock_gettime; do
+			grep -Eq "[[:space:]]${symbol}$" <<<"$symbols" || {
+				printf 'validate-crate-archive: %s is missing required symbol %s\n' \
+					"$archive" "$symbol" >&2
+				exit 1
+			}
+		done
+		printf 'validated crate archive (structural; MSVC-ABI COFF): %s\n' "$archive"
+	else
+		# The byte-string fallback the deferral path below also uses: a symbol
+		# name is present in the archive's string table whether or not a COFF
+		# reader is installed.
+		for symbol in hl_engine_create hl_host_process_open hl_production_clock_gettime; do
+			grep -aq "$symbol" "$archive" || {
+				printf 'validate-crate-archive: %s is missing required symbol %s\n' \
+					"$archive" "$symbol" >&2
+				exit 1
+			}
+		done
+		printf 'validated crate archive (structural, no llvm-nm): %s\n' "$archive"
+	fi
+	exit 0
+fi
 
 # An archive can only be inspected and linked on its own kind of host: the
 # Darwin half needs Apple libtool/nm/clang, the Linux half needs GNU nm and the

@@ -68,6 +68,28 @@ else()
   set(HL_PACKAGE_ARCH_DIR ${CMAKE_BINARY_DIR}/package/linux-${HL_HOST_ARCH})
 endif()
 
+# Whether the C link needs an EXPLICIT archive group. The engine archives are
+# mutually recursive, so GNU ld has to be handed --start-group/--end-group,
+# which CMake spells $<LINK_GROUP:RESCAN,...>. Two of this tree's linkers reject
+# that generator expression at CONFIGURE time -- "Feature 'RESCAN' ... is not
+# supported for the 'C' link language" -- and neither needs it, because both
+# rescan archives to a fixed point on their own:
+#
+#   * Apple's linker, on a Darwin host.
+#   * the MSVC linker, reached through the clang driver when the target ABI is
+#     *-windows-msvc (cmake/toolchains/x86_64-windows-msvc.cmake). Note this is
+#     an ABI test and NOT a host-OS test: the mingw-w64 Windows toolchain drives
+#     ld.lld with the GNU driver and DOES need the group.
+#
+# Named once here because three call sites need the same answer and each had
+# been deriving it separately -- Phase 4's from the host OS alone, which was
+# right until a second Windows ABI existed.
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_C_COMPILER_TARGET MATCHES "windows-msvc")
+  set(HL_LINK_GROUP_RESCAN FALSE)
+else()
+  set(HL_LINK_GROUP_RESCAN TRUE)
+endif()
+
 # ---------------------------------------------------------------------------
 # Static-analysis target family (lint, format checks, CI-quality gates).
 # ---------------------------------------------------------------------------
@@ -228,6 +250,7 @@ set(WINDOWS_HOST_SOURCES
   src/host/windows/ntpath.c src/host/windows/file.c src/host/windows/process.c
   src/host/windows/range.c src/host/windows/system.c src/host/windows/directory.c
   src/host/windows/child.c src/host/windows/fork_wire.c
+  src/host/windows/counter.c src/host/windows/event.c src/host/windows/stream.c
   src/host/windows/private.c src/host/windows/resolve.c src/host/windows/math.c
   src/host/range.c src/host/file.c src/host/clock.c src/host/sync.c)
 
