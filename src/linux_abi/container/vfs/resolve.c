@@ -167,9 +167,8 @@ restart:;
             int kl = snprintf(dkey, sizeof dkey, "%s%s", g_rootfs_canon, dnorm);
             char dcanon[DC_KEYMAX];
             int dk;
-            if (kl > 0 && (size_t)kl < sizeof dkey &&
-                hl_fdcache_dentry_lookup(dkey, dcanon, sizeof dcanon, &dk) && dk == 0 &&
-                !strcmp(dcanon, dkey)) {
+            if (kl > 0 && (size_t)kl < sizeof dkey && hl_fdcache_dentry_lookup(dkey, dcanon, sizeof dcanon, &dk) &&
+                dk == 0 && !strcmp(dcanon, dkey)) {
                 int d = open(dcanon, O_RDONLY | O_DIRECTORY);
                 if (d >= 0) {
                     if (nofollow) {
@@ -227,7 +226,7 @@ restart:;
                 vol_parent_guest(volidx, parent, sizeof parent);
                 char next[8192];
                 int joined = parent[1] == 0 ? path_copy(next, sizeof next, tail[0] ? tail : "/")
-                                             : path_concat(next, sizeof next, parent, tail);
+                                            : path_concat(next, sizeof next, parent, tail);
                 if (joined != 0) {
                     ret = -ENAMETOOLONG;
                     goto out;
@@ -272,7 +271,8 @@ restart:;
                     ret = -ENAMETOOLONG;
                     goto out;
                 }
-                for (int i = 0; i < nf; i++) close(fds[i]);
+                for (int i = 0; i < nf; i++)
+                    close(fds[i]);
                 goto restart;
             } else
                 // tail already carries its leading '/' (or is empty)
@@ -360,10 +360,9 @@ static int vfs_host_error(hl_status status) {
     }
 }
 
-static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, uint32_t host_access,
-                          uint32_t host_creation, uint32_t permissions, int typed,
-                          int (*reserve)(void *), void *reserve_opaque, int (*dirfd_error)(int), int *created,
-                          char *final, size_t final_size, hl_open_plan *plan) {
+static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, uint32_t host_access, uint32_t host_creation,
+                          uint32_t permissions, int typed, int (*reserve)(void *), void *reserve_opaque,
+                          int (*dirfd_error)(int), int *created, char *final, size_t final_size, hl_open_plan *plan) {
     char absolute[8192];
     hl_open_request request;
     int native_parent;
@@ -415,8 +414,8 @@ static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, uint32_t 
        into its parent namespace. The host-service resolver is deliberately rooted in one selected
        jail, so feeding it the same `..` path would clamp at that jail and overwrite the correct
        native result (for example `/data/..` would remain inside the `/data` bind). */
-    if (plan->kind == HL_OPEN_HOST_PATH && !path_has_dotdot(absolute) && g_host_services &&
-        g_host_services->file && g_host_services->file->resolve_beneath) {
+    if (plan->kind == HL_OPEN_HOST_PATH && !path_has_dotdot(absolute) && g_host_services && g_host_services->file &&
+        g_host_services->file->resolve_beneath) {
         char rooted[8192];
         const char *relative;
         hl_host_handle route_root = g_root_handle;
@@ -443,9 +442,9 @@ static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, uint32_t 
         if (!*relative) relative = ".";
         if (route_root != HL_HOST_HANDLE_INVALID &&
             g_host_services->file
-                ->resolve_beneath(g_host_services->context, route_root, relative, strlen(relative), policy,
-                                  &resolved)
-                .status == HL_STATUS_OK) {
+                    ->resolve_beneath(g_host_services->context, route_root, relative, strlen(relative), policy,
+                                      &resolved)
+                    .status == HL_STATUS_OK) {
             plan->directory = resolved.parent;
             plan->target = resolved.target;
             plan->target_type = resolved.target_type;
@@ -467,21 +466,20 @@ static int jail_open_plan(int dirfd, const char *raw, uint32_t intent, uint32_t 
                     return reserve_result;
                 }
                 if ((host_creation & HL_HOST_FILE_CREATE) != 0) {
-                    opened = g_host_services->file->open_beneath(
-                        g_host_services->context, route_root, relative, strlen(relative),
-                        host_access | HL_HOST_FILE_NONBLOCK,
-                        host_creation | HL_HOST_FILE_EXCLUSIVE, permissions, open_policy);
+                    opened = g_host_services->file->open_beneath(g_host_services->context, route_root, relative,
+                                                                 strlen(relative), host_access | HL_HOST_FILE_NONBLOCK,
+                                                                 host_creation | HL_HOST_FILE_EXCLUSIVE, permissions,
+                                                                 open_policy);
                     if (opened.status == HL_STATUS_OK)
                         opened_created = 1;
-                    else if (opened.status == HL_STATUS_ALREADY_EXISTS &&
-                             (host_creation & HL_HOST_FILE_EXCLUSIVE) == 0)
+                    else if (opened.status == HL_STATUS_ALREADY_EXISTS && (host_creation & HL_HOST_FILE_EXCLUSIVE) == 0)
                         opened = g_host_services->file->open_beneath(
                             g_host_services->context, route_root, relative, strlen(relative),
                             host_access | HL_HOST_FILE_NONBLOCK, host_creation, permissions, open_policy);
                 } else {
-                    opened = g_host_services->file->open_beneath(
-                        g_host_services->context, route_root, relative, strlen(relative),
-                        host_access | HL_HOST_FILE_NONBLOCK, host_creation, permissions, open_policy);
+                    opened = g_host_services->file->open_beneath(g_host_services->context, route_root, relative,
+                                                                 strlen(relative), host_access | HL_HOST_FILE_NONBLOCK,
+                                                                 host_creation, permissions, open_policy);
                 }
                 if (resolved.target != HL_HOST_HANDLE_INVALID)
                     (void)g_host_services->file->close(g_host_services->context, resolved.target);

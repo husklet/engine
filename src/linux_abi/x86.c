@@ -13,9 +13,9 @@ static void *elf_host_map(void *context, void *address, size_t length, uint32_t 
     uint32_t flags = HL_HOST_MEMORY_PRIVATE;
     if (placement == HL_ELF_MAP_FIXED) flags |= HL_HOST_MEMORY_FIXED;
     state->mapping = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(state->mapping), 0, 0, 0, 0};
-    hl_host_result result = host->memory->map_anonymous(host->context, (uint64_t)(uintptr_t)address, length,
-                                                        HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, flags,
-                                                        &state->mapping);
+    hl_host_result result =
+        host->memory->map_anonymous(host->context, (uint64_t)(uintptr_t)address, length,
+                                    HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, flags, &state->mapping);
     return result.status == HL_STATUS_OK ? (void *)(uintptr_t)state->mapping.address : NULL;
 }
 
@@ -379,13 +379,12 @@ static void load_elf(const char *path, struct loaded *out) {
     } else
         base = hl_elf_place_image(elf_host_map, &map_context, NULL, span, NULL);
     if (base == NULL) {
-        fprintf(stderr, "hl-engine: load_elf: cannot map x86 guest image (%llu bytes)\n",
-                (unsigned long long)span);
+        fprintf(stderr, "hl-engine: load_elf: cannot map x86 guest image (%llu bytes)\n", (unsigned long long)span);
         exit(1);
     }
     if (hl_exec_mapping_add((uint64_t)base, span, map_context.mapping.handle) != 0) {
         (void)effective_host_services()->memory->release(effective_host_services()->context,
-                                                          map_context.mapping.handle);
+                                                         map_context.mapping.handle);
         fprintf(stderr, "hl-engine: loader mapping registry exhausted\n");
         exit(1);
     }
@@ -534,9 +533,9 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     const hl_host_services *host = effective_host_services();
     hl_host_memory_mapping stack_mapping = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(stack_mapping), 0, 0, 0, 0};
     uint64_t stack_address = hl_option_get("HL_CHECKPOINT") ? UINT64_C(0x0000058000000000) : 0;
-    hl_host_result stack_result = host->memory->map_anonymous(host->context, stack_address, LOGUARD + SZ + GUARD,
-                                                              HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
-                                                              HL_HOST_MEMORY_PRIVATE, &stack_mapping);
+    hl_host_result stack_result =
+        host->memory->map_anonymous(host->context, stack_address, LOGUARD + SZ + GUARD,
+                                    HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_PRIVATE, &stack_mapping);
     if (stack_result.status != HL_STATUS_OK) {
         fprintf(stderr, "hl-engine: cannot map x86 guest main stack (host status %d)\n", stack_result.status);
         exit(1);
@@ -655,12 +654,12 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         {16, x86_guest_hwcap()},
         {15, plat},
         {25, rnd},
-        {23, 0},       // AT_SECURE 0
-        {17, 100},     // AT_CLKTCK
-        {26, 0},       // AT_HWCAP2 -- 0 by derivation, see x86_guest_hwcap()
+        {23, 0},      // AT_SECURE 0
+        {17, 100},    // AT_CLKTCK
+        {26, 0},      // AT_HWCAP2 -- 0 by derivation, see x86_guest_hwcap()
         {31, execfn}, // AT_EXECFN -> execve pathname string (glibc/Rust/uutils multicall read it). Missing it
                       // made getauxval(AT_EXECFN)==0 -> strlen(0) -> SIGSEGV.
-        {0, 0},        // AT_NULL terminator
+        {0, 0},       // AT_NULL terminator
     };
     int naux = (int)(sizeof aux / sizeof aux[0]);
     size_t nslots = 1 + (argc + 1) + (envc + 1) + (size_t)naux * 2;
@@ -827,10 +826,10 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
     if (va < g_nonpie_lo || va >= g_nonpie_hi) return 0;
     ucontext_t *uc = (ucontext_t *)ucv;
     uint32_t insn = *(uint32_t *)(HL_HOST_UC_PC(uc));
-    uint64_t real = va + g_nonpie_bias;      // the actual mapped location of the datum
-    uint64_t *X = HL_HOST_UC_REGS(uc); // x[0..30]
+    uint64_t real = va + g_nonpie_bias; // the actual mapped location of the datum
+    uint64_t *X = HL_HOST_UC_REGS(uc);  // x[0..30]
     __uint128_t *V = HL_HOST_UC_VREGS(uc);
-    int v = (insn >> 26) & 1;                // SIMD&FP?
+    int v = (insn >> 26) & 1; // SIMD&FP?
     int rt = insn & 0x1F;
     // Load/store-register IMMEDIATE family: bits[29:27]==111, and either the scaled unsigned-imm form
     // (bit24==1) or the unscaled ldur/stur form (bit24==0 && bit21==0 && bits[11:10]==00). This EXCLUDES
@@ -979,7 +978,7 @@ static int lse_align_fixup(int sig, siginfo_t *si, void *ucv) {
 #endif
     ucontext_t *uc = (ucontext_t *)ucv;
     uint64_t hpc = (uint64_t)HL_HOST_UC_PC(uc);
-    extern int jit_pc_in_cache(uint64_t pc, uint64_t * base);
+    extern int jit_pc_in_cache(uint64_t pc, uint64_t *base);
     if (!jit_pc_in_cache(hpc, NULL)) return 0; // not code we emitted
     uint32_t insn = *(uint32_t *)hpc;
     int size = insn >> 30; // 0=B 1=H 2=W 3=X
@@ -1060,7 +1059,7 @@ static int lse_align_fixup(int sig, siginfo_t *si, void *ucv) {
 #if defined(HL_HOST_HAS_A64_CONTEXT)
 
 static int ldapr_align_fixup(int sig, siginfo_t *si, void *ucv) {
-    extern int g_host_lrcpc;                     // set from host AT_HWCAP (emit.c); 0 => no LDAPR emitted
+    extern int g_host_lrcpc; // set from host AT_HWCAP (emit.c); 0 => no LDAPR emitted
     if (!g_host_lrcpc || sig != SIGBUS || !si || !ucv) return 0; // inert on the LDR+DMB fallback path
 #ifdef BUS_ADRALN
     if (si->si_code != BUS_ADRALN) return 0;
@@ -1087,7 +1086,7 @@ static int ldapr_align_fixup(int sig, siginfo_t *si, void *ucv) {
     uint64_t val = 0;
     memcpy(&val, (const void *)addr, width);        // little-endian host==guest; zero-extends to 64 bits
     __asm__ __volatile__("dmb ishld" ::: "memory"); // acquire: order the load before later loads/stores
-    if (rt != 31) X[rt] = val;                       // Rt==31 would be ZR (discard); never emitted for a load
+    if (rt != 31) X[rt] = val;                      // Rt==31 would be ZR (discard); never emitted for a load
     HL_HOST_UC_PC(uc) += 4;
     return 1;
 }
@@ -1226,9 +1225,8 @@ void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
             /* The accessor only reads immutable process-global pointers. Cache it so the signal path
              * performs one accessor read followed by one explicitly signal-context-safe provider call. */
             const hl_host_services *host = effective_host_services();
-            if (host->memory->repair_signal_page(
-                    host->context, pg, UINT64_C(4096),
-                    HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE)) {
+            if (host->memory->repair_signal_page(host->context, pg, UINT64_C(4096),
+                                                 HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE)) {
                 if (adjacent)
                     g_growmaps++;
                 else
@@ -1285,6 +1283,7 @@ __attribute__((constructor)) static void jit86_sync_fault_guards_constructor(voi
 
 #if defined(_WIN32)
 #include "../host/windows/fault.h"
+
 /*
  * The single classifier the host's vectored exception handler calls, standing in for all five sigactions
  * the POSIX arms install.
@@ -1328,7 +1327,9 @@ static int hl_windows_guest_fault(hl_windows_fault *fault, void *context) {
     case HL_WINDOWS_FAULT_BUS: jit86_lazyguard((int)fault->kind, &info, fault->context); return HL_WINDOWS_FAULT_RESUME;
     case HL_WINDOWS_FAULT_ILL:
     case HL_WINDOWS_FAULT_FPE:
-    case HL_WINDOWS_FAULT_TRAP: jit86_syncguard((int)fault->kind, &info, fault->context); return HL_WINDOWS_FAULT_RESUME;
+    case HL_WINDOWS_FAULT_TRAP:
+        jit86_syncguard((int)fault->kind, &info, fault->context);
+        return HL_WINDOWS_FAULT_RESUME;
     default:
         /* Not a class any guard models -- a C++ throw, a debugger breakpoint the
          * debugger owns, a language exception from a loaded DLL. Declining lets

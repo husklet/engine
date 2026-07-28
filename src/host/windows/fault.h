@@ -99,11 +99,7 @@ enum {
  * infer write-ness from "a read would have been legal under this protection, so
  * it must have been a write" can stop inferring on this host.
  */
-enum {
-    HL_WINDOWS_FAULT_ACCESS_READ = 0,
-    HL_WINDOWS_FAULT_ACCESS_WRITE = 1,
-    HL_WINDOWS_FAULT_ACCESS_EXECUTE = 2
-};
+enum { HL_WINDOWS_FAULT_ACCESS_READ = 0, HL_WINDOWS_FAULT_ACCESS_WRITE = 1, HL_WINDOWS_FAULT_ACCESS_EXECUTE = 2 };
 
 enum {
     /* address / access are meaningful. Set for SEGV and BUS, clear otherwise. */
@@ -274,7 +270,7 @@ typedef struct hl_windows_fault_pad {
                          "1:\n"                                                                                        \
                          :                                                                                             \
                          : "r"(pad)                                                                                    \
-                         : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4",       \
+                         : "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4",      \
                            "xmm5", "cc", "memory")
 
 /* Point a register file at the pad's landing site. The CONTEXT form is the one a

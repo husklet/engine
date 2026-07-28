@@ -21,7 +21,9 @@
 /* --- 1. constructor attribute: how production backends self-register ------ */
 static int constructor_ran;
 
-__attribute__((constructor)) static void probe_constructor(void) { constructor_ran = 1; }
+__attribute__((constructor)) static void probe_constructor(void) {
+    constructor_ran = 1;
+}
 
 /* --- 2. file-scope __asm__: the run_block/block_return trampoline shape --- */
 __asm__(".text\n"
@@ -90,7 +92,7 @@ static int probe_dual_alias_jit(void) {
     if (rw != NULL && rx != NULL) {
         memcpy(rw, code, sizeof code);
         FlushInstructionCache(GetCurrentProcess(), rx, sizeof code);
-        fn = (uint64_t(*)(uint64_t))(void *)rx;
+        fn = (uint64_t (*)(uint64_t))(void *)rx;
         ok = fn(41) == 42;
     }
     if (rw != NULL) UnmapViewOfFile(rw);

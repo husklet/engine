@@ -94,8 +94,8 @@ static int jit_publish_code(const void *address, size_t size) {
 
 static int code_mapping_reserve(hl_host_code_mapping *mapping, int dual_alias) {
     uint64_t alignment;
-    if (hl_host_services_validate(&g_jit_services,
-                                  HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING) != HL_STATUS_OK)
+    if (hl_host_services_validate(&g_jit_services, HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING) !=
+        HL_STATUS_OK)
         return -1;
     if (g_jit_log.host == NULL) (void)hl_log_context_init(&g_jit_log, &g_jit_services, hl_option_get("HL_LOG"));
     /* Must start on a host page boundary: reserve_code rejects anything smaller, and the dual-alias path
@@ -247,12 +247,16 @@ static uint32_t g_map_tombstone_epoch[JIT_MAP_N];
 // records source boundaries; execution performs no checkpoint writes. Epoch publication makes signal-side
 // reads coherent, while the circular bound caps metadata at 8 MiB.
 #define JIT_INSN_MAP_N (1u << 18)
-typedef struct { uint64_t host, end, guest; uint32_t epoch; } jit_instruction_map_entry;
+
+typedef struct {
+    uint64_t host, end, guest;
+    uint32_t epoch;
+} jit_instruction_map_entry;
+
 static jit_instruction_map_entry g_instruction_map[JIT_INSN_MAP_N];
 static uint32_t g_instruction_map_next;
 static int jit_host_to_rwpc(uint64_t host_pc, uint64_t *rwpc);
-static inline __attribute__((always_inline)) int
-jit_resolve_rw_code(void *rwcode, void **rxcode, uint64_t *generation);
+static inline __attribute__((always_inline)) int jit_resolve_rw_code(void *rwcode, void **rxcode, uint64_t *generation);
 static void ibtc_drop_target(uint64_t target);
 
 static void jit_instruction_map_put(uint64_t host, uint64_t end, uint64_t guest) {
@@ -285,7 +289,10 @@ static int jit_instruction_guest_pc(uint64_t host_pc, uint64_t *guest_pc) {
     return jit_instruction_map_lookup(rwpc, guest_pc);
 }
 
-static int map_live(uint32_t index) { return g_map[index].generation == g_map_epoch; }
+static int map_live(uint32_t index) {
+    return g_map[index].generation == g_map_epoch;
+}
+
 static int map_tombstone(uint32_t index) {
     return !map_live(index) && g_map_tombstone_epoch[index] == g_map_epoch;
 }
@@ -415,6 +422,7 @@ static void txpg_put(uint64_t p) { // insert one guest page (addr>>12) into the 
 //     blocks were never line-recorded even by the eager engine).
 static int g_txln_active;
 static int g_txln_prime; // first SMC after activation must invalidate wholesale (no lines recorded yet)
+
 static void txln_activate(void) {
     if (g_txln_active) return;
     g_txln_active = 1;
@@ -552,9 +560,8 @@ static void map_put(uint64_t gpc, uint64_t guest_start, uint64_t guest_end, void
             g_map[j].host = host;
             g_map[j].body = body;
             g_map_guest_start[j] = guest_start;
-            g_map_guest_end[j] = guest_end > guest_start
-                                     ? guest_end
-                                     : (guest_start == UINT64_MAX ? UINT64_MAX : guest_start + 1);
+            g_map_guest_end[j] =
+                guest_end > guest_start ? guest_end : (guest_start == UINT64_MAX ? UINT64_MAX : guest_start + 1);
             g_map_cache_gen[j] = g_cache_gen;
             g_map_tombstone_epoch[j] = 0;
             g_map[j].generation = g_map_epoch;
@@ -568,9 +575,8 @@ static void map_put(uint64_t gpc, uint64_t guest_start, uint64_t guest_end, void
         g_map[j].host = host;
         g_map[j].body = body;
         g_map_guest_start[j] = guest_start;
-        g_map_guest_end[j] = guest_end > guest_start
-                                 ? guest_end
-                                 : (guest_start == UINT64_MAX ? UINT64_MAX : guest_start + 1);
+        g_map_guest_end[j] =
+            guest_end > guest_start ? guest_end : (guest_start == UINT64_MAX ? UINT64_MAX : guest_start + 1);
         g_map_cache_gen[j] = g_cache_gen;
         g_map_tombstone_epoch[j] = 0;
         g_map[j].generation = g_map_epoch;
@@ -840,6 +846,7 @@ static uint64_t g_t2thresh = 1000; // back-edge iterations before promotion (TIE
 static uint64_t g_prof_t2;         // PROF: blocks promoted to tier-2
 static int g_tier2_build;          // set while recompiling a block as tier-2 (fold, no counter, no map_put)
 static void *g_last_body;          // body pointer of the most recent translate_block (for the promoter)
+
 // Kill-switch + threshold env, read ONCE (idempotent static guard; the W4E diff read these in the target
 // main(), relocated here to keep the integration inside the allowed jit/ + frontend/aarch64/ units).
 static void tier2_env_init(void) {
@@ -892,13 +899,20 @@ static int g_npend;
 // flush (pend_reset -> g_npend=0) invalidates every stale head in O(1) instead of memset-ing the table.
 #define PEND_CAP (1 << 16)
 #define PBUCKET_N (1 << 16)
-static int32_t g_pnext[PEND_CAP];  // intrusive doubly-linked bucket chain over g_pend indices
+static int32_t g_pnext[PEND_CAP]; // intrusive doubly-linked bucket chain over g_pend indices
 static int32_t g_pprev[PEND_CAP];
 static int32_t g_pbhead[PBUCKET_N];   // bucket head index (valid only when g_pbepoch == g_pend_epoch)
 static uint32_t g_pbepoch[PBUCKET_N]; // zero-init: reads as "empty" against g_pend_epoch (starts at 1)
 static uint32_t g_pend_epoch = 1;     // never 0 in use, so zero-init buckets always read empty
-static inline uint32_t pbucket_of(uint64_t target) { return (uint32_t)((target >> 2) & (PBUCKET_N - 1)); }
-static inline int32_t pbucket_head(uint32_t h) { return g_pbepoch[h] == g_pend_epoch ? g_pbhead[h] : -1; }
+
+static inline uint32_t pbucket_of(uint64_t target) {
+    return (uint32_t)((target >> 2) & (PBUCKET_N - 1));
+}
+
+static inline int32_t pbucket_head(uint32_t h) {
+    return g_pbepoch[h] == g_pend_epoch ? g_pbhead[h] : -1;
+}
+
 static inline void pbucket_link(int32_t i, uint64_t target) {
     uint32_t h = pbucket_of(target);
     int32_t head = pbucket_head(h);
@@ -908,6 +922,7 @@ static inline void pbucket_link(int32_t i, uint64_t target) {
     if (head != -1) g_pprev[head] = i;
     g_pbhead[h] = i;
 }
+
 static inline void pbucket_unlink(int32_t i, uint64_t target) {
     if (g_pprev[i] != -1)
         g_pnext[g_pprev[i]] = g_pnext[i];
@@ -915,6 +930,7 @@ static inline void pbucket_unlink(int32_t i, uint64_t target) {
         g_pbhead[pbucket_of(target)] = g_pnext[i];
     if (g_pnext[i] != -1) g_pprev[g_pnext[i]] = g_pprev[i];
 }
+
 static void pend_reset(void) {
     g_npend = 0;
     if (++g_pend_epoch == 0) g_pend_epoch = 1; // skip 0 so zero-init buckets never alias a live epoch
@@ -934,14 +950,12 @@ static void add_pend3(uint32_t *slot, uint64_t target, int is_bl, int fwd) {
 }
 
 static uint32_t pend_recode_cond(uint32_t in, int64_t d) {
-    if ((in & 0xff000010u) == 0x54000000u)
-        return (in & 0xff00001fu) | (((uint32_t)d & 0x7ffffu) << 5);
-    if ((in & 0x7e000000u) == 0x34000000u)
-        return (in & 0xff00001fu) | (((uint32_t)d & 0x7ffffu) << 5);
+    if ((in & 0xff000010u) == 0x54000000u) return (in & 0xff00001fu) | (((uint32_t)d & 0x7ffffu) << 5);
+    if ((in & 0x7e000000u) == 0x34000000u) return (in & 0xff00001fu) | (((uint32_t)d & 0x7ffffu) << 5);
     return (in & 0xfff8001fu) | (((uint32_t)d & 0x3fffu) << 5);
 }
-static void add_pend_cond(uint32_t *slot, uint64_t target, uint32_t orig,
-                          uint64_t source_gpc, int fwd) {
+
+static void add_pend_cond(uint32_t *slot, uint64_t target, uint32_t orig, uint64_t source_gpc, int fwd) {
     if (g_npend < PEND_CAP) {
         int32_t i = g_npend++;
         g_pend[i].slot = slot;
@@ -986,7 +1000,7 @@ static void patch_links_to(uint64_t gpc, void *body) {
                 // bl / b target.body (+8: forward edge skips the entry poll under IRQSLIM)
                 (g_pend[i].is_bl ? 0x94000000u : 0x14000000u) | ((uint32_t)d & 0x3FFFFFFu);
             if (!jit_publish_code(g_pend[i].slot, 4)) return;
-cond_remove:
+        cond_remove:
             // swap-remove keeps g_pend compact (pcache/layout unchanged); fix up the bucket chains.
             pbucket_unlink(i, gpc);
             int32_t last = --g_npend;
@@ -1106,8 +1120,8 @@ static int jit_host_to_rwpc(uint64_t host_pc, uint64_t *rwpc) {
  * to STW before execution so reclamation cannot unmap them underneath a peer.
  * Caller holds g_jit_lock whenever guest threads can race a rollover.
  */
-static inline __attribute__((always_inline)) int
-jit_resolve_rw_code(void *rwcode, void **rxcode, uint64_t *generation) {
+static inline __attribute__((always_inline)) int jit_resolve_rw_code(void *rwcode, void **rxcode,
+                                                                     uint64_t *generation) {
     uintptr_t pc = (uintptr_t)rwcode;
     uintptr_t lo = (uintptr_t)g_cache;
     if (pc >= lo && pc < lo + CACHE_SZ) {
@@ -1385,8 +1399,7 @@ static void stw_mapping_begin(void) {
         if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
         if (pthread_equal(g_stw_threads[i].th, me))
             atomic_store_explicit(&g_stw_threads[i].dispatch_ack, request, memory_order_release);
-        else if (atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_seq_cst) &&
-                 g_stw_threads[i].cpu)
+        else if (atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_seq_cst) && g_stw_threads[i].cpu)
             __atomic_store_n(&g_stw_threads[i].cpu->irq, 1, __ATOMIC_SEQ_CST);
     }
     stw_wait_translated_acks(request);
@@ -1395,8 +1408,7 @@ static void stw_mapping_begin(void) {
        translated-data TLB while the registry is pinned and no peer can run. */
 #ifdef G_SOFT_TLB_CLEAR
     for (int i = 0; i < STW_MAXTHREAD; ++i)
-        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) &&
-            g_stw_threads[i].cpu != NULL)
+        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) && g_stw_threads[i].cpu != NULL)
             G_SOFT_TLB_CLEAR(g_stw_threads[i].cpu);
 #endif
 }
@@ -1407,8 +1419,7 @@ static void stw_mapping_end(void) {
        the mapping gate. Publish each CPU's conservative rejection hull before
        translated execution resumes. */
     for (int i = 0; i < STW_MAXTHREAD; ++i)
-        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) &&
-            g_stw_threads[i].cpu != NULL)
+        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire) && g_stw_threads[i].cpu != NULL)
             G_SOFT_TLB_REFRESH(g_stw_threads[i].cpu);
 #endif
     atomic_store_explicit(&g_dispatch_gate, 0, memory_order_release);
@@ -1460,8 +1471,7 @@ static int stw_checkpoint_wait(uint64_t request) {
         struct cpu *c = g_stw_threads[i].cpu;
         HL_LOGF(&g_jit_log, HL_LOG_TAG_PROCESS,
                 "checkpoint thread barrier timeout tid=%d translated=%d service=%llu ack=%llu request=%llu",
-                c ? c->tid : -1,
-                atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire),
+                c ? c->tid : -1, atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire),
                 (unsigned long long)(c ? __atomic_load_n(&c->in_service, __ATOMIC_SEQ_CST) : 0),
                 (unsigned long long)ack, (unsigned long long)request);
     }
@@ -1528,8 +1538,7 @@ static int gen_in_use(uint64_t gen) {
 static void reclaim_retired(void) {
     if (g_no_stw_reclaim) return;
     for (int i = 0; i < g_nretired;) {
-        if (!gen_in_use(g_retired[i].gen) &&
-            !map_has_cache_generation(g_retired[i].gen)) {
+        if (!gen_in_use(g_retired[i].gen) && !map_has_cache_generation(g_retired[i].gen)) {
             uint64_t gen = g_retired[i].gen;
             cache_unmap(g_retired[i].handle, g_retired[i].rw, g_retired[i].rw2rx);
             if (g_nfreed_total) g_freed[(g_nfreed_total - 1) % STW_FREED_MAX].gen = gen;
@@ -1590,8 +1599,7 @@ static int jit_flush_to_fresh(int retain_map_generations) {
      * map.  Pre-SMC direct chains retain the historical wholesale policy.
      */
     uint32_t evicted = 0;
-    if (retain_generations && g_cache_gen >= 3)
-        evicted = map_invalidate_cache_generation(g_cache_gen - 3);
+    if (retain_generations && g_cache_gen >= 3) evicted = map_invalidate_cache_generation(g_cache_gen - 3);
     reclaim_retired(); // free retired caches no peer is still in -> bound VA + free space for the new alloc
     if (code_mapping_reserve(&mapping, g_dualmap) != 0) return cache_oom_fail();
     if (!retire_current()) {
@@ -1601,12 +1609,11 @@ static int jit_flush_to_fresh(int retain_map_generations) {
     hl_arena_bind(&g_emit, &mapping);
     HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT,
             "cache rotate generation=%llu rw=%p rx=%p used=%zu blocks=%u evicted=%u retained=%u",
-            (unsigned long long)(g_cache_gen + 1), (void *)g_cache, J_RX(g_cache),
-            old_used, old_blocks, evicted, g_live_map_count);
+            (unsigned long long)(g_cache_gen + 1), (void *)g_cache, J_RX(g_cache), old_used, old_blocks, evicted,
+            g_live_map_count);
     g_cache_gen++; // peers still on the just-retired generation pin it until they round-trip
     if (!retain_generations) map_clear();
-    if (!retain_generations)
-        memset(g_ibtc, 0, sizeof g_ibtc);
+    if (!retain_generations) memset(g_ibtc, 0, sizeof g_ibtc);
     pend_reset();
     return 1;
 }

@@ -33,8 +33,8 @@ static _Atomic int g_guest_soft_active;
 
 static int jit_guest_soft_activate(void) {
     int expected = 0;
-    if (!atomic_compare_exchange_strong_explicit(&g_guest_soft_active, &expected, 1,
-                                                 memory_order_acq_rel, memory_order_acquire))
+    if (!atomic_compare_exchange_strong_explicit(&g_guest_soft_active, &expected, 1, memory_order_acq_rel,
+                                                 memory_order_acquire))
         return 1;
     /* Publish the translation gate before flushing: every block admitted
        after the synchronous rotation contains soft guards. */
@@ -57,8 +57,8 @@ static void jit_guest_soft_restore_deactivate(void) {
 
 static void jit_guest_soft_deactivate(void) {
     int expected = 1;
-    if (!atomic_compare_exchange_strong_explicit(&g_guest_soft_active, &expected, 0,
-                                                 memory_order_acq_rel, memory_order_acquire))
+    if (!atomic_compare_exchange_strong_explicit(&g_guest_soft_active, &expected, 0, memory_order_acq_rel,
+                                                 memory_order_acquire))
         return;
     /* Existing guarded blocks remain correct while the flush runs; misses
        resolve identity after the logical snapshot became empty. */
@@ -210,9 +210,9 @@ static void block_return(void) {
 #endif
 // Post-translate chaining. aarch64 chains in the dispatcher (here); x86 chains inside translate_block.
 #ifndef G_DISPATCH_CHAIN
-#define G_DISPATCH_CHAIN(c)                                                                                           \
-    do {                                                                                                              \
-        if (!smc_seen()) patch_links_to(G_PC(c), map_body(G_PC(c)));                                                  \
+#define G_DISPATCH_CHAIN(c)                                                                                            \
+    do {                                                                                                               \
+        if (!smc_seen()) patch_links_to(G_PC(c), map_body(G_PC(c)));                                                   \
     } while (0)
 #endif
 // Post-translate per-arch step. aarch64 has none; x86 does W6A SMC source-page write-protect.

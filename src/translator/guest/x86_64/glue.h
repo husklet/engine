@@ -10,11 +10,7 @@
 #define XIBTC_WAYS 2
 #define PC_RELOC_CAP (1u << 20)
 
-enum {
-    PRELOC_BLOCKRET = 1,
-    PRELOC_IBTC = 2,
-    PRELOC_HOSTGLOBAL = 3
-};
+enum { PRELOC_BLOCKRET = 1, PRELOC_IBTC = 2, PRELOC_HOSTGLOBAL = 3 };
 
 typedef struct hl_x86_ibtc_entry {
     uint64_t target;

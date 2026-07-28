@@ -20,8 +20,7 @@ void hl_host_fork_client_close(hl_host_fork_client *client);
 /* POSIX forkserver transport. Native descriptors never cross into the portable codec. */
 int hl_fork_wire_send_descriptors(int socket, const void *buffer, size_t size, const int *descriptors,
                                   int descriptor_count);
-int hl_fork_wire_receive_descriptors(int socket, void *buffer, size_t size, int *descriptors,
-                                     int *descriptor_count);
+int hl_fork_wire_receive_descriptors(int socket, void *buffer, size_t size, int *descriptors, int *descriptor_count);
 int hl_fork_wire_send(int socket, const void *buffer, size_t size);
 int hl_fork_wire_receive(int socket, void *buffer, size_t size);
 

@@ -96,14 +96,15 @@ static hl_host_handle fdhandle_take_full(int descriptor, int *retired) {
     if (slot == NULL) return HL_HOST_HANDLE_INVALID;
     previous = atomic_exchange_explicit(&slot->handle, (uint64_t)HL_HOST_HANDLE_INVALID, memory_order_acq_rel);
     previous_state = atomic_exchange_explicit(&slot->state, 0, memory_order_acq_rel);
-    if (previous == HL_HOST_HANDLE_INVALID && !(previous_state & HL_FDHANDLE_AMBIENT))
-        return HL_HOST_HANDLE_INVALID;
+    if (previous == HL_HOST_HANDLE_INVALID && !(previous_state & HL_FDHANDLE_AMBIENT)) return HL_HOST_HANDLE_INVALID;
     if (retired != NULL) *retired = 1;
     (void)atomic_fetch_sub_explicit(&g_fdhandle_population, 1, memory_order_relaxed);
     return previous == HL_HOST_HANDLE_INVALID ? HL_HOST_HANDLE_INVALID : (hl_host_handle)previous;
 }
 
-static hl_host_handle fdhandle_take(int descriptor) { return fdhandle_take_full(descriptor, NULL); }
+static hl_host_handle fdhandle_take(int descriptor) {
+    return fdhandle_take_full(descriptor, NULL);
+}
 
 // Live in either sense: a handle binding, or an ambient state-only one.
 static int fdhandle_live(uint64_t handle, uint32_t state) {
@@ -185,8 +186,8 @@ int hl_fdhandle_set_state(int descriptor, uint32_t state) {
     // AMBIENT is the binding's kind, not a flag a caller may set or clear, and
     // for an ambient binding it is also the liveness marker -- dropping it here
     // would silently retire the binding a caller was only editing.
-    atomic_store_explicit(&slot->state, (state & ~(uint32_t)HL_FDHANDLE_AMBIENT) |
-                                            (current & (uint32_t)HL_FDHANDLE_AMBIENT),
+    atomic_store_explicit(&slot->state,
+                          (state & ~(uint32_t)HL_FDHANDLE_AMBIENT) | (current & (uint32_t)HL_FDHANDLE_AMBIENT),
                           memory_order_release);
     return 0;
 }
@@ -219,8 +220,7 @@ int hl_fdhandle_clone(int from, int to) {
     // namespace and both numbers name the one host object. All that is missing
     // on the new number is the record, which is what dup(2) copies anyway --
     // minus close-on-exec, exactly as below.
-    if (state & HL_FDHANDLE_AMBIENT)
-        return hl_fdhandle_publish_ambient(to, state & ~(uint32_t)HL_FDHANDLE_CLOEXEC);
+    if (state & HL_FDHANDLE_AMBIENT) return hl_fdhandle_publish_ambient(to, state & ~(uint32_t)HL_FDHANDLE_CLOEXEC);
     if (file == NULL || file->clone_for_fork == NULL) return -1;
     cloned = file->clone_for_fork(host->context, source);
     if (cloned.status != HL_STATUS_OK || cloned.value == HL_HOST_HANDLE_INVALID) return -1;

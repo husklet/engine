@@ -12,7 +12,8 @@ static inline void hl_launch_hygiene(void) {
     (void)unsetenv("MFLAGS");
     maximum = sysconf(_SC_OPEN_MAX);
     if (maximum < 0 || maximum > 4096) maximum = 4096;
-    for (int descriptor = 3; descriptor < maximum; ++descriptor) (void)close(descriptor);
+    for (int descriptor = 3; descriptor < maximum; ++descriptor)
+        (void)close(descriptor);
 }
 
 #endif

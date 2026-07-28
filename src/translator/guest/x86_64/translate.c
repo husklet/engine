@@ -4670,8 +4670,8 @@ static void *translate_block(uint64_t gpc) {
                     vm &= 7;
                 }
                 int mmx_wb = mmx ? vd : -1; // vector register the 64-bit write-back must narrow, or -1
-                if (op == 0x6E) { // movd/movq xmm, r/m  (66; bare = MMX movd/movq mm, r/m)
-                    mmx_wb = -1;  // LDR S/D and FMOV S/D already zero-extend
+                if (op == 0x6E) {           // movd/movq xmm, r/m  (66; bare = MMX movd/movq mm, r/m)
+                    mmx_wb = -1;            // LDR S/D and FMOV S/D already zero-extend
                     if (I.is_mem) {
                         emit_ea(&I, next);
                         emit_memory_guard(17, I.rexW ? 8u : 4u, gpc, X86_SOFT_READ);
@@ -4938,9 +4938,9 @@ static void *translate_block(uint64_t gpc) {
                     else if (sub == 4)
                         e_vshr_imm(x, x, esz, sh, 1); // psra
                     else if (sub == 6)
-                        e_vshl_imm(x, x, esz, sh);                   // psll
+                        e_vshl_imm(x, x, esz, sh);                           // psll
                     else if (op == 0x73 && (sub == 3 || sub == 7) && !mmx) { // psrldq / pslldq (66 only; #UD bare)
-                        if (sh > 15) {                               // x86: count > 15 -> result is all-zero
+                        if (sh > 15) {                                       // x86: count > 15 -> result is all-zero
                             e_v3(0x6E201C00u, x, x, x);
                         } else if (sh) { // count 0 is the identity -> emit nothing
                             if (!crypto_state.zero_ready || nosseopt())
@@ -5122,11 +5122,11 @@ static void *translate_block(uint64_t gpc) {
                     e_movconst(19, 0xC1E0000000000000ull);
                     emit32(0x4E080C00u | (19 << 5) | 26); // v26.2d = -2^31
                     e_movconst(19, 0x80000000ull);
-                    emit32(0x0E040C00u | (19 << 5) | 27);                  // v27.2s = integer indefinite
-                    emit_pd2i32_pieces(22, 18, s, trunc, 25, 26, 28, 21);  // v22 = int64 lanes, v18 = fixup mask
-                    emit32(0x0EA12800u | (22 << 5) | 24);                  // XTN v24.2s, v22.2d (result)
-                    emit32(0x0EA12800u | (18 << 5) | 25);                  // XTN v25.2s, v18.2d (mask)
-                    emit32(0x2E601C00u | (24 << 16) | (27 << 5) | 25);     // BSL v25.8b -> mask?indef:result
+                    emit32(0x0E040C00u | (19 << 5) | 27);                 // v27.2s = integer indefinite
+                    emit_pd2i32_pieces(22, 18, s, trunc, 25, 26, 28, 21); // v22 = int64 lanes, v18 = fixup mask
+                    emit32(0x0EA12800u | (22 << 5) | 24);                 // XTN v24.2s, v22.2d (result)
+                    emit32(0x0EA12800u | (18 << 5) | 25);                 // XTN v25.2s, v18.2d (mask)
+                    emit32(0x2E601C00u | (24 << 16) | (27 << 5) | 25);    // BSL v25.8b -> mask?indef:result
                     e_vmov(vd, 25);
                 } else if (op == 0x60 || op == 0x61 || op == 0x62 || op == 0x6C || op == 0x68 || op == 0x69 ||
                            op == 0x6A || op == 0x6D) { // punpck l/h bw/wd/dq/qdq -> ZIP1/ZIP2
@@ -5338,8 +5338,8 @@ static void *translate_block(uint64_t gpc) {
                         // (The old comment claimed the top-of-loop had already flushed g_fl_pending
                         // here; a `cmp`; `cvttsd2si`; `js` sequence shows that it had not.)
                         uint32_t fcmp = I.repne ? 0x1E602000u : 0x1E202000u;
-                        emit32(0xD53B4200u | 21);                     // mrs x21, nzcv
-                        emit32(fcmp | (19 << 16) | (s << 5));         // FCMP s, v19
+                        emit32(0xD53B4200u | 21);             // mrs x21, nzcv
+                        emit32(fcmp | (19 << 16) | (s << 5)); // FCMP s, v19
                         if (op == 0x2D) {
                             // #P. FCVTZS above reports it for 0x2C (an in-range inexact truncation) but not
                             // for 0x2D, whose FRINTI value is already integral -- and FRINTI itself reports

@@ -178,11 +178,13 @@ __attribute__((constructor)) static void hl_detect_host_matrix_ext(void) {
 }
 #elif defined(__APPLE__) && defined(HL_HOST_CPU_AARCH64)
 #include <sys/sysctl.h>
+
 static int hl_sysctl_flag(const char *name) {
     int v = 0;
     size_t n = sizeof v;
     return sysctlbyname(name, &v, &n, NULL, 0) == 0 && v;
 }
+
 __attribute__((constructor)) static void hl_detect_host_matrix_ext(void) {
     g_host_i8mm = hl_sysctl_flag("hw.optional.arm.FEAT_I8MM");
     g_host_bf16 = hl_sysctl_flag("hw.optional.arm.FEAT_BF16");
@@ -274,9 +276,9 @@ static void emit_bf16_bfcvt(uint32_t in) {
     e_str(15, CPUREG, 15 * 8);
     if (!g_steal1617) e_stp(16, 17, CPUREG, 16 * 8);
 
-    emit32(0x1E260000u | ((uint32_t)n << 5) | 16u); /* FMOV w16,sN */
-    emit32(0x2A1003EFu);                              /* MOV w15,w16 (retain NaN test bits) */
-    emit32(0x53107C00u | ((uint32_t)16 << 5) | 17u); /* LSR w17,w16,#16 */
+    emit32(0x1E260000u | ((uint32_t)n << 5) | 16u);               /* FMOV w16,sN */
+    emit32(0x2A1003EFu);                                          /* MOV w15,w16 (retain NaN test bits) */
+    emit32(0x53107C00u | ((uint32_t)16 << 5) | 17u);              /* LSR w17,w16,#16 */
     emit32(0x12000000u | (1u << 10) | ((uint32_t)17 << 5) | 17u); /* AND w17,w17,#1 */
     emit32(0x0B000000u | ((uint32_t)17 << 16) | ((uint32_t)16 << 5) | 16u);
     emit32(0x528FFFE0u | 17u); /* MOV w17,#0x7fff */
@@ -286,16 +288,16 @@ static void emit_bf16_bfcvt(uint32_t in) {
     /* A signaling NaN whose payload lies below bit 16 must remain a NaN, not
        round down to infinity.  Set the quiet bit branchlessly and preserve
        integer NZCV, which scalar BFCVT does not modify. */
-    emit32(0x531779F1u); /* UBFX w17,w15,#23,#8 */
-    emit32(0x52001E31u); /* EOR w17,w17,#0xff */
-    emit32(0x5AC01231u); /* CLZ w17,w17 */
-    emit32(0x53057E31u); /* LSR w17,w17,#5: exponent was all ones */
-    emit32(0x120059EFu); /* AND w15,w15,#0x7fffff */
-    emit32(0x5AC011EFu); /* CLZ w15,w15 */
-    emit32(0x53057DEFu); /* LSR w15,w15,#5 */
-    emit32(0x520001EFu); /* EOR w15,w15,#1: mantissa was nonzero */
-    emit32(0x0A0F0231u); /* AND w17,w17,w15 */
-    emit32(0x2A111A10u); /* ORR w16,w16,w17,LSL #6 */
+    emit32(0x531779F1u);                                     /* UBFX w17,w15,#23,#8 */
+    emit32(0x52001E31u);                                     /* EOR w17,w17,#0xff */
+    emit32(0x5AC01231u);                                     /* CLZ w17,w17 */
+    emit32(0x53057E31u);                                     /* LSR w17,w17,#5: exponent was all ones */
+    emit32(0x120059EFu);                                     /* AND w15,w15,#0x7fffff */
+    emit32(0x5AC011EFu);                                     /* CLZ w15,w15 */
+    emit32(0x53057DEFu);                                     /* LSR w15,w15,#5 */
+    emit32(0x520001EFu);                                     /* EOR w15,w15,#1: mantissa was nonzero */
+    emit32(0x0A0F0231u);                                     /* AND w17,w17,w15 */
+    emit32(0x2A111A10u);                                     /* ORR w16,w16,w17,LSL #6 */
     emit32(0x1E270000u | ((uint32_t)16 << 5) | (uint32_t)d); /* FMOV sD,w16 */
 
     if (!g_steal1617) e_ldp(16, 17, CPUREG, 16 * 8);
@@ -306,14 +308,13 @@ static void emit_bf16_bfdot(uint32_t in) {
     int d = (int)(in & 31u), n = (int)((in >> 5) & 31u), m = (int)((in >> 16) & 31u);
     int scratch = 0;
     for (; scratch < 32; scratch += 4)
-        if ((d < scratch || d >= scratch + 4) && (n < scratch || n >= scratch + 4) &&
-            (m < scratch || m >= scratch + 4))
+        if ((d < scratch || d >= scratch + 4) && (n < scratch || n >= scratch + 4) && (m < scratch || m >= scratch + 4))
             break;
     int lo = scratch, hi = scratch + 1, rhs = scratch + 2, spare = scratch + 3;
     e_stp_q(lo, hi, CPUREG, OFF_V + lo * 16);
     e_stp_q(rhs, spare, CPUREG, OFF_V + rhs * 16);
 
-    emit32(0x2F10A400u | ((uint32_t)n << 5) | (uint32_t)lo); /* UXTL low N */
+    emit32(0x2F10A400u | ((uint32_t)n << 5) | (uint32_t)lo);  /* UXTL low N */
     emit32(0x4F305400u | ((uint32_t)lo << 5) | (uint32_t)lo); /* SHL #16 */
     emit32(0x2F10A400u | ((uint32_t)m << 5) | (uint32_t)rhs);
     emit32(0x4F305400u | ((uint32_t)rhs << 5) | (uint32_t)rhs);
@@ -342,7 +343,9 @@ static void emit_bf16_bfdot(uint32_t in) {
 // instruction, store back. Sampled attribution on the CPython eval loop showed the mscratch dance +
 // cpu->x[] traffic at ~20% of total run time (PLT stubs -- adrp x16/ldr x17/add x16/br x17, all-stolen --
 // alone were 19% of samples), so this is the single biggest engine tax on call-heavy aarch64 guests.
-static int stealfast_on(void) { return g_steal1617; }
+static int stealfast_on(void) {
+    return g_steal1617;
+}
 
 // Emit a guest insn that references stolen reg(s): for each, a scratch S = cpu->x[stolen]; run the
 // insn with the stolen field(s) replaced by scratch(es); store back. Real x28 = cpu is the base;
@@ -369,8 +372,7 @@ static void emit_mangled_x18(uint32_t in, int mask) {
             // SBFM/UBFM read Rn and overwrite Rd. BFM merges selected bits
             // into the old Rd value, so it reads Rd as well as writing it.
             read_mask = mask & 2;
-            if (((in >> 29) & 3) == 1)
-                read_mask |= mask & 1;
+            if (((in >> 29) & 3) == 1) read_mask |= mask & 1;
             write_mask = mask & 1;
         } else {
             read_mask = mask & 2;
@@ -379,18 +381,15 @@ static void emit_mangled_x18(uint32_t in, int mask) {
     } else if ((in & 0x0E000000u) == 0x0A000000u) {
         read_mask = mask & (2 | 4 | 8);
         write_mask = mask & 1;
-    } else if (!(in & 0x04000000u) &&
-        ((in & 0x3B000000u) == 0x39000000u ||
-         (in & 0x3B200000u) == 0x38000000u ||
-         (in & 0x3B200C00u) == 0x38200800u)) {
+    } else if (!(in & 0x04000000u) && ((in & 0x3B000000u) == 0x39000000u || (in & 0x3B200000u) == 0x38000000u ||
+                                       (in & 0x3B200C00u) == 0x38200800u)) {
         // Ordinary integer single load/store.  Atomics/exclusives occupy a
         // different encoding box and deliberately stay conservative.
         int opc = (int)((in >> 22) & 3);
         int size = (int)((in >> 30) & 3);
         if (!(size == 3 && opc == 2)) { // PRFM encodes an operation, not a GPR Rt
             int mode = (int)((in >> 10) & 3);
-            int writeback = (in & 0x3B200000u) == 0x38000000u &&
-                            (mode == 1 || mode == 3);
+            int writeback = (in & 0x3B200000u) == 0x38000000u && (mode == 1 || mode == 3);
             int base_and_index = mask & (2 | 4);
             if (opc == 0) { // store: Rt/base/index inputs
                 read_mask = mask & (1 | 2 | 4);
@@ -444,8 +443,7 @@ static void emit_mangled_x18(uint32_t in, int mask) {
         for (int i = 0; i < ns; i++) {
             int read = 0;
             for (int k = 0; k < 4; k++)
-                if ((read_mask & mbits[k]) && (int)((in >> shifts[k]) & 31) == stolen[i])
-                    read = 1;
+                if ((read_mask & mbits[k]) && (int)((in >> shifts[k]) & 31) == stolen[i]) read = 1;
             if (read)
                 // scratch = cpu->x[stolen]
                 e_ldr(hsc[i], CPUREG, stolen[i] * 8);
@@ -467,8 +465,7 @@ static void emit_mangled_x18(uint32_t in, int mask) {
         for (int i = 0; i < ns; i++) {
             int written = 0;
             for (int k = 0; k < 4; k++)
-                if ((write_mask & mbits[k]) && (int)((in >> shifts[k]) & 31) == stolen[i])
-                    written = 1;
+                if ((write_mask & mbits[k]) && (int)((in >> shifts[k]) & 31) == stolen[i]) written = 1;
             if (written)
                 // cpu->x[stolen] = scratch
                 e_str(hsc[i], CPUREG, stolen[i] * 8);
@@ -486,8 +483,7 @@ static void emit_mangled_x18(uint32_t in, int mask) {
     for (int i = 0; i < ns; i++) {
         int read = 0;
         for (int k = 0; k < 4; k++)
-            if ((read_mask & mbits[k]) && (int)((in >> shifts[k]) & 31) == stolen[i])
-                read = 1;
+            if ((read_mask & mbits[k]) && (int)((in >> shifts[k]) & 31) == stolen[i]) read = 1;
         if (read)
             // scratch = cpu->x[stolen]
             e_ldr(sc[i], CPUREG, stolen[i] * 8);
@@ -509,8 +505,7 @@ static void emit_mangled_x18(uint32_t in, int mask) {
     for (int i = 0; i < ns; i++) {
         int written = 0;
         for (int k = 0; k < 4; k++)
-            if ((write_mask & mbits[k]) && (int)((in >> shifts[k]) & 31) == stolen[i])
-                written = 1;
+            if ((write_mask & mbits[k]) && (int)((in >> shifts[k]) & 31) == stolen[i]) written = 1;
         if (written)
             // cpu->x[stolen] = scratch
             e_str(sc[i], CPUREG, stolen[i] * 8);
@@ -531,18 +526,18 @@ static void emit_mangled_x18(uint32_t in, int mask) {
 // makes the compare see garbage in the high half -> the swap spuriously fails, or a stolen Xs writeback
 // loses the observed old value). Relocate each guest pair into a free even/odd host pair, run the CASP,
 // and write the Rs pair result back. Encoding: (in & 0xBFA07C00) == 0x08207C00 (bit23==0 excludes CAS).
-static int is_casp(uint32_t in) { return (in & 0xBFA07C00u) == 0x08207C00u; }
+static int is_casp(uint32_t in) {
+    return (in & 0xBFA07C00u) == 0x08207C00u;
+}
 
 static int casp_uses_stolen(uint32_t in) {
     int Rs = (in >> 16) & 31, Rt = in & 31, Rn = (in >> 5) & 31;
-    return is_stolen(Rs) || is_stolen((Rs + 1) & 31) || is_stolen(Rt) || is_stolen((Rt + 1) & 31) ||
-           is_stolen(Rn);
+    return is_stolen(Rs) || is_stolen((Rs + 1) & 31) || is_stolen(Rt) || is_stolen((Rt + 1) & 31) || is_stolen(Rn);
 }
 
 static void emit_casp_mangled(uint32_t in, int override_base) {
     int Rs = (in >> 16) & 31, Rt = in & 31, Rn = (in >> 5) & 31;
-    int touch[5] = {Rs, (Rs + 1) & 31, Rt, (Rt + 1) & 31,
-                    override_base >= 0 ? override_base : Rn};
+    int touch[5] = {Rs, (Rs + 1) & 31, Rt, (Rt + 1) & 31, override_base >= 0 ? override_base : Rn};
     // Two DISTINCT free even host pairs (P = Rs role, Q = Rt role): neither member stolen, neither a guest
     // reg the op names. Register 31 in a CASP field means xzr (not SP), so it is safe to leave in place.
     int P = -1, Q = -1, Nr = -1;
@@ -577,14 +572,15 @@ static void emit_casp_mangled(uint32_t in, int override_base) {
     spill[nsp++] = Q;
     spill[nsp++] = Q + 1;
     if (Nr >= 0) spill[nsp++] = Nr;
-    for (int i = 0; i < nsp; i++) e_str(spill[i], CPUREG, (int)OFF_MSCRATCH + 8 * i);
+    for (int i = 0; i < nsp; i++)
+        e_str(spill[i], CPUREG, (int)OFF_MSCRATCH + 8 * i);
     // Load guest pair values (a stolen member lives in its cpu slot; else in the live host reg).
-#define CASP_LOADG(dst, g)                                                                                 \
-    do {                                                                                                   \
-        if (is_stolen(g))                                                                                  \
-            e_ldr((dst), CPUREG, (g) * 8);                                                                 \
-        else                                                                                               \
-            e_movr((dst), (g));                                                                            \
+#define CASP_LOADG(dst, g)                                                                                             \
+    do {                                                                                                               \
+        if (is_stolen(g))                                                                                              \
+            e_ldr((dst), CPUREG, (g) * 8);                                                                             \
+        else                                                                                                           \
+            e_movr((dst), (g));                                                                                        \
     } while (0)
     CASP_LOADG(P, Rs);
     CASP_LOADG(P + 1, (Rs + 1) & 31);
@@ -593,8 +589,8 @@ static void emit_casp_mangled(uint32_t in, int override_base) {
 #undef CASP_LOADG
     if (Nr >= 0) e_ldr(Nr, CPUREG, Rn * 8);
     int base = override_base >= 0 ? override_base : (Nr >= 0) ? Nr : Rn;
-    uint32_t m = (in & ~((0x1Fu << 16) | (0x1Fu << 5) | 0x1Fu)) | ((uint32_t)P << 16) |
-                 ((uint32_t)base << 5) | (uint32_t)Q;
+    uint32_t m =
+        (in & ~((0x1Fu << 16) | (0x1Fu << 5) | 0x1Fu)) | ((uint32_t)P << 16) | ((uint32_t)base << 5) | (uint32_t)Q;
     emit32(m);
     // CASP wrote the old memory pair into P,P+1 (the Rs pair) -> store back to guest Rs,Rs+1.
     if (is_stolen(Rs))
@@ -605,7 +601,8 @@ static void emit_casp_mangled(uint32_t in, int override_base) {
         e_str(P + 1, CPUREG, ((Rs + 1) & 31) * 8);
     else
         e_movr((Rs + 1) & 31, P + 1);
-    for (int i = 0; i < nsp; i++) e_ldr(spill[i], CPUREG, (int)OFF_MSCRATCH + 8 * i);
+    for (int i = 0; i < nsp; i++)
+        e_ldr(spill[i], CPUREG, (int)OFF_MSCRATCH + 8 * i);
 }
 
 // ---- guest_base bias-fold for non-PIE ET_EXEC images ----
@@ -638,7 +635,7 @@ static int is_foldable_mem(uint32_t in) {
                                                      // handled by emit_fold_mem -- post/pre are the hot form)
     if ((in & 0x3B200C00u) == 0x38200800u) return 1; // register-offset [Xn,Xm{,ext}]: full-EA fold below
     if ((in & 0x3A000000u) == 0x28000000u) {         // LDP/STP family
-        return 1; /* no-alloc, offset, post-index, and pre-index */
+        return 1;                                    /* no-alloc, offset, post-index, and pre-index */
     }
     if ((in & 0x3F000000u) == 0x08000000u)           // exclusive / ordered / CAS group ([Xn] base)
         return (in & 0x00800000u) != 0;              // bit23: 1=LDAR/STLR/CAS (single) -> fold; 0=monitor pair
@@ -649,9 +646,7 @@ static int is_foldable_mem(uint32_t in) {
 static int is_prfm_register_or_immediate(uint32_t in) {
     if ((in & 0x04000000u) != 0) return 0; /* SIMD/FP */
     if (((in >> 30) & 3) != 3 || ((in >> 22) & 3) != 2) return 0;
-    return (in & 0x3B000000u) == 0x39000000u ||
-           (in & 0x3B200000u) == 0x38000000u ||
-           (in & 0x3B200C00u) == 0x38200800u;
+    return (in & 0x3B000000u) == 0x39000000u || (in & 0x3B200000u) == 0x38000000u || (in & 0x3B200C00u) == 0x38200800u;
 }
 
 static uint64_t a64_mem_bytes(uint32_t in) {
@@ -668,16 +663,13 @@ static uint64_t a64_mem_bytes(uint32_t in) {
         unsigned scale = ((((in >> 22) & 3u) >> 1) << 2) | size;
         bytes = UINT64_C(1) << scale; /* B/H/S/D/Q scalar or vector */
     }
-    if ((in & 0x3F000000u) == 0x08000000u && !(in & (1u << 23)) &&
-        (in & (1u << 21)))
-        bytes *= 2; /* LDXP/STXP */
+    if ((in & 0x3F000000u) == 0x08000000u && !(in & (1u << 23)) && (in & (1u << 21))) bytes *= 2; /* LDXP/STXP */
     return pair ? bytes * 2 : bytes;
 }
 
 static uint32_t a64_mem_required(uint32_t in) {
     /* LSE RMW and compare-and-swap instructions both read and write. */
-    if ((in & 0x3B200C00u) == 0x38200000u || is_casp(in) ||
-        ((in & 0x3FA07C00u) == 0x08A07C00u))
+    if ((in & 0x3B200C00u) == 0x38200000u || is_casp(in) || ((in & 0x3FA07C00u) == 0x08A07C00u))
         return HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_WRITE;
     return (in & (1u << 22)) ? HL_LOGICAL_VMA_READ : HL_LOGICAL_VMA_WRITE;
 }
@@ -697,8 +689,7 @@ static int64_t a64_fold_mem_offset(uint32_t in, int wb) {
         uint64_t bytes = a64_mem_bytes(in);
         return (int64_t)((in >> 10) & 0xfff) << __builtin_ctzll(bytes);
     }
-    if ((in & 0x3b200000u) == 0x38000000u)
-        return sext((in >> 12) & 0x1ff, 9);
+    if ((in & 0x3b200000u) == 0x38000000u) return sext((in >> 12) & 0x1ff, 9);
     return 0; /* register-offset already materialized; atomics use [Xn] */
 }
 
@@ -759,14 +750,13 @@ static uint32_t a64_cbnz_x(int reg, int64_t words) {
 }
 
 static uint32_t a64_tbz_x(int reg, unsigned bit, int64_t words) {
-    return 0x36000000u | ((bit & 0x20u) << 26) | ((bit & 0x1fu) << 19) |
-           (((uint32_t)words & 0x3fffu) << 5) | (unsigned)reg;
+    return 0x36000000u | ((bit & 0x20u) << 26) | ((bit & 0x1fu) << 19) | (((uint32_t)words & 0x3fffu) << 5) |
+           (unsigned)reg;
 }
 
-static struct a64_soft_guard emit_a64_soft_guard_begin(int ea, int tmp, int tmp2, uint64_t bytes,
-                                                       uint32_t required, uint64_t pc) {
-    struct a64_soft_guard guard = {
-        .ea = ea, .tmp = tmp, .tmp2 = tmp2, .bytes = bytes, .required = required, .pc = pc};
+static struct a64_soft_guard emit_a64_soft_guard_begin(int ea, int tmp, int tmp2, uint64_t bytes, uint32_t required,
+                                                       uint64_t pc) {
+    struct a64_soft_guard guard = {.ea = ea, .tmp = tmp, .tmp2 = tmp2, .bytes = bytes, .required = required, .pc = pc};
     int resume_ea = ea;
     if (!jit_guest_soft_active()) return guard;
     guard.active = 1;
@@ -862,10 +852,8 @@ static struct a64_soft_guard emit_a64_soft_guard_begin(int ea, int tmp, int tmp2
 
     e_ldr(tmp, CPUREG, OFF_SOFT_LIMIT); /* exclusive end */
     e_movconst(tmp2, bytes);
-    emit32(0x8B000000u | ((unsigned)tmp2 << 16) |
-           ((unsigned)ea << 5) | (unsigned)tmp2);
-    emit32(0xCB000000u | ((unsigned)tmp2 << 16) |
-           ((unsigned)tmp << 5) | (unsigned)tmp2);
+    emit32(0x8B000000u | ((unsigned)tmp2 << 16) | ((unsigned)ea << 5) | (unsigned)tmp2);
+    emit32(0xCB000000u | ((unsigned)tmp2 << 16) | ((unsigned)tmp << 5) | (unsigned)tmp2);
     emit32(0xD37FFC00u | ((unsigned)tmp2 << 5) | (unsigned)tmp2);
     guard.miss[guard.nmiss++] = (uint32_t *)g_cp;
     guard.miss_bit[guard.nmiss - 1] = -1;
@@ -951,8 +939,7 @@ static void emit_a64_soft_guard_end(struct a64_soft_guard *guard) {
         g_soft_stub_patches[g_soft_stub_patch_count++] = (uint32_t *)g_cp;
         emit32(0); /* b shared_soft_exit */
         uint8_t *resume = g_cp;
-        *skip = 0x14000000u |
-                ((uint32_t)((resume - (uint8_t *)skip) / 4) & 0x03ffffffu);
+        *skip = 0x14000000u | ((uint32_t)((resume - (uint8_t *)skip) / 4) & 0x03ffffffu);
         int64_t miss_delta = miss - guard->native;
         if (miss_delta < INT32_MIN || miss_delta > INT32_MAX) {
             static const char message[] = "soft-memory site miss displacement out of range";
@@ -962,9 +949,7 @@ static void emit_a64_soft_guard_end(struct a64_soft_guard *guard) {
         int32_t narrow_delta = (int32_t)miss_delta;
         memcpy(guard->metadata + 8, &narrow_delta, sizeof narrow_delta);
         for (unsigned i = 0; i < guard->ndirect; ++i)
-            *guard->direct[i] =
-                a64_tbz_x(guard->tmp2, 0,
-                          (guard->native - (uint8_t *)guard->direct[i]) / 4);
+            *guard->direct[i] = a64_tbz_x(guard->tmp2, 0, (guard->native - (uint8_t *)guard->direct[i]) / 4);
         return;
     }
     uint32_t *skip = (uint32_t *)g_cp;
@@ -975,15 +960,13 @@ static void emit_a64_soft_guard_end(struct a64_soft_guard *guard) {
     *skip = 0x14000000u | ((uint32_t)((resume - (uint8_t *)skip) / 4) & 0x03ffffffu);
     for (unsigned i = 0; i < guard->nmiss; ++i) {
         if (guard->miss_bit[i] < 0)
-            *guard->miss[i] =
-                a64_cbnz_x(guard->miss_reg[i], (miss - (uint8_t *)guard->miss[i]) / 4);
+            *guard->miss[i] = a64_cbnz_x(guard->miss_reg[i], (miss - (uint8_t *)guard->miss[i]) / 4);
         else
-            *guard->miss[i] = a64_tbz_x(guard->miss_reg[i], (unsigned)guard->miss_bit[i],
-                                        (miss - (uint8_t *)guard->miss[i]) / 4);
+            *guard->miss[i] =
+                a64_tbz_x(guard->miss_reg[i], (unsigned)guard->miss_bit[i], (miss - (uint8_t *)guard->miss[i]) / 4);
     }
     for (unsigned i = 0; i < guard->ndirect; ++i)
-        *guard->direct[i] =
-            a64_tbz_x(guard->tmp2, 0, (guard->native - (uint8_t *)guard->direct[i]) / 4);
+        *guard->direct[i] = a64_tbz_x(guard->tmp2, 0, (guard->native - (uint8_t *)guard->direct[i]) / 4);
 }
 
 static void aarch64_soft_filter_refresh(struct cpu *c) {
@@ -999,37 +982,30 @@ static void aarch64_soft_filter_refresh(struct cpu *c) {
 }
 
 static void emit_a64_soft_stub(void) {
-    if (!g_soft_stub_patch_count && !g_soft_resolver_patch_count &&
-        !g_soft_legacy_stub_patch_count)
-        return;
+    if (!g_soft_stub_patch_count && !g_soft_resolver_patch_count && !g_soft_legacy_stub_patch_count) return;
     if (g_soft_resolver_patch_count) {
         uint32_t *cold_miss_patches[1024];
         int cold_miss_bits[1024]; /* -1 = CBNZ x18, otherwise TBZ x18,bit */
         unsigned cold_miss_count = 0;
         for (;;) {
             uint32_t first = 0;
-            while (first < g_soft_resolver_patch_count &&
-                   g_soft_resolver_patches[first] == NULL)
+            while (first < g_soft_resolver_patch_count && g_soft_resolver_patches[first] == NULL)
                 ++first;
             if (first == g_soft_resolver_patch_count) break;
             uint32_t bytes = g_soft_resolver_bytes[first];
             uint32_t required = g_soft_resolver_required[first];
             uint8_t *resolver = g_cp;
             for (uint32_t i = first; i < g_soft_resolver_patch_count; ++i) {
-                if (g_soft_resolver_patches[i] == NULL ||
-                    g_soft_resolver_bytes[i] != bytes ||
+                if (g_soft_resolver_patches[i] == NULL || g_soft_resolver_bytes[i] != bytes ||
                     g_soft_resolver_required[i] != required)
                     continue;
-                int64_t displacement =
-                    (resolver - (uint8_t *)g_soft_resolver_patches[i]) / 4;
-                if (displacement < -(INT64_C(1) << 25) ||
-                    displacement >= (INT64_C(1) << 25)) {
+                int64_t displacement = (resolver - (uint8_t *)g_soft_resolver_patches[i]) / 4;
+                if (displacement < -(INT64_C(1) << 25) || displacement >= (INT64_C(1) << 25)) {
                     static const char message[] = "soft-memory resolver branch out of range";
                     (void)jit_fail(HL_STATUS_OUT_OF_MEMORY, message, sizeof message - 1u);
                     _exit(70);
                 }
-                *g_soft_resolver_patches[i] =
-                    0x14000000u | ((uint32_t)displacement & 0x03ffffffu);
+                *g_soft_resolver_patches[i] = 0x14000000u | ((uint32_t)displacement & 0x03ffffffu);
                 g_soft_resolver_patches[i] = NULL;
             }
 
@@ -1077,9 +1053,8 @@ static void emit_a64_soft_stub(void) {
         for (unsigned i = 0; i < cold_miss_count; ++i) {
             uint32_t *patch = cold_miss_patches[i];
             int64_t displacement = (resolver_miss - (uint8_t *)patch) / 4;
-            *patch = cold_miss_bits[i] < 0
-                         ? a64_cbnz_x(18, displacement)
-                         : a64_tbz_x(18, (unsigned)cold_miss_bits[i], displacement);
+            *patch = cold_miss_bits[i] < 0 ? a64_cbnz_x(18, displacement)
+                                           : a64_tbz_x(18, (unsigned)cold_miss_bits[i], displacement);
         }
         e_str(16, CPUREG, OFF_SOFT_EA);
         emit32(0x79400000u | (6u << 10) | (17u << 5) | 18u); /* ldrh w18,[meta,#12] */
@@ -1099,14 +1074,12 @@ static void emit_a64_soft_stub(void) {
         uint8_t *stub = g_cp;
         for (uint32_t i = 0; i < g_soft_stub_patch_count; ++i) {
             int64_t displacement = (stub - (uint8_t *)g_soft_stub_patches[i]) / 4;
-            if (displacement < -(INT64_C(1) << 25) ||
-                displacement >= (INT64_C(1) << 25)) {
+            if (displacement < -(INT64_C(1) << 25) || displacement >= (INT64_C(1) << 25)) {
                 static const char message[] = "soft-memory stub branch out of range";
                 (void)jit_fail(HL_STATUS_OUT_OF_MEMORY, message, sizeof message - 1u);
                 _exit(70);
             }
-            *g_soft_stub_patches[i] =
-                0x14000000u | ((uint32_t)displacement & 0x03ffffffu);
+            *g_soft_stub_patches[i] = 0x14000000u | ((uint32_t)displacement & 0x03ffffffu);
         }
         emit_spill();
         e_movconst(9, R_SOFTMISS);
@@ -1117,16 +1090,13 @@ static void emit_a64_soft_stub(void) {
     if (g_soft_legacy_stub_patch_count) {
         uint8_t *stub = g_cp;
         for (uint32_t i = 0; i < g_soft_legacy_stub_patch_count; ++i) {
-            int64_t displacement =
-                (stub - (uint8_t *)g_soft_legacy_stub_patches[i]) / 4;
-            if (displacement < -(INT64_C(1) << 25) ||
-                displacement >= (INT64_C(1) << 25)) {
+            int64_t displacement = (stub - (uint8_t *)g_soft_legacy_stub_patches[i]) / 4;
+            if (displacement < -(INT64_C(1) << 25) || displacement >= (INT64_C(1) << 25)) {
                 static const char message[] = "legacy soft-memory stub branch out of range";
                 (void)jit_fail(HL_STATUS_OUT_OF_MEMORY, message, sizeof message - 1u);
                 _exit(70);
             }
-            *g_soft_legacy_stub_patches[i] =
-                0x14000000u | ((uint32_t)displacement & 0x03ffffffu);
+            *g_soft_legacy_stub_patches[i] = 0x14000000u | ((uint32_t)displacement & 0x03ffffffu);
         }
         emit_spill();
         e_ldr(9, 17, 0);
@@ -1153,8 +1123,7 @@ static void emit_a64_soft_bounce_commit(uint64_t next_pc) {
     emit32(0); /* cbz x16,resume */
     emit_exit_const(next_pc, R_SOFTCOMMIT);
     uint8_t *resume = g_cp;
-    *clear = 0xB4000000u |
-             (((uint32_t)((resume - (uint8_t *)clear) / 4) & 0x7ffffu) << 5) | 16u;
+    *clear = 0xB4000000u | (((uint32_t)((resume - (uint8_t *)clear) / 4) & 0x7ffffu) << 5) | 16u;
 }
 
 static void emit_a64_soft_exclusive(uint32_t in) {
@@ -1167,8 +1136,7 @@ static void emit_a64_soft_exclusive(uint32_t in) {
         e_movr(16, base);
     emit_a64_bus_guard(16, a64_mem_bytes(in), g_emit_gpc);
     struct a64_soft_guard soft =
-        emit_a64_soft_guard_begin(16, 17, 18, a64_mem_bytes(in),
-                                  a64_mem_required(in), g_emit_gpc);
+        emit_a64_soft_guard_begin(16, 17, 18, a64_mem_bytes(in), a64_mem_required(in), g_emit_gpc);
     if (is_casp(in)) {
         emit_casp_mangled(in, 16);
     } else {
@@ -1201,8 +1169,8 @@ static void patch_adr(uint32_t *instruction, uint8_t *target, unsigned reg) {
         _exit(70);
     }
     uint64_t immediate = (uint64_t)displacement & UINT64_C(0x1fffff);
-    *instruction = 0x10000000u | (uint32_t)((immediate & 3u) << 29) |
-                   (uint32_t)(((immediate >> 2) & 0x7ffffu) << 5) | reg;
+    *instruction =
+        0x10000000u | (uint32_t)((immediate & 3u) << 29) | (uint32_t)(((immediate >> 2) & 0x7ffffu) << 5) | reg;
 }
 
 static void emit_a64_bus_guard_saved(uint64_t bytes, uint64_t pc) {
@@ -1213,7 +1181,7 @@ static void emit_a64_bus_guard_saved(uint64_t bytes, uint64_t pc) {
        parked in shared per-thread scratch here: an asynchronous signal may
        re-enter translated code and run another guard before this one resumes. */
     e_ldr(17, CPUREG, OFF_BUS_EA);
-    emit32(0xD34CFC00u | (17u << 5) | 17u); /* lsr x17,x17,#12: page */
+    emit32(0xD34CFC00u | (17u << 5) | 17u);                            /* lsr x17,x17,#12: page */
     emit32(0xD3400000u | (6u << 16) | (15u << 10) | (17u << 5) | 16u); /* ubfx x16,x17,#6,#10 */
     e_ldr(17, CPUREG, OFF_BUS_FILTER);
     emit32(0x8B000000u | (16u << 16) | (3u << 10) | (17u << 5) | 16u); /* add x16,x17,x16,lsl#3 */
@@ -1224,8 +1192,7 @@ static void emit_a64_bus_guard_saved(uint64_t bytes, uint64_t pc) {
     uint32_t *filter_miss = (uint32_t *)g_cp;
     emit32(0); /* tbz x18,#0,resume */
     uint8_t *slow = g_cp;
-    *force_slow = 0x37000000u | (1u << 19) |
-                  (((uint32_t)((slow - (uint8_t *)force_slow) / 4) & 0x3FFFu) << 5) | 16u;
+    *force_slow = 0x37000000u | (1u << 19) | (((uint32_t)((slow - (uint8_t *)force_slow) / 4) & 0x3FFFu) << 5) | 16u;
     /*
      * Carry only engine-reserved registers into the shared stub. emit_spill()
      * deliberately preserves x16/x17, so an asynchronous signal cannot
@@ -1252,8 +1219,7 @@ static void emit_a64_bus_guard_saved(uint64_t bytes, uint64_t pc) {
     uint8_t *resume_fast = g_cp;
     uint64_t resume_rx = (uint64_t)J_RX(resume_fast);
     memcpy(resume_slot, &resume_rx, sizeof(resume_rx));
-    *filter_miss = 0x36000000u |
-                   (((uint32_t)((resume_fast - (uint8_t *)filter_miss) / 4) & 0x3FFFu) << 5) | 16u;
+    *filter_miss = 0x36000000u | (((uint32_t)((resume_fast - (uint8_t *)filter_miss) / 4) & 0x3FFFu) << 5) | 16u;
 }
 
 static void emit_a64_bus_stub(void) {
@@ -1291,7 +1257,8 @@ static void emit_a64_bus_stub(void) {
     e_mov_sp_from(9);
     e_ldr(9, CPUREG, OFF_NZCV);
     emit32(0xD51B4200u | 9);
-    for (int t = 0; t < 32; t += 2) e_ldp_q(t, t + 1, CPUREG, OFF_V + t * 16);
+    for (int t = 0; t < 32; t += 2)
+        e_ldp_q(t, t + 1, CPUREG, OFF_V + t * 16);
     for (int r = 1; r <= 30; r++)
         if (!is_stolen(r)) e_ldr(r, CPUREG, r * 8);
     e_ldr(0, CPUREG, 0);
@@ -1311,8 +1278,8 @@ static void emit_a64_bus_guard(int ea, uint64_t bytes, uint64_t pc) {
     emit_a64_bus_guard_saved(bytes, pc);
     uint8_t *resume_inactive = g_cp;
     e_ldr(ea, CPUREG, OFF_BUS_EA);
-    *inactive_fast = 0x36000000u | (((uint32_t)((resume_inactive - (uint8_t *)inactive_fast) / 4) & 0x3FFFu) << 5) |
-                     16u;
+    *inactive_fast =
+        0x36000000u | (((uint32_t)((resume_inactive - (uint8_t *)inactive_fast) / 4) & 0x3FFFu) << 5) | 16u;
 }
 
 static void emit_a64_bus_guard_base(int base, int64_t offset, uint64_t bytes, uint64_t pc) {
@@ -1344,15 +1311,13 @@ static void emit_a64_bus_guard_instruction(uint32_t in, uint64_t pc) {
     if (regoff) {
         int rm = (int)((in >> 16) & 31u), opt = (int)((in >> 13) & 7u);
         int vector = (int)((in >> 26) & 1u);
-        int size = vector ? (int)((((in >> 22) & 3u) >> 1) << 2) | (int)((in >> 30) & 3u)
-                          : (int)((in >> 30) & 3u);
+        int size = vector ? (int)((((in >> 22) & 3u) >> 1) << 2) | (int)((in >> 30) & 3u) : (int)((in >> 30) & 3u);
         int amount = ((in >> 12) & 1u) ? size : 0;
         if (is_stolen(rm))
             e_ldr(17, CPUREG, rm * 8);
         else
             e_movr(17, rm);
-        emit32(0x8B200000u | (17u << 16) | ((unsigned)opt << 13) |
-               ((unsigned)(amount & 7) << 10) | (16u << 5) | 16u);
+        emit32(0x8B200000u | (17u << 16) | ((unsigned)opt << 13) | ((unsigned)(amount & 7) << 10) | (16u << 5) | 16u);
     } else {
         int64_t offset = a64_fold_mem_offset(in, 0);
         if (((in >> 27) & 7u) == 7u && !((in >> 24) & 1u)) {
@@ -1412,9 +1377,7 @@ static void emit_fold_mem(uint32_t in, int emit_bus_guard) {
     } else if ((in & 0x3A000000u) == 0x28000000u) {
         int o = (in >> 23) & 3;
         wb = o == 3 ? 1 : o == 1 ? 2 : 0;
-        if (wb)
-            wbimm = sext((uint64_t)((in >> 15) & 0x7f), 7) *
-                    (int64_t)(a64_mem_bytes(in) / 2);
+        if (wb) wbimm = sext((uint64_t)((in >> 15) & 0x7f), 7) * (int64_t)(a64_mem_bytes(in) / 2);
     }
     int sc[4];
     fold_mem_scratch(in, sc); // shared with fault-time reconstruction: same slot mapping
@@ -1447,8 +1410,8 @@ static void emit_fold_mem(uint32_t in, int emit_bus_guard) {
     int64_t access_off = regoff ? 0 : a64_fold_mem_offset(in, wb);
     if (access_off) {
         e_movconst(T, (uint64_t)(access_off < 0 ? -access_off : access_off));
-        emit32((access_off < 0 ? 0xCB000000u : 0x8B000000u) | ((unsigned)T << 16) |
-               ((unsigned)Sb << 5) | (unsigned)Sb); /* sub/add Sb,Sb,T */
+        emit32((access_off < 0 ? 0xCB000000u : 0x8B000000u) | ((unsigned)T << 16) | ((unsigned)Sb << 5) |
+               (unsigned)Sb); /* sub/add Sb,Sb,T */
     }
     if (guestbase_on()) {
         // Bias iff the EA falls in THIS image's span [g_nonpie_lo, g_nonpie_hi). Fast path: a >= 4GiB address is
@@ -1472,10 +1435,8 @@ static void emit_fold_mem(uint32_t in, int emit_bus_guard) {
         emit32(0xD51B4200u | T2);
         uint8_t *Lhi = g_cp;
         *p_hi = 0xB5000000u | (((uint32_t)(((uint8_t *)Lhi - (uint8_t *)p_hi) / 4) & 0x7FFFF) << 5) | T;
-        *p_lo1 =
-            0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo1) / 4) & 0x7FFFF) << 5) | 3;
-        *p_lo2 =
-            0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo2) / 4) & 0x7FFFF) << 5) | 2;
+        *p_lo1 = 0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo1) / 4) & 0x7FFFF) << 5) | 3;
+        *p_lo2 = 0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo2) / 4) & 0x7FFFF) << 5) | 2;
     }
     uint32_t m;
     int emask = mask;
@@ -1519,8 +1480,8 @@ static void emit_fold_mem(uint32_t in, int emit_bus_guard) {
         emit_a64_bus_guard_saved(a64_mem_bytes(in), g_emit_gpc);
         e_ldr(Sb, CPUREG, OFF_BUS_EA);
         uint8_t *resume_inactive = g_cp;
-        *inactive_fast = 0x36000000u |
-                         (((uint32_t)((resume_inactive - (uint8_t *)inactive_fast) / 4) & 0x3FFFu) << 5) | 16u;
+        *inactive_fast =
+            0x36000000u | (((uint32_t)((resume_inactive - (uint8_t *)inactive_fast) / 4) & 0x3FFFu) << 5) | 16u;
     }
     struct a64_soft_guard soft =
         emit_a64_soft_guard_begin(Sb, T, T2, a64_mem_bytes(in), a64_mem_required(in), g_emit_gpc);
@@ -1621,26 +1582,26 @@ static void emit_fold_advsimd_struct(uint32_t in) {
     // Bias iff Sb is in [g_nonpie_lo, g_nonpie_hi); a >= 4GiB base is never the low image -> skip with no flag
     // traffic. The compares clobber NZCV, so save/restore the guest flags. (Same discriminator as emit_fold_mem.)
     if (guestbase_on()) {
-    emit32(0xD360FC00u | (Sb << 5) | T); // lsr T, Sb, #32
-    uint32_t *p_hi = (uint32_t *)g_cp;
-    emit32(0);                // cbnz T, Lhi   (>= 4GiB -> skip, flags untouched)
-    emit32(0xD53B4200u | T2); // mrs T2, nzcv  (save guest flags)
-    e_movconst(T, g_nonpie_lo);
-    emit32(0xEB000000u | (T << 16) | (Sb << 5) | 31); // cmp Sb, lo
-    uint32_t *p_lo1 = (uint32_t *)g_cp;
-    emit32(0); // b.lo Llo   (Sb < lo -> not image)
-    e_movconst(T, g_nonpie_hi);
-    emit32(0xEB000000u | (T << 16) | (Sb << 5) | 31); // cmp Sb, hi
-    uint32_t *p_lo2 = (uint32_t *)g_cp;
-    emit32(0); // b.hs Llo   (Sb >= hi -> not image)
-    e_movconst(T, g_nonpie_bias);
-    emit32(0x8B000000u | (T << 16) | (Sb << 5) | Sb); // add Sb, Sb, bias
-    uint8_t *Llo = g_cp;
-    emit32(0xD51B4200u | T2); // msr nzcv, T2  (restore guest flags)
-    uint8_t *Lhi = g_cp;
-    *p_hi = 0xB5000000u | (((uint32_t)(((uint8_t *)Lhi - (uint8_t *)p_hi) / 4) & 0x7FFFF) << 5) | T;
-    *p_lo1 = 0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo1) / 4) & 0x7FFFF) << 5) | 3; // b.lo
-    *p_lo2 = 0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo2) / 4) & 0x7FFFF) << 5) | 2; // b.hs
+        emit32(0xD360FC00u | (Sb << 5) | T); // lsr T, Sb, #32
+        uint32_t *p_hi = (uint32_t *)g_cp;
+        emit32(0);                // cbnz T, Lhi   (>= 4GiB -> skip, flags untouched)
+        emit32(0xD53B4200u | T2); // mrs T2, nzcv  (save guest flags)
+        e_movconst(T, g_nonpie_lo);
+        emit32(0xEB000000u | (T << 16) | (Sb << 5) | 31); // cmp Sb, lo
+        uint32_t *p_lo1 = (uint32_t *)g_cp;
+        emit32(0); // b.lo Llo   (Sb < lo -> not image)
+        e_movconst(T, g_nonpie_hi);
+        emit32(0xEB000000u | (T << 16) | (Sb << 5) | 31); // cmp Sb, hi
+        uint32_t *p_lo2 = (uint32_t *)g_cp;
+        emit32(0); // b.hs Llo   (Sb >= hi -> not image)
+        e_movconst(T, g_nonpie_bias);
+        emit32(0x8B000000u | (T << 16) | (Sb << 5) | Sb); // add Sb, Sb, bias
+        uint8_t *Llo = g_cp;
+        emit32(0xD51B4200u | T2); // msr nzcv, T2  (restore guest flags)
+        uint8_t *Lhi = g_cp;
+        *p_hi = 0xB5000000u | (((uint32_t)(((uint8_t *)Lhi - (uint8_t *)p_hi) / 4) & 0x7FFFF) << 5) | T;
+        *p_lo1 = 0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo1) / 4) & 0x7FFFF) << 5) | 3; // b.lo
+        *p_lo2 = 0x54000000u | (((uint32_t)(((uint8_t *)Llo - (uint8_t *)p_lo2) / 4) & 0x7FFFF) << 5) | 2; // b.hs
     }
     // De-index to the no-offset form against Sb: clear post-index (bit23) and Rm[20:16], rebase Xn -> Sb. The
     // V-register list, opcode, R, and size fields are untouched, so the transfer is identical -- only its
@@ -1648,8 +1609,7 @@ static void emit_fold_advsimd_struct(uint32_t in) {
     emit_a64_bus_guard(Sb, (uint64_t)advsimd_struct_bytes(in), g_emit_gpc);
     struct a64_soft_guard soft =
         emit_a64_soft_guard_begin(Sb, T, T2, (uint64_t)advsimd_struct_bytes(in),
-                                  (in & (1u << 22)) ? HL_LOGICAL_VMA_READ : HL_LOGICAL_VMA_WRITE,
-                                  g_emit_gpc);
+                                  (in & (1u << 22)) ? HL_LOGICAL_VMA_READ : HL_LOGICAL_VMA_WRITE, g_emit_gpc);
     a64_soft_guard_restore(&soft, Sb, M + 32);
     a64_soft_guard_restore(&soft, T, M + 40);
     a64_soft_guard_restore(&soft, T2, M + 48);
@@ -1889,13 +1849,14 @@ static int target_is_leaf(uint64_t target) {
 
 #define CTX_INLINE_DEPTH 3
 #define CTX_INLINE_INSNS 64
-static int context_clone_candidate(uint64_t target, const uint64_t ancestors[], int depth,
-                                   uint64_t *retpc, int *cost) {
+
+static int context_clone_candidate(uint64_t target, const uint64_t ancestors[], int depth, uint64_t *retpc, int *cost) {
     if (depth >= CTX_INLINE_DEPTH) return 0;
     for (int i = 0; i < depth; i++)
         if (ancestors[i] == target) return 0;
     uint64_t anc[CTX_INLINE_DEPTH];
-    for (int i = 0; i < depth; i++) anc[i] = ancestors[i];
+    for (int i = 0; i < depth; i++)
+        anc[i] = ancestors[i];
     anc[depth] = target;
     int total = 0;
     /*
@@ -1906,32 +1867,27 @@ static int context_clone_candidate(uint64_t target, const uint64_t ancestors[], 
      * byte is outside the containing readable region.
      */
     hl_host_region region;
-    if (!hl_host_region_query((uintptr_t)target, &region) ||
-        target < region.address || !(region.protection & HL_HOST_REGION_READ))
+    if (!hl_host_region_query((uintptr_t)target, &region) || target < region.address ||
+        !(region.protection & HL_HOST_REGION_READ))
         return 0;
     uint64_t region_offset = target - region.address;
     if (region_offset >= region.size) return 0;
     uint64_t remaining = region.size - region_offset;
     for (int i = 0; i < CTX_INLINE_INSNS; i++) {
         uint64_t offset = (uint64_t)i * 4;
-        if (offset > remaining || remaining - offset < 4 || offset > UINT64_MAX - target)
-            return 0;
+        if (offset > remaining || remaining - offset < 4 || offset > UINT64_MAX - target) return 0;
         uint64_t pc = target + offset;
         uint32_t in = a64_fetch_instruction(pc, NULL);
         total++;
-        if ((in & 31u) == 30u &&
-            (in & 0xFC000000u) != 0x94000000u &&
-            (in & 0xFFFFFC1Fu) != 0xD65F0000u)
-            return 0;
-        if (in == 0xD4000001u || (in & 0xFC000000u) == 0x14000000u ||
-            (in & 0xFFFFFC1Fu) == 0xD61F0000u || (in & 0xFFFFFC1Fu) == 0xD63F0000u)
+        if ((in & 31u) == 30u && (in & 0xFC000000u) != 0x94000000u && (in & 0xFFFFFC1Fu) != 0xD65F0000u) return 0;
+        if (in == 0xD4000001u || (in & 0xFC000000u) == 0x14000000u || (in & 0xFFFFFC1Fu) == 0xD61F0000u ||
+            (in & 0xFFFFFC1Fu) == 0xD63F0000u)
             return 0;
         if ((in & 0xFC000000u) == 0x94000000u) {
             int64_t off = sext(in & 0x3FFFFFF, 26) << 2;
             uint64_t child_ret;
             int child_cost;
-            if (!context_clone_candidate(pc + off, anc, depth + 1, &child_ret, &child_cost))
-                return 0;
+            if (!context_clone_candidate(pc + off, anc, depth + 1, &child_ret, &child_cost)) return 0;
             total += child_cost;
             if (total > CTX_INLINE_INSNS * CTX_INLINE_DEPTH) return 0;
         }
@@ -1978,8 +1934,7 @@ static void emit_bl_ras(uint64_t gpc, uint64_t target) {
     // host ret lands here
     uint8_t *Lcont = g_cp;
     int64_t ao = Lcont - (uint8_t *)p_adr;
-    *p_adr = 0x10000000u | ((uint32_t)(ao & 3) << 29) |
-             (((uint32_t)((ao >> 2) & 0x7FFFF)) << 5) | 3u;
+    *p_adr = 0x10000000u | ((uint32_t)(ao & 3) << 29) | (((uint32_t)((ao >> 2) & 0x7FFFF)) << 5) | 3u;
     // after the call returns -> gpc+4
     emit_chain_exit(gpc + 4);
 }
@@ -2192,12 +2147,10 @@ static void emit_selfloop(uint32_t in, uint64_t start, uint64_t fall, void *body
 // instruction (no monitor), so the injected spill/fill is harmless, making this the correct path. The
 // common clean PIE case still lowers to the bare op -> byte-identical to before.
 static void emit_atomic_part(uint32_t in, int mask, int is_mem) {
-    if (is_mem && (guestbase_on() || jit_guest_soft_active()) &&
-        (jit_guest_soft_active() || ((in >> 5) & 31) != 31)) {
+    if (is_mem && (guestbase_on() || jit_guest_soft_active()) && (jit_guest_soft_active() || ((in >> 5) & 31) != 31)) {
         if (jit_guest_bus_active()) emit_a64_bus_guard_instruction(in, g_emit_gpc);
         emit_fold_mem(in, 0);
-    }
-    else if (uses_x18(in, mask))
+    } else if (uses_x18(in, mask))
         emit_mangled_x18(in, mask);
     else
         emit32(in);
@@ -2210,7 +2163,7 @@ static void emit_atomic_part(uint32_t in, int mask, int is_mem) {
 // the original loop the stxr writes Ws after every other operand, so a Ws that aliases Wt/Ws2/Wm
 // must also end up zero.
 static void emit_lse_status_zero(int Ws) {
-    if (Ws == 31) return; /* stxr wzr: the status is architecturally discarded */
+    if (Ws == 31) return;                               /* stxr wzr: the status is architecturally discarded */
     emit_atomic_part(0x2A1F03E0u | (uint32_t)Ws, 1, 0); /* mov Ws, wzr */
 }
 
@@ -2507,7 +2460,9 @@ static void stitch_cond(uint32_t inv, uint64_t taken) {
     *patch = recode_cond(inv, ((uint8_t *)g_cp - (uint8_t *)patch) / 4);
 }
 
-static int smc_disabled(void) { return 0; }
+static int smc_disabled(void) {
+    return 0;
+}
 
 static void *translate_block(uint64_t gpc);
 static uint64_t g_last_guest_start;
@@ -2520,8 +2475,7 @@ static void smc_queue_line(struct cpu *c, uint64_t address) {
      * intervals use the real executable address, so normalize an ic-ivau
      * operand exactly like instruction dispatch does before classifying it.
      */
-    if (g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi)
-        address += g_nonpie_bias;
+    if (g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi) address += g_nonpie_bias;
     uint64_t start = address & ~UINT64_C(63), end = start + 64;
     for (uint32_t i = 0; i < c->smc_range_count; i++) {
         if (end < c->smc_ranges[i][0] || start > c->smc_ranges[i][1]) continue;
@@ -2566,8 +2520,7 @@ static int aarch64_soft_tlb_miss(struct cpu *c) {
     void *host = NULL;
     size_t contiguous = 0;
     uint32_t protection = HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_WRITE | HL_LOGICAL_VMA_EXEC;
-    int resolved = hl_logical_vma_resolve_data(c->soft_ea, 1, (uint32_t)c->soft_required,
-                                               &host, &contiguous);
+    int resolved = hl_logical_vma_resolve_data(c->soft_ea, 1, (uint32_t)c->soft_required, &host, &contiguous);
     if (resolved < 0) return 0;
     uint64_t first, last;
     if (resolved) {
@@ -2590,8 +2543,7 @@ static int aarch64_soft_tlb_miss(struct cpu *c) {
         first = c->soft_ea & ~UINT64_C(4095);
         last = first + UINT64_C(4096);
     }
-    if (c->soft_bytes == 0 || c->soft_bytes > last - first ||
-        c->soft_ea > last - c->soft_bytes) {
+    if (c->soft_bytes == 0 || c->soft_bytes > last - first || c->soft_ea > last - c->soft_bytes) {
         c->reason = R_SOFTSPAN;
         return 1;
     }
@@ -2616,8 +2568,7 @@ static int aarch64_soft_span_copy(struct cpu *c, int to_guest, int copy_bytes) {
         void *host = NULL;
         size_t contiguous = 0;
         uint32_t required = to_guest ? HL_LOGICAL_VMA_WRITE : HL_LOGICAL_VMA_READ;
-        int resolved = hl_logical_vma_resolve_data(
-            cursor, 1, required, &host, &contiguous);
+        int resolved = hl_logical_vma_resolve_data(cursor, 1, required, &host, &contiguous);
         if (resolved < 0) return 0;
         if (!resolved) {
             size_t page_left = 4096u - (size_t)(cursor & 4095u);
@@ -2643,16 +2594,12 @@ static int aarch64_soft_span_copy(struct cpu *c, int to_guest, int copy_bytes) {
 static int aarch64_soft_prepare_bounce(struct cpu *c) {
     int ok = 0;
     uint32_t in = a64_fetch_instruction(c->soft_pc, &ok);
-    int single = (in & 0x3B000000u) == 0x39000000u ||
-                 (in & 0x3B200000u) == 0x38000000u;
+    int single = (in & 0x3B000000u) == 0x39000000u || (in & 0x3B200000u) == 0x38000000u;
     int pair = (in & 0x3A000000u) == 0x28000000u;
     int structure = is_advsimd_struct(in);
-    int literal = (in & 0xBF000000u) == 0x18000000u ||
-                  (in & 0xFF000000u) == 0x98000000u ||
-                  ((in & 0x3F000000u) == 0x1C000000u &&
-                   ((in >> 30) & 3) != 3);
-    int atomic = (in & 0x3B200C00u) == 0x38200000u ||
-                 (in & 0x3F000000u) == 0x08000000u || is_casp(in);
+    int literal = (in & 0xBF000000u) == 0x18000000u || (in & 0xFF000000u) == 0x98000000u ||
+                  ((in & 0x3F000000u) == 0x1C000000u && ((in >> 30) & 3) != 3);
+    int atomic = (in & 0x3B200C00u) == 0x38200000u || (in & 0x3F000000u) == 0x08000000u || is_casp(in);
     if (!ok || !(single || pair || structure || literal) || atomic || c->soft_bytes == 0 ||
         c->soft_bytes > sizeof(c->soft_bounce))
         return -1;
@@ -2668,10 +2615,8 @@ static int aarch64_soft_prepare_bounce(struct cpu *c) {
      */
     sigset_t all;
     sigfillset(&all);
-    _Static_assert(sizeof(sigset_t) <= sizeof(c->soft_bounce_host_mask),
-                   "soft bounce host-mask storage is too small");
-    if (pthread_sigmask(SIG_BLOCK, &all,
-                        (sigset_t *)(void *)c->soft_bounce_host_mask) != 0) return 0;
+    _Static_assert(sizeof(sigset_t) <= sizeof(c->soft_bounce_host_mask), "soft bounce host-mask storage is too small");
+    if (pthread_sigmask(SIG_BLOCK, &all, (sigset_t *)(void *)c->soft_bounce_host_mask) != 0) return 0;
     c->soft_bounce_write = (uint64_t)write;
     c->soft_bounce_pending = 1;
     c->soft_page = c->soft_ea;
@@ -2685,13 +2630,11 @@ static int aarch64_soft_prepare_bounce(struct cpu *c) {
 static int aarch64_soft_bounce_commit(struct cpu *c) {
     if (!c->soft_bounce_pending) return 1;
     int ok = !c->soft_bounce_write || aarch64_soft_span_copy(c, 1, 1);
-    if (ok && c->soft_bounce_write)
-        aarch64_smc_copyout(c->soft_ea, c->soft_ea + c->soft_bytes);
+    if (ok && c->soft_bounce_write) aarch64_smc_copyout(c->soft_ea, c->soft_ea + c->soft_bytes);
     c->soft_bounce_pending = 0;
     c->soft_page = UINT64_MAX;
     c->soft_protection = 0;
-    (void)pthread_sigmask(SIG_SETMASK,
-                          (const sigset_t *)(const void *)c->soft_bounce_host_mask, NULL);
+    (void)pthread_sigmask(SIG_SETMASK, (const sigset_t *)(const void *)c->soft_bounce_host_mask, NULL);
     return ok;
 }
 
@@ -2702,12 +2645,10 @@ static int aarch64_soft_tlb_span(struct cpu *c) {
     while (cursor < last) {
         void *host = NULL;
         size_t contiguous = 0;
-        int resolved = hl_logical_vma_resolve_data(cursor, 1, (uint32_t)c->soft_required,
-                                                   &host, &contiguous);
+        int resolved = hl_logical_vma_resolve_data(cursor, 1, (uint32_t)c->soft_required, &host, &contiguous);
         if (resolved < 0) return 0;
         uint64_t part_delta = resolved ? (uint64_t)(uintptr_t)host - cursor : 0;
-        if (have_delta && part_delta != delta)
-            return aarch64_soft_prepare_bounce(c);
+        if (have_delta && part_delta != delta) return aarch64_soft_prepare_bounce(c);
         delta = part_delta;
         have_delta = 1;
         uint64_t step = UINT64_C(4096) - (cursor & UINT64_C(4095));
@@ -2792,18 +2733,15 @@ static int smc_commit(struct cpu *c) {
         memset(g_ibtc, 0, sizeof g_ibtc);
         txpg_clear();
     } else {
-        removed = map_invalidate_source_ranges(
-            (const uint64_t (*)[2])c->smc_ranges, c->smc_range_count);
+        removed = map_invalidate_source_ranges((const uint64_t (*)[2])c->smc_ranges, c->smc_range_count);
     }
     pend_reset();
     for (int i = 0; i < STW_MAXTHREAD; i++)
-        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed) &&
-            g_stw_threads[i].cpu)
+        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed) && g_stw_threads[i].cpu)
             g_stw_threads[i].cpu->ssp = 0;
-    HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT,
-            "smc invalidate mode=%s ranges=%u removed=%u retained=%u",
-            (force_whole || c->smc_range_overflow) ? "whole" : "targeted",
-            c->smc_range_count, removed, g_live_map_count);
+    HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT, "smc invalidate mode=%s ranges=%u removed=%u retained=%u",
+            (force_whole || c->smc_range_overflow) ? "whole" : "targeted", c->smc_range_count, removed,
+            g_live_map_count);
     g_smc_flushes++;
     stw_mapping_end();
     c->smc_range_count = 0;
@@ -2880,8 +2818,10 @@ static void smc_icflush(struct cpu *c, uint64_t va) {
 
 static void emit_smc_queue(int va_register) {
     assert(g_steal1617);
-    if (is_stolen(va_register)) e_ldr(16, CPUREG, va_register * 8);
-    else e_movr(16, va_register);
+    if (is_stolen(va_register))
+        e_ldr(16, CPUREG, va_register * 8);
+    else
+        e_movr(16, va_register);
     emit32(0x927AE610u); /* and x16,x16,#-64 */
     e_str(16, CPUREG, OFF_SMCVA);
     e_ldr(16, CPUREG, OFF_SMC_RANGE_COUNT);
@@ -2941,11 +2881,9 @@ static void emit_smc_queue(int va_register) {
     e_str(16, CPUREG, OFF_SMC_RANGE_OVERFLOW);
     uint8_t *done = g_cp;
     *empty = 0xB4000000u | (((uint32_t)((append - (uint8_t *)empty) / 4) & 0x7ffffu) << 5) | 16u;
-    *not_adjacent = 0xB5000000u |
-                    (((uint32_t)((append - (uint8_t *)not_adjacent) / 4) & 0x7ffffu) << 5) | 17u;
+    *not_adjacent = 0xB5000000u | (((uint32_t)((append - (uint8_t *)not_adjacent) / 4) & 0x7ffffu) << 5) | 17u;
     *extended = 0x14000000u | ((uint32_t)((done - (uint8_t *)extended) / 4) & 0x03ffffffu);
-    *overflow = 0xB4000000u |
-                (((uint32_t)((overflow_body - (uint8_t *)overflow) / 4) & 0x7ffffu) << 5) | 17u;
+    *overflow = 0xB4000000u | (((uint32_t)((overflow_body - (uint8_t *)overflow) / 4) & 0x7ffffu) << 5) | 17u;
     *skip = 0x14000000u | ((uint32_t)((done - (uint8_t *)skip) / 4) & 0x03ffffffu);
 }
 
@@ -3006,8 +2944,7 @@ static int insn_touches_vreg(uint32_t in) {
     return 0;
 }
 
-static int x28_alu_window_classify(uint32_t in, int *mask_out,
-                                   int *read_out, int *write_out) {
+static int x28_alu_window_classify(uint32_t in, int *mask_out, int *read_out, int *write_out) {
     static const int shifts[4] = {0, 5, 16, 10};
     static const int mbits[4] = {1, 2, 4, 8};
     int mask = gpr_field_mask(in), read = 0, write = 0;
@@ -3022,8 +2959,7 @@ static int x28_alu_window_classify(uint32_t in, int *mask_out,
         } else if ((in & 0x1F800000u) == 0x13800000u) {
             read = mask & (2 | 4);
             write = mask & 1;
-        } else if ((in & 0x1F000000u) == 0x11000000u ||
-                   (in & 0x1F800000u) == 0x12000000u ||
+        } else if ((in & 0x1F000000u) == 0x11000000u || (in & 0x1F800000u) == 0x12000000u ||
                    (in & 0x1F800000u) == 0x13000000u) {
             read = mask & 2;
             write = mask & 1;
@@ -3037,9 +2973,7 @@ static int x28_alu_window_classify(uint32_t in, int *mask_out,
         return 0;
     }
     for (int k = 0; k < 4; k++)
-        if ((mask & mbits[k]) && is_stolen((in >> shifts[k]) & 31) &&
-            ((in >> shifts[k]) & 31) != 28)
-            return 0;
+        if ((mask & mbits[k]) && is_stolen((in >> shifts[k]) & 31) && ((in >> shifts[k]) & 31) != 28) return 0;
     *mask_out = mask;
     *read_out = read;
     *write_out = write;
@@ -3050,8 +2984,7 @@ static int x28_alu_window_field(uint32_t in, int fields) {
     static const int shifts[4] = {0, 5, 16, 10};
     static const int mbits[4] = {1, 2, 4, 8};
     for (int k = 0; k < 4; k++)
-        if ((fields & mbits[k]) && ((in >> shifts[k]) & 31) == 28)
-            return 1;
+        if ((fields & mbits[k]) && ((in >> shifts[k]) & 31) == 28) return 1;
     return 0;
 }
 
@@ -3059,8 +2992,7 @@ static uint32_t x28_alu_window_rewrite(uint32_t in, int mask) {
     static const int shifts[4] = {0, 5, 16, 10};
     static const int mbits[4] = {1, 2, 4, 8};
     for (int k = 0; k < 4; k++)
-        if ((mask & mbits[k]) && ((in >> shifts[k]) & 31) == 28)
-            in = (in & ~(31u << shifts[k])) | (17u << shifts[k]);
+        if ((mask & mbits[k]) && ((in >> shifts[k]) & 31) == 28) in = (in & ~(31u << shifts[k])) | (17u << shifts[k]);
     return in;
 }
 
@@ -3080,9 +3012,7 @@ static uint32_t x28_alu_window_rewrite(uint32_t in, int mask) {
  * atomics/exclusives, SIMD, branches/system instructions, guest-base/folded
  * addressing, tier 2, and active guest-bus/SMC-special translation modes.
  */
-static int stolen_forward_classify(uint32_t in, int *mask_out,
-                                   int *read_out, int *write_out,
-                                   int *fault_out) {
+static int stolen_forward_classify(uint32_t in, int *mask_out, int *read_out, int *write_out, int *fault_out) {
     int mask, read, write;
     if (x28_alu_window_classify(in, &mask, &read, &write)) {
         *mask_out = mask;
@@ -3105,8 +3035,7 @@ static int stolen_forward_classify(uint32_t in, int *mask_out,
         } else if ((in & 0x1F800000u) == 0x13800000u) {
             read = mask & (2 | 4);
             write = mask & 1;
-        } else if ((in & 0x1F000000u) == 0x11000000u ||
-                   (in & 0x1F800000u) == 0x12000000u ||
+        } else if ((in & 0x1F000000u) == 0x11000000u || (in & 0x1F800000u) == 0x12000000u ||
                    (in & 0x1F800000u) == 0x13000000u) {
             read = mask & 2;
             write = mask & 1;
@@ -3150,8 +3079,7 @@ try_memory:
     int opc = (in >> 22) & 3;
     int size = (in >> 30) & 3;
     if (size == 3 && opc == 2) return 0; /* PRFM */
-    int writeback = unscaled && (((in >> 10) & 3) == 1 ||
-                                 ((in >> 10) & 3) == 3);
+    int writeback = unscaled && (((in >> 10) & 3) == 1 || ((in >> 10) & 3) == 3);
     int base_index = mask & (2 | 4);
     if (opc == 0) {
         read = mask & (1 | 2 | 4);
@@ -3179,8 +3107,7 @@ static int stolen_forward_field(uint32_t in, int fields, int reg) {
     static const int shifts[4] = {0, 5, 16, 10};
     static const int mbits[4] = {1, 2, 4, 8};
     for (int k = 0; k < 4; k++)
-        if ((fields & mbits[k]) && (int)((in >> shifts[k]) & 31) == reg)
-            return 1;
+        if ((fields & mbits[k]) && (int)((in >> shifts[k]) & 31) == reg) return 1;
     return 0;
 }
 
@@ -3188,8 +3115,7 @@ static uint32_t stolen_forward_rewrite(uint32_t in, int mask) {
     static const int shifts[4] = {0, 5, 16, 10};
     static const int mbits[4] = {1, 2, 4, 8};
     for (int k = 0; k < 4; k++)
-        if ((mask & mbits[k]) && ((in >> shifts[k]) & 31) == 28)
-            in = (in & ~(31u << shifts[k])) | (17u << shifts[k]);
+        if ((mask & mbits[k]) && ((in >> shifts[k]) & 31) == 28) in = (in & ~(31u << shifts[k])) | (17u << shifts[k]);
     return in;
 }
 
@@ -3233,11 +3159,9 @@ static uint64_t scan_tail_x30_carry(uint64_t pc) {
         }
         // No memory, control flow, system, SIMD, PC-relative operation, or
         // stolen guest register may occur while host x17 carries the LR.
-        if ((in & 0x0A000000u) == 0x08000000u ||
-            (in & 0x7C000000u) == 0x14000000u ||
-            (in & 0x1C000000u) == 0x10000000u ||
-            (in & 0x0E000000u) == 0x0E000000u ||
-            (in & 0xFFC00000u) == 0xD5000000u) return 0;
+        if ((in & 0x0A000000u) == 0x08000000u || (in & 0x7C000000u) == 0x14000000u ||
+            (in & 0x1C000000u) == 0x10000000u || (in & 0x0E000000u) == 0x0E000000u || (in & 0xFFC00000u) == 0xD5000000u)
+            return 0;
         int mask = gpr_field_mask(in);
         if (uses_x18(in, mask)) return 0;
     }
@@ -3262,7 +3186,7 @@ static void *translate_block(uint64_t gpc) {
     uint64_t guest_start = gpc;
     uint64_t guest_end = gpc + 4;
     uint64_t tail_carry_ldp = scan_tail_x30_carry(gpc);
-    g_blk_vdirty = 0; // reset per block; set below when a V-writing insn is emitted
+    g_blk_vdirty = 0;     // reset per block; set below when a V-writing insn is emitted
     g_t2_loop_top = NULL; // reset per block; set only in the tier-2 vdirty-hoist path below
     g_t2_irq_patch = NULL;
     void *host = g_cp;
@@ -3308,9 +3232,11 @@ static void *translate_block(uint64_t gpc) {
     // registered in g_map, so the truncated successor self-heals as an on-demand fresh translation via the
     // ordinary chain-exit path (identical to the NOSTITCH baseline, just re-anchored deeper).
     int ncond = 0;
+
     struct {
         uint64_t target, resume, retpc, expected_x30;
     } ctx[CTX_INLINE_DEPTH];
+
     int nctx = 0;
 #ifndef STITCH_MAX_COND
 #define STITCH_MAX_COND 3
@@ -3327,7 +3253,7 @@ static void *translate_block(uint64_t gpc) {
     // post-loop guard.
     uint64_t tx_last_line = ~UINT64_C(0);
 #define STITCH_OK                                                                                                      \
-    (g_stitch && !smc_seen() && !in_excl && trace_blk < TRACE_MAX_BLK - 1 && ncond < STITCH_MAX_COND &&              \
+    (g_stitch && !smc_seen() && !in_excl && trace_blk < TRACE_MAX_BLK - 1 && ncond < STITCH_MAX_COND &&                \
      (g_cp - (uint8_t *)host) < TRACE_MAX_BYTES)
     for (;;) {
         // A basic block is not necessarily small: generated programs can contain tens of thousands of
@@ -3336,9 +3262,8 @@ static void *translate_block(uint64_t gpc) {
         // size so the dispatcher's CACHE_EMIT_HEADROOM admission guarantee remains true.  Splitting at an
         // arbitrary instruction boundary is equivalent to an ordinary chain exit; exclusive sequences are
         // exempt because an injected dispatcher edge would clear the architectural monitor.
-        if (!in_excl &&
-            ((size_t)(g_cp - (uint8_t *)host) >= CACHE_EMIT_HEADROOM / 2 ||
-             g_bus_stub_patch_count >= BUS_STUB_PATCH_MAX - 4)) {
+        if (!in_excl && ((size_t)(g_cp - (uint8_t *)host) >= CACHE_EMIT_HEADROOM / 2 ||
+                         g_bus_stub_patch_count >= BUS_STUB_PATCH_MAX - 4)) {
             emit_chain_exit(gpc);
             break;
         }
@@ -3350,19 +3275,17 @@ static void *translate_block(uint64_t gpc) {
             emit_exit_const(gpc, R_FETCHFAULT);
             break;
         }
-        if (stealfast_on() && !g_tier2_build && !in_excl && !guestbase_on() &&
-            !jit_guest_bus_active() && !g_nonpie_lo) {
+        if (stealfast_on() && !g_tier2_build && !in_excl && !guestbase_on() && !jit_guest_bus_active() &&
+            !g_nonpie_lo) {
             int mask, read, write, fault;
             if (stolen_forward_classify(in, &mask, &read, &write, &fault) &&
-                (stolen_forward_field(in, read, 16) ||
-                 stolen_forward_field(in, read, 28))) {
+                (stolen_forward_field(in, read, 16) || stolen_forward_field(in, read, 28))) {
                 int count = 0, touches = 0, last_touch = -1;
                 int need16 = 0, need28 = 0;
                 for (; count < 12; count++) {
                     uint32_t win = a64_fetch_instruction(gpc + (uint64_t)count * 4, NULL);
                     int wm, wr, ww, wf;
-                    if (!stolen_forward_classify(win, &wm, &wr, &ww, &wf))
-                        break;
+                    if (!stolen_forward_classify(win, &wm, &wr, &ww, &wf)) break;
                     int r16 = stolen_forward_field(win, wr, 16);
                     int r28 = stolen_forward_field(win, wr, 28);
                     if (r16 || r28) {
@@ -3375,9 +3298,7 @@ static void *translate_block(uint64_t gpc) {
                 if (touches >= 3) {
                     int window = last_touch + 1;
                     if (provenance_fault_capable)
-                        jit_instruction_map_put(provenance_host,
-                                                (uint64_t)g_cp,
-                                                provenance_guest);
+                        jit_instruction_map_put(provenance_host, (uint64_t)g_cp, provenance_guest);
                     /* Load x16 first: the second load still needs real x28. */
                     if (need16) e_ldr(16, CPUREG, 16 * 8);
                     if (need28) e_ldr(17, CPUREG, 28 * 8);
@@ -3389,16 +3310,12 @@ static void *translate_block(uint64_t gpc) {
                         assert(ok);
                         uint64_t hstart = (uint64_t)g_cp;
                         emit32(stolen_forward_rewrite(win, wm));
-                        if (stolen_forward_field(win, ww, 16))
-                            e_str(16, CPUREG, 16 * 8);
-                        if (stolen_forward_field(win, ww, 28))
-                            e_str(17, CPUREG, 28 * 8);
-                        if (wf)
-                            jit_instruction_map_put(hstart, (uint64_t)g_cp, pc);
+                        if (stolen_forward_field(win, ww, 16)) e_str(16, CPUREG, 16 * 8);
+                        if (stolen_forward_field(win, ww, 28)) e_str(17, CPUREG, 28 * 8);
+                        if (wf) jit_instruction_map_put(hstart, (uint64_t)g_cp, pc);
                     }
                     if (g_txln_active) {
-                        uint64_t last =
-                            (gpc + (uint64_t)window * 4 - 1) >> 6;
+                        uint64_t last = (gpc + (uint64_t)window * 4 - 1) >> 6;
                         for (uint64_t line = gpc >> 6; line <= last; line++)
                             txln_put(line);
                         tx_last_line = last;
@@ -3411,17 +3328,15 @@ static void *translate_block(uint64_t gpc) {
                 }
             }
         }
-        if (stealfast_on() && !g_tier2_build && !in_excl && !guestbase_on() &&
-            !jit_guest_bus_active() && !g_nonpie_lo) {
+        if (stealfast_on() && !g_tier2_build && !in_excl && !guestbase_on() && !jit_guest_bus_active() &&
+            !g_nonpie_lo) {
             int mask, read, write;
-            if (x28_alu_window_classify(in, &mask, &read, &write) &&
-                x28_alu_window_field(in, read)) {
+            if (x28_alu_window_classify(in, &mask, &read, &write) && x28_alu_window_field(in, read)) {
                 int count = 0, reads = 0, last_read = -1;
                 for (; count < 12; count++) {
                     uint32_t win = a64_fetch_instruction(gpc + (uint64_t)count * 4, NULL);
                     int wm, wr, ww;
-                    if (!x28_alu_window_classify(win, &wm, &wr, &ww))
-                        break;
+                    if (!x28_alu_window_classify(win, &wm, &wr, &ww)) break;
                     if (x28_alu_window_field(win, wr)) {
                         reads++;
                         last_read = count;
@@ -3430,9 +3345,7 @@ static void *translate_block(uint64_t gpc) {
                 if (reads >= 3) {
                     int window = last_read + 1;
                     if (provenance_fault_capable)
-                        jit_instruction_map_put(provenance_host,
-                                                (uint64_t)g_cp,
-                                                provenance_guest);
+                        jit_instruction_map_put(provenance_host, (uint64_t)g_cp, provenance_guest);
                     e_ldr(17, CPUREG, 28 * 8);
                     for (int i = 0; i < window; i++) {
                         uint64_t pc = gpc + (uint64_t)i * 4;
@@ -3441,12 +3354,10 @@ static void *translate_block(uint64_t gpc) {
                         int ok = x28_alu_window_classify(win, &wm, &wr, &ww);
                         assert(ok);
                         emit32(x28_alu_window_rewrite(win, wm));
-                        if (x28_alu_window_field(win, ww))
-                            e_str(17, CPUREG, 28 * 8);
+                        if (x28_alu_window_field(win, ww)) e_str(17, CPUREG, 28 * 8);
                     }
                     if (g_txln_active) {
-                        uint64_t last =
-                            (gpc + (uint64_t)window * 4 - 1) >> 6;
+                        uint64_t last = (gpc + (uint64_t)window * 4 - 1) >> 6;
                         for (uint64_t line = gpc >> 6; line <= last; line++)
                             txln_put(line);
                         tx_last_line = last;
@@ -3468,13 +3379,12 @@ static void *translate_block(uint64_t gpc) {
         }
         if (gpc < guest_start) guest_start = gpc;
         if (gpc + 4 > guest_end) guest_end = gpc + 4;
-        if (provenance_fault_capable)
-            jit_instruction_map_put(provenance_host, (uint64_t)g_cp, provenance_guest);
+        if (provenance_fault_capable) jit_instruction_map_put(provenance_host, (uint64_t)g_cp, provenance_guest);
         provenance_host = (uint64_t)g_cp;
         provenance_guest = gpc;
         uint32_t provenance_major = (in >> 25) & 0xFu;
-        provenance_fault_capable = ((in & 0x0A000000u) == 0x08000000u) || provenance_major == 0xA ||
-                                   provenance_major == 0xB;
+        provenance_fault_capable =
+            ((in & 0x0A000000u) == 0x08000000u) || provenance_major == 0xA || provenance_major == 0xB;
         g_emit_gpc = gpc; // IRQSLIM: tag the current guest PC for the forward/backward edge test in emit_chain_exit
         // at the FIRST vector-touching instruction of the region, store the (nonzero) cpu pointer
         // into cpu->vdirty so a later (possibly chained-to) syscall exit takes the full V spill. Emitted
@@ -3518,7 +3428,8 @@ static void *translate_block(uint64_t gpc) {
                 // loop top, so mark every source line it spans -- not just gpc's -- keeping the line set a
                 // complete superset of the decoded bytes.
                 if (!g_tier2_build && g_txln_active)
-                    for (uint64_t ll = gpc >> 6; ll <= (gpc + n - 1) >> 6; ll++) txln_put(ll);
+                    for (uint64_t ll = gpc >> 6; ll <= (gpc + n - 1) >> 6; ll++)
+                        txln_put(ll);
                 gpc += n;
                 continue;
             }
@@ -3597,13 +3508,9 @@ static void *translate_block(uint64_t gpc) {
             uint32_t p1 = a64_fetch_instruction(plt + 4, NULL);
             uint32_t p2 = a64_fetch_instruction(plt + 8, NULL);
             uint32_t p3 = a64_fetch_instruction(plt + 12, NULL);
-            if (!guestbase_on() && !jit_guest_bus_active() &&
-                (p0 & 0x9F00001Fu) == 0x90000010u &&
-                (p1 & 0xFFC003FFu) == 0xF9400211u &&
-                (p2 & 0xFFC003FFu) == 0x91000210u &&
-                p3 == 0xD61F0220u) {
-                int64_t pimm =
-                    sext((((p0 >> 5) & 0x7FFFF) << 2) | ((p0 >> 29) & 3), 21) << 12;
+            if (!guestbase_on() && !jit_guest_bus_active() && (p0 & 0x9F00001Fu) == 0x90000010u &&
+                (p1 & 0xFFC003FFu) == 0xF9400211u && (p2 & 0xFFC003FFu) == 0x91000210u && p3 == 0xD61F0220u) {
+                int64_t pimm = sext((((p0 >> 5) & 0x7FFFF) << 2) | ((p0 >> 29) & 3), 21) << 12;
                 uint64_t page = (pcrel_base(plt) & ~0xFFFull) + pimm;
                 emit_set_x30(pcrel_base(gpc) + 4);
                 if (!emit_guest_adrp_page(16, page)) e_movconst(16, page);
@@ -3621,7 +3528,7 @@ static void *translate_block(uint64_t gpc) {
                 emit_ibranch_ip2_ready(17, 1);
                 break;
             }
-no_bl_plt_fuse:
+        no_bl_plt_fuse:
             // Inline an LSE outline-atomic helper call to a single host atomic op (elides the call +
             // return dispatch, the dominant atomics tax); only fires in the verbatim-safe regime.
             if (try_inline_outline_atomic(gpc, gpc + off)) {
@@ -3629,7 +3536,8 @@ no_bl_plt_fuse:
                 continue;
             }
             uint64_t ancestors[CTX_INLINE_DEPTH];
-            for (int i = 0; i < nctx; i++) ancestors[i] = ctx[i].target;
+            for (int i = 0; i < nctx; i++)
+                ancestors[i] = ctx[i].target;
             uint64_t clone_ret;
             int clone_cost;
             /*
@@ -3666,9 +3574,8 @@ no_bl_plt_fuse:
                 emit32(0);
                 emit_ibranch(30);
                 uint8_t *resume_host = g_cp;
-                *p_zero = 0xB4000000u |
-                          (((uint32_t)(((uint8_t *)resume_host - (uint8_t *)p_zero) / 4) &
-                            0x7FFFF) << 5) | 16;
+                *p_zero =
+                    0xB4000000u | (((uint32_t)(((uint8_t *)resume_host - (uint8_t *)p_zero) / 4) & 0x7FFFF) << 5) | 16;
                 gpc = ctx[nctx - 1].resume;
                 nctx--;
                 continue;
@@ -4019,11 +3926,10 @@ no_bl_plt_fuse:
                 e_movr(16, source);
             emit32(0x927AE610u); /* and x16,x16,#-64 */
             if (jit_guest_bus_active()) emit_a64_bus_guard(16, 64, gpc);
-            struct a64_soft_guard soft =
-                emit_a64_soft_guard_begin(16, 17, 18, 64, HL_LOGICAL_VMA_WRITE, gpc);
+            struct a64_soft_guard soft = emit_a64_soft_guard_begin(16, 17, 18, 64, HL_LOGICAL_VMA_WRITE, gpc);
             for (unsigned offset = 0; offset < 64; offset += 16)
-                emit32(0xA9000000u | (((offset / 8) & 0x7Fu) << 15) |
-                       (31u << 10) | (16u << 5) | 31u); /* stp xzr,xzr,[x16,#offset] */
+                emit32(0xA9000000u | (((offset / 8) & 0x7Fu) << 15) | (31u << 10) | (16u << 5) |
+                       31u); /* stp xzr,xzr,[x16,#offset] */
             emit_a64_soft_guard_end(&soft);
             gpc += 4;
             continue;
@@ -4089,11 +3995,8 @@ no_bl_plt_fuse:
             uint32_t p1 = a64_fetch_instruction(gpc + 4, NULL);
             uint32_t p2 = a64_fetch_instruction(gpc + 8, NULL);
             uint32_t p3 = a64_fetch_instruction(gpc + 12, NULL);
-            if (!guestbase_on() && !jit_guest_bus_active() &&
-                (in & 0x9F00001Fu) == 0x90000010u &&
-                (p1 & 0xFFC003FFu) == 0xF9400211u &&
-                (p2 & 0xFFC003FFu) == 0x91000210u &&
-                p3 == 0xD61F0220u) {
+            if (!guestbase_on() && !jit_guest_bus_active() && (in & 0x9F00001Fu) == 0x90000010u &&
+                (p1 & 0xFFC003FFu) == 0xF9400211u && (p2 & 0xFFC003FFu) == 0x91000210u && p3 == 0xD61F0220u) {
                 if (!emit_guest_adrp_page(16, v)) e_movconst(16, v);
                 e_str(16, CPUREG, 16 * 8);
                 uint64_t load_host = (uint64_t)g_cp;
@@ -4104,14 +4007,15 @@ no_bl_plt_fuse:
                 e_str(16, CPUREG, 16 * 8);
                 if (!g_tier2_build && g_txln_active) {
                     uint64_t last = (gpc + 12) >> 6;
-                    for (uint64_t line = gpc >> 6; line <= last; line++) txln_put(line);
+                    for (uint64_t line = gpc >> 6; line <= last; line++)
+                        txln_put(line);
                     tx_last_line = last;
                 }
                 if (gpc + 16 > guest_end) guest_end = gpc + 16;
                 emit_ibranch_ip2_ready(17, 1);
                 break;
             }
-no_adrp_plt_fuse:
+        no_adrp_plt_fuse:
             if (is_stolen(rd)) {
                 if (stealfast_on()) {
                     if (!emit_guest_adrp_page(16, v)) e_movconst(16, v);
@@ -4122,8 +4026,8 @@ no_adrp_plt_fuse:
                     e_str(0, 1, rd * 8);
                     x18_epilog();
                 }
-            } else
-                if (!emit_guest_adrp_page(rd, v)) e_movconst(rd, v);
+            } else if (!emit_guest_adrp_page(rd, v))
+                e_movconst(rd, v);
             gpc += 4;
             continue;
         }
@@ -4135,8 +4039,7 @@ no_adrp_plt_fuse:
                 e_movconst(16, gpc + off);
                 emit_a64_bus_guard(16, is64 ? 8 : 4, gpc);
                 struct a64_soft_guard soft =
-                    emit_a64_soft_guard_begin(16, 17, 18, is64 ? 8 : 4,
-                                              HL_LOGICAL_VMA_READ, gpc);
+                    emit_a64_soft_guard_begin(16, 17, 18, is64 ? 8 : 4, HL_LOGICAL_VMA_READ, gpc);
                 if (is64)
                     e_ldr(16, 16, 0);
                 else
@@ -4148,8 +4051,7 @@ no_adrp_plt_fuse:
                 e_movconst(rt, gpc + off);
                 emit_a64_bus_guard(rt, is64 ? 8 : 4, gpc);
                 struct a64_soft_guard soft =
-                    emit_a64_soft_guard_begin(rt, 16, 17, is64 ? 8 : 4,
-                                              HL_LOGICAL_VMA_READ, gpc);
+                    emit_a64_soft_guard_begin(rt, 16, 17, is64 ? 8 : 4, HL_LOGICAL_VMA_READ, gpc);
                 if (is64)
                     e_ldr(rt, rt, 0);
                 else
@@ -4171,11 +4073,9 @@ no_adrp_plt_fuse:
             int rt = in & 31;
             int64_t off = sext((in >> 5) & 0x7FFFF, 19) << 2;
             if (is_stolen(rt)) {
-                e_movconst(16, gpc + off);            // x16 = guest literal address
+                e_movconst(16, gpc + off); // x16 = guest literal address
                 emit_a64_bus_guard(16, 4, gpc);
-                struct a64_soft_guard soft =
-                    emit_a64_soft_guard_begin(16, 17, 18, 4,
-                                              HL_LOGICAL_VMA_READ, gpc);
+                struct a64_soft_guard soft = emit_a64_soft_guard_begin(16, 17, 18, 4, HL_LOGICAL_VMA_READ, gpc);
                 emit32(0xB9800000u | (16 << 5) | 16); // ldrsw x16, [x16]
                 emit_a64_soft_guard_end(&soft);
                 e_str(16, CPUREG, rt * 8);
@@ -4183,9 +4083,7 @@ no_adrp_plt_fuse:
             } else {
                 e_movconst(rt, gpc + off);
                 emit_a64_bus_guard(rt, 4, gpc);
-                struct a64_soft_guard soft =
-                    emit_a64_soft_guard_begin(rt, 16, 17, 4,
-                                              HL_LOGICAL_VMA_READ, gpc);
+                struct a64_soft_guard soft = emit_a64_soft_guard_begin(rt, 16, 17, 4, HL_LOGICAL_VMA_READ, gpc);
                 emit32(0xB9800000u | (rt << 5) | rt); // ldrsw xt, [xt]
                 emit_a64_soft_guard_end(&soft);
                 emit_a64_soft_bounce_commit(gpc + 4);
@@ -4205,11 +4103,10 @@ no_adrp_plt_fuse:
             int64_t off = sext((in >> 5) & 0x7FFFF, 19) << 2;
             // ldr (V), [Xn] unsigned-offset #0 base forms, Rn=x0: S=0xBD400000 D=0xFD400000 Q=0x3DC00000
             uint32_t ld = sz == 0 ? 0xBD400000u : (sz == 1 ? 0xFD400000u : 0x3DC00000u);
-            e_movconst(16, gpc + off);              // x16 = guest literal address
+            e_movconst(16, gpc + off); // x16 = guest literal address
             emit_a64_bus_guard(16, UINT64_C(4) << sz, gpc);
             struct a64_soft_guard soft =
-                emit_a64_soft_guard_begin(16, 17, 18, UINT64_C(4) << sz,
-                                          HL_LOGICAL_VMA_READ, gpc);
+                emit_a64_soft_guard_begin(16, 17, 18, UINT64_C(4) << sz, HL_LOGICAL_VMA_READ, gpc);
             emit32(ld | (16u << 5) | (uint32_t)vt); // ldr St/Dt/Qt, [x16]
             emit_a64_soft_guard_end(&soft);
             emit_a64_soft_bounce_commit(gpc + 4);
@@ -4273,11 +4170,9 @@ no_adrp_plt_fuse:
             }
         }
         if (jit_guest_bus_active()) {
-            if (!guestbase_on() && !in_excl && is_foldable_mem(in))
-                emit_a64_bus_guard_instruction(in, gpc);
+            if (!guestbase_on() && !in_excl && is_foldable_mem(in)) emit_a64_bus_guard_instruction(in, gpc);
             if (!guestbase_on() && !in_excl && is_advsimd_struct(in))
-                emit_a64_bus_guard_base((in >> 5) & 31, 0,
-                                        (uint64_t)advsimd_struct_bytes(in), gpc);
+                emit_a64_bus_guard_base((in >> 5) & 31, 0, (uint64_t)advsimd_struct_bytes(in), gpc);
             /* Pair pre/post-index forms are deliberately not bias-folded.  Guard
                their architectural access address, then preserve the native
                writeback opcode verbatim below. */
@@ -4299,8 +4194,7 @@ no_adrp_plt_fuse:
                 emit_a64_bus_guard_base((in >> 5) & 31, 0, bytes, gpc);
             }
         }
-        if (jit_guest_soft_active() &&
-            (((in & 0x3F000000u) == 0x08000000u) || is_casp(in))) {
+        if (jit_guest_soft_active() && (((in & 0x3F000000u) == 0x08000000u) || is_casp(in))) {
             emit_a64_soft_exclusive(in);
             gpc += 4;
             continue;
@@ -4323,15 +4217,13 @@ no_adrp_plt_fuse:
                 if (in >> 31)
                     e_ldr(rd, CPUREG, rm * 8);
                 else
-                    emit32(0xB9400000u | ((unsigned)(rm * 2) << 10) |
-                           ((unsigned)CPUREG << 5) | (unsigned)rd);
+                    emit32(0xB9400000u | ((unsigned)(rm * 2) << 10) | ((unsigned)CPUREG << 5) | (unsigned)rd);
                 gpc += 4;
                 continue;
             }
         }
         // Exact MOVZ Wd/Xd,#0,LSL#0.
-        if (stealfast_on() && (in & 0x7FFFFFE0u) == 0x52800000u &&
-            is_stolen(in & 31)) {
+        if (stealfast_on() && (in & 0x7FFFFFE0u) == 0x52800000u && is_stolen(in & 31)) {
             e_str(31, CPUREG, (int)(in & 31) * 8);
             gpc += 4;
             continue;
@@ -4345,8 +4237,7 @@ no_adrp_plt_fuse:
             emit32(in);
         gpc += 4;
     }
-    if (provenance_fault_capable)
-        jit_instruction_map_put(provenance_host, (uint64_t)g_cp, provenance_guest);
+    if (provenance_fault_capable) jit_instruction_map_put(provenance_host, (uint64_t)g_cp, provenance_guest);
     // emit the deferred exit stubs for branches taken inside an exclusive region
     for (int i = 0; i < ndefer; i++) {
         int64_t d = ((uint8_t *)g_cp - (uint8_t *)defer[i].patch) / 4;
@@ -4362,14 +4253,12 @@ no_adrp_plt_fuse:
         if (g_irq_patch) {
             uint32_t *p = g_irq_patch;
             g_irq_patch = NULL;
-            *p = 0xB5000000u |
-                 (((uint32_t)((stub - (uint8_t *)p) / 4) & 0x7FFFF) << 5) | 16;
+            *p = 0xB5000000u | (((uint32_t)((stub - (uint8_t *)p) / 4) & 0x7FFFF) << 5) | 16;
         }
         if (g_t2_irq_patch) {
             uint32_t *p = g_t2_irq_patch;
             g_t2_irq_patch = NULL;
-            *p = 0xB5000000u |
-                 (((uint32_t)((stub - (uint8_t *)p) / 4) & 0x7FFFF) << 5) | 16;
+            *p = 0xB5000000u | (((uint32_t)((stub - (uint8_t *)p) / 4) & 0x7FFFF) << 5) | 16;
         }
         uint8_t *exit_begin = g_cp;
         emit_exit_const(start, R_BRANCH);
@@ -4384,9 +4273,8 @@ no_adrp_plt_fuse:
     if (emitted_bytes >= (1u << 20))
         HL_LOGF(&g_jit_log, HL_LOG_TAG_JIT,
                 "large block guest=%#llx source=%#llx-%#llx bytes=%zu bus_sites=%u soft_sites=%u",
-                (unsigned long long)start, (unsigned long long)guest_start,
-                (unsigned long long)guest_end, emitted_bytes, g_bus_stub_patch_count,
-                g_soft_stub_patch_count);
+                (unsigned long long)start, (unsigned long long)guest_start, (unsigned long long)guest_end,
+                emitted_bytes, g_bus_stub_patch_count, g_soft_stub_patch_count);
     // Only the REGION HEAD (start) is registered; intermediate inlined block-starts are left
     // unregistered so a later mid-region entry self-heals via re-translate + back-patch.
     // W4E tier-2: the promoter (g_tier2_build) recompiles in place and updates the EXISTING map entry
@@ -4449,7 +4337,10 @@ static void tier2_promote(uint64_t gpc) {
         fprintf(stderr, "\n");
     }
     // make the tier-2 code coherent on all cores BEFORE anything can branch into it
-    if (!jit_publish_code(g_emit_start, (size_t)(g_cp - g_emit_start))) { (void)jit_wprot(1); return; }
+    if (!jit_publish_code(g_emit_start, (size_t)(g_cp - g_emit_start))) {
+        (void)jit_wprot(1);
+        return;
+    }
     // Redirect the OLD tier-1 body to tier-2: overwrite its first instruction with `b nb`. Chains from
     // predecessors were resolved to the old body when they were translated (patch_links_to only fixes
     // still-PENDING ones), so without this an outer loop re-entering this inner loop would keep hitting
@@ -4463,7 +4354,10 @@ static void tier2_promote(uint64_t gpc) {
         int64_t bd8 = (((uint8_t *)nb + 8) - ((uint8_t *)old_body + 8)) / 4;
         ((uint32_t *)old_body)[2] = 0x14000000u | ((uint32_t)bd8 & 0x3FFFFFFu);
     }
-    if (!jit_publish_code(old_body, 4 + (g_fwdskip ? 8 : 0))) { (void)jit_wprot(1); return; }
+    if (!jit_publish_code(old_body, 4 + (g_fwdskip ? 8 : 0))) {
+        (void)jit_wprot(1);
+        return;
+    }
     // swap the live map entry: future dispatcher lookups + IBTC fills resolve to tier-2 directly
     g_map[mi].host = nh;
     g_map[mi].body = nb;

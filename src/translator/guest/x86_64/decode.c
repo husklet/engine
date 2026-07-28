@@ -92,13 +92,13 @@ static int op_imm_bytes(struct insn *I) {
     if (op == 0xA8) return 1;
     if (op == 0xA9) return os == 2 ? 2 : 4; // test
     if (op == 0x6A) return 1;
-    if (op == 0x68) return os == 2 ? 2 : 4;       // push imm
-    if (op == 0x80) return 1;                     // group1 r/m8, ib
-    if (op == 0x81) return os == 2 ? 2 : 4;       // group1 r/m, iz
-    if (op == 0x83) return 1;                     // group1 r/m, ib (sign-ext)
-    if (op == 0xC6) return 1;                     // mov r/m8, ib
-    if (op == 0xC7) return os == 2 ? 2 : 4;       // mov r/m, iz
-    if (op == 0xC0 || op == 0xC1) return 1;       // shift r/m, ib
+    if (op == 0x68) return os == 2 ? 2 : 4; // push imm
+    if (op == 0x80) return 1;               // group1 r/m8, ib
+    if (op == 0x81) return os == 2 ? 2 : 4; // group1 r/m, iz
+    if (op == 0x83) return 1;               // group1 r/m, ib (sign-ext)
+    if (op == 0xC6) return 1;               // mov r/m8, ib
+    if (op == 0xC7) return os == 2 ? 2 : 4; // mov r/m, iz
+    if (op == 0xC0 || op == 0xC1) return 1; // shift r/m, ib
     // & 7: I->reg carries REX.R, but a group's /reg is an OPCODE EXTENSION and REX.R does not extend it.
     // Without the mask `47 f6 c0 ib` decoded as NOT (no immediate) and the length came out short, so the
     // immediate byte was executed as the next instruction.

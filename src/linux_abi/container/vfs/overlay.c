@@ -73,7 +73,8 @@ static void layer_follow(const char *jc, size_t jcl, const char *guest, char *ou
     if (root >= 0) {
         hl_host_resolved_path resolved;
         const char *relative = guest;
-        while (*relative == '/') relative++;
+        while (*relative == '/')
+            relative++;
         if (!*relative) relative = ".";
         unsigned policy = nofollow ? HL_HOST_RESOLVE_NOFOLLOW_FINAL : 0;
         if (hl_host_resolve_beneath(root, relative, policy, -1, &resolved) == 0) {
@@ -320,7 +321,7 @@ static int overlay_resolve(const char *guest, char *host, size_t hn, int nofollo
         }
     }
     resolve_loop_mark(); // chain deeper than the symlink-traversal limit -> ELOOP
-    return 0;             // chain too deep (host holds the last upper path)
+    return 0;            // chain too deep (host holds the last upper path)
 }
 
 // Resolve an executable/interpreter path through the FULL overlay (upper THEN lowers), returning the host
@@ -556,7 +557,8 @@ static void overlay_copyup(const char *guest, char *host, size_t hn) {
             if (lstat(lp, &ds) == 0) {
                 if (S_ISDIR(ds.st_mode)) {
                     overlay_mkparents(guest);
-                    if (hl_compat_mkdir(up, ds.st_mode & 0777) == 0) hl_fdcache_resolution_bump(); // upper dir materialized
+                    if (hl_compat_mkdir(up, ds.st_mode & 0777) == 0)
+                        hl_fdcache_resolution_bump(); // upper dir materialized
                     return;
                 }
                 break; // lower provides it as a non-dir (symlink/special): leave to the caller's fallback
@@ -870,9 +872,9 @@ static int overlay_readdir(const char *gdir, char (**names_out)[256], uint8_t **
         child[k] = 0;
         // The file mount's own leaf (rest fully consumed, no further '/') lists as a regular file; an
         // intermediate dir of a nested mount, or a directory mount's child, lists as a directory.
-        uint8_t cty = (g_vols[i].issymlink && rest[k] == 0)
-                          ? DT_LNK
-                          : (g_vols[i].isfile && rest[k] == 0) ? DT_REG : DT_DIR;
+        uint8_t cty = (g_vols[i].issymlink && rest[k] == 0) ? DT_LNK
+                      : (g_vols[i].isfile && rest[k] == 0)  ? DT_REG
+                                                            : DT_DIR;
         int dup = 0;
         for (int j = 0; j < ns; j++)
             if (!strcmp(seen[j], child)) {

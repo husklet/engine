@@ -18,8 +18,7 @@ static inline void hl_dispatch_profile_translation(hl_dispatch_profile *profile)
     profile->translations++;
 }
 
-static inline void hl_dispatch_profile_translation_end(hl_dispatch_profile *profile, uint64_t start,
-                                                       uint64_t now) {
+static inline void hl_dispatch_profile_translation_end(hl_dispatch_profile *profile, uint64_t start, uint64_t now) {
     if (profile->enabled) profile->translation_ns += now - start;
 }
 

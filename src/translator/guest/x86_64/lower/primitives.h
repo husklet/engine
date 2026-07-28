@@ -10,13 +10,13 @@
 /*
  * Everything declared below emits ARM64, and is defined by emit.c + translate.c
  * -- which core/target/x86_64.c includes only on an AArch64 host. Compiled into
- * the engine anywhere else a lower/*.c is an object nothing can resolve, and a
+ * the engine anywhere else, a lowering object has unresolved emitter symbols.
  * linker that pulls archive members on demand hides that until some unrelated
  * symbol in the same object is referenced. Fail here instead. Unit tests supply
  * their own emitters and set HL_X86_LOWER_STANDALONE.
  */
 #if !defined(HL_HOST_CPU_AARCH64) && !defined(HL_X86_LOWER_STANDALONE)
-#error "guest/x86_64/lower/ emits ARM64: build it only on an AArch64 host (see docs/amd64-host.md)"
+#error "guest/x86_64/lower/ emits ARM64 and requires an AArch64 host"
 #endif
 
 enum hl_x86_translate_result {

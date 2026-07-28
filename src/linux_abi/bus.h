@@ -17,8 +17,9 @@ enum hl_linux_file_event_kind {
     HL_LINUX_FILE_EVENT_RESIZE = 1,
     HL_LINUX_FILE_EVENT_WRITE = 2,
 };
-typedef void (*hl_linux_file_event_fn)(void *opaque, uint32_t kind, uint64_t device, uint64_t object,
-                                       uint64_t first, uint64_t second);
+
+typedef void (*hl_linux_file_event_fn)(void *opaque, uint32_t kind, uint64_t device, uint64_t object, uint64_t first,
+                                       uint64_t second);
 /* Per-target runtime state: activation archives contain both guest targets. */
 static int hl_linux_file_events_enable(void);
 static void hl_linux_file_event_publish(uint32_t kind, uint64_t device, uint64_t object, uint64_t first,
@@ -32,6 +33,7 @@ typedef struct hl_linux_bus_transition {
     uint64_t generation;
     uint32_t held;
 } hl_linux_bus_transition;
+
 int hl_linux_bus_transition_begin(hl_linux_bus_transition *transition);
 int hl_linux_bus_transition_add(hl_linux_bus_transition *transition, uint64_t lo, uint64_t hi);
 void hl_linux_bus_transition_clear(hl_linux_bus_transition *transition, uint64_t lo, uint64_t hi);

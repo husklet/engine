@@ -34,9 +34,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
-int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs,
-                       hl_host_handle executable, const void *executable_image, size_t executable_size,
-                       uint32_t argc, char *const argv[]);
+int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable,
+                       const void *executable_image, size_t executable_size, uint32_t argc, char *const argv[]);
 
 int main(int argc, char **argv) {
     hl_host_windows *native = NULL;
@@ -54,6 +53,5 @@ int main(int argc, char **argv) {
     /* rootfs NULL is a bare launch: the guest path is a host path. executable
      * INVALID makes the loader open argv[0] itself rather than adopt a handle,
      * which is what keeps this probe independent of the file-binding work. */
-    return hl_run_linux_guest(&services, NULL, NULL, HL_HOST_HANDLE_INVALID, NULL, 0, (uint32_t)(argc - 1),
-                              argv + 1);
+    return hl_run_linux_guest(&services, NULL, NULL, HL_HOST_HANDLE_INVALID, NULL, 0, (uint32_t)(argc - 1), argv + 1);
 }

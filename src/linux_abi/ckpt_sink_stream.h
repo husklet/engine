@@ -23,8 +23,7 @@ static uint64_t g_ckpt_stream_next_id = 1;
 
 // One round trip with no payload in either direction. Returns the reply status, or -1 on transport failure.
 static int ckpt_stream_call(uint32_t op, const char *name, uint64_t stream, uint64_t offset, uint32_t flags,
-                            const void *payload, size_t size, hl_ckpt_reply *reply, void *out,
-                            size_t capacity) {
+                            const void *payload, size_t size, hl_ckpt_reply *reply, void *out, size_t capacity) {
     hl_ckpt_request request = {0};
     hl_ckpt_reply local;
     if (reply == NULL) reply = &local;
@@ -37,8 +36,7 @@ static int ckpt_stream_call(uint32_t op, const char *name, uint64_t stream, uint
     return reply->status;
 }
 
-static void ckpt_sink_stream_name(struct ckpt_sink *sink, const char *group, const char *name, char *out,
-                                  size_t size) {
+static void ckpt_sink_stream_name(struct ckpt_sink *sink, const char *group, const char *name, char *out, size_t size) {
     (void)sink;
     if (group)
         snprintf(out, size, "%s/%s", group, name);
@@ -50,8 +48,8 @@ static int ckpt_sink_stream_flush(struct ckpt_sink_stream *stream) {
     if (stream->failed) return -1;
     if (stream->buffered == 0) return 0;
     // Append: the buffer always sits at the object's logical end, because write_at flushes before patching.
-    if (ckpt_stream_call(HL_CKPT_OP_OBJECT_WRITE, NULL, stream->id, 0, 0, stream->buffer, stream->buffered,
-                         NULL, NULL, 0) != HL_CKPT_STATUS_OK) {
+    if (ckpt_stream_call(HL_CKPT_OP_OBJECT_WRITE, NULL, stream->id, 0, 0, stream->buffer, stream->buffered, NULL, NULL,
+                         0) != HL_CKPT_STATUS_OK) {
         stream->failed = 1;
         return -1;
     }
@@ -75,11 +73,10 @@ static int ckpt_sink_stream_write(struct ckpt_sink_stream *stream, const void *d
     return 0;
 }
 
-static int ckpt_sink_stream_write_at(struct ckpt_sink_stream *stream, uint64_t offset, const void *data,
-                                     size_t size) {
+static int ckpt_sink_stream_write_at(struct ckpt_sink_stream *stream, uint64_t offset, const void *data, size_t size) {
     if (stream->failed || ckpt_sink_stream_flush(stream) != 0) return -1;
-    if (ckpt_stream_call(HL_CKPT_OP_OBJECT_WRITE_AT, NULL, stream->id, offset, 0, data, size, NULL, NULL,
-                         0) != HL_CKPT_STATUS_OK) {
+    if (ckpt_stream_call(HL_CKPT_OP_OBJECT_WRITE_AT, NULL, stream->id, offset, 0, data, size, NULL, NULL, 0) !=
+        HL_CKPT_STATUS_OK) {
         stream->failed = 1;
         return -1;
     }
@@ -95,8 +92,8 @@ static int64_t ckpt_sink_stream_tell(struct ckpt_sink_stream *stream) {
 
 static int ckpt_sink_stream_finish(struct ckpt_sink_stream *stream) {
     int failed = stream->failed || ckpt_sink_stream_flush(stream) != 0;
-    if (!failed && ckpt_stream_call(HL_CKPT_OP_OBJECT_FINISH, NULL, stream->id, 0, 0, NULL, 0, NULL, NULL,
-                                    0) != HL_CKPT_STATUS_OK)
+    if (!failed &&
+        ckpt_stream_call(HL_CKPT_OP_OBJECT_FINISH, NULL, stream->id, 0, 0, NULL, 0, NULL, NULL, 0) != HL_CKPT_STATUS_OK)
         failed = 1;
     if (failed) (void)ckpt_stream_call(HL_CKPT_OP_OBJECT_ABORT, NULL, stream->id, 0, 0, NULL, 0, NULL, NULL, 0);
     free(stream);
@@ -128,18 +125,14 @@ static int ckpt_sink_stream_begin(struct ckpt_sink *sink, const char *group, con
 
 static int ckpt_sink_stream_group_begin(struct ckpt_sink *sink, const char *group) {
     (void)sink;
-    return ckpt_stream_call(HL_CKPT_OP_GROUP_BEGIN, group, 0, 0, 0, NULL, 0, NULL, NULL, 0) ==
-                   HL_CKPT_STATUS_OK
-               ? 0
-               : -1;
+    return ckpt_stream_call(HL_CKPT_OP_GROUP_BEGIN, group, 0, 0, 0, NULL, 0, NULL, NULL, 0) == HL_CKPT_STATUS_OK ? 0
+                                                                                                                 : -1;
 }
 
 static int ckpt_sink_stream_group_commit(struct ckpt_sink *sink, const char *group) {
     (void)sink;
-    return ckpt_stream_call(HL_CKPT_OP_GROUP_COMMIT, group, 0, 0, 0, NULL, 0, NULL, NULL, 0) ==
-                   HL_CKPT_STATUS_OK
-               ? 0
-               : -1;
+    return ckpt_stream_call(HL_CKPT_OP_GROUP_COMMIT, group, 0, 0, 0, NULL, 0, NULL, NULL, 0) == HL_CKPT_STATUS_OK ? 0
+                                                                                                                  : -1;
 }
 
 static void ckpt_sink_stream_group_abort(struct ckpt_sink *sink, const char *group) {
@@ -163,8 +156,7 @@ static void ckpt_sink_stream_unclaim(struct ckpt_sink *sink, const char *name) {
 static int ckpt_sink_stream_group_present(struct ckpt_sink *sink, const char *group) {
     hl_ckpt_reply reply;
     (void)sink;
-    if (ckpt_stream_call(HL_CKPT_OP_GROUP_PRESENT, group, 0, 0, 0, NULL, 0, &reply, NULL, 0) !=
-        HL_CKPT_STATUS_OK)
+    if (ckpt_stream_call(HL_CKPT_OP_GROUP_PRESENT, group, 0, 0, 0, NULL, 0, &reply, NULL, 0) != HL_CKPT_STATUS_OK)
         return -1;
     return reply.value != 0 ? 1 : 0;
 }
@@ -172,8 +164,7 @@ static int ckpt_sink_stream_group_present(struct ckpt_sink *sink, const char *gr
 static int ckpt_sink_stream_group_count(struct ckpt_sink *sink, const char *prefix) {
     hl_ckpt_reply reply;
     (void)sink;
-    if (ckpt_stream_call(HL_CKPT_OP_GROUP_COUNT, prefix, 0, 0, 0, NULL, 0, &reply, NULL, 0) !=
-        HL_CKPT_STATUS_OK)
+    if (ckpt_stream_call(HL_CKPT_OP_GROUP_COUNT, prefix, 0, 0, 0, NULL, 0, &reply, NULL, 0) != HL_CKPT_STATUS_OK)
         return -1;
     return (int)reply.value;
 }
@@ -194,10 +185,8 @@ static int ckpt_sink_stream_digest(struct ckpt_sink *sink, uint64_t *hash, uint6
 
 static int ckpt_sink_stream_commit(struct ckpt_sink *sink, const void *manifest, size_t size) {
     (void)sink;
-    return ckpt_stream_call(HL_CKPT_OP_COMMIT, NULL, 0, 0, 0, manifest, size, NULL, NULL, 0) ==
-                   HL_CKPT_STATUS_OK
-               ? 0
-               : -1;
+    return ckpt_stream_call(HL_CKPT_OP_COMMIT, NULL, 0, 0, 0, manifest, size, NULL, NULL, 0) == HL_CKPT_STATUS_OK ? 0
+                                                                                                                  : -1;
 }
 
 static const ckpt_sink_vtable g_ckpt_sink_stream_ops = {

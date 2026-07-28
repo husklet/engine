@@ -202,8 +202,8 @@ void hl_windows_clear_entry_locked(hl_windows_handle_entry *entry);
 /* --- the NT path layer (ntpath.c) ----------------------------------------- */
 
 enum {
-    HL_WINDOWS_NAME_MAX = 255,   /* NTFS MaximumComponentNameLength, read back at run time */
-    HL_WINDOWS_PATH_MAX = 4096,  /* in WCHARs; a bound on this layer, not on NT */
+    HL_WINDOWS_NAME_MAX = 255,  /* NTFS MaximumComponentNameLength, read back at run time */
+    HL_WINDOWS_PATH_MAX = 4096, /* in WCHARs; a bound on this layer, not on NT */
     HL_WINDOWS_SYMLINK_MAGIC_SIZE = 13
 };
 

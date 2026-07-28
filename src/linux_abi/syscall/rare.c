@@ -635,9 +635,8 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         unsigned priority = 0;
         long r = syscall(SYS_mq_timedreceive, (int)a0, message, (size_t)a2, a3 ? &priority : NULL, timeoutp);
-        if (r >= 0 &&
-            ((r && guest_copy_to(a1, message, (size_t)r) != r) ||
-             (a3 && guest_copy_to(a3, &priority, sizeof(priority)) != (ssize_t)sizeof(priority))))
+        if (r >= 0 && ((r && guest_copy_to(a1, message, (size_t)r) != r) ||
+                       (a3 && guest_copy_to(a3, &priority, sizeof(priority)) != (ssize_t)sizeof(priority))))
             r = -1, errno = EFAULT;
         free(message);
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : (uint64_t)r;
@@ -848,7 +847,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     }
     case 125: G_RET(c) = (a0 == 1 || a0 == 2) ? 99 : 0; break; // sched_get_priority_max: FIFO/RR=99 else 0
     case 126: G_RET(c) = (a0 == 1 || a0 == 2) ? 1 : 0; break;  // sched_get_priority_min: FIFO/RR=1 else 0
-    case 127: { // sched_rr_get_interval -> a nominal 100ms slice
+    case 127: {                                                // sched_rr_get_interval -> a nominal 100ms slice
         struct timespec interval = {.tv_nsec = 100000000L};
         if (guest_copy_to(a1, &interval, sizeof interval) != sizeof interval) {
             G_RET(c) = (uint64_t)(int64_t)-EFAULT;
@@ -932,9 +931,8 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         if (status)
             for (unsigned long i = 0; i < count; i++)
-                status[i] = guest_accessible_prefix((uint64_t)(uintptr_t)pages[i], 1, HL_LOGICAL_VMA_READ) == 1
-                                ? 0
-                                : -ENOENT;
+                status[i] =
+                    guest_accessible_prefix((uint64_t)(uintptr_t)pages[i], 1, HL_LOGICAL_VMA_READ) == 1 ? 0 : -ENOENT;
         if (status && guest_copy_to(a4, status, count * sizeof *status) != (ssize_t)(count * sizeof *status)) {
             free(pages);
             free(nodes);
@@ -975,9 +973,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         if (getitimer((int)a0, &value) < 0)
             G_RET(c) = (uint64_t)(-errno);
         else
-            G_RET(c) = guest_copy_to(a1, &value, sizeof value) == sizeof value
-                           ? 0
-                           : (uint64_t)(int64_t)-EFAULT;
+            G_RET(c) = guest_copy_to(a1, &value, sizeof value) == sizeof value ? 0 : (uint64_t)(int64_t)-EFAULT;
         break;
     }
     case 103: {
@@ -1009,8 +1005,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // getcpu(cpu, node, tcache): report a CPU from the guest's affinity set (LTP getcpu01 pins to one
     // CPU and expects it back), node 0 (single NUMA node). A cpu/node pointer outside the address space
     // -> EFAULT (LTP getcpu02; guest_bad_ptr also catches a PROT_NONE tst_get_bad_addr page).
-    case 168:
-        {
+    case 168: {
         unsigned cpu = hl_linux_affinity_first(&g_affinity, linux_online_cpus()), node = 0;
         if ((a0 && guest_copy_to(a0, &cpu, sizeof cpu) != sizeof cpu) ||
             (a1 && guest_copy_to(a1, &node, sizeof node) != sizeof node)) {
@@ -1019,7 +1014,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         G_RET(c) = 0;
         break;
-        }
+    }
     case 213: { // readahead: advisory, but Linux still validates the descriptor and offset
         if ((int)a0 < 0 || fcntl((int)a0, F_GETFD) < 0)
             G_RET(c) = (uint64_t)(int64_t)(-EBADF);
@@ -1324,9 +1319,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         } else {
             uint64_t limits[2];
             svc_fill_rlimit((int)a0, limits);
-            G_RET(c) = guest_copy_to(a1, limits, sizeof limits) == sizeof limits
-                           ? 0
-                           : (uint64_t)(int64_t)(-EFAULT);
+            G_RET(c) = guest_copy_to(a1, limits, sizeof limits) == sizeof limits ? 0 : (uint64_t)(int64_t)(-EFAULT);
         }
         break;
     case 164: {

@@ -74,6 +74,7 @@ static ssize_t hl_getline(char **line, size_t *capacity, FILE *file) {
     (*line)[used] = 0;
     return (ssize_t)used;
 }
+
 #define getline hl_getline
 #else
 #define HL_O_BINARY 0
@@ -429,15 +430,14 @@ static int run_case(const char *engine, const char *guest, const char *golden, i
     DWORD exit_code = 0, path_length;
     int output = -1, status = 0, timed_out = 0, stalled = 0, undetectable = 0, written;
     path_length = GetTempPathA((DWORD)sizeof directory, directory);
-    if (path_length == 0 || path_length >= sizeof directory ||
-        GetTempFileNameA(directory, "hlm", 0, temporary) == 0) {
+    if (path_length == 0 || path_length >= sizeof directory || GetTempFileNameA(directory, "hlm", 0, temporary) == 0) {
         fprintf(stderr, "linux-matrix: cannot create a capture file under the host temp directory\n");
         return 1;
     }
     /* DELETE_ON_CLOSE is this arm's `unlink` immediately after `mkstemp`: the file has no reachable name
        once the last handle closes, whether the case passes, fails or is killed. */
-    capture = CreateFileA(temporary, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                          &inheritable, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    capture = CreateFileA(temporary, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable,
+                          CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
     if (capture == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "linux-matrix: cannot open capture file %s (error %lu)\n", temporary, GetLastError());
         return 1;

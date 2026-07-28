@@ -67,8 +67,11 @@ static void emit_prologue(void) {
 // FULL spill clears it. Runtime rather than a static per-block flag because blocks CHAIN without spilling,
 // so a vector-dirty region can reach a statically-"clean" syscall block with host V != cpu->V. A syscall
 // that itself writes cpu->V (sigreturn) is republished by the prologue reload, so V state is never lost.
-static int g_blk_vdirty;   // per-region latch: has the vdirty-set store already been emitted this region?
-static int slimsys_on(void) { return 1; }
+static int g_blk_vdirty; // per-region latch: has the vdirty-set store already been emitted this region?
+
+static int slimsys_on(void) {
+    return 1;
+}
 
 // GPR + flags + SP spill, WITHOUT the V-register save. Leaves x0 = &cpu (callers rely on it). Must NOT
 // touch the guest red zone [sp,#-16..] (see emit_spill).
@@ -173,8 +176,7 @@ static void emit_ibranch_ip2_ready(int rn, int ready) {
     if (!ready) e_ldr(rn, CPUREG, rn * 8);
     uint32_t *p_ldrt = (uint32_t *)g_cp;
     emit32(0);
-    emit32(0xCB000000u | ((unsigned)rn << 16) |
-           ((unsigned)other << 5) | (unsigned)other);
+    emit32(0xCB000000u | ((unsigned)rn << 16) | ((unsigned)other << 5) | (unsigned)other);
     uint32_t *p_cbnz = (uint32_t *)g_cp;
     emit32(0);
     uint32_t *p_bhit = (uint32_t *)g_cp;
@@ -199,19 +201,16 @@ static void emit_ibranch_ip2_ready(int rn, int ready) {
     g_cp += 8;
     *(uint64_t *)g_cp = (uint64_t)((uint8_t *)p_bhit - g_cache);
     g_cp += 8;
-    *p_ldrt = 0x58000000u |
-              (((uint32_t)((Lt - (uint8_t *)p_ldrt) / 4) & 0x7FFFFu) << 5) |
-              (unsigned)other;
-    *p_cbnz = 0xB5000000u |
-              (((uint32_t)(((uint8_t *)miss - (uint8_t *)p_cbnz) / 4) &
-                0x7FFFFu) << 5) | (unsigned)other;
+    *p_ldrt = 0x58000000u | (((uint32_t)((Lt - (uint8_t *)p_ldrt) / 4) & 0x7FFFFu) << 5) | (unsigned)other;
+    *p_cbnz = 0xB5000000u | (((uint32_t)(((uint8_t *)miss - (uint8_t *)p_cbnz) / 4) & 0x7FFFFu) << 5) | (unsigned)other;
     int64_t ao = Lt - (uint8_t *)p_adr;
-    *p_adr = 0x10000000u | ((uint32_t)(ao & 3) << 29) |
-             (((uint32_t)(ao >> 2) & 0x7FFFFu) << 5) | 9u;
+    *p_adr = 0x10000000u | ((uint32_t)(ao & 3) << 29) | (((uint32_t)(ao >> 2) & 0x7FFFFu) << 5) | 9u;
     pc_record_icsite(Lt);
 }
 
-static void emit_ibranch_ip2(int rn) { emit_ibranch_ip2_ready(rn, 0); }
+static void emit_ibranch_ip2(int rn) {
+    emit_ibranch_ip2_ready(rn, 0);
+}
 
 static void emit_ibranch_steal(int rn) {
     if (rn == 16 || rn == 17) {
@@ -555,10 +554,8 @@ static void emit_smc_chain_exit(uint64_t target) {
     e_str(9, CPUREG, OFF_RSN);
     emit_blockret(9);
     e_br(9);
-    *empty_branch = 0xB4000000u |
-                    (((uint32_t)((miss - (uint8_t *)empty_branch) / 4) & 0x7ffffu) << 5) | 16u;
-    *miss_branch = 0xB5000000u |
-                   (((uint32_t)((miss - (uint8_t *)miss_branch) / 4) & 0x7ffffu) << 5) | 17u;
+    *empty_branch = 0xB4000000u | (((uint32_t)((miss - (uint8_t *)empty_branch) / 4) & 0x7ffffu) << 5) | 16u;
+    *miss_branch = 0xB5000000u | (((uint32_t)((miss - (uint8_t *)miss_branch) / 4) & 0x7ffffu) << 5) | 17u;
 }
 
 static void emit_chain_exit_from(uint64_t target, uint64_t source_gpc) {
@@ -594,6 +591,7 @@ static void emit_chain_exit_from(uint64_t target, uint64_t source_gpc) {
     }
     emit_exit_const(target, R_BRANCH);
 }
+
 static void emit_chain_exit(uint64_t target) {
     emit_chain_exit_from(target, g_emit_gpc);
 }

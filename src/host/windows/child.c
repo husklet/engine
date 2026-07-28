@@ -49,9 +49,13 @@ int hl_host_child_watch_descriptor(const hl_host_child_watch *watch) {
     return -1;
 }
 
-void hl_host_child_watch_notify(const hl_host_child_watch *watch) { (void)watch; }
+void hl_host_child_watch_notify(const hl_host_child_watch *watch) {
+    (void)watch;
+}
 
-void hl_host_child_watch_drain(const hl_host_child_watch *watch) { (void)watch; }
+void hl_host_child_watch_drain(const hl_host_child_watch *watch) {
+    (void)watch;
+}
 
 void hl_host_child_watch_close(hl_host_child_watch *watch) {
     if (watch != NULL) {

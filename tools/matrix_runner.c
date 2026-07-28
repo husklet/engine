@@ -111,6 +111,7 @@ static ssize_t hl_getline(char **line, size_t *capacity, FILE *file) {
     (*line)[used] = 0;
     return (ssize_t)used;
 }
+
 #define getline hl_getline
 #else
 #define HL_O_BINARY 0
@@ -578,7 +579,9 @@ typedef enum { ENGINE_ELF, ENGINE_MACHO, ENGINE_PE } engine_format;
  * than skipping it. A silently narrower lane that still reports "all cases passed" is the failure this
  * runner keeps being rewritten to prevent; passing `-` to a suite that needs the ISA is a hard error naming
  * the first case that needs it. */
-static int engine_absent(const char *engine_path) { return strcmp(engine_path, "-") == 0; }
+static int engine_absent(const char *engine_path) {
+    return strcmp(engine_path, "-") == 0;
+}
 
 static int engine_format_of(const char *engine_path, engine_format *out) {
     unsigned char magic[4] = {0};
@@ -1140,9 +1143,9 @@ static int make_config(const char *binary_root, const char *guest, const char *a
  * arms, so a change to the workspace cannot apply to one host and not the other. On failure nothing is left
  * behind and the caller returns 1.
  */
-static int open_case_workspace(const char *binary_root, const char *guest, const char *argument,
-                               const char *rootfs, const char *environment, char scratch[1024],
-                               char capture_output[1200], char capture_error[1200], char config_path[1024]) {
+static int open_case_workspace(const char *binary_root, const char *guest, const char *argument, const char *rootfs,
+                               const char *environment, char scratch[1024], char capture_output[1200],
+                               char capture_error[1200], char config_path[1024]) {
     /*
      * The guest scratch is mapped as the guest's /tmp volume, so its backing
      * filesystem determines whether statx-btime, memfd seals, and related
@@ -1435,8 +1438,7 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
     /* The kill switch, and the reason a runaway case cannot outlive its case: whatever the engine started,
        closing this job ends. */
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if (!SetInformationJobObject(child.job, JobObjectExtendedLimitInformation, &limits, sizeof limits))
-        goto cleanup;
+    if (!SetInformationJobObject(child.job, JobObjectExtendedLimitInformation, &limits, sizeof limits)) goto cleanup;
     memset(&startup, 0, sizeof startup);
     memset(&process, 0, sizeof process);
     startup.cb = sizeof startup;
@@ -1852,8 +1854,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     {
-        engine_format aarch64_format;
-        engine_format x86_64_format;
+        engine_format aarch64_format = ENGINE_ELF;
+        engine_format x86_64_format = ENGINE_ELF;
         if (have_aarch64 && engine_format_of(argv[2], &aarch64_format) != 0) return 2;
         if (have_x86_64 && engine_format_of(argv[4], &x86_64_format) != 0) return 2;
         if (!have_aarch64) aarch64_format = x86_64_format;

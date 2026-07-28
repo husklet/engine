@@ -74,8 +74,7 @@ int hl_fork_wire_send_descriptors(int socket, const void *buffer, size_t size, c
     return -1;
 }
 
-int hl_fork_wire_receive_descriptors(int socket, void *buffer, size_t size, int *descriptors,
-                                     int *descriptor_count) {
+int hl_fork_wire_receive_descriptors(int socket, void *buffer, size_t size, int *descriptors, int *descriptor_count) {
     (void)socket;
     (void)buffer;
     (void)size;

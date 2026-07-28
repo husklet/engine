@@ -915,9 +915,8 @@ static hl_host_result hl_macos_unmap_range(void *context, hl_host_handle handle,
          *
          * If the record cannot grow, the subrange stays claimed. That refuses a reuse that would
          * have been legal, which is recoverable; the other direction is not. */
-        if ((offset == 0 && size == mapping->size) ||
-            (hl_host_hole_set_retire(&mapping->retired, offset, size) &&
-             !hl_host_hole_set_holds(&mapping->retired, 0, mapping->size)))
+        if ((offset == 0 && size == mapping->size) || (hl_host_hole_set_retire(&mapping->retired, offset, size) &&
+                                                       !hl_host_hole_set_holds(&mapping->retired, 0, mapping->size)))
             hl_macos_retire_mapping_locked(mapping);
     }
     pthread_mutex_unlock(&host->lock);
@@ -4850,7 +4849,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         hl_macos_release,          hl_macos_publish,        hl_macos_reserve_code, hl_macos_repair_code,
         hl_macos_begin_code_write, hl_macos_end_code_write, hl_macos_map_file,     hl_macos_mapping_sync,
         hl_macos_unmap_range,      hl_macos_map_anonymous,  hl_macos_discard,      hl_macos_repair_signal_page,
-        hl_macos_unmap_address,    hl_macos_wire_range,     hl_macos_unwire_range,  hl_macos_protect_address,
+        hl_macos_unmap_address,    hl_macos_wire_range,     hl_macos_unwire_range, hl_macos_protect_address,
         hl_macos_sync_address};
     static const hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI,
                                                  .size = sizeof(clock),
@@ -4916,15 +4915,15 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     static const hl_host_shared_memory_services shared_memory = {HL_HOST_SHARED_MEMORY_ABI, sizeof(shared_memory),
                                                                  hl_macos_shared_create,    hl_macos_shared_open,
                                                                  hl_macos_shared_resize,    hl_macos_file_close};
-    static const hl_host_sync_services sync = {
-        HL_HOST_SYNC_ABI,      sizeof(sync),           hl_macos_mutex_create, hl_macos_mutex_lock,
-        hl_macos_mutex_unlock, hl_macos_mutex_close,   hl_macos_fork_prepare, hl_macos_fork_complete,
-        hl_macos_fork_child,   hl_macos_park,          hl_macos_unpark,       hl_macos_interrupt_park};
-    static const hl_host_terminal_services terminal = {
-        HL_HOST_TERMINAL_ABI,       sizeof(terminal),           hl_macos_terminal_probe,
-        hl_macos_terminal_get_mode, hl_macos_terminal_set_mode, hl_macos_terminal_get_size,
-        hl_macos_terminal_set_size, hl_macos_terminal_read,     hl_macos_terminal_write,
-        hl_macos_terminal_size_change_event};
+    static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,      sizeof(sync),           hl_macos_mutex_create,
+                                               hl_macos_mutex_lock,   hl_macos_mutex_unlock,  hl_macos_mutex_close,
+                                               hl_macos_fork_prepare, hl_macos_fork_complete, hl_macos_fork_child,
+                                               hl_macos_park,         hl_macos_unpark,        hl_macos_interrupt_park};
+    static const hl_host_terminal_services terminal = {HL_HOST_TERMINAL_ABI,       sizeof(terminal),
+                                                       hl_macos_terminal_probe,    hl_macos_terminal_get_mode,
+                                                       hl_macos_terminal_set_mode, hl_macos_terminal_get_size,
+                                                       hl_macos_terminal_set_size, hl_macos_terminal_read,
+                                                       hl_macos_terminal_write,    hl_macos_terminal_size_change_event};
     static const hl_host_counter_services counter = {
         HL_HOST_COUNTER_ABI,          sizeof(counter),
         hl_macos_counter_create,      hl_macos_counter_read,

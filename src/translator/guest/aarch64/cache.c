@@ -83,16 +83,16 @@
 #include "../../persist.h"
 
 // reloc kinds (packed into pc_reloc.info: kind<<0 | rd<<8 | slot<<16)
-#define RK_BLOCKRET 1 // 4-insn movz/movk of block_return into reg `rd`
-#define RK_IBTC 2     // 4-insn movz/movk of &g_ibtc into reg `rd`
-#define RK_T2CNT 3    // 4-insn movz/movk of &g_t2cnt[slot] into reg `rd`
-#define RK_ICSITE 4   // 16-byte per-site IC {target,body} literal pair -> zero on load (neutralize)
-#define RK_BUSFAULT 5 // 4-insn pointer to the generic translated-memory BUS query
+#define RK_BLOCKRET 1   // 4-insn movz/movk of block_return into reg `rd`
+#define RK_IBTC 2       // 4-insn movz/movk of &g_ibtc into reg `rd`
+#define RK_T2CNT 3      // 4-insn movz/movk of &g_t2cnt[slot] into reg `rd`
+#define RK_ICSITE 4     // 16-byte per-site IC {target,body} literal pair -> zero on load (neutralize)
+#define RK_BUSFAULT 5   // 4-insn pointer to the generic translated-memory BUS query
 #define RK_GUEST_ADRP 6 // one-insn ADRP of a fixed guest page; re-encode for the live arena RX base
 
 // ---- engine state (defined here; used by the recorded emitters + load/save) ----
-static int g_pcache;            // persistent cache active (HL_PCACHE=1)
-static int g_coldprof;          // Internal cache timing diagnostics; production entry keeps this disabled.
+static int g_pcache;   // persistent cache active (HL_PCACHE=1)
+static int g_coldprof; // Internal cache timing diagnostics; production entry keeps this disabled.
 static hl_persist_directory g_pc_directory;
 static char g_pc_directory_path[1024];
 static uint64_t g_force_base;   // if nonzero, load_elf() maps the NEXT image MAP_FIXED here (one-shot; elf.c)
@@ -109,19 +109,21 @@ static hl_reloc_table g_reloc_table = {g_reloc_storage, 0, (int)PC_RELOC_CAP};
 #define g_nreloc (g_reloc_table.count)
 
 #define PC_PROV_CAP (1u << 16)
-struct pc_prov { uint64_t host_off, guest; uint32_t size, reserved; };
+
+struct pc_prov {
+    uint64_t host_off, guest;
+    uint32_t size, reserved;
+};
 static struct pc_prov g_pc_prov[PC_PROV_CAP];
 static uint32_t g_pc_nprov;
 
 static void pcache_record_provenance(uint64_t host, uint64_t end, uint64_t guest) {
     jit_instruction_map_put(host, end, guest);
-    if (!g_pcache || host < (uint64_t)g_cache || end < host ||
-        end - host > UINT32_MAX || g_pc_nprov >= PC_PROV_CAP) {
+    if (!g_pcache || host < (uint64_t)g_cache || end < host || end - host > UINT32_MAX || g_pc_nprov >= PC_PROV_CAP) {
         if (g_pcache && g_pc_nprov >= PC_PROV_CAP) g_pcache_poison = 1;
         return;
     }
-    g_pc_prov[g_pc_nprov++] =
-        (struct pc_prov){host - (uint64_t)g_cache, guest, (uint32_t)(end - host), 0};
+    g_pc_prov[g_pc_nprov++] = (struct pc_prov){host - (uint64_t)g_cache, guest, (uint32_t)(end - host), 0};
 }
 
 // Forward-declares the dispatcher's block_return so the emitters below can bake its address. The condition
@@ -395,13 +397,15 @@ static int pcache_load(uint64_t entry_jump) {
     if (!hl_persist_load_at(&g_pc_directory, path, CACHE_SZ + UINT64_C(134217728), &image, &image_size)) return 0;
     hl_persist_cursor cursor = {image, image_size, 0};
     struct pc_hdr h;
-    if (!hl_persist_take(&cursor, &h, sizeof h)) { free(image); return 0; }
+    if (!hl_persist_take(&cursor, &h, sizeof h)) {
+        free(image);
+        return 0;
+    }
     if (h.magic != PC_MAGIC || h.version != PC_VERSION_EFF || h.cpu_sz != sizeof(struct cpu) ||
         h.jit_map_n != JIT_MAP_N || h.ibtc_n != IBTC_N || h.img_base != PC_IMG_BASE ||
         h.interp_base != PC_INTERP_BASE || h.bin_id != g_pc_binid || h.entry_jump != entry_jump ||
         h.arena_used > CACHE_SZ || (h.arena_used & 3) || h.n_reloc > PC_RELOC_CAP || h.n_mapent > JIT_MAP_N ||
-        h.n_pend > (1u << 16) || h.n_t2 > T2_MAX || h.n_txpg > TXPG_N ||
-        h.n_prov > PC_PROV_CAP) {
+        h.n_pend > (1u << 16) || h.n_t2 > T2_MAX || h.n_txpg > TXPG_N || h.n_prov > PC_PROV_CAP) {
         free(image);
         return 0;
     }
@@ -444,23 +448,19 @@ static int pcache_load(uint64_t entry_jump) {
         ok = pc_guest_adrp_ok(re[i], abuf, h.arena_rx_at);
     for (uint64_t i = 0; ok && i < h.n_mapent; i++)
         ok = hl_window_contains(h.arena_used, me[i].host_off, 1, 4) &&
-             hl_window_contains(h.arena_used, me[i].body_off, 1, 4) &&
-             me[i].guest_start < me[i].guest_end;
+             hl_window_contains(h.arena_used, me[i].body_off, 1, 4) && me[i].guest_start < me[i].guest_end;
     for (uint64_t i = 0; ok && i < h.n_pend; i++) {
-        ok = hl_window_contains(h.arena_used, pe[i].slot_off, 4, 4) &&
-             pe[i].kind <= 2 && pe[i].fwd <= 1;
+        ok = hl_window_contains(h.arena_used, pe[i].slot_off, 4, 4) && pe[i].kind <= 2 && pe[i].fwd <= 1;
         if (ok && pe[i].kind == 2) {
             uint32_t in = pe[i].orig;
-            int valid = (in & 0xff000010u) == 0x54000000u ||
-                        (in & 0x7e000000u) == 0x34000000u ||
+            int valid = (in & 0xff000010u) == 0x54000000u || (in & 0x7e000000u) == 0x34000000u ||
                         (in & 0x7e000000u) == 0x36000000u;
             ok = valid && !(pe[i].source_gpc & 3) &&
                  pe[i].fwd == (uint32_t)(g_fwdskip && pe[i].target > pe[i].source_gpc);
         }
     }
     for (uint64_t i = 0; ok && i < h.n_prov; i++)
-        ok = pv[i].reserved == 0 && pv[i].size != 0 &&
-             hl_window_contains(h.arena_used, pv[i].host_off, pv[i].size, 4);
+        ok = pv[i].reserved == 0 && pv[i].size != 0 && hl_window_contains(h.arena_used, pv[i].host_off, pv[i].size, 4);
     if (!ok) {
         free(re);
         free(me);
@@ -484,17 +484,14 @@ static int pcache_load(uint64_t entry_jump) {
         return 0;
     }
     for (uint64_t i = 0; i < h.n_mapent; i++)
-        map_put(me[i].gpc, me[i].guest_start, me[i].guest_end,
-                g_cache + me[i].host_off, g_cache + me[i].body_off);
+        map_put(me[i].gpc, me[i].guest_start, me[i].guest_end, g_cache + me[i].host_off, g_cache + me[i].body_off);
     pend_reset();
     for (uint64_t i = 0; i < h.n_pend; i++) {
         uint32_t *slot = (uint32_t *)(g_cache + pe[i].slot_off);
         if (pe[i].kind == 2)
-            add_pend_cond(slot, pe[i].target, pe[i].orig,
-                          pe[i].source_gpc, (int)pe[i].fwd);
+            add_pend_cond(slot, pe[i].target, pe[i].orig, pe[i].source_gpc, (int)pe[i].fwd);
         else
-            add_pend3(slot, pe[i].target, (int)pe[i].kind,
-                      (int)pe[i].fwd);
+            add_pend3(slot, pe[i].target, (int)pe[i].kind, (int)pe[i].fwd);
     }
     g_t2n = (int)h.n_t2;
     for (uint64_t i = 0; i < h.n_t2; i++) {
@@ -510,8 +507,7 @@ static int pcache_load(uint64_t entry_jump) {
         if (tx[i]) txpg_put(tx[i]);
     g_pc_nprov = 0;
     for (uint64_t i = 0; i < h.n_prov; i++) {
-        jit_instruction_map_put((uint64_t)g_cache + pv[i].host_off,
-                                (uint64_t)g_cache + pv[i].host_off + pv[i].size,
+        jit_instruction_map_put((uint64_t)g_cache + pv[i].host_off, (uint64_t)g_cache + pv[i].host_off + pv[i].size,
                                 pv[i].guest);
         g_pc_prov[g_pc_nprov++] = pv[i];
     }
@@ -524,10 +520,16 @@ static int pcache_load(uint64_t entry_jump) {
     free(pv);
 
     // Commit the arena bytes + re-emit every baked host pointer, then publish to the I-cache.
-    if (!jit_wprot(0)) { free(abuf); return 0; }
+    if (!jit_wprot(0)) {
+        free(abuf);
+        return 0;
+    }
     memcpy(g_cache, abuf, h.arena_used);
     pcache_relocate(h.arena_rx_at);
-    if (!jit_wprot(1) || !jit_publish_code(J_RX(g_cache), h.arena_used)) { free(abuf); return 0; }
+    if (!jit_wprot(1) || !jit_publish_code(J_RX(g_cache), h.arena_used)) {
+        free(abuf);
+        return 0;
+    }
     memset(g_ibtc, 0, sizeof g_ibtc); // shared IBTC data table: refills lazily
     free(abuf);
     g_pcache_loaded = 1;
@@ -592,8 +594,7 @@ static void pcache_save(void) {
     // Build the whole image in one heap buffer -> one write() (per-record writes dominated the save cost).
     size_t total = sizeof h + (size_t)g_nreloc * sizeof(hl_reloc) + (size_t)nmap * sizeof(struct pc_mapent) +
                    (size_t)g_npend * sizeof(struct pc_pend) + (size_t)g_t2n * sizeof(struct pc_t2) +
-                   (size_t)ntxpg * sizeof(uint64_t) +
-                   (size_t)g_pc_nprov * sizeof(struct pc_prov) + arena_used;
+                   (size_t)ntxpg * sizeof(uint64_t) + (size_t)g_pc_nprov * sizeof(struct pc_prov) + arena_used;
     uint8_t *buf = malloc(total);
     int ok = buf != NULL;
     if (ok) {
@@ -611,11 +612,13 @@ static void pcache_save(void) {
             w += sizeof e;
         }
         for (int i = 0; i < g_npend; i++) {
-            struct pc_pend e = {
-                (uint64_t)((uint8_t *)g_pend[i].slot - g_cache),
-                g_pend[i].target, g_pend[i].source_gpc,
-                (uint32_t)g_pend[i].is_bl, (uint32_t)g_pend[i].fwd,
-                g_pend[i].orig, 0};
+            struct pc_pend e = {(uint64_t)((uint8_t *)g_pend[i].slot - g_cache),
+                                g_pend[i].target,
+                                g_pend[i].source_gpc,
+                                (uint32_t)g_pend[i].is_bl,
+                                (uint32_t)g_pend[i].fwd,
+                                g_pend[i].orig,
+                                0};
             memcpy(w, &e, sizeof e);
             w += sizeof e;
         }

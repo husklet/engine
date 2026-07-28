@@ -40,8 +40,8 @@ static uint64_t hl_elf_ph64(const uint8_t *p) {
 // `phdr` is the program-header table (file or mapped copy -- identical bytes), `bias` the amount the
 // image was displaced from its link address. `mapping` is the image's host mapping; pass NULL to change
 // the protection with mprotect(2) directly, which is all the fork-server restore has to hand.
-static void hl_elf_protect_segments(const hl_host_memory_mapping *mapping, const uint8_t *phdr, int phnum,
-                                    int phent, uint64_t bias) {
+static void hl_elf_protect_segments(const hl_host_memory_mapping *mapping, const uint8_t *phdr, int phnum, int phent,
+                                    uint64_t bias) {
     size_t host_page = hl_host_page_size();
     for (int i = 0; i < phnum; i++) {
         const uint8_t *ph = phdr + (size_t)i * (size_t)phent;

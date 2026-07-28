@@ -20,11 +20,15 @@
 #define HL_NATIVE_SEEK_DATA SEEK_DATA
 #define HL_NATIVE_SEEK_HOLE SEEK_HOLE
 
-static inline void hl_native_kqueue_close(int descriptor) { (void)descriptor; }
+static inline void hl_native_kqueue_close(int descriptor) {
+    (void)descriptor;
+}
+
 static inline void hl_native_kqueue_duplicate(int source, int destination) {
     (void)source;
     (void)destination;
 }
+
 /* A kqueue() descriptor here is a real kernel object, so dup2()/F_DUPFD move it with no bookkeeping. */
 static inline void hl_native_kqueue_relocate(int source, int destination) {
     (void)source;
@@ -35,34 +39,45 @@ static inline int hl_native_fd_path(int descriptor, char *path, size_t capacity)
     (void)capacity;
     return fcntl(descriptor, F_GETPATH, path);
 }
-static inline int hl_native_open_watch(const char *path) { return open(path, O_EVTONLY); }
+
+static inline int hl_native_open_watch(const char *path) {
+    return open(path, O_EVTONLY);
+}
+
 static inline int hl_native_set_no_sigpipe(int descriptor) {
     int enabled = 1;
     return setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
 }
+
 static inline int hl_native_birthtime(const struct stat *status, struct timespec *time) {
     *time = status->st_birthtimespec;
     return 0;
 }
+
 static inline int hl_native_setxattr(const char *path, const char *name, const void *value, size_t size, int position,
-                                    int options) {
+                                     int options) {
     return setxattr(path, name, value, size, position, options);
 }
+
 static inline int hl_native_fsetxattr(int fd, const char *name, const void *value, size_t size, int position,
-                                     int options) {
+                                      int options) {
     return fsetxattr(fd, name, value, size, position, options);
 }
+
 static inline ssize_t hl_native_getxattr(const char *path, const char *name, void *value, size_t size, int position,
-                                        int options) {
+                                         int options) {
     return getxattr(path, name, value, size, position, options);
 }
+
 static inline ssize_t hl_native_fgetxattr(int fd, const char *name, void *value, size_t size, int position,
-                                         int options) {
+                                          int options) {
     return fgetxattr(fd, name, value, size, position, options);
 }
+
 static inline ssize_t hl_native_listxattr(const char *path, char *list, size_t size, int options) {
     return listxattr(path, list, size, options);
 }
+
 static inline int hl_native_removexattr(const char *path, const char *name, int options) {
     return removexattr(path, name, options);
 }
@@ -129,8 +144,8 @@ struct kevent {
 // already an exact hrtimer.
 #define NOTE_CRITICAL UINT32_C(0x00000020)
 
-#define EV_SET(event, identifier, event_filter, event_flags, event_fflags, event_data, event_udata)                  \
-    (*(event) = (struct kevent){(uintptr_t)(identifier), (int16_t)(event_filter), (uint16_t)(event_flags),          \
+#define EV_SET(event, identifier, event_filter, event_flags, event_fflags, event_data, event_udata)                    \
+    (*(event) = (struct kevent){(uintptr_t)(identifier), (int16_t)(event_filter), (uint16_t)(event_flags),             \
                                 (uint32_t)(event_fflags), (intptr_t)(event_data), (void *)(event_udata)})
 
 typedef struct hl_native_kregistration {
@@ -148,11 +163,13 @@ typedef struct hl_native_kregistration {
 
 static pthread_mutex_t hl_native_klock = PTHREAD_MUTEX_INITIALIZER;
 static hl_native_kregistration *hl_native_kregistrations;
+
 typedef struct hl_native_kalias {
     int descriptor;
     uint64_t queue;
     struct hl_native_kalias *next;
 } hl_native_kalias;
+
 static hl_native_kalias *hl_native_kaliases;
 static uint64_t hl_native_knext = 1;
 static uint64_t hl_native_ktoken_next = 1;
@@ -178,7 +195,8 @@ static inline hl_native_kregistration *hl_native_ktoken_find(uint64_t token) {
 
 static inline void hl_native_kqueue_release_locked(int descriptor) {
     hl_native_kalias **alias_cursor = &hl_native_kaliases;
-    while (*alias_cursor != NULL && (*alias_cursor)->descriptor != descriptor) alias_cursor = &(*alias_cursor)->next;
+    while (*alias_cursor != NULL && (*alias_cursor)->descriptor != descriptor)
+        alias_cursor = &(*alias_cursor)->next;
     if (*alias_cursor == NULL) return;
     hl_native_kalias *alias = *alias_cursor;
     uint64_t queue = alias->queue;
@@ -330,9 +348,12 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
                 errno = ENOENT;
                 return -1;
             }
-            if (change->filter == EVFILT_READ) entry->read = 0;
-            else if (change->filter == EVFILT_WRITE) entry->write = 0;
-            else entry->read = 0;
+            if (change->filter == EVFILT_READ)
+                entry->read = 0;
+            else if (change->filter == EVFILT_WRITE)
+                entry->write = 0;
+            else
+                entry->read = 0;
         } else if ((change->flags & EV_ADD) != 0) {
             if (entry == NULL) {
                 entry = calloc(1, sizeof(*entry));
@@ -351,8 +372,10 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
             }
             entry->flags = change->flags;
             entry->udata = change->udata;
-            if (change->filter == EVFILT_READ) entry->read = 1;
-            else if (change->filter == EVFILT_WRITE) entry->write = 1;
+            if (change->filter == EVFILT_READ)
+                entry->read = 1;
+            else if (change->filter == EVFILT_WRITE)
+                entry->write = 1;
             else {
                 if (entry->wake < 0) {
                     int wake = change->filter == EVFILT_TIMER
@@ -460,14 +483,18 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
                         continue;
                     }
                     events[delivered] = (struct kevent){(uintptr_t)(entry->target < 0 ? descriptor : entry->target),
-                                                        EVFILT_TIMER, 0, 0, (intptr_t)expirations, entry->udata};
+                                                        EVFILT_TIMER,
+                                                        0,
+                                                        0,
+                                                        (intptr_t)expirations,
+                                                        entry->udata};
                     delivered++;
                     pthread_mutex_unlock(&hl_native_klock);
                     continue;
                 }
                 int16_t filter = (ready & (EPOLLIN | EPOLLPRI | EPOLLRDHUP)) != 0 ? EVFILT_READ : EVFILT_WRITE;
-                events[delivered] = (struct kevent){(uintptr_t)(entry->target < 0 ? descriptor : entry->target),
-                                                    filter, 0, 0, 0, entry->udata};
+                events[delivered] = (struct kevent){
+                    (uintptr_t)(entry->target < 0 ? descriptor : entry->target), filter, 0, 0, 0, entry->udata};
                 if ((ready & (EPOLLHUP | EPOLLRDHUP)) != 0) events[delivered].flags |= EV_EOF;
                 if ((ready & EPOLLERR) != 0) events[delivered].flags |= EV_ERROR;
                 if (entry->target < 0) {
@@ -491,6 +518,7 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
         }
     }
 }
+
 #define st_atimespec st_atim
 #define st_mtimespec st_mtim
 #define st_ctimespec st_ctim
@@ -539,33 +567,39 @@ static inline int hl_native_birthtime(const struct stat *status, struct timespec
 }
 
 static inline int hl_native_setxattr(const char *path, const char *name, const void *value, size_t size, int position,
-                                    int options) {
+                                     int options) {
     (void)position;
     return options != 0 ? lsetxattr(path, name, value, size, 0) : setxattr(path, name, value, size, 0);
 }
+
 static inline int hl_native_fsetxattr(int fd, const char *name, const void *value, size_t size, int position,
-                                     int options) {
+                                      int options) {
     (void)position;
     (void)options;
     return fsetxattr(fd, name, value, size, 0);
 }
+
 static inline ssize_t hl_native_getxattr(const char *path, const char *name, void *value, size_t size, int position,
-                                        int options) {
+                                         int options) {
     (void)position;
     return options != 0 ? lgetxattr(path, name, value, size) : getxattr(path, name, value, size);
 }
+
 static inline ssize_t hl_native_fgetxattr(int fd, const char *name, void *value, size_t size, int position,
-                                         int options) {
+                                          int options) {
     (void)position;
     (void)options;
     return fgetxattr(fd, name, value, size);
 }
+
 static inline ssize_t hl_native_listxattr(const char *path, char *list, size_t size, int options) {
     return options != 0 ? llistxattr(path, list, size) : listxattr(path, list, size);
 }
+
 static inline int hl_native_removexattr(const char *path, const char *name, int options) {
     return options != 0 ? lremovexattr(path, name) : removexattr(path, name);
 }
+
 #define XATTR_NOFOLLOW 1
 #ifndef ENOATTR
 #define ENOATTR ENODATA
@@ -761,8 +795,8 @@ struct kevent {
 // macOS-only hint (minimal power-aware timer coalescing); inert here, as it is in the Linux arm.
 #define NOTE_CRITICAL UINT32_C(0x00000020)
 
-#define EV_SET(event, identifier, event_filter, event_flags, event_fflags, event_data, event_udata)                  \
-    (*(event) = (struct kevent){(uintptr_t)(identifier), (int16_t)(event_filter), (uint16_t)(event_flags),          \
+#define EV_SET(event, identifier, event_filter, event_flags, event_fflags, event_data, event_udata)                    \
+    (*(event) = (struct kevent){(uintptr_t)(identifier), (int16_t)(event_filter), (uint16_t)(event_flags),             \
                                 (uint32_t)(event_fflags), (intptr_t)(event_data), (void *)(event_udata)})
 
 /* REFUSAL. */
@@ -791,11 +825,15 @@ static inline int kevent(int descriptor, const struct kevent *changes, int chang
  * That is the same reasoning the Darwin arm gives for its empty bodies (there
  * the descriptor is a real kernel object dup2 moves by itself); only the Linux
  * arm needs bookkeeping, because only it keeps a side table. */
-static inline void hl_native_kqueue_close(int descriptor) { (void)descriptor; }
+static inline void hl_native_kqueue_close(int descriptor) {
+    (void)descriptor;
+}
+
 static inline void hl_native_kqueue_duplicate(int source, int destination) {
     (void)source;
     (void)destination;
 }
+
 static inline void hl_native_kqueue_relocate(int source, int destination) {
     (void)source;
     (void)destination;
@@ -824,8 +862,8 @@ static inline int hl_native_fd_path(int descriptor, char *path, size_t capacity)
         errno = EBADF;
         return -1;
     }
-    count = GetFinalPathNameByHandleW(handle, buffer, (unsigned long)(sizeof(inline_buffer) / sizeof(*inline_buffer)),
-                                      0ul);
+    count =
+        GetFinalPathNameByHandleW(handle, buffer, (unsigned long)(sizeof(inline_buffer) / sizeof(*inline_buffer)), 0ul);
     if (count >= sizeof(inline_buffer) / sizeof(*inline_buffer)) {
         buffer = (wchar_t *)malloc(((size_t)count + 1u) * sizeof(*buffer));
         if (buffer == NULL) {
@@ -909,29 +947,7 @@ static inline int hl_native_birthtime(const struct stat *status, struct timespec
  * has been told something true and already knows how to handle it -- which a
  * silent empty listing would not be. */
 static inline int hl_native_setxattr(const char *path, const char *name, const void *value, size_t size, int position,
-                                    int options) {
-    (void)path;
-    (void)name;
-    (void)value;
-    (void)size;
-    (void)position;
-    (void)options;
-    errno = ENOTSUP;
-    return -1;
-}
-static inline int hl_native_fsetxattr(int fd, const char *name, const void *value, size_t size, int position,
                                      int options) {
-    (void)fd;
-    (void)name;
-    (void)value;
-    (void)size;
-    (void)position;
-    (void)options;
-    errno = ENOTSUP;
-    return -1;
-}
-static inline ssize_t hl_native_getxattr(const char *path, const char *name, void *value, size_t size, int position,
-                                        int options) {
     (void)path;
     (void)name;
     (void)value;
@@ -941,8 +957,9 @@ static inline ssize_t hl_native_getxattr(const char *path, const char *name, voi
     errno = ENOTSUP;
     return -1;
 }
-static inline ssize_t hl_native_fgetxattr(int fd, const char *name, void *value, size_t size, int position,
-                                         int options) {
+
+static inline int hl_native_fsetxattr(int fd, const char *name, const void *value, size_t size, int position,
+                                      int options) {
     (void)fd;
     (void)name;
     (void)value;
@@ -952,6 +969,31 @@ static inline ssize_t hl_native_fgetxattr(int fd, const char *name, void *value,
     errno = ENOTSUP;
     return -1;
 }
+
+static inline ssize_t hl_native_getxattr(const char *path, const char *name, void *value, size_t size, int position,
+                                         int options) {
+    (void)path;
+    (void)name;
+    (void)value;
+    (void)size;
+    (void)position;
+    (void)options;
+    errno = ENOTSUP;
+    return -1;
+}
+
+static inline ssize_t hl_native_fgetxattr(int fd, const char *name, void *value, size_t size, int position,
+                                          int options) {
+    (void)fd;
+    (void)name;
+    (void)value;
+    (void)size;
+    (void)position;
+    (void)options;
+    errno = ENOTSUP;
+    return -1;
+}
+
 static inline ssize_t hl_native_listxattr(const char *path, char *list, size_t size, int options) {
     (void)path;
     (void)list;
@@ -960,6 +1002,7 @@ static inline ssize_t hl_native_listxattr(const char *path, char *list, size_t s
     errno = ENOTSUP;
     return -1;
 }
+
 static inline int hl_native_removexattr(const char *path, const char *name, int options) {
     (void)path;
     (void)name;
@@ -967,6 +1010,7 @@ static inline int hl_native_removexattr(const char *path, const char *name, int 
     errno = ENOTSUP;
     return -1;
 }
+
 #define XATTR_NOFOLLOW 1
 #ifndef ENOATTR
 #define ENOATTR ENODATA
@@ -1079,7 +1123,9 @@ static inline int renameatx_np(int old_directory, const char *old_path, int new_
  * self-modifying-code guard protects a page at a time and would work at 4096
  * too, so it over-protects and takes some extra traps.  That is a cost, not a
  * correctness break, and it is the right direction to be wrong in. */
-static inline int getpagesize(void) { return 65536; }
+static inline int getpagesize(void) {
+    return 65536;
+}
 
 /* REAL.  Pure byte swaps, and that is the whole point of defining them here:
  * their only declaration on Windows is in <winsock2.h>, which would pull the
@@ -1089,10 +1135,21 @@ static inline int getpagesize(void) { return 65536; }
  * Winsock include markers so a TU that legitimately needs sockets keeps the
  * real declarations and never sees a conflicting one. */
 #if !defined(_WINSOCK2API_) && !defined(_WINSOCKAPI_)
-static inline unsigned short htons(unsigned short value) { return __builtin_bswap16(value); }
-static inline unsigned short ntohs(unsigned short value) { return __builtin_bswap16(value); }
-static inline unsigned int htonl(unsigned int value) { return __builtin_bswap32(value); }
-static inline unsigned int ntohl(unsigned int value) { return __builtin_bswap32(value); }
+static inline unsigned short htons(unsigned short value) {
+    return __builtin_bswap16(value);
+}
+
+static inline unsigned short ntohs(unsigned short value) {
+    return __builtin_bswap16(value);
+}
+
+static inline unsigned int htonl(unsigned int value) {
+    return __builtin_bswap32(value);
+}
+
+static inline unsigned int ntohl(unsigned int value) {
+    return __builtin_bswap32(value);
+}
 #endif
 
 /* st_atimespec / st_mtimespec / st_ctimespec are deliberately NOT aliased.

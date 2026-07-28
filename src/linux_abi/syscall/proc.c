@@ -888,8 +888,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
-        if (copy &&
-            guest_copy_to(a2, hl_linux_affinity_get(&g_affinity, linux_online_cpus()), copy) != (ssize_t)copy) {
+        if (copy && guest_copy_to(a2, hl_linux_affinity_get(&g_affinity, linux_online_cpus()), copy) != (ssize_t)copy) {
             G_RET(c) = (uint64_t)(-EFAULT);
             break;
         }
@@ -1357,8 +1356,8 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         if (ng > 0) {
-            if (!a1 || guest_copy_from(g_groups, a1, (size_t)ng * sizeof(gid_t)) !=
-                           (ssize_t)((size_t)ng * sizeof(gid_t))) {
+            if (!a1 ||
+                guest_copy_from(g_groups, a1, (size_t)ng * sizeof(gid_t)) != (ssize_t)((size_t)ng * sizeof(gid_t))) {
                 G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                 break;
             }
@@ -2044,8 +2043,8 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                         // An ELF this engine cannot translate (32-bit, or a foreign e_machine) is ENOEXEC --
                         // Linux reports that for an image no binfmt handler accepts. load_elf() would instead
                         // exit(1) the whole engine, and the exec commit point below is past every return.
-                        if (is_elf && (got < 20 || hdr[4] != 2 ||
-                                       (unsigned)(hdr[18] | (hdr[19] << 8)) != HL_EXEC_ELF_MACHINE)) {
+                        if (is_elf &&
+                            (got < 20 || hdr[4] != 2 || (unsigned)(hdr[18] | (hdr[19] << 8)) != HL_EXEC_ELF_MACHINE)) {
                             G_RET(c) = (uint64_t)(int64_t)(-ENOEXEC);
                             break;
                         }

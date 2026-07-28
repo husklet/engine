@@ -18,7 +18,7 @@ int hl_linux_errno_from_macos(int host_errno) {
      * is the same convention the Darwin table uses for its unassigned numbers.
      * EOTHER (131) has no Linux counterpart at all and takes EINVAL for real. */
     static const short low[43] = {
-        /*   0.. 9 */ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+        /*   0.. 9 */ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9,
         /*  10..19 */ 10, 11, 12, 13, 14, 22, 16, 17, 18, 19,
         /*  20..29 */ 20, 21, 22, 23, 24, 25, 22, 27, 28, 29,
         /*  30..39 */ 30, 31, 32, 33, 34, 22, 35, 22, 36, 37,

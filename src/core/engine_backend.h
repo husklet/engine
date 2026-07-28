@@ -8,11 +8,10 @@
 typedef struct hl_engine_backend {
     uint32_t guest_isa;
     hl_status (*start_process)(const hl_host_services *host, hl_linux_abi *box, hl_options *options,
-                               const hl_engine_config *config,
-                               uint32_t argc, const char *const argv[], hl_host_handle *process,
-                               hl_host_handle *result);
-    hl_status (*finish_process)(const hl_host_services *host, hl_host_handle token,
-                                const hl_host_result *waited, hl_engine_exit *result);
+                               const hl_engine_config *config, uint32_t argc, const char *const argv[],
+                               hl_host_handle *process, hl_host_handle *result);
+    hl_status (*finish_process)(const hl_host_services *host, hl_host_handle token, const hl_host_result *waited,
+                                hl_engine_exit *result);
     void (*release_process_result)(const hl_host_services *host, hl_host_handle token);
 } hl_engine_backend;
 

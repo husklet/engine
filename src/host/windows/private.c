@@ -49,13 +49,18 @@
  * Linux ABI layer; the value is pinned by the goldens either way. */
 #define HL_WINDOWS_GUEST_FD_LIMIT UINT32_C(65536)
 
-void hl_host_private_init(void) {}
+void hl_host_private_init(void) {
+}
 
-uint32_t hl_engine_guest_fd_limit(void) { return HL_WINDOWS_GUEST_FD_LIMIT; }
+uint32_t hl_engine_guest_fd_limit(void) {
+    return HL_WINDOWS_GUEST_FD_LIMIT;
+}
 
 /* REFUSAL. -1 is "no private band", which every caller reads as "do not hoist"
  * rather than as descriptor -1. */
-int hl_host_process_fd_private_floor(void) { return -1; }
+int hl_host_process_fd_private_floor(void) {
+    return -1;
+}
 
 int hl_host_process_fd_private_add(int descriptor) {
     (void)descriptor;
@@ -71,7 +76,9 @@ int hl_host_process_fd_private_adopt(int descriptor) {
     return -ENOSYS;
 }
 
-void hl_host_process_fd_private_remove(int descriptor) { (void)descriptor; }
+void hl_host_process_fd_private_remove(int descriptor) {
+    (void)descriptor;
+}
 
 /* Nothing was ever recorded as private, so nothing is. Answering yes would make
  * a caller refuse to hand a perfectly ordinary descriptor to a guest. */
@@ -90,11 +97,14 @@ int hl_host_process_fd_private_current(int descriptor) {
 /* The fork hooks re-seat the private band across a fork. There is no fork on
  * this host, so there is nothing to re-seat and reporting success is the honest
  * answer -- unlike the calls above, this one is not withholding anything. */
-int hl_host_process_fd_private_fork_prepare(void) { return 0; }
+int hl_host_process_fd_private_fork_prepare(void) {
+    return 0;
+}
 
 int hl_host_process_fd_private_fork_complete(int child) {
     (void)child;
     return 0;
 }
 
-void hl_host_process_fd_private_cleanup(void) {}
+void hl_host_process_fd_private_cleanup(void) {
+}

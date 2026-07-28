@@ -48,8 +48,8 @@ int hl_x86_trace_loop_hazard(uint64_t body, uint64_t end);
 int hl_x86_trace_flags_livein(hl_x86_trace_state *state, uint64_t pc, uint64_t anchor);
 int hl_x86_trace_pfaf_dead(hl_x86_trace_state *state, const struct insn *insn, uint64_t pc, uint64_t anchor);
 void hl_x86_trace_flags_edge(hl_x86_trace_state *state, uint64_t target, uint64_t anchor);
-void hl_x86_trace_jcc_flags(hl_x86_trace_state *state, uint64_t taken, uint64_t fall, uint64_t anchor,
-                            int stitch_fall, int arm_cc, int *save_taken, int *save_fall);
+void hl_x86_trace_jcc_flags(hl_x86_trace_state *state, uint64_t taken, uint64_t fall, uint64_t anchor, int stitch_fall,
+                            int arm_cc, int *save_taken, int *save_fall);
 void hl_x86_trace_self_loop(hl_x86_trace_state *state, int condition, uint64_t start, uint64_t fall, void *body,
                             int slot);
 

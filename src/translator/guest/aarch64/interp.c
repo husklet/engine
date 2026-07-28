@@ -25,10 +25,10 @@
 
 // Engine-wide debug/identity state that stubs.c owns for the JIT; the trace hook, syscall tracer, /proc
 // synthesis, ELF loader and checkpoint writer all read it, so this backend must own it too.
-static int g_trace;         // G_TRACE_DUMP: per-block guest PC + register dump
-static int g_systrace;      // syscall tracer
-static int g_dbg_nochain;   // suppress inter-block chaining so every block re-enters the dispatcher
-static int g_dbg_gprdump;   // dump all guest GPRs per block, for a register-value differential
+static int g_trace;       // G_TRACE_DUMP: per-block guest PC + register dump
+static int g_systrace;    // syscall tracer
+static int g_dbg_nochain; // suppress inter-block chaining so every block re-enters the dispatcher
+static int g_dbg_gprdump; // dump all guest GPRs per block, for a register-value differential
 // What /proc/self/exe must report; a literal, not NULL, so an early reader cannot deref it.
 static const char *g_exe_path = "";
 
@@ -66,13 +66,13 @@ static uint64_t interp_guest_pointer(uint64_t address) {
 // back. Sound because nothing in between holds a lock, and a load commits its destination only after the
 // marked memcpy returns while a store reads its sources into locals first: the abandoned instruction made no
 // partial architectural change and cpu->pc still names it.
-static __thread struct cpu *g_interp_marker_cpu;   // the cpu whose run_block armed the marker
-static __thread sigjmp_buf g_interp_marker_jmp;    // where interp_signal_resume goes
-static __thread int g_interp_marker_armed;         // 1 while the buffer is valid
-static __thread int g_interp_access_active;        // 1 while a guest access is in flight
-static __thread uint64_t g_interp_access_address;  // its effective guest address
-static __thread uint64_t g_interp_access_bytes;    // its size
-static __thread int g_interp_access_write;         // 1 for a store
+static __thread struct cpu *g_interp_marker_cpu;  // the cpu whose run_block armed the marker
+static __thread sigjmp_buf g_interp_marker_jmp;   // where interp_signal_resume goes
+static __thread int g_interp_marker_armed;        // 1 while the buffer is valid
+static __thread int g_interp_access_active;       // 1 while a guest access is in flight
+static __thread uint64_t g_interp_access_address; // its effective guest address
+static __thread uint64_t g_interp_access_bytes;   // its size
+static __thread int g_interp_access_write;        // 1 for a store
 
 // The past-EOF SIGBUS ledger. mem.c re-maps the past-EOF tail of a MAP_PRIVATE file mapping as anonymous
 // zero, so that SIGBUS is owed by the TRANSLATOR, from mem.c's ledger via core/bus.h; interp_access_begin is
@@ -183,10 +183,21 @@ static void interp_signal_resume(struct cpu *c, void *ucontext) {
 // directly on the host, ~1e-4 of the CASes that raced such a copy were silently undone. Packed structs, not
 // casts: a guest access need not be aligned, and this must stay one instruction at every -O level, not only
 // where the optimiser happens to inline a constant-size memcpy.
-struct interp_una8 { uint8_t v; } __attribute__((packed));
-struct interp_una16 { uint16_t v; } __attribute__((packed));
-struct interp_una32 { uint32_t v; } __attribute__((packed));
-struct interp_una64 { uint64_t v; } __attribute__((packed));
+struct interp_una8 {
+    uint8_t v;
+} __attribute__((packed));
+
+struct interp_una16 {
+    uint16_t v;
+} __attribute__((packed));
+
+struct interp_una32 {
+    uint32_t v;
+} __attribute__((packed));
+
+struct interp_una64 {
+    uint64_t v;
+} __attribute__((packed));
 
 static void interp_copy_indivisible(void *destination, const void *source, unsigned bytes) {
     switch (bytes) {
@@ -275,8 +286,7 @@ static void interp_set_gpr32_sp(struct cpu *cpu, int reg, uint32_t value) {
 #define INTERP_NZCV_V (UINT64_C(1) << 28)
 
 static void interp_set_flags(struct cpu *cpu, unsigned n, unsigned z, unsigned c, unsigned v) {
-    cpu->nzcv = (n ? INTERP_NZCV_N : 0) | (z ? INTERP_NZCV_Z : 0) | (c ? INTERP_NZCV_C : 0) |
-                (v ? INTERP_NZCV_V : 0);
+    cpu->nzcv = (n ? INTERP_NZCV_N : 0) | (z ? INTERP_NZCV_Z : 0) | (c ? INTERP_NZCV_C : 0) | (v ? INTERP_NZCV_V : 0);
 }
 
 // FPCR/FPSR. Per-thread, and NOT in struct cpu -- that layout is the checkpoint format shared with the JIT,
@@ -310,27 +320,35 @@ static void interp_fpsr_raise(unsigned bits) {
     g_interp_fpsr |= bits;
 }
 
-static unsigned interp_flag_n(const struct cpu *cpu) { return (cpu->nzcv & INTERP_NZCV_N) != 0; }
+static unsigned interp_flag_n(const struct cpu *cpu) {
+    return (cpu->nzcv & INTERP_NZCV_N) != 0;
+}
 
-static unsigned interp_flag_z(const struct cpu *cpu) { return (cpu->nzcv & INTERP_NZCV_Z) != 0; }
+static unsigned interp_flag_z(const struct cpu *cpu) {
+    return (cpu->nzcv & INTERP_NZCV_Z) != 0;
+}
 
-static unsigned interp_flag_c(const struct cpu *cpu) { return (cpu->nzcv & INTERP_NZCV_C) != 0; }
+static unsigned interp_flag_c(const struct cpu *cpu) {
+    return (cpu->nzcv & INTERP_NZCV_C) != 0;
+}
 
-static unsigned interp_flag_v(const struct cpu *cpu) { return (cpu->nzcv & INTERP_NZCV_V) != 0; }
+static unsigned interp_flag_v(const struct cpu *cpu) {
+    return (cpu->nzcv & INTERP_NZCV_V) != 0;
+}
 
 // ConditionHolds(). The low bit inverts the test, except for 0b1111 (NV), which is AL, not "never".
 static int interp_cond_holds(const struct cpu *cpu, unsigned cond) {
     unsigned n = interp_flag_n(cpu), z = interp_flag_z(cpu), c = interp_flag_c(cpu), v = interp_flag_v(cpu);
     int result;
     switch ((cond >> 1) & 7) {
-    case 0: result = z; break;                     // EQ / NE
-    case 1: result = c; break;                     // CS(HS) / CC(LO)
-    case 2: result = n; break;                     // MI / PL
-    case 3: result = v; break;                     // VS / VC
-    case 4: result = c && !z; break;               // HI / LS
-    case 5: result = (n == v); break;              // GE / LT
-    case 6: result = (n == v) && !z; break;        // GT / LE
-    default: result = 1; break;                    // AL / NV
+    case 0: result = z; break;              // EQ / NE
+    case 1: result = c; break;              // CS(HS) / CC(LO)
+    case 2: result = n; break;              // MI / PL
+    case 3: result = v; break;              // VS / VC
+    case 4: result = c && !z; break;        // HI / LS
+    case 5: result = (n == v); break;       // GE / LT
+    case 6: result = (n == v) && !z; break; // GT / LE
+    default: result = 1; break;             // AL / NV
     }
     if ((cond & 1) && (cond & 0xE) != 0xE) result = !result;
     return result;
@@ -394,7 +412,7 @@ static uint32_t interp_ror32(uint32_t value, unsigned amount) {
 // DecodeBitMasks(). immediate = 1 (logical-immediate group) forbids the all-ones element, 0 (bitfield group)
 // permits it. Returns 0 for an encoding the architecture leaves UNDEFINED, so the caller can refuse it.
 static int interp_bit_masks(unsigned sf, unsigned immn, unsigned imms, unsigned immr, int immediate,
-                           uint64_t *wmask_out, uint64_t *tmask_out) {
+                            uint64_t *wmask_out, uint64_t *tmask_out) {
     uint32_t combined = (immn << 6) | ((~imms) & 0x3Fu); // N : NOT(imms)
     int length = -1;
     for (int bit = 6; bit >= 0; --bit)
@@ -527,9 +545,9 @@ static int interp_exec_dp_immediate(struct cpu *cpu, uint32_t insn) {
             return interp_undefined(cpu, insn, "data-processing immediate -- undefined logical-immediate mask");
         uint64_t operand = interp_gpr(cpu, rn), result;
         switch (opc) {
-        case 0: result = operand & wmask; break; // AND
-        case 1: result = operand | wmask; break; // ORR
-        case 2: result = operand ^ wmask; break; // EOR
+        case 0: result = operand & wmask; break;  // AND
+        case 1: result = operand | wmask; break;  // ORR
+        case 2: result = operand ^ wmask; break;  // EOR
         default: result = operand & wmask; break; // ANDS
         }
         if (!sf) result = (uint32_t)result;
@@ -623,10 +641,10 @@ static int interp_exec_dp_immediate(struct cpu *cpu, uint32_t insn) {
 static uint64_t interp_shift_operand(uint64_t value, unsigned shift_type, unsigned amount, unsigned sf) {
     if (sf) {
         switch (shift_type) {
-        case 0: return amount ? (value << amount) : value;                       // LSL
-        case 1: return amount ? (value >> amount) : value;                       // LSR
+        case 0: return amount ? (value << amount) : value;                               // LSL
+        case 1: return amount ? (value >> amount) : value;                               // LSR
         case 2: return (uint64_t)(amount ? ((int64_t)value >> amount) : (int64_t)value); // ASR
-        default: return interp_ror64(value, amount);                             // ROR
+        default: return interp_ror64(value, amount);                                     // ROR
         }
     }
     uint32_t narrow = (uint32_t)value;
@@ -639,19 +657,18 @@ static uint64_t interp_shift_operand(uint64_t value, unsigned shift_type, unsign
 }
 
 // ExtendReg(): Rm sign/zero-extended per `option`, then shifted. UXTX/SXTX read the whole register.
-static uint64_t interp_extend_operand(const struct cpu *cpu, int rm, unsigned option, unsigned shift,
-                                      unsigned sf) {
+static uint64_t interp_extend_operand(const struct cpu *cpu, int rm, unsigned option, unsigned shift, unsigned sf) {
     uint64_t value = interp_gpr(cpu, rm);
     uint64_t extended;
     switch (option) {
-    case 0: extended = (uint8_t)value; break;                                    // UXTB
-    case 1: extended = (uint16_t)value; break;                                   // UXTH
-    case 2: extended = (uint32_t)value; break;                                   // UXTW
-    case 3: extended = value; break;                                             // UXTX
-    case 4: extended = (uint64_t)(int64_t)(int8_t)value; break;                   // SXTB
-    case 5: extended = (uint64_t)(int64_t)(int16_t)value; break;                  // SXTH
-    case 6: extended = (uint64_t)(int64_t)(int32_t)value; break;                  // SXTW
-    default: extended = value; break;                                            // SXTX
+    case 0: extended = (uint8_t)value; break;                    // UXTB
+    case 1: extended = (uint16_t)value; break;                   // UXTH
+    case 2: extended = (uint32_t)value; break;                   // UXTW
+    case 3: extended = value; break;                             // UXTX
+    case 4: extended = (uint64_t)(int64_t)(int8_t)value; break;  // SXTB
+    case 5: extended = (uint64_t)(int64_t)(int16_t)value; break; // SXTH
+    case 6: extended = (uint64_t)(int64_t)(int32_t)value; break; // SXTW
+    default: extended = value; break;                            // SXTX
     }
     extended <<= shift;
     return sf ? extended : (uint64_t)(uint32_t)extended;
@@ -673,7 +690,7 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
             if (shift > 4) return interp_undefined(cpu, insn, "data-processing register -- extend shift > 4");
             operand = interp_extend_operand(cpu, rm, option, shift, sf);
             destination_is_sp = 1; // Rn is <Xn|SP>; Rd too unless flag-setting
-        } else { // shifted register
+        } else {                   // shifted register
             unsigned shift_type = (insn >> 22) & 3, amount = (insn >> 10) & 0x3Fu;
             if (shift_type == 3) return interp_undefined(cpu, insn, "data-processing register -- add/sub ROR");
             if (!sf && (amount & 0x20u))
@@ -763,8 +780,7 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
         }
         case 6: { // UMULH
             if (!sf || o0) return interp_undefined(cpu, insn, "data-processing register -- unallocated UMULH form");
-            unsigned __int128 product =
-                (unsigned __int128)interp_gpr(cpu, rn) * (unsigned __int128)interp_gpr(cpu, rm);
+            unsigned __int128 product = (unsigned __int128)interp_gpr(cpu, rn) * (unsigned __int128)interp_gpr(cpu, rm);
             interp_set_gpr(cpu, rd, (uint64_t)(product >> 64));
             break;
         }
@@ -776,7 +792,8 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
 
     if ((insn & 0x1FE00000u) == 0x1A000000u) { // ADC / ADCS / SBC / SBCS
         unsigned op = (insn >> 30) & 1, setflags = (insn >> 29) & 1;
-        if ((insn & 0x0000FC00u) != 0) return interp_undefined(cpu, insn, "data-processing register -- rotate/flag ops");
+        if ((insn & 0x0000FC00u) != 0)
+            return interp_undefined(cpu, insn, "data-processing register -- rotate/flag ops");
         unsigned carry = interp_flag_c(cpu);
         if (sf) {
             uint64_t a = interp_gpr(cpu, rn), b = interp_gpr(cpu, rm);
@@ -847,7 +864,7 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
     }
 
     if ((insn & 0x1FE00000u) == 0x1AC00000u) { // Data-processing (1 source) and (2 source)
-        if (insn & 0x40000000u) { // insn[30] == 1: 1 source
+        if (insn & 0x40000000u) {              // insn[30] == 1: 1 source
             unsigned opcode2 = (insn >> 16) & 0x1Fu, opcode = (insn >> 10) & 0x3Fu;
             if (((insn >> 29) & 1) || opcode2 != 0)
                 return interp_undefined(cpu, insn, "data-processing register -- PAC/1-source extension");
@@ -870,10 +887,9 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
             case 2: // REV (32-bit form) / REV32 (64-bit form)
                 if (sf) {
                     uint64_t wide = value;
-                    result = ((wide & UINT64_C(0x000000FF000000FF)) << 24) |
-                             ((wide & UINT64_C(0x0000FF000000FF00)) << 8) |
-                             ((wide >> 8) & UINT64_C(0x0000FF000000FF00)) |
-                             ((wide >> 24) & UINT64_C(0x000000FF000000FF));
+                    result =
+                        ((wide & UINT64_C(0x000000FF000000FF)) << 24) | ((wide & UINT64_C(0x0000FF000000FF00)) << 8) |
+                        ((wide >> 8) & UINT64_C(0x0000FF000000FF00)) | ((wide >> 24) & UINT64_C(0x000000FF000000FF));
                 } else {
                     result = (uint64_t)__builtin_bswap32((uint32_t)value);
                 }
@@ -929,10 +945,12 @@ static int interp_exec_dp_register(struct cpu *cpu, uint32_t insn) {
             }
             break;
         // The variable shifts mask their amount by the operand size, so LSLV by 64 is a no-op, not zero.
-        case 8: result = interp_shift_operand(a, 0, (unsigned)(b & (sf ? 63u : 31u)), sf); break; // LSLV
-        case 9: result = interp_shift_operand(a, 1, (unsigned)(b & (sf ? 63u : 31u)), sf); break; // LSRV
+        case 8: result = interp_shift_operand(a, 0, (unsigned)(b & (sf ? 63u : 31u)), sf); break;  // LSLV
+        case 9: result = interp_shift_operand(a, 1, (unsigned)(b & (sf ? 63u : 31u)), sf); break;  // LSRV
         case 10: result = interp_shift_operand(a, 2, (unsigned)(b & (sf ? 63u : 31u)), sf); break; // ASRV
-        case 11: result = interp_shift_operand(a, 3, (unsigned)(b & (sf ? 63u : 31u)), sf); break; // RORV
+        case 11:
+            result = interp_shift_operand(a, 3, (unsigned)(b & (sf ? 63u : 31u)), sf);
+            break; // RORV
         // CRC32B/H/W/X (10000..10011) and CRC32CB/H/W/X (10100..10111). sf names the DATA operand width
         // only, so it must be 1 for exactly the ..X forms; accumulator and result are always 32-bit.
         case 16:
@@ -1244,8 +1262,8 @@ static uint64_t interp_element_sext(uint64_t element, unsigned size) {
 // The byte dot product shared by FEAT_DotProd (SDOT/UDOT) and FEAT_I8MM (USDOT, SMMLA/UMMLA/USMMLA): four
 // byte products summed modulo 2^32, exactly as the ARM ARM writes them. MMLA calls it twice per lane for its
 // eight-element rows. Signedness is per SOURCE, which is what the mixed US/SU forms need.
-static uint32_t interp_dot4(const interp_vec *left, const interp_vec *right, unsigned left_base,
-                            unsigned right_base, int left_signed, int right_signed) {
+static uint32_t interp_dot4(const interp_vec *left, const interp_vec *right, unsigned left_base, unsigned right_base,
+                            int left_signed, int right_signed) {
     uint32_t sum = 0;
     for (unsigned i = 0; i < 4u; i++) {
         uint8_t a = left->byte[left_base + i], b = right->byte[right_base + i];
@@ -1303,14 +1321,14 @@ static int interp_advsimd_expand_imm(unsigned op, unsigned cmode, unsigned o2, u
     } else if (!op && o2) { // half-precision float expansion, replicated (FMOV Vd.4H/8H, #imm)
         uint32_t sign = (uint32_t)((imm8 >> 7) & 1), exponent = (uint32_t)((imm8 >> 4) & 7);
         uint32_t fraction = (uint32_t)(imm8 & 0xFu);
-        uint32_t narrow = (sign << 15) | ((exponent & 4u) ? 0x3000u : 0x4000u) |
-                          ((exponent & 3u) << 10) | (fraction << 6);
+        uint32_t narrow =
+            (sign << 15) | ((exponent & 4u) ? 0x3000u : 0x4000u) | ((exponent & 3u) << 10) | (fraction << 6);
         imm64 = (uint64_t)narrow * UINT64_C(0x0001000100010001);
     } else if (!op) { // single-precision float expansion, replicated
         uint32_t sign = (uint32_t)((imm8 >> 7) & 1), exponent = (uint32_t)((imm8 >> 4) & 7);
         uint32_t fraction = (uint32_t)(imm8 & 0xFu);
-        uint32_t narrow = (sign << 31) | ((exponent & 4u) ? 0x3E000000u : 0x40000000u) |
-                          ((exponent & 3u) << 23) | (fraction << 19);
+        uint32_t narrow =
+            (sign << 31) | ((exponent & 4u) ? 0x3E000000u : 0x40000000u) | ((exponent & 3u) << 23) | (fraction << 19);
         imm64 = ((uint64_t)narrow << 32) | narrow;
     } else { // double-precision float expansion (Q must be 1)
         if (!q || o2) return 0;
@@ -1419,7 +1437,6 @@ static void interp_monitor_clear(void) {
     g_interp_monitor_valid = 0;
 }
 
-
 // A misaligned atomic: an alignment fault, reported through the JIT's soft-TLB-probe reason so signal.c
 // raises it as an ordinary synchronous SIGBUS.
 static int interp_alignment_fault(struct cpu *cpu, uint64_t address) {
@@ -1443,13 +1460,25 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         int post_index = (insn & 0x00800000u) != 0;
         unsigned registers, interleaved = 1;
         switch (opcode) {
-        case 0x0: registers = 4; break;                    // LD4/ST4
-        case 0x2: registers = 4; interleaved = 0; break;    // LD1/ST1, four registers
-        case 0x4: registers = 3; break;                    // LD3/ST3
-        case 0x6: registers = 3; interleaved = 0; break;    // LD1/ST1, three registers
-        case 0x7: registers = 1; interleaved = 0; break;    // LD1/ST1, one register
-        case 0x8: registers = 2; break;                    // LD2/ST2
-        case 0xA: registers = 2; interleaved = 0; break;    // LD1/ST1, two registers
+        case 0x0: registers = 4; break; // LD4/ST4
+        case 0x2:
+            registers = 4;
+            interleaved = 0;
+            break;                      // LD1/ST1, four registers
+        case 0x4: registers = 3; break; // LD3/ST3
+        case 0x6:
+            registers = 3;
+            interleaved = 0;
+            break; // LD1/ST1, three registers
+        case 0x7:
+            registers = 1;
+            interleaved = 0;
+            break;                      // LD1/ST1, one register
+        case 0x8: registers = 2; break; // LD2/ST2
+        case 0xA:
+            registers = 2;
+            interleaved = 0;
+            break; // LD1/ST1, two registers
         default: return interp_undefined(cpu, insn, "AdvSIMD load/store -- unallocated multi-structure opcode");
         }
         unsigned bytes = q ? 16u : 8u;
@@ -1700,8 +1729,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             }
             default: {
                 uint64_t wide = expected;
-                __atomic_compare_exchange_n((uint64_t *)pointer, &wide, swap, 0, __ATOMIC_SEQ_CST,
-                                            __ATOMIC_SEQ_CST);
+                __atomic_compare_exchange_n((uint64_t *)pointer, &wide, swap, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
                 observed = wide;
                 break;
             }
@@ -1763,11 +1791,10 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
                 observed_low = expected & 0xFFFFFFFFu;
                 observed_high = expected >> 32;
             } else {
-                unsigned __int128 expected =
-                    (unsigned __int128)compare_low | ((unsigned __int128)compare_high << 64);
+                unsigned __int128 expected = (unsigned __int128)compare_low | ((unsigned __int128)compare_high << 64);
                 unsigned __int128 replacement = (unsigned __int128)swap_low | ((unsigned __int128)swap_high << 64);
-                __atomic_compare_exchange_n((unsigned __int128 *)pointer, &expected, replacement, 0,
-                                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                __atomic_compare_exchange_n((unsigned __int128 *)pointer, &expected, replacement, 0, __ATOMIC_SEQ_CST,
+                                            __ATOMIC_SEQ_CST);
                 observed_low = (uint64_t)expected;
                 observed_high = (uint64_t)(expected >> 64);
             }
@@ -1784,8 +1811,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             return INTERP_NEXT;
         }
 
-        if (o1 && size < 2)
-            return interp_undefined(cpu, insn, "loads and stores -- unallocated exclusive-pair size");
+        if (o1 && size < 2) return interp_undefined(cpu, insn, "loads and stores -- unallocated exclusive-pair size");
         unsigned access_bytes = o1 ? bytes * 2u : bytes;
         if (load) { // LDXR / LDAXR / LDXP / LDAXP
             if (rs != 31 || (!o1 && rt2 != 31))
@@ -1816,8 +1842,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         void *pointer = interp_atomic_pointer(address, bytes);
         if (pointer == NULL) return interp_alignment_fault(cpu, address);
         unsigned failed = 1;
-        if (g_interp_monitor_valid && g_interp_monitor_address == address &&
-            g_interp_monitor_bytes == access_bytes) {
+        if (g_interp_monitor_valid && g_interp_monitor_address == address && g_interp_monitor_bytes == access_bytes) {
             uint64_t desired = interp_gpr(cpu, rt);
             if (o0) __atomic_thread_fence(__ATOMIC_RELEASE); // STLXR/STLXP
             interp_access_begin(address, access_bytes, 1);
@@ -1843,8 +1868,8 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
                 }
                 default: {
                     uint64_t expected = g_interp_monitor_value;
-                    failed = !__atomic_compare_exchange_n((uint64_t *)pointer, &expected, desired, 0,
-                                                          __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                    failed = !__atomic_compare_exchange_n((uint64_t *)pointer, &expected, desired, 0, __ATOMIC_SEQ_CST,
+                                                          __ATOMIC_SEQ_CST);
                     break;
                 }
                 }
@@ -1854,16 +1879,15 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
                 // because every access to the location goes through this code.
                 uint64_t desired2 = interp_gpr(cpu, rt2);
                 if (bytes == 4) {
-                    uint64_t expected = (g_interp_monitor_value & 0xFFFFFFFFu) |
-                                        ((g_interp_monitor_value2 & 0xFFFFFFFFu) << 32);
+                    uint64_t expected =
+                        (g_interp_monitor_value & 0xFFFFFFFFu) | ((g_interp_monitor_value2 & 0xFFFFFFFFu) << 32);
                     uint64_t replacement = (desired & 0xFFFFFFFFu) | ((desired2 & 0xFFFFFFFFu) << 32);
                     failed = !__atomic_compare_exchange_n((uint64_t *)pointer, &expected, replacement, 0,
                                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
                 } else {
-                    unsigned __int128 expected = (unsigned __int128)g_interp_monitor_value |
-                                                 ((unsigned __int128)g_interp_monitor_value2 << 64);
-                    unsigned __int128 replacement =
-                        (unsigned __int128)desired | ((unsigned __int128)desired2 << 64);
+                    unsigned __int128 expected =
+                        (unsigned __int128)g_interp_monitor_value | ((unsigned __int128)g_interp_monitor_value2 << 64);
+                    unsigned __int128 replacement = (unsigned __int128)desired | ((unsigned __int128)desired2 << 64);
                     failed = !__atomic_compare_exchange_n((unsigned __int128 *)pointer, &expected, replacement, 0,
                                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
                 }
@@ -1903,21 +1927,21 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         uint64_t operand = interp_gpr(cpu, rs), old = 0;
         // Real host read-modify-writes, not load-then-store: an interleaved peer would lose an update.
         interp_access_begin(address, bytes, 1);
-#define INTERP_LSE_RMW(type, expression)                                                                        \
-    do {                                                                                                        \
-        type *slot = (type *)pointer;                                                                            \
-        type argument = (type)operand;                                                                           \
-        (void)argument;                                                                                          \
-        old = (uint64_t)(expression);                                                                            \
+#define INTERP_LSE_RMW(type, expression)                                                                               \
+    do {                                                                                                               \
+        type *slot = (type *)pointer;                                                                                  \
+        type argument = (type)operand;                                                                                 \
+        (void)argument;                                                                                                \
+        old = (uint64_t)(expression);                                                                                  \
     } while (0)
-#define INTERP_LSE_WIDTHS(expression8, expression16, expression32, expression64)                                 \
-    do {                                                                                                        \
-        switch (bytes) {                                                                                        \
-        case 1: INTERP_LSE_RMW(uint8_t, expression8); break;                                                     \
-        case 2: INTERP_LSE_RMW(uint16_t, expression16); break;                                                    \
-        case 4: INTERP_LSE_RMW(uint32_t, expression32); break;                                                    \
-        default: INTERP_LSE_RMW(uint64_t, expression64); break;                                                   \
-        }                                                                                                       \
+#define INTERP_LSE_WIDTHS(expression8, expression16, expression32, expression64)                                       \
+    do {                                                                                                               \
+        switch (bytes) {                                                                                               \
+        case 1: INTERP_LSE_RMW(uint8_t, expression8); break;                                                           \
+        case 2: INTERP_LSE_RMW(uint16_t, expression16); break;                                                         \
+        case 4: INTERP_LSE_RMW(uint32_t, expression32); break;                                                         \
+        default: INTERP_LSE_RMW(uint64_t, expression64); break;                                                        \
+        }                                                                                                              \
     } while (0)
         if (o3) { // SWP
             if (opc != 0) {
@@ -1954,30 +1978,28 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
                                   __atomic_fetch_or(slot, argument, __ATOMIC_SEQ_CST),
                                   __atomic_fetch_or(slot, argument, __ATOMIC_SEQ_CST));
                 break;
-            case 4: // LDSMAX
-            case 5: // LDSMIN
-            case 6: // LDUMAX
+            case 4:   // LDSMAX
+            case 5:   // LDSMIN
+            case 6:   // LDUMAX
             case 7: { // LDUMIN
                 // No __atomic_fetch_max, so these are a CAS retry loop: a load-compare-store would let a
                 // peer's update land in between. Comparison is at the ACCESS width and signedness.
                 unsigned want_max = opc == 4 || opc == 6;
                 unsigned is_signed = opc < 6;
-#define INTERP_LSE_MINMAX(type, signed_type)                                                                     \
-    do {                                                                                                        \
-        type *slot = (type *)pointer;                                                                            \
-        type argument = (type)operand;                                                                           \
-        type current = __atomic_load_n(slot, __ATOMIC_SEQ_CST);                                                  \
-        for (;;) {                                                                                              \
-            int argument_greater = is_signed ? ((signed_type)argument > (signed_type)current)                     \
-                                             : (argument > current);                                             \
-            type chosen = (argument_greater == (int)(want_max != 0)) ? argument : current;                        \
-            /* Already correct: nothing to store, and `current` is still the pre-existing value to return. */    \
-            if (chosen == current) break;                                                                       \
-            if (__atomic_compare_exchange_n(slot, &current, chosen, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))       \
-                break;                                                                                          \
-            /* A peer won the race; `current` now holds its value, so re-decide against that. */                 \
-        }                                                                                                       \
-        old = (uint64_t)current;                                                                                 \
+#define INTERP_LSE_MINMAX(type, signed_type)                                                                           \
+    do {                                                                                                               \
+        type *slot = (type *)pointer;                                                                                  \
+        type argument = (type)operand;                                                                                 \
+        type current = __atomic_load_n(slot, __ATOMIC_SEQ_CST);                                                        \
+        for (;;) {                                                                                                     \
+            int argument_greater = is_signed ? ((signed_type)argument > (signed_type)current) : (argument > current);  \
+            type chosen = (argument_greater == (int)(want_max != 0)) ? argument : current;                             \
+            /* Already correct: nothing to store, and `current` is still the pre-existing value to return. */          \
+            if (chosen == current) break;                                                                              \
+            if (__atomic_compare_exchange_n(slot, &current, chosen, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) break;     \
+            /* A peer won the race; `current` now holds its value, so re-decide against that. */                       \
+        }                                                                                                              \
+        old = (uint64_t)current;                                                                                       \
     } while (0)
                 switch (bytes) {
                 case 1: INTERP_LSE_MINMAX(uint8_t, int8_t); break;
@@ -2019,8 +2041,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
         return interp_undefined(cpu, insn, "loads and stores -- LDRAA/LDRAB (pointer authentication)");
 
     unsigned bytes = vector ? interp_simd_access_bytes(size, opc) : (1u << size);
-    if (vector && bytes == 0)
-        return interp_undefined(cpu, insn, "loads and stores -- unallocated SIMD/FP access size");
+    if (vector && bytes == 0) return interp_undefined(cpu, insn, "loads and stores -- unallocated SIMD/FP access size");
     unsigned scale = vector ? (opc & 2u ? 4u : size) : size;
     uint64_t base = interp_gpr_sp(cpu, rn);
     uint64_t address;
@@ -2048,7 +2069,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             interp_vec_load(cpu, rt, address, bytes);
         else
             interp_vec_store(cpu, rt, address, bytes);
-    } else if (opc == 0) { // store
+    } else if (opc == 0) {                    // store
         uint64_t value = interp_gpr(cpu, rt); // source read before the access
         interp_store_bits(address, value, bytes);
     } else if (opc == 2 && size == 3) { // PRFM / PRFUM: a hint
@@ -2059,7 +2080,7 @@ static int interp_exec_load_store(struct cpu *cpu, uint32_t insn) {
             interp_set_gpr(cpu, rt, value);
         else
             interp_set_gpr32(cpu, rt, (uint32_t)value); // a 32-bit destination zero-extends to 64 anyway
-    } else { // sign-extending load: LDRSB / LDRSH / LDRSW
+    } else {                                            // sign-extending load: LDRSB / LDRSH / LDRSW
         if (size == 3 || (size == 2 && opc == 3))
             return interp_undefined(cpu, insn, "loads and stores -- unallocated sign-extending load size");
         uint64_t value = (uint64_t)interp_sext(interp_load_bits(address, bytes), bytes * 8u);
@@ -2185,8 +2206,7 @@ static void interp_fp_env_enter(interp_fpenv *env) {
 static unsigned interp_fp_env_leave(interp_fpenv *env) {
     __asm__ __volatile__("" ::: "memory");
     int raised = fetestexcept(FE_ALL_EXCEPT);
-    if (env->host_round != interp_fp_host_round(INTERP_FPCR_RMODE(g_interp_fpcr)))
-        (void)fesetround(env->host_round);
+    if (env->host_round != interp_fp_host_round(INTERP_FPCR_RMODE(g_interp_fpcr))) (void)fesetround(env->host_round);
     unsigned bits = 0;
     if (raised & FE_INVALID) bits |= INTERP_FPSR_IOC;
     if (raised & FE_DIVBYZERO) bits |= INTERP_FPSR_DZC;
@@ -2491,8 +2511,7 @@ static uint64_t interp_fp_mulx(unsigned fmt, uint64_t a, uint64_t b) {
     unsigned class_a = interp_fp_class(a, fmt), class_b = interp_fp_class(b, fmt);
     if ((class_a == INTERP_FPC_INF && class_b == INTERP_FPC_ZERO) ||
         (class_a == INTERP_FPC_ZERO && class_b == INTERP_FPC_INF))
-        return ((a ^ b) & interp_fp_sign_mask(fmt)) |
-               ((uint64_t)(interp_fp_bias(fmt) + 1) << interp_fp_mant(fmt));
+        return ((a ^ b) & interp_fp_sign_mask(fmt)) | ((uint64_t)(interp_fp_bias(fmt) + 1) << interp_fp_mant(fmt));
     return interp_fp_arith(fmt, INTERP_FPOP_MUL, a, b);
 }
 
@@ -2650,7 +2669,8 @@ static unsigned interp_recip_estimate(unsigned a) {
 static unsigned interp_recip_sqrt_estimate(unsigned a) {
     a = a < 256u ? a * 2u + 1u : (((a >> 1) << 1) + 1u) * 2u; // 0.25..0.5 keeps its low bit, 0.5..1.0 drops it
     uint64_t b = 512;
-    while ((uint64_t)a * (b + 1u) * (b + 1u) < (UINT64_C(1) << 28)) b++;
+    while ((uint64_t)a * (b + 1u) * (b + 1u) < (UINT64_C(1) << 28))
+        b++;
     return (unsigned)((b + 1u) / 2u);
 }
 
@@ -2676,12 +2696,11 @@ static uint64_t interp_fp_recip_estimate(unsigned fmt, uint64_t a) {
         unsigned rmode = INTERP_FPCR_RMODE(g_interp_fpcr);
         int to_inf = rmode == INTERP_RM_RN || (rmode == INTERP_RM_RP && !sign) || (rmode == INTERP_RM_RM && sign);
         interp_fpsr_raise(INTERP_FPSR_OFC | INTERP_FPSR_IXC);
-        return sign | (to_inf ? ((uint64_t)inf_exp << mant)
-                              : (((uint64_t)(inf_exp - 1u) << mant) | interp_fp_mant_mask(fmt)));
+        return sign |
+               (to_inf ? ((uint64_t)inf_exp << mant) : (((uint64_t)(inf_exp - 1u) << mant) | interp_fp_mant_mask(fmt)));
     }
     // The mirror case: FZ turns a reciprocal that would be denormal into zero, Underflow and no Inexact.
-    if ((fmt == INTERP_FP_H ? INTERP_FPCR_FZ16(g_interp_fpcr) : INTERP_FPCR_FZ(g_interp_fpcr)) &&
-        exp >= 2 * bias - 1) {
+    if ((fmt == INTERP_FP_H ? INTERP_FPCR_FZ16(g_interp_fpcr) : INTERP_FPCR_FZ(g_interp_fpcr)) && exp >= 2 * bias - 1) {
         interp_fpsr_raise(INTERP_FPSR_UFC);
         return sign;
     }
@@ -2773,8 +2792,7 @@ static uint64_t interp_fp_recip_step(unsigned fmt, uint64_t a, uint64_t b, int s
     if ((inf_a && class_b == INTERP_FPC_ZERO) || (class_a == INTERP_FPC_ZERO && inf_b))
         return sqrt_form ? (((uint64_t)interp_fp_bias(fmt) << mant) | (UINT64_C(1) << (mant - 1u)))
                          : ((uint64_t)(interp_fp_bias(fmt) + 1) << mant);
-    if (inf_a || inf_b)
-        return ((a ^ b) & interp_fp_sign_mask(fmt)) | ((uint64_t)interp_fp_inf_exp(fmt) << mant);
+    if (inf_a || inf_b) return ((a ^ b) & interp_fp_sign_mask(fmt)) | ((uint64_t)interp_fp_inf_exp(fmt) << mant);
 
     // (3 - a*b)/2 is ONE rounding, so the halving must stay out of it: 1.5 + (a/2)*b is a single fma when
     // a/2 is exact. When it is not, |a| is below 2^(2-bias) and |a*b| below 8, so halving afterwards
@@ -2817,7 +2835,7 @@ static uint64_t interp_fp_int_saturate(unsigned sign, unsigned dest_bits, int is
 // Invalid, and a NaN becomes 0 before the check. The two exceptions are exclusive (FPToFixed's if/elsif):
 // -1.5 saturates with Invalid ALONE, Inexact suppressed.
 static uint64_t interp_fp_to_int(unsigned fmt, uint64_t bits, unsigned dest_bits, int is_signed, unsigned rmode,
-                                unsigned fbits) {
+                                 unsigned fbits) {
     bits = interp_fp_flush_input(bits, fmt);
     unsigned cls = interp_fp_class(bits, fmt);
     unsigned sign = (bits & interp_fp_sign_mask(fmt)) != 0;
@@ -2894,7 +2912,7 @@ static uint64_t interp_fp_to_int(unsigned fmt, uint64_t bits, unsigned dest_bits
 }
 
 static uint64_t interp_fp_from_int(unsigned fmt, uint64_t value, unsigned source_bits, int is_signed, unsigned rmode,
-                                  unsigned fbits) {
+                                   unsigned fbits) {
     unsigned sign = 0;
     uint64_t magnitude;
     // Any width, not just 32: a 16-bit source (SCVTF Vd.8H, Vn.8H, #fbits) arrives zero-extended, and
@@ -2921,8 +2939,7 @@ static uint64_t interp_fp_expand_imm(unsigned fmt, uint64_t imm8) {
     uint64_t sign = (imm8 >> 7) & 1u;
     uint64_t b = (imm8 >> 6) & 1u;
     uint64_t exponent = (b ? 0u : 1u) << (exp_bits - 1u);
-    if (b)
-        exponent |= (((UINT64_C(1) << (exp_bits - 3u)) - 1u) << 2);
+    if (b) exponent |= (((UINT64_C(1) << (exp_bits - 3u)) - 1u) << 2);
     exponent |= (imm8 >> 4) & 3u;
     return (sign << (interp_fp_width(fmt) - 1u)) | (exponent << mant) | ((imm8 & 0xFu) << (mant - 4u));
 }
@@ -3070,41 +3087,37 @@ static void interp_poly_mul(uint64_t a, uint64_t b, unsigned bits, uint64_t *low
 // AES, SHA1 and SHA256. hwcap 0x1fb advertises HWCAP_AES/PMULL/SHA1/SHA2, so guest ifunc resolvers pick
 // these paths. The tables are GENERATED (GF(2^8) inverse then the FIPS-197 affine transform).
 static const uint8_t interp_aes_sbox[256] = {
-    0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76,
-    0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0,
-    0xB7, 0xFD, 0x93, 0x26, 0x36, 0x3F, 0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15,
-    0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07, 0x12, 0x80, 0xE2, 0xEB, 0x27, 0xB2, 0x75,
-    0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0, 0x52, 0x3B, 0xD6, 0xB3, 0x29, 0xE3, 0x2F, 0x84,
-    0x53, 0xD1, 0x00, 0xED, 0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58, 0xCF,
-    0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F, 0x50, 0x3C, 0x9F, 0xA8,
-    0x51, 0xA3, 0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5, 0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2,
-    0xCD, 0x0C, 0x13, 0xEC, 0x5F, 0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73,
-    0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88, 0x46, 0xEE, 0xB8, 0x14, 0xDE, 0x5E, 0x0B, 0xDB,
-    0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C, 0xC2, 0xD3, 0xAC, 0x62, 0x91, 0x95, 0xE4, 0x79,
-    0xE7, 0xC8, 0x37, 0x6D, 0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A, 0xAE, 0x08,
-    0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F, 0x4B, 0xBD, 0x8B, 0x8A,
-    0x70, 0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E, 0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E,
-    0xE1, 0xF8, 0x98, 0x11, 0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF,
-    0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16,
+    0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76, 0xCA, 0x82, 0xC9,
+    0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0, 0xB7, 0xFD, 0x93, 0x26, 0x36, 0x3F,
+    0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15, 0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07,
+    0x12, 0x80, 0xE2, 0xEB, 0x27, 0xB2, 0x75, 0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0, 0x52, 0x3B, 0xD6, 0xB3,
+    0x29, 0xE3, 0x2F, 0x84, 0x53, 0xD1, 0x00, 0xED, 0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58,
+    0xCF, 0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F, 0x50, 0x3C, 0x9F, 0xA8, 0x51, 0xA3,
+    0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5, 0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2, 0xCD, 0x0C, 0x13, 0xEC, 0x5F,
+    0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73, 0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88,
+    0x46, 0xEE, 0xB8, 0x14, 0xDE, 0x5E, 0x0B, 0xDB, 0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C, 0xC2, 0xD3, 0xAC,
+    0x62, 0x91, 0x95, 0xE4, 0x79, 0xE7, 0xC8, 0x37, 0x6D, 0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A,
+    0xAE, 0x08, 0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F, 0x4B, 0xBD, 0x8B, 0x8A, 0x70,
+    0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E, 0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E, 0xE1, 0xF8, 0x98, 0x11,
+    0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF, 0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42,
+    0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16,
 };
 
 static const uint8_t interp_aes_inv_sbox[256] = {
-    0x52, 0x09, 0x6A, 0xD5, 0x30, 0x36, 0xA5, 0x38, 0xBF, 0x40, 0xA3, 0x9E, 0x81, 0xF3, 0xD7, 0xFB,
-    0x7C, 0xE3, 0x39, 0x82, 0x9B, 0x2F, 0xFF, 0x87, 0x34, 0x8E, 0x43, 0x44, 0xC4, 0xDE, 0xE9, 0xCB,
-    0x54, 0x7B, 0x94, 0x32, 0xA6, 0xC2, 0x23, 0x3D, 0xEE, 0x4C, 0x95, 0x0B, 0x42, 0xFA, 0xC3, 0x4E,
-    0x08, 0x2E, 0xA1, 0x66, 0x28, 0xD9, 0x24, 0xB2, 0x76, 0x5B, 0xA2, 0x49, 0x6D, 0x8B, 0xD1, 0x25,
-    0x72, 0xF8, 0xF6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xD4, 0xA4, 0x5C, 0xCC, 0x5D, 0x65, 0xB6, 0x92,
-    0x6C, 0x70, 0x48, 0x50, 0xFD, 0xED, 0xB9, 0xDA, 0x5E, 0x15, 0x46, 0x57, 0xA7, 0x8D, 0x9D, 0x84,
-    0x90, 0xD8, 0xAB, 0x00, 0x8C, 0xBC, 0xD3, 0x0A, 0xF7, 0xE4, 0x58, 0x05, 0xB8, 0xB3, 0x45, 0x06,
-    0xD0, 0x2C, 0x1E, 0x8F, 0xCA, 0x3F, 0x0F, 0x02, 0xC1, 0xAF, 0xBD, 0x03, 0x01, 0x13, 0x8A, 0x6B,
-    0x3A, 0x91, 0x11, 0x41, 0x4F, 0x67, 0xDC, 0xEA, 0x97, 0xF2, 0xCF, 0xCE, 0xF0, 0xB4, 0xE6, 0x73,
-    0x96, 0xAC, 0x74, 0x22, 0xE7, 0xAD, 0x35, 0x85, 0xE2, 0xF9, 0x37, 0xE8, 0x1C, 0x75, 0xDF, 0x6E,
-    0x47, 0xF1, 0x1A, 0x71, 0x1D, 0x29, 0xC5, 0x89, 0x6F, 0xB7, 0x62, 0x0E, 0xAA, 0x18, 0xBE, 0x1B,
-    0xFC, 0x56, 0x3E, 0x4B, 0xC6, 0xD2, 0x79, 0x20, 0x9A, 0xDB, 0xC0, 0xFE, 0x78, 0xCD, 0x5A, 0xF4,
-    0x1F, 0xDD, 0xA8, 0x33, 0x88, 0x07, 0xC7, 0x31, 0xB1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xEC, 0x5F,
-    0x60, 0x51, 0x7F, 0xA9, 0x19, 0xB5, 0x4A, 0x0D, 0x2D, 0xE5, 0x7A, 0x9F, 0x93, 0xC9, 0x9C, 0xEF,
-    0xA0, 0xE0, 0x3B, 0x4D, 0xAE, 0x2A, 0xF5, 0xB0, 0xC8, 0xEB, 0xBB, 0x3C, 0x83, 0x53, 0x99, 0x61,
-    0x17, 0x2B, 0x04, 0x7E, 0xBA, 0x77, 0xD6, 0x26, 0xE1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0C, 0x7D,
+    0x52, 0x09, 0x6A, 0xD5, 0x30, 0x36, 0xA5, 0x38, 0xBF, 0x40, 0xA3, 0x9E, 0x81, 0xF3, 0xD7, 0xFB, 0x7C, 0xE3, 0x39,
+    0x82, 0x9B, 0x2F, 0xFF, 0x87, 0x34, 0x8E, 0x43, 0x44, 0xC4, 0xDE, 0xE9, 0xCB, 0x54, 0x7B, 0x94, 0x32, 0xA6, 0xC2,
+    0x23, 0x3D, 0xEE, 0x4C, 0x95, 0x0B, 0x42, 0xFA, 0xC3, 0x4E, 0x08, 0x2E, 0xA1, 0x66, 0x28, 0xD9, 0x24, 0xB2, 0x76,
+    0x5B, 0xA2, 0x49, 0x6D, 0x8B, 0xD1, 0x25, 0x72, 0xF8, 0xF6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xD4, 0xA4, 0x5C, 0xCC,
+    0x5D, 0x65, 0xB6, 0x92, 0x6C, 0x70, 0x48, 0x50, 0xFD, 0xED, 0xB9, 0xDA, 0x5E, 0x15, 0x46, 0x57, 0xA7, 0x8D, 0x9D,
+    0x84, 0x90, 0xD8, 0xAB, 0x00, 0x8C, 0xBC, 0xD3, 0x0A, 0xF7, 0xE4, 0x58, 0x05, 0xB8, 0xB3, 0x45, 0x06, 0xD0, 0x2C,
+    0x1E, 0x8F, 0xCA, 0x3F, 0x0F, 0x02, 0xC1, 0xAF, 0xBD, 0x03, 0x01, 0x13, 0x8A, 0x6B, 0x3A, 0x91, 0x11, 0x41, 0x4F,
+    0x67, 0xDC, 0xEA, 0x97, 0xF2, 0xCF, 0xCE, 0xF0, 0xB4, 0xE6, 0x73, 0x96, 0xAC, 0x74, 0x22, 0xE7, 0xAD, 0x35, 0x85,
+    0xE2, 0xF9, 0x37, 0xE8, 0x1C, 0x75, 0xDF, 0x6E, 0x47, 0xF1, 0x1A, 0x71, 0x1D, 0x29, 0xC5, 0x89, 0x6F, 0xB7, 0x62,
+    0x0E, 0xAA, 0x18, 0xBE, 0x1B, 0xFC, 0x56, 0x3E, 0x4B, 0xC6, 0xD2, 0x79, 0x20, 0x9A, 0xDB, 0xC0, 0xFE, 0x78, 0xCD,
+    0x5A, 0xF4, 0x1F, 0xDD, 0xA8, 0x33, 0x88, 0x07, 0xC7, 0x31, 0xB1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xEC, 0x5F, 0x60,
+    0x51, 0x7F, 0xA9, 0x19, 0xB5, 0x4A, 0x0D, 0x2D, 0xE5, 0x7A, 0x9F, 0x93, 0xC9, 0x9C, 0xEF, 0xA0, 0xE0, 0x3B, 0x4D,
+    0xAE, 0x2A, 0xF5, 0xB0, 0xC8, 0xEB, 0xBB, 0x3C, 0x83, 0x53, 0x99, 0x61, 0x17, 0x2B, 0x04, 0x7E, 0xBA, 0x77, 0xD6,
+    0x26, 0xE1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0C, 0x7D,
 };
 
 // GF(2^8) multiply by x, modulo the AES polynomial 0x11B.
@@ -3221,12 +3234,12 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
             return interp_undefined(cpu, insn, "scalar FP -- 32-bit fixed-point conversion with scale < 32");
         if (rmode == 0 && (opcode == 2 || opcode == 3)) { // SCVTF / UCVTF (fixed-point)
             uint64_t value = interp_gpr(cpu, rn);
-            interp_fp_write(cpu, rd, fmt,
-                            interp_fp_from_int(fmt, value, sf ? 64u : 32u, opcode == 2,
-                                               INTERP_FPCR_RMODE(g_interp_fpcr), fbits));
+            interp_fp_write(
+                cpu, rd, fmt,
+                interp_fp_from_int(fmt, value, sf ? 64u : 32u, opcode == 2, INTERP_FPCR_RMODE(g_interp_fpcr), fbits));
         } else if (rmode == 3 && opcode <= 1) { // FCVTZS / FCVTZU (fixed-point)
-            uint64_t out = interp_fp_to_int(fmt, interp_fp_read(cpu, rn, fmt), sf ? 64u : 32u, opcode == 0,
-                                           INTERP_RM_RZ, fbits);
+            uint64_t out =
+                interp_fp_to_int(fmt, interp_fp_read(cpu, rn, fmt), sf ? 64u : 32u, opcode == 0, INTERP_RM_RZ, fbits);
             if (sf)
                 interp_set_gpr(cpu, rd, out);
             else
@@ -3246,8 +3259,7 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
         if (!interp_fp_type_fmt(type, &fmt)) return interp_undefined(cpu, insn, "scalar FP -- FCCMP ptype");
         unsigned cond = (insn >> 12) & 0xFu, quiet_signals = (insn >> 4) & 1u;
         if (interp_cond_holds(cpu, cond))
-            interp_fp_compare(cpu, fmt, interp_fp_read(cpu, rn, fmt), interp_fp_read(cpu, rm, fmt),
-                              (int)quiet_signals);
+            interp_fp_compare(cpu, fmt, interp_fp_read(cpu, rn, fmt), interp_fp_read(cpu, rm, fmt), (int)quiet_signals);
         else
             // No comparison happens and no exception can be raised; NZCV comes from the insn's nzcv field.
             cpu->nzcv = ((uint64_t)(insn & 0xFu)) << 28;
@@ -3308,7 +3320,7 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
             return INTERP_NEXT;
         }
         if (rmode == 0 && opcode == 7) { // FMOV from a general register (Rn -> Vd's low element)
-            if (type == 0 && !sf) // FMOV Sd, Wn
+            if (type == 0 && !sf)        // FMOV Sd, Wn
                 interp_fp_write(cpu, rd, INTERP_FP_S, interp_gpr(cpu, rn) & 0xFFFFFFFFu);
             else if (type == 1 && sf) // FMOV Dd, Xn
                 interp_fp_write(cpu, rd, INTERP_FP_D, interp_gpr(cpu, rn));
@@ -3382,7 +3394,7 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
                 convert_mode = by_rmode[rmode];
             }
             uint64_t out = interp_fp_to_int(fmt, interp_fp_read(cpu, rn, fmt), sf ? 64u : 32u, (opcode & 1u) == 0,
-                                           convert_mode, 0);
+                                            convert_mode, 0);
             if (sf)
                 interp_set_gpr(cpu, rd, out);
             else
@@ -3448,16 +3460,18 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
         }
         uint64_t a = interp_fp_read(cpu, rn, fmt), out;
         switch (opcode) {
-        case 0x00: out = a; break;                              // FMOV (register): a pure bit copy
-        case 0x01: out = a & ~interp_fp_sign_mask(fmt); break;   // FABS: clears the sign bit, nothing else
-        case 0x02: out = a ^ interp_fp_sign_mask(fmt); break;    // FNEG: a sign-bit toggle
-        case 0x03: out = interp_fp_sqrt(fmt, a); break;          // FSQRT
+        case 0x00: out = a; break;                             // FMOV (register): a pure bit copy
+        case 0x01: out = a & ~interp_fp_sign_mask(fmt); break; // FABS: clears the sign bit, nothing else
+        case 0x02: out = a ^ interp_fp_sign_mask(fmt); break;  // FNEG: a sign-bit toggle
+        case 0x03:
+            out = interp_fp_sqrt(fmt, a);
+            break; // FSQRT
         // The FRINT family differs only in the mode and in whether a change is Inexact; only FRINTX is.
-        case 0x08: out = interp_fp_round_integral(fmt, a, INTERP_RM_RN, 0); break; // FRINTN
-        case 0x09: out = interp_fp_round_integral(fmt, a, INTERP_RM_RP, 0); break; // FRINTP
-        case 0x0A: out = interp_fp_round_integral(fmt, a, INTERP_RM_RM, 0); break; // FRINTM
-        case 0x0B: out = interp_fp_round_integral(fmt, a, INTERP_RM_RZ, 0); break; // FRINTZ
-        case 0x0C: out = interp_fp_round_integral(fmt, a, INTERP_RM_RA, 0); break; // FRINTA
+        case 0x08: out = interp_fp_round_integral(fmt, a, INTERP_RM_RN, 0); break;                     // FRINTN
+        case 0x09: out = interp_fp_round_integral(fmt, a, INTERP_RM_RP, 0); break;                     // FRINTP
+        case 0x0A: out = interp_fp_round_integral(fmt, a, INTERP_RM_RM, 0); break;                     // FRINTM
+        case 0x0B: out = interp_fp_round_integral(fmt, a, INTERP_RM_RZ, 0); break;                     // FRINTZ
+        case 0x0C: out = interp_fp_round_integral(fmt, a, INTERP_RM_RA, 0); break;                     // FRINTA
         case 0x0E: out = interp_fp_round_integral(fmt, a, INTERP_FPCR_RMODE(g_interp_fpcr), 1); break; // FRINTX
         case 0x0F: out = interp_fp_round_integral(fmt, a, INTERP_FPCR_RMODE(g_interp_fpcr), 0); break; // FRINTI
         default: return interp_undefined(cpu, insn, "scalar FP -- unimplemented 1-source opcode");
@@ -3521,8 +3535,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 memcpy(result.byte, stage, 16);
                 break;
             }
-            case 0x06:   // AESMC
-            case 0x07:   // AESIMC
+            case 0x06: // AESMC
+            case 0x07: // AESIMC
                 interp_aes_mix_columns(source.byte, mixed, opcode == 0x07);
                 memcpy(result.byte, mixed, 16);
                 break;
@@ -3568,7 +3582,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         default: return interp_undefined(cpu, insn, "AdvSIMD SHA -- unallocated two-register opcode");
         }
         memset(result.byte, 0, sizeof result.byte);
-        for (unsigned index = 0; index < 4u; index++) interp_vec_set_element(&result, 2, index, out[index]);
+        for (unsigned index = 0; index < 4u; index++)
+            interp_vec_set_element(&result, 2, index, out[index]);
         interp_vec_write(cpu, rd, result, 1);
         cpu->pc = gpc + 4;
         return INTERP_NEXT;
@@ -3589,7 +3604,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             // SHA1C/P/M: FOUR SHA-1 rounds; K is folded into Vm by the caller.
             uint32_t e = y[0];
             for (unsigned round = 0; round < 4u; round++) {
-                uint32_t t = opcode == 0 ? interp_sha_choose(x[1], x[2], x[3])
+                uint32_t t = opcode == 0   ? interp_sha_choose(x[1], x[2], x[3])
                              : opcode == 1 ? interp_sha_parity(x[1], x[2], x[3])
                                            : interp_sha_majority(x[1], x[2], x[3]);
                 uint32_t next = e + interp_rol32_bits(x[0], 5) + t + w[round];
@@ -3604,7 +3619,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         } else if (opcode == 3u) {
             // SHA1SU0
             uint32_t t[4] = {x[2], x[3], y[0], y[1]};
-            for (unsigned index = 0; index < 4u; index++) result_words[index] = t[index] ^ x[index] ^ w[index];
+            for (unsigned index = 0; index < 4u; index++)
+                result_words[index] = t[index] ^ x[index] ^ w[index];
         } else if (opcode == 4u || opcode == 5u) {
             // SHA256H -> x, SHA256H2 -> y, halves swapped.
             int part1 = opcode == 4u;
@@ -3619,10 +3635,10 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             for (unsigned round = 0; round < 4u; round++) {
                 uint32_t chs = interp_sha_choose(b[0], b[1], b[2]);
                 uint32_t maj = interp_sha_majority(a[0], a[1], a[2]);
-                uint32_t sigma1 = interp_ror32_bits(b[0], 6) ^ interp_ror32_bits(b[0], 11) ^
-                                  interp_ror32_bits(b[0], 25);
-                uint32_t sigma0 = interp_ror32_bits(a[0], 2) ^ interp_ror32_bits(a[0], 13) ^
-                                  interp_ror32_bits(a[0], 22);
+                uint32_t sigma1 =
+                    interp_ror32_bits(b[0], 6) ^ interp_ror32_bits(b[0], 11) ^ interp_ror32_bits(b[0], 25);
+                uint32_t sigma0 =
+                    interp_ror32_bits(a[0], 2) ^ interp_ror32_bits(a[0], 13) ^ interp_ror32_bits(a[0], 22);
                 uint32_t t = b[3] + sigma1 + chs + w[round];
                 uint32_t new_a3 = t + a[3];
                 uint32_t new_b3 = t + sigma0 + maj;
@@ -3860,8 +3876,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                     shifted = value > (unsigned __int128)wide_mask ? wide_mask : (uint64_t)value;
                 }
                 interp_vec_set_element(&packed, size, lane,
-                                      saturating ? interp_sat_narrow(shifted, size, source_signed, dest_signed)
-                                                 : (shifted & mask));
+                                       saturating ? interp_sat_narrow(shifted, size, source_signed, dest_signed)
+                                                  : (shifted & mask));
             }
             if (!q || scalar) {
                 // Unsuffixed: write the low 64 bits, ZERO the upper half.
@@ -3898,8 +3914,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         if (opcode == 0x0A && !u) { // SHL
             unsigned shift = combined - esize;
             for (unsigned lane = 0; lane < lanes; lane++)
-                interp_vec_set_element(&result, size, lane,
-                                       (interp_vec_element(&source, size, lane) << shift) & mask);
+                interp_vec_set_element(&result, size, lane, (interp_vec_element(&source, size, lane) << shift) & mask);
         } else if (opcode == 0x08 || (opcode == 0x0A && u)) {
             // SRI / SLI: the shifted-in bits come from the DESTINATION, not zeroes.
             interp_vec destination = interp_vec_read(cpu, rd);
@@ -3926,10 +3941,12 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 uint64_t value;
                 if (opcode == 0x0E && u) { // UQSHL
                     value = element & mask;
-                    for (unsigned step = 0; step < shift; step++) value = interp_uqadd_element(value, value, size, 0);
+                    for (unsigned step = 0; step < shift; step++)
+                        value = interp_uqadd_element(value, value, size, 0);
                 } else if (opcode == 0x0E) { // SQSHL
                     value = element & mask;
-                    for (unsigned step = 0; step < shift; step++) value = interp_sqadd_element(value, value, size, 0);
+                    for (unsigned step = 0; step < shift; step++)
+                        value = interp_sqadd_element(value, value, size, 0);
                 } else { // SQSHLU: UNSIGNED saturation
                     int64_t signed_element = (int64_t)interp_element_sext(element, size);
                     if (signed_element < 0) {
@@ -3959,10 +3976,9 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                     shifted = (shift >= esize ? 0 : (value >> shift)) + round;
                 } else {
                     int64_t signed_element = (int64_t)interp_element_sext(element, size);
-                    uint64_t round =
-                        rounding && shift > 0
-                            ? (uint64_t)((signed_element >> (shift > esize ? esize - 1u : shift - 1u)) & 1)
-                            : 0u;
+                    uint64_t round = rounding && shift > 0
+                                         ? (uint64_t)((signed_element >> (shift > esize ? esize - 1u : shift - 1u)) & 1)
+                                         : 0u;
                     shifted = (uint64_t)(shift >= esize ? (signed_element >> (esize - 1)) : (signed_element >> shift));
                     shifted += round;
                 }
@@ -4025,7 +4041,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         for (unsigned lane = 0; lane < lanes; lane++) {
             uint64_t element;
             switch (opcode) {
-            case 1: // UZP1 (even lanes of Vn:Vm)
+            case 1:   // UZP1 (even lanes of Vn:Vm)
             case 5: { // UZP2 (odd)
                 unsigned offset = opcode == 5 ? 1u : 0u;
                 const interp_vec *source = lane < half ? &left : &right;
@@ -4072,7 +4088,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             uint64_t accumulator = interp_vec_element(&source, element, 0);
             for (unsigned lane = 1; lane < lanes; lane++)
                 accumulator = interp_fp_minmax(fmt, accumulator, interp_vec_element(&source, element, lane), !high,
-                                              opcode == 0x0Cu);
+                                               opcode == 0x0Cu);
             interp_vec_set_element(&result, element, 0, accumulator);
             interp_vec_write(cpu, rd, result, 0);
             cpu->pc = gpc + 4;
@@ -4086,7 +4102,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             if (!u && opcode == 0x1Bu) { // ADDP (scalar): 2D only
                 if (size != 3) return interp_undefined(cpu, insn, "AdvSIMD scalar pairwise -- ADDP needs 2D");
                 interp_vec_set_element(&result, 3, 0,
-                                      interp_vec_element(&source, 3, 0) + interp_vec_element(&source, 3, 1));
+                                       interp_vec_element(&source, 3, 0) + interp_vec_element(&source, 3, 1));
             } else if (u && (opcode == 0x0Cu || opcode == 0x0Du || opcode == 0x0Fu)) {
                 unsigned fmt = (size & 1u) ? INTERP_FP_D : INTERP_FP_S, high = (size >> 1) & 1u;
                 unsigned element = fmt + 1u;
@@ -4191,8 +4207,9 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 // which were reaching FCVTL's code; there is no scalar FCVTL/FCVTN.
                 unsigned odd = u && opcode == 0x16u && (size & 1u);
                 if (high || (u && !odd) || (scalar && !odd))
-                    return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- BFCVTN/F1CVTL/F2CVTL/BF1CVTL or "
-                                                       "unallocated FCVTL/FCVTN/FCVTXN form");
+                    return interp_undefined(cpu, insn,
+                                            "AdvSIMD two-reg misc -- BFCVTN/F1CVTL/F2CVTL/BF1CVTL or "
+                                            "unallocated FCVTL/FCVTN/FCVTXN form");
                 unsigned narrow = (size & 1u) ? INTERP_FP_S : INTERP_FP_H, wide = narrow + 1u;
                 // The narrow side is 64 bits of elements; Q picks the half.
                 unsigned narrow_lanes = narrow == INTERP_FP_S ? 2u : 4u;
@@ -4253,8 +4270,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 } else {
                     switch (opcode) {
                     case 0x18: // FRINTN / FRINTP; FRINTA / FRINTX under U
-                        value = interp_fp_round_integral(fmt, a, u ? INTERP_RM_RA : (high ? INTERP_RM_RP : INTERP_RM_RN),
-                                                        0);
+                        value = interp_fp_round_integral(fmt, a,
+                                                         u ? INTERP_RM_RA : (high ? INTERP_RM_RP : INTERP_RM_RN), 0);
                         if (u && high) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- unallocated FRINT");
                         break;
                     case 0x19:
@@ -4265,10 +4282,12 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                             value = interp_fp_round_integral(fmt, a, high ? INTERP_RM_RZ : INTERP_RM_RM, 0);
                         break;
                     case 0x1A: // FCVTNS/FCVTNU or FCVTPS/FCVTPU
-                        value = interp_fp_to_int(fmt, a, interp_fp_width(fmt), !u, high ? INTERP_RM_RP : INTERP_RM_RN, 0);
+                        value =
+                            interp_fp_to_int(fmt, a, interp_fp_width(fmt), !u, high ? INTERP_RM_RP : INTERP_RM_RN, 0);
                         break;
                     case 0x1B: // FCVTMS/FCVTMU or FCVTZS/FCVTZU
-                        value = interp_fp_to_int(fmt, a, interp_fp_width(fmt), !u, high ? INTERP_RM_RZ : INTERP_RM_RM, 0);
+                        value =
+                            interp_fp_to_int(fmt, a, interp_fp_width(fmt), !u, high ? INTERP_RM_RZ : INTERP_RM_RM, 0);
                         break;
                     case 0x1C: // FCVTAS/FCVTAU at bit23 clear, URECPE/URSQRTE at set (.2S/.4S only)
                         if (high) {
@@ -4368,8 +4387,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 uint64_t folded = ((a >> 1) ^ a) & (interp_element_mask(size) >> 1);
                 unsigned count;
                 if (!u)
-                    count = folded == 0 ? esize - 1u
-                                        : (unsigned)(esize - 2u - (unsigned)(63 - __builtin_clzll(folded)));
+                    count =
+                        folded == 0 ? esize - 1u : (unsigned)(esize - 2u - (unsigned)(63 - __builtin_clzll(folded)));
                 else
                     count = a == 0 ? esize : (unsigned)(esize - 1u - (unsigned)(63 - __builtin_clzll(a)));
                 interp_vec_set_element(&result, size, lane, count);
@@ -4430,8 +4449,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             unsigned wide = size + 1u, wide_lanes = 64u / (8u << size);
             for (unsigned lane = 0; lane < wide_lanes; lane++) {
                 uint64_t a = interp_vec_element(&source, size, q ? lane + wide_lanes : lane);
-                interp_vec_set_element(&result, wide, lane,
-                                      (a << (8u << size)) & interp_element_mask(wide));
+                interp_vec_set_element(&result, wide, lane, (a << (8u << size)) & interp_element_mask(wide));
             }
             interp_vec_write(cpu, rd, result, 1);
             cpu->pc = gpc + 4;
@@ -4450,11 +4468,10 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- REV element wider than container");
             for (unsigned base = 0; base < bytes; base += container)
                 for (unsigned offset = 0; offset < container; offset += element)
-                    memcpy(result.byte + base + (container - element - offset), source.byte + base + offset,
-                           element);
+                    memcpy(result.byte + base + (container - element - offset), source.byte + base + offset, element);
             break;
         }
-        case 0x05: { // CNT / NOT (size=0) / RBIT (size=1)
+        case 0x05: {  // CNT / NOT (size=0) / RBIT (size=1)
             if (!u) { // CNT
                 if (size != 0) return interp_undefined(cpu, insn, "AdvSIMD two-reg misc -- CNT requires 8B/16B");
                 for (unsigned index = 0; index < bytes; index++)
@@ -4559,8 +4576,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                                    opcode == 0x1 || opcode == 0x3 ? lane : narrow_lane);
             b = interp_vec_element(&right, size, narrow_lane);
             // Widening forms sign-extend at U == 0, zero-extend at U == 1; PMULL is polynomial.
-            uint64_t extended_a = opcode == 0x1 || opcode == 0x3 ? a
-                                  : (u ? a & narrow_mask : (interp_element_sext(a, size) & wide_mask));
+            uint64_t extended_a =
+                opcode == 0x1 || opcode == 0x3 ? a : (u ? a & narrow_mask : (interp_element_sext(a, size) & wide_mask));
             uint64_t extended_b = u ? (b & narrow_mask) : (interp_element_sext(b, size) & wide_mask);
             uint64_t value;
             switch (opcode) {
@@ -4568,8 +4585,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             case 0x1: value = extended_a + extended_b; break; // SADDW / UADDW (Rn wide)
             case 0x2: value = extended_a - extended_b; break; // SSUBL / USUBL
             case 0x3: value = extended_a - extended_b; break; // SSUBW / USUBW
-            case 0x5:   // SABAL / UABAL
-            case 0x7: { // SABDL / UABDL
+            case 0x5:                                         // SABAL / UABAL
+            case 0x7: {                                       // SABDL / UABDL
                 uint64_t difference;
                 if (u) {
                     uint64_t x = a & narrow_mask, y = b & narrow_mask;
@@ -4657,8 +4674,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             uint64_t saved_nzcv = cpu->nzcv;
             for (unsigned lane = 0; lane < fp_lanes; lane++) {
                 // Pairwise forms take both operands from Vn:Vm, not from matching lanes.
-                int pairwise = u && (opcode == 0x18 || opcode == 0x1A || opcode == 0x1E) &&
-                               !(opcode == 0x1A && high);
+                int pairwise = u && (opcode == 0x18 || opcode == 0x1A || opcode == 0x1E) && !(opcode == 0x1A && high);
                 uint64_t a, b;
                 if (pairwise) {
                     const interp_vec *source = lane < fp_lanes / 2u ? &left : &right;
@@ -4673,7 +4689,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 if (!u) {
                     switch (opcode) {
                     case 0x18: value = interp_fp_minmax(fmt, a, b, !high, 1); break; // FMAXNM / FMINNM
-                    case 0x19: { // FMLA / FMLS
+                    case 0x19: {                                                     // FMLA / FMLS
                         uint64_t addend = interp_vec_element(&accumulate, element, lane);
                         value = interp_fp_muladd(fmt, addend, high ? (a ^ sign) : a, b);
                         break;
@@ -4706,8 +4722,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                     case 0x1B:
                         if (high) return interp_undefined(cpu, insn, "AdvSIMD three same -- unallocated FP opcode");
                         value = interp_fp_arith(fmt, INTERP_FPOP_MUL, a, b);
-                        break; // FMUL
-                    case 0x1C: // FCMGE / FCMGT
+                        break;   // FMUL
+                    case 0x1C:   // FCMGE / FCMGT
                     case 0x1D: { // FACGE / FACGT (absolute)
                         uint64_t x = a, y = b;
                         if (opcode == 0x1D) {
@@ -4745,9 +4761,9 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 uint8_t value;
                 if (!u) {
                     switch (size) {
-                    case 0: value = (uint8_t)(a & b); break;         // AND
-                    case 1: value = (uint8_t)(a & ~b); break;        // BIC
-                    case 2: value = (uint8_t)(a | b); break;         // ORR (MOV when Rn == Rm)
+                    case 0: value = (uint8_t)(a & b); break;            // AND
+                    case 1: value = (uint8_t)(a & ~b); break;           // BIC
+                    case 2: value = (uint8_t)(a | b); break;            // ORR (MOV when Rn == Rm)
                     default: value = (uint8_t)(a | (uint8_t)~b); break; // ORN
                     }
                 } else {
@@ -4805,8 +4821,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
             for (unsigned lane = 0; lane < lanes; lane++) {
                 uint64_t a = interp_vec_element(&left, size, lane), b = interp_vec_element(&right, size, lane);
                 interp_vec_set_element(&result, size, lane,
-                                      u ? interp_uqadd_element(a, b, size, subtract)
-                                        : interp_sqadd_element(a, b, size, subtract));
+                                       u ? interp_uqadd_element(a, b, size, subtract)
+                                         : interp_sqadd_element(a, b, size, subtract));
             }
             break;
         }
@@ -4826,8 +4842,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                         uint64_t saturated = (a & mask);
                         // shift == 0 must be spelled out: at esize 64 the else arm shifts by 64, which the
                         // host masks to 0 and so saturates every nonzero input on a no-op shift.
-                        int overflow = shift != 0 &&
-                                       (shift >= esize ? saturated != 0 : (saturated >> (esize - shift)) != 0);
+                        int overflow =
+                            shift != 0 && (shift >= esize ? saturated != 0 : (saturated >> (esize - shift)) != 0);
                         if (overflow) {
                             interp_fpsr_raise(INTERP_FPSR_QC);
                             value = mask;
@@ -4862,8 +4878,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                         value = shift >= esize ? round : ((x >> shift) + round);
                     } else {
                         int64_t x = (int64_t)interp_element_sext(a, size);
-                        uint64_t round = rounding && shift > 0 ? (uint64_t)((x >> (shift >= 64u ? 63u : shift - 1u)) & 1)
-                                                              : 0u;
+                        uint64_t round =
+                            rounding && shift > 0 ? (uint64_t)((x >> (shift >= 64u ? 63u : shift - 1u)) & 1) : 0u;
                         int64_t shifted = shift >= esize ? (x >> (esize - 1u)) : (x >> shift);
                         value = (uint64_t)shifted + round;
                     }
@@ -4988,17 +5004,17 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 if (size != 0) return interp_undefined(cpu, insn, "AdvSIMD three same -- PMUL requires 8B/16B");
                 for (unsigned lane = 0; lane < lanes; lane++) {
                     uint64_t low, high;
-                    interp_poly_mul(interp_vec_element(&left, 0, lane), interp_vec_element(&right, 0, lane), 8,
-                                    &low, &high);
+                    interp_poly_mul(interp_vec_element(&left, 0, lane), interp_vec_element(&right, 0, lane), 8, &low,
+                                    &high);
                     interp_vec_set_element(&result, 0, lane, low & 0xFFu);
                 }
                 break;
             }
             if (size == 3) return interp_undefined(cpu, insn, "AdvSIMD three same -- 64-bit element MUL");
             for (unsigned lane = 0; lane < lanes; lane++)
-                interp_vec_set_element(&result, size, lane,
-                                       (interp_vec_element(&left, size, lane) *
-                                        interp_vec_element(&right, size, lane)) & mask);
+                interp_vec_set_element(
+                    &result, size, lane,
+                    (interp_vec_element(&left, size, lane) * interp_vec_element(&right, size, lane)) & mask);
             break;
         }
         case 0x14: { // SMAXP / UMAXP
@@ -5098,8 +5114,7 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
         unsigned opcode = (decode >> 12) & 0xFu, size = (decode >> 22) & 3u;
         // The by-element spelling shifts the vector opcodes one nibble up: 1110 is SDOT/UDOT, and 1111 is
         // USDOT at size 10 / SUDOT at size 00 -- the same pair the vector box spells 0010 and 0011.
-        if (!scalar &&
-            ((opcode == 0xEu && size == 2u) || (opcode == 0xFu && !u && (size == 2u || size == 0u)))) {
+        if (!scalar && ((opcode == 0xEu && size == 2u) || (opcode == 0xFu && !u && (size == 2u || size == 0u)))) {
             int n_signed = opcode == 0xEu ? !u : (size == 0u), m_signed = opcode == 0xEu ? !u : !(size == 0u);
             // Rm is M:Rm here, and H:L indexes the 32-bit group of Vm broadcast to every lane.
             interp_vec left = interp_vec_read(cpu, rn);
@@ -5178,8 +5193,8 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                         value = interp_sqrdmlah_element(interp_vec_element(&accumulate, size, lane), a, b, size,
                                                         opcode == 0xFu);
                     else {
-                        uint64_t product = (uint64_t)((int64_t)interp_element_sext(a, size) *
-                                                      (int64_t)interp_element_sext(b, size));
+                        uint64_t product =
+                            (uint64_t)((int64_t)interp_element_sext(a, size) * (int64_t)interp_element_sext(b, size));
                         uint64_t base = interp_vec_element(&accumulate, size, lane);
                         value = mla ? base + product : (mls ? base - product : product);
                     }
@@ -5190,12 +5205,12 @@ static int interp_exec_simd(struct cpu *cpu, uint32_t insn) {
                 if (wide_sat) {
                     uint64_t product = interp_sqdmull_element(a, b, size);
                     value = opcode == 0xBu ? product
-                                           : interp_sqadd_element(interp_vec_element(&accumulate, wide, lane),
-                                                                  product, wide, opcode == 0x7u);
+                                           : interp_sqadd_element(interp_vec_element(&accumulate, wide, lane), product,
+                                                                  wide, opcode == 0x7u);
                 } else {
-                    uint64_t product = u ? (a & mask) * (b & mask)
-                                         : (uint64_t)((int64_t)interp_element_sext(a, size) *
-                                                      (int64_t)interp_element_sext(b, size));
+                    uint64_t product =
+                        u ? (a & mask) * (b & mask)
+                          : (uint64_t)((int64_t)interp_element_sext(a, size) * (int64_t)interp_element_sext(b, size));
                     uint64_t base = interp_vec_element(&accumulate, wide, lane);
                     value = opcode == 0x2u ? base + product : (opcode == 0x6u ? base - product : product);
                 }
@@ -5232,42 +5247,34 @@ static int interp_step(struct cpu *cpu) {
         // si_addr the faulting PC via pcrel_base.
         interp_raise_sync_signal(cpu, 4 /* SIGILL */, 1 /* ILL_ILLOPC */, pcrel_base(cpu->pc));
         return INTERP_END;
-    case 0x1:
-        return interp_undefined(cpu, insn, "unallocated (SME)");
-    case 0x2:
-        return interp_undefined(cpu, insn, "SVE");
-    case 0x3:
-        return interp_undefined(cpu, insn, "unallocated");
+    case 0x1: return interp_undefined(cpu, insn, "unallocated (SME)");
+    case 0x2: return interp_undefined(cpu, insn, "SVE");
+    case 0x3: return interp_undefined(cpu, insn, "unallocated");
     case 0x8:
-    case 0x9:
-        return interp_exec_dp_immediate(cpu, insn);
+    case 0x9: return interp_exec_dp_immediate(cpu, insn);
     case 0xA:
-    case 0xB:
-        return interp_exec_branch_system(cpu, insn);
+    case 0xB: return interp_exec_branch_system(cpu, insn);
     case 0x4:
     case 0x6:
     case 0xC:
-    case 0xE:
-        return interp_exec_load_store(cpu, insn);
+    case 0xE: return interp_exec_load_store(cpu, insn);
     case 0x5:
-    case 0xD:
-        return interp_exec_dp_register(cpu, insn);
-    default:
-        return interp_exec_simd(cpu, insn);
+    case 0xD: return interp_exec_dp_register(cpu, insn);
+    default: return interp_exec_simd(cpu, insn);
     }
 }
 
 // Must answer 1 wherever interp_step ends a block; more is only wasteful. The recorded range must never
 // be a SUBSET of the bytes executed -- map_put's range is what SMC tests.
 static int interp_block_ends(uint32_t insn) {
-    if ((insn & 0x7C000000u) == 0x14000000u) return 1;  // B / BL
-    if ((insn & 0xFF000010u) == 0x54000000u) return 1;  // B.cond
-    if ((insn & 0xFF000010u) == 0x54000010u) return 1;  // BC.cond
-    if ((insn & 0x7E000000u) == 0x34000000u) return 1;  // CBZ / CBNZ
-    if ((insn & 0x7E000000u) == 0x36000000u) return 1;  // TBZ / TBNZ
-    if ((insn & 0xFE000000u) == 0xD6000000u) return 1;  // BR / BLR / RET / ERET
-    if ((insn & 0xFF000000u) == 0xD4000000u) return 1;  // SVC / BRK / HLT / ...
-    if ((insn & 0xFFFFFFE0u) == 0xD50B7520u) return 1;  // ic ivau -> R_ICFLUSH
+    if ((insn & 0x7C000000u) == 0x14000000u) return 1;                           // B / BL
+    if ((insn & 0xFF000010u) == 0x54000000u) return 1;                           // B.cond
+    if ((insn & 0xFF000010u) == 0x54000010u) return 1;                           // BC.cond
+    if ((insn & 0x7E000000u) == 0x34000000u) return 1;                           // CBZ / CBNZ
+    if ((insn & 0x7E000000u) == 0x36000000u) return 1;                           // TBZ / TBNZ
+    if ((insn & 0xFE000000u) == 0xD6000000u) return 1;                           // BR / BLR / RET / ERET
+    if ((insn & 0xFF000000u) == 0xD4000000u) return 1;                           // SVC / BRK / HLT / ...
+    if ((insn & 0xFFFFFFE0u) == 0xD50B7520u) return 1;                           // ic ivau -> R_ICFLUSH
     if ((insn & 0xFFFFF01Fu) == 0xD503301Fu && ((insn >> 5) & 7) == 6) return 1; // ISB -> R_ICCOMMIT
     return 0;
 }
@@ -5401,8 +5408,7 @@ static void run_block(struct cpu *cpu, void *code) {
 // sigframe_resume_dispatch bakes it. Abort, not return -- a silent return spins the dispatcher on a stale
 // cpu->reason.
 static void block_return(void) {
-    fprintf(stderr, "hl: block_return() entered under the aarch64 interpreter backend on a " HL_HOST_CPU_NAME
-                    " host.\n"
+    fprintf(stderr, "hl: block_return() entered under the aarch64 interpreter backend on a " HL_HOST_CPU_NAME " host.\n"
                     "    Nothing in the code arena is executable here, so no translated block can have branched\n"
                     "    to this address -- it was baked into something that then ran, which means a stale\n"
                     "    persistent-cache image or a checkpoint written by the JIT was accepted.\n");
@@ -5557,15 +5563,15 @@ static int shadowgate(void) {
 #define PC_IMG_BASE 0x0000040000000000ull    // fixed guest image base
 #define PC_INTERP_BASE 0x0000048000000000ull // fixed interpreter (ld.so) base
 
-static int g_pcache;             // HL_PCACHE=1 requested (never hits)
-static int g_coldprof;           // cache timing diagnostics
-static uint64_t g_force_base;    // one-shot fixed-VA request consumed by load_elf
-static int g_force_base_failed;  // a fixed-VA map fell back to a kernel base
-static uint64_t g_pc_binid;      // binary + interp + argv0 + build + host ISA
-static uint64_t g_pc_entry;      // initial guest pc
-static int g_pcache_loaded;      // never set here
-static int g_pcache_forked;      // never set here
-static int g_nreloc;             // always zero here
+static int g_pcache;            // HL_PCACHE=1 requested (never hits)
+static int g_coldprof;          // cache timing diagnostics
+static uint64_t g_force_base;   // one-shot fixed-VA request consumed by load_elf
+static int g_force_base_failed; // a fixed-VA map fell back to a kernel base
+static uint64_t g_pc_binid;     // binary + interp + argv0 + build + host ISA
+static uint64_t g_pc_entry;     // initial guest pc
+static int g_pcache_loaded;     // never set here
+static int g_pcache_forked;     // never set here
+static int g_nreloc;            // always zero here
 
 // Engine-identity mix-in for the cache key. Must be right even though the cache never hits: host_isa is
 // HL_HOST_CPU_ISA, not a hardcoded 1 -- passing 1 would collide an x86-64-host identity with a JIT-written
@@ -5589,8 +5595,7 @@ static uint64_t pcache_make_id(const char *prog_host, const char *interp_host, c
 // Always a clean MISS.
 static int pcache_load(uint64_t entry_jump) {
     (void)entry_jump;
-    if (g_pcache && g_coldprof)
-        fprintf(stderr, "[pcache] MISS (interpreter backend stores no host code)\n");
+    if (g_pcache && g_coldprof) fprintf(stderr, "[pcache] MISS (interpreter backend stores no host code)\n");
     return 0;
 }
 

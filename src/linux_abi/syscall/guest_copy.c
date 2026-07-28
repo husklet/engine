@@ -80,9 +80,8 @@ static int guest_span(uint64_t guest, size_t length, uint32_t protection, void *
     while (prefix < bound) {
         size_t page_left = 4096u - (size_t)((guest + prefix) & 4095u);
         size_t chunk = bound - prefix < page_left ? bound - prefix : page_left;
-        int accessible = (protection & HL_LOGICAL_VMA_WRITE)
-                             ? host_range_writable((uintptr_t)(guest + prefix), chunk)
-                             : host_range_mapped((uintptr_t)(guest + prefix), chunk);
+        int accessible = (protection & HL_LOGICAL_VMA_WRITE) ? host_range_writable((uintptr_t)(guest + prefix), chunk)
+                                                             : host_range_mapped((uintptr_t)(guest + prefix), chunk);
         if (!accessible) break;
         prefix += chunk;
     }
@@ -399,10 +398,9 @@ static ssize_t guest_fd_vector_flags(int fd, uint64_t guest_vectors, size_t gues
         return -1;
     }
 #endif
-        result = positional
-                     ? (output ? preadv(fd, host_iov, (int)host_count, offset)
-                               : pwritev(fd, host_iov, (int)host_count, offset))
-                     : (output ? readv(fd, host_iov, (int)host_count) : writev(fd, host_iov, (int)host_count));
+        result = positional ? (output ? preadv(fd, host_iov, (int)host_count, offset)
+                                      : pwritev(fd, host_iov, (int)host_count, offset))
+                            : (output ? readv(fd, host_iov, (int)host_count) : writev(fd, host_iov, (int)host_count));
     if (output && result > 0) {
         size_t remaining = (size_t)result;
         for (size_t index = 0; index < host_count && remaining; ++index) {

@@ -26,9 +26,11 @@
 #define R_ICFLUSH 4
 #define R_ICCOMMIT 6
 static int g_smc_seen;
+
 static inline int smc_seen(void) {
     return __atomic_load_n(&g_smc_seen, __ATOMIC_ACQUIRE);
 }
+
 static uint64_t g_smc_flushes;
 
 // (4) x86-only top-of-loop instrumentation (g_prevpc/g_disp_n/trace cap/g_w8 watchpoint/malloc track).
@@ -70,12 +72,12 @@ static uint64_t g_smc_flushes;
         if (bd) {                                                                                                      \
             uint32_t h = (uint32_t)(((c)->pc >> 2) & (IBTC_N - 1));                                                    \
             /* A1: x16/x17 stolen -> probe needs no restore -> land on body; legacy lands on body-8.   */              \
-            void *_rxbd = NULL;                                                                                       \
-            uint64_t _bdgen;                                                                                          \
-            /* map_body returned a live entry under g_jit_lock, so its owning arena must be live. */                  \
-            if (!jit_resolve_rw_code(bd, &_rxbd, &_bdgen)) __builtin_trap();                                          \
-            (void)_bdgen;                                                                                             \
-            void *bind = (void *)((uint64_t)_rxbd - (g_steal1617 ? 0 : 8));                                           \
+            void *_rxbd = NULL;                                                                                        \
+            uint64_t _bdgen;                                                                                           \
+            /* map_body returned a live entry under g_jit_lock, so its owning arena must be live. */                   \
+            if (!jit_resolve_rw_code(bd, &_rxbd, &_bdgen)) __builtin_trap();                                           \
+            (void)_bdgen;                                                                                              \
+            void *bind = (void *)((uint64_t)_rxbd - (g_steal1617 ? 0 : 8));                                            \
             if (_mt) {                                                                                                 \
                 /* threaded: single 128-bit atomic release publish; consumed by an atomic ldp reader */                \
                 ibtc_publish(&g_ibtc[h], (c)->pc, bind);                                                               \
@@ -89,20 +91,20 @@ static uint64_t g_smc_flushes;
                  * stale body. So once SMC is in play, skip the per-site IC: the indirect branch falls to the          \
                  * shared-hash IBTC (g_ibtc), which smc_icflush() DOES clear -> the re-call re-translates. */          \
                 if ((c)->ic_site != 1 && !(g_rwx_guest || smc_seen())) { /* per-site monomorphic IC */                 \
-                    /* ic_site is the RX address of the CURRENT literal pair. Retained generations exist only         \
+                    /* ic_site is the RX address of the CURRENT literal pair. Retained generations exist only          \
                      * after smc_seen(), which disables this per-site patch path above. */                             \
                     uint64_t *site = (uint64_t *)J_RW((c)->ic_site);                                                   \
                     if (jit_wprot(0)) {                                                                                \
                         if (g_steal1617) {                                                                             \
-                            /* steal path: Lb (site[1]) holds the hit branch's arena offset -> patch `b bind`.  \
-                             * Drops the ldr+indirect-br hit tail to one direct branch. */                          \
-                            uint32_t *brw = (uint32_t *)(g_cache + site[1]);                                          \
-                            uint32_t *brx = (uint32_t *)J_RX(brw);                                                    \
-                            int64_t bd_d = ((uint8_t *)bind - (uint8_t *)brx) / 4;                                    \
-                            *brw = 0x14000000u | ((uint32_t)bd_d & 0x3FFFFFFu); /* b bind */                          \
-                            site[0] = (c)->pc; /* Lsite_tgt guard */                                                  \
+                            /* steal path: Lb (site[1]) holds the hit branch's arena offset -> patch `b bind`.         \
+                             * Drops the ldr+indirect-br hit tail to one direct branch. */                             \
+                            uint32_t *brw = (uint32_t *)(g_cache + site[1]);                                           \
+                            uint32_t *brx = (uint32_t *)J_RX(brw);                                                     \
+                            int64_t bd_d = ((uint8_t *)bind - (uint8_t *)brx) / 4;                                     \
+                            *brw = 0x14000000u | ((uint32_t)bd_d & 0x3FFFFFFu); /* b bind */                           \
+                            site[0] = (c)->pc;                                  /* Lsite_tgt guard */                  \
                             (void)jit_wprot(1);                                                                        \
-                            (void)jit_publish_code(brw, 4); /* branch is code -> flush I-cache */                     \
+                            (void)jit_publish_code(brw, 4); /* branch is code -> flush I-cache */                      \
                         } else {                                                                                       \
                             site[1] = (uint64_t)bind; /* Lsite_body (RX) */                                            \
                             site[0] = (c)->pc;        /* Lsite_tgt       */                                            \
@@ -123,30 +125,45 @@ static uint64_t g_smc_flushes;
     if ((c)->reason == R_SOFTMISS) {                                                                                   \
         if (aarch64_soft_tlb_miss(c)) {                                                                                \
             if ((c)->reason != R_SOFTSPAN) continue;                                                                   \
-            if (aarch64_soft_tlb_span(c) > 0) continue;                                                               \
+            if (aarch64_soft_tlb_span(c) > 0) continue;                                                                \
         }                                                                                                              \
         (c)->fault_addr = (c)->soft_ea;                                                                                \
-        if (raise_guest_fetch_fault(c)) { maybe_deliver_signal(c); continue; }                                         \
+        if (raise_guest_fetch_fault(c)) {                                                                              \
+            maybe_deliver_signal(c);                                                                                   \
+            continue;                                                                                                  \
+        }                                                                                                              \
         break;                                                                                                         \
     } else if ((c)->reason == R_SOFTCOMMIT) {                                                                          \
         if (aarch64_soft_bounce_commit(c)) continue;                                                                   \
         (c)->fault_addr = (c)->soft_ea;                                                                                \
-        if (raise_guest_fetch_fault(c)) { maybe_deliver_signal(c); continue; }                                         \
+        if (raise_guest_fetch_fault(c)) {                                                                              \
+            maybe_deliver_signal(c);                                                                                   \
+            continue;                                                                                                  \
+        }                                                                                                              \
         break;                                                                                                         \
     } else if ((c)->reason == R_SOFTSPAN) {                                                                            \
         int _soft_span = aarch64_soft_tlb_span(c);                                                                     \
         if (_soft_span > 0) continue;                                                                                  \
         (c)->fault_addr = (c)->soft_ea;                                                                                \
-        if (raise_guest_fetch_fault(c)) { maybe_deliver_signal(c); continue; }                                         \
+        if (raise_guest_fetch_fault(c)) {                                                                              \
+            maybe_deliver_signal(c);                                                                                   \
+            continue;                                                                                                  \
+        }                                                                                                              \
         break;                                                                                                         \
     } else if ((c)->reason == R_FETCHFAULT) {                                                                          \
-        if (raise_guest_fetch_fault(c)) { maybe_deliver_signal(c); continue; }                                         \
+        if (raise_guest_fetch_fault(c)) {                                                                              \
+            maybe_deliver_signal(c);                                                                                   \
+            continue;                                                                                                  \
+        }                                                                                                              \
         break;                                                                                                         \
     } else if ((c)->reason == R_BUS) {                                                                                 \
-        if (raise_guest_bus(c)) { maybe_deliver_signal(c); continue; }                                                \
+        if (raise_guest_bus(c)) {                                                                                      \
+            maybe_deliver_signal(c);                                                                                   \
+            continue;                                                                                                  \
+        }                                                                                                              \
         break;                                                                                                         \
     } else if ((c)->reason == R_ICFLUSH) {                                                                             \
-        uint64_t _line = (c)->smc_va & ~UINT64_C(0xfff);                                                              \
+        uint64_t _line = (c)->smc_va & ~UINT64_C(0xfff);                                                               \
         filemap_refresh_emulated(_line, _line + UINT64_C(0x1000));                                                     \
         smc_icflush((c), (c)->smc_va); /* queue dirty line until the architecturally-visible ISB */                    \
     } else if ((c)->reason == R_ICCOMMIT) {                                                                            \

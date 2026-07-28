@@ -34,8 +34,8 @@ int hl_ckpt_channel_acquire(void);
  * payload is copied into `out` (up to `capacity`); a longer reply is a protocol error. Returns 0 when a
  * well-formed reply arrived -- the operation's own status is in `reply->status` -- and -1 when the transport
  * or the framing failed. */
-int hl_ckpt_channel_call(hl_ckpt_request *request, const char *name, const void *payload,
-                         hl_ckpt_reply *reply, void *out, size_t capacity);
+int hl_ckpt_channel_call(hl_ckpt_request *request, const char *name, const void *payload, hl_ckpt_reply *reply,
+                         void *out, size_t capacity);
 
 /* The checkpoint TRIGGER is a 4-byte generation counter shared by every engine process and bumped by the
  * embedder to request a capture. ckpt_poll reads it at every safepoint, so it has to be a plain memory load;
@@ -56,8 +56,7 @@ int hl_ckpt_trigger_descriptor(void);
  * above keep plain int -- they never leave this process, and their -1 is a POSIX descriptor number rather
  * than an API contract. */
 int hl_ckpt_broker_pair(hl_activation_descriptor *out_parent, hl_activation_descriptor *out_child);
-hl_activation_descriptor hl_ckpt_broker_accept(hl_activation_descriptor broker, int timeout_ms,
-                                               uint64_t *out_host_pid);
+hl_activation_descriptor hl_ckpt_broker_accept(hl_activation_descriptor broker, int timeout_ms, uint64_t *out_host_pid);
 
 /* Embedder side of the trigger: create the shared counter, read and bump it, release it. */
 int hl_ckpt_trigger_create(hl_activation_descriptor *out_descriptor, void **out_mapping);

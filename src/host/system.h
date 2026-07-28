@@ -5,7 +5,6 @@
 #define HL_HOST_PRIVATE_DESCRIPTOR_MINIMUM 4096u
 #define HL_HOST_GUEST_DESCRIPTOR_MINIMUM 20480u
 
-
 void hl_host_private_init(void);
 
 #include <stddef.h>
@@ -50,6 +49,7 @@ enum {
     HL_HOST_FD_PIPE = 2,
     HL_HOST_FD_SOCKET = 3,
 };
+
 enum { HL_HOST_PROCESS_FD_ENGINE_PRIVATE = 1u << 0 };
 
 typedef struct hl_host_process_fd {

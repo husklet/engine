@@ -119,7 +119,7 @@ static void fp_tag_index(int i) {
     e_addi(17, 17, 8, 0);
 }
 
-static void fp_tag_test(int xdst) { // xdst = 1 if x16's bit x17 is set (slot empty); clobbers x20
+static void fp_tag_test(int xdst) {      // xdst = 1 if x16's bit x17 is set (slot empty); clobbers x20
     e_shv(0x1AC02400u, xdst, 16, 17, 1); // lsrv
     e_movconst(20, 1);
     e_rrr(A_AND, xdst, xdst, 20, 1, 0);
@@ -131,7 +131,9 @@ static void fp_tag_mark(int empty) { // x16's bit x17 <- empty; clobbers x20
     e_rrr(empty ? A_ORR : A_BIC, 16, 16, 20, 1, 0);
 }
 
-static void fp_tags_store(void) { e_str(16, 28, OFF_FPTOP); }
+static void fp_tags_store(void) {
+    e_str(16, 28, OFF_FPTOP);
+}
 
 // #IS, predicated on x22. C1 tells the two apart: 1 = OVERFLOW (a push onto a non-empty slot), 0 =
 // UNDERFLOW (a read of an empty one). FSW.IE goes into the host FPSR, which is where the JIT projects
@@ -259,7 +261,9 @@ void hl_x86_x87_rc_enter(void) {
     emit32(0xD51B4400u | 20); // msr fpcr, x20
 }
 
-void hl_x86_x87_rc_leave(void) { emit32(0xD51B4400u | 23); } // msr fpcr, x23
+void hl_x86_x87_rc_leave(void) {
+    emit32(0xD51B4400u | 23);
+} // msr fpcr, x23
 
 // FCW.PC (bits 9:8): 00 = 24 significand bits, 10 = 53, 11 = 64 (the FNINIT default). The carrier is a
 // double, so PC=53 is exact and PC=64 is the model's known shortfall; PC=24 IS exact, because re-rounding a
@@ -383,7 +387,7 @@ void hl_x86_x87_extract(void) {
     e_rrr(A_AND, 16, 16, 19, 1, 0); // clear exponent field
     e_movconst(19, 1023ULL << 52);
     e_rrr(A_ORR, 16, 16, 19, 1, 0); // set exponent to bias -> significand in [1,2)
-    e_fmov_to_d(18, 16); // d18 = significand
+    e_fmov_to_d(18, 16);            // d18 = significand
     hl_x86_x87_indefinite(17);      // an empty ST0 gives BOTH results the indefinite (x22 is consumed here:
     hl_x86_x87_indefinite(18);      // hl_x86_x87_push below reuses it for its own overflow verdict)
     hl_x86_x87_store(17, 0);        // ST0 = exponent
@@ -394,9 +398,9 @@ void hl_x86_x87_extract(void) {
 // sign-magnitude, so this is NOT `result > original` (measured: -2.5 under RC=down gives -3 with C1=1).
 // vr = the rounded value, vo = the original. Clobbers x20/x21/x23 and v20/v21; preserves x22.
 void hl_x86_x87_rounded_up(int vr, int vo) {
-    emit32(0x1E60C000u | (vr << 5) | 20);              // fabs d20, dvr
-    emit32(0x1E60C000u | (vo << 5) | 21);              // fabs d21, dvo
-    emit32(0x1E602000u | (21 << 16) | (20 << 5));      // fcmp d20, d21
+    emit32(0x1E60C000u | (vr << 5) | 20);         // fabs d20, dvr
+    emit32(0x1E60C000u | (vo << 5) | 21);         // fabs d21, dvo
+    emit32(0x1E602000u | (21 << 16) | (20 << 5)); // fcmp d20, d21
     e_cset(20, 12 /*GT*/, 1);
     e_ldr(21, 28, OFF_FPSW);
     e_movconst(23, 0x200);

@@ -19,14 +19,24 @@
  * to shim, and inventing half of it here would produce a channel that accepts requests and captures nothing. */
 #if defined(_WIN32)
 
-void hl_ckpt_channel_publish(int broker) { (void)broker; }
-int hl_ckpt_channel_broker(void) { return -1; }
+void hl_ckpt_channel_publish(int broker) {
+    (void)broker;
+}
+
+int hl_ckpt_channel_broker(void) {
+    return -1;
+}
+
 int hl_ckpt_channel_adopt(const char *broker, const char *trigger) {
     (void)broker;
     (void)trigger;
     return -1;
 }
-int hl_ckpt_channel_acquire(void) { return -1; }
+
+int hl_ckpt_channel_acquire(void) {
+    return -1;
+}
+
 int hl_ckpt_channel_call(hl_ckpt_request *request, const char *name, const void *payload, hl_ckpt_reply *reply,
                          void *out, size_t capacity) {
     (void)request;
@@ -37,13 +47,21 @@ int hl_ckpt_channel_call(hl_ckpt_request *request, const char *name, const void 
     (void)capacity;
     return -1;
 }
-void hl_ckpt_trigger_publish(int descriptor) { (void)descriptor; }
-int hl_ckpt_trigger_descriptor(void) { return -1; }
+
+void hl_ckpt_trigger_publish(int descriptor) {
+    (void)descriptor;
+}
+
+int hl_ckpt_trigger_descriptor(void) {
+    return -1;
+}
+
 int hl_ckpt_broker_pair(hl_activation_descriptor *out_parent, hl_activation_descriptor *out_child) {
     if (out_parent != NULL) *out_parent = HL_ACTIVATION_DESCRIPTOR_NONE;
     if (out_child != NULL) *out_child = HL_ACTIVATION_DESCRIPTOR_NONE;
     return -1;
 }
+
 hl_activation_descriptor hl_ckpt_broker_accept(hl_activation_descriptor broker, int timeout_ms,
                                                uint64_t *out_host_pid) {
     (void)broker;
@@ -51,17 +69,20 @@ hl_activation_descriptor hl_ckpt_broker_accept(hl_activation_descriptor broker, 
     (void)out_host_pid;
     return HL_ACTIVATION_DESCRIPTOR_NONE;
 }
+
 int hl_ckpt_trigger_create(hl_activation_descriptor *out_descriptor, void **out_mapping) {
     if (out_descriptor != NULL) *out_descriptor = HL_ACTIVATION_DESCRIPTOR_NONE;
     if (out_mapping != NULL) *out_mapping = NULL;
     return -1;
 }
+
 /* A trigger that was never created has no generation to advance. Zero is what a NULL mapping already
  * returns on every host, so a caller that skipped the failed create() sees one answer everywhere. */
 uint32_t hl_ckpt_trigger_bump(void *mapping) {
     (void)mapping;
     return 0;
 }
+
 void hl_ckpt_trigger_destroy(void *mapping, hl_activation_descriptor descriptor) {
     (void)mapping;
     (void)descriptor;
@@ -111,15 +132,13 @@ int hl_ckpt_channel_adopt(const char *broker, const char *trigger) {
     int broker_descriptor = checkpoint_parse_descriptor(broker);
     int trigger_descriptor = checkpoint_parse_descriptor(trigger);
     if (broker_descriptor < 0 || trigger_descriptor < 0) return -1;
-    if (fcntl(broker_descriptor, F_GETFD) < 0 || fcntl(trigger_descriptor, F_GETFD) < 0)
-        return -1;
+    if (fcntl(broker_descriptor, F_GETFD) < 0 || fcntl(trigger_descriptor, F_GETFD) < 0) return -1;
     hl_host_private_init();
     /* Move both into the engine-private range, exactly as activation does with the descriptors it is
      * handed: the guest descriptor scan must never see them. */
     broker_descriptor = hl_host_process_fd_private_adopt(broker_descriptor);
     trigger_descriptor = hl_host_process_fd_private_adopt(trigger_descriptor);
-    if (broker_descriptor < 0 || trigger_descriptor < 0)
-        return -1;
+    if (broker_descriptor < 0 || trigger_descriptor < 0) return -1;
     checkpoint_broker = broker_descriptor;
     checkpoint_trigger = trigger_descriptor;
     return 0;
@@ -279,8 +298,7 @@ hl_activation_descriptor hl_ckpt_broker_accept(hl_activation_descriptor broker, 
         ready = poll(&waiting, 1, timeout_ms);
     } while (ready < 0 && errno == EINTR);
     if (ready <= 0) return HL_ACTIVATION_DESCRIPTOR_NONE;
-    if (hl_fork_wire_receive_descriptors(waiting.fd, &hello, sizeof hello, descriptors, &count) !=
-        (int)sizeof hello) {
+    if (hl_fork_wire_receive_descriptors(waiting.fd, &hello, sizeof hello, descriptors, &count) != (int)sizeof hello) {
         while (count > 0)
             (void)close(descriptors[--count]);
         return HL_ACTIVATION_DESCRIPTOR_NONE;

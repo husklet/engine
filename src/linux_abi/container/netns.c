@@ -41,16 +41,17 @@ static const int CC_L2M[17] = {VINTR, VQUIT, VERASE, VKILL, VEOF, VTIME, VMIN, -
 #define TIO_CBAUD 0x100fu
 #define TIO_CIBAUD_SHIFT 16
 static const uint32_t TIO_BAUD[][2] = {
-    {0, 0},           {1, 50},          {2, 75},          {3, 110},         {4, 134},
-    {5, 150},         {6, 200},         {7, 300},         {8, 600},         {9, 1200},
-    {0xa, 1800},      {0xb, 2400},      {0xc, 4800},      {0xd, 9600},      {0xe, 19200},
-    {0xf, 38400},     {0x1001, 57600},  {0x1002, 115200}, {0x1003, 230400}, {0x1004, 460800},
-    {0x1005, 500000}, {0x1006, 576000}, {0x1007, 921600}, {0x1008, 1000000}};
+    {0, 0},           {1, 50},          {2, 75},          {3, 110},         {4, 134},         {5, 150},
+    {6, 200},         {7, 300},         {8, 600},         {9, 1200},        {0xa, 1800},      {0xb, 2400},
+    {0xc, 4800},      {0xd, 9600},      {0xe, 19200},     {0xf, 38400},     {0x1001, 57600},  {0x1002, 115200},
+    {0x1003, 230400}, {0x1004, 460800}, {0x1005, 500000}, {0x1006, 576000}, {0x1007, 921600}, {0x1008, 1000000}};
+
 static uint32_t baud_code_to_num(uint32_t code) {
     for (unsigned i = 0; i < sizeof TIO_BAUD / sizeof TIO_BAUD[0]; i++)
         if (TIO_BAUD[i][0] == code) return TIO_BAUD[i][1];
     return 0;
 }
+
 static uint32_t baud_num_to_code(uint32_t num) {
     for (unsigned i = 0; i < sizeof TIO_BAUD / sizeof TIO_BAUD[0]; i++)
         if (TIO_BAUD[i][1] == num) return TIO_BAUD[i][0];
@@ -252,6 +253,7 @@ static int msgflags_m2l(int mf) {
 // Shared ownership metadata for macOS's DGRAM-backed Linux SOCK_SEQPACKET emulation. Definitions live
 // ahead of ancillary translation because SCM_RIGHTS send/receive participates in the same lifetime.
 #define SEQ_REF_N 4096
+
 struct seq_ref {
     volatile uint32_t used;
     volatile uint32_t refs[2];
@@ -297,12 +299,14 @@ struct hl_cmsg_eventfd_meta {
     uint32_t sema;
     uint32_t nb; // guest EFD_NONBLOCK intent (g_eventfd_gnb) — the host fd is always O_NONBLOCK internally
 };
+
 struct hl_cmsg_seq_meta {
     uint32_t magic;
     uint32_t ordinal;
     uint32_t slot;
     uint32_t end;
 };
+
 // A timerfd is an engine-emulated object (kqueue-shim host fd + per-fd deadline/interval/clock
 // bookkeeping the timerfd read/gettime paths consult, keyed by fd number). Passing one over SCM_RIGHTS
 // dups the shared host object into the receiver, but the receiver's fd number carries none of the
@@ -324,17 +328,20 @@ struct hl_cmsg_timerfd_meta {
     uint64_t object;
     uint64_t shared_state; // restore-only MAP_SHARED address inherited by the reforked process tree
 };
+
 struct hl_cmsg_ofd_meta {
     uint32_t magic;
     uint32_t ordinal;
     uint64_t identity;
 };
+
 struct hl_cmsg_memfd_meta {
     uint32_t magic;
     uint32_t ordinal;
     int32_t seals;
     uint32_t reserved;
 };
+
 struct hl_cmsg_pipe_meta {
     uint32_t magic;
     uint32_t ordinal;
@@ -342,6 +349,7 @@ struct hl_cmsg_pipe_meta {
     int32_t size;
     uint32_t reserved;
 };
+
 struct hl_cmsg_signalfd_meta {
     uint32_t magic;
     uint32_t ordinal;
@@ -349,6 +357,7 @@ struct hl_cmsg_signalfd_meta {
     int32_t source_slot;
     uint64_t mask;
 };
+
 struct hl_cmsg_kqueue_meta {
     uint32_t magic;
     uint32_t ordinal;
@@ -363,6 +372,7 @@ struct hl_cmsg_kqueue_meta {
     uint32_t reserved;
     uint64_t image_size;
 };
+
 struct hl_cmsg_epoll_watch {
     int32_t descriptor;
     uint32_t events;
@@ -370,11 +380,11 @@ struct hl_cmsg_epoll_watch {
     uint32_t reserved;
     uint64_t data;
 };
+
 static int kqueue_scm_export(int fd, struct hl_cmsg_kqueue_meta *metadata);
 static int kqueue_scm_import(int fd, const struct hl_cmsg_kqueue_meta *metadata, int marker);
 static int epoll_scm_hidden_export(struct hl_cmsg_kqueue_meta *metadata, int *fds, int capacity);
 static int epoll_scm_image_remap(const struct hl_cmsg_kqueue_meta *metadata, int marker, const int *fds);
-
 
 static __thread int g_cmsg_tmpfds[1024];
 static __thread uint8_t g_cmsg_tmpfd_borrowed[1024];
@@ -780,8 +790,8 @@ static int cmsg_import_kqueue_trailer(int *fds, int nfds) {
             (metadata.kind != 1 || epoll_scm_image_remap(&metadata, marker, fds + hidden_base) == 0) && fd >= 0)
             imported = kqueue_scm_import(fd, &metadata, marker);
         if (imported < 0)
-            fprintf(stderr, "[scm-epoll] import failed kind=%u hidden=%u adopted=%d fd=%d errno=%d\n",
-                    metadata.kind, metadata.hidden_count, adopted, fd, errno);
+            fprintf(stderr, "[scm-epoll] import failed kind=%u hidden=%u adopted=%d fd=%d errno=%d\n", metadata.kind,
+                    metadata.hidden_count, adopted, fd, errno);
         if (imported <= 0) {
             for (int index = 0; index < adopted; ++index) {
                 hl_host_process_fd_private_remove(fds[hidden_base + index]);
@@ -830,11 +840,13 @@ static int cmsg_import_signalfd_trailer(int *fds, int nfds) {
                     if (writer >= 0) {
                         hl_host_process_fd_private_remove(writer);
                         close(writer);
-                    } else close(hidden);
+                    } else
+                        close(hidden);
                     if (slot >= 0) g_sfd[slot].refs = 0;
                 }
             }
-        } else close(hidden);
+        } else
+            close(hidden);
         close(marker);
         visible -= 2;
     }
@@ -885,8 +897,7 @@ static int cmsg_import_timerfd_trailer(int *fds, int nfds) {
                 hl_native_kqueue_duplicate(m.source_fd, fd);
             } else {
                 struct timerfd_shared_state *state = NULL;
-                if (m.shared_state != 0 &&
-                    (m.source_pid == (int32_t)getpid() || m.restore_shared != 0))
+                if (m.shared_state != 0 && (m.source_pid == (int32_t)getpid() || m.restore_shared != 0))
                     state = (struct timerfd_shared_state *)(uintptr_t)m.shared_state;
                 if (state == NULL) {
                     state = mmap(NULL, sizeof *state, PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, -1, 0);
@@ -940,9 +951,8 @@ static int cmsg_import_seq_trailer(int *fds, int nfds) {
         if (m.ordinal >= (uint32_t)(visible - 1) || m.slot >= SEQ_REF_N || m.end > 1) break;
         int fd = fds[m.ordinal];
         uint32_t pending = __atomic_load_n(&g_seq_refs[m.slot].pending[m.end], __ATOMIC_ACQUIRE);
-        while (pending != 0 && !__atomic_compare_exchange_n(&g_seq_refs[m.slot].pending[m.end], &pending,
-                                                             pending - 1, 0, __ATOMIC_ACQ_REL,
-                                                             __ATOMIC_ACQUIRE)) {}
+        while (pending != 0 && !__atomic_compare_exchange_n(&g_seq_refs[m.slot].pending[m.end], &pending, pending - 1,
+                                                            0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
         if (pending == 0) __atomic_add_fetch(&g_seq_refs[m.slot].refs[m.end], 1, __ATOMIC_ACQ_REL);
         if (fd >= 0 && fd < HL_NFD) {
             g_seq_ref[fd] = (uint16_t)(m.slot + 1);
@@ -1106,8 +1116,7 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                 }
                 combo[combo_n++] = native;
                 (void)ofd_identity_ensure(fds[i]);
-                if (engine_metadata && fds[i] >= 0 && fds[i] < HL_NFD && g_seq_ref[fds[i]] &&
-                    g_cmsg_nseq < 253) {
+                if (engine_metadata && fds[i] >= 0 && fds[i] < HL_NFD && g_seq_ref[fds[i]] && g_cmsg_nseq < 253) {
                     uint32_t slot = g_seq_ref[fds[i]] - 1;
                     uint32_t end = g_seq_end[fds[i]];
                     __atomic_add_fetch(&g_seq_refs[slot].refs[end], 1, __ATOMIC_ACQ_REL);
@@ -1328,7 +1337,7 @@ static ssize_t cmsg_l2m(const uint8_t *g, size_t glen, uint8_t *h, size_t cap, i
                 combo[combo_n++] = marker;
                 cmsg_inflight_hold(fds[i], marker);
             }
-cmsg_visible_only:
+        cmsg_visible_only:
             dlen = (size_t)combo_n * sizeof(int);
         }
         size_t need = CMSG_SPACE(dlen);
@@ -1573,30 +1582,37 @@ static uint8_t g_so_reuseport[HL_NFD];
 #define TCP_SHADOW_N 7
 static int g_tcp_optval[HL_NFD][TCP_SHADOW_N];
 static uint8_t g_tcp_optset[HL_NFD][TCP_SHADOW_N];
+
 // Map a Linux IPPROTO_TCP integer optname to a shadow slot, or -1 if it is not a virtualized round-trip
 // option (e.g. TCP_INFO, which is a struct handled separately). MAXSEG is get-mostly but Linux lets a guest
 // lower the clamp, so it round-trips through a slot too.
 static int tcp_shadow_slot(int optname) {
     switch (optname) {
-        case 1: return 0;  // TCP_NODELAY
-        case 3: return 1;  // TCP_CORK
-        case 4: return 2;  // TCP_KEEPIDLE
-        case 5: return 3;  // TCP_KEEPINTVL
-        case 6: return 4;  // TCP_KEEPCNT
-        case 12: return 5; // TCP_QUICKACK
-        case 2: return 6;  // TCP_MAXSEG
-        default: return -1;
+    case 1: return 0;  // TCP_NODELAY
+    case 3: return 1;  // TCP_CORK
+    case 4: return 2;  // TCP_KEEPIDLE
+    case 5: return 3;  // TCP_KEEPINTVL
+    case 6: return 4;  // TCP_KEEPCNT
+    case 12: return 5; // TCP_QUICKACK
+    case 2: return 6;  // TCP_MAXSEG
+    default: return -1;
     }
 }
+
 // A get on a MAXSEG slot never set by the guest reports a plausible loopback MSS so diagnostic code that
 // requires a nonzero segment size keeps working over the switch (the exact value is host-variable on native
 // and therefore not a stable fact); every other slot defaults to 0, the Linux default for the booleans.
-static int tcp_shadow_default(int slot) { return slot == 6 ? 65483 : 0; }
+static int tcp_shadow_default(int slot) {
+    return slot == 6 ? 65483 : 0;
+}
+
 // Drop any shadowed TCP options for a reused fd number (socket()/accept()/close re-init).
 static void tcp_shadow_clear(int fd) {
     if (fd < 0 || fd >= HL_NFD) return;
-    for (int i = 0; i < TCP_SHADOW_N; i++) g_tcp_optset[fd][i] = 0;
+    for (int i = 0; i < TCP_SHADOW_N; i++)
+        g_tcp_optset[fd][i] = 0;
 }
+
 // fd -> shadowed IPPROTO_IP(level 0) / IPPROTO_IPV6(level 41) integer options. Same class as the TCP shadow
 // above: once a private-loopback/bridge guest INET socket is bound/connected, its host backing becomes an
 // AF_UNIX switch socket (see lo_swap), which rejects every setsockopt/getsockopt at IPPROTO_IP/IPPROTO_IPV6
@@ -1611,59 +1627,69 @@ static void tcp_shadow_clear(int fd) {
 #define IPOPT_SHADOW_N 14
 static int g_ipopt_val[HL_NFD][IPOPT_SHADOW_N];
 static uint8_t g_ipopt_set[HL_NFD][IPOPT_SHADOW_N];
+
 // Map a Linux IPPROTO_IP integer optname to a shadow slot, or -1 if it is not a virtualized round-trip
 // option at this level (unknown, struct-valued, or one native rejects on a unicast stream socket).
 static int ip_shadow_slot(int optname) {
     switch (optname) {
-        case 1: return 0;  // IP_TOS
-        case 2: return 1;  // IP_TTL
-        case 8: return 2;  // IP_PKTINFO
-        case 10: return 3; // IP_MTU_DISCOVER
-        case 11: return 4; // IP_RECVERR
-        case 12: return 5; // IP_RECVTTL
-        case 13: return 6; // IP_RECVTOS
-        case 15: return 7; // IP_FREEBIND
-        default: return -1;
+    case 1: return 0;  // IP_TOS
+    case 2: return 1;  // IP_TTL
+    case 8: return 2;  // IP_PKTINFO
+    case 10: return 3; // IP_MTU_DISCOVER
+    case 11: return 4; // IP_RECVERR
+    case 12: return 5; // IP_RECVTTL
+    case 13: return 6; // IP_RECVTOS
+    case 15: return 7; // IP_FREEBIND
+    default: return -1;
     }
 }
+
 // Map a Linux IPPROTO_IPV6 integer optname to a shadow slot, or -1. IPV6_V6ONLY(26) uses slot 13 but its
 // setsockopt is handled specially (native rejects a change after bind with EINVAL), so it is excluded here
 // and matched directly on the optname in the setsockopt/getsockopt paths.
 static int ip6_shadow_slot(int optname) {
     switch (optname) {
-        case 67: return 8;  // IPV6_TCLASS
-        case 16: return 9;  // IPV6_UNICAST_HOPS
-        case 49: return 10; // IPV6_RECVPKTINFO
-        case 51: return 11; // IPV6_RECVHOPLIMIT
-        case 66: return 12; // IPV6_RECVTCLASS
-        default: return -1;
+    case 67: return 8;  // IPV6_TCLASS
+    case 16: return 9;  // IPV6_UNICAST_HOPS
+    case 49: return 10; // IPV6_RECVPKTINFO
+    case 51: return 11; // IPV6_RECVHOPLIMIT
+    case 66: return 12; // IPV6_RECVTCLASS
+    default: return -1;
     }
 }
+
 #define IPOPT_V6ONLY_SLOT 13
+
 // A get on a slot the guest never set reports the Linux default so code that reads an option it did not set
 // still sees a plausible value over the switch instead of ENOPROTOOPT (only reached when the real host
 // getsockopt is also rejected, i.e. the AF_UNIX switch backing). IP_TTL and IPV6_UNICAST_HOPS default to 64;
 // the boolean recv-flags and TOS/TCLASS default to 0.
 static int ipopt_shadow_default(int slot) {
     switch (slot) {
-        case 1: return 64; // IP_TTL
-        case 9: return 64; // IPV6_UNICAST_HOPS
-        default: return 0;
+    case 1: return 64; // IP_TTL
+    case 9: return 64; // IPV6_UNICAST_HOPS
+    default: return 0;
     }
 }
+
 // Drop any shadowed IP/IPV6 options for a reused fd number (socket()/accept()/close re-init).
 static void ipopt_shadow_clear(int fd) {
     if (fd < 0 || fd >= HL_NFD) return;
-    for (int i = 0; i < IPOPT_SHADOW_N; i++) g_ipopt_set[fd][i] = 0;
+    for (int i = 0; i < IPOPT_SHADOW_N; i++)
+        g_ipopt_set[fd][i] = 0;
 }
+
 // fd -> 1 if created AF_INET SOCK_DGRAM (only those get the published-UDP switch redirect, below)
 static uint8_t g_sock_dgram[HL_NFD];
 static uint16_t g_udp_local_port[HL_NFD], g_udp_peer_port[HL_NFD];
 static uint32_t g_udp_local_ip[HL_NFD], g_udp_peer_ip[HL_NFD];
 static uint8_t g_udp_local_interface[HL_NFD], g_udp_peer_interface[HL_NFD];
 static uint8_t g_udp_local_v6[HL_NFD], g_udp_peer_v6[HL_NFD];
+
 enum { HL_NETIF_MAX = 8 };
+
 #define UDP_REF_N 4096
+
 struct udp_ref {
     volatile uint32_t used, refs;
     char path[200];
@@ -1793,8 +1819,7 @@ static void seq_ref_drop(int fd) {
     uint32_t end = g_seq_end[fd];
     g_seq_ref[fd] = 0;
     g_seq_end[fd] = 0;
-    if (__atomic_sub_fetch(&g_seq_refs[slot].refs[end], 1, __ATOMIC_ACQ_REL) == 0)
-        (void)send(fd, "", 0, MSG_DONTWAIT);
+    if (__atomic_sub_fetch(&g_seq_refs[slot].refs[end], 1, __ATOMIC_ACQ_REL) == 0) (void)send(fd, "", 0, MSG_DONTWAIT);
     if (__atomic_load_n(&g_seq_refs[slot].refs[0], __ATOMIC_ACQUIRE) == 0 &&
         __atomic_load_n(&g_seq_refs[slot].refs[1], __ATOMIC_ACQUIRE) == 0)
         __atomic_store_n(&g_seq_refs[slot].used, 0, __ATOMIC_RELEASE);
@@ -2079,7 +2104,7 @@ static uint16_t lo_alloc_ephemeral(void) {
 // preserves both the option's effect (a receive timeout still fires, so a blocked recv wakes with EAGAIN
 // instead of hanging) and its get-after-set readback (SO_REUSEADDR/SO_REUSEPORT report 1, not the fresh
 // socket's 0). Options the guest sets AFTER the swap already land on the AF_UNIX fd directly.
-static const int lo_carry_opts[] = {SO_REUSEADDR, SO_REUSEPORT, SO_RCVTIMEO, SO_SNDTIMEO,
+static const int lo_carry_opts[] = {SO_REUSEADDR, SO_REUSEPORT, SO_RCVTIMEO,  SO_SNDTIMEO,
                                     SO_KEEPALIVE, SO_BROADCAST, SO_OOBINLINE, SO_LINGER};
 
 static int stream_swap(int fd, int family) {
@@ -2176,8 +2201,8 @@ struct br_interface {
 };
 static struct br_interface g_netif[HL_NETIF_MAX];
 static uint8_t g_netif_count;
-static uint16_t g_br_port[HL_NFD]; // fd -> virtual port of a bridge socket (0 = not a bridge socket)
-static uint32_t g_br_ip[HL_NFD];   // fd -> virtual IP (network order) reported via getsockname/getpeername
+static uint16_t g_br_port[HL_NFD];     // fd -> virtual port of a bridge socket (0 = not a bridge socket)
+static uint32_t g_br_ip[HL_NFD];       // fd -> virtual IP (network order) reported via getsockname/getpeername
 static uint8_t g_br_interface[HL_NFD]; // fd -> interface index + 1
 static int g_br_init;
 static uint8_t g_icmp_kind[HL_NFD]; // 1=dgram ping socket, 2=raw ping socket
@@ -2207,7 +2232,7 @@ static void fd_carry_sock(int dst, int src) {
     g_sock_pair_peer[dst] = g_sock_pair_peer[src]; // dup aliases the same end -> same partner
     g_sock_object[dst] = g_sock_object[src];
     g_sock_peer_object[dst] = g_sock_peer_object[src];
-    g_sock_peer_pid[dst] = g_sock_peer_pid[src];   // ... and the same synthetic peer node identity
+    g_sock_peer_pid[dst] = g_sock_peer_pid[src]; // ... and the same synthetic peer node identity
     g_sock_passcred[dst] = g_sock_passcred[src];
     g_sock_conn[dst] = g_sock_conn[src];
     g_sock_connecting[dst] = g_sock_connecting[src];
@@ -2327,8 +2352,8 @@ static void br_init(void) {
             bridge_size = (size_t)(equal - line);
             ip_size = (size_t)(end - equal - 1);
             if (bridge_size == 0 || bridge_size > 40 || ip_size == 0 || ip_size >= sizeof ip) break;
-            snprintf(g_netif[g_netif_count].path, sizeof g_netif[g_netif_count].path,
-                     "/tmp/.hl-bridge-%.*s", (int)bridge_size, line);
+            snprintf(g_netif[g_netif_count].path, sizeof g_netif[g_netif_count].path, "/tmp/.hl-bridge-%.*s",
+                     (int)bridge_size, line);
             memcpy(ip, equal + 1, ip_size);
             ip[ip_size] = 0;
             slash = strchr(ip, '/');
@@ -2756,9 +2781,14 @@ static int udp_swap(int fd) {
 static int udp_switch_bind(int fd, int interface, uint32_t ip, uint16_t port) {
     char path[200];
     if (!port) port = interface >= 0 ? br_alloc_ephemeral(interface) : lo_alloc_ephemeral();
-    if (!port) { errno = EADDRINUSE; return -1; }
-    if (interface >= 0) br_path(interface, ip, port, path, sizeof path);
-    else lo_path(port, path, sizeof path);
+    if (!port) {
+        errno = EADDRINUSE;
+        return -1;
+    }
+    if (interface >= 0)
+        br_path(interface, ip, port, path, sizeof path);
+    else
+        lo_path(port, path, sizeof path);
     struct sockaddr_un un;
     if (unix_addr_set(&un, path) < 0) return -1;
     if (!g_udp_local_port[fd] && udp_swap(fd) < 0) return -1;
@@ -2781,8 +2811,8 @@ static int udp_switch_ensure_source(int fd, int interface) {
     return udp_switch_bind(fd, interface, interface >= 0 ? g_netif[interface].ip : 0, 0);
 }
 
-static int udp_switch_destination(const uint8_t *sa, socklen_t len, int *interface, uint32_t *ip,
-                                  uint16_t *port, char *path, size_t capacity) {
+static int udp_switch_destination(const uint8_t *sa, socklen_t len, int *interface, uint32_t *ip, uint16_t *port,
+                                  char *path, size_t capacity) {
     if (lo_on() && lo6_is(sa, len)) {
         *ip = 0;
         *port = ntohs(*(const uint16_t *)(sa + 2));
@@ -2825,9 +2855,7 @@ static int udp_switch_peer_path(int fd, char *path, size_t capacity) {
 // unconnected host socket and leaking EDESTADDRREQ to applications such as BusyBox nc.
 static int udp_switch_write(int fd, const struct iovec *iov, int iov_count, int64_t *result) {
     char path[200];
-    if (fd < 0 || fd >= HL_NFD || !g_sock_dgram[fd] ||
-        !udp_switch_peer_path(fd, path, sizeof path))
-        return 0;
+    if (fd < 0 || fd >= HL_NFD || !g_sock_dgram[fd] || !udp_switch_peer_path(fd, path, sizeof path)) return 0;
     int interface = (int)g_udp_peer_interface[fd] - 1;
     if (udp_switch_ensure_source(fd, interface) < 0) {
         *result = -errno;
@@ -2851,12 +2879,10 @@ static int udp_switch_write(int fd, const struct iovec *iov, int iov_count, int6
 
 static int udp_switch_source(const struct sockaddr_storage *source, socklen_t length, uint8_t *guest,
                              socklen_t *guest_length) {
-    if (!source || source->ss_family != AF_UNIX || length < offsetof(struct sockaddr_un, sun_path) + 2)
-        return 0;
+    if (!source || source->ss_family != AF_UNIX || length < offsetof(struct sockaddr_un, sun_path) + 2) return 0;
     const char *path = ((const struct sockaddr_un *)source)->sun_path;
     unsigned port;
-    if (g_netns[0] && !strncmp(path, g_netns, strlen(g_netns)) &&
-        sscanf(path + strlen(g_netns), "/p%u", &port) == 1) {
+    if (g_netns[0] && !strncmp(path, g_netns, strlen(g_netns)) && sscanf(path + strlen(g_netns), "/p%u", &port) == 1) {
         fill_inet_lo(guest, guest_length, (uint16_t)port);
         return 1;
     }
@@ -2864,8 +2890,8 @@ static int udp_switch_source(const struct sockaddr_storage *source, socklen_t le
         size_t prefix = strlen(g_netif[i].path);
         unsigned a, b, c, d;
         if (!strncmp(path, g_netif[i].path, prefix) &&
-            sscanf(path + prefix, "/%u.%u.%u.%u:%u", &a, &b, &c, &d, &port) == 5 &&
-            a < 256 && b < 256 && c < 256 && d < 256 && port < 65536) {
+            sscanf(path + prefix, "/%u.%u.%u.%u:%u", &a, &b, &c, &d, &port) == 5 && a < 256 && b < 256 && c < 256 &&
+            d < 256 && port < 65536) {
             uint8_t bytes[4] = {(uint8_t)a, (uint8_t)b, (uint8_t)c, (uint8_t)d};
             uint32_t address;
             memcpy(&address, bytes, sizeof address);
@@ -2881,8 +2907,8 @@ static int udp_switch_source(const struct sockaddr_storage *source, socklen_t le
 struct udp_peer {
     struct sockaddr_storage caddr; // host client addr (macOS layout, as recvfrom delivered it)
     socklen_t calen;
-    int gs; // guest-facing AF_UNIX/SOCK_DGRAM socket (bound to its own path,
-            // connected to the guest switch socket) -- this client's identity
+    int gs;          // guest-facing AF_UNIX/SOCK_DGRAM socket (bound to its own path,
+                     // connected to the guest switch socket) -- this client's identity
     unsigned pathid; // the pseq used to build this peer's bound socket path (pdir/<pathid>); kept so the
                      // on-disk inode can be unlink'd when the peer is evicted or the forwarder tears down
     int used;
@@ -3503,8 +3529,7 @@ static int sa_un_m2l(const struct sockaddr *m, socklen_t mlen, uint8_t *g, sockl
         for (int volume = 0; volume < g_nvols; ++volume) {
             struct stat status;
             if (g_vols[volume].dead || g_vols[volume].isfile ||
-                snprintf(canonical, sizeof canonical, "%s/%s", g_vols[volume].hcanon, hpath) >=
-                    (int)sizeof canonical)
+                snprintf(canonical, sizeof canonical, "%s/%s", g_vols[volume].hcanon, hpath) >= (int)sizeof canonical)
                 continue;
             if (lstat(canonical, &status) != 0 || !S_ISSOCK(status.st_mode)) continue;
             backing = canonical;
@@ -3520,8 +3545,7 @@ static int sa_un_m2l(const struct sockaddr *m, socklen_t mlen, uint8_t *g, sockl
             matched_volume = volume;
         }
     if (matched_volume >= 0)
-        snprintf(gpath, sizeof gpath, "%s%s", g_vols[matched_volume].guest,
-                 backing + g_vols[matched_volume].hlen);
+        snprintf(gpath, sizeof gpath, "%s%s", g_vols[matched_volume].guest, backing + g_vols[matched_volume].hlen);
     else if (guest_backing)
         guest_from_host(backing, gpath, sizeof gpath); // overlay host path -> guest-visible path
     else
@@ -4238,7 +4262,8 @@ static uint16_t icmp_checksum(const void *data, size_t size) {
         size -= 2;
     }
     if (size) sum += (uint32_t)bytes[0] << 8;
-    while (sum >> 16) sum = (sum & 0xffffu) + (sum >> 16);
+    while (sum >> 16)
+        sum = (sum & 0xffffu) + (sum >> 16);
     return htons((uint16_t)~sum);
 }
 

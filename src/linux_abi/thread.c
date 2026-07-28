@@ -427,9 +427,12 @@ static _Atomic uint64_t g_gna_generation = 2;
 static atomic_flag g_gna_writer = ATOMIC_FLAG_INIT;
 static _Thread_local uint64_t g_gna_negative_page[GNA_NEGATIVE_N];
 static _Thread_local uint64_t g_gna_negative_generation[GNA_NEGATIVE_N];
+
 static void gna_writer_lock(void) {
-    while (atomic_flag_test_and_set_explicit(&g_gna_writer, memory_order_acquire)) sched_yield();
+    while (atomic_flag_test_and_set_explicit(&g_gna_writer, memory_order_acquire))
+        sched_yield();
 }
+
 static void gna_writer_unlock(void) {
     atomic_flag_clear_explicit(&g_gna_writer, memory_order_release);
 }
@@ -447,7 +450,8 @@ static void gro_clear(uint64_t lo, uint64_t hi);
 static void gro_clear_raw(uint64_t lo, uint64_t hi);
 
 static void gro_writer_lock(void) {
-    while (atomic_flag_test_and_set_explicit(&g_gro_writer, memory_order_acquire)) sched_yield();
+    while (atomic_flag_test_and_set_explicit(&g_gro_writer, memory_order_acquire))
+        sched_yield();
 }
 
 static void gro_writer_unlock(void) {
@@ -550,8 +554,7 @@ static void filemap_shared_filter_add(uint64_t address, uint64_t size) {
     }
     for (uint64_t page = first;; ++page) {
         uint64_t bit = page & (FILEMAP_SHARED_FILTER_BITS - 1);
-        atomic_fetch_or_explicit(&g_filemap_shared_filter[bit >> 6], UINT64_C(1) << (bit & 63),
-                                 memory_order_release);
+        atomic_fetch_or_explicit(&g_filemap_shared_filter[bit >> 6], UINT64_C(1) << (bit & 63), memory_order_release);
         if (page == last) break;
     }
 }
@@ -692,8 +695,7 @@ static void filemap_register(uint64_t address, uint64_t size, int fd, uint64_t o
         g_filemap[g_nfilemap++] = (struct guest_file_mapping){
             address, address + size, offset,           (uint64_t)st.st_dev, (uint64_t)st.st_ino, 0,
             0,       retained,       (uint32_t)shared, (uint32_t)emulated};
-        if (shared && emulated)
-            atomic_store_explicit(&g_filemap_emulated_shared, 1, memory_order_release);
+        if (shared && emulated) atomic_store_explicit(&g_filemap_emulated_shared, 1, memory_order_release);
         if (shared) atomic_fetch_add_explicit(&g_filemap_shared_epoch, 1, memory_order_seq_cst);
     } else if (retained >= 0) {
         int shared_source = 0;
@@ -940,8 +942,7 @@ static void filemap_written_identity(uint64_t device, uint64_t inode, int source
     pthread_mutex_lock(&g_filemap_lock);
     for (int i = 0; i < g_nfilemap; ++i) {
         struct guest_file_mapping *mapping = &g_filemap[i];
-        if (mapping->device != device || mapping->inode != inode)
-            continue;
+        if (mapping->device != device || mapping->inode != inode) continue;
         uint64_t map_lo;
         uint64_t map_hi;
         if (mapping->shared && mapping->emulated) {
@@ -1373,8 +1374,8 @@ static int gna_hit(uint64_t a, uint64_t len) {
     uint64_t generation = atomic_load_explicit(&g_gna_generation, memory_order_acquire);
     uint64_t first_page = a >> 12, last_page = (end - 1) >> 12;
     uint32_t slot = (uint32_t)(first_page * 2654435761u) & (GNA_NEGATIVE_N - 1);
-    if (!(generation & 1) && first_page == last_page &&
-        g_gna_negative_generation[slot] == generation && g_gna_negative_page[slot] == first_page)
+    if (!(generation & 1) && first_page == last_page && g_gna_negative_generation[slot] == generation &&
+        g_gna_negative_page[slot] == first_page)
         return 0;
     for (int i = 0; i < g_ngna; i++) {
         if (a < g_gna[i].hi && end > g_gna[i].lo) return 1;
@@ -1448,10 +1449,8 @@ static void gro_clear_raw(uint64_t lo, uint64_t hi) {
         int keep_head = b < lo, keep_tail = hi < e;
         if (!keep_head && !keep_tail) {
             --g_ngro;
-            __atomic_store_n(&g_gro[i].lo, __atomic_load_n(&g_gro[g_ngro].lo, __ATOMIC_RELAXED),
-                             __ATOMIC_RELAXED);
-            __atomic_store_n(&g_gro[i].hi, __atomic_load_n(&g_gro[g_ngro].hi, __ATOMIC_RELAXED),
-                             __ATOMIC_RELAXED);
+            __atomic_store_n(&g_gro[i].lo, __atomic_load_n(&g_gro[g_ngro].lo, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
+            __atomic_store_n(&g_gro[i].hi, __atomic_load_n(&g_gro[g_ngro].hi, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
             continue;
         }
         if (keep_head)

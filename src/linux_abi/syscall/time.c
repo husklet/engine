@@ -510,8 +510,8 @@ static int svc_time(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // swallowed all of that and always returned 0. Retry only on a spurious/internal EINTR (nothing
         // deliverable to the guest); surface a real EINTR so the dispatcher runs the pending handler. (LTP
         // nanosleep02: an out-of-range tv_nsec / negative tv_sec is EINVAL, not a silent success.)
-        if (a3 && guest_accessible_prefix(a3, sizeof(struct timespec), HL_LOGICAL_VMA_WRITE) !=
-                      sizeof(struct timespec)) {
+        if (a3 &&
+            guest_accessible_prefix(a3, sizeof(struct timespec), HL_LOGICAL_VMA_WRITE) != sizeof(struct timespec)) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
             break;
         }

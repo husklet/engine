@@ -290,8 +290,7 @@ static hl_host_result hl_windows_event_arm_timer(void *context, hl_host_handle p
                 LeaveCriticalSection(&pollset->lock);
                 return hl_windows_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
             }
-            memset(&grown[pollset->timer_capacity], 0,
-                   (size_t)(capacity - pollset->timer_capacity) * sizeof(*grown));
+            memset(&grown[pollset->timer_capacity], 0, (size_t)(capacity - pollset->timer_capacity) * sizeof(*grown));
             pollset->timers = grown;
             pollset->timer_capacity = capacity;
         }
@@ -495,7 +494,8 @@ static hl_host_result hl_windows_event_wait(void *context, hl_host_handle pollse
         return hl_windows_result(HL_STATUS_OUT_OF_MEMORY, 0, 0);
     }
     handles[0] = pollset->wake;
-    for (index = 0; index < count; ++index) handles[index + 1u] = slots[index].object;
+    for (index = 0; index < count; ++index)
+        handles[index + 1u] = slots[index].object;
     waited = WaitForMultipleObjects(count + 1u, handles, FALSE, hl_windows_event_timeout(host, deadline_ns));
     if (waited == WAIT_FAILED) {
         hl_host_result failure = hl_windows_last_error_result();
@@ -507,7 +507,8 @@ static hl_host_result hl_windows_event_wait(void *context, hl_host_handle pollse
     /* The wait that returned has already consumed the signalled object's state
      * -- an auto-reset timer is now reset -- so that one slot is reported from
      * the return value and only the others are re-sampled. */
-    if (satisfied == 0) ResetEvent(pollset->wake);
+    if (satisfied == 0)
+        ResetEvent(pollset->wake);
     else if (satisfied != UINT32_MAX && produced < event_capacity) {
         events[produced].token = slots[satisfied - 1u].token;
         events[produced].readiness = slots[satisfied - 1u].readiness;

@@ -189,9 +189,9 @@ static hl_status bound_provider_add(void *opaque, const char *path, size_t path_
         free(saved);
         return HL_STATUS_NOT_DIRECTORY;
     }
-    opened = provider->host->file->open_relative(
-        provider->host->context, HL_HOST_HANDLE_CWD, path, path_size,
-        HL_HOST_FILE_READ | (is_directory ? HL_HOST_FILE_DIRECTORY : 0u), 0, 0);
+    opened =
+        provider->host->file->open_relative(provider->host->context, HL_HOST_HANDLE_CWD, path, path_size,
+                                            HL_HOST_FILE_READ | (is_directory ? HL_HOST_FILE_DIRECTORY : 0u), 0, 0);
     if (opened.status != HL_STATUS_OK) {
         free(saved);
         return (hl_status)opened.status;
@@ -495,6 +495,7 @@ static void bound_inotify_notify_move(int source_directory, const char *source_p
         bound_inotify_move_side(provider, destination, HL_LINUX_IN_MOVED_TO, cookie);
     }
 }
+
 int typed_inotify_scm_image_export(struct hl_cmsg_kqueue_meta *metadata, int marker) {
     if (metadata == NULL || metadata->kind != 3) return 0;
     size_t size = 0;
@@ -527,17 +528,16 @@ int typed_inotify_scm_image_import(int fd, const struct hl_cmsg_kqueue_meta *met
     void *image = malloc(size);
     if (image == NULL || pread(marker, image, size, (off_t)sizeof *metadata) != (ssize_t)size ||
         bound_shadow_install(fd) != fd) {
-        fprintf(stderr, "[scm-inotify] cannot load/install fd=%d marker=%d size=%zu errno=%d\n", fd, marker,
-                size, errno);
+        fprintf(stderr, "[scm-inotify] cannot load/install fd=%d marker=%d size=%zu errno=%d\n", fd, marker, size,
+                errno);
         free(image);
         return -1;
     }
     void *provider = bound_inotify_provider_create(g_host_services);
-    int64_t imported = provider == NULL
-                           ? -HL_LINUX_ENOMEM
-                           : hl_linux_inotify_import_at(g_linux_box, (hl_linux_fd)fd, &bound_inotify_ops, provider,
-                                                        metadata->descriptor_flags, metadata->nonblock ? O_NONBLOCK : 0,
-                                                        image, size);
+    int64_t imported = provider == NULL ? -HL_LINUX_ENOMEM
+                                        : hl_linux_inotify_import_at(g_linux_box, (hl_linux_fd)fd, &bound_inotify_ops,
+                                                                     provider, metadata->descriptor_flags,
+                                                                     metadata->nonblock ? O_NONBLOCK : 0, image, size);
     free(image);
     if (imported < 0) {
         fprintf(stderr, "[scm-inotify] typed import fd=%d failed=%lld\n", fd, (long long)imported);

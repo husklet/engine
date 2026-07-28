@@ -65,8 +65,8 @@ typedef struct hl_windows_pipe_local_information {
 typedef struct hl_windows_stream_object {
     CRITICAL_SECTION lock;
     HANDLE pipe;
-    HANDLE ready;       /* manual-reset; the standing zero-byte read's event. Read end only. */
-    OVERLAPPED *arm;    /* the standing zero-byte read. Heap, because the kernel writes it. */
+    HANDLE ready;        /* manual-reset; the standing zero-byte read's event. Read end only. */
+    OVERLAPPED *arm;     /* the standing zero-byte read. Heap, because the kernel writes it. */
     unsigned char probe; /* the zero-byte read's (unused) buffer; never dereferenced by the kernel */
     uint32_t writing;
     uint32_t flags; /* HL_HOST_STREAM_NONBLOCK */
@@ -156,7 +156,8 @@ static uint32_t hl_windows_stream_append_number(WCHAR *out, uint32_t offset, uin
         digits[count++] = (WCHAR)(L'0' + (WCHAR)(value % 10u));
         value /= 10u;
     } while (value != 0 && count < (uint32_t)(sizeof(digits) / sizeof(digits[0])));
-    while (count != 0) out[offset++] = digits[--count];
+    while (count != 0)
+        out[offset++] = digits[--count];
     return offset;
 }
 
@@ -618,8 +619,7 @@ static hl_host_result hl_windows_stream_move(void *context, hl_host_handle sourc
             hl_windows_move_release(&output);
             return failure;
         }
-        if (!ReadFile(input.stream->pipe, buffer, chunk, &produced, &overlapped) &&
-            GetLastError() == ERROR_IO_PENDING)
+        if (!ReadFile(input.stream->pipe, buffer, chunk, &produced, &overlapped) && GetLastError() == ERROR_IO_PENDING)
             (void)GetOverlappedResult(input.stream->pipe, &overlapped, &produced, TRUE);
         CloseHandle(overlapped.hEvent);
         EnterCriticalSection(&input.stream->lock);

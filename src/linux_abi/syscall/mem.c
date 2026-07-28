@@ -1231,7 +1231,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
     // page is faithful.) Untouched trailing bytes (the guest zero-filled its vector) stay 0 = absent.
     case 232: {
         size_t hps = hl_linux_host_map_granularity(); // 16 KB on Apple Silicon, 64 KB on Windows
-        size_t gps = guest_pagesz();        // page size the GUEST believes in (AT_PAGESZ: 4 KB on both ISAs)
+        size_t gps = guest_pagesz();                  // page size the GUEST believes in (AT_PAGESZ: 4 KB on both ISAs)
         size_t len = (size_t)a1;
         // Linux mincore requires a page-aligned start address -> EINVAL otherwise (align to the GUEST page
         // so a valid 4 KB-granular start is not rejected on a coarser host page).

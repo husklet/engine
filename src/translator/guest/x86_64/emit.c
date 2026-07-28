@@ -127,7 +127,7 @@ static int g_shared_obs;
 
 static void e_dmb_ish(void) {
     if (!g_threaded && !g_shared_obs) return; // no peer thread AND no shared mapping -> nothing can observe
-    emit32(0xD5033ABFu); // DMB ISHST -- StoreStore only (see above; loads self-fence via ISHLD)
+    emit32(0xD5033ABFu);                      // DMB ISHST -- StoreStore only (see above; loads self-fence via ISHLD)
 }
 
 static void e_dmb_ishld(void) {
@@ -304,7 +304,9 @@ static void e_nzcv_save_ci(void) {  // save flags, inverting C (scratch x22: x21
     emit32(0xD51B4200u | 20); // also sync live ARM nzcv (msr) so spill persists the corrected value
 }
 
-void hl_x86_emit_flags_load(void) { e_nzcv_load(); }
+void hl_x86_emit_flags_load(void) {
+    e_nzcv_load();
+}
 
 static void e_nzcv_load_ci(void) { // load flags into live nzcv, inverting C
     e_ldr(20, 28, OFF_NZCV);
@@ -599,6 +601,7 @@ static void e_str_s(int t, int rn) {
 
 // Guest SIMD/x87 accesses. Keep these distinct from relaxed engine spills to cpu/scratch storage.
 static void emit_bus_guard_mem17(uint64_t size, int offset);
+
 static void g_ldr_q(int t, int rn, int off) {
     if (rn == 17) emit_bus_guard_mem17(16, off);
     e_ldr_q(t, rn, off);
@@ -621,7 +624,9 @@ void g_ldr_d(int t, int rn) {
     e_dmb_ishld();
 }
 
-void hl_x86_emit_vector_load64(int destination, int address) { g_ldr_d(destination, address); }
+void hl_x86_emit_vector_load64(int destination, int address) {
+    g_ldr_d(destination, address);
+}
 
 void g_str_d(int t, int rn) {
     if (rn == 17) emit_bus_guard_mem17(8, 0);
@@ -635,9 +640,13 @@ static void g_ldr_s(int t, int rn) {
     e_dmb_ishld();
 }
 
-void hl_x86_emit_load_scalar32(int destination, int address) { g_ldr_s(destination, address); }
+void hl_x86_emit_load_scalar32(int destination, int address) {
+    g_ldr_s(destination, address);
+}
 
-void hl_x86_emit_vector_load32(int destination, int address) { g_ldr_s(destination, address); }
+void hl_x86_emit_vector_load32(int destination, int address) {
+    g_ldr_s(destination, address);
+}
 
 static void g_str_s(int t, int rn) {
     if (rn == 17) emit_bus_guard_mem17(4, 0);
@@ -665,7 +674,9 @@ static void e_vmov(int vd, int vn) {
     emit32(0x4EA01C00u | (vn << 16) | (vn << 5) | vd);
 } // mov vd.16b, vn.16b (orr)
 
-void hl_x86_emit_vector_copy(int destination, int source) { e_vmov(destination, source); }
+void hl_x86_emit_vector_copy(int destination, int source) {
+    e_vmov(destination, source);
+}
 
 void hl_x86_emit_vector_broadcast32(int destination, int source, int lane) {
     emit32(UINT32_C(0x4E000400) | ((uint32_t)((lane << 3) | 4) << 16) | ((uint32_t)source << 5) |
@@ -901,8 +912,10 @@ static void emit_spill(void) {
 
 static void emit_reload_full(void) {
     e_nzcv_load();
-    for (int t = 0; t < 16; t += 2) e_ldp_q(t, t + 1, 28, OFF_V + t * 16);
-    for (int r = 1; r <= 15; ++r) e_ldr(r, 28, R_OFF(r));
+    for (int t = 0; t < 16; t += 2)
+        e_ldp_q(t, t + 1, 28, OFF_V + t * 16);
+    for (int r = 1; r <= 15; ++r)
+        e_ldr(r, 28, R_OFF(r));
     e_ldr(0, 28, R_OFF(0));
 }
 
@@ -952,8 +965,7 @@ static void emit_soft_guard(int address_register, uint64_t size, uint64_t rip, u
     }
     emit32(0xD53B4200u | 16u);
     e_str(16, 28, OFF_NZCV);
-    emit32(0xB1000000u | (((uint32_t)size & 0xfffu) << 10) |
-           ((unsigned)address_register << 5) | 9u);
+    emit32(0xB1000000u | (((uint32_t)size & 0xfffu) << 10) | ((unsigned)address_register << 5) | 9u);
     uint32_t *overflow_branch = (uint32_t *)g_cp;
     emit32(0);
     e_ldr(16, 28, OFF_SOFT_LAST);
@@ -1001,15 +1013,15 @@ static void emit_soft_guard(int address_register, uint64_t size, uint64_t rip, u
     e_br(16);
 
     uint8_t *resume = g_cp;
-#define PATCH_CBZ_X(p, target) (*(p) = 0xB4000000u | (((uint32_t)(((target) - (uint8_t *)(p)) / 4) & 0x7ffffu) << 5) | 16u)
+#define PATCH_CBZ_X(p, target)                                                                                         \
+    (*(p) = 0xB4000000u | (((uint32_t)(((target) - (uint8_t *)(p)) / 4) & 0x7ffffu) << 5) | 16u)
     PATCH_CBZ_X(invalid, miss);
     *wrong_page = 0xB5000000u | (((uint32_t)((miss - (uint8_t *)wrong_page) / 4) & 0x7ffffu) << 5) | 9u;
     if (denied_read)
         *denied_read = 0x36000000u | (((uint32_t)((miss - (uint8_t *)denied_read) / 4) & 0x3fffu) << 5) | 16u;
     if (denied_write)
         *denied_write = 0x36080000u | (((uint32_t)((miss - (uint8_t *)denied_write) / 4) & 0x3fffu) << 5) | 16u;
-    *overflow_branch =
-        0x54000002u | (((uint32_t)((span - (uint8_t *)overflow_branch) / 4) & 0x7ffffu) << 5);
+    *overflow_branch = 0x54000002u | (((uint32_t)((span - (uint8_t *)overflow_branch) / 4) & 0x7ffffu) << 5);
     *span_branch = 0x54000008u | (((uint32_t)((span - (uint8_t *)span_branch) / 4) & 0x7ffffu) << 5);
     *resume_branch = 0x14000000u | ((uint32_t)((resume - (uint8_t *)resume_branch) / 4) & 0x03ffffffu);
 #undef PATCH_CBZ_X
@@ -1053,8 +1065,7 @@ void emit_memory_guard(int address_register, uint64_t size, uint64_t rip, uint32
     uint32_t *filter_miss = (uint32_t *)g_cp;
     emit32(0); /* tbz x18,#0,resume */
     uint8_t *slow = g_cp;
-    *force_slow = 0x37000000u | (1u << 19) |
-                  (((uint32_t)((slow - (uint8_t *)force_slow) / 4) & 0x3FFFu) << 5) | 16u;
+    *force_slow = 0x37000000u | (1u << 19) | (((uint32_t)((slow - (uint8_t *)force_slow) / 4) & 0x3FFFu) << 5) | 16u;
     e_ldr(9, 28, OFF_BUS_SCRATCH);
     emit_spill();
     e_ldr(0, 28, OFF_BUS_EA);
@@ -1083,8 +1094,8 @@ void emit_memory_guard(int address_register, uint64_t size, uint64_t rip, uint32
     e_ldr(address_register, 28, OFF_BUS_EA);
     *filter_miss = 0x36000000u | (((uint32_t)((resume_fast - (uint8_t *)filter_miss) / 4) & 0x3FFFu) << 5) | 9u;
     uint8_t *resume_inactive = g_cp;
-    *inactive_fast = 0x36000000u | (((uint32_t)((resume_inactive - (uint8_t *)inactive_fast) / 4) & 0x3FFFu) << 5) |
-                     16u;
+    *inactive_fast =
+        0x36000000u | (((uint32_t)((resume_inactive - (uint8_t *)inactive_fast) / 4) & 0x3FFFu) << 5) | 16u;
 }
 
 void emit_bus_guard(int address_register, uint64_t size, uint64_t rip) {
@@ -1292,7 +1303,7 @@ static void emit_fast_syscall(uint64_t next) {
     // ---- clock_gettime: rax == 228 ----
     e_subi_s(16, 0, 228, 1); // subs x16, x0,
     uint32_t *m1 = (uint32_t *)g_cp;
-    e_bcond(1, 0);    // b.ne -> gettimeofday
+    e_bcond(1, 0); // b.ne -> gettimeofday
     if (g_nonpie_lo) {
         // The inline path writes RSI directly, while an ET_EXEC image's static
         // pointers name the low Linux link address and require nonpie_p()
@@ -1362,7 +1373,7 @@ static void emit_fast_syscall(uint64_t next) {
         to_slow[nsl++] = (uint32_t *)g_cp;
         e_bcond(14, 0); // fixed-layout pointers require canonical rebasing
     }
-    if (!g_fastclk) {                       // time arm disabled -> real gettimeofday syscall
+    if (!g_fastclk) { // time arm disabled -> real gettimeofday syscall
         to_slow[nsl++] = (uint32_t *)g_cp;
         e_bcond(14, 0); // b.al -> slow
     }
@@ -1479,7 +1490,7 @@ static void emit_fast_syscall(uint64_t next) {
         e_str(20, 28, OFF_FCRES); // window armed
         e_ldr(22, 6, 0);          // x22 = set = *(uint64_t*)rsi     [guarded]
         e_str(31, 28, OFF_FCRES); // window disarmed
-        e_subi_s(20, 7, 0, 1); // how == 0 (SIG_BLOCK) ?
+        e_subi_s(20, 7, 0, 1);    // how == 0 (SIG_BLOCK) ?
         uint32_t *not_block = (uint32_t *)g_cp;
         e_bcond(1, 0);                  // b.ne -> check unblock
         e_rrr(A_ORR, 19, 19, 22, 1, 0); // SIG_BLOCK: x19 = old | set

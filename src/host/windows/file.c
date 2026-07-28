@@ -120,8 +120,7 @@ static hl_host_result hl_windows_directory_for(hl_host_windows *host, hl_host_ha
     return hl_windows_result(HL_STATUS_OK, 0, 0);
 }
 
-static hl_host_result hl_windows_file_register(hl_host_windows *host, HANDLE object, uint32_t access,
-                                               uint32_t state) {
+static hl_host_result hl_windows_file_register(hl_host_windows *host, HANDLE object, uint32_t access, uint32_t state) {
     hl_host_result registered = hl_windows_allocate_handle(host, HL_WINDOWS_HANDLE_FILE);
     hl_windows_handle_entry *entry;
     if (registered.status != HL_STATUS_OK) return registered;
@@ -251,10 +250,10 @@ static hl_host_result hl_windows_metadata_for(hl_host_windows *host, HANDLE obje
          * the object actually is so a guest fstat can tell a console from a
          * pipe from a redirected file. */
         const DWORD kind = GetFileType(object);
-        output->type = kind == FILE_TYPE_CHAR    ? (uint32_t)HL_HOST_FILE_TYPE_CHARACTER
-                       : kind == FILE_TYPE_PIPE  ? (uint32_t)HL_HOST_FILE_TYPE_FIFO
-                       : kind == FILE_TYPE_DISK  ? (uint32_t)HL_HOST_FILE_TYPE_REGULAR
-                                                 : (uint32_t)HL_HOST_FILE_TYPE_UNKNOWN;
+        output->type = kind == FILE_TYPE_CHAR   ? (uint32_t)HL_HOST_FILE_TYPE_CHARACTER
+                       : kind == FILE_TYPE_PIPE ? (uint32_t)HL_HOST_FILE_TYPE_FIFO
+                       : kind == FILE_TYPE_DISK ? (uint32_t)HL_HOST_FILE_TYPE_REGULAR
+                                                : (uint32_t)HL_HOST_FILE_TYPE_UNKNOWN;
     } else if (hl_windows_symlink_candidate(attributes, output->size) &&
                hl_windows_symlink_read(&host->nt, object, NULL, 0, NULL)) {
         output->type = HL_HOST_FILE_TYPE_SYMLINK;
@@ -286,18 +285,17 @@ static hl_host_result hl_windows_open_resolved(hl_host_windows *host, const hl_w
     /* Windows has no mode bits at create time. The only guest bit with a native
      * counterpart is write permission, which becomes the read-only attribute;
      * the rest are the Linux front end's to virtualise. */
-    const ULONG attributes = (permissions & 0222u) == 0u ? (ULONG)FILE_ATTRIBUTE_READONLY : (ULONG)FILE_ATTRIBUTE_NORMAL;
-    NTSTATUS status = hl_windows_open_child(&host->nt, resolved->parent, resolved->leaf, resolved->leaf_length,
-                                            hl_windows_desired_access(access), attributes,
-                                            hl_windows_disposition(creation),
-                                            hl_windows_open_options(access, creation), &object);
+    const ULONG attributes =
+        (permissions & 0222u) == 0u ? (ULONG)FILE_ATTRIBUTE_READONLY : (ULONG)FILE_ATTRIBUTE_NORMAL;
+    NTSTATUS status = hl_windows_open_child(
+        &host->nt, resolved->parent, resolved->leaf, resolved->leaf_length, hl_windows_desired_access(access),
+        attributes, hl_windows_disposition(creation), hl_windows_open_options(access, creation), &object);
     hl_host_result result;
     uint32_t state = HL_WINDOWS_FILE_PATH_BACKED;
     if (status == HL_NT_ACCESS_DENIED && (access & HL_HOST_FILE_PATH_ONLY) != 0)
-        status = hl_windows_open_child(&host->nt, resolved->parent, resolved->leaf, resolved->leaf_length,
-                                       FILE_READ_ATTRIBUTES | FILE_TRAVERSE, attributes,
-                                       hl_windows_disposition(creation),
-                                       hl_windows_open_options(access, creation), &object);
+        status = hl_windows_open_child(
+            &host->nt, resolved->parent, resolved->leaf, resolved->leaf_length, FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+            attributes, hl_windows_disposition(creation), hl_windows_open_options(access, creation), &object);
     if (status != HL_NT_SUCCESS) return hl_windows_nt_result(host, status);
     if ((access & HL_HOST_FILE_DIRECTORY) != 0) state |= HL_WINDOWS_FILE_DIRECTORY;
     result = hl_windows_file_register(host, object, access, state);
@@ -305,9 +303,8 @@ static hl_host_result hl_windows_open_resolved(hl_host_windows *host, const hl_w
     return result;
 }
 
-static hl_host_result hl_windows_file_open(void *context, hl_host_handle directory, const char *path,
-                                           size_t path_size, uint32_t access, uint32_t creation,
-                                           uint32_t permissions) {
+static hl_host_result hl_windows_file_open(void *context, hl_host_handle directory, const char *path, size_t path_size,
+                                           uint32_t access, uint32_t creation, uint32_t permissions) {
     hl_host_windows *host = context;
     hl_windows_resolution resolved;
     hl_host_result result;
@@ -321,8 +318,7 @@ static hl_host_result hl_windows_file_open(void *context, hl_host_handle directo
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     /* O_NOFOLLOW, and O_CREAT|O_EXCL, both stop at the link node itself. */
     if ((access & HL_HOST_FILE_NOFOLLOW) != 0 ||
-        (creation & (HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE)) ==
-            (HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE))
+        (creation & (HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE)) == (HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE))
         policy |= HL_HOST_RESOLVE_NOFOLLOW_FINAL;
     result = hl_windows_directory_for(host, directory, &root);
     if (result.status != HL_STATUS_OK) return result;
@@ -341,16 +337,14 @@ static hl_host_result hl_windows_file_open_beneath(void *context, hl_host_handle
     hl_windows_resolution resolved;
     hl_host_result result;
     HANDLE anchor = NULL;
-    if (path == NULL || path_size == 0 || path[0] == '/' || path[0] == '\\' ||
-        memchr(path, '\0', path_size) != NULL ||
+    if (path == NULL || path_size == 0 || path[0] == '/' || path[0] == '\\' || memchr(path, '\0', path_size) != NULL ||
         (policy & ~(uint32_t)(HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS)) != 0)
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     /* A drive-qualified spelling is an absolute path wearing a relative shape,
      * and resolve_path would honour it. Beneath-a-root must not. */
     if (path_size >= 2 && path[1] == ':') return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     policy |= HL_HOST_RESOLVE_ALLOW_MISSING;
-    if ((creation & (HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE)) ==
-        (HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE))
+    if ((creation & (HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE)) == (HL_HOST_FILE_CREATE | HL_HOST_FILE_EXCLUSIVE))
         policy |= HL_HOST_RESOLVE_NOFOLLOW_FINAL;
     result = hl_windows_directory_for(host, root, &anchor);
     if (result.status != HL_STATUS_OK) return result;
@@ -407,10 +401,9 @@ static hl_host_result hl_windows_file_resolve_beneath(void *context, hl_host_han
     /* Resolution must not participate in special-file I/O, so the target is
      * pinned for metadata only -- FILE_READ_ATTRIBUTES is this backend's O_PATH. */
     if ((policy & HL_HOST_RESOLVE_ALLOW_MISSING) == 0) {
-        const NTSTATUS status =
-            hl_windows_open_child(&host->nt, resolved.parent, resolved.leaf, resolved.leaf_length,
-                                  FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_TRAVERSE, 0, FILE_OPEN,
-                                  FILE_OPEN_REPARSE_POINT, &target);
+        const NTSTATUS status = hl_windows_open_child(&host->nt, resolved.parent, resolved.leaf, resolved.leaf_length,
+                                                      FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_TRAVERSE, 0,
+                                                      FILE_OPEN, FILE_OPEN_REPARSE_POINT, &target);
         if (status != HL_NT_SUCCESS) {
             CloseHandle(resolved.parent);
             return hl_windows_nt_result(host, status);
@@ -485,8 +478,7 @@ static hl_host_result hl_windows_file_positioned(hl_host_windows *host, hl_host_
     moved = (uint64_t)status_block.Information;
     if (restore) {
         IO_STATUS_BLOCK restored;
-        (void)host->nt.set_information_file(object, &restored, &saved, (ULONG)sizeof(saved),
-                                            FilePositionInformation);
+        (void)host->nt.set_information_file(object, &restored, &saved, (ULONG)sizeof(saved), FilePositionInformation);
     }
     hl_windows_unlock(host);
     if (status == HL_NT_END_OF_FILE) return hl_windows_result(HL_STATUS_OK, 0, 0);
@@ -554,8 +546,8 @@ static hl_host_result hl_windows_append_bytes(hl_host_windows *host, hl_host_han
     if ((access & HL_HOST_FILE_APPEND) == 0) return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     where.HighPart = -1;
     where.LowPart = 0xFFFFFFFFu; /* FILE_WRITE_TO_END_OF_FILE */
-    status = host->nt.write_file(object, NULL, NULL, NULL, &status_block, data, hl_windows_transfer_size(size),
-                                 &where, NULL);
+    status = host->nt.write_file(object, NULL, NULL, NULL, &status_block, data, hl_windows_transfer_size(size), &where,
+                                 NULL);
     if (status != HL_NT_SUCCESS) return hl_windows_nt_result(host, status);
     return hl_windows_result(HL_STATUS_OK, (uint64_t)status_block.Information, 0);
 }
@@ -587,9 +579,8 @@ static hl_status hl_windows_vectors_valid(const hl_host_iovec *vectors, uint32_t
  * these iterate. The loop stops on the first short transfer, which is what a
  * caller must already tolerate from readv on a POSIX host.
  */
-static hl_host_result hl_windows_file_vector(hl_host_windows *host, hl_host_handle file,
-                                             const hl_host_iovec *vectors, uint32_t count, uint64_t offset,
-                                             int positioned, int writing) {
+static hl_host_result hl_windows_file_vector(hl_host_windows *host, hl_host_handle file, const hl_host_iovec *vectors,
+                                             uint32_t count, uint64_t offset, int positioned, int writing) {
     uint64_t total = 0;
     uint64_t moved = 0;
     uint32_t index;
@@ -754,8 +745,7 @@ static hl_host_result hl_windows_file_truncate(void *context, hl_host_handle fil
     if (!hl_windows_file_borrow(host, file, &object, NULL, NULL))
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     end.value.QuadPart = (LONGLONG)size;
-    status = host->nt.set_information_file(object, &status_block, &end, (ULONG)sizeof(end),
-                                           FileEndOfFileInformation);
+    status = host->nt.set_information_file(object, &status_block, &end, (ULONG)sizeof(end), FileEndOfFileInformation);
     return status == HL_NT_SUCCESS ? hl_windows_result(HL_STATUS_OK, 0, 0) : hl_windows_nt_result(host, status);
 }
 
@@ -785,8 +775,8 @@ static hl_host_result hl_windows_file_data_sync(void *context, hl_host_handle fi
  * so the range is honoured by being exceeded. */
 static hl_host_result hl_windows_file_sync_range(void *context, hl_host_handle file, uint64_t offset, uint64_t size,
                                                  uint32_t flags) {
-    if ((flags & ~(uint32_t)(HL_HOST_FILE_SYNC_WAIT_BEFORE | HL_HOST_FILE_SYNC_WRITE |
-                             HL_HOST_FILE_SYNC_WAIT_AFTER)) != 0 ||
+    if ((flags & ~(uint32_t)(HL_HOST_FILE_SYNC_WAIT_BEFORE | HL_HOST_FILE_SYNC_WRITE | HL_HOST_FILE_SYNC_WAIT_AFTER)) !=
+            0 ||
         offset > (uint64_t)INT64_MAX || size > (uint64_t)INT64_MAX || offset > (uint64_t)INT64_MAX - size)
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     return hl_windows_flush(context, file);
@@ -838,10 +828,9 @@ static hl_host_result hl_windows_remove(hl_host_windows *host, hl_host_handle di
     if (path == NULL || path_size == 0) return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     result = hl_windows_directory_for(host, directory, &root);
     if (result.status != HL_STATUS_OK) return result;
-    result = hl_windows_resolve_path(host, root, path, path_size,
-                                     HL_WINDOWS_RESOLVE_ESCAPE | HL_HOST_RESOLVE_NOFOLLOW_FINAL |
-                                         HL_HOST_RESOLVE_ALLOW_MISSING,
-                                     &resolved);
+    result = hl_windows_resolve_path(
+        host, root, path, path_size,
+        HL_WINDOWS_RESOLVE_ESCAPE | HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_ALLOW_MISSING, &resolved);
     CloseHandle(root);
     if (result.status != HL_STATUS_OK) return result;
     if (resolved.leaf_length == 0) {
@@ -849,11 +838,10 @@ static hl_host_result hl_windows_remove(hl_host_windows *host, hl_host_handle di
         CloseHandle(resolved.parent);
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    status = hl_windows_open_child(&host->nt, resolved.parent, resolved.leaf, resolved.leaf_length, DELETE, 0,
-                                   FILE_OPEN,
-                                   FILE_OPEN_REPARSE_POINT |
-                                       (as_directory ? (ULONG)FILE_DIRECTORY_FILE : (ULONG)FILE_NON_DIRECTORY_FILE),
-                                   &victim);
+    status = hl_windows_open_child(
+        &host->nt, resolved.parent, resolved.leaf, resolved.leaf_length, DELETE, 0, FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT | (as_directory ? (ULONG)FILE_DIRECTORY_FILE : (ULONG)FILE_NON_DIRECTORY_FILE),
+        &victim);
     CloseHandle(resolved.parent);
     if (status != HL_NT_SUCCESS) return hl_windows_nt_result(host, status);
     flags = HL_NT_DISPOSITION_DELETE | HL_NT_DISPOSITION_POSIX | HL_NT_DISPOSITION_IGNORE_READONLY;
@@ -881,8 +869,8 @@ static hl_host_result hl_windows_file_remove_directory(void *context, hl_host_ha
 }
 
 static hl_host_result hl_windows_file_rename(void *context, hl_host_handle old_directory, const char *old_path,
-                                             size_t old_path_size, hl_host_handle new_directory,
-                                             const char *new_path, size_t new_path_size) {
+                                             size_t old_path_size, hl_host_handle new_directory, const char *new_path,
+                                             size_t new_path_size) {
     hl_host_windows *host = context;
     hl_windows_resolution source;
     hl_windows_resolution destination;
@@ -905,10 +893,9 @@ static hl_host_result hl_windows_file_rename(void *context, hl_host_handle old_d
         CloseHandle(source.parent);
         return result;
     }
-    result = hl_windows_resolve_path(host, root, new_path, new_path_size,
-                                     HL_WINDOWS_RESOLVE_ESCAPE | HL_HOST_RESOLVE_NOFOLLOW_FINAL |
-                                         HL_HOST_RESOLVE_ALLOW_MISSING,
-                                     &destination);
+    result = hl_windows_resolve_path(
+        host, root, new_path, new_path_size,
+        HL_WINDOWS_RESOLVE_ESCAPE | HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_ALLOW_MISSING, &destination);
     CloseHandle(root);
     if (result.status != HL_STATUS_OK) {
         CloseHandle(source.parent);
@@ -933,12 +920,12 @@ static hl_host_result hl_windows_file_rename(void *context, hl_host_handle old_d
     /* POSIX semantics is what makes replacing an *open* destination work, which
      * rename(2) requires and the legacy class refuses. */
     information.flags = HL_NT_RENAME_REPLACE_IF_EXISTS | HL_NT_RENAME_POSIX;
-    status = host->nt.set_information_file(object, &status_block, &information,
-                                           hl_windows_link_size(&information), HL_NT_FILE_RENAME_INFORMATION_EX);
+    status = host->nt.set_information_file(object, &status_block, &information, hl_windows_link_size(&information),
+                                           HL_NT_FILE_RENAME_INFORMATION_EX);
     if (status != HL_NT_SUCCESS) {
         information.flags = HL_NT_RENAME_REPLACE_IF_EXISTS;
-        status = host->nt.set_information_file(object, &status_block, &information,
-                                               hl_windows_link_size(&information), FileRenameInformation);
+        status = host->nt.set_information_file(object, &status_block, &information, hl_windows_link_size(&information),
+                                               FileRenameInformation);
     }
     CloseHandle(object);
     CloseHandle(destination.parent);
@@ -957,10 +944,9 @@ static hl_host_result hl_windows_file_make_directory(void *context, hl_host_hand
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     result = hl_windows_directory_for(host, directory, &root);
     if (result.status != HL_STATUS_OK) return result;
-    result = hl_windows_resolve_path(host, root, path, path_size,
-                                     HL_WINDOWS_RESOLVE_ESCAPE | HL_HOST_RESOLVE_NOFOLLOW_FINAL |
-                                         HL_HOST_RESOLVE_ALLOW_MISSING,
-                                     &resolved);
+    result = hl_windows_resolve_path(
+        host, root, path, path_size,
+        HL_WINDOWS_RESOLVE_ESCAPE | HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_ALLOW_MISSING, &resolved);
     CloseHandle(root);
     if (result.status != HL_STATUS_OK) return result;
     if (resolved.leaf_length == 0) {
@@ -991,10 +977,9 @@ static hl_host_result hl_windows_file_make_symlink(void *context, const char *ta
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     result = hl_windows_directory_for(host, directory, &root);
     if (result.status != HL_STATUS_OK) return result;
-    result = hl_windows_resolve_path(host, root, path, path_size,
-                                     HL_WINDOWS_RESOLVE_ESCAPE | HL_HOST_RESOLVE_NOFOLLOW_FINAL |
-                                         HL_HOST_RESOLVE_ALLOW_MISSING,
-                                     &resolved);
+    result = hl_windows_resolve_path(
+        host, root, path, path_size,
+        HL_WINDOWS_RESOLVE_ESCAPE | HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_ALLOW_MISSING, &resolved);
     CloseHandle(root);
     if (result.status != HL_STATUS_OK) return result;
     if (resolved.leaf_length == 0) {
@@ -1013,8 +998,7 @@ static hl_host_result hl_windows_file_make_symlink(void *context, const char *ta
                                  (ULONG)HL_WINDOWS_SYMLINK_MAGIC_SIZE, &where, NULL);
     if (status == HL_NT_SUCCESS) {
         where.QuadPart = HL_WINDOWS_SYMLINK_MAGIC_SIZE;
-        status = host->nt.write_file(object, NULL, NULL, NULL, &status_block, target, (ULONG)target_size, &where,
-                                     NULL);
+        status = host->nt.write_file(object, NULL, NULL, NULL, &status_block, target, (ULONG)target_size, &where, NULL);
     }
     CloseHandle(object);
     if (status != HL_NT_SUCCESS) {
@@ -1040,10 +1024,9 @@ static hl_host_result hl_windows_file_make_link(void *context, hl_host_handle ol
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     result = hl_windows_directory_for(host, old_directory, &root);
     if (result.status != HL_STATUS_OK) return result;
-    result = hl_windows_resolve_path(host, root, old_path, old_path_size,
-                                     HL_WINDOWS_RESOLVE_ESCAPE |
-                                         ((flags & 1u) != 0 ? 0u : (uint32_t)HL_HOST_RESOLVE_NOFOLLOW_FINAL),
-                                     &source);
+    result = hl_windows_resolve_path(
+        host, root, old_path, old_path_size,
+        HL_WINDOWS_RESOLVE_ESCAPE | ((flags & 1u) != 0 ? 0u : (uint32_t)HL_HOST_RESOLVE_NOFOLLOW_FINAL), &source);
     CloseHandle(root);
     if (result.status != HL_STATUS_OK) return result;
     result = hl_windows_directory_for(host, new_directory, &root);
@@ -1051,10 +1034,9 @@ static hl_host_result hl_windows_file_make_link(void *context, hl_host_handle ol
         CloseHandle(source.parent);
         return result;
     }
-    result = hl_windows_resolve_path(host, root, new_path, new_path_size,
-                                     HL_WINDOWS_RESOLVE_ESCAPE | HL_HOST_RESOLVE_NOFOLLOW_FINAL |
-                                         HL_HOST_RESOLVE_ALLOW_MISSING,
-                                     &destination);
+    result = hl_windows_resolve_path(
+        host, root, new_path, new_path_size,
+        HL_WINDOWS_RESOLVE_ESCAPE | HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_ALLOW_MISSING, &destination);
     CloseHandle(root);
     if (result.status != HL_STATUS_OK) {
         CloseHandle(source.parent);
@@ -1065,8 +1047,8 @@ static hl_host_result hl_windows_file_make_link(void *context, hl_host_handle ol
         CloseHandle(destination.parent);
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    status = hl_windows_open_child(&host->nt, source.parent, source.leaf, source.leaf_length, FILE_READ_ATTRIBUTES,
-                                   0, FILE_OPEN, FILE_OPEN_REPARSE_POINT | FILE_NON_DIRECTORY_FILE, &object);
+    status = hl_windows_open_child(&host->nt, source.parent, source.leaf, source.leaf_length, FILE_READ_ATTRIBUTES, 0,
+                                   FILE_OPEN, FILE_OPEN_REPARSE_POINT | FILE_NON_DIRECTORY_FILE, &object);
     CloseHandle(source.parent);
     if (status != HL_NT_SUCCESS) {
         CloseHandle(destination.parent);
@@ -1112,8 +1094,7 @@ static hl_host_result hl_windows_file_readlink(void *context, hl_host_handle fil
     if (output.size != 0 && output.data == NULL) return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if (!hl_windows_file_borrow(host, file, &object, NULL, &state))
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if ((state & HL_WINDOWS_FILE_PATH_BACKED) == 0)
-        return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if ((state & HL_WINDOWS_FILE_PATH_BACKED) == 0) return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if (!hl_windows_symlink_read(&host->nt, object, target, (uint32_t)sizeof(target), &target_size))
         /* readlink(2) on a non-symlink is EINVAL, not ENOENT. */
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
@@ -1141,8 +1122,7 @@ static hl_host_result hl_windows_file_path(void *context, hl_host_handle file, h
     if (output.size != 0 && output.data == NULL) return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if (!hl_windows_file_borrow(host, file, &object, NULL, &state))
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if ((state & HL_WINDOWS_FILE_PATH_BACKED) == 0)
-        return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if ((state & HL_WINDOWS_FILE_PATH_BACKED) == 0) return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     produced = GetFinalPathNameByHandleW(object, path, (DWORD)(sizeof(path) / sizeof(*path)),
                                          FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
     if (produced == 0 || produced >= sizeof(path) / sizeof(*path)) return hl_windows_last_error_result();
@@ -1179,8 +1159,7 @@ static hl_host_result hl_windows_file_set_permissions(void *context, hl_host_han
     if (!hl_windows_file_borrow(host, file, &object, NULL, NULL))
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     memset(&basic, 0, sizeof(basic));
-    status = host->nt.query_information_file(object, &status_block, &basic, (ULONG)sizeof(basic),
-                                             FileBasicInformation);
+    status = host->nt.query_information_file(object, &status_block, &basic, (ULONG)sizeof(basic), FileBasicInformation);
     if (status != HL_NT_SUCCESS) return hl_windows_nt_result(host, status);
     /* Only the write bits survive the crossing. Setting the read-only attribute
      * is the whole of what chmod can mean on a Windows volume without an ACL
@@ -1190,8 +1169,7 @@ static hl_host_result hl_windows_file_set_permissions(void *context, hl_host_han
     if (attributes == 0) attributes = FILE_ATTRIBUTE_NORMAL;
     memset(&basic, 0, sizeof(basic));
     basic.FileAttributes = attributes;
-    status = host->nt.set_information_file(object, &status_block, &basic, (ULONG)sizeof(basic),
-                                           FileBasicInformation);
+    status = host->nt.set_information_file(object, &status_block, &basic, (ULONG)sizeof(basic), FileBasicInformation);
     return status == HL_NT_SUCCESS ? hl_windows_result(HL_STATUS_OK, 0, 0) : hl_windows_nt_result(host, status);
 }
 
@@ -1224,15 +1202,14 @@ static hl_host_result hl_windows_file_set_times(void *context, hl_host_handle fi
         else
             basic.LastWriteTime = value;
     }
-    status = host->nt.set_information_file(object, &status_block, &basic, (ULONG)sizeof(basic),
-                                           FileBasicInformation);
+    status = host->nt.set_information_file(object, &status_block, &basic, (ULONG)sizeof(basic), FileBasicInformation);
     return status == HL_NT_SUCCESS ? hl_windows_result(HL_STATUS_OK, 0, 0) : hl_windows_nt_result(host, status);
 }
 
-static hl_host_result hl_windows_file_allocate_range(void *context, hl_host_handle file, uint32_t mode,
-                                                     uint64_t offset, uint64_t size) {
-    const uint32_t allowed = HL_HOST_FILE_ALLOC_KEEP_SIZE | HL_HOST_FILE_ALLOC_PUNCH_HOLE |
-                             HL_HOST_FILE_ALLOC_ZERO_RANGE;
+static hl_host_result hl_windows_file_allocate_range(void *context, hl_host_handle file, uint32_t mode, uint64_t offset,
+                                                     uint64_t size) {
+    const uint32_t allowed =
+        HL_HOST_FILE_ALLOC_KEEP_SIZE | HL_HOST_FILE_ALLOC_PUNCH_HOLE | HL_HOST_FILE_ALLOC_ZERO_RANGE;
     hl_host_windows *host = context;
     FILE_STANDARD_INFORMATION standard;
     hl_windows_offset_information extent;
@@ -1240,8 +1217,7 @@ static hl_host_result hl_windows_file_allocate_range(void *context, hl_host_hand
     NTSTATUS status;
     HANDLE object = NULL;
     DWORD produced = 0;
-    if (size == 0 || offset > (uint64_t)INT64_MAX || size > (uint64_t)INT64_MAX ||
-        offset > (uint64_t)INT64_MAX - size)
+    if (size == 0 || offset > (uint64_t)INT64_MAX || size > (uint64_t)INT64_MAX || offset > (uint64_t)INT64_MAX - size)
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     /* COLLAPSE_RANGE, INSERT_RANGE and UNSHARE_RANGE move or split file extents
      * in place. NTFS exposes no operation that does either, and no sequence of
@@ -1259,8 +1235,7 @@ static hl_host_result hl_windows_file_allocate_range(void *context, hl_host_hand
         if ((mode & HL_HOST_FILE_ALLOC_PUNCH_HOLE) != 0) {
             /* fallocate demands KEEP_SIZE with PUNCH_HOLE, and the hole is only
              * a hole once the file is sparse. */
-            if ((mode & HL_HOST_FILE_ALLOC_KEEP_SIZE) == 0)
-                return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+            if ((mode & HL_HOST_FILE_ALLOC_KEEP_SIZE) == 0) return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
             if (!DeviceIoControl(object, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &produced, NULL))
                 return hl_windows_last_error_result();
         }
@@ -1369,9 +1344,8 @@ static hl_host_result hl_windows_file_read_directory(void *context, hl_host_hand
             return produced != 0 ? hl_windows_result(HL_STATUS_OK, produced, bytes)
                                  : hl_windows_nt_result(host, status);
         }
-        converted = hl_windows_utf8_from_wide(record->FileName, record->FileNameLength / 2u,
-                                              entries[produced].name, sizeof(entries[produced].name) - 1u,
-                                              &name_size);
+        converted = hl_windows_utf8_from_wide(record->FileName, record->FileNameLength / 2u, entries[produced].name,
+                                              sizeof(entries[produced].name) - 1u, &name_size);
         if (converted != HL_STATUS_OK) {
             hl_windows_unlock(host);
             return hl_windows_result(converted, produced, bytes);
@@ -1395,9 +1369,8 @@ static hl_host_result hl_windows_file_read_directory(void *context, hl_host_hand
              * instead of pushing a stat back onto every caller. */
             HANDLE probe = NULL;
             entries[produced].type = HL_HOST_DIRECTORY_TYPE_REGULAR;
-            if (hl_windows_open_child(&host->nt, object, record->FileName, record->FileNameLength / 2u,
-                                      FILE_READ_DATA, 0, FILE_OPEN, FILE_OPEN_REPARSE_POINT, &probe) ==
-                HL_NT_SUCCESS) {
+            if (hl_windows_open_child(&host->nt, object, record->FileName, record->FileNameLength / 2u, FILE_READ_DATA,
+                                      0, FILE_OPEN, FILE_OPEN_REPARSE_POINT, &probe) == HL_NT_SUCCESS) {
                 if (hl_windows_symlink_read(&host->nt, probe, NULL, 0, NULL))
                     entries[produced].type = HL_HOST_DIRECTORY_TYPE_LINK;
                 CloseHandle(probe);
@@ -1492,8 +1465,10 @@ static hl_host_result hl_windows_file_close(void *context, hl_host_handle file) 
  * for the same reason ntdll is bound by name: a static archive that pulls in a
  * second import library pushes a link flag onto everything downstream.
  */
-enum { HL_WINDOWS_WRITE_ACCESS = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
-                                 WRITE_DAC | WRITE_OWNER | DELETE | GENERIC_WRITE | GENERIC_ALL };
+enum {
+    HL_WINDOWS_WRITE_ACCESS = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | WRITE_DAC |
+                              WRITE_OWNER | DELETE | GENERIC_WRITE | GENERIC_ALL
+};
 
 static uint32_t hl_windows_sid_size(const void *sid) {
     const unsigned char *bytes = sid;
@@ -1531,8 +1506,7 @@ static hl_host_result hl_windows_validate_private(hl_host_windows *host, hl_host
     uint32_t state = 0;
     if (!hl_windows_file_borrow(host, file, &object, NULL, &state))
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if ((state & HL_WINDOWS_FILE_PATH_BACKED) == 0)
-        return hl_windows_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
+    if ((state & HL_WINDOWS_FILE_PATH_BACKED) == 0) return hl_windows_result(HL_STATUS_PERMISSION_DENIED, 0, 0);
     memset(&metadata, 0, sizeof(metadata));
     result = hl_windows_metadata_for(host, object, state, &metadata);
     if (result.status != HL_STATUS_OK) return result;
@@ -1553,8 +1527,7 @@ static hl_host_result hl_windows_validate_private(hl_host_windows *host, hl_host
 
     status = host->nt.open_process_token(GetCurrentProcess(), TOKEN_QUERY, &token);
     if (status != HL_NT_SUCCESS) return hl_windows_nt_result(host, status);
-    status = host->nt.query_information_token(token, 1 /* TokenUser */, token_raw, (ULONG)sizeof(token_raw),
-                                              &produced);
+    status = host->nt.query_information_token(token, 1 /* TokenUser */, token_raw, (ULONG)sizeof(token_raw), &produced);
     CloseHandle(token);
     if (status != HL_NT_SUCCESS) return hl_windows_nt_result(host, status);
     user = (const unsigned char *)((const TOKEN_USER *)(const void *)token_raw)->User.Sid;
@@ -1608,15 +1581,14 @@ static hl_host_result hl_windows_file_store_private_atomic(void *context, hl_hos
     uint64_t at = 0;
     unsigned attempt;
     int length;
-    if (path == NULL || path_size == 0 || (permissions & ~07777u) != 0 ||
-        (input.size != 0 && input.data == NULL) || input.size > HL_WINDOWS_IO_MAX)
+    if (path == NULL || path_size == 0 || (permissions & ~07777u) != 0 || (input.size != 0 && input.data == NULL) ||
+        input.size > HL_WINDOWS_IO_MAX)
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     result = hl_windows_directory_for(host, directory, &root);
     if (result.status != HL_STATUS_OK) return result;
-    result = hl_windows_resolve_path(host, root, path, path_size,
-                                     HL_WINDOWS_RESOLVE_ESCAPE | HL_HOST_RESOLVE_NOFOLLOW_FINAL |
-                                         HL_HOST_RESOLVE_ALLOW_MISSING,
-                                     &resolved);
+    result = hl_windows_resolve_path(
+        host, root, path, path_size,
+        HL_WINDOWS_RESOLVE_ESCAPE | HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_ALLOW_MISSING, &resolved);
     CloseHandle(root);
     if (result.status != HL_STATUS_OK) return result;
     if (resolved.leaf_length == 0 || resolved.leaf_length > HL_WINDOWS_NAME_MAX - 32) {
@@ -1628,11 +1600,10 @@ static hl_host_result hl_windows_file_store_private_atomic(void *context, hl_hos
                           (int)resolved.leaf_length, resolved.leaf, (unsigned long)GetCurrentProcessId(),
                           (unsigned long)InterlockedIncrement(&sequence));
         if (length <= 0) break;
-        status = hl_windows_open_child(&host->nt, resolved.parent, temporary, (uint32_t)length,
-                                       FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | DELETE,
-                                       (permissions & 0222u) == 0u ? (ULONG)FILE_ATTRIBUTE_READONLY
-                                                                   : (ULONG)FILE_ATTRIBUTE_NORMAL,
-                                       FILE_CREATE, FILE_NON_DIRECTORY_FILE, &object);
+        status = hl_windows_open_child(
+            &host->nt, resolved.parent, temporary, (uint32_t)length, FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | DELETE,
+            (permissions & 0222u) == 0u ? (ULONG)FILE_ATTRIBUTE_READONLY : (ULONG)FILE_ATTRIBUTE_NORMAL, FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE, &object);
         if (status == HL_NT_SUCCESS) break;
     }
     if (status != HL_NT_SUCCESS || object == NULL) {
@@ -1653,8 +1624,8 @@ static hl_host_result hl_windows_file_store_private_atomic(void *context, hl_hos
         information.root = resolved.parent;
         information.name_length = resolved.leaf_length * 2u;
         memcpy(information.name, resolved.leaf, (size_t)resolved.leaf_length * sizeof(WCHAR));
-        status = host->nt.set_information_file(object, &status_block, &information,
-                                               hl_windows_link_size(&information), HL_NT_FILE_RENAME_INFORMATION_EX);
+        status = host->nt.set_information_file(object, &status_block, &information, hl_windows_link_size(&information),
+                                               HL_NT_FILE_RENAME_INFORMATION_EX);
         if (status != HL_NT_SUCCESS) {
             information.flags = HL_NT_RENAME_REPLACE_IF_EXISTS;
             status = host->nt.set_information_file(object, &status_block, &information,

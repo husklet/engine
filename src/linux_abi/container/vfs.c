@@ -10,9 +10,9 @@
 #include "../../core/provider/files.h"
 #include "../../core/provider/namespace.h"
 #if defined(__linux__)
-#include <sys/prctl.h> // host PR_SET_NAME: mirror the guest comm onto this host task so a PEER's
-                       // /proc/<pid>/{stat,status,comm} read (hl_host_process_read) reports the guest
-                       // program name, not the engine binary "hl-engine-linux".
+#include <sys/prctl.h>     // host PR_SET_NAME: mirror the guest comm onto this host task so a PEER's
+                           // /proc/<pid>/{stat,status,comm} read (hl_host_process_read) reports the guest
+                           // program name, not the engine binary "hl-engine-linux".
 #include <sys/sysmacros.h> // glibc keeps major()/minor() here, not in <sys/types.h>: the dev field of a
                            // file-backed /proc/<pid>/maps row.
 #endif
@@ -22,9 +22,18 @@
 // would otherwise degrade into a host stat of a mis-followed path (ENOENT) instead of ELOOP. atpath() clears
 // this at entry; the path syscalls consult resolve_loop_detected() after resolving and surface -ELOOP.
 static _Thread_local int g_symloop_hit;
-static void resolve_loop_mark(void) { g_symloop_hit = 1; }
-static void resolve_loop_clear(void) { g_symloop_hit = 0; }
-static int resolve_loop_detected(void) { return g_symloop_hit; }
+
+static void resolve_loop_mark(void) {
+    g_symloop_hit = 1;
+}
+
+static void resolve_loop_clear(void) {
+    g_symloop_hit = 0;
+}
+
+static int resolve_loop_detected(void) {
+    return g_symloop_hit;
+}
 
 static int path_copy(char *out, size_t capacity, const char *value) {
     size_t length;
@@ -468,7 +477,6 @@ static void proc_fdvis_cleanup(void);
 static void proc_fdvis_close(int guest_fd);
 static int proc_fdvis_publish_native_fd(int guest_fd);
 
-
 struct fdvis_fork_entry {
     unsigned slot;
     int guest_fd;
@@ -819,7 +827,8 @@ static int proc_fdvis_fork_prepare(struct fdvis_fork_plan *plan) {
         entries[reserved++].slot = index;
     }
     if (reserved != count) {
-        for (size_t index = 0; index < reserved; ++index) memset(&g_fdvis[entries[index].slot], 0, sizeof *g_fdvis);
+        for (size_t index = 0; index < reserved; ++index)
+            memset(&g_fdvis[entries[index].slot], 0, sizeof *g_fdvis);
         fdvis_unlock();
         free(entries);
         return -ENOSPC;
@@ -912,7 +921,10 @@ static _Thread_local struct ts_slot *ts_self;
 static _Thread_local int ts_self_pid;
 static void ts_after_fork(void); // pthread_atfork child handler: drops the inherited slot cache
 static pthread_once_t ts_atfork_once = PTHREAD_ONCE_INIT;
-static void ts_atfork_install(void) { (void)pthread_atfork(NULL, NULL, ts_after_fork); }
+
+static void ts_atfork_install(void) {
+    (void)pthread_atfork(NULL, NULL, ts_after_fork);
+}
 
 static struct ts_slot *ts_mine(void) {
     if (__builtin_expect(ts_self != NULL, 1)) return ts_self;
@@ -1285,6 +1297,7 @@ static void inotify_object_assign(int fd) {
     if (!serial) serial = ++g_inotify_object_next;
     g_inotify_object[fd] = ((uint64_t)(uint32_t)getpid() << 32) | serial;
 }
+
 // timerfd remaining-time tracking (lsys-timerfd-gettime): absolute CLOCK_MONOTONIC deadline (ns) of the
 // next expiry + the interval (ns). timerfd_settime records them so timerfd_gettime reports it_value/interval.
 static int64_t g_tfd_deadline[HL_NFD];
@@ -1295,6 +1308,7 @@ static uint64_t g_tfd_pending[HL_NFD];
 static int g_tfd_refs[HL_NFD];
 static uint64_t g_tfd_object[HL_NFD];
 static uint8_t g_tfd_nb[HL_NFD];
+
 struct timerfd_shared_state {
     volatile int lock;
     int64_t deadline;
@@ -1304,12 +1318,14 @@ struct timerfd_shared_state {
 static struct timerfd_shared_state *g_tfd_shared[HL_NFD];
 
 static void timerfd_shared_lock(struct timerfd_shared_state *state) {
-    while (__sync_lock_test_and_set(&state->lock, 1)) sched_yield();
+    while (__sync_lock_test_and_set(&state->lock, 1))
+        sched_yield();
 }
 
 static void timerfd_shared_unlock(struct timerfd_shared_state *state) {
     __sync_lock_release(&state->lock);
 }
+
 static uint32_t g_tfd_object_next;
 
 static int timerfd_slot(int fd) {
@@ -1325,6 +1341,7 @@ static void timerfd_object_assign(int fd) {
     g_tfd_cslot[fd] = fd + 1;
     g_tfd_refs[fd] = 1;
 }
+
 // A periodic timerfd whose FIRST expiry (it_value) differs from its interval (it_interval) can't be
 // expressed in a single kqueue EVFILT_TIMER (which fires first only after its period). So we arm a
 // ONE-SHOT at the first delay and set this flag; on the first read() drain the timer is re-armed as a
@@ -1495,8 +1512,8 @@ static int root_handle_bind(const char *path) {
         if (borrowed.status != HL_STATUS_OK)
             borrowed = attachment->borrow_file_at_least(g_host_services->context, root.value, 64);
         if (borrowed.status != HL_STATUS_OK || borrowed.value > INT_MAX) goto fail_root;
-        if (g_root_fd >= 0 && attachment->release(g_host_services->context, (uint64_t)(unsigned)g_root_fd).status !=
-                                  HL_STATUS_OK)
+        if (g_root_fd >= 0 &&
+            attachment->release(g_host_services->context, (uint64_t)(unsigned)g_root_fd).status != HL_STATUS_OK)
             goto fail_borrowed;
     }
     if (g_root_handle != HL_HOST_HANDLE_INVALID &&
@@ -1525,8 +1542,9 @@ fail_root:
 // HL_HOST_CAP_POSIX_ATTACHMENT (linux/host.c, macos/host.c), so root_handle_bind always binds g_root_fd.
 static int root_native_require(const char *path) {
     if (g_root_fd >= 0) return 0;
-    fprintf(stderr, "hl-engine: rootfs %s needs a native root descriptor; this host does not implement the "
-                    "optional POSIX attachment services\n",
+    fprintf(stderr,
+            "hl-engine: rootfs %s needs a native root descriptor; this host does not implement the "
+            "optional POSIX attachment services\n",
             path);
     return -1;
 }
@@ -1936,8 +1954,7 @@ static int secure_resolve(const char *guest, char *out, size_t n, int nofollow) 
     char final[512], parent[4200];
     int descriptor = resolve_at(guest, final, sizeof final, nofollow);
     if (descriptor >= 0) {
-        int ok = hl_native_fd_path(descriptor, parent, sizeof parent) == 0 &&
-                 path_join(out, n, parent, final) == 0;
+        int ok = hl_native_fd_path(descriptor, parent, sizeof parent) == 0 && path_join(out, n, parent, final) == 0;
         close(descriptor);
         if (ok) return 1;
     }
@@ -2131,8 +2148,7 @@ static const char *find_in_path(const char *prog, char *gbuf, size_t n) {
             // on .jail-escape-denied and simply fails to match), so this is safe.
             if (dl == 0) {
                 if (path_join(gbuf, n, g_cwd, prog) != 0) continue;
-            }
-            else {
+            } else {
                 char dir[4200];
                 if (dl >= sizeof dir) dl = sizeof dir - 1;
                 memcpy(dir, s, dl);
@@ -2141,8 +2157,7 @@ static const char *find_in_path(const char *prog, char *gbuf, size_t n) {
                     if (path_join(gbuf, n, dir, prog) != 0) continue;
                 } else {
                     char rooted[8400];
-                    if (path_join(rooted, sizeof rooted, g_cwd, dir) != 0 ||
-                        path_join(gbuf, n, rooted, prog) != 0)
+                    if (path_join(rooted, sizeof rooted, g_cwd, dir) != 0 || path_join(gbuf, n, rooted, prog) != 0)
                         continue;
                 }
             }
@@ -2649,6 +2664,7 @@ static int maps_prot_spans(const void *reg, int count, uint64_t lo, uint64_t hi,
     const struct {
         uint64_t lo, hi;
     } *iv = reg;
+
     int n = 0;
     for (int i = 0; i < count && n < maxn; i++) {
         uint64_t a = iv[i].lo > lo ? iv[i].lo : lo, b = iv[i].hi < hi ? iv[i].hi : hi;
@@ -3057,6 +3073,7 @@ static int map_files_target(const char *entry, char *out, size_t n) {
 // /proc/[pid]/status -- the Name:/State:/VmRSS: key:value format (NOT the stat one-liner). VmRSS/VmSize
 // reflect the cgroup memory charge so a reader sees a plausible footprint.
 static unsigned long long self_rss_bytes(void); // defined after hl_get_procinfo (real engine resident floor)
+
 // One current per-process footprint sample (resident + virtual, in bytes).
 // /proc is live state on Linux: values may legitimately move between separate
 // reads. Caching the first sample forever made statm claim that a faulted
@@ -3135,8 +3152,7 @@ static int proc_status_text(char *b, size_t n) {
         "Cpus_allowed:\t%s\nCpus_allowed_list:\t%s\nvoluntary_ctxt_switches:\t1\n"
         "nonvoluntary_ctxt_switches:\t0\n",
         comm, (unsigned)g_umask, pid, pid, ppid, uid_r, uid_e, uid_s, uid_fs, gid_r, gid_e, gid_s, gid_fs, groups, vsz,
-        vsz, vmlck, rss,
-        rss, rss, threads, (unsigned long long)HL_CAP_DEFAULT, (unsigned long long)g_cap_eff,
+        vsz, vmlck, rss, rss, rss, threads, (unsigned long long)HL_CAP_DEFAULT, (unsigned long long)g_cap_eff,
         (unsigned long long)g_cap_bnd, g_nnp, cpumask, cpulist);
 }
 
@@ -3464,8 +3480,7 @@ static int proc_mountstats_text(char *b, size_t n) {
         int nf = 0;
         for (char *tok = strtok(line, " "); tok && nf < 11; tok = strtok(NULL, " "))
             f[nf++] = tok;
-        if (nf >= 10)
-            o += snprintf(b + o, n - (size_t)o, "device %s mounted on %s with fstype %s\n", f[8], f[4], f[7]);
+        if (nf >= 10) o += snprintf(b + o, n - (size_t)o, "device %s mounted on %s with fstype %s\n", f[8], f[4], f[7]);
         line = nl + 1;
         if ((size_t)o + 128 >= n) break;
     }
@@ -3511,7 +3526,7 @@ static void proc_reg_key(char *out, size_t n) {
 // This process's own registry file (unlinked on exit; the exit_group path calls proc_reg_unlink since
 // _exit bypasses atexit). Stale files from a crash are pruned lazily by the enumerator (dead-pid check).
 static char g_reg_file[128];
-static char g_reg_exe_file[128]; // sibling "x<pid>" record: the canonical exe path (for /proc/<pid>/exe)
+static char g_reg_exe_file[128];   // sibling "x<pid>" record: the canonical exe path (for /proc/<pid>/exe)
 static char g_reg_birth_file[160]; // sibling "b<pid>": native start time, preventing PID-reuse kills
 static char g_reg_last_buf[4096];
 static int g_reg_last_len;
@@ -3553,8 +3568,7 @@ static void proc_reg_write_files(const char *dir, const char *buf, int len, cons
             if (hl_host_file_rename(&g_jit_services, xtmp, xfin) == 0) {
                 if (path_copy(g_reg_exe_file, sizeof g_reg_exe_file, xfin) != 0)
                     (void)hl_host_file_unlink(&g_jit_services, xfin);
-            }
-            else
+            } else
                 (void)hl_host_file_unlink(&g_jit_services, xtmp);
         }
     }
@@ -3792,8 +3806,7 @@ static int proc_fd_link_pid(int host, int fd, char *out, size_t n) {
     uint32_t logical_kind = HL_HOST_FD_OTHER;
     uint64_t logical_device = 0, logical_object = 0;
     int logical_found = proc_fdvis_lookup(host, fd, &logical_kind, &logical_device, &logical_object);
-    if (logical_found &&
-        logical_kind != HL_HOST_FD_FILE && logical_object != 0) {
+    if (logical_found && logical_kind != HL_HOST_FD_FILE && logical_object != 0) {
         const char *logical_name = logical_kind == HL_HOST_FD_SOCKET ? "socket"
                                    : logical_kind == HL_HOST_FD_PIPE ? "pipe"
                                                                      : "anon_inode";
@@ -4198,9 +4211,9 @@ static int proc_pid_not_self(const char *rp) {
 // expose it (e.g. the macOS build), keeping a well-formed link. Writes the string into `out`, returns len.
 static int ns_link_target(const char *name, char *out, size_t cap) {
     static const struct {
-        const char *nm;   // guest ns-dir entry name
-        const char *tgt;  // link target namespace name (pid_for_children -> "pid")
-        unsigned ino;     // initial-namespace fallback inode
+        const char *nm;  // guest ns-dir entry name
+        const char *tgt; // link target namespace name (pid_for_children -> "pid")
+        unsigned ino;    // initial-namespace fallback inode
     } NS[] = {{"cgroup", "cgroup", 4026531835u},
               {"ipc", "ipc", 4026531839u},
               {"mnt", "mnt", 4026531841u},
@@ -4526,11 +4539,10 @@ static int proc_leaf_dir_open(const char *guestpath, int with_task) {
     // The per-pid file set. Direct open/stat serve every name here (proc_open), so listing them makes
     // readdir-based discovery agree with direct probing (mountinfo/limits/environ/smaps/pagemap/io were
     // openable but hidden from `ls /proc/self`).
-    static const char *const files[] = {"stat",       "statm",         "status",  "cmdline",   "comm",
-                                        "maps",       "oom_score_adj", "oom_adj", "oom_score", "mountinfo",
-                                        "limits",     "environ",       "smaps",   "pagemap",   "io",
-                                        "mounts",     "cgroup",        "auxv",    "numa_maps", "smaps_rollup",
-                                        "mountstats", "syscall",       0};
+    static const char *const files[] = {"stat",          "statm",        "status",     "cmdline",   "comm",   "maps",
+                                        "oom_score_adj", "oom_adj",      "oom_score",  "mountinfo", "limits", "environ",
+                                        "smaps",         "pagemap",      "io",         "mounts",    "cgroup", "auxv",
+                                        "numa_maps",     "smaps_rollup", "mountstats", "syscall",   0};
     for (int i = 0; files[i]; i++) {
         char p[64];
         snprintf(p, sizeof p, "%s/%s", tmpl, files[i]);
@@ -4885,8 +4897,7 @@ static int synth_names_dir_open(const char *guestpath, const char *const *names,
                 procfd_dir_rm(tmpl);
                 return -1;
             }
-        }
-        else {
+        } else {
             int f = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0444);
             if (f >= 0) close(f);
         }
@@ -4940,10 +4951,9 @@ static int synth_misc_dir_open(const char *gp) {
     if (!strcmp(gp, "/dev/fd") || !strcmp(gp, "/dev/fd/")) return proc_fd_dir_open(); // /dev/fd == /proc/self/fd
     // /proc/net: direct leaves (tcp/dev/unix/…) exist but the dir must enumerate them too.
     if (!strcmp(gp, "/proc/net") || !strcmp(gp, "/proc/net/")) {
-        static const char *const net[] = {"tcp",     "tcp6",     "udp",       "udp6",       "unix",
-                                          "dev",     "route",    "if_inet6",  "snmp",       "snmp6",
-                                          "netstat", "sockstat", "sockstat6", "ipv6_route", "arp",
-                                          "igmp",    0};
+        static const char *const net[] = {"tcp",       "tcp6",       "udp",  "udp6",  "unix",    "dev",
+                                          "route",     "if_inet6",   "snmp", "snmp6", "netstat", "sockstat",
+                                          "sockstat6", "ipv6_route", "arp",  "igmp",  0};
         return synth_names_dir_open("/proc/net", net, 0);
     }
     // /proc/tty: tty discovery tools (agetty, `ls /proc/tty`) walk this before reading drivers.
@@ -5573,8 +5583,7 @@ static int proc_open(const char *rp) {
             // The host's whole mount table, device names included, came through here while mounts/mountinfo
             // were intercepted. Same view as those two, in mountstats' "device X mounted on Y" form.
             n = proc_mountstats_text(buf, sizeof buf);
-        else
-        if (!strcmp(leaf, "status"))
+        else if (!strcmp(leaf, "status"))
             n = proc_status_text(buf, sizeof buf);
         else if (!strcmp(leaf, "stat"))
             n = proc_stat_text(buf, sizeof buf);
@@ -6408,7 +6417,8 @@ static uint8_t g_fd_ptsmaster[HL_NFD];       // 1 = this fd is the MASTER end, 0
 static int pts_node_path(int n, char *buf, size_t bn) {
     char directory[4200], leaf[16];
     int length = snprintf(leaf, sizeof leaf, "%d", n);
-    if (length < 0 || (size_t)length >= sizeof leaf || path_concat(directory, sizeof directory, g_rootfs_canon, "/dev/pts") != 0)
+    if (length < 0 || (size_t)length >= sizeof leaf ||
+        path_concat(directory, sizeof directory, g_rootfs_canon, "/dev/pts") != 0)
         return -1;
     return path_join(buf, bn, directory, leaf);
 }
@@ -7046,8 +7056,7 @@ static int synth_stat_raw(const char *gp, struct stat *s) {
     }
     close(fd);
     // /proc/self/comm is 0644 on Linux (writing it renames the task; see the write handler in io.c).
-    int writable_proc =
-        gp && (strstr(gp, "/oom_score_adj") || strstr(gp, "/oom_adj") || strstr(gp, "/self/comm"));
+    int writable_proc = gp && (strstr(gp, "/oom_score_adj") || strstr(gp, "/oom_adj") || strstr(gp, "/self/comm"));
     s->st_mode = S_IFREG | (writable_proc ? 0644 : 0444);
     // present as a readable regular file
     s->st_nlink = 1;

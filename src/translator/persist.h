@@ -19,7 +19,12 @@ int hl_persist_load_at(const hl_persist_directory *directory, const char *name, 
 int hl_persist_store_at(const hl_persist_directory *directory, const char *name, const void *data, size_t size);
 int hl_persist_remove_at(const hl_persist_directory *directory, const char *name);
 
-typedef struct hl_persist_cursor { const unsigned char *data; size_t size; size_t offset; } hl_persist_cursor;
+typedef struct hl_persist_cursor {
+    const unsigned char *data;
+    size_t size;
+    size_t offset;
+} hl_persist_cursor;
+
 int hl_persist_take(hl_persist_cursor *cursor, void *output, size_t size);
 
 #endif

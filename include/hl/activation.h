@@ -97,8 +97,7 @@ HL_API hl_status hl_activation_start_terminal_with_transport(const char *executa
 HL_API hl_status hl_activation_start_with_streams(const char *executable, uint32_t guest_isa, const char *config_path,
                                                   const hl_activation_streams *streams, const hl_terminal_size *size,
                                                   hl_activation_descriptor transport,
-                                                  hl_activation_descriptor checkpoint,
-                                                  hl_activation_descriptor trigger,
+                                                  hl_activation_descriptor checkpoint, hl_activation_descriptor trigger,
                                                   hl_activation_descriptor *out_master,
                                                   hl_activation_process **out_process);
 HL_API hl_status hl_activation_terminal_resize(hl_activation_descriptor master, hl_terminal_size size);

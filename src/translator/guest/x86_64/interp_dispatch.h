@@ -45,22 +45,22 @@ static inline int smc_seen(void) {
 // A PLAIN brace block (NOT do/while(0)) so the trace-cap `break` reaches the shared dispatcher while-loop.
 #define G_DISPATCH_DEBUG(c)                                                                                            \
     {                                                                                                                  \
-        if (g_pending) maybe_deliver_signal(c); /* redirect to the guest handler */                                     \
-        g_prevpc = g_curpc;                                                                                             \
-        g_curpc = (c)->rip;                                                                                             \
-        g_disp_n++;                                                                                                     \
-        if (g_trace && g_tracecap && g_disp_n > g_tracecap) { /* bound runaway trace output */                          \
-            fprintf(stderr, "[hl] trace cap %llu blocks reached -> stop\n", (unsigned long long)g_tracecap);            \
-            (c)->exited = 1;                                                                                            \
-            (c)->exit_code = 99;                                                                                        \
-            break;                                                                                                      \
-        }                                                                                                               \
+        if (g_pending) maybe_deliver_signal(c); /* redirect to the guest handler */                                    \
+        g_prevpc = g_curpc;                                                                                            \
+        g_curpc = (c)->rip;                                                                                            \
+        g_disp_n++;                                                                                                    \
+        if (g_trace && g_tracecap && g_disp_n > g_tracecap) { /* bound runaway trace output */                         \
+            fprintf(stderr, "[hl] trace cap %llu blocks reached -> stop\n", (unsigned long long)g_tracecap);           \
+            (c)->exited = 1;                                                                                           \
+            (c)->exit_code = 99;                                                                                       \
+            break;                                                                                                     \
+        }                                                                                                              \
         if (g_w8 && *g_w8 != g_w8v) { /* byte watchpoint */                                                            \
-            fprintf(stderr, "[w8] @%p %02x -> %02x  by block +%llx  malloc#=%llu  rsi=%llx\n", (void *)g_w8, g_w8v,     \
-                    *g_w8, (unsigned long long)(g_prevpc - g_loadbase), (unsigned long long)g_malloc_n,                 \
-                    (unsigned long long)(c)->r[6]);                                                                     \
-            g_w8v = *g_w8;                                                                                              \
-        }                                                                                                               \
+            fprintf(stderr, "[w8] @%p %02x -> %02x  by block +%llx  malloc#=%llu  rsi=%llx\n", (void *)g_w8, g_w8v,    \
+                    *g_w8, (unsigned long long)(g_prevpc - g_loadbase), (unsigned long long)g_malloc_n,                \
+                    (unsigned long long)(c)->r[6]);                                                                    \
+            g_w8v = *g_w8;                                                                                             \
+        }                                                                                                              \
     }
 
 // On-flush reset; g_xibtc holds HOST code pointers (header note).
@@ -101,9 +101,9 @@ static inline int smc_seen(void) {
 // falls through to the R_BRANCH default and resumes at a PC nobody set -- and R_TIER2 must NOT take
 // dispatch.h's tier2_promote + `continue`, which without an emitted counter would loop on one block.
 #define G_DISPATCH_REASON(c)                                                                                           \
-    /* The C instruction emulators come FIRST and do not `continue` unconditionally: they run outside      \
-       run_block, so a guest access they reject leaves a NEW reason (R_SOFTMISS, or R_TRAP for an          \
-       emulated #UD) that the arms below have to see. rip = the insn; the callee advances it. */           \
+    /* The C instruction emulators come FIRST and do not `continue` unconditionally: they run outside                  \
+       run_block, so a guest access they reject leaves a NEW reason (R_SOFTMISS, or R_TRAP for an                      \
+       emulated #UD) that the arms below have to see. rip = the insn; the callee advances it. */                       \
     if ((c)->reason == R_AVX) {                                                                                        \
         hl_x86_avx_run(&g_avx_state, (c));                                                                             \
         if ((c)->reason == R_AVX) continue;                                                                            \
@@ -116,17 +116,17 @@ static inline int smc_seen(void) {
         if (soft_tlb_miss(c)) maybe_deliver_signal(c);                                                                 \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_SOFTSPAN) { /* retry the restartable string op */                                              \
+    if ((c)->reason == R_SOFTSPAN) { /* retry the restartable string op */                                             \
         (c)->reason = R_BRANCH;                                                                                        \
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == 99) {                                                                                           \
-        fprintf(stderr, "[hl] aborting at rip marker %llx (unimplemented opcode)\n", (unsigned long long)(c)->rip);     \
+        fprintf(stderr, "[hl] aborting at rip marker %llx (unimplemented opcode)\n", (unsigned long long)(c)->rip);    \
         (c)->exited = 1;                                                                                               \
         (c)->exit_code = 70;                                                                                           \
         break;                                                                                                         \
     }                                                                                                                  \
-    if ((c)->reason == R_TIER2) { /* see the header note */                                                             \
+    if ((c)->reason == R_TIER2) { /* see the header note */                                                            \
         (c)->reason = R_BRANCH;                                                                                        \
         continue;                                                                                                      \
     }                                                                                                                  \
@@ -134,35 +134,35 @@ static inline int smc_seen(void) {
         hl_x86_cpuid(c);                                                                                               \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_REPSTR) { /* rep cmps/scas */                                                                  \
+    if ((c)->reason == R_REPSTR) { /* rep cmps/scas */                                                                 \
         hl_x86_rep_compare(c, g_nonpie_lo, g_nonpie_hi, g_nonpie_bias);                                                \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_X87FLD) {                                                                                      \
+    if ((c)->reason == R_X87FLD) {                                                                                     \
         hl_x86_x87_load_ext80(c);                                                                                      \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_X87FSTP) {                                                                                     \
+    if ((c)->reason == R_X87FSTP) {                                                                                    \
         hl_x86_x87_store_ext80_pop(c);                                                                                 \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_X87FUNC) {                                                                                     \
+    if ((c)->reason == R_X87FUNC) {                                                                                    \
         hl_x86_x87_math(c);                                                                                            \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_RCL) { /* RCL/RCR by CL */                                                                     \
+    if ((c)->reason == R_RCL) { /* RCL/RCR by CL */                                                                    \
         hl_x86_rotate_carry(c);                                                                                        \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_CMPXCHG16) {                                                                                   \
+    if ((c)->reason == R_CMPXCHG16) {                                                                                  \
         hl_x86_cmpxchg16(c);                                                                                           \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_FXSAVE) { /* x87-register DATA + FSW tail */                                                   \
+    if ((c)->reason == R_FXSAVE) { /* x87-register DATA + FSW tail */                                                  \
         hl_x86_fxsave(c);                                                                                              \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_FXRSTOR) { /* x87-register DATA + FSW tail */                                                   \
+    if ((c)->reason == R_FXRSTOR) { /* x87-register DATA + FSW tail */                                                 \
         hl_x86_fxrstor(c);                                                                                             \
         continue;                                                                                                      \
     }                                                                                                                  \
@@ -207,13 +207,13 @@ static inline int smc_seen(void) {
         (c)->r[RDX] = (uint64_t)(num % d);                                                                             \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_TRAP) { /* int3/UD2; cpu->divop = signo|code<<8 */                                             \
+    if ((c)->reason == R_TRAP) { /* int3/UD2; cpu->divop = signo|code<<8 */                                            \
         if (raise_guest_trap(c)) {                                                                                     \
             maybe_deliver_signal(c);                                                                                   \
             continue;                                                                                                  \
         }                                                                                                              \
-        (c)->exited = 1; /* no handler: default action terminates */                                                    \
-        (c)->exit_code = 128 + ((int)((c)->divop & 0xff));                                                              \
+        (c)->exited = 1; /* no handler: default action terminates */                                                   \
+        (c)->exit_code = 128 + ((int)((c)->divop & 0xff));                                                             \
         break;                                                                                                         \
     }                                                                                                                  \
     if ((c)->reason == R_BUS) {                                                                                        \
@@ -229,12 +229,12 @@ static inline int smc_seen(void) {
         continue;                                                                                                      \
     }                                                                                                                  \
     if ((c)->reason == R_SYSCALL) {                                                                                    \
-        /* Publish emulated MAP_SHARED stores before a write/socket/futex syscall can notify a peer. */                 \
-        if ((c)->smc_range_count || (c)->smc_range_overflow) jit86_smc_commit(c);                                       \
+        /* Publish emulated MAP_SHARED stores before a write/socket/futex syscall can notify a peer. */                \
+        if ((c)->smc_range_count || (c)->smc_range_overflow) jit86_smc_commit(c);                                      \
         service(c);                                                                                                    \
         if ((c)->exited) break;                                                                                        \
-        /* And after: the syscall's own copyout (G_SMC_COPYOUT) may have written an executable alias. */                \
-        if ((c)->smc_range_count || (c)->smc_range_overflow) jit86_smc_commit(c);                                       \
-        if ((c)->redirect) (c)->redirect = 0; /* else rip already = next */                                             \
+        /* And after: the syscall's own copyout (G_SMC_COPYOUT) may have written an executable alias. */               \
+        if ((c)->smc_range_count || (c)->smc_range_overflow) jit86_smc_commit(c);                                      \
+        if ((c)->redirect) (c)->redirect = 0; /* else rip already = next */                                            \
     }                                                                                                                  \
     /* R_BRANCH: c->rip already holds the target */

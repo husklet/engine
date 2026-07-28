@@ -113,8 +113,7 @@ static const char *atpath(int dirfd, const char *raw, char *buf, size_t n, int n
                 }
         char combined[8400];
         char rooted[8400];
-        if (path_join(rooted, sizeof rooted, "/", gdir) != 0 ||
-            path_join(combined, sizeof combined, rooted, raw) != 0)
+        if (path_join(rooted, sizeof rooted, "/", gdir) != 0 || path_join(combined, sizeof combined, rooted, raw) != 0)
             return NULL;
         if (g_nlower) {
             overlay_resolve(combined, buf, n, nofollow);

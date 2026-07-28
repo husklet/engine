@@ -133,9 +133,7 @@ static void acct_claim_self(void) {
 static void acct_container_reset(const hl_host_services *host) {
     size_t sz = sizeof(struct hl_acct_slot) * HL_ACCT_SLOTS;
     void *arena = NULL;
-    g_acct = hl_linux_shared_create(host, sz, &arena) == HL_STATUS_OK
-                 ? (struct hl_acct_slot *)arena
-                 : NULL;
+    g_acct = hl_linux_shared_create(host, sz, &arena) == HL_STATUS_OK ? (struct hl_acct_slot *)arena : NULL;
     g_acct_self = NULL;
     acct_claim_self();
     static int reg = 0; // free our slot on a normal exit (fork children inherit this atexit registration)
@@ -395,8 +393,9 @@ static int mode_xattr_set_fd(int fd, mode_t mode) {
 
 static int mode_xattr_get(const char *hostpath, int fd, mode_t *mode) {
     uint32_t value;
-    ssize_t size = fd >= 0 ? hl_native_fgetxattr(fd, HL_MODE_XATTR, &value, sizeof value, 0, 0)
-                           : hostpath ? hl_native_getxattr(hostpath, HL_MODE_XATTR, &value, sizeof value, 0, 0) : -1;
+    ssize_t size = fd >= 0    ? hl_native_fgetxattr(fd, HL_MODE_XATTR, &value, sizeof value, 0, 0)
+                   : hostpath ? hl_native_getxattr(hostpath, HL_MODE_XATTR, &value, sizeof value, 0, 0)
+                              : -1;
     if (size != (ssize_t)sizeof value) return 0;
     *mode = (mode_t)(value & 07777u);
     return 1;
@@ -588,7 +587,7 @@ static int gid_permitted(int id) {
 static uint64_t g_cap_eff = HL_CAP_DEFAULT; // process EFFECTIVE cap set (capset(2) may narrow it)
 static uint64_t g_cap_bnd = HL_CAP_DEFAULT; // process BOUNDING cap set (PR_CAPBSET_DROP clears bits)
 static int g_nnp;                           // PR_SET/GET_NO_NEW_PRIVS: sticky; /proc/self/status NoNewPrivs
-static int g_securebits;                     // PR_SET/GET_SECUREBITS: the per-process securebits flags (0 default)
+static int g_securebits;                    // PR_SET/GET_SECUREBITS: the per-process securebits flags (0 default)
 // The file-mode creation mask. Forwarded to the host on umask(2) so real inode creation honours it, but ALSO
 // tracked here so /proc/self/status `Umask:` reflects the guest's current value (it was hardcoded 0022, so a
 // guest umask(2) changed real file modes yet the status line stayed 0022 -- a syscall-vs-/proc disagreement).
@@ -673,8 +672,13 @@ static hl_linux_ports g_ports;
 // fd -> the container port it bound (for getsockname)
 static uint16_t g_fd_cport[HL_NFD];
 
-static uint16_t pm_host(uint16_t c) { return hl_linux_ports_host(&g_ports, c); }
-static uint32_t pm_address(uint16_t c) { return hl_linux_ports_address(&g_ports, c); }
+static uint16_t pm_host(uint16_t c) {
+    return hl_linux_ports_host(&g_ports, c);
+}
+
+static uint32_t pm_address(uint16_t c) {
+    return hl_linux_ports_address(&g_ports, c);
+}
 
 static uint32_t parse_publish_address(const char *begin, const char *end) {
     uint32_t address = 0;

@@ -66,12 +66,12 @@ static void aarch64_smc_copyout(uint64_t, uint64_t);
 static void aarch64_soft_filter_refresh(struct cpu *);
 #define G_SOFT_TLB_REFRESH(c) aarch64_soft_filter_refresh(c)
 /* Mapping publication retires logical-VMA backing only after this STW clear. */
-#define G_SOFT_TLB_CLEAR(c)                                                                                           \
-    do {                                                                                                              \
-        (c)->soft_page = UINT64_MAX;                                                                                  \
-        (c)->soft_protection = 0;                                                                                     \
-        (c)->soft_span_bytes = 0;                                                                                     \
-        (c)->soft_span_protection = 0;                                                                                \
+#define G_SOFT_TLB_CLEAR(c)                                                                                            \
+    do {                                                                                                               \
+        (c)->soft_page = UINT64_MAX;                                                                                   \
+        (c)->soft_protection = 0;                                                                                      \
+        (c)->soft_span_bytes = 0;                                                                                      \
+        (c)->soft_span_protection = 0;                                                                                 \
     } while (0)
 
 // Child thread resume PC: aarch64 services a syscall with pc still at the SVC, so advance +4.

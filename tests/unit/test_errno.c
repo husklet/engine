@@ -25,14 +25,14 @@ int main(void) {
     HL_CHECK(hl_linux_errno_from_macos(41) == 39); /* ENOTEMPTY */
     HL_CHECK(hl_linux_errno_from_macos(42) == 84); /* EILSEQ */
     /* The 100..140 POSIX-2008 block. */
-    HL_CHECK(hl_linux_errno_from_macos(100) == 98);  /* EADDRINUSE */
-    HL_CHECK(hl_linux_errno_from_macos(114) == 40);  /* ELOOP */
-    HL_CHECK(hl_linux_errno_from_macos(115) == 90);  /* EMSGSIZE */
-    HL_CHECK(hl_linux_errno_from_macos(129) == 95);  /* ENOTSUP */
-    HL_CHECK(hl_linux_errno_from_macos(130) == 95);  /* EOPNOTSUPP, same as above */
-    HL_CHECK(hl_linux_errno_from_macos(132) == 75);  /* EOVERFLOW */
-    HL_CHECK(hl_linux_errno_from_macos(139) == 26);  /* ETXTBSY */
-    HL_CHECK(hl_linux_errno_from_macos(140) == 11);  /* EWOULDBLOCK == EAGAIN */
+    HL_CHECK(hl_linux_errno_from_macos(100) == 98); /* EADDRINUSE */
+    HL_CHECK(hl_linux_errno_from_macos(114) == 40); /* ELOOP */
+    HL_CHECK(hl_linux_errno_from_macos(115) == 90); /* EMSGSIZE */
+    HL_CHECK(hl_linux_errno_from_macos(129) == 95); /* ENOTSUP */
+    HL_CHECK(hl_linux_errno_from_macos(130) == 95); /* EOPNOTSUPP, same as above */
+    HL_CHECK(hl_linux_errno_from_macos(132) == 75); /* EOVERFLOW */
+    HL_CHECK(hl_linux_errno_from_macos(139) == 26); /* ETXTBSY */
+    HL_CHECK(hl_linux_errno_from_macos(140) == 11); /* EWOULDBLOCK == EAGAIN */
     /* Unassigned UCRT slots collapse to EINVAL; non-errno values pass through. */
     HL_CHECK(hl_linux_errno_from_macos(15) == 22);
     HL_CHECK(hl_linux_errno_from_macos(60) == 22);

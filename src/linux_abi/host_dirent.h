@@ -116,7 +116,9 @@ static inline int closedir(DIR *directory) {
     return -1;
 }
 
-static inline void rewinddir(DIR *directory) { (void)directory; }
+static inline void rewinddir(DIR *directory) {
+    (void)directory;
+}
 
 static inline long telldir(DIR *directory) {
     (void)directory;

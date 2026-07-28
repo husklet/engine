@@ -1091,9 +1091,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 G_RET(c) = (uint64_t)(int64_t)(-error);
                 break;
             }
-            if (nr == 242) {
-                hl_linux_socket_apply_type_flags(r, (int)a3);
-            }
+            if (nr == 242) { hl_linux_socket_apply_type_flags(r, (int)a3); }
             if (want_peer) {
                 socklen_t gcap = a2 ? *(socklen_t *)a2 : 0;
                 int ll = sa_m2l((struct sockaddr *)&hss, (uint8_t *)a1, gcap);
@@ -2428,10 +2426,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // passed fd (and any other) is a coherent host file on the receiving side.
             if (gc && gcl) memf_materialize_all();
             int cerr = 0;
-            int engine_metadata =
-                (int)a0 < 0 || (int)a0 >= HL_NFD || !g_sock_native_peer[(int)a0];
-            ssize_t hn =
-                (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, hcap, engine_metadata, &cerr) : 0;
+            int engine_metadata = (int)a0 < 0 || (int)a0 >= HL_NFD || !g_sock_native_peer[(int)a0];
+            ssize_t hn = (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, hcap, engine_metadata, &cerr) : 0;
             if (hn < 0) {
                 cmsg_tmpfds_close();
                 cmsg_seq_finish(0);
@@ -2749,10 +2745,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             }
             if (nr == 269) { // sendmmsg: translate guest -> host
                 int cerr = 0;
-                int engine_metadata =
-                    (int)a0 < 0 || (int)a0 >= HL_NFD || !g_sock_native_peer[(int)a0];
-                ssize_t hn =
-                    (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, hcap, engine_metadata, &cerr) : 0;
+                int engine_metadata = (int)a0 < 0 || (int)a0 >= HL_NFD || !g_sock_native_peer[(int)a0];
+                ssize_t hn = (gc && gcl) ? cmsg_l2m(gc, gcl, hctl, hcap, engine_metadata, &cerr) : 0;
                 if (hn < 0) {
                     cmsg_tmpfds_close();
                     cmsg_seq_finish(0);

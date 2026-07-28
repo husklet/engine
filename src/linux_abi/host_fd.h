@@ -233,7 +233,7 @@ typedef long blksize_t;
  * inside it and is the one vacuous member: nothing on Windows acquires a
  * controlling terminal, so "do not acquire one" is already true. */
 #define HL_LINUX_HOST_OPEN_ACTIONABLE                                                                                  \
-    (O_ACCMODE | O_APPEND | O_CREAT | O_TRUNC | O_EXCL | O_CLOEXEC | O_NOCTTY | O_BINARY | O_TEXT | O_TEMPORARY |       \
+    (O_ACCMODE | O_APPEND | O_CREAT | O_TRUNC | O_EXCL | O_CLOEXEC | O_NOCTTY | O_BINARY | O_TEXT | O_TEMPORARY |      \
      O_RANDOM | O_SEQUENTIAL)
 
 /* ---- SHAPE: fcntl commands and the descriptor flag.  Linux values. -------- */
@@ -299,13 +299,17 @@ struct flock {
  * this cannot either.  Its one caller (syscall/proc.c's exec CLOEXEC sweep
  * fallback) uses it as a scan bound, which is exactly what the ceiling is.
  */
-static inline int getdtablesize(void) { return 8192; }
+static inline int getdtablesize(void) {
+    return 8192;
+}
 
 /*
  * REAL.  _commit() is FlushFileBuffers on the descriptor's handle -- the same
  * operation fsync(2) names, with the same durability guarantee.
  */
-static inline int fsync(int descriptor) { return _commit(descriptor); }
+static inline int fsync(int descriptor) {
+    return _commit(descriptor);
+}
 
 /*
  * REAL.  _pipe() is the anonymous pipe, and the two arguments POSIX pipe(2) does
@@ -314,7 +318,9 @@ static inline int fsync(int descriptor) { return _commit(descriptor); }
  * (see the header note), and newline translation inside a pipe would corrupt
  * every byte stream the guest pushes through one.
  */
-static inline int pipe(int descriptors[2]) { return _pipe(descriptors, 65536, _O_BINARY); }
+static inline int pipe(int descriptors[2]) {
+    return _pipe(descriptors, 65536, _O_BINARY);
+}
 
 /*
  * REAL, with one named residual.  The UCRT has no nofollow stat and no
@@ -325,7 +331,9 @@ static inline int pipe(int descriptors[2]) { return _pipe(descriptors, 65536, _O
  * same one every S_ISLNK() on this host already carries; refusing instead would
  * make lstat() wrong for ordinary files too, which is strictly worse.
  */
-static inline int lstat(const char *path, struct stat *status) { return stat(path, status); }
+static inline int lstat(const char *path, struct stat *status) {
+    return stat(path, status);
+}
 
 /*
  * REAL, with one named residual.  _fullpath() canonicalizes . and .. and makes
@@ -842,8 +850,7 @@ static inline ssize_t pread(int descriptor, void *buffer, size_t count, off_t of
         errno = EINVAL;
         return -1;
     }
-    if (!hl_fdhandle_lookup(descriptor, &handle) || host == NULL || host->file == NULL ||
-        host->file->read_at == NULL) {
+    if (!hl_fdhandle_lookup(descriptor, &handle) || host == NULL || host->file == NULL || host->file->read_at == NULL) {
         errno = ENOSYS;
         return -1;
     }
@@ -902,7 +909,9 @@ static inline int fchdir(int descriptor) {
  * would make the no-op look like an implementation.  Windows has no
  * whole-system flush short of enumerating volumes and FlushFileBuffers-ing each.
  */
-static inline void sync(void) { errno = ENOSYS; }
+static inline void sync(void) {
+    errno = ENOSYS;
+}
 
 /* kill(2) is NOT here.  It reads as descriptor-adjacent because it travels with
  * the pid vocabulary below, but it is <signal.h>'s and host_signal.h defines it;

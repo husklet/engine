@@ -657,9 +657,8 @@ static hl_host_result hl_linux_memory_unmap_range(void *context, hl_host_handle 
          * have been legal, which is recoverable; the other direction is not. The same reasoning
          * applies to the tail of a non-page-aligned length: the kernel rounds it up and this does
          * not, so the handle keeps claiming those last bytes rather than guessing them away. */
-        if ((offset == 0 && size == entry->size) ||
-            (hl_host_hole_set_retire(&entry->retired, offset, size) &&
-             !hl_host_hole_set_holds(&entry->retired, 0, entry->size)))
+        if ((offset == 0 && size == entry->size) || (hl_host_hole_set_retire(&entry->retired, offset, size) &&
+                                                     !hl_host_hole_set_holds(&entry->retired, 0, entry->size)))
             hl_linux_retire_mapping_locked(entry);
     }
     pthread_mutex_unlock(&host->lock);
@@ -752,8 +751,7 @@ static hl_host_result hl_linux_memory_sync_address(void *context, uint64_t addre
     if ((flags & HL_HOST_MEMORY_SYNC_INVALIDATE) != 0) native_flags |= MS_INVALIDATE;
     /* No ownership question is asked. Flushing takes nothing away from a handle that covers the
      * range: the mapping, its protection and its contents are all exactly as they were. */
-    return msync((void *)low, span, native_flags) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0)
-                                                       : hl_linux_errno_result();
+    return msync((void *)low, span, native_flags) == 0 ? hl_linux_result(HL_STATUS_OK, 0, 0) : hl_linux_errno_result();
 }
 
 /* mlock(2) pins against reclaim and charges RLIMIT_MEMLOCK, so this host reports HL_HOST_WIRE_RESIDENT.
@@ -3704,7 +3702,8 @@ static hl_status hl_linux_network_decode(const struct sockaddr_storage *storage,
                               : 0;
         size_t length = 0;
         if (capacity > sizeof(local->sun_path)) capacity = sizeof(local->sun_path);
-        while (length < capacity && local->sun_path[length] != '\0') length++;
+        while (length < capacity && local->sun_path[length] != '\0')
+            length++;
         out->family = HL_HOST_NETWORK_LOCAL;
         out->size = (uint16_t)length;
         if (length != 0) memcpy(out->local_path, local->sun_path, length);
@@ -3769,8 +3768,7 @@ static hl_host_result hl_linux_network_pair(void *context, uint32_t family, uint
     int descriptors[2];
     hl_host_result first;
     hl_host_result second;
-    if (ends == NULL || native_family < 0 || native_type < 0)
-        return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (ends == NULL || native_family < 0 || native_type < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     if (socketpair(native_family, native_type | SOCK_CLOEXEC, (int)protocol, descriptors) != 0)
         return hl_linux_network_error();
     first = hl_linux_allocate_handle(host, HL_LINUX_HANDLE_SOCKET, descriptors[0], NULL, NULL, 0, -1);
@@ -3916,8 +3914,8 @@ static hl_host_result hl_linux_network_get_option(void *context, hl_host_handle 
         socklen_t size = (socklen_t)sizeof(native);
         if (value.size < sizeof(nanoseconds)) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
         memset(&native, 0, sizeof(native));
-        if (getsockopt(descriptor, SOL_SOCKET,
-                       option == HL_HOST_SOCKOPT_SEND_TIMEOUT ? SO_SNDTIMEO : SO_RCVTIMEO, &native, &size) != 0)
+        if (getsockopt(descriptor, SOL_SOCKET, option == HL_HOST_SOCKOPT_SEND_TIMEOUT ? SO_SNDTIMEO : SO_RCVTIMEO,
+                       &native, &size) != 0)
             return hl_linux_network_error();
         nanoseconds = (uint64_t)native.tv_sec * UINT64_C(1000000000) + (uint64_t)native.tv_usec * UINT64_C(1000);
         memcpy(value.data, &nanoseconds, sizeof(nanoseconds));
@@ -3989,9 +3987,8 @@ static hl_host_result hl_linux_network_set_option(void *context, hl_host_handle 
         memcpy(&nanoseconds, value.data, sizeof(nanoseconds));
         native.tv_sec = (time_t)(nanoseconds / UINT64_C(1000000000));
         native.tv_usec = (suseconds_t)((nanoseconds % UINT64_C(1000000000)) / UINT64_C(1000));
-        return setsockopt(descriptor, SOL_SOCKET,
-                          option == HL_HOST_SOCKOPT_SEND_TIMEOUT ? SO_SNDTIMEO : SO_RCVTIMEO, &native,
-                          (socklen_t)sizeof(native)) == 0
+        return setsockopt(descriptor, SOL_SOCKET, option == HL_HOST_SOCKOPT_SEND_TIMEOUT ? SO_SNDTIMEO : SO_RCVTIMEO,
+                          &native, (socklen_t)sizeof(native)) == 0
                    ? hl_linux_result(HL_STATUS_OK, 0, 0)
                    : hl_linux_network_error();
     }
@@ -4044,8 +4041,7 @@ static hl_host_result hl_linux_network_send_message(void *context, hl_host_handl
     /* Ancillary data has no encoding on this seam yet. Refused rather than
      * dropped: a caller that passed control bytes and got a success would
      * believe the peer received them. */
-    if (message->control != NULL && message->control_size != 0)
-        return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+    if (message->control != NULL && message->control_size != 0) return hl_linux_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
     sent = sendmsg(descriptor, &header, (int)hl_linux_network_flags(flags));
     return sent >= 0 ? hl_linux_result(HL_STATUS_OK, (uint64_t)sent, 0) : hl_linux_network_error();
 }
@@ -4611,14 +4607,22 @@ static hl_host_result hl_linux_fork_child(void *context) {
 }
 
 hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_services) {
-    static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI,           sizeof(memory),
-                                                   hl_linux_memory_reserve,      hl_linux_memory_protect,
-                                                   hl_linux_memory_release,      hl_linux_memory_publish,
-                                                   hl_linux_memory_reserve_code, hl_linux_memory_repair_code,
-                                                   hl_linux_memory_code_write,   hl_linux_memory_code_write,
-                                                   hl_linux_memory_map_file,     hl_linux_memory_sync,
-                                                   hl_linux_memory_unmap_range,  hl_linux_memory_map_anonymous,
-                                                   hl_linux_memory_discard,      hl_linux_memory_repair_signal_page,
+    static const hl_host_memory_services memory = {HL_HOST_MEMORY_ABI,
+                                                   sizeof(memory),
+                                                   hl_linux_memory_reserve,
+                                                   hl_linux_memory_protect,
+                                                   hl_linux_memory_release,
+                                                   hl_linux_memory_publish,
+                                                   hl_linux_memory_reserve_code,
+                                                   hl_linux_memory_repair_code,
+                                                   hl_linux_memory_code_write,
+                                                   hl_linux_memory_code_write,
+                                                   hl_linux_memory_map_file,
+                                                   hl_linux_memory_sync,
+                                                   hl_linux_memory_unmap_range,
+                                                   hl_linux_memory_map_anonymous,
+                                                   hl_linux_memory_discard,
+                                                   hl_linux_memory_repair_signal_page,
                                                    hl_linux_memory_unmap_address,
                                                    hl_linux_memory_wire_range,
                                                    hl_linux_memory_unwire_range,
@@ -4737,14 +4741,15 @@ hl_status hl_host_linux_create(hl_host_linux **out_host, hl_host_services *out_s
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,        sizeof(process),        hl_linux_process_spawn,         hl_linux_process_wait,
         hl_linux_process_terminate, hl_linux_process_close, hl_linux_process_spawn_prepared};
-    static const hl_host_sync_services sync = {
-        HL_HOST_SYNC_ABI,      sizeof(sync),           hl_linux_mutex_create, hl_linux_mutex_lock,
-        hl_linux_mutex_unlock, hl_linux_mutex_close,   hl_linux_fork_prepare, hl_linux_fork_complete,
-        hl_linux_fork_child,   hl_linux_park,          hl_linux_unpark,       hl_linux_interrupt_park};
-    static const hl_host_terminal_services terminal = {
-        HL_HOST_TERMINAL_ABI,      sizeof(terminal),          hl_linux_terminal_probe, hl_linux_terminal_get_mode,
-        hl_linux_terminal_set_mode, hl_linux_terminal_get_size, hl_linux_terminal_set_size, hl_linux_terminal_read,
-        hl_linux_terminal_write,   hl_linux_terminal_size_change_event};
+    static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,      sizeof(sync),           hl_linux_mutex_create,
+                                               hl_linux_mutex_lock,   hl_linux_mutex_unlock,  hl_linux_mutex_close,
+                                               hl_linux_fork_prepare, hl_linux_fork_complete, hl_linux_fork_child,
+                                               hl_linux_park,         hl_linux_unpark,        hl_linux_interrupt_park};
+    static const hl_host_terminal_services terminal = {HL_HOST_TERMINAL_ABI,       sizeof(terminal),
+                                                       hl_linux_terminal_probe,    hl_linux_terminal_get_mode,
+                                                       hl_linux_terminal_set_mode, hl_linux_terminal_get_size,
+                                                       hl_linux_terminal_set_size, hl_linux_terminal_read,
+                                                       hl_linux_terminal_write,    hl_linux_terminal_size_change_event};
     hl_host_linux *host;
     uint32_t i;
     if (out_host == NULL || out_services == NULL) return HL_STATUS_INVALID_ARGUMENT;

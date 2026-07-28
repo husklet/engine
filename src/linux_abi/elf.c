@@ -162,7 +162,7 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
     if (va < g_nonpie_lo || va >= g_nonpie_hi) return 0;
     ucontext_t *uc = (ucontext_t *)ucv;
     uint32_t insn = *(uint32_t *)(HL_HOST_UC_PC(uc));
-    uint64_t real = va + g_nonpie_bias;         // the datum's real (high) mapped location
+    uint64_t real = va + g_nonpie_bias; // the datum's real (high) mapped location
     uint64_t *X = HL_HOST_UC_REGS(uc);
     __uint128_t *V = HL_HOST_UC_VREGS(uc);
     int rt = insn & 0x1F;
@@ -710,8 +710,8 @@ static hl_host_memory_mapping elf_map_checked(void *hint, size_t len, uint32_t p
     const hl_host_services *host = effective_host_services();
     for (int t = 0;; t++) {
         hl_host_memory_mapping mapped = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(mapped), 0, 0, 0, 0};
-        hl_host_result result = host->memory->map_anonymous(host->context, (uint64_t)(uintptr_t)hint, len, protection,
-                                                            flags, &mapped);
+        hl_host_result result =
+            host->memory->map_anonymous(host->context, (uint64_t)(uintptr_t)hint, len, protection, flags, &mapped);
         if (result.status == HL_STATUS_OK) return mapped;
         if (t >= ELF_MAP_RETRIES) {
             fprintf(stderr, "hl-engine: load_elf: cannot map %s (%zu bytes) for the guest image (host status %d)\n",
@@ -731,7 +731,7 @@ static hl_host_memory_mapping elf_map_checked(void *hint, size_t len, uint32_t p
 // transient ENOMEM a few times so the tightening still applies once pressure clears; give up quietly on
 // anything else -- matching the original best-effort mprotect, so no working image regresses.
 static void elf_mprotect_besteffort(const hl_host_memory_mapping *mapping, void *addr, size_t len, uint32_t protection,
-                                   const char *what) {
+                                    const char *what) {
     (void)what;
     size_t host_page = hl_host_page_size();
     uint64_t start = (uint64_t)(uintptr_t)addr;
@@ -821,8 +821,8 @@ static void load_elf(const char *path, struct loaded *out) {
          * interpreter consume deterministic slots from the same high arena as
          * the stack, brk, and guest mmap allocations. */
         void *hint = (void *)(uintptr_t)hl_linux_snapshot_reserve(&g_ckpt_snapshot, span);
-        image_mapping = elf_map_checked(hint, span, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
-                                        HL_HOST_MEMORY_PRIVATE, "image base");
+        image_mapping = elf_map_checked(hint, span, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_PRIVATE,
+                                        "image base");
         base = (uint8_t *)(uintptr_t)image_mapping.address;
     }
     if (hl_exec_mapping_add((uint64_t)base, span, image_mapping.handle) != 0) {
@@ -899,8 +899,7 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
     // checkpoint/restore: place the main stack in the deterministic high arena (0 hint => normal placement)
     hl_host_memory_mapping stack_mapping =
         elf_map_checked((void *)hl_linux_snapshot_reserve(&g_ckpt_snapshot, GUARD + SZ), GUARD + SZ,
-                        HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
-                        HL_HOST_MEMORY_PRIVATE, "main stack");
+                        HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_PRIVATE, "main stack");
     uint8_t *base = (uint8_t *)(uintptr_t)stack_mapping.address;
     elf_mprotect_besteffort(&stack_mapping, base, GUARD, 0, "stack guard");
     gna_add((uint64_t)base, (uint64_t)base + GUARD);

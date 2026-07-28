@@ -260,9 +260,9 @@ static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **a
     // colliding guest PCs. Warm runners get preserve=1 (inherit the prewarmed arena, skip re-translate);
     // cold runners keep the proven preserve=0 fresh-arena path.
     int warm = g_warm_ready && argc >= 1 && strcmp(argv[0], g_wprog) == 0;
-    g_fsrv_preserve = warm;    // inherit the resident parent's prewarmed arena (warm fork-server runner only)
+    g_fsrv_preserve = warm; // inherit the resident parent's prewarmed arena (warm fork-server runner only)
     int fsrv_pres_ok = jit_after_fork();
-    g_fsrv_preserve = 0;       // a GUEST fork inside this runner must use the preserve=0 nested-fork cure
+    g_fsrv_preserve = 0; // a GUEST fork inside this runner must use the preserve=0 nested-fork cure
     if (!fsrv_pres_ok) _exit(70);
     // wave-2 discipline: this process is a fork child on a COW copy of the PARENT's arena +
     // recording state -- it must NEVER pcache_save under the request binary's identity. A guest
@@ -298,9 +298,9 @@ static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **a
         hl_option_unset("HL_PCACHE");
         hl_option_unset("HL_PCACHE_DIR");
     }
-    _exit(
-        hl_run_linux_guest(hl_target_services_effective(&g_target_services), g_linux_box,
-                           g_srv_rootfs[0] ? g_srv_rootfs : NULL, HL_HOST_HANDLE_INVALID, NULL, 0, (uint32_t)argc, argv));
+    _exit(hl_run_linux_guest(hl_target_services_effective(&g_target_services), g_linux_box,
+                             g_srv_rootfs[0] ? g_srv_rootfs : NULL, HL_HOST_HANDLE_INVALID, NULL, 0, (uint32_t)argc,
+                             argv));
 }
 
 // ---- server ----
@@ -466,9 +466,7 @@ static int hl_server_main(int argc, char **argv) {
             break;
         }
         if (ne == 0) continue;
-        if (watched[1].revents != 0) {
-            hl_host_child_watch_drain(&g_fsrv_wake);
-        }
+        if (watched[1].revents != 0) { hl_host_child_watch_drain(&g_fsrv_wake); }
         for (int i = 0; i < FSRV_MAXLIVE; i++)
             if (g_fsrv_live[i].pid) {
                 int status;

@@ -375,8 +375,7 @@ static hl_host_result hl_fake_park_waiter(void *context, uint64_t waiter, uint32
     return (hl_host_result){HL_STATUS_TIMED_OUT, 0, 0, 0};
 }
 
-static hl_host_result hl_fake_unpark(void *context, uint32_t scope, uint64_t key, const void *address,
-                                     uint32_t count) {
+static hl_host_result hl_fake_unpark(void *context, uint32_t scope, uint64_t key, const void *address, uint32_t count) {
     (void)context;
     (void)key;
     (void)count;
@@ -1451,15 +1450,15 @@ void hl_fake_host_init(hl_fake_host *fake, hl_host_services *services) {
     static const hl_host_process_services process = {
         HL_HOST_PROCESS_ABI,       sizeof(process),       hl_fake_spawn_cloned, hl_fake_process_wait,
         hl_fake_process_terminate, hl_fake_process_close, hl_fake_spawn_cloned};
-    static const hl_host_sync_services sync = {
-        HL_HOST_SYNC_ABI,       sizeof(sync),           hl_fake_mutex_create,   hl_fake_mutex_lock,
-        hl_fake_mutex_unlock,   hl_fake_mutex_close,    hl_fake_fork_lifecycle, hl_fake_fork_lifecycle,
-        hl_fake_fork_lifecycle, hl_fake_park_waiter,    hl_fake_unpark,         hl_fake_interrupt_park};
-    static const hl_host_terminal_services terminal = {
-        HL_HOST_TERMINAL_ABI,       sizeof(terminal),           hl_fake_terminal_probe,
-        hl_fake_terminal_get_mode,  hl_fake_terminal_set_mode,  hl_fake_terminal_get_size,
-        hl_fake_terminal_set_size,  hl_fake_terminal_read,      hl_fake_terminal_write,
-        hl_fake_terminal_size_change_event};
+    static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,       sizeof(sync),           hl_fake_mutex_create,
+                                               hl_fake_mutex_lock,     hl_fake_mutex_unlock,   hl_fake_mutex_close,
+                                               hl_fake_fork_lifecycle, hl_fake_fork_lifecycle, hl_fake_fork_lifecycle,
+                                               hl_fake_park_waiter,    hl_fake_unpark,         hl_fake_interrupt_park};
+    static const hl_host_terminal_services terminal = {HL_HOST_TERMINAL_ABI,      sizeof(terminal),
+                                                       hl_fake_terminal_probe,    hl_fake_terminal_get_mode,
+                                                       hl_fake_terminal_set_mode, hl_fake_terminal_get_size,
+                                                       hl_fake_terminal_set_size, hl_fake_terminal_read,
+                                                       hl_fake_terminal_write,    hl_fake_terminal_size_change_event};
     static const hl_host_counter_services counter = {
         HL_HOST_COUNTER_ABI,       sizeof(counter),           hl_fake_counter_create,      hl_fake_counter_read,
         hl_fake_counter_write,     hl_fake_counter_get_flags, hl_fake_counter_set_flags,   hl_fake_counter_duplicate,

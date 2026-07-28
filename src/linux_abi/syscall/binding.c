@@ -1463,8 +1463,8 @@ issue_or_fail:
     if (output && result > 0) {
         int64_t remaining = result, copied_total = 0;
         for (uint32_t index = 0; index < usable && remaining > 0; ++index) {
-            size_t amount = (uint64_t)remaining < host_vectors[index].size ? (size_t)remaining
-                                                                          : (size_t)host_vectors[index].size;
+            size_t amount =
+                (uint64_t)remaining < host_vectors[index].size ? (size_t)remaining : (size_t)host_vectors[index].size;
             ssize_t copied = guest_copy_to(guest_vectors[index].address, buffers[index], amount);
             if (copied <= 0) {
                 result = copied_total != 0 ? copied_total : -EFAULT;
@@ -1479,7 +1479,8 @@ issue_or_fail:
         }
     }
 cleanup:
-    for (uint32_t index = 0; index < usable; ++index) free(buffers[index]);
+    for (uint32_t index = 0; index < usable; ++index)
+        free(buffers[index]);
     return result;
 }
 
@@ -1522,8 +1523,7 @@ static int bound_fdsets_reference(uint64_t count, uint64_t read_set, uint64_t wr
     for (fd = 0; fd < count; ++fd) {
         uint8_t mask = (uint8_t)(1u << (fd & 7u));
         size_t byte = (size_t)(fd >> 3);
-        if (((read_set != 0 && (sets[byte] & mask) != 0) ||
-             (write_set != 0 && (sets[bytes + byte] & mask) != 0) ||
+        if (((read_set != 0 && (sets[byte] & mask) != 0) || (write_set != 0 && (sets[bytes + byte] & mask) != 0) ||
              (except_set != 0 && (sets[bytes * 2 + byte] & mask) != 0)) &&
             bound_snapshot(fd, &snapshot)) {
             free(sets);
@@ -1867,8 +1867,7 @@ static int bound_rights_reference(uint64_t message_address) {
 #endif
     if (control_address == 0 || control_size < 16) return 0;
     control = malloc((size_t)control_size);
-    if (control == NULL ||
-        guest_copy_from(control, control_address, (size_t)control_size) != (ssize_t)control_size) {
+    if (control == NULL || guest_copy_from(control, control_address, (size_t)control_size) != (ssize_t)control_size) {
         free(control);
         return 0;
     }
@@ -1952,8 +1951,9 @@ static int64_t bound_stream_write(const hl_linux_fd_snapshot *file, int native_f
 
 static int64_t bound_guest_read(const hl_linux_fd_snapshot *file, uint64_t guest, size_t size, uint64_t offset,
                                 int positioned) {
-    if (size == 0) return positioned ? hl_linux_pread64(g_linux_box, file->fd, NULL, 0, offset)
-                                     : hl_linux_read(g_linux_box, file->fd, NULL, 0);
+    if (size == 0)
+        return positioned ? hl_linux_pread64(g_linux_box, file->fd, NULL, 0, offset)
+                          : hl_linux_read(g_linux_box, file->fd, NULL, 0);
     size_t accessible = guest_accessible_prefix(guest, size, HL_LOGICAL_VMA_WRITE);
     if (accessible == 0) return bound_read_no_copy(file, offset, positioned);
     void *buffer = malloc(accessible);
@@ -1970,8 +1970,9 @@ static int64_t bound_guest_read(const hl_linux_fd_snapshot *file, uint64_t guest
 
 static int64_t bound_guest_write(const hl_linux_fd_snapshot *file, uint64_t guest, size_t size, uint64_t offset,
                                  int positioned) {
-    if (size == 0) return positioned ? hl_linux_pwrite64(g_linux_box, file->fd, NULL, 0, offset)
-                                     : hl_linux_write(g_linux_box, file->fd, NULL, 0);
+    if (size == 0)
+        return positioned ? hl_linux_pwrite64(g_linux_box, file->fd, NULL, 0, offset)
+                          : hl_linux_write(g_linux_box, file->fd, NULL, 0);
     if (bound_access_rejects(file, 0)) return -EBADF;
     void *buffer = malloc(size);
     if (buffer == NULL) return -ENOMEM;
@@ -2063,11 +2064,10 @@ static int64_t bound_splice(const hl_linux_fd_snapshot *input, int input_fd, uin
     if (flags & ~UINT64_C(0xf)) return -EINVAL;
     if (!input_pipe && !output_pipe) return -EINVAL;
     if ((input_pipe && input_offset != NULL) || (output_pipe && output_offset != NULL)) return -ESPIPE;
-    if ((input_offset != NULL &&
-         guest_copy_from(input_offset, input_offset_address, sizeof(*input_offset)) != (ssize_t)sizeof(*input_offset)) ||
-        (output_offset != NULL &&
-         guest_copy_from(output_offset, output_offset_address, sizeof(*output_offset)) !=
-             (ssize_t)sizeof(*output_offset)))
+    if ((input_offset != NULL && guest_copy_from(input_offset, input_offset_address, sizeof(*input_offset)) !=
+                                     (ssize_t)sizeof(*input_offset)) ||
+        (output_offset != NULL && guest_copy_from(output_offset, output_offset_address, sizeof(*output_offset)) !=
+                                      (ssize_t)sizeof(*output_offset)))
         return -EFAULT;
     if (size > UINT64_C(0x7ffff000)) size = UINT64_C(0x7ffff000);
     if (size > sizeof(buffer)) size = sizeof(buffer);
@@ -2096,9 +2096,8 @@ static int64_t bound_splice(const hl_linux_fd_snapshot *input, int input_fd, uin
     if (output_offset != NULL) *output_offset += (off_t)write_count;
     if ((input_offset != NULL &&
          guest_copy_to(input_offset_address, input_offset, sizeof(*input_offset)) != (ssize_t)sizeof(*input_offset)) ||
-        (output_offset != NULL &&
-         guest_copy_to(output_offset_address, output_offset, sizeof(*output_offset)) !=
-             (ssize_t)sizeof(*output_offset)))
+        (output_offset != NULL && guest_copy_to(output_offset_address, output_offset, sizeof(*output_offset)) !=
+                                      (ssize_t)sizeof(*output_offset)))
         return -EFAULT;
     return write_count;
 }
@@ -2217,9 +2216,8 @@ static int64_t bound_socket_vector(struct cpu *c, uint64_t address, uint64_t cou
         uint64_t offset = 0;
         for (index = 0; index < count; ++index) {
             const size_t length = vectors[index].iov_len;
-            if (length != 0 &&
-                guest_copy_from(buffer + offset, (uint64_t)(uintptr_t)vectors[index].iov_base, length) !=
-                    (ssize_t)length) {
+            if (length != 0 && guest_copy_from(buffer + offset, (uint64_t)(uintptr_t)vectors[index].iov_base, length) !=
+                                   (ssize_t)length) {
                 free(buffer);
                 return -EFAULT;
             }
@@ -2234,9 +2232,8 @@ static int64_t bound_socket_vector(struct cpu *c, uint64_t address, uint64_t cou
             for (index = 0; index < count && remaining != 0; ++index) {
                 size_t length = vectors[index].iov_len;
                 if ((uint64_t)length > remaining) length = (size_t)remaining;
-                if (length != 0 &&
-                    guest_copy_to((uint64_t)(uintptr_t)vectors[index].iov_base, buffer + offset, length) !=
-                        (ssize_t)length) {
+                if (length != 0 && guest_copy_to((uint64_t)(uintptr_t)vectors[index].iov_base, buffer + offset,
+                                                 length) != (ssize_t)length) {
                     free(buffer);
                     return -EFAULT;
                 }
@@ -2382,12 +2379,10 @@ static int bound_socket_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t 
                 (void)hl_linux_socket_set_cloexec((int)result, 1);
             if (result < 0) result = -(int64_t)errno;
             break;
-        case HL_LINUX_F_GETFD:
-            result = (flags & HL_LINUX_SOCKET_CLOEXEC) != 0 ? HL_LINUX_FD_CLOEXEC : 0;
-            break;
+        case HL_LINUX_F_GETFD: result = (flags & HL_LINUX_SOCKET_CLOEXEC) != 0 ? HL_LINUX_FD_CLOEXEC : 0; break;
         case HL_LINUX_F_SETFD:
-            result = hl_linux_socket_set_cloexec(descriptor, (a2 & HL_LINUX_FD_CLOEXEC) != 0) == 0 ? 0
-                                                                                                  : -(int64_t)errno;
+            result =
+                hl_linux_socket_set_cloexec(descriptor, (a2 & HL_LINUX_FD_CLOEXEC) != 0) == 0 ? 0 : -(int64_t)errno;
             break;
         case HL_LINUX_F_GETFL:
             /* A socket is always readable and writable, so the access mode is
@@ -2396,9 +2391,8 @@ static int bound_socket_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t 
                                          ((flags & HL_LINUX_SOCKET_NONBLOCK) != 0 ? HL_LINUX_O_NONBLOCK : 0u));
             break;
         case HL_LINUX_F_SETFL:
-            result = hl_linux_socket_set_nonblock(descriptor, (a2 & HL_LINUX_O_NONBLOCK) != 0) == 0
-                         ? 0
-                         : -(int64_t)errno;
+            result =
+                hl_linux_socket_set_nonblock(descriptor, (a2 & HL_LINUX_O_NONBLOCK) != 0) == 0 ? 0 : -(int64_t)errno;
             break;
         default: result = -EINVAL; break;
         }
@@ -3105,8 +3099,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             break;
         }
         char first_path_byte;
-        if (nr == 452 && (flags & UINT64_C(0x1000)) != 0 && a1 != 0 &&
-            guest_copy_from(&first_path_byte, a1, 1) == 1 && first_path_byte == '\0') {
+        if (nr == 452 && (flags & UINT64_C(0x1000)) != 0 && a1 != 0 && guest_copy_from(&first_path_byte, a1, 1) == 1 &&
+            first_path_byte == '\0') {
             if (g_host_services->file->set_permissions == NULL) {
                 result = -ENOSYS;
                 break;
@@ -3242,8 +3236,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         char output[HL_LINUX_PATH_MAX];
         size_t path_size;
         size_t capacity = a3 < sizeof output ? (size_t)a3 : sizeof output;
-        if (a3 == 0 || a3 > SIZE_MAX ||
-            guest_accessible_prefix(a2, capacity, HL_LOGICAL_VMA_WRITE) != capacity) {
+        if (a3 == 0 || a3 > SIZE_MAX || guest_accessible_prefix(a2, capacity, HL_LOGICAL_VMA_WRITE) != capacity) {
             result = a3 == 0 ? -EINVAL : -EFAULT;
             break;
         }
@@ -3257,8 +3250,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = bound_host_error(opened.status);
             break;
         }
-        hl_host_result read = g_host_services->file->readlink(g_host_services->context, opened.value,
-                                                              (hl_host_bytes){output, capacity});
+        hl_host_result read =
+            g_host_services->file->readlink(g_host_services->context, opened.value, (hl_host_bytes){output, capacity});
         result = read.status == HL_STATUS_OK ? (int64_t)read.value : bound_host_error(read.status);
         if (result > 0 && guest_copy_to(a2, output, (size_t)result) != result) result = -EFAULT;
         (void)g_host_services->file->close(g_host_services->context, opened.value);
@@ -3356,18 +3349,12 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         (void)close((int)source.fd);
         break;
     case 62: result = hl_linux_lseek(g_linux_box, source.fd, (int64_t)a1, (int32_t)a2); break;
-    case 63:
-        result = bound_guest_read(&source, a1, (size_t)a2, 0, 0);
-        break;
-    case 64:
-        {
-            int64_t allowed = bound_fsize_gate(c, &source, source.offset, a2); // RLIMIT_FSIZE -> SIGXFSZ/EFBIG
-            result = allowed < 0 ? allowed : bound_guest_write(&source, a1, (size_t)allowed, 0, 0);
-        }
-        break;
-    case 67:
-        result = bound_guest_read(&source, a1, (size_t)a2, a3, 1);
-        break;
+    case 63: result = bound_guest_read(&source, a1, (size_t)a2, 0, 0); break;
+    case 64: {
+        int64_t allowed = bound_fsize_gate(c, &source, source.offset, a2); // RLIMIT_FSIZE -> SIGXFSZ/EFBIG
+        result = allowed < 0 ? allowed : bound_guest_write(&source, a1, (size_t)allowed, 0, 0);
+    } break;
+    case 67: result = bound_guest_read(&source, a1, (size_t)a2, a3, 1); break;
     case 68:
         if (source.status_flags & HL_LINUX_O_APPEND) {
             // Linux quirk: pwrite() on an O_APPEND fd IGNORES the supplied offset and appends at EOF (the
@@ -3447,8 +3434,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -95; /* Linux EOPNOTSUPP; macOS's native value is 102. */
             break;
         }
-        result = bound_vector_io(&source, vectors, (uint32_t)a2, nr == 286, vector_offset != UINT64_MAX,
-                                 vector_offset);
+        result = bound_vector_io(&source, vectors, (uint32_t)a2, nr == 286, vector_offset != UINT64_MAX, vector_offset);
         if (nr == 287 && result > 0)
             bound_mapping_file_written(&source, vector_offset == UINT64_MAX ? source.offset : vector_offset,
                                        (uint64_t)result);
@@ -3857,6 +3843,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 }
 #endif
             } else if (request >= 0x5402u && request <= 0x5404u) { /* TCSETS{,W,F} */
+
                 struct termios native;
                 {
 #if defined(__linux__)
@@ -3953,8 +3940,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             memcpy(record + 19, entries[index].name, entries[index].name_size);
             used += record_size;
         }
-        if (result == 0 &&
-            guest_copy_to(a1, output, used) != (ssize_t)used)
+        if (result == 0 && guest_copy_to(a1, output, used) != (ssize_t)used)
             result = -EFAULT;
         else if (result == 0)
             result = (int64_t)used;
@@ -4138,7 +4124,8 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = -ENOSYS;
             break;
         }
-        if ((input_offset && guest_copy_from(input_offset, a1, sizeof(*input_offset)) != (ssize_t)sizeof(*input_offset)) ||
+        if ((input_offset &&
+             guest_copy_from(input_offset, a1, sizeof(*input_offset)) != (ssize_t)sizeof(*input_offset)) ||
             (output_offset &&
              guest_copy_from(output_offset, a3, sizeof(*output_offset)) != (ssize_t)sizeof(*output_offset))) {
             result = -EFAULT;
@@ -4149,17 +4136,16 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         if (G_A4(c) > 0 && g_host_services != NULL && g_host_services->file != NULL &&
             g_host_services->file->metadata != NULL) {
             hl_host_file_metadata in_meta, out_meta;
-            hl_host_result in_status = g_host_services->file->metadata(g_host_services->context, source.host_handle,
-                                                                      &in_meta);
-            hl_host_result out_status = g_host_services->file->metadata(g_host_services->context, output.host_handle,
-                                                                       &out_meta);
+            hl_host_result in_status =
+                g_host_services->file->metadata(g_host_services->context, source.host_handle, &in_meta);
+            hl_host_result out_status =
+                g_host_services->file->metadata(g_host_services->context, output.host_handle, &out_meta);
             if (in_status.status == HL_STATUS_OK && out_status.status == HL_STATUS_OK &&
                 in_meta.stable_device == out_meta.stable_device && in_meta.stable_object == out_meta.stable_object) {
                 off_t in_start = input_offset ? *input_offset : (off_t)source.offset;
                 off_t out_start = output_offset ? *output_offset : (off_t)output.offset;
                 off_t length = (off_t)G_A4(c);
-                if (in_start >= 0 && out_start >= 0 && in_start < out_start + length &&
-                    out_start < in_start + length) {
+                if (in_start >= 0 && out_start >= 0 && in_start < out_start + length && out_start < in_start + length) {
                     result = -EINVAL;
                     break;
                 }
@@ -4188,10 +4174,10 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
             result = (int64_t)done;
             if (nr_written < nr_read) break;
         }
-        if (result >= 0 &&
-            ((input_offset && guest_copy_to(a1, input_offset, sizeof(*input_offset)) != (ssize_t)sizeof(*input_offset)) ||
-             (output_offset &&
-              guest_copy_to(a3, output_offset, sizeof(*output_offset)) != (ssize_t)sizeof(*output_offset))))
+        if (result >= 0 && ((input_offset && guest_copy_to(a1, input_offset, sizeof(*input_offset)) !=
+                                                 (ssize_t)sizeof(*input_offset)) ||
+                            (output_offset && guest_copy_to(a3, output_offset, sizeof(*output_offset)) !=
+                                                  (ssize_t)sizeof(*output_offset))))
             result = done != 0 ? (int64_t)done : -EFAULT;
         break;
     }

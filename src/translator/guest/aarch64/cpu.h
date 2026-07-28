@@ -265,22 +265,22 @@ static int is_stolen(int r) {
 #define OFF_SOFT_SPAN_PROTECTION ((int)offsetof(struct cpu, soft_span_protection))
 #define OFF_SOFT_BOUNCE_PENDING ((int)offsetof(struct cpu, soft_bounce_pending))
 #define OFF_SOFT_BOUNCE ((int)offsetof(struct cpu, soft_bounce))
-#define G_SOFT_STATE_RESET(c)                                                                                         \
-    do {                                                                                                              \
-        (c)->soft_page = UINT64_MAX;                                                                                  \
-        (c)->soft_limit = 0;                                                                                          \
-        (c)->soft_filter_first = UINT64_MAX;                                                                          \
-        (c)->soft_filter_last = 0;                                                                                    \
-        (c)->soft_delta = 0;                                                                                          \
-        (c)->soft_protection = 0;                                                                                     \
-        (c)->soft_ea = 0;                                                                                             \
-        (c)->soft_bytes = 0;                                                                                          \
-        (c)->soft_required = 0;                                                                                       \
-        (c)->soft_pc = 0;                                                                                             \
-        (c)->soft_span_ea = 0;                                                                                        \
-        (c)->soft_span_bytes = 0;                                                                                     \
-        (c)->soft_span_delta = 0;                                                                                     \
-        (c)->soft_span_protection = 0;                                                                                \
-        (c)->soft_bounce_pending = 0;                                                                                 \
-        (c)->soft_bounce_write = 0;                                                                                   \
+#define G_SOFT_STATE_RESET(c)                                                                                          \
+    do {                                                                                                               \
+        (c)->soft_page = UINT64_MAX;                                                                                   \
+        (c)->soft_limit = 0;                                                                                           \
+        (c)->soft_filter_first = UINT64_MAX;                                                                           \
+        (c)->soft_filter_last = 0;                                                                                     \
+        (c)->soft_delta = 0;                                                                                           \
+        (c)->soft_protection = 0;                                                                                      \
+        (c)->soft_ea = 0;                                                                                              \
+        (c)->soft_bytes = 0;                                                                                           \
+        (c)->soft_required = 0;                                                                                        \
+        (c)->soft_pc = 0;                                                                                              \
+        (c)->soft_span_ea = 0;                                                                                         \
+        (c)->soft_span_bytes = 0;                                                                                      \
+        (c)->soft_span_delta = 0;                                                                                      \
+        (c)->soft_span_protection = 0;                                                                                 \
+        (c)->soft_bounce_pending = 0;                                                                                  \
+        (c)->soft_bounce_write = 0;                                                                                    \
     } while (0)

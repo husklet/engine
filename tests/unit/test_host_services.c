@@ -287,8 +287,7 @@ int main(void) {
                  ->sync_address(services.context, 0x40000000, 4096,
                                 HL_HOST_MEMORY_SYNC_ASYNC | HL_HOST_MEMORY_SYNC_INVALIDATE)
                  .status == HL_STATUS_OK);
-    HL_CHECK(services.memory->sync_address(services.context, 0x40000001, 4096, 0).status ==
-             HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->sync_address(services.context, 0x40000001, 4096, 0).status == HL_STATUS_INVALID_ARGUMENT);
     HL_CHECK(services.memory->sync_address(services.context, 0x40000000, 4096, UINT32_MAX).status ==
              HL_STATUS_INVALID_ARGUMENT);
     /* Rollback: an injected failure leaves the operation refused and nothing half-applied. */
@@ -357,9 +356,9 @@ int main(void) {
                  HL_STATUS_WOULD_BLOCK);
         HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_SHARED, key, &word, 0, 8, 0).status ==
                  HL_STATUS_TIMED_OUT);
-        HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, &word, 0, 4,
-                                     HL_HOST_DEADLINE_INFINITE)
-                     .status == HL_STATUS_NOT_SUPPORTED);
+        HL_CHECK(
+            services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, &word, 0, 4, HL_HOST_DEADLINE_INFINITE)
+                .status == HL_STATUS_NOT_SUPPORTED);
         HL_CHECK(services.sync->unpark(services.context, HL_HOST_PARK_PRIVATE, key, NULL, 1).status ==
                  HL_STATUS_INVALID_ARGUMENT);
         HL_CHECK(services.sync->unpark(services.context, 5u, key, &word, 1).status == HL_STATUS_INVALID_ARGUMENT);
@@ -370,9 +369,9 @@ int main(void) {
          * block does. An infinite deadline proves the record is consulted before any waiting. */
         HL_CHECK(services.sync->interrupt_park(services.context, 55).status == HL_STATUS_OK);
         HL_CHECK(services.sync->interrupt_park(services.context, 55).status == HL_STATUS_OK);
-        HL_CHECK(services.sync->park(services.context, 55, HL_HOST_PARK_PRIVATE, key, &word, 0, 4,
-                                     HL_HOST_DEADLINE_INFINITE)
-                     .status == HL_STATUS_INTERRUPTED);
+        HL_CHECK(
+            services.sync->park(services.context, 55, HL_HOST_PARK_PRIVATE, key, &word, 0, 4, HL_HOST_DEADLINE_INFINITE)
+                .status == HL_STATUS_INTERRUPTED);
         HL_CHECK(services.sync->park(services.context, 55, HL_HOST_PARK_PRIVATE, key, &word, 0, 4, 0).status ==
                  HL_STATUS_TIMED_OUT);
     }
@@ -436,8 +435,7 @@ int main(void) {
         HL_CHECK(services.terminal->set_size(services.context, console.value, NULL).status ==
                  HL_STATUS_INVALID_ARGUMENT);
 
-        HL_CHECK(services.terminal->write(services.context, console.value, (hl_host_const_bytes){"tty", 3}).value ==
-                 3);
+        HL_CHECK(services.terminal->write(services.context, console.value, (hl_host_const_bytes){"tty", 3}).value == 3);
         HL_CHECK(services.terminal->read(services.context, console.value, (hl_host_bytes){bytes, sizeof bytes}).value ==
                  3);
         HL_CHECK(memcmp(bytes, "tty", 3) == 0);
@@ -670,12 +668,11 @@ int main(void) {
          * on a partial unmap is what strands a handle over a hole it no longer has. */
         anonymous = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(anonymous), 0, 0, 0, 0};
         HL_CHECK(services.memory
-                     ->map_anonymous(services.context, 0, 8192, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
-                                     HL_HOST_MEMORY_PRIVATE, &anonymous)
-                     .status == HL_STATUS_OK &&
+                         ->map_anonymous(services.context, 0, 8192, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                         HL_HOST_MEMORY_PRIVATE, &anonymous)
+                         .status == HL_STATUS_OK &&
                  fake.live_mappings == 1);
-        HL_CHECK(services.memory->unmap_range(services.context, anonymous.handle, 4096, 4096).status ==
-                     HL_STATUS_OK &&
+        HL_CHECK(services.memory->unmap_range(services.context, anonymous.handle, 4096, 4096).status == HL_STATUS_OK &&
                  fake.live_mappings == 1);
         HL_CHECK(services.memory->unmap_range(services.context, anonymous.handle, 0, 4096).status == HL_STATUS_OK &&
                  fake.live_mappings == 0);

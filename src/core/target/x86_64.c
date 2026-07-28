@@ -37,7 +37,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
-#include "../../linux_abi/host_fd.h" // <fcntl.h> + <unistd.h>, or the descriptor vocabulary where the host has none
+#include "../../linux_abi/host_fd.h"   // <fcntl.h> + <unistd.h>, or the descriptor vocabulary where the host has none
 #include "../../linux_abi/host_mman.h" // <sys/mman.h>, or the typed VM seam where the host has none
 #include <sys/stat.h>
 #include <pthread.h>
@@ -57,7 +57,7 @@
 #include "../../host/native_context.h"
 #include "../../linux_abi/logical_vma.h"
 #include "../../linux_abi/host_dirent.h" // <dirent.h>, or the Linux dirent shape where the host structure has no d_type
-#include "../../linux_abi/host_system.h"  // sysconf/major/minor/arc4random_buf/fork: the residue no single POSIX header owns
+#include "../../linux_abi/host_system.h" // sysconf/major/minor/arc4random_buf/fork: the residue no single POSIX header owns
 #include "../../linux_abi/host_signal.h" // <signal.h>, or the Linux signal vocabulary where the host has no signals
 #include "../../linux_abi/host_tty.h"
 #include "../../linux_abi/host_tty.h"
@@ -355,13 +355,16 @@ void emit_load_mem(struct insn *insn, uint64_t next, int width, int rt) {
 
 #include "../../translator/guest/x86_64/translate.c" // x86-64 translate_block + trampolines
 #include "../../translator/guest/x86_64/cache.c"     // persistent translated-code cache (HL_PCACHE=1)
+
 // The same-ISA transliterator is a THIRD arm of this fork and belongs to the interpreter's side of it
 // (translator/guest/x86_64/translit/, included by interp.c). The two hooks the rest of this file calls
 // exist here too, so the ARM64 host arm needs no #ifdef at either call site.
 static int translit_enabled(void) {
     return 0;
 }
-static void translit_report(void) {}
+
+static void translit_report(void) {
+}
 #else
 // interp.c defines the same names emit.c/translate.c/cache.c do, so everything below is host-identical.
 #include "../../translator/guest/x86_64/interp.c"
@@ -486,8 +489,7 @@ static void jit86_smc_commit(struct cpu *cpu) {
         memset(g_ibtc, 0, sizeof g_ibtc);
         memset(g_xibtc, 0, sizeof g_xibtc);
     } else {
-        removed = map_invalidate_source_ranges((const uint64_t (*)[2])cpu->smc_ranges,
-                                               (uint32_t)cpu->smc_range_count);
+        removed = map_invalidate_source_ranges((const uint64_t (*)[2])cpu->smc_ranges, (uint32_t)cpu->smc_range_count);
         if (removed) {
             memset(g_ibtc, 0, sizeof g_ibtc);
             memset(g_xibtc, 0, sizeof g_xibtc);

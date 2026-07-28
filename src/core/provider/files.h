@@ -11,8 +11,8 @@ void hl_provider_files_revoke(void);
 int hl_provider_files_is_handle(hl_host_handle handle);
 uint32_t hl_provider_files_readiness(hl_host_handle handle, uint32_t interests);
 uint32_t hl_provider_files_cached_readiness(hl_host_handle handle, uint32_t interests);
-int hl_provider_files_subscribe(hl_host_handle handle, uint32_t interests,
-                                void (*notify)(void *, uint64_t), void *opaque, uint64_t token);
+int hl_provider_files_subscribe(hl_host_handle handle, uint32_t interests, void (*notify)(void *, uint64_t),
+                                void *opaque, uint64_t token);
 void hl_provider_files_unsubscribe(hl_host_handle handle, void *opaque, uint64_t token);
 
 #endif

@@ -219,9 +219,9 @@ int main(void) {
         HL_CHECK(msync((void *)(uintptr_t)(base + frame_page), (size_t)frame_page, MS_ASYNC) != 0);
         HL_CHECK(msync((void *)(uintptr_t)(base + frame_page * 2), (size_t)frame_page, MS_ASYNC) == 0);
         /* The handle survived, and offsets still mean what they meant when it was created. */
-        HL_CHECK(services.memory
-                     ->protect(services.context, frame.handle, frame_page * 2, frame_page, HL_HOST_MEMORY_READ)
-                     .status == HL_STATUS_OK);
+        HL_CHECK(
+            services.memory->protect(services.context, frame.handle, frame_page * 2, frame_page, HL_HOST_MEMORY_READ)
+                .status == HL_STATUS_OK);
         /* The hole is vacant, so an address-keyed release of it must succeed. */
         HL_CHECK(services.memory->unmap_address(services.context, base + frame_page, frame_page).status ==
                  HL_STATUS_OK);
@@ -232,15 +232,14 @@ int main(void) {
         HL_CHECK(services.memory->unmap_address(services.context, base, frame_page * 3).status == HL_STATUS_BUSY);
         /* A placement is free to take the hole; the exact-address form proves it really is vacant. */
         HL_CHECK(services.memory
-                     ->map_anonymous(services.context, base + frame_page, frame_page,
-                                     HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
-                                     HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED_NOREPLACE, &tenant)
-                     .status == HL_STATUS_OK &&
+                         ->map_anonymous(services.context, base + frame_page, frame_page,
+                                         HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                         HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED_NOREPLACE, &tenant)
+                         .status == HL_STATUS_OK &&
                  tenant.address == base + frame_page);
         ((unsigned char *)(uintptr_t)tenant.address)[0] = 0xc3;
         /* Busy again, for the right reason: a second handle holds it now. */
-        HL_CHECK(services.memory->unmap_address(services.context, tenant.address, frame_page).status ==
-                 HL_STATUS_BUSY);
+        HL_CHECK(services.memory->unmap_address(services.context, tenant.address, frame_page).status == HL_STATUS_BUSY);
         /* Tearing the first handle down gives back only what it still held. */
         HL_CHECK(services.memory->release(services.context, frame.handle).status == HL_STATUS_OK);
         HL_CHECK(msync((void *)(uintptr_t)base, (size_t)frame_page, MS_ASYNC) != 0);
@@ -359,9 +358,9 @@ int main(void) {
                  HL_STATUS_INVALID_ARGUMENT);
         HL_CHECK(services.memory->protect_address(services.context, page, page, UINT32_MAX).status ==
                  HL_STATUS_INVALID_ARGUMENT);
-        HL_CHECK(services.memory->protect_address(services.context, UINT64_MAX - page + 1, page * 2,
-                                                  HL_HOST_MEMORY_READ)
-                     .status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(
+            services.memory->protect_address(services.context, UINT64_MAX - page + 1, page * 2, HL_HOST_MEMORY_READ)
+                .status == HL_STATUS_INVALID_ARGUMENT);
         HL_CHECK(services.memory->sync_address(services.context, 0, page, 0).status == HL_STATUS_INVALID_ARGUMENT);
         HL_CHECK(services.memory->sync_address(services.context, page, 0, 0).status == HL_STATUS_INVALID_ARGUMENT);
         HL_CHECK(services.memory->sync_address(services.context, page + 1, page, 0).status ==
@@ -382,17 +381,16 @@ int main(void) {
         HL_CHECK(msync((void *)(uintptr_t)owned.address, (size_t)page, MS_ASYNC) == 0);
         HL_CHECK(((unsigned char *)(uintptr_t)owned.address)[0] == 0x5a);
         HL_CHECK(services.memory
-                     ->protect(services.context, owned.handle, 0, page * 2,
-                               HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE)
+                     ->protect(services.context, owned.handle, 0, page * 2, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE)
                      .status == HL_STATUS_OK);
         ((unsigned char *)(uintptr_t)owned.address)[0] = 0x5b;
         /* An unaligned length is rounded up to whole pages, as the host operation itself does. */
-        HL_CHECK(services.memory->protect_address(services.context, owned.address, page + 1,
-                                                  HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE)
-                     .status == HL_STATUS_OK);
+        HL_CHECK(
+            services.memory
+                ->protect_address(services.context, owned.address, page + 1, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE)
+                .status == HL_STATUS_OK);
         HL_CHECK(services.memory->sync_address(services.context, owned.address, page * 2, 0).status == HL_STATUS_OK);
-        HL_CHECK(services.memory
-                     ->sync_address(services.context, owned.address, page * 2, HL_HOST_MEMORY_SYNC_ASYNC)
+        HL_CHECK(services.memory->sync_address(services.context, owned.address, page * 2, HL_HOST_MEMORY_SYNC_ASYNC)
                      .status == HL_STATUS_OK);
         HL_CHECK(services.memory->release(services.context, owned.handle).status == HL_STATUS_OK);
 
@@ -413,12 +411,12 @@ int main(void) {
         /* Code mappings keep the refusal, whole and with nothing changed. */
         memset(&executable, 0, sizeof(executable));
         HL_CHECK(services.memory->reserve_code(services.context, page, page, 0, &executable).status == HL_STATUS_OK);
-        HL_CHECK(services.memory
-                     ->protect_address(services.context, executable.executable_address, page, HL_HOST_MEMORY_READ)
-                     .status == HL_STATUS_BUSY);
-        HL_CHECK(services.memory
-                     ->protect_address(services.context, executable.writable_address, page, HL_HOST_MEMORY_READ)
-                     .status == HL_STATUS_BUSY);
+        HL_CHECK(
+            services.memory->protect_address(services.context, executable.executable_address, page, HL_HOST_MEMORY_READ)
+                .status == HL_STATUS_BUSY);
+        HL_CHECK(
+            services.memory->protect_address(services.context, executable.writable_address, page, HL_HOST_MEMORY_READ)
+                .status == HL_STATUS_BUSY);
         /* Flushing it is not a protection change and is not refused. */
         HL_CHECK(services.memory->sync_address(services.context, executable.writable_address, page, 0).status ==
                  HL_STATUS_OK);
@@ -458,9 +456,9 @@ int main(void) {
                  HL_STATUS_NOT_SUPPORTED);
 
         /* The compare is the provider's, and it happens before anything is enqueued. */
-        HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, &word, 99, 4,
-                                     HL_HOST_DEADLINE_INFINITE)
-                     .status == HL_STATUS_WOULD_BLOCK);
+        HL_CHECK(
+            services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, &word, 99, 4, HL_HOST_DEADLINE_INFINITE)
+                .status == HL_STATUS_WOULD_BLOCK);
         HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, &word, 0, 4, 1).status ==
                  HL_STATUS_TIMED_OUT);
         parked = services.sync->unpark(services.context, HL_HOST_PARK_PRIVATE, key, &word, 1);
@@ -470,8 +468,8 @@ int main(void) {
          * deadline is used deliberately: if the record were kept against an outstanding wait rather
          * than against the waiter, this call would never return. */
         HL_CHECK(services.sync->interrupt_park(services.context, 4242).status == HL_STATUS_OK);
-        HL_CHECK(services.sync->park(services.context, 4242, HL_HOST_PARK_PRIVATE, key, &word, 0, 4,
-                                     HL_HOST_DEADLINE_INFINITE)
+        HL_CHECK(services.sync
+                     ->park(services.context, 4242, HL_HOST_PARK_PRIVATE, key, &word, 0, 4, HL_HOST_DEADLINE_INFINITE)
                      .status == HL_STATUS_INTERRUPTED);
         HL_CHECK(services.sync->park(services.context, 4242, HL_HOST_PARK_PRIVATE, key, &word, 0, 4, 1).status ==
                  HL_STATUS_TIMED_OUT);

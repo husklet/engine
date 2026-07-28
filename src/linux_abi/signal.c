@@ -170,7 +170,8 @@ static void sigq_drop_tag(int sig, int tag) {
         if (e.tag != tag) copy[kept++] = e;
     }
     int dropped = g_sigq[sig].count - kept;
-    for (int i = 0; i < kept; i++) g_sigq[sig].e[i] = copy[i];
+    for (int i = 0; i < kept; i++)
+        g_sigq[sig].e[i] = copy[i];
     g_sigq[sig].head = 0;
     g_sigq[sig].count = kept;
     pthread_mutex_unlock(&g_sigq_lk);
@@ -910,7 +911,7 @@ static int raise_guest_bus(struct cpu *c) {
     if (g_sigact[7].handler <= 1) { guest_group_fatal(c, 7); }
     c->sync_signal = 7;
     c->sync_address = nonpie_unfold(c->fault_addr); // guest-visible si_addr (see above)
-    c->sync_code = 2; /* BUS_ADRERR */
+    c->sync_code = 2;                               /* BUS_ADRERR */
     c->sigmask &= ~(1ull << 6);
     c->reason = R_BRANCH;
     /* A synchronous memory fault belongs to the faulting thread.  Process-wide
@@ -927,7 +928,7 @@ static int raise_guest_fetch_fault(struct cpu *c) {
     if (g_sigact[11].handler <= 1) { guest_group_fatal(c, 11); }
     c->sync_signal = 11;
     c->sync_address = nonpie_unfold(c->fault_addr); // guest-visible si_addr (see above)
-    c->sync_code = 2; /* SEGV_ACCERR */
+    c->sync_code = 2;                               /* SEGV_ACCERR */
     c->sigmask &= ~(1ull << 10);
     c->reason = R_BRANCH;
     __atomic_or_fetch(&c->tpending, 1ull << 11, __ATOMIC_SEQ_CST);
@@ -938,7 +939,7 @@ static int raise_guest_data_map_fault(struct cpu *c) {
     if (g_sigact[11].handler <= 1) guest_group_fatal(c, 11);
     c->sync_signal = 11;
     c->sync_address = nonpie_unfold(c->fault_addr); // guest-visible si_addr (see above)
-    c->sync_code = 1; /* SEGV_MAPERR */
+    c->sync_code = 1;                               /* SEGV_MAPERR */
     c->sigmask &= ~(1ull << 10);
     c->reason = R_BRANCH;
     __atomic_or_fetch(&c->tpending, 1ull << 11, __ATOMIC_SEQ_CST);

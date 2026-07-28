@@ -14,7 +14,6 @@ typedef void *(*hl_elf_mapper)(void *context, void *address, size_t length, uint
  * report that the resulting image is not safe for fixed-address cache reuse.
  * A mapper reports failure with NULL.
  */
-void *hl_elf_place_image(hl_elf_mapper mapper, void *context, void *fixed_address, size_t length,
-                         int *fixed_failed);
+void *hl_elf_place_image(hl_elf_mapper mapper, void *context, void *fixed_address, size_t length, int *fixed_failed);
 
 #endif

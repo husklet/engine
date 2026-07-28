@@ -69,8 +69,7 @@ static int logical_backing_ref_open(int fd, logical_backing_ref *reference) {
  * A descriptor with no binding still reports its absence through the same NULL-and-errno channel a refused
  * mmap already uses; every caller below unwinds on that, so no half-built backing and no unbacked ledger
  * entry can result. */
-static void *logical_backing_map(const logical_backing_ref *reference, size_t length, uint64_t offset,
-                                 int writable) {
+static void *logical_backing_map(const logical_backing_ref *reference, size_t length, uint64_t offset, int writable) {
 #if defined(_WIN32)
     const hl_host_services *host = hl_fdhandle_host();
     hl_host_file_mapping mapping = {HL_HOST_FILE_MAPPING_ABI, sizeof(mapping), 0, 0, 0, 0};
@@ -83,8 +82,8 @@ static void *logical_backing_map(const logical_backing_ref *reference, size_t le
     /* Canonical storage is engine-private and RW; SHARED because the whole point of this backing is that
        every logical view of the same file region observes one another's stores. */
     result = host->memory->map_file(host->context, reference->handle, 0, offset, (uint64_t)length,
-                                    HL_HOST_MEMORY_READ | (writable ? HL_HOST_MEMORY_WRITE : 0u),
-                                    HL_HOST_MEMORY_SHARED, &mapping);
+                                    HL_HOST_MEMORY_READ | (writable ? HL_HOST_MEMORY_WRITE : 0u), HL_HOST_MEMORY_SHARED,
+                                    &mapping);
     if (result.status != HL_STATUS_OK) {
         errno = hl_fdhandle_errno(result.status);
         return NULL;

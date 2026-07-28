@@ -1126,9 +1126,8 @@ static hl_host_result hl_windows_memory_unmap_address(void *context, uint64_t ad
     hl_status status = HL_STATUS_OK;
     char *cursor;
     char *end;
-    if (address == 0 || size == 0 || size > SIZE_MAX || address > UINTPTR_MAX ||
-        address % HL_WINDOWS_PAGE_SIZE != 0 || size % HL_WINDOWS_PAGE_SIZE != 0 ||
-        size > (uint64_t)UINTPTR_MAX - address)
+    if (address == 0 || size == 0 || size > SIZE_MAX || address > UINTPTR_MAX || address % HL_WINDOWS_PAGE_SIZE != 0 ||
+        size % HL_WINDOWS_PAGE_SIZE != 0 || size > (uint64_t)UINTPTR_MAX - address)
         return hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     cursor = (char *)(uintptr_t)address;
     end = cursor + (uintptr_t)size;

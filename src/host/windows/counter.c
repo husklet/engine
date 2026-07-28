@@ -178,8 +178,7 @@ static hl_host_result hl_windows_counter_create(void *context, uint64_t initial,
     hl_windows_lock(host);
     entry = hl_windows_lookup_locked(host, allocated.value, HL_WINDOWS_HANDLE_COUNTER);
     entry->payload = object;
-    entry->rights =
-        HL_HOST_TRANSFER_READ | HL_HOST_TRANSFER_WRITE | HL_HOST_TRANSFER_WAIT | HL_HOST_TRANSFER_CONTROL;
+    entry->rights = HL_HOST_TRANSFER_READ | HL_HOST_TRANSFER_WRITE | HL_HOST_TRANSFER_WAIT | HL_HOST_TRANSFER_CONTROL;
     hl_windows_unlock(host);
     return allocated;
 }
@@ -372,7 +371,8 @@ static hl_host_result hl_windows_counter_unsubscribe(void *context, hl_host_hand
     EnterCriticalSection(&object->lock);
     {
         hl_windows_counter_subscription **link = &object->subscriptions;
-        while (*link != NULL && *link != subscription) link = &(*link)->next;
+        while (*link != NULL && *link != subscription)
+            link = &(*link)->next;
         if (*link == subscription) *link = subscription->next;
     }
     registration = subscription->wait;

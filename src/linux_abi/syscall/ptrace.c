@@ -756,8 +756,7 @@ static int svc_ptrace(struct cpu *c, uint64_t req, uint64_t pid, uint64_t addr, 
             if (guest_copy_to(data + offsetof(struct iovec, iov_len), &reported, sizeof reported) != sizeof reported)
                 return -EFAULT;
         } else {
-            if (guest_copy_from((void *)L->regs, (uint64_t)(uintptr_t)iov.iov_base, n) != (ssize_t)n)
-                return -EFAULT;
+            if (guest_copy_from((void *)L->regs, (uint64_t)(uintptr_t)iov.iov_base, n) != (ssize_t)n) return -EFAULT;
             L->regs_dirty = 1;
         }
         return 0;

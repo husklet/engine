@@ -337,23 +337,23 @@ struct sockaddr_in6 {
 #define HL_LINUX_IN6_OCTET(a, i) (((const struct in6_addr *)(a))->s6_addr[(i)])
 
 #define HL_LINUX_IN6_TOP12_ZERO(a)                                                                                     \
-    (HL_LINUX_IN6_OCTET(a, 0) == 0 && HL_LINUX_IN6_OCTET(a, 1) == 0 && HL_LINUX_IN6_OCTET(a, 2) == 0 &&                 \
-     HL_LINUX_IN6_OCTET(a, 3) == 0 && HL_LINUX_IN6_OCTET(a, 4) == 0 && HL_LINUX_IN6_OCTET(a, 5) == 0 &&                 \
-     HL_LINUX_IN6_OCTET(a, 6) == 0 && HL_LINUX_IN6_OCTET(a, 7) == 0 && HL_LINUX_IN6_OCTET(a, 8) == 0 &&                 \
+    (HL_LINUX_IN6_OCTET(a, 0) == 0 && HL_LINUX_IN6_OCTET(a, 1) == 0 && HL_LINUX_IN6_OCTET(a, 2) == 0 &&                \
+     HL_LINUX_IN6_OCTET(a, 3) == 0 && HL_LINUX_IN6_OCTET(a, 4) == 0 && HL_LINUX_IN6_OCTET(a, 5) == 0 &&                \
+     HL_LINUX_IN6_OCTET(a, 6) == 0 && HL_LINUX_IN6_OCTET(a, 7) == 0 && HL_LINUX_IN6_OCTET(a, 8) == 0 &&                \
      HL_LINUX_IN6_OCTET(a, 9) == 0 && HL_LINUX_IN6_OCTET(a, 10) == 0 && HL_LINUX_IN6_OCTET(a, 11) == 0)
 
 #define IN6_IS_ADDR_UNSPECIFIED(a)                                                                                     \
-    (HL_LINUX_IN6_TOP12_ZERO(a) && HL_LINUX_IN6_OCTET(a, 12) == 0 && HL_LINUX_IN6_OCTET(a, 13) == 0 &&                  \
+    (HL_LINUX_IN6_TOP12_ZERO(a) && HL_LINUX_IN6_OCTET(a, 12) == 0 && HL_LINUX_IN6_OCTET(a, 13) == 0 &&                 \
      HL_LINUX_IN6_OCTET(a, 14) == 0 && HL_LINUX_IN6_OCTET(a, 15) == 0)
 
 #define IN6_IS_ADDR_LOOPBACK(a)                                                                                        \
-    (HL_LINUX_IN6_TOP12_ZERO(a) && HL_LINUX_IN6_OCTET(a, 12) == 0 && HL_LINUX_IN6_OCTET(a, 13) == 0 &&                  \
+    (HL_LINUX_IN6_TOP12_ZERO(a) && HL_LINUX_IN6_OCTET(a, 12) == 0 && HL_LINUX_IN6_OCTET(a, 13) == 0 &&                 \
      HL_LINUX_IN6_OCTET(a, 14) == 0 && HL_LINUX_IN6_OCTET(a, 15) == 1)
 
 #define IN6_IS_ADDR_V4MAPPED(a)                                                                                        \
-    (HL_LINUX_IN6_OCTET(a, 0) == 0 && HL_LINUX_IN6_OCTET(a, 1) == 0 && HL_LINUX_IN6_OCTET(a, 2) == 0 &&                 \
-     HL_LINUX_IN6_OCTET(a, 3) == 0 && HL_LINUX_IN6_OCTET(a, 4) == 0 && HL_LINUX_IN6_OCTET(a, 5) == 0 &&                 \
-     HL_LINUX_IN6_OCTET(a, 6) == 0 && HL_LINUX_IN6_OCTET(a, 7) == 0 && HL_LINUX_IN6_OCTET(a, 8) == 0 &&                 \
+    (HL_LINUX_IN6_OCTET(a, 0) == 0 && HL_LINUX_IN6_OCTET(a, 1) == 0 && HL_LINUX_IN6_OCTET(a, 2) == 0 &&                \
+     HL_LINUX_IN6_OCTET(a, 3) == 0 && HL_LINUX_IN6_OCTET(a, 4) == 0 && HL_LINUX_IN6_OCTET(a, 5) == 0 &&                \
+     HL_LINUX_IN6_OCTET(a, 6) == 0 && HL_LINUX_IN6_OCTET(a, 7) == 0 && HL_LINUX_IN6_OCTET(a, 8) == 0 &&                \
      HL_LINUX_IN6_OCTET(a, 9) == 0 && HL_LINUX_IN6_OCTET(a, 10) == 0xff && HL_LINUX_IN6_OCTET(a, 11) == 0xff)
 
 #define IN6_IS_ADDR_LINKLOCAL(a) (HL_LINUX_IN6_OCTET(a, 0) == 0xfe && (HL_LINUX_IN6_OCTET(a, 1) & 0xc0) == 0x80)
@@ -562,14 +562,14 @@ struct mmsghdr {
  * it lays out the GUEST's control buffer, so the two agree by construction
  * rather than by luck.  CMSG_SPACE must stay an integer constant expression:
  * sentry.c and checkpoint.c size stack arrays with it. */
-#define CMSG_ALIGN(len) (((len) + sizeof(size_t) - 1) & (size_t) ~(sizeof(size_t) - 1))
+#define CMSG_ALIGN(len) (((len) + sizeof(size_t) - 1) & (size_t)~(sizeof(size_t) - 1))
 #define CMSG_SPACE(len) (CMSG_ALIGN(len) + CMSG_ALIGN(sizeof(struct cmsghdr)))
 #define CMSG_LEN(len) (CMSG_ALIGN(sizeof(struct cmsghdr)) + (len))
 #define CMSG_DATA(cmsg) ((unsigned char *)((struct cmsghdr *)(cmsg) + 1))
 
 #define CMSG_FIRSTHDR(mhdr)                                                                                            \
-    ((size_t)(mhdr)->msg_controllen >= sizeof(struct cmsghdr) ? (struct cmsghdr *)(mhdr)->msg_control                   \
-                                                             : (struct cmsghdr *)0)
+    ((size_t)(mhdr)->msg_controllen >= sizeof(struct cmsghdr) ? (struct cmsghdr *)(mhdr)->msg_control                  \
+                                                              : (struct cmsghdr *)0)
 
 /* A function rather than a macro for the same reason glibc uses one: the walk
  * has to bounds-check the NEXT record against the control buffer twice -- once
@@ -916,11 +916,7 @@ static inline char *inet_ntoa(struct in_addr address) {
 
 #define HL_LINUX_SOCKET_MAX 8192
 
-enum {
-    HL_LINUX_SOCKET_CLOEXEC = 1u << 0,
-    HL_LINUX_SOCKET_NONBLOCK = 1u << 1,
-    HL_LINUX_SOCKET_LISTENING = 1u << 2
-};
+enum { HL_LINUX_SOCKET_CLOEXEC = 1u << 0, HL_LINUX_SOCKET_NONBLOCK = 1u << 1, HL_LINUX_SOCKET_LISTENING = 1u << 2 };
 
 typedef struct hl_linux_socket_slot {
     /* The handle is the liveness flag: a zero here is a free slot, and it is
@@ -1241,7 +1237,8 @@ static inline int hl_linux_socket_address_to_host(const struct sockaddr *address
         }
         capacity = (size_t)length - offsetof(struct sockaddr_un, sun_path);
         if (capacity > sizeof(local->sun_path)) capacity = sizeof(local->sun_path);
-        while (size < capacity && local->sun_path[size] != '\0') size++;
+        while (size < capacity && local->sun_path[size] != '\0')
+            size++;
         if (size >= sizeof(out->local_path)) {
             errno = ENAMETOOLONG;
             return -1;
@@ -1622,10 +1619,12 @@ static inline int getsockopt(int descriptor, int level, int option, void *value,
          * nanoseconds, because one of the three hosts takes milliseconds in a
          * DWORD and none of them agree on the structure. */
         uint64_t nanoseconds;
+
         struct {
             int64_t seconds;
             int64_t microseconds;
         } guest;
+
         if (*length < (socklen_t)sizeof(guest)) {
             errno = EINVAL;
             return -1;
@@ -1707,6 +1706,7 @@ static inline int setsockopt(int descriptor, int level, int option, const void *
             int64_t seconds;
             int64_t microseconds;
         } guest;
+
         uint64_t nanoseconds;
         if (length < (socklen_t)sizeof(guest)) {
             errno = EINVAL;

@@ -13,7 +13,8 @@
  * one would only move the same first-call cost, never a correctness answer. */
 #if defined(_WIN32)
 
-void hl_linux_dns_prepare(void) {}
+void hl_linux_dns_prepare(void) {
+}
 
 #else
 

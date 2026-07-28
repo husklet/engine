@@ -12,8 +12,8 @@
 #error HL_PRODUCTION_GUEST_ISA is required
 #endif
 
-int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable, const void *executable_image, size_t executable_size, uint32_t argc,
-                       char *const argv[]);
+int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable,
+                       const void *executable_image, size_t executable_size, uint32_t argc, char *const argv[]);
 hl_status hl_run_linux_guest_status(void);
 
 typedef struct hl_production_result_state {
@@ -27,16 +27,16 @@ static _Atomic int result_published;
 static int hl_engine_child_result_claim(void) {
     int expected = 0;
     if (active_result == NULL) return 0;
-    if (atomic_compare_exchange_strong_explicit(&result_published, &expected, 1,
-                                                memory_order_acq_rel, memory_order_acquire))
+    if (atomic_compare_exchange_strong_explicit(&result_published, &expected, 1, memory_order_acq_rel,
+                                                memory_order_acquire))
         return 1;
     while (atomic_load_explicit(&result_published, memory_order_acquire) == 1) {}
     return 0;
 }
 
 void hl_engine_child_result_publish(int32_t guest_status, hl_status engine_status, uint64_t detail) {
-    hl_engine_child_result record = {0, HL_ENGINE_CHILD_RESULT_VERSION, guest_status, engine_status,
-                                     HL_ENGINE_CHILD_RESULT_EXIT, 0, detail};
+    hl_engine_child_result record = {
+        0, HL_ENGINE_CHILD_RESULT_VERSION, guest_status, engine_status, HL_ENGINE_CHILD_RESULT_EXIT, 0, detail};
     if (!hl_engine_child_result_claim()) return;
     memcpy(active_result, &record, sizeof(record));
     atomic_store_explicit((_Atomic uint32_t *)&active_result->magic, HL_ENGINE_CHILD_RESULT_MAGIC,
@@ -116,7 +116,7 @@ typedef struct hl_production_launch_header {
     uint32_t version;
     uint64_t total_size;
     uint32_t argc;
-    uint32_t option_count;   /* records present, not the table's length */
+    uint32_t option_count;    /* records present, not the table's length */
     uint32_t option_capacity; /* the table's length in the producing image */
     uint32_t reserved;
     uint64_t rootfs_offset; /* 0 when the launch has no rootfs */
@@ -191,8 +191,7 @@ static void *hl_production_launch_encode(const hl_engine_config *config, const h
     bytes = malloc(offset);
     if (bytes == NULL) return NULL;
     memcpy(bytes, &header, sizeof(header));
-    if (header.rootfs_offset != 0)
-        memcpy(bytes + header.rootfs_offset, config->rootfs, (size_t)header.rootfs_size);
+    if (header.rootfs_offset != 0) memcpy(bytes + header.rootfs_offset, config->rootfs, (size_t)header.rootfs_size);
     offset = (size_t)header.argv_offset;
     for (index = 0; index < argc; ++index) {
         const size_t size = hl_production_launch_text(argv[index]);
@@ -424,12 +423,12 @@ static int32_t hl_production_entry(void *opaque) {
     active_result = context->result;
     atomic_store_explicit(&result_published, 0, memory_order_release);
     hl_options *previous = hl_options_bind_process(context->options);
-    hl_host_handle executable = context->config->executable == NULL ? HL_HOST_HANDLE_INVALID
-                                                                    : context->config->executable->host_handle;
+    hl_host_handle executable =
+        context->config->executable == NULL ? HL_HOST_HANDLE_INVALID : context->config->executable->host_handle;
     const hl_engine_executable *spec = context->config->executable;
     int32_t result = hl_run_linux_guest(context->host, context->box, context->config->rootfs, executable,
-                                        spec == NULL ? NULL : spec->image, spec == NULL ? 0 : spec->image_size, context->argc,
-                                        (char *const *)(uintptr_t)context->argv);
+                                        spec == NULL ? NULL : spec->image, spec == NULL ? 0 : spec->image_size,
+                                        context->argc, (char *const *)(uintptr_t)context->argv);
     (void)hl_options_bind_process(previous);
     hl_engine_child_result_publish(result, hl_run_linux_guest_status(), 0);
     return result;
@@ -444,11 +443,9 @@ static void hl_production_result_release(const hl_host_services *host, hl_host_h
     free(state);
 }
 
-static hl_status hl_production_start_process(const hl_host_services *host, hl_linux_abi *box,
-                                             hl_options *options,
-                                             const hl_engine_config *config, uint32_t argc,
-                                             const char *const argv[], hl_host_handle *process,
-                                             hl_host_handle *result_token) {
+static hl_status hl_production_start_process(const hl_host_services *host, hl_linux_abi *box, hl_options *options,
+                                             const hl_engine_config *config, uint32_t argc, const char *const argv[],
+                                             hl_host_handle *process, hl_host_handle *result_token) {
 #if !defined(_WIN32)
     hl_production_entry_context entry = {0};
 #endif
@@ -494,9 +491,8 @@ static hl_status hl_production_start_process(const hl_host_services *host, hl_li
             return HL_STATUS_OUT_OF_MEMORY;
         }
         published = hl_host_windows_launch_publish(payload, payload_size, result->mapping.handle);
-        spawned = published == HL_STATUS_OK
-                      ? host->process->spawn_cloned(host->context, hl_production_cold_entry, NULL)
-                      : (hl_host_result){(int32_t)published, 0, 0, 0};
+        spawned = published == HL_STATUS_OK ? host->process->spawn_cloned(host->context, hl_production_cold_entry, NULL)
+                                            : (hl_host_result){(int32_t)published, 0, 0, 0};
         free(payload);
     }
 #else
@@ -546,16 +542,15 @@ static hl_status hl_production_finish_process(const hl_host_services *host, hl_h
         return HL_STATUS_OK;
     }
     memset(&record, 0, sizeof(record));
-    if (state != NULL &&
-        atomic_load_explicit((_Atomic uint32_t *)&state->record->magic, memory_order_acquire) ==
-            HL_ENGINE_CHILD_RESULT_MAGIC)
+    if (state != NULL && atomic_load_explicit((_Atomic uint32_t *)&state->record->magic, memory_order_acquire) ==
+                             HL_ENGINE_CHILD_RESULT_MAGIC)
         memcpy(&record, state->record, sizeof(record));
     hl_production_result_release(host, token);
     result->kind = HL_ENGINE_EXIT_ENGINE_ERROR;
     result->guest_status = HL_STATUS_CORRUPT;
     result->detail = record.magic == HL_ENGINE_CHILD_RESULT_MAGIC ? sizeof(record) : 0;
-    if (record.magic != HL_ENGINE_CHILD_RESULT_MAGIC ||
-        record.version != HL_ENGINE_CHILD_RESULT_VERSION || waited->detail != HL_HOST_PROCESS_EXIT_CODE)
+    if (record.magic != HL_ENGINE_CHILD_RESULT_MAGIC || record.version != HL_ENGINE_CHILD_RESULT_VERSION ||
+        waited->detail != HL_HOST_PROCESS_EXIT_CODE)
         return HL_STATUS_CORRUPT;
     if (record.engine_status != HL_STATUS_OK) {
         if (record.engine_status < HL_STATUS_INVALID_ARGUMENT || record.engine_status > HL_STATUS_ADDRESS_IN_USE)

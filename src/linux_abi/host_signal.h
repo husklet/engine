@@ -284,19 +284,23 @@ typedef struct {
     int si_errno;
     int si_code;
     int __si_pad0;
+
     union {
         struct {
             int si_pid;
             unsigned int si_uid;
+
             union {
                 int si_status;
                 union sigval si_value;
             };
         };
+
         struct {
             void *si_addr;
             short si_addr_lsb;
         };
+
         struct {
             /* Linux's si_band is `long int`, which is 64 bits there and 32 here;
              * spelled `long long` for the same reason sigset_t is, so si_fd
@@ -304,6 +308,7 @@ typedef struct {
             long long si_band;
             int si_fd;
         };
+
         char __si_pad[112];
     };
 } siginfo_t;
@@ -335,6 +340,7 @@ struct sigaction {
         __sighandler_t sa_handler;
         void (*sa_sigaction)(int, siginfo_t *, void *);
     };
+
     sigset_t sa_mask;
     int sa_flags;
     void (*sa_restorer)(void);
@@ -352,7 +358,9 @@ typedef struct {
  * ask, on any host.  Signal n occupies bit (n-1), which is Linux's convention.
  * Range-checked the way glibc's are (EINVAL outside the representable range)
  * rather than silently scribbling past the array. */
-static inline int hl_linux_sigset_bit_ok(int signo) { return signo >= 1 && signo <= 1024; }
+static inline int hl_linux_sigset_bit_ok(int signo) {
+    return signo >= 1 && signo <= 1024;
+}
 
 static inline int sigemptyset(sigset_t *set) {
     if (set == NULL) {

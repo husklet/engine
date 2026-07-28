@@ -93,8 +93,13 @@ int hl_provider_demux_unsubscribe_remote(hl_provider_demux *d, uint64_t id) {
 
 /* No create() ever succeeded, so no event carries storage and no demultiplexer exists to tear down. Both
  * releases stay callable so an error path that unwinds unconditionally still compiles and runs. */
-void hl_provider_event_destroy(hl_provider_event *event) { (void)event; }
-void hl_provider_demux_destroy(hl_provider_demux *d) { (void)d; }
+void hl_provider_event_destroy(hl_provider_event *event) {
+    (void)event;
+}
+
+void hl_provider_demux_destroy(hl_provider_demux *d) {
+    (void)d;
+}
 
 #else
 

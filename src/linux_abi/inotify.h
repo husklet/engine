@@ -68,7 +68,6 @@ hl_status hl_linux_inotify_export(hl_linux_abi *linux_abi, hl_linux_fd fd, void 
                                   size_t *out_size);
 int64_t hl_linux_inotify_import_at(hl_linux_abi *linux_abi, hl_linux_fd requested,
                                    const hl_linux_inotify_provider_ops *provider, void *provider_context,
-                                   uint32_t descriptor_flags, uint32_t status_flags, const void *buffer,
-                                   size_t size);
+                                   uint32_t descriptor_flags, uint32_t status_flags, const void *buffer, size_t size);
 
 #endif

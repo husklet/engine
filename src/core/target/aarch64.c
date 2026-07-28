@@ -77,7 +77,7 @@ static void filemap_refresh_emulated(uint64_t lo, uint64_t hi);
 
 #include "../../translator/guest/aarch64/cpu.h"
 #include "../../translator/guest/aarch64/signal.h"
-#include "../../translator/guest/aarch64/abi.h"  // the cpu interface os/linux/ is written against
+#include "../../translator/guest/aarch64/abi.h" // the cpu interface os/linux/ is written against
 #define HL_GUEST_STAT_SIZE HL_LINUX_STAT_AARCH64_SIZE
 #define HL_GUEST_STAT_ENCODE hl_linux_stat_encode_aarch64
 #define HL_GUEST_BOUND_STAT hl_linux_stat_aarch64
@@ -123,29 +123,99 @@ static void emit_crash_diagnostic(const char *message, size_t size) {
 // Keep the unity consumers' compact encoder vocabulary while the assembler itself is an independently
 // compiled, explicitly-stateful translator component.
 #include "../../translator/host/aarch64/asm.h"
-static void emit32(uint32_t instruction) { hl_a64_emit32(&g_emit, instruction); }
-static void e_str(int rt, int rn, int off) { hl_a64_str(&g_emit, rt, rn, off); }
-static void e_ldr(int rt, int rn, int off) { hl_a64_ldr(&g_emit, rt, rn, off); }
-static void e_mov_sp_from(int rn) { hl_a64_mov_sp_from(&g_emit, rn); }
-static void e_mov_from_sp(int rd) { hl_a64_mov_from_sp(&g_emit, rd); }
-static void e_movz(int rd, uint32_t immediate, int shift) { hl_a64_movz(&g_emit, rd, immediate, shift); }
-static void e_movk(int rd, uint32_t immediate, int shift) { hl_a64_movk(&g_emit, rd, immediate, shift); }
-static void e_br(int rn) { hl_a64_br(&g_emit, rn); }
-static void e_movconst(int rd, uint64_t value) { hl_a64_movconst(&g_emit, rd, value); }
-static void e_stp(int rt, int rt2, int rn, int off) { hl_a64_stp(&g_emit, rt, rt2, rn, off); }
-static void e_ldp(int rt, int rt2, int rn, int off) { hl_a64_ldp(&g_emit, rt, rt2, rn, off); }
-static void e_addi(int rd, int rn, unsigned immediate) { hl_a64_addi(&g_emit, rd, rn, immediate); }
-static void e_addlsl4(int rd, int rn, int rm) { hl_a64_addlsl4(&g_emit, rd, rn, rm); }
-static void e_addlsl3(int rd, int rn, int rm) { hl_a64_addlsl3(&g_emit, rd, rn, rm); }
-static void e_movr(int rd, int rm) { hl_a64_movr(&g_emit, rd, rm); }
-static void e_subi(int rd, int rn, unsigned immediate) { hl_a64_subi(&g_emit, rd, rn, immediate); }
-static void e_hret(void) { hl_a64_ret(&g_emit); }
-static void e_adrp_add(int rd, uint64_t target) { hl_a64_adrp_add(&g_emit, rd, target); }
-static void e_load_cpu(int reg) { hl_a64_load_cpu(&g_emit, reg, (uintptr_t)g_cpu_key); }
-static void e_stur(int rt, int rn, int immediate) { hl_a64_stur(&g_emit, rt, rn, immediate); }
-static void e_ldur(int rt, int rn, int immediate) { hl_a64_ldur(&g_emit, rt, rn, immediate); }
-static void e_stp_q(int rt, int rt2, int rn, int off) { hl_a64_stp_q(&g_emit, rt, rt2, rn, off); }
-static void e_ldp_q(int rt, int rt2, int rn, int off) { hl_a64_ldp_q(&g_emit, rt, rt2, rn, off); }
+
+static void emit32(uint32_t instruction) {
+    hl_a64_emit32(&g_emit, instruction);
+}
+
+static void e_str(int rt, int rn, int off) {
+    hl_a64_str(&g_emit, rt, rn, off);
+}
+
+static void e_ldr(int rt, int rn, int off) {
+    hl_a64_ldr(&g_emit, rt, rn, off);
+}
+
+static void e_mov_sp_from(int rn) {
+    hl_a64_mov_sp_from(&g_emit, rn);
+}
+
+static void e_mov_from_sp(int rd) {
+    hl_a64_mov_from_sp(&g_emit, rd);
+}
+
+static void e_movz(int rd, uint32_t immediate, int shift) {
+    hl_a64_movz(&g_emit, rd, immediate, shift);
+}
+
+static void e_movk(int rd, uint32_t immediate, int shift) {
+    hl_a64_movk(&g_emit, rd, immediate, shift);
+}
+
+static void e_br(int rn) {
+    hl_a64_br(&g_emit, rn);
+}
+
+static void e_movconst(int rd, uint64_t value) {
+    hl_a64_movconst(&g_emit, rd, value);
+}
+
+static void e_stp(int rt, int rt2, int rn, int off) {
+    hl_a64_stp(&g_emit, rt, rt2, rn, off);
+}
+
+static void e_ldp(int rt, int rt2, int rn, int off) {
+    hl_a64_ldp(&g_emit, rt, rt2, rn, off);
+}
+
+static void e_addi(int rd, int rn, unsigned immediate) {
+    hl_a64_addi(&g_emit, rd, rn, immediate);
+}
+
+static void e_addlsl4(int rd, int rn, int rm) {
+    hl_a64_addlsl4(&g_emit, rd, rn, rm);
+}
+
+static void e_addlsl3(int rd, int rn, int rm) {
+    hl_a64_addlsl3(&g_emit, rd, rn, rm);
+}
+
+static void e_movr(int rd, int rm) {
+    hl_a64_movr(&g_emit, rd, rm);
+}
+
+static void e_subi(int rd, int rn, unsigned immediate) {
+    hl_a64_subi(&g_emit, rd, rn, immediate);
+}
+
+static void e_hret(void) {
+    hl_a64_ret(&g_emit);
+}
+
+static void e_adrp_add(int rd, uint64_t target) {
+    hl_a64_adrp_add(&g_emit, rd, target);
+}
+
+static void e_load_cpu(int reg) {
+    hl_a64_load_cpu(&g_emit, reg, (uintptr_t)g_cpu_key);
+}
+
+static void e_stur(int rt, int rn, int immediate) {
+    hl_a64_stur(&g_emit, rt, rn, immediate);
+}
+
+static void e_ldur(int rt, int rn, int immediate) {
+    hl_a64_ldur(&g_emit, rt, rn, immediate);
+}
+
+static void e_stp_q(int rt, int rt2, int rn, int off) {
+    hl_a64_stp_q(&g_emit, rt, rt2, rn, off);
+}
+
+static void e_ldp_q(int rt, int rt2, int rn, int off) {
+    hl_a64_ldp_q(&g_emit, rt, rt2, rn, off);
+}
+
 // persistent cross-process translated-code cache (recorded emitters used by stubs.c/translate.c;
 // load/save/relocate). MUST precede stubs.c + translate.c (they call the recorded emitters).
 #include "../../translator/guest/aarch64/cache.c"
@@ -212,7 +282,8 @@ static int sigframe_capture_fault(struct cpu *c, void *native_context) {
         int base = (int)((insn >> 5) & 31);
         if (guestbase_on() && is_foldable_mem(insn) && base != 31) {
             int slots[4], nsl = fold_mem_scratch(insn, slots);
-            for (int i = 0; i < nsl; i++) c->x[slots[i]] = c->mscratch[4 + i];
+            for (int i = 0; i < nsl; i++)
+                c->x[slots[i]] = c->mscratch[4 + i];
         }
     }
     return 1;
@@ -299,6 +370,7 @@ static int aarch64_image_read(const char *path, hl_linux_image *image) {
     }
     return hl_linux_image_read(effective_host_services(), request, image);
 }
+
 // termios + NET-ns loopback
 #include "../../linux_abi/container/netns.c"
 // ELF fwd-decls + FS-metadata cache
@@ -315,10 +387,10 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 static void ckpt_poll(struct cpu *c);
 #define G_CKPT_POLL(c) ckpt_poll(c)
 #define G_CKPT_ARCH 2
-#define G_CKPT_CPU_SANITIZE(c)                                                                                        \
-    do {                                                                                                              \
-        (c)->ic_site = 0;                                                                                             \
-        G_SOFT_STATE_RESET(c);                                                                                        \
+#define G_CKPT_CPU_SANITIZE(c)                                                                                         \
+    do {                                                                                                               \
+        (c)->ic_site = 0;                                                                                              \
+        G_SOFT_STATE_RESET(c);                                                                                         \
     } while (0)
 // checkpoint.c's restore driver (included below) rebuilds the container from these, defined later in this TU.
 static int container_init(const char *rootfs);
@@ -817,7 +889,8 @@ static int container_init(const char *rootfs) {
     }
     if (rootfs && rootfs[0]) {
         const char *owner_lowers[8];
-        for (int i = 0; i < g_nlower; ++i) owner_lowers[i] = g_lower[i].canon;
+        for (int i = 0; i < g_nlower; ++i)
+            owner_lowers[i] = g_lower[i].canon;
         g_rootfs = (char *)rootfs;
         if (root_handle_bind(g_rootfs) != 0 || root_native_require(g_rootfs) != 0) return -1;
         if (hl_owner_seed(g_rootfs, hl_option_get("HL_FILE_OWNERS"), owner_lowers, (size_t)g_nlower) != 0) return -1;
@@ -999,8 +1072,8 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
     // checkpoint/restore: place the brk heap in the deterministic high arena (0 hint => normal NULL placement)
     uint64_t heap;
     if (hl_gmap_map_anonymous(hl_linux_snapshot_reserve(&g_ckpt_snapshot, 256u << 20), 256u << 20,
-                              HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
-                              HL_HOST_MEMORY_PRIVATE, &heap) != HL_STATUS_OK)
+                              HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE, HL_HOST_MEMORY_PRIVATE,
+                              &heap) != HL_STATUS_OK)
         return 70;
     brk_lo = brk_cur = heap;
     brk_hi = brk_lo + (256u << 20);
@@ -1025,7 +1098,8 @@ static int hl_restore_checkpoint(const char *rootfs) {
     return ckpt_restore_tree(rootfs);
 }
 
-int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable, const void *executable_image, size_t executable_size, uint32_t argument_count,
+int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable,
+                       const void *executable_image, size_t executable_size, uint32_t argument_count,
                        char *const argv[]) {
     int argc;
     (void)executable;
@@ -1152,9 +1226,9 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
 // around the guest image's W^X is now the shared default too (fork.c, fsrv_restore_prep/done).
 // Bind the same per-guest host-service tables a cold hl_run_linux_guest() would, so the fork-server prewarm
 // parent (which runs guests via run_loaded()) allocates them once and every warm COW worker inherits them.
-#define FSRV_GUEST_HOST_INIT()                                                                                          \
+#define FSRV_GUEST_HOST_INIT()                                                                                         \
     do {                                                                                                               \
-        const hl_host_services *fsrv_host_ = hl_target_services_effective(&g_target_services);                        \
+        const hl_host_services *fsrv_host_ = hl_target_services_effective(&g_target_services);                         \
         futex_table_init(fsrv_host_);                                                                                  \
         seq_ref_arena_init(fsrv_host_);                                                                                \
         eventfd_count_init(fsrv_host_);                                                                                \
@@ -1174,8 +1248,8 @@ void hl_target_runtime_init(void) {
 // harness) launching identically.
 int hl_engine_entry(int argc, char **argv);
 
-static int hl_standalone_run(const char *rootfs, const char *executable_host, uint32_t argc, char *const argv[], const hl_options *options,
-                             const char *result_path) {
+static int hl_standalone_run(const char *rootfs, const char *executable_host, uint32_t argc, char *const argv[],
+                             const hl_options *options, const char *result_path) {
     (void)executable_host;
     // Earliest point that knows this launch is a restore: cover the whole rebuild against a terminal signal
     // typed at the pty before the tree exists (ckpt_restore_hold_tty_signals).

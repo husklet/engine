@@ -110,7 +110,6 @@ typedef hl_host_windows hl_activation_host;
 #endif
 #include <unistd.h>
 
-
 static hl_status activation_host_create(hl_activation_host **host, hl_host_services *services) {
 #if defined(__APPLE__)
     return hl_host_macos_create(host, services);
@@ -160,11 +159,12 @@ extern char **environ;
 void hl_activation_test_mode(uint32_t mode);
 
 enum { HL_ACTIVATION_FD = 3, HL_ACTIVATION_ABI = 2, HL_ACTIVATION_PATH_MAX = 4096 };
+
 /* Descriptor roles carried by one activation request, in ascending bit order. ABI 1 carried at most the
  * provider transport in an untagged single slot; ABI 2 tags them so the checkpoint broker can be attached
  * with or without a provider. */
-enum { HL_ACTIVATION_ROLE_TRANSPORT = 1u, HL_ACTIVATION_ROLE_CHECKPOINT = 2u,
-       HL_ACTIVATION_ROLE_TRIGGER = 4u };
+enum { HL_ACTIVATION_ROLE_TRANSPORT = 1u, HL_ACTIVATION_ROLE_CHECKPOINT = 2u, HL_ACTIVATION_ROLE_TRIGGER = 4u };
+
 #define HL_ACTIVATION_MAGIC UINT64_C(0x484c414354495631)
 
 typedef struct hl_activation_request {
@@ -175,8 +175,8 @@ typedef struct hl_activation_request {
     uint32_t guest_isa;
     uint32_t path_size;
     uint32_t test_flags;
-    uint32_t reserved;          /* number of attached descriptors */
-    uint32_t descriptor_roles;  /* HL_ACTIVATION_ROLE_* bitmask; descriptors arrive in ascending bit order */
+    uint32_t reserved;         /* number of attached descriptors */
+    uint32_t descriptor_roles; /* HL_ACTIVATION_ROLE_* bitmask; descriptors arrive in ascending bit order */
     uint32_t reserved_abi2;
     char path[HL_ACTIVATION_PATH_MAX];
 #if defined(_WIN32)
@@ -218,8 +218,8 @@ static int transfer(int fd, void *data, size_t size, int writing) {
 #if defined(MSG_NOSIGNAL)
         if (writing) flags = MSG_NOSIGNAL;
 #endif
-        ssize_t count = writing ? send(fd, bytes + offset, size - offset, flags)
-                                : read(fd, bytes + offset, size - offset);
+        ssize_t count =
+            writing ? send(fd, bytes + offset, size - offset, flags) : read(fd, bytes + offset, size - offset);
 #endif
         if (count < 0 && errno == EINTR) continue;
         if (count <= 0) return -1;
@@ -236,12 +236,13 @@ static int activation_provider_handshake(int descriptor) {
     int result;
     hello[20] = 1; /* NamespaceInstall v1. */
     if (transfer(descriptor, hello, sizeof(hello), 1) != 0) return -1;
-    do { result = poll(&pollfd, 1, 5000); } while (result < 0 && errno == EINTR);
-    if (result <= 0 || (pollfd.revents & POLLIN) == 0 || transfer(descriptor, ready, sizeof(ready), 0) != 0)
-        return -1;
+    do {
+        result = poll(&pollfd, 1, 5000);
+    } while (result < 0 && errno == EINTR);
+    if (result <= 0 || (pollfd.revents & POLLIN) == 0 || transfer(descriptor, ready, sizeof(ready), 0) != 0) return -1;
     /* HLPR, version 1, READY, empty payload, request id zero, reserved zero. */
-    if (ready[0] != 'R' || ready[1] != 'P' || ready[2] != 'L' || ready[3] != 'H' ||
-        ready[4] != 1 || ready[5] != 0 || ready[6] != 2 || ready[7] != 0)
+    if (ready[0] != 'R' || ready[1] != 'P' || ready[2] != 'L' || ready[3] != 'H' || ready[4] != 1 || ready[5] != 0 ||
+        ready[6] != 2 || ready[7] != 0)
         return -1;
     for (size_t index = 8; index < 20; ++index)
         if (ready[index] != 0) return -1;
@@ -250,11 +251,9 @@ static int activation_provider_handshake(int descriptor) {
     if ((ready[20] & 1u) != 0) {
         uint32_t size;
         if (transfer(descriptor, setup, sizeof(setup), 0) != 0 || setup[0] != 'R' || setup[1] != 'P' ||
-            setup[2] != 'L' || setup[3] != 'H' || setup[4] != 1 || setup[5] != 0 || setup[6] != 7 ||
-            setup[7] != 0)
+            setup[2] != 'L' || setup[3] != 'H' || setup[4] != 1 || setup[5] != 0 || setup[6] != 7 || setup[7] != 0)
             return -1;
-        size = (uint32_t)setup[8] | (uint32_t)setup[9] << 8 | (uint32_t)setup[10] << 16 |
-               (uint32_t)setup[11] << 24;
+        size = (uint32_t)setup[8] | (uint32_t)setup[9] << 8 | (uint32_t)setup[10] << 16 | (uint32_t)setup[11] << 24;
         if (size > 1024 * 1024 || memcmp(setup + 12, "\0\0\0\0\0\0\0\0", 8) != 0) return -1;
         payload = malloc(size == 0 ? 1 : size);
         if (payload == NULL || (size != 0 && transfer(descriptor, payload, size, 0) != 0) ||
@@ -359,9 +358,8 @@ static int activation_guest_signal(int host_signal) {
      * one conversion in one place. */
     return host_signal;
 #else
-    static const unsigned char macos_to_linux[32] = {
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 7, 11, 31, 13, 14, 15,
-        23, 19, 20, 18, 17, 21, 22, 29, 24, 25, 26, 27, 28, 29, 10, 12};
+    static const unsigned char macos_to_linux[32] = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  7,  11, 31, 13, 14, 15,
+                                                     23, 19, 20, 18, 17, 21, 22, 29, 24, 25, 26, 27, 28, 29, 10, 12};
     return host_signal > 0 && host_signal < 32 ? macos_to_linux[host_signal] : host_signal;
 #endif
 }
@@ -390,12 +388,12 @@ static void *activation_signal_relay(void *unused) {
         if (signal_number == 0) break;
         pthread_mutex_lock(&activation_engine_lock);
         if (activation_engine != NULL)
-            (void)hl_engine_request(activation_engine, HL_ENGINE_REQUEST_SIGNAL, &guest_signal,
-                                    sizeof(guest_signal));
+            (void)hl_engine_request(activation_engine, HL_ENGINE_REQUEST_SIGNAL, &guest_signal, sizeof(guest_signal));
         else
             activation_pending_signal = signal_number;
         pthread_mutex_unlock(&activation_engine_lock);
     }
+
     return NULL;
 }
 
@@ -531,8 +529,8 @@ static int activation_run_config(const char *rootfs, const char *executable_host
                                  const hl_options *options, const char *result_path) {
     hl_engine_fd_binding bindings[3] = {0};
     hl_engine_executable executable = {0};
-    hl_engine_config config = {.abi = HL_ENGINE_ABI, .size = sizeof(config),
-                               .guest_isa = activation_guest_isa, .rootfs = rootfs};
+    hl_engine_config config = {
+        .abi = HL_ENGINE_ABI, .size = sizeof(config), .guest_isa = activation_guest_isa, .rootfs = rootfs};
     hl_engine *engine = NULL;
     uint32_t count = 0;
     uint32_t stream;
@@ -541,18 +539,21 @@ static int activation_run_config(const char *rootfs, const char *executable_host
         hl_host_result adopted = activation_services->file->standard_stream(activation_services->context, stream);
         uint32_t access;
         if (adopted.status == HL_STATUS_NOT_FOUND) continue;
-        if (adopted.status != HL_STATUS_OK) { activation_status = (hl_status)adopted.status; return 78; }
+        if (adopted.status != HL_STATUS_OK) {
+            activation_status = (hl_status)adopted.status;
+            return 78;
+        }
         access = (uint32_t)adopted.detail & (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE);
-        bindings[count] = (hl_engine_fd_binding){.abi = HL_ENGINE_ABI, .size = sizeof(bindings[count]),
-                                                 .guest_fd = stream,
-                                                 .status_flags = access == (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE)
-                                                                     ? HL_LINUX_O_RDWR
-                                                                 : access == HL_HOST_FILE_WRITE ? HL_LINUX_O_WRONLY
-                                                                                                  : HL_LINUX_O_RDONLY,
-                                                 .ownership = HL_ENGINE_FD_TRANSFER,
-                                                 .host_handle = adopted.value};
-        if (((uint32_t)adopted.detail & HL_HOST_FILE_APPEND) != 0)
-            bindings[count].status_flags |= HL_LINUX_O_APPEND;
+        bindings[count] =
+            (hl_engine_fd_binding){.abi = HL_ENGINE_ABI,
+                                   .size = sizeof(bindings[count]),
+                                   .guest_fd = stream,
+                                   .status_flags = access == (HL_HOST_FILE_READ | HL_HOST_FILE_WRITE) ? HL_LINUX_O_RDWR
+                                                   : access == HL_HOST_FILE_WRITE ? HL_LINUX_O_WRONLY
+                                                                                  : HL_LINUX_O_RDONLY,
+                                   .ownership = HL_ENGINE_FD_TRANSFER,
+                                   .host_handle = adopted.value};
+        if (((uint32_t)adopted.detail & HL_HOST_FILE_APPEND) != 0) bindings[count].status_flags |= HL_LINUX_O_APPEND;
         if (((uint32_t)adopted.detail & HL_HOST_FILE_NONBLOCK) != 0)
             bindings[count].status_flags |= HL_LINUX_O_NONBLOCK;
         ++count;
@@ -569,8 +570,8 @@ static int activation_run_config(const char *rootfs, const char *executable_host
             activation_status = (hl_status)opened.status;
             return 78;
         }
-        executable = (hl_engine_executable){HL_ENGINE_ABI, sizeof(executable), HL_ENGINE_FD_TRANSFER, 0,
-                                            opened.value, NULL, 0};
+        executable =
+            (hl_engine_executable){HL_ENGINE_ABI, sizeof(executable), HL_ENGINE_FD_TRANSFER, 0, opened.value, NULL, 0};
         config.executable = &executable;
     }
     activation_status = hl_engine_create_with_options(&config, activation_services, options, &engine);
@@ -582,8 +583,7 @@ static int activation_run_config(const char *rootfs, const char *executable_host
         activation_engine = engine;
         pending = activation_pending_signal;
         activation_pending_signal = 0;
-        if (pending != 0)
-            (void)hl_engine_request(engine, HL_ENGINE_REQUEST_SIGNAL, &pending, sizeof(pending));
+        if (pending != 0) (void)hl_engine_request(engine, HL_ENGINE_REQUEST_SIGNAL, &pending, sizeof(pending));
         pthread_mutex_unlock(&activation_engine_lock);
         activation_status = hl_engine_run(engine, (int)argc, (const char *const *)argv, activation_result);
         pthread_mutex_lock(&activation_engine_lock);
@@ -670,20 +670,21 @@ static void hl_activation_child(void) {
         }
     }
 #else
-    if (hl_fork_wire_receive_descriptors((int)descriptor, &request, sizeof(request), inherited,
-                                         &inherited_count) != (int)sizeof(request)) _exit(126);
+    if (hl_fork_wire_receive_descriptors((int)descriptor, &request, sizeof(request), inherited, &inherited_count) !=
+        (int)sizeof(request))
+        _exit(126);
 #endif
     {
         unsigned roles = request.descriptor_roles;
-        int expected = ((roles & HL_ACTIVATION_ROLE_TRANSPORT) != 0) +
-                       ((roles & HL_ACTIVATION_ROLE_CHECKPOINT) != 0) +
+        int expected = ((roles & HL_ACTIVATION_ROLE_TRANSPORT) != 0) + ((roles & HL_ACTIVATION_ROLE_CHECKPOINT) != 0) +
                        ((roles & HL_ACTIVATION_ROLE_TRIGGER) != 0);
         int slot = 0;
         if (request.reserved > 3u ||
             (roles & ~(unsigned)(HL_ACTIVATION_ROLE_TRANSPORT | HL_ACTIVATION_ROLE_CHECKPOINT |
                                  HL_ACTIVATION_ROLE_TRIGGER)) != 0 ||
             inherited_count != (int)request.reserved || inherited_count != expected) {
-            while (inherited_count > 0) (void)close(inherited[--inherited_count]);
+            while (inherited_count > 0)
+                (void)close(inherited[--inherited_count]);
             _exit(126);
         }
         for (int index = 0; index < inherited_count; ++index) {
@@ -715,9 +716,9 @@ static void hl_activation_child(void) {
     reply.result.abi = HL_ENGINE_ABI;
     reply.result.size = sizeof(reply.result);
     if (request.test_flags == 1) reply.nonce[0] ^= UINT64_C(1);
-    if (request.magic == HL_ACTIVATION_MAGIC && request.abi == HL_ACTIVATION_ABI &&
-        request.size == sizeof(request) && request.path_size > 1 && request.path_size <= sizeof(request.path) &&
-        activation_absolute(request.path) && request.path[request.path_size - 1] == 0 &&
+    if (request.magic == HL_ACTIVATION_MAGIC && request.abi == HL_ACTIVATION_ABI && request.size == sizeof(request) &&
+        request.path_size > 1 && request.path_size <= sizeof(request.path) && activation_absolute(request.path) &&
+        request.path[request.path_size - 1] == 0 &&
         (request.guest_isa == HL_GUEST_ISA_AARCH64 || request.guest_isa == HL_GUEST_ISA_X86_64)) {
         /* Armed before the reply: activation_start returns to the embedder as soon as this
          * reply is acknowledged, and the embedder may signal immediately.  A signal landing
@@ -747,7 +748,8 @@ static void hl_activation_child(void) {
         activation_result = &reply.result;
         activation_status = status;
         if (status == HL_STATUS_OK && hl_run_config_file_with(request.path, activation_run_config) != 0 &&
-            activation_status == HL_STATUS_OK) activation_status = HL_STATUS_CORRUPT;
+            activation_status == HL_STATUS_OK)
+            activation_status = HL_STATUS_CORRUPT;
         status = activation_status;
     } else {
         (void)transfer((int)descriptor, &reply, sizeof(reply), 1);
@@ -910,8 +912,8 @@ static int domain_job_processes(HANDLE job, DWORD *ids, uint32_t capacity, uint3
 
 #if !defined(_WIN32)
 static void domain_path(hl_process_domain domain, char *path, size_t capacity) {
-    snprintf(path, capacity, "/tmp/.hl-domain.%016llx%016llx",
-             (unsigned long long)domain.identity[0], (unsigned long long)domain.identity[1]);
+    snprintf(path, capacity, "/tmp/.hl-domain.%016llx%016llx", (unsigned long long)domain.identity[0],
+             (unsigned long long)domain.identity[1]);
 }
 
 static int domain_birth(const char *directory, pid_t pid, uint64_t *birth) {
@@ -922,7 +924,9 @@ static int domain_birth(const char *directory, pid_t pid, uint64_t *birth) {
     snprintf(path, sizeof path, "%s/b%d", directory, (int)pid);
     descriptor = open(path, O_RDONLY | O_CLOEXEC);
     if (descriptor < 0) return 0;
-    do { count = read(descriptor, text, sizeof text - 1); } while (count < 0 && errno == EINTR);
+    do {
+        count = read(descriptor, text, sizeof text - 1);
+    } while (count < 0 && errno == EINTR);
     (void)close(descriptor);
     if (count <= 0) return 0;
     text[count] = 0;
@@ -958,8 +962,7 @@ static void domain_directory_remove(const char *directory) {
         if (name[0] < '1' || name[0] > '9') continue;
         errno = 0;
         raw = strtol(name, &end, 10);
-        if (errno == 0 && *end == 0 && raw > 0 && raw <= INT32_MAX)
-            domain_record_remove(directory, (pid_t)raw);
+        if (errno == 0 && *end == 0 && raw > 0 && raw <= INT32_MAX) domain_record_remove(directory, (pid_t)raw);
     }
     (void)closedir(entries);
     (void)rmdir(directory);
@@ -969,8 +972,8 @@ static void domain_network_remove(hl_process_domain domain) {
     char directory[96];
     DIR *entries;
     struct dirent *entry;
-    snprintf(directory, sizeof directory, "/tmp/.hl-net-%016llx%016llx",
-             (unsigned long long)domain.identity[0], (unsigned long long)domain.identity[1]);
+    snprintf(directory, sizeof directory, "/tmp/.hl-net-%016llx%016llx", (unsigned long long)domain.identity[0],
+             (unsigned long long)domain.identity[1]);
     entries = opendir(directory);
     if (entries == NULL) return;
     while ((entry = readdir(entries)) != NULL) {
@@ -1193,7 +1196,9 @@ hl_status hl_activation_domain_terminate(hl_process_domain domain) {
 #if !defined(_WIN32)
 static int wait_child(pid_t child, int *waited) {
     pid_t result;
-    do { result = waitpid(child, waited, 0); } while (result < 0 && errno == EINTR);
+    do {
+        result = waitpid(child, waited, 0);
+    } while (result < 0 && errno == EINTR);
     return result == child ? 0 : -1;
 }
 #endif
@@ -1229,8 +1234,10 @@ static int reserve_control_descriptors(int pair[2]) {
 static void cache_failure(hl_activation_process *process, hl_status status) {
     process->finished = 1;
     process->final_status = status;
-    process->final_exit = (hl_engine_exit){.abi = HL_ENGINE_ABI, .size = sizeof(process->final_exit),
-                                           .kind = HL_ENGINE_EXIT_ENGINE_ERROR, .detail = (uint64_t)status};
+    process->final_exit = (hl_engine_exit){.abi = HL_ENGINE_ABI,
+                                           .size = sizeof(process->final_exit),
+                                           .kind = HL_ENGINE_EXIT_ENGINE_ERROR,
+                                           .detail = (uint64_t)status};
 }
 
 /*
@@ -1317,9 +1324,9 @@ static int activation_handshake(int control, const hl_activation_request *reques
      * only route this transport allows. */
     if (test_mode == 3) return -1;
 #else
-    if ((attached_count > 0 ? hl_fork_wire_send_descriptors(control, request, sizeof(*request), attached,
-                                                            attached_count)
-                            : hl_fork_wire_send_descriptors(control, request, size, NULL, 0)) != 0)
+    if ((attached_count > 0
+             ? hl_fork_wire_send_descriptors(control, request, sizeof(*request), attached, attached_count)
+             : hl_fork_wire_send_descriptors(control, request, size, NULL, 0)) != 0)
         return -1;
     if (test_mode == 3) (void)shutdown(control, SHUT_WR);
 #endif
@@ -1358,24 +1365,40 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
 #if defined(__APPLE__)
     hl_linux_dns_prepare();
 #endif
-    while (environ[env_count] != NULL) ++env_count;
+    while (environ[env_count] != NULL)
+        ++env_count;
     child_env = calloc(env_count + 2, sizeof(*child_env));
     if (child_env == NULL) return HL_STATUS_OUT_OF_MEMORY;
     for (env_count = 0; environ[env_count] != NULL; ++env_count)
         if (strncmp(environ[env_count], "HL_ACTIVATION_FD=", 17) != 0) child_env[env_output++] = environ[env_count];
     child_env[env_output] = activation;
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) { free(child_env); return HL_STATUS_PLATFORM_FAILURE; }
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+        free(child_env);
+        return HL_STATUS_PLATFORM_FAILURE;
+    }
     if (reserve_control_descriptors(pair) != 0) {
-        close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
+        close(pair[0]);
+        close(pair[1]);
+        free(child_env);
+        return HL_STATUS_PLATFORM_FAILURE;
     }
 #if defined(__APPLE__)
-    { int enabled = 1; if (setsockopt(pair[0], SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0 ||
-                           setsockopt(pair[1], SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) {
-        close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
-    } }
+    {
+        int enabled = 1;
+        if (setsockopt(pair[0], SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0 ||
+            setsockopt(pair[1], SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) {
+            close(pair[0]);
+            close(pair[1]);
+            free(child_env);
+            return HL_STATUS_PLATFORM_FAILURE;
+        }
+    }
 #endif
     if (fcntl(pair[0], F_SETFD, FD_CLOEXEC) != 0 || fcntl(pair[1], F_SETFD, FD_CLOEXEC) != 0) {
-        close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
+        close(pair[0]);
+        close(pair[1]);
+        free(child_env);
+        return HL_STATUS_PLATFORM_FAILURE;
     }
     child_argv[0] = (char *)(uintptr_t)executable;
     child_argv[1] = NULL;
@@ -1388,7 +1411,10 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
             fcntl(slave, F_SETFD, FD_CLOEXEC) != 0) {
             if (master >= 0) close(master);
             if (slave >= 0) close(slave);
-            close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
+            close(pair[0]);
+            close(pair[1]);
+            free(child_env);
+            return HL_STATUS_PLATFORM_FAILURE;
         }
         child = fork();
         if (child == 0) {
@@ -1417,15 +1443,25 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
         (void)close(slave);
         slave = -1;
         if (child < 0) {
-            close(master); close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
+            close(master);
+            close(pair[0]);
+            close(pair[1]);
+            free(child_env);
+            return HL_STATUS_PLATFORM_FAILURE;
         }
         goto spawned;
     }
     if (posix_spawn_file_actions_init(&actions) != 0) {
-        close(pair[0]); close(pair[1]); free(child_env); return HL_STATUS_PLATFORM_FAILURE;
+        close(pair[0]);
+        close(pair[1]);
+        free(child_env);
+        return HL_STATUS_PLATFORM_FAILURE;
     }
     if (posix_spawnattr_init(&attributes) != 0) {
-        posix_spawn_file_actions_destroy(&actions); close(pair[0]); close(pair[1]); free(child_env);
+        posix_spawn_file_actions_destroy(&actions);
+        close(pair[0]);
+        close(pair[1]);
+        free(child_env);
         return HL_STATUS_PLATFORM_FAILURE;
     }
     short spawn_flags = POSIX_SPAWN_SETPGROUP;
@@ -1439,22 +1475,29 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
     if (((stdio == NULL || stdio->input < 0) && posix_spawn_file_actions_addinherit_np(&actions, 0) != 0) ||
         ((stdio == NULL || stdio->output < 0) && posix_spawn_file_actions_addinherit_np(&actions, 1) != 0) ||
         ((stdio == NULL || stdio->error < 0) && posix_spawn_file_actions_addinherit_np(&actions, 2) != 0)) {
-        posix_spawnattr_destroy(&attributes); posix_spawn_file_actions_destroy(&actions);
-        close(pair[0]); close(pair[1]); free(child_env);
+        posix_spawnattr_destroy(&attributes);
+        posix_spawn_file_actions_destroy(&actions);
+        close(pair[0]);
+        close(pair[1]);
+        free(child_env);
         return HL_STATUS_PLATFORM_FAILURE;
     }
 #endif
-    if (posix_spawnattr_setflags(&attributes, spawn_flags) != 0 ||
-        posix_spawnattr_setpgroup(&attributes, 0) != 0) {
-        posix_spawn_file_actions_destroy(&actions); close(pair[0]); close(pair[1]); free(child_env);
+    if (posix_spawnattr_setflags(&attributes, spawn_flags) != 0 || posix_spawnattr_setpgroup(&attributes, 0) != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        close(pair[0]);
+        close(pair[1]);
+        free(child_env);
         return HL_STATUS_PLATFORM_FAILURE;
     }
-    if (stdio != NULL &&
-        ((stdio->input >= 0 && posix_spawn_file_actions_adddup2(&actions, stdio->input, 0) != 0) ||
-         (stdio->output >= 0 && posix_spawn_file_actions_adddup2(&actions, stdio->output, 1) != 0) ||
-         (stdio->error >= 0 && posix_spawn_file_actions_adddup2(&actions, stdio->error, 2) != 0))) {
-        posix_spawnattr_destroy(&attributes); posix_spawn_file_actions_destroy(&actions);
-        close(pair[0]); close(pair[1]); free(child_env);
+    if (stdio != NULL && ((stdio->input >= 0 && posix_spawn_file_actions_adddup2(&actions, stdio->input, 0) != 0) ||
+                          (stdio->output >= 0 && posix_spawn_file_actions_adddup2(&actions, stdio->output, 1) != 0) ||
+                          (stdio->error >= 0 && posix_spawn_file_actions_adddup2(&actions, stdio->error, 2) != 0))) {
+        posix_spawnattr_destroy(&attributes);
+        posix_spawn_file_actions_destroy(&actions);
+        close(pair[0]);
+        close(pair[1]);
+        free(child_env);
         return HL_STATUS_PLATFORM_FAILURE;
     }
     /*
@@ -1470,13 +1513,19 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
         || posix_spawn_file_actions_addclosefrom_np(&actions, HL_ACTIVATION_FD + 1) != 0
 #endif
     ) {
-        posix_spawnattr_destroy(&attributes); posix_spawn_file_actions_destroy(&actions);
-        close(pair[0]); close(pair[1]); free(child_env);
+        posix_spawnattr_destroy(&attributes);
+        posix_spawn_file_actions_destroy(&actions);
+        close(pair[0]);
+        close(pair[1]);
+        free(child_env);
         return HL_STATUS_PLATFORM_FAILURE;
     }
     if (posix_spawn(&child, executable, &actions, &attributes, child_argv, child_env) != 0) {
-        posix_spawnattr_destroy(&attributes); posix_spawn_file_actions_destroy(&actions);
-        close(pair[0]); close(pair[1]); free(child_env);
+        posix_spawnattr_destroy(&attributes);
+        posix_spawn_file_actions_destroy(&actions);
+        close(pair[0]);
+        close(pair[1]);
+        free(child_env);
         return HL_STATUS_PLATFORM_FAILURE;
     }
     posix_spawnattr_destroy(&attributes);
@@ -1493,11 +1542,21 @@ spawned:
         if (trigger >= 0) attached[attached_count++] = trigger;
         if (test_mode == 3) attached_count = 0;
         if (activation_handshake(pair[0], &request, test_mode, attached, attached_count) != 0) {
-            close(pair[0]); if (master >= 0) close(master); (void)kill(-child, SIGKILL); (void)wait_child(child, &waited); return HL_STATUS_CORRUPT;
+            close(pair[0]);
+            if (master >= 0) close(master);
+            (void)kill(-child, SIGKILL);
+            (void)wait_child(child, &waited);
+            return HL_STATUS_CORRUPT;
         }
     }
     process = calloc(1, sizeof(*process));
-    if (process == NULL) { close(pair[0]); if (master >= 0) close(master); (void)kill(-child, SIGKILL); wait_child(child, &waited); return HL_STATUS_OUT_OF_MEMORY; }
+    if (process == NULL) {
+        close(pair[0]);
+        if (master >= 0) close(master);
+        (void)kill(-child, SIGKILL);
+        wait_child(child, &waited);
+        return HL_STATUS_OUT_OF_MEMORY;
+    }
     process->descriptor = pair[0];
     process->pid = child;
     memcpy(process->nonce, request.nonce, sizeof(process->nonce));
@@ -1564,8 +1623,8 @@ static WCHAR *activation_child_environment(unsigned long long handle_value) {
     const WCHAR *scan;
     size_t offset = 0;
     if (block == NULL) return NULL;
-    addition_length = (size_t)swprintf(addition, sizeof addition / sizeof addition[0], L"HL_ACTIVATION_FD=%llu",
-                                       handle_value);
+    addition_length =
+        (size_t)swprintf(addition, sizeof addition / sizeof addition[0], L"HL_ACTIVATION_FD=%llu", handle_value);
     for (scan = block; *scan != L'\0'; scan += wcslen(scan) + 1)
         if (_wcsnicmp(scan, L"HL_ACTIVATION_FD=", 17) != 0) kept += wcslen(scan) + 1;
     built = calloc(kept + addition_length + 2u, sizeof(*built));
@@ -1615,8 +1674,8 @@ static int activation_control_pair(HANDLE *out_server, HANDLE *out_client) {
     snprintf(name, sizeof name, "\\\\.\\pipe\\hl-activation.%08lx.%016llx%016llx", GetCurrentProcessId(),
              (unsigned long long)unique[0], (unsigned long long)unique[1]);
     server = CreateNamedPipeA(name, PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                              PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1,
-                              65536, 65536, 0, NULL);
+                              PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 65536,
+                              65536, 0, NULL);
     if (server == INVALID_HANDLE_VALUE) return -1;
     client = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, &inheritable, OPEN_EXISTING, 0, NULL);
     if (client == INVALID_HANDLE_VALUE) {
@@ -1742,7 +1801,8 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
         /* The truncation test withholds the descriptors as well as the tail of
          * the request, exactly as the POSIX arm does. */
         if (test_mode == 3) {
-            for (index = 0; index < attached; ++index) request.handles[index] = 0;
+            for (index = 0; index < attached; ++index)
+                request.handles[index] = 0;
             request.reserved = 0;
             request.descriptor_roles = 0;
         }
@@ -1852,7 +1912,8 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
     /* The child owns its own copies now. Releasing the parent's duplicates here
      * -- including the control client -- is what makes a child exit break the
      * pipe, which is the hang-up try_wait and wait both read. */
-    for (index = 0; index < inherited_count; ++index) CloseHandle(inherited[index]);
+    for (index = 0; index < inherited_count; ++index)
+        CloseHandle(inherited[index]);
     inherited_count = 0;
     DeleteProcThreadAttributeList(startup.lpAttributeList);
     free(startup.lpAttributeList);
@@ -1898,7 +1959,8 @@ fail:
         DeleteProcThreadAttributeList(startup.lpAttributeList);
         free(startup.lpAttributeList);
     }
-    for (index = 0; index < inherited_count; ++index) CloseHandle(inherited[index]);
+    for (index = 0; index < inherited_count; ++index)
+        CloseHandle(inherited[index]);
     if (control >= 0) (void)close(control);
     if (server != NULL) CloseHandle(server);
     if (job != NULL) CloseHandle(job);
@@ -1929,20 +1991,19 @@ hl_status hl_activation_start_terminal(const char *executable, uint32_t guest_is
     return activation_start(executable, guest_isa, guest, NULL, &size, out_master, -1, -1, -1, out_process);
 }
 
-hl_status hl_activation_start_terminal_with_transport(
-    const char *executable, uint32_t guest_isa, const char *guest, hl_terminal_size size,
-    int32_t transport, int32_t *out_master, hl_activation_process **out_process) {
+hl_status hl_activation_start_terminal_with_transport(const char *executable, uint32_t guest_isa, const char *guest,
+                                                      hl_terminal_size size, int32_t transport, int32_t *out_master,
+                                                      hl_activation_process **out_process) {
     if (transport < 0) return HL_STATUS_INVALID_ARGUMENT;
-    return activation_start(executable, guest_isa, guest, NULL, &size, out_master, transport, -1, -1,
-                            out_process);
+    return activation_start(executable, guest_isa, guest, NULL, &size, out_master, transport, -1, -1, out_process);
 }
 
 hl_status hl_activation_start_with_channels(const char *executable, uint32_t guest_isa, const char *guest,
                                             const hl_activation_stdio *stdio, const hl_terminal_size *size,
-                                            int32_t transport, int32_t checkpoint, int32_t trigger,
-                                            int32_t *out_master, hl_activation_process **out_process) {
-    return activation_start(executable, guest_isa, guest, stdio, size, out_master, transport, checkpoint,
-                            trigger, out_process);
+                                            int32_t transport, int32_t checkpoint, int32_t trigger, int32_t *out_master,
+                                            hl_activation_process **out_process) {
+    return activation_start(executable, guest_isa, guest, stdio, size, out_master, transport, checkpoint, trigger,
+                            out_process);
 }
 
 hl_status hl_terminal_resize(int32_t master, hl_terminal_size size) {
@@ -2004,8 +2065,8 @@ hl_status hl_activation_start_with_streams(const char *executable, uint32_t gues
         native_streams.error = (int32_t)error;
     }
     status = activation_start(executable, guest_isa, guest, streams != NULL ? &native_streams : NULL, size,
-                              out_master != NULL ? &master : NULL, native_transport, native_checkpoint,
-                              native_trigger, out_process);
+                              out_master != NULL ? &master : NULL, native_transport, native_checkpoint, native_trigger,
+                              out_process);
     /* activation_start leaves master at -1 whenever no terminal was produced, which is exactly the case
      * this API reports as NONE. */
     if (out_master != NULL && master >= 0) *out_master = (hl_activation_descriptor)master;
@@ -2066,7 +2127,10 @@ hl_status hl_activation_wait(hl_activation_process *process, hl_engine_exit *out
     hl_activation_reply reply;
     int waited = 0;
     if (process == NULL || out_exit == NULL) return HL_STATUS_INVALID_ARGUMENT;
-    if (process->finished) { *out_exit = process->final_exit; return process->final_status; }
+    if (process->finished) {
+        *out_exit = process->final_exit;
+        return process->final_status;
+    }
     if (transfer(process->descriptor, &reply, sizeof(reply), 0) != 0) {
         (void)close(process->descriptor);
         if (wait_child_process(process, &waited) != 0) {
@@ -2077,7 +2141,8 @@ hl_status hl_activation_wait(hl_activation_process *process, hl_engine_exit *out
         if (WIFSIGNALED(waited)) {
             process->finished = 1;
             process->final_status = HL_STATUS_OK;
-            process->final_exit = (hl_engine_exit){.abi = HL_ENGINE_ABI, .size = sizeof(process->final_exit),
+            process->final_exit = (hl_engine_exit){.abi = HL_ENGINE_ABI,
+                                                   .size = sizeof(process->final_exit),
                                                    .kind = HL_ENGINE_EXIT_SIGNAL,
                                                    .guest_status = WTERMSIG(waited)};
             *out_exit = process->final_exit;
@@ -2108,16 +2173,24 @@ hl_status hl_activation_wait(hl_activation_process *process, hl_engine_exit *out
     return process->final_status;
 }
 
-hl_status hl_activation_try_wait(hl_activation_process *process, uint32_t *out_ready,
-                                 hl_engine_exit *out_exit) {
+hl_status hl_activation_try_wait(hl_activation_process *process, uint32_t *out_ready, hl_engine_exit *out_exit) {
     struct pollfd descriptor;
     int ready;
     if (process == NULL || out_ready == NULL || out_exit == NULL) return HL_STATUS_INVALID_ARGUMENT;
-    if (process->finished) { *out_ready = 1; *out_exit = process->final_exit; return process->final_status; }
+    if (process->finished) {
+        *out_ready = 1;
+        *out_exit = process->final_exit;
+        return process->final_status;
+    }
     descriptor = (struct pollfd){.fd = process->descriptor, .events = POLLIN | POLLHUP};
-    do { ready = poll(&descriptor, 1, 0); } while (ready < 0 && errno == EINTR);
+    do {
+        ready = poll(&descriptor, 1, 0);
+    } while (ready < 0 && errno == EINTR);
     if (ready < 0) return HL_STATUS_PLATFORM_FAILURE;
-    if (ready == 0) { *out_ready = 0; return HL_STATUS_OK; }
+    if (ready == 0) {
+        *out_ready = 0;
+        return HL_STATUS_OK;
+    }
     *out_ready = 1;
     return hl_activation_wait(process, out_exit);
 }
@@ -2141,7 +2214,10 @@ hl_status hl_activation_kill(hl_activation_process *process) {
 void hl_activation_process_destroy(hl_activation_process *process) {
     hl_engine_exit ignored;
     if (process == NULL) return;
-    if (!process->finished) { (void)hl_activation_kill(process); (void)hl_activation_wait(process, &ignored); }
+    if (!process->finished) {
+        (void)hl_activation_kill(process);
+        (void)hl_activation_wait(process, &ignored);
+    }
 #if defined(_WIN32)
     /* Neither job carries KILL_ON_JOB_CLOSE, so releasing them here does not
      * terminate anything: a guest that outlived its initial process stays alive

@@ -1905,8 +1905,9 @@ static void syscall_route(struct cpu *c) {
     // worker-local fd, which must not leak into the guest's (fully virtual) descriptor space -- hand it to
     // the sentry for adoption so read/lseek/close forward exactly like any sentry-opened descriptor.
     char worker_proc_path[SENTRY_PATHCAP];
-    int worker_proc_path_len =
-        ((nr == 56 || nr == 78) && G_A1(c)) ? guest_copy_string(worker_proc_path, sizeof worker_proc_path, G_A1(c)) : -1;
+    int worker_proc_path_len = ((nr == 56 || nr == 78) && G_A1(c))
+                                   ? guest_copy_string(worker_proc_path, sizeof worker_proc_path, G_A1(c))
+                                   : -1;
     if (worker_proc_path_len >= 0 && sentry_worker_proc_leaf(worker_proc_path)) {
         service_local(c);
         if (nr == 56 && (int64_t)G_RET(c) >= 0) {
@@ -2027,33 +2028,33 @@ static void syscall_route(struct cpu *c) {
     socklen_t worker_socklen = 0;
     int worker_socklen_valid = 0;
 
-#define SENTRY_IMPORT_EXACT(dst, src, len)                                                                              \
-    do {                                                                                                                \
-        size_t _n = (size_t)(len);                                                                                      \
+#define SENTRY_IMPORT_EXACT(dst, src, len)                                                                             \
+    do {                                                                                                               \
+        size_t _n = (size_t)(len);                                                                                     \
         if (_n && guest_copy_from((dst), (uint64_t)(src), _n) != (ssize_t)_n) {                                        \
-            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);                                                                    \
-            atomic_store_explicit(&R->busy, 0, memory_order_release);                                                    \
-            return;                                                                                                     \
-        }                                                                                                               \
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);                                                                   \
+            atomic_store_explicit(&R->busy, 0, memory_order_release);                                                  \
+            return;                                                                                                    \
+        }                                                                                                              \
     } while (0)
-#define SENTRY_IMPORT_STRING(dst, cap, src)                                                                             \
-    do {                                                                                                                \
-        int _r = guest_copy_string((dst), (cap), (uint64_t)(src));                                                      \
-        if (_r < 0) {                                                                                                   \
-            G_RET(c) = (uint64_t)(int64_t)_r;                                                                           \
-            atomic_store_explicit(&R->busy, 0, memory_order_release);                                                    \
-            return;                                                                                                     \
-        }                                                                                                               \
-        R->inlen = (uint32_t)_r + 1u;                                                                                   \
+#define SENTRY_IMPORT_STRING(dst, cap, src)                                                                            \
+    do {                                                                                                               \
+        int _r = guest_copy_string((dst), (cap), (uint64_t)(src));                                                     \
+        if (_r < 0) {                                                                                                  \
+            G_RET(c) = (uint64_t)(int64_t)_r;                                                                          \
+            atomic_store_explicit(&R->busy, 0, memory_order_release);                                                  \
+            return;                                                                                                    \
+        }                                                                                                              \
+        R->inlen = (uint32_t)_r + 1u;                                                                                  \
     } while (0)
-#define SENTRY_REQUIRE_WRITE(ptr, len)                                                                                  \
-    do {                                                                                                                \
-        size_t _n = (size_t)(len);                                                                                      \
+#define SENTRY_REQUIRE_WRITE(ptr, len)                                                                                 \
+    do {                                                                                                               \
+        size_t _n = (size_t)(len);                                                                                     \
         if (_n && guest_accessible_prefix((uint64_t)(ptr), _n, HL_LOGICAL_VMA_WRITE) != _n) {                          \
-            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);                                                                    \
-            atomic_store_explicit(&R->busy, 0, memory_order_release);                                                    \
-            return;                                                                                                     \
-        }                                                                                                               \
+            G_RET(c) = (uint64_t)(int64_t)(-EFAULT);                                                                   \
+            atomic_store_explicit(&R->busy, 0, memory_order_release);                                                  \
+            return;                                                                                                    \
+        }                                                                                                              \
     } while (0)
 
     switch (nr) {
@@ -2200,8 +2201,8 @@ static void syscall_route(struct cpu *c) {
             uint32_t room = SENTRY_BUFSZ - cur;
             uint32_t want = (giov && giov[i].iov_len < room) ? (uint32_t)giov[i].iov_len : room;
             if (nr == 65 && want) {
-                size_t prefix = guest_accessible_prefix((uint64_t)(uintptr_t)giov[i].iov_base, want,
-                                                        HL_LOGICAL_VMA_WRITE);
+                size_t prefix =
+                    guest_accessible_prefix((uint64_t)(uintptr_t)giov[i].iov_base, want, HL_LOGICAL_VMA_WRITE);
                 if (!prefix) {
                     if (!payload) {
                         G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
@@ -2401,8 +2402,8 @@ static void syscall_route(struct cpu *c) {
             uint32_t room = (cur < SENTRY_DATACAP) ? (SENTRY_DATACAP - cur) : 0; // keep data clear of the tail
             uint32_t want = (giov && giov[i].iov_len < room) ? (uint32_t)giov[i].iov_len : room;
             if (nr == 212 && want) {
-                size_t prefix = guest_accessible_prefix((uint64_t)(uintptr_t)giov[i].iov_base, want,
-                                                        HL_LOGICAL_VMA_WRITE);
+                size_t prefix =
+                    guest_accessible_prefix((uint64_t)(uintptr_t)giov[i].iov_base, want, HL_LOGICAL_VMA_WRITE);
                 if (!prefix) {
                     if (!msg_payload) {
                         G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
@@ -2416,8 +2417,7 @@ static void syscall_route(struct cpu *c) {
                 want = (uint32_t)prefix;
             }
             if (nr == 211 && want) {
-                ssize_t copied =
-                    guest_copy_from(R->buf + cur, (uint64_t)(uintptr_t)giov[i].iov_base, want);
+                ssize_t copied = guest_copy_from(R->buf + cur, (uint64_t)(uintptr_t)giov[i].iov_base, want);
                 if (copied != (ssize_t)want) {
                     if (copied <= 0 && i == 0) {
                         G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
@@ -2564,12 +2564,12 @@ static void syscall_route(struct cpu *c) {
     if (nr == 56 && ret >= 0 && ret < HL_NFD) {
         const char *opened_path = (const char *)R->buf; /* canonical path snapshot, never reread guest memory */
         if (!strcmp(opened_path, "/proc") || !strncmp(opened_path, "/proc/", 6) || !strcmp(opened_path, "/dev/fd"))
-            snprintf(g_fdpath[(int)ret], sizeof g_fdpath[(int)ret], "%.*s",
-                     (int)sizeof(g_fdpath[(int)ret]) - 1, opened_path);
+            snprintf(g_fdpath[(int)ret], sizeof g_fdpath[(int)ret], "%.*s", (int)sizeof(g_fdpath[(int)ret]) - 1,
+                     opened_path);
     }
-#define SENTRY_EXPORT_EXACT(dst, src, len)                                                                              \
-    do {                                                                                                                \
-        size_t _n = (size_t)(len);                                                                                      \
+#define SENTRY_EXPORT_EXACT(dst, src, len)                                                                             \
+    do {                                                                                                               \
+        size_t _n = (size_t)(len);                                                                                     \
         if (_n && guest_copy_to((uint64_t)(dst), (src), _n) != (ssize_t)_n) ret = -EFAULT;                             \
     } while (0)
     switch (nr) {
@@ -2681,11 +2681,11 @@ static void syscall_route(struct cpu *c) {
     // ---- recvmsg (item 2): scatter received data + write back name/control/flags into the guest msghdr ----
     case 212:
         if (ret >= 0 && worker_msghdr_valid) {
-            uint8_t *h = R->buf;             // the ring msghdr copy service_local filled
+            uint8_t *h = R->buf; // the ring msghdr copy service_local filled
             uint64_t g_name = *(uint64_t *)(worker_msghdr + 0);
             if (g_nonpie_lo) g_name = nonpie_p(g_name);
             uint32_t g_namecap = *(uint32_t *)(worker_msghdr + 8);
-            uint32_t outnl = *(uint32_t *)(h + 8);     // length the sentry reported
+            uint32_t outnl = *(uint32_t *)(h + 8); // length the sentry reported
             if (g_name && g_namecap) {
                 uint32_t cpy = outnl < g_namecap ? outnl : g_namecap;
                 if (cpy > SENTRY_SADDRCAP) cpy = SENTRY_SADDRCAP;
@@ -2711,8 +2711,8 @@ static void syscall_route(struct cpu *c) {
                 for (uint32_t i = 0; i < n && remaining; i++) {
                     uint32_t seg = (uint32_t)biov[i].iov_len;
                     if (seg > remaining) seg = remaining;
-                    ssize_t copied = guest_copy_to((uint64_t)(uintptr_t)worker_msg_iov[i].iov_base,
-                                                   biov[i].iov_base, seg);
+                    ssize_t copied =
+                        guest_copy_to((uint64_t)(uintptr_t)worker_msg_iov[i].iov_base, biov[i].iov_base, seg);
                     if (copied != (ssize_t)seg) {
                         if (copied > 0) delivered += (uint32_t)copied;
                         ret = delivered ? (int64_t)delivered : -EFAULT;
@@ -2754,8 +2754,7 @@ static void syscall_route(struct cpu *c) {
         }
         break;
     case 25: // fcntl F_GETLK: the conflicting lock was written back into the ring flock
-        if ((int)G_A1(c) == 5 && ret >= 0 && G_A2(c))
-            SENTRY_EXPORT_EXACT(G_A2(c), R->buf, SENTRY_FLOCKSZ);
+        if ((int)G_A1(c) == 5 && ret >= 0 && G_A2(c)) SENTRY_EXPORT_EXACT(G_A2(c), R->buf, SENTRY_FLOCKSZ);
         break;
     case 29: // ioctl: write back exactly the out bytes the request defines (never clobber past them)
         if (ret >= 0 && G_A2(c)) {

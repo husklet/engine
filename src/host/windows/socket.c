@@ -97,8 +97,7 @@ typedef struct hl_windows_winsock {
     int(WSAAPI *select)(int, fd_set *, fd_set *, fd_set *, const struct timeval *);
     int(WSAAPI *event_select)(SOCKET, WSAEVENT, long);
     int(WSAAPI *enum_network_events)(SOCKET, WSAEVENT, LPWSANETWORKEVENTS);
-    int(WSAAPI *send)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, LPWSAOVERLAPPED,
-                      LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+    int(WSAAPI *send)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
     int(WSAAPI *receive)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, LPWSAOVERLAPPED,
                          LPWSAOVERLAPPED_COMPLETION_ROUTINE);
     int(WSAAPI *send_to)(SOCKET, LPWSABUF, DWORD, LPDWORD, DWORD, const struct sockaddr *, int, LPWSAOVERLAPPED,
@@ -268,7 +267,7 @@ enum {
 typedef struct hl_windows_socket_object {
     CRITICAL_SECTION lock;
     SOCKET socket;
-    HANDLE ready; /* manual-reset; WSAEventSelect's event. Also set by close, to release waiters. */
+    HANDLE ready;      /* manual-reset; WSAEventSelect's event. Also set by close, to release waiters. */
     uint32_t family;   /* hl_host_network_family */
     uint32_t type;     /* hl_host_network_type */
     uint32_t protocol; /* as the caller asked for it, so SOCKOPT_PROTOCOL can answer */
@@ -389,8 +388,7 @@ static void hl_windows_socket_drain(const hl_windows_winsock *ws, hl_windows_soc
         object->connecting = 0;
         if (events.iErrorCode[FD_CONNECT_BIT] != 0) object->pending_error = events.iErrorCode[FD_CONNECT_BIT];
     }
-    if ((events.lNetworkEvents & FD_CLOSE) != 0 && events.iErrorCode[FD_CLOSE_BIT] != 0 &&
-        object->pending_error == 0)
+    if ((events.lNetworkEvents & FD_CLOSE) != 0 && events.iErrorCode[FD_CLOSE_BIT] != 0 && object->pending_error == 0)
         object->pending_error = events.iErrorCode[FD_CLOSE_BIT];
     LeaveCriticalSection(&object->lock);
 }
@@ -518,7 +516,8 @@ static hl_status hl_windows_socket_decode(const struct sockaddr_storage *storage
     if (storage->ss_family == AF_UNIX) {
         const struct sockaddr_un *local = (const struct sockaddr_un *)storage;
         size_t length = 0;
-        while (length < sizeof(local->sun_path) && local->sun_path[length] != '\0') length++;
+        while (length < sizeof(local->sun_path) && local->sun_path[length] != '\0')
+            length++;
         out->family = HL_HOST_NETWORK_LOCAL;
         out->size = (uint16_t)length;
         if (length != 0) memcpy(out->local_path, local->sun_path, length);
@@ -766,9 +765,8 @@ static hl_host_result hl_windows_network_connect(void *context, hl_host_handle h
              * difference: EINPROGRESS means "wait for writability", EALREADY
              * means "you already asked". */
             result = hl_windows_socket_condition(code == WSAEALREADY ? HL_STATUS_BUSY : HL_STATUS_WOULD_BLOCK,
-                                                 code == WSAEALREADY
-                                                     ? HL_HOST_NETWORK_CONDITION_CONNECT_PENDING
-                                                     : HL_HOST_NETWORK_CONDITION_CONNECT_IN_PROGRESS);
+                                                 code == WSAEALREADY ? HL_HOST_NETWORK_CONDITION_CONNECT_PENDING
+                                                                     : HL_HOST_NETWORK_CONDITION_CONNECT_IN_PROGRESS);
             break;
         }
         result = hl_windows_socket_error_result(code);
@@ -830,9 +828,7 @@ static hl_host_result hl_windows_network_name(void *context, hl_host_handle hand
          * it is said here. */
         memset(address, 0, sizeof(*address));
         address->family = object->family;
-        address->size = object->family == HL_HOST_NETWORK_IPV4    ? 4
-                        : object->family == HL_HOST_NETWORK_IPV6 ? 16
-                                                                 : 0;
+        address->size = object->family == HL_HOST_NETWORK_IPV4 ? 4 : object->family == HL_HOST_NETWORK_IPV6 ? 16 : 0;
         result = hl_windows_result(HL_STATUS_OK, 0, 0);
     } else if (failed) {
         result = hl_windows_socket_last_error(ws);
@@ -952,8 +948,8 @@ static hl_host_result hl_windows_network_transfer(void *context, hl_host_handle 
          * away" and closes, where the correct answer tells it to supply an
          * address. */
         if (sending && code == WSAENOTCONN && destination == NULL && object->type != HL_HOST_NETWORK_STREAM) {
-            result = hl_windows_socket_condition(HL_STATUS_INVALID_ARGUMENT,
-                                                 HL_HOST_NETWORK_CONDITION_DESTINATION_REQUIRED);
+            result =
+                hl_windows_socket_condition(HL_STATUS_INVALID_ARGUMENT, HL_HOST_NETWORK_CONDITION_DESTINATION_REQUIRED);
             break;
         }
         /* A receive on an end we ourselves shut down for reading is end of
@@ -1032,13 +1028,12 @@ static hl_host_result hl_windows_network_send_message(void *context, hl_host_han
      * silently dropped it would make a descriptor-passing guest look like it
      * had succeeded. Refused, with the message unsent. */
     if (message->control != NULL && message->control_size != 0)
-        return hl_windows_socket_condition(HL_STATUS_NOT_SUPPORTED,
-                                           HL_HOST_NETWORK_CONDITION_OPERATION_NOT_SUPPORTED);
+        return hl_windows_socket_condition(HL_STATUS_NOT_SUPPORTED, HL_HOST_NETWORK_CONDITION_OPERATION_NOT_SUPPORTED);
     if (message->address != NULL) {
         status = hl_windows_socket_encode(message->address, &storage, &size);
         if (status != HL_STATUS_OK) return hl_windows_result(status, 0, 0);
-        return hl_windows_network_transfer(context, handle, buffers, count, flags, 1,
-                                           (const struct sockaddr *)&storage, size, NULL, NULL);
+        return hl_windows_network_transfer(context, handle, buffers, count, flags, 1, (const struct sockaddr *)&storage,
+                                           size, NULL, NULL);
     }
     return hl_windows_network_transfer(context, handle, buffers, count, flags, 1, NULL, 0, NULL, NULL);
 }
@@ -1326,8 +1321,7 @@ static hl_host_result hl_windows_network_get_option(void *context, hl_host_handl
     }
     entry = hl_windows_socket_option_find(option);
     if (entry == NULL || !entry->readable) {
-        result = hl_windows_socket_condition(HL_STATUS_NOT_SUPPORTED,
-                                             HL_HOST_NETWORK_CONDITION_OPTION_NOT_SUPPORTED);
+        result = hl_windows_socket_condition(HL_STATUS_NOT_SUPPORTED, HL_HOST_NETWORK_CONDITION_OPTION_NOT_SUPPORTED);
     } else {
         int scalar = 0;
         int size = (int)sizeof(scalar);
@@ -1391,10 +1385,10 @@ static hl_host_result hl_windows_network_set_option(void *context, hl_host_handl
         }
         native.l_onoff = (u_short)(in.enabled != 0 ? 1 : 0);
         native.l_linger = (u_short)in.seconds;
-        result = ws->set_sock_opt(object->socket, SOL_SOCKET, SO_LINGER, (const char *)&native,
-                                  (int)sizeof(native)) == 0
-                     ? hl_windows_result(HL_STATUS_OK, 0, 0)
-                     : hl_windows_socket_last_error(ws);
+        result =
+            ws->set_sock_opt(object->socket, SOL_SOCKET, SO_LINGER, (const char *)&native, (int)sizeof(native)) == 0
+                ? hl_windows_result(HL_STATUS_OK, 0, 0)
+                : hl_windows_socket_last_error(ws);
         goto done;
     }
     case HL_HOST_SOCKOPT_SEND_TIMEOUT:
@@ -1427,25 +1421,23 @@ static hl_host_result hl_windows_network_set_option(void *context, hl_host_handl
          * accept rather than as a bad argument, because that is the distinction
          * a caller acts on: one says "ask differently", the other says "this
          * option is not settable here". */
-        result = hl_windows_socket_condition(HL_STATUS_NOT_SUPPORTED,
-                                             HL_HOST_NETWORK_CONDITION_OPTION_NOT_SUPPORTED);
+        result = hl_windows_socket_condition(HL_STATUS_NOT_SUPPORTED, HL_HOST_NETWORK_CONDITION_OPTION_NOT_SUPPORTED);
         goto done;
     default: break;
     }
     entry = hl_windows_socket_option_find(option);
     if (entry == NULL || !entry->writable) {
-        result = hl_windows_socket_condition(HL_STATUS_NOT_SUPPORTED,
-                                             HL_HOST_NETWORK_CONDITION_OPTION_NOT_SUPPORTED);
+        result = hl_windows_socket_condition(HL_STATUS_NOT_SUPPORTED, HL_HOST_NETWORK_CONDITION_OPTION_NOT_SUPPORTED);
     } else if (value.data == NULL || value.size < sizeof(uint32_t)) {
         result = hl_windows_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     } else {
         int native;
         memcpy(&scalar, value.data, sizeof(scalar));
         native = (int)scalar;
-        result = ws->set_sock_opt(object->socket, entry->level, entry->name, (const char *)&native,
-                                  (int)sizeof(native)) == 0
-                     ? hl_windows_result(HL_STATUS_OK, 0, 0)
-                     : hl_windows_socket_last_error(ws);
+        result =
+            ws->set_sock_opt(object->socket, entry->level, entry->name, (const char *)&native, (int)sizeof(native)) == 0
+                ? hl_windows_result(HL_STATUS_OK, 0, 0)
+                : hl_windows_socket_last_error(ws);
     }
 done:
     hl_windows_socket_object_release(object);
@@ -1513,7 +1505,8 @@ static hl_host_result hl_windows_network_pair(void *context, uint32_t family, ui
     {
         static const char prefix[] = "hl-pair-";
         size_t index;
-        for (index = 0; index + 1 < sizeof(prefix); ++index) path[offset++] = prefix[index];
+        for (index = 0; index + 1 < sizeof(prefix); ++index)
+            path[offset++] = prefix[index];
     }
     unique = ((unsigned long long)GetCurrentProcessId() << 32) ^
              ((unsigned long long)(ULONG)InterlockedIncrement(&sequence) << 8) ^ (unsigned long long)GetTickCount64();
@@ -1588,26 +1581,25 @@ fail:
     return result;
 }
 
-const hl_host_network_services hl_windows_network_services = {
-    .abi = HL_HOST_NETWORK_ABI,
-    .size = sizeof(hl_host_network_services),
-    .socket = hl_windows_network_socket,
-    .bind = hl_windows_network_bind,
-    .connect = hl_windows_network_connect,
-    .send = hl_windows_network_send,
-    .receive = hl_windows_network_receive,
-    .close = hl_windows_network_close,
-    .listen = hl_windows_network_listen,
-    .accept = hl_windows_network_accept,
-    .pair = hl_windows_network_pair,
-    .shutdown = hl_windows_network_shutdown,
-    .local_address = hl_windows_network_local_address,
-    .peer_address = hl_windows_network_peer_address,
-    .get_option = hl_windows_network_get_option,
-    .set_option = hl_windows_network_set_option,
-    .send_message = hl_windows_network_send_message,
-    .receive_message = hl_windows_network_receive_message,
-    .readiness = hl_windows_network_readiness,
-    .wait_handle = hl_windows_network_wait_handle,
-    .set_status_flags = hl_windows_network_set_status_flags,
-    .duplicate = hl_windows_network_duplicate};
+const hl_host_network_services hl_windows_network_services = {.abi = HL_HOST_NETWORK_ABI,
+                                                              .size = sizeof(hl_host_network_services),
+                                                              .socket = hl_windows_network_socket,
+                                                              .bind = hl_windows_network_bind,
+                                                              .connect = hl_windows_network_connect,
+                                                              .send = hl_windows_network_send,
+                                                              .receive = hl_windows_network_receive,
+                                                              .close = hl_windows_network_close,
+                                                              .listen = hl_windows_network_listen,
+                                                              .accept = hl_windows_network_accept,
+                                                              .pair = hl_windows_network_pair,
+                                                              .shutdown = hl_windows_network_shutdown,
+                                                              .local_address = hl_windows_network_local_address,
+                                                              .peer_address = hl_windows_network_peer_address,
+                                                              .get_option = hl_windows_network_get_option,
+                                                              .set_option = hl_windows_network_set_option,
+                                                              .send_message = hl_windows_network_send_message,
+                                                              .receive_message = hl_windows_network_receive_message,
+                                                              .readiness = hl_windows_network_readiness,
+                                                              .wait_handle = hl_windows_network_wait_handle,
+                                                              .set_status_flags = hl_windows_network_set_status_flags,
+                                                              .duplicate = hl_windows_network_duplicate};

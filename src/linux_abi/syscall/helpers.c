@@ -321,24 +321,38 @@ static void poslk_unlock(void) {
 }
 
 static int flock_holder_find(struct flock_broker_record *record, int32_t pid) {
-    for (int index = 0; index < FLOCK_HOLDERS_MAX; ++index) if (record->holders[index] == pid) return index;
+    for (int index = 0; index < FLOCK_HOLDERS_MAX; ++index)
+        if (record->holders[index] == pid) return index;
     return -1;
 }
+
 static int flock_holder_add(struct flock_broker_record *record, int32_t pid) {
     if (flock_holder_find(record, pid) >= 0) return 0;
-    for (int index = 0; index < FLOCK_HOLDERS_MAX; ++index) if (record->holders[index] == 0) {
-        record->holders[index] = pid; return 0;
-    }
-    errno = ENOLCK; return -1;
+    for (int index = 0; index < FLOCK_HOLDERS_MAX; ++index)
+        if (record->holders[index] == 0) {
+            record->holders[index] = pid;
+            return 0;
+        }
+    errno = ENOLCK;
+    return -1;
 }
+
 static int flock_has_holders(const struct flock_broker_record *record) {
-    for (int index = 0; index < FLOCK_HOLDERS_MAX; ++index) if (record->holders[index] != 0) return 1;
+    for (int index = 0; index < FLOCK_HOLDERS_MAX; ++index)
+        if (record->holders[index] != 0) return 1;
     return 0;
 }
+
 static int flock_broker_apply(const hl_linux_fd_snapshot *source, uint64_t device, uint64_t object, int operation) {
-    if (g_poslk == NULL || source->flock_token == 0) { errno = ENOLCK; return -1; }
+    if (g_poslk == NULL || source->flock_token == 0) {
+        errno = ENOLCK;
+        return -1;
+    }
     int base = operation & ~LOCK_NB;
-    if (base != LOCK_SH && base != LOCK_EX && base != LOCK_UN) { errno = EINVAL; return -1; }
+    if (base != LOCK_SH && base != LOCK_EX && base != LOCK_UN) {
+        errno = EINVAL;
+        return -1;
+    }
     for (;;) {
         struct flock_broker_record *own = NULL, *free_record = NULL;
         int conflict = 0;
@@ -346,7 +360,10 @@ static int flock_broker_apply(const hl_linux_fd_snapshot *source, uint64_t devic
         poslk_lock();
         for (int index = 0; index < FLOCK_BROKER_MAX; ++index) {
             struct flock_broker_record *record = &g_poslk->flock[index];
-            if (!record->active) { if (free_record == NULL) free_record = record; continue; }
+            if (!record->active) {
+                if (free_record == NULL) free_record = record;
+                continue;
+            }
             for (int holder = 0; holder < FLOCK_HOLDERS_MAX; ++holder)
                 if (record->holders[holder] > 0 && kill(record->holders[holder], 0) < 0 && errno == ESRCH)
                     record->holders[holder] = 0;
@@ -355,28 +372,47 @@ static int flock_broker_apply(const hl_linux_fd_snapshot *source, uint64_t devic
                 if (free_record == NULL) free_record = record;
                 continue;
             }
-            if (record->token == source->flock_token) { own = record; continue; }
+            if (record->token == source->flock_token) {
+                own = record;
+                continue;
+            }
             if (record->device == device && record->object == object && record->mode != 0 && base != LOCK_UN &&
-                (base == LOCK_EX || record->mode == LOCK_EX)) conflict = 1;
+                (base == LOCK_EX || record->mode == LOCK_EX))
+                conflict = 1;
         }
         if (!conflict && base == LOCK_UN) {
             if (own != NULL) own->mode = 0;
         } else if (!conflict) {
             if (own == NULL) {
-                if (free_record == NULL) { poslk_unlock(); errno = ENOLCK; return -1; }
+                if (free_record == NULL) {
+                    poslk_unlock();
+                    errno = ENOLCK;
+                    return -1;
+                }
                 own = free_record;
                 memset(own, 0, sizeof(*own));
-                own->device = device; own->object = object; own->token = source->flock_token; own->active = 1;
+                own->device = device;
+                own->object = object;
+                own->token = source->flock_token;
+                own->active = 1;
             }
-            if (flock_holder_add(own, getpid()) != 0) { poslk_unlock(); return -1; }
+            if (flock_holder_add(own, getpid()) != 0) {
+                poslk_unlock();
+                return -1;
+            }
             own->mode = (uint8_t)base;
         }
         if (!conflict) atomic_fetch_add_explicit(&g_poslk->flock_generation, 1, memory_order_release);
         poslk_unlock();
         if (!conflict) return 0;
-        if (operation & LOCK_NB) { errno = EWOULDBLOCK; return -1; }
-        do { struct timespec pause = {0, 1000000}; nanosleep(&pause, NULL); }
-        while (atomic_load_explicit(&g_poslk->flock_generation, memory_order_acquire) == before);
+        if (operation & LOCK_NB) {
+            errno = EWOULDBLOCK;
+            return -1;
+        }
+        do {
+            struct timespec pause = {0, 1000000};
+            nanosleep(&pause, NULL);
+        } while (atomic_load_explicit(&g_poslk->flock_generation, memory_order_acquire) == before);
     }
 }
 
@@ -404,12 +440,14 @@ static void flock_broker_after_fork(void) {
     // unconditional exactly as before so any observer's re-read semantics are unchanged.
     int any_active = 0;
     for (int index = 0; index < FLOCK_BROKER_MAX; ++index)
-        if (g_poslk->flock[index].active) { any_active = 1; break; }
+        if (g_poslk->flock[index].active) {
+            any_active = 1;
+            break;
+        }
     if (any_active)
         for (uint32_t fd = 0; fd < g_linux_box->fd_capacity; ++fd) {
             hl_linux_fd_snapshot source;
-            if (hl_linux_fd_snapshot_get(g_linux_box, fd, &source) != HL_STATUS_OK || source.flock_token == 0)
-                continue;
+            if (hl_linux_fd_snapshot_get(g_linux_box, fd, &source) != HL_STATUS_OK || source.flock_token == 0) continue;
             for (int index = 0; index < FLOCK_BROKER_MAX; ++index) {
                 struct flock_broker_record *record = &g_poslk->flock[index];
                 if (record->active && record->token == source.flock_token) (void)flock_holder_add(record, getpid());
@@ -536,8 +574,8 @@ static int poslk_resolve(int fd, const uint8_t *lf, dev_t *dev, ino_t *ino, int6
 // (*out = the value to return to the guest: 0 / -EAGAIN / -EBADF / -EINVAL / -ENOLCK) or 0 when the fd is not
 // a regular file (the caller must fall back to a real host fcntl). F_SETLKW is a single non-blocking attempt
 // here (returns -EAGAIN on conflict); io.c wraps it in a signal-aware poll-retry loop.
-static int poslk_apply(uint64_t device, uint64_t object, int lcmd, uint8_t *lf, int64_t lo, int64_t hi,
-                       int type, int *out) {
+static int poslk_apply(uint64_t device, uint64_t object, int lcmd, uint8_t *lf, int64_t lo, int64_t hi, int type,
+                       int *out) {
     int32_t me = poslk_mypid();
     poslk_lock();
     if (lcmd == 5) { // F_GETLK: report the first conflicting lock held by ANOTHER process, else F_UNLCK
@@ -626,8 +664,8 @@ static int poslk_op(int fd, int lcmd, uint8_t *lf, int *out) {
 /* Host-neutral typed-file entry: the caller resolves stable identity, current
    offset, and size through host services, never by treating an opaque handle
    as a native descriptor. */
-static int poslk_op_identity(uint64_t device, uint64_t object, int64_t current, uint64_t size,
-                             int lcmd, uint8_t *lf, int *out) {
+static int poslk_op_identity(uint64_t device, uint64_t object, int64_t current, uint64_t size, int lcmd, uint8_t *lf,
+                             int *out) {
     short linux_type = *(const short *)(lf + 0);
     short whence = *(const short *)(lf + 2);
     int64_t start = *(const int64_t *)(lf + 8);
@@ -1017,12 +1055,19 @@ static int g_anonmap_capacity;
 // anon_after_fork() to re-init it in the child, mirroring eventfd_after_fork/sysv_after_fork.
 static pthread_mutex_t g_anonmap_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void anon_lock(void) { pthread_mutex_lock(&g_anonmap_lock); }
-static void anon_unlock(void) { pthread_mutex_unlock(&g_anonmap_lock); }
+static void anon_lock(void) {
+    pthread_mutex_lock(&g_anonmap_lock);
+}
+
+static void anon_unlock(void) {
+    pthread_mutex_unlock(&g_anonmap_lock);
+}
 
 // Called in the fork CHILD (from fork_child_hooks): a peer thread may have held g_anonmap_lock at the
 // instant of fork, leaving the inherited copy permanently locked. Re-init to a fresh unlocked mutex.
-static void anon_after_fork(void) { pthread_mutex_init(&g_anonmap_lock, NULL); }
+static void anon_after_fork(void) {
+    pthread_mutex_init(&g_anonmap_lock, NULL);
+}
 
 static void anon_reserve_one(void) {
     if (g_nanonmap < g_anonmap_capacity) return;
@@ -1307,9 +1352,9 @@ static int epoll_slot(int fd) {
 // -dup can re-home the knote onto the surviving alias. Like the g_ep_rd/wr armed maps this is a SINGLE
 // owner per watched fd (hl already assumes a fd is watched by at most one epoll instance); the writes are
 // a couple of fd-indexed stores on the epoll_ctl path, so the hot path cost matches the existing armed map.
-static int g_ep_owner[HL_NFD];       // watched fd -> owning epoll instance fd + 1 (0 = not watched)
-static uint32_t g_ep_events[HL_NFD]; // watched fd -> the epoll events mask registered (EPOLLIN/OUT/ET/ONESHOT)
-static uint64_t g_ep_udata[HL_NFD];  // watched fd -> the epoll_event.data registered for it
+static int g_ep_owner[HL_NFD];            // watched fd -> owning epoll instance fd + 1 (0 = not watched)
+static uint32_t g_ep_events[HL_NFD];      // watched fd -> the epoll events mask registered (EPOLLIN/OUT/ET/ONESHOT)
+static uint64_t g_ep_udata[HL_NFD];       // watched fd -> the epoll_event.data registered for it
 static void ep_mem_close(int ep, int fd); // implemented beside the membership table in event.c
 static int ep_mem_test(int ep, int fd);
 static void ep_mem_set(int ep, int fd, int on);
@@ -1366,8 +1411,7 @@ static void ep_rehome_instance(int fd) {
     if (fd < 0 || fd >= HL_NFD || !g_epoll[fd] || epoll_slot(fd) != fd) return;
     int replacement = -1;
     for (int candidate = 0; candidate < HL_NFD; ++candidate)
-        if (candidate != fd && g_epoll[candidate] && epoll_slot(candidate) == fd &&
-            fcntl(candidate, F_GETFD) >= 0) {
+        if (candidate != fd && g_epoll[candidate] && epoll_slot(candidate) == fd && fcntl(candidate, F_GETFD) >= 0) {
             replacement = candidate;
             break;
         }

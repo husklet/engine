@@ -274,8 +274,8 @@ static hl_status hl_park_wait(uint32_t scope, const void *address, uint64_t expe
 
 static hl_status hl_park_wake(uint32_t scope, const void *address, uint32_t count, uint64_t *released) {
     int operation = FUTEX_WAKE | (scope == HL_HOST_PARK_PRIVATE ? FUTEX_PRIVATE_FLAG : 0);
-    long result = syscall(SYS_futex, address, operation, count > (uint32_t)INT_MAX ? INT_MAX : (int)count, NULL, NULL,
-                          0);
+    long result =
+        syscall(SYS_futex, address, operation, count > (uint32_t)INT_MAX ? INT_MAX : (int)count, NULL, NULL, 0);
     *released = 0;
     if (result < 0)
         return (errno == EFAULT || errno == EINVAL) ? HL_STATUS_INVALID_ARGUMENT : HL_STATUS_PLATFORM_FAILURE;
@@ -697,8 +697,7 @@ static hl_park_slot *hl_park_claim(hl_host_sync_registry *registry, uint64_t wai
         }
         if (vacant != NULL) {
             uint64_t expected = 0;
-            if (!__atomic_compare_exchange_n(&vacant->waiter, &expected, waiter, 0, __ATOMIC_SEQ_CST,
-                                             __ATOMIC_SEQ_CST))
+            if (!__atomic_compare_exchange_n(&vacant->waiter, &expected, waiter, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
                 continue; /* someone took it; rescan, which may now find our own waiter */
             __atomic_store_n(&vacant->address, 0, __ATOMIC_SEQ_CST);
             __atomic_store_n(&vacant->scope, 0, __ATOMIC_SEQ_CST);

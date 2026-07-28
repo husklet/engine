@@ -198,14 +198,14 @@ static int translit_classify(const struct insn *insn) {
     if (op == 0x69 || op == 0x6B) return TL_COPY;   // imul imm
     if (op >= 0x70 && op <= 0x7F) return TL_JCC;
     if (op == 0x80 || op == 0x81 || op == 0x83) return TL_COPY;
-    if (op >= 0x84 && op <= 0x8B) return TL_COPY; // test/xchg/mov
-    if (op == 0x8D) return TL_COPY;               // lea
+    if (op >= 0x84 && op <= 0x8B) return TL_COPY;            // test/xchg/mov
+    if (op == 0x8D) return TL_COPY;                          // lea
     if (op == 0x8F) return insn->reg == 0 ? TL_COPY : TL_NO; // pop r/m (/0 only; the rest are #UD)
-    if (op >= 0x90 && op <= 0x99) return TL_COPY; // nop/xchg rAX/cwtl/cltd
-    if (op >= 0xA0 && op <= 0xA3) return TL_COPY; // mov moffs
-    if (op >= 0xA4 && op <= 0xAF) return TL_COPY; // string ops + test imm
-    if (op >= 0xB0 && op <= 0xBF) return TL_COPY; // mov reg, imm
-    if (op == 0xC0 || op == 0xC1) return TL_COPY; // shift imm8
+    if (op >= 0x90 && op <= 0x99) return TL_COPY;            // nop/xchg rAX/cwtl/cltd
+    if (op >= 0xA0 && op <= 0xA3) return TL_COPY;            // mov moffs
+    if (op >= 0xA4 && op <= 0xAF) return TL_COPY;            // string ops + test imm
+    if (op >= 0xB0 && op <= 0xBF) return TL_COPY;            // mov reg, imm
+    if (op == 0xC0 || op == 0xC1) return TL_COPY;            // shift imm8
     if (op == 0xC2 || op == 0xC3) return TL_RET;
     if (op == 0xC6 || op == 0xC7) return TL_COPY; // mov r/m, imm
     if (op == 0xC9) return TL_COPY;               // leave

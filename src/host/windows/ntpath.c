@@ -82,8 +82,7 @@ int hl_windows_resolve_ntdll(hl_windows_ntdll *nt) {
     /* Same cast shape as hl_windows_resolve_kernelbase: FARPROC converts back
      * only to a function pointer type, so the hop through one is what ISO C
      * permits. */
-#define HL_WINDOWS_BIND(field, name)                                                                                   \
-    *(void (**)(void)) & nt->field = (void (*)(void))GetProcAddress(module, name)
+#define HL_WINDOWS_BIND(field, name) *(void (**)(void)) & nt->field = (void (*)(void))GetProcAddress(module, name)
     HL_WINDOWS_BIND(create_file, "NtCreateFile");
     HL_WINDOWS_BIND(read_file, "NtReadFile");
     HL_WINDOWS_BIND(write_file, "NtWriteFile");
@@ -98,10 +97,10 @@ int hl_windows_resolve_ntdll(hl_windows_ntdll *nt) {
     HL_WINDOWS_BIND(status_to_dos_error, "RtlNtStatusToDosError");
 #undef HL_WINDOWS_BIND
     return nt->create_file != NULL && nt->read_file != NULL && nt->write_file != NULL &&
-           nt->query_information_file != NULL && nt->set_information_file != NULL &&
-           nt->query_directory_file != NULL && nt->query_volume_information_file != NULL &&
-           nt->flush_buffers_file != NULL && nt->query_security_object != NULL && nt->open_process_token != NULL &&
-           nt->query_information_token != NULL && nt->status_to_dos_error != NULL;
+           nt->query_information_file != NULL && nt->set_information_file != NULL && nt->query_directory_file != NULL &&
+           nt->query_volume_information_file != NULL && nt->flush_buffers_file != NULL &&
+           nt->query_security_object != NULL && nt->open_process_token != NULL && nt->query_information_token != NULL &&
+           nt->status_to_dos_error != NULL;
 }
 
 /* --- status mapping -------------------------------------------------------- */
@@ -210,8 +209,7 @@ hl_status hl_windows_wide_from_utf8(const char *bytes, size_t size, int escape, 
     return HL_STATUS_OK;
 }
 
-hl_status hl_windows_utf8_from_wide(const WCHAR *wide, uint32_t length, char *out, size_t capacity,
-                                    size_t *out_size) {
+hl_status hl_windows_utf8_from_wide(const WCHAR *wide, uint32_t length, char *out, size_t capacity, size_t *out_size) {
     WCHAR stack[512];
     WCHAR *plain = stack;
     int produced;
@@ -232,8 +230,8 @@ hl_status hl_windows_utf8_from_wide(const WCHAR *wide, uint32_t length, char *ou
      * have been unreachable through the forward direction anyway. */
     for (index = 0; index < length; ++index)
         plain[index] = (wide[index] & 0xFF00u) == 0xF000u ? (WCHAR)(wide[index] & 0x00FFu) : wide[index];
-    produced = WideCharToMultiByte(CP_UTF8, 0, plain, (int)length, capacity == 0 ? NULL : out, (int)capacity, NULL,
-                                   NULL);
+    produced =
+        WideCharToMultiByte(CP_UTF8, 0, plain, (int)length, capacity == 0 ? NULL : out, (int)capacity, NULL, NULL);
     if (plain != stack) free(plain);
     if (produced <= 0) {
         if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) return HL_STATUS_INVALID_ARGUMENT;
@@ -291,8 +289,8 @@ NTSTATUS hl_windows_open_child(const hl_windows_ntdll *nt, HANDLE parent, const 
  * a round trip through UTF-16 would not be lossless for a target that is not
  * valid UTF-8.
  */
-const char hl_windows_symlink_magic[HL_WINDOWS_SYMLINK_MAGIC_SIZE] = {'!',    '<',    's', 'y', 'm', 'l', 'i',
-                                                                      'n',    'k',    '>', '\xEF', '\xBB', '\xBF'};
+const char hl_windows_symlink_magic[HL_WINDOWS_SYMLINK_MAGIC_SIZE] = {'!', '<', 's', 'y',    'm',    'l',   'i',
+                                                                      'n', 'k', '>', '\xEF', '\xBB', '\xBF'};
 
 int hl_windows_symlink_candidate(uint32_t attributes, uint64_t size) {
     return (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 && (attributes & FILE_ATTRIBUTE_SYSTEM) != 0 &&
@@ -339,8 +337,7 @@ int hl_windows_symlink_read(const hl_windows_ntdll *nt, HANDLE file, char *targe
 static int hl_windows_native_prefix(const char *path, size_t size) {
     if (size >= 4 && path[0] == '\\' && path[1] == '\\' && (path[2] == '?' || path[2] == '.') && path[3] == '\\')
         return 1;
-    if (size >= 2 && path[1] == ':' &&
-        ((path[0] >= 'a' && path[0] <= 'z') || (path[0] >= 'A' && path[0] <= 'Z')))
+    if (size >= 2 && path[1] == ':' && ((path[0] >= 'a' && path[0] <= 'z') || (path[0] >= 'A' && path[0] <= 'Z')))
         return 1;
     return 0;
 }
@@ -368,9 +365,8 @@ static hl_host_result hl_windows_open_absolute_root(hl_host_windows *host, const
         memcpy(native, L"\\??\\", 4 * sizeof(WCHAR));
         {
             uint32_t produced = 0;
-            hl_status converted = hl_windows_wide_from_utf8(path + start, at - start, 0, native + 4,
-                                                            (uint32_t)(sizeof(native) / sizeof(*native)) - 6u,
-                                                            &produced);
+            hl_status converted = hl_windows_wide_from_utf8(
+                path + start, at - start, 0, native + 4, (uint32_t)(sizeof(native) / sizeof(*native)) - 6u, &produced);
             if (converted != HL_STATUS_OK) return hl_windows_result(converted, 0, 0);
             length = produced + 4u;
         }
@@ -437,9 +433,9 @@ static hl_host_result hl_windows_open_parent(hl_host_windows *host, HANDLE direc
         --at; /* drop the separator, unless that would empty the name */
         if (at == 0) at = 1;
     }
-    status = hl_windows_open_child(&host->nt, NULL, path + 4, at,
-                                   FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES, 0, FILE_OPEN,
-                                   FILE_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT, out);
+    status =
+        hl_windows_open_child(&host->nt, NULL, path + 4, at, FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
+                              0, FILE_OPEN, FILE_DIRECTORY_FILE | FILE_OPEN_FOR_BACKUP_INTENT, out);
     return status == HL_NT_SUCCESS ? hl_windows_result(HL_STATUS_OK, 0, 0) : hl_windows_nt_result(host, status);
 }
 
@@ -636,8 +632,8 @@ hl_host_result hl_windows_resolve_path(hl_host_windows *host, HANDLE root, const
                                        FILE_OPEN_REPARSE_POINT, &child);
         if (status == HL_NT_ACCESS_DENIED)
             status = hl_windows_open_child(&host->nt, current, pending + start, end - start,
-                                           FILE_READ_ATTRIBUTES | FILE_TRAVERSE, 0, FILE_OPEN,
-                                           FILE_OPEN_REPARSE_POINT, &child);
+                                           FILE_READ_ATTRIBUTES | FILE_TRAVERSE, 0, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+                                           &child);
         if (status != HL_NT_SUCCESS) {
             if (missing_ok && rest >= length &&
                 (status == HL_NT_OBJECT_NAME_NOT_FOUND || status == HL_NT_OBJECT_PATH_NOT_FOUND)) {

@@ -290,8 +290,7 @@ static inline int semop(int identifier, struct sembuf *operations, size_t count)
     return -1;
 }
 
-static inline int semtimedop(int identifier, struct sembuf *operations, size_t count,
-                             const struct timespec *timeout) {
+static inline int semtimedop(int identifier, struct sembuf *operations, size_t count, const struct timespec *timeout) {
     (void)identifier;
     (void)operations;
     (void)count;

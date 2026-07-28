@@ -17,11 +17,10 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
     if ((services->capabilities & HL_HOST_CAP_MEMORY) != 0) {
         const hl_host_memory_services *memory = services->memory;
         if (memory == NULL || memory->abi != HL_HOST_MEMORY_ABI || memory->size < sizeof(*memory) ||
-            memory->reserve == NULL || memory->protect == NULL ||
-            memory->release == NULL || memory->publish_code == NULL || memory->map_anonymous == NULL ||
-            memory->discard == NULL || memory->repair_signal_page == NULL || memory->unmap_address == NULL ||
-            memory->wire_range == NULL || memory->unwire_range == NULL || memory->protect_address == NULL ||
-            memory->sync_address == NULL)
+            memory->reserve == NULL || memory->protect == NULL || memory->release == NULL ||
+            memory->publish_code == NULL || memory->map_anonymous == NULL || memory->discard == NULL ||
+            memory->repair_signal_page == NULL || memory->unmap_address == NULL || memory->wire_range == NULL ||
+            memory->unwire_range == NULL || memory->protect_address == NULL || memory->sync_address == NULL)
             return HL_STATUS_ABI_MISMATCH;
     }
     if ((services->capabilities & HL_HOST_CAP_CODE_MAPPING) != 0 &&
@@ -84,8 +83,8 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
     if ((services->capabilities & HL_HOST_CAP_NETWORK) != 0) {
         const hl_host_network_services *network = services->network;
         if (network == NULL || network->abi != HL_HOST_NETWORK_ABI || network->size < sizeof(*network) ||
-            network->socket == NULL || network->bind == NULL ||
-            network->connect == NULL || network->send == NULL || network->receive == NULL || network->close == NULL)
+            network->socket == NULL || network->bind == NULL || network->connect == NULL || network->send == NULL ||
+            network->receive == NULL || network->close == NULL)
             return HL_STATUS_ABI_MISMATCH;
         if (network->listen == NULL || network->accept == NULL || network->pair == NULL || network->shutdown == NULL ||
             network->local_address == NULL || network->peer_address == NULL || network->get_option == NULL ||
@@ -101,11 +100,10 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
         return HL_STATUS_ABI_MISMATCH;
     if ((services->capabilities & HL_HOST_CAP_SYNC) != 0) {
         const hl_host_sync_services *sync = services->sync;
-        if (sync == NULL || sync->abi != HL_HOST_SYNC_ABI || sync->size < sizeof(*sync) ||
-            sync->mutex_create == NULL || sync->mutex_lock == NULL ||
-            sync->mutex_unlock == NULL || sync->mutex_close == NULL || sync->fork_prepare == NULL ||
-            sync->fork_parent == NULL || sync->fork_child == NULL || sync->park == NULL || sync->unpark == NULL ||
-            sync->interrupt_park == NULL)
+        if (sync == NULL || sync->abi != HL_HOST_SYNC_ABI || sync->size < sizeof(*sync) || sync->mutex_create == NULL ||
+            sync->mutex_lock == NULL || sync->mutex_unlock == NULL || sync->mutex_close == NULL ||
+            sync->fork_prepare == NULL || sync->fork_parent == NULL || sync->fork_child == NULL || sync->park == NULL ||
+            sync->unpark == NULL || sync->interrupt_park == NULL)
             return HL_STATUS_ABI_MISMATCH;
     }
     if ((services->capabilities & HL_HOST_CAP_TERMINAL) != 0 &&

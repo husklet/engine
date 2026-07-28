@@ -48,8 +48,7 @@ static uint64_t hl_owner_birth(const char *path, int fd, int nofollow, const str
     memset(&status, 0, sizeof(status));
     if (name != NULL && syscall(SYS_statx, directory, name, flags, STATX_BTIME, &status) == 0 &&
         (status.stx_mask & STATX_BTIME) != 0)
-        return (uint64_t)status.stx_btime.tv_sec * UINT64_C(1000000000) +
-               (uint64_t)status.stx_btime.tv_nsec;
+        return (uint64_t)status.stx_btime.tv_sec * UINT64_C(1000000000) + (uint64_t)status.stx_btime.tv_nsec;
     (void)fallback;
     return 0;
 #else
@@ -109,8 +108,8 @@ static hl_owner_entry *hl_owner_slot(uint64_t device, uint64_t object, uint64_t 
         if (!create) return NULL;
         {
             uint32_t expected = 0;
-            if (!atomic_compare_exchange_strong_explicit(&entry->active, &expected, 2,
-                                                         memory_order_acq_rel, memory_order_acquire))
+            if (!atomic_compare_exchange_strong_explicit(&entry->active, &expected, 2, memory_order_acq_rel,
+                                                         memory_order_acquire))
                 goto retry_entry;
         }
         entry->device = device;
@@ -162,9 +161,11 @@ static int hl_owner_path_valid(const char *path, size_t length) {
     if (length == 0 || path[0] == '/') return 0;
     while (start < length) {
         size_t end = start;
-        while (end < length && path[end] != '/') ++end;
+        while (end < length && path[end] != '/')
+            ++end;
         if (end == start || (end - start == 1 && path[start] == '.') ||
-            (end - start == 2 && path[start] == '.' && path[start + 1] == '.')) return 0;
+            (end - start == 2 && path[start] == '.' && path[start + 1] == '.'))
+            return 0;
         start = end + 1;
     }
     return path[length - 1] != '/';

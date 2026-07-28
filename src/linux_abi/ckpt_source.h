@@ -50,16 +50,16 @@ static int64_t ckpt_source_stream_size(struct ckpt_source *source, const char *n
     return (int64_t)reply.value;
 }
 
-static int64_t ckpt_source_stream_read(struct ckpt_source *source, const char *name, uint64_t offset,
-                                       void *out, size_t size) {
+static int64_t ckpt_source_stream_read(struct ckpt_source *source, const char *name, uint64_t offset, void *out,
+                                       size_t size) {
     size_t done = 0;
     (void)source;
     while (done < size) {
         hl_ckpt_reply reply;
         size_t chunk = size - done;
         if (chunk > HL_CKPT_STREAM_PAYLOAD_MAX) chunk = HL_CKPT_STREAM_PAYLOAD_MAX;
-        if (ckpt_stream_call(HL_CKPT_OP_SOURCE_READ, name, 0, offset + done, 0, NULL, chunk, &reply,
-                             (char *)out + done, chunk) != HL_CKPT_STATUS_OK)
+        if (ckpt_stream_call(HL_CKPT_OP_SOURCE_READ, name, 0, offset + done, 0, NULL, chunk, &reply, (char *)out + done,
+                             chunk) != HL_CKPT_STATUS_OK)
             return -1;
         if (reply.length == 0) break; // end of object
         done += (size_t)reply.length;
@@ -67,18 +67,15 @@ static int64_t ckpt_source_stream_read(struct ckpt_source *source, const char *n
     return (int64_t)done;
 }
 
-static int ckpt_source_stream_list(struct ckpt_source *source, const char *prefix, char *out,
-                                   size_t capacity) {
+static int ckpt_source_stream_list(struct ckpt_source *source, const char *prefix, char *out, size_t capacity) {
     hl_ckpt_reply reply;
     (void)source;
-    if (ckpt_stream_call(HL_CKPT_OP_SOURCE_LIST, prefix, 0, 0, 0, NULL, 0, &reply, out, capacity) !=
-        HL_CKPT_STATUS_OK)
+    if (ckpt_stream_call(HL_CKPT_OP_SOURCE_LIST, prefix, 0, 0, 0, NULL, 0, &reply, out, capacity) != HL_CKPT_STATUS_OK)
         return -1;
     return (int)reply.value;
 }
 
-static int ckpt_source_stream_digest(struct ckpt_source *source, uint64_t *hash, uint64_t *files,
-                                     uint64_t *bytes) {
+static int ckpt_source_stream_digest(struct ckpt_source *source, uint64_t *hash, uint64_t *files, uint64_t *bytes) {
     hl_ckpt_stream_digest digest = {0};
     hl_ckpt_reply reply;
     (void)source;
@@ -136,6 +133,7 @@ static int ckpt_source_digest(uint64_t *hash, uint64_t *files, uint64_t *bytes) 
 // The materialised objects handed out as FILE*. One entry per open image object; the restore driver never
 // holds more than a handful at once.
 #define CKPT_SOURCE_OPEN_MAX 64
+
 static struct {
     FILE *file;
     void *bytes;

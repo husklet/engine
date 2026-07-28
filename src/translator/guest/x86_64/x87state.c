@@ -18,7 +18,8 @@ unsigned hl_x87_exceptions_get(void) {
     uint64_t fpsr;
     unsigned flags = 0;
     __asm__ volatile("mrs %0, fpsr" : "=r"(fpsr));
-    for (unsigned bit = 0; bit < 6; ++bit) flags |= (unsigned)((fpsr >> g_fpsr_bit[bit]) & 1u) << bit;
+    for (unsigned bit = 0; bit < 6; ++bit)
+        flags |= (unsigned)((fpsr >> g_fpsr_bit[bit]) & 1u) << bit;
     return flags;
 #elif defined(HL_HOST_CPU_X86_64)
     return _mm_getcsr() & 0x3fu;
@@ -32,7 +33,8 @@ void hl_x87_exceptions_set(unsigned flags) {
     uint64_t fpsr;
     __asm__ volatile("mrs %0, fpsr" : "=r"(fpsr));
     fpsr &= ~UINT64_C(0x9f);
-    for (unsigned bit = 0; bit < 6; ++bit) fpsr |= (uint64_t)((flags >> bit) & 1u) << g_fpsr_bit[bit];
+    for (unsigned bit = 0; bit < 6; ++bit)
+        fpsr |= (uint64_t)((flags >> bit) & 1u) << g_fpsr_bit[bit];
     __asm__ volatile("msr fpsr, %0" : : "r"(fpsr));
 #elif defined(HL_HOST_CPU_X86_64)
     _mm_setcsr((_mm_getcsr() & ~0x3fu) | (flags & 0x3fu));
@@ -41,7 +43,9 @@ void hl_x87_exceptions_set(unsigned flags) {
 #endif
 }
 
-void hl_x87_exceptions_raise(unsigned flags) { hl_x87_exceptions_set(hl_x87_exceptions_get() | (flags & 0x3fu)); }
+void hl_x87_exceptions_raise(unsigned flags) {
+    hl_x87_exceptions_set(hl_x87_exceptions_get() | (flags & 0x3fu));
+}
 
 // #IS. C1 tells the two apart: 1 = OVERFLOW (a push onto a non-empty slot), 0 = UNDERFLOW (a read of an
 // empty one). Mirrors interp_x87_stack_fault.
@@ -151,7 +155,9 @@ uint16_t hl_x86_x87_status_word(const struct cpu *cpu) {
     return status;
 }
 
-static void x87_put32(uint8_t *area, unsigned offset, uint32_t value) { memcpy(area + offset, &value, 4); }
+static void x87_put32(uint8_t *area, unsigned offset, uint32_t value) {
+    memcpy(area + offset, &value, 4);
+}
 
 static uint32_t x87_get16(const uint8_t *area, unsigned offset) {
     uint16_t value;

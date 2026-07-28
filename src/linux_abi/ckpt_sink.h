@@ -55,8 +55,8 @@ typedef struct ckpt_sink_vtable {
     int (*write)(struct ckpt_sink_stream *stream, const void *data, size_t size);
     int (*write_at)(struct ckpt_sink_stream *stream, uint64_t offset, const void *data, size_t size);
     int64_t (*tell)(struct ckpt_sink_stream *stream);
-    int (*finish)(struct ckpt_sink_stream *stream);  // durable + visible; frees the stream either way
-    void (*abort)(struct ckpt_sink_stream *stream);  // discard; frees the stream
+    int (*finish)(struct ckpt_sink_stream *stream); // durable + visible; frees the stream either way
+    void (*abort)(struct ckpt_sink_stream *stream); // discard; frees the stream
 
     // Groups (per-process images).
     int (*group_begin)(struct ckpt_sink *sink, const char *group);
@@ -99,8 +99,7 @@ static int ckpt_sink_begin(struct ckpt_sink *sink, const char *group, const char
     return sink->ops->begin(sink, group, name, flags, out);
 }
 
-static int ckpt_sink_write(struct ckpt_sink *sink, struct ckpt_sink_stream *stream, const void *data,
-                           size_t size) {
+static int ckpt_sink_write(struct ckpt_sink *sink, struct ckpt_sink_stream *stream, const void *data, size_t size) {
     return sink->ops->write(stream, data, size);
 }
 
@@ -129,8 +128,8 @@ static void ckpt_sink_abort(struct ckpt_sink *sink, struct ckpt_sink_stream **st
 }
 
 // begin+write+finish of a whole in-memory object.
-static int ckpt_sink_put(struct ckpt_sink *sink, const char *group, const char *name, uint32_t flags,
-                         const void *data, size_t size) {
+static int ckpt_sink_put(struct ckpt_sink *sink, const char *group, const char *name, uint32_t flags, const void *data,
+                         size_t size) {
     struct ckpt_sink_stream *stream = NULL;
     if (ckpt_sink_begin(sink, group, name, flags, &stream) != 0) return -1;
     if (ckpt_sink_write(sink, stream, data, size) != 0) {
@@ -143,25 +142,35 @@ static int ckpt_sink_put(struct ckpt_sink *sink, const char *group, const char *
 static int ckpt_sink_group_begin(struct ckpt_sink *sink, const char *group) {
     return sink && sink->ops ? sink->ops->group_begin(sink, group) : -1;
 }
+
 static int ckpt_sink_group_commit(struct ckpt_sink *sink, const char *group) {
     return sink->ops->group_commit(sink, group);
 }
+
 static void ckpt_sink_group_abort(struct ckpt_sink *sink, const char *group) {
     sink->ops->group_abort(sink, group);
 }
+
 static int ckpt_sink_claim(struct ckpt_sink *sink, const char *name) {
     return sink && sink->ops ? sink->ops->claim(sink, name) : -1;
 }
-static void ckpt_sink_unclaim(struct ckpt_sink *sink, const char *name) { sink->ops->unclaim(sink, name); }
+
+static void ckpt_sink_unclaim(struct ckpt_sink *sink, const char *name) {
+    sink->ops->unclaim(sink, name);
+}
+
 static int ckpt_sink_group_present(struct ckpt_sink *sink, const char *group) {
     return sink && sink->ops ? sink->ops->group_present(sink, group) : -1;
 }
+
 static int ckpt_sink_group_count(struct ckpt_sink *sink, const char *prefix) {
     return sink && sink->ops ? sink->ops->group_count(sink, prefix) : -1;
 }
+
 static int ckpt_sink_digest(struct ckpt_sink *sink, uint64_t *hash, uint64_t *files, uint64_t *bytes) {
     return sink && sink->ops ? sink->ops->digest(sink, hash, files, bytes) : -1;
 }
+
 static int ckpt_sink_commit(struct ckpt_sink *sink, const void *manifest, size_t size) {
     return sink && sink->ops ? sink->ops->commit(sink, manifest, size) : -1;
 }

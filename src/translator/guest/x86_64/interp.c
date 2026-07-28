@@ -55,7 +55,7 @@ static void jit86_drop_range_translations(uint64_t lo, uint64_t hi) {
     uint64_t range[1][2];
     range[0][0] = lo;
     range[0][1] = hi;
-    if (map_invalidate_source_ranges((const uint64_t(*)[2])range, 1)) {
+    if (map_invalidate_source_ranges((const uint64_t (*)[2])range, 1)) {
         memset(g_ibtc, 0, sizeof g_ibtc);
         memset(g_xibtc, 0, sizeof g_xibtc);
     }
@@ -261,10 +261,21 @@ static inline void interp_tso_fence(void) {
 // on the aarch64 guest as a spinlock admitting two holders; ~1e-4 of racing CASes silently undone. Packed
 // structs, not casts: a guest access need not be aligned, and this must stay one instruction at every -O
 // level, not only where the optimiser inlines a constant-size memcpy.
-struct interp_una8 { uint8_t v; } __attribute__((packed));
-struct interp_una16 { uint16_t v; } __attribute__((packed));
-struct interp_una32 { uint32_t v; } __attribute__((packed));
-struct interp_una64 { uint64_t v; } __attribute__((packed));
+struct interp_una8 {
+    uint8_t v;
+} __attribute__((packed));
+
+struct interp_una16 {
+    uint16_t v;
+} __attribute__((packed));
+
+struct interp_una32 {
+    uint32_t v;
+} __attribute__((packed));
+
+struct interp_una64 {
+    uint64_t v;
+} __attribute__((packed));
 
 static void interp_copy_indivisible(void *destination, const void *source, unsigned bytes) {
     switch (bytes) {
@@ -766,7 +777,7 @@ static int interp_undefined(struct cpu *cpu, const struct insn *insn, uint64_t p
     char text[96];
     int length = (insn->len > 0 && insn->len <= 15) ? insn->len : 8;
     int used = 0;
-    const char *map = insn->vex ? (insn->evex ? "EVEX" : "VEX")
+    const char *map = insn->vex         ? (insn->evex ? "EVEX" : "VEX")
                       : insn->map3 == 2 ? "0F38"
                       : insn->map3 == 3 ? "0F3A"
                       : insn->two       ? "0F"
@@ -781,7 +792,10 @@ static int interp_undefined(struct cpu *cpu, const struct insn *insn, uint64_t p
             class_name, (unsigned long long)pc, (unsigned long long)(pc - g_loadbase), text, map, insn->op,
             insn->has_modrm ? insn->modrm : 0, insn->reg, insn->rm_reg, insn->opsize, insn->len,
             insn->has_rex ? " REX" : "", insn->p66 ? " 66" : "", insn->rep ? " F3" : "", insn->repne ? " F2" : "",
-            insn->lock ? " LOCK" : "", insn->seg == 1 ? " FS" : insn->seg == 2 ? " GS" : "");
+            insn->lock ? " LOCK" : "",
+            insn->seg == 1   ? " FS"
+            : insn->seg == 2 ? " GS"
+                             : "");
     HL_LOGF(&g_jit_log, HL_LOG_TAG_TRANSLATE, "isa=x86_64 interp unimplemented=%s guest_pc=%#llx op=%#x", class_name,
             (unsigned long long)pc, (unsigned)insn->op);
     cpu->rip = pc;
@@ -819,7 +833,6 @@ static int interp_softmiss(struct cpu *cpu, uint64_t rip, uint64_t address, uint
     cpu->reason = R_SOFTMISS;
     return STEP_END;
 }
-
 
 // Push/pop default to 64-bit in long mode; insn->opsize follows REX.W, so ask here instead. 66 narrows the
 // stack operand to 16 bits, but REX.W WINS over 66 (SDM vol 2 table 3-4): measured on silicon, `66 48 50`
@@ -946,8 +959,7 @@ static int interp_divide(struct cpu *cpu, uint64_t divisor, int width, int is_si
     uint64_t m = interp_mask(width);
     if (!is_signed) {
         // At byte width the dividend is AX alone, not DX:AX.
-        uint64_t dividend = width == 1 ? (cpu->r[RAX] & 0xffff)
-                                       : (((cpu->r[RDX] & m) << bits) | (cpu->r[RAX] & m));
+        uint64_t dividend = width == 1 ? (cpu->r[RAX] & 0xffff) : (((cpu->r[RDX] & m) << bits) | (cpu->r[RAX] & m));
         uint64_t quotient = dividend / (divisor & m);
         uint64_t remainder = dividend % (divisor & m);
         if (quotient > m) {
@@ -985,8 +997,8 @@ static int interp_divide(struct cpu *cpu, uint64_t divisor, int width, int is_si
         return interp_exit(cpu, pc, reason);
     }
     if (width == 1) {
-        cpu->r[RAX] = (cpu->r[RAX] & ~UINT64_C(0xffff)) | ((uint64_t)quotient & 0xff) |
-                      (((uint64_t)remainder & 0xff) << 8);
+        cpu->r[RAX] =
+            (cpu->r[RAX] & ~UINT64_C(0xffff)) | ((uint64_t)quotient & 0xff) | (((uint64_t)remainder & 0xff) << 8);
     } else {
         uint64_t q = (uint64_t)quotient & m, r = (uint64_t)remainder & m;
         cpu->r[RAX] = width == 4 ? q : ((cpu->r[RAX] & ~m) | q);
@@ -1147,7 +1159,7 @@ static void block_return(void) {
 // The eight ALU kinds in x86 opcode order.
 enum { ALU_ADD, ALU_OR, ALU_ADC, ALU_SBB, ALU_AND, ALU_SUB, ALU_XOR, ALU_CMP };
 
-static const enum interp_rmw_kind g_alu_rmw[8] = {RMW_ADD, RMW_OR, RMW_ADC, RMW_SBB,
+static const enum interp_rmw_kind g_alu_rmw[8] = {RMW_ADD, RMW_OR,  RMW_ADC, RMW_SBB,
                                                   RMW_AND, RMW_SUB, RMW_XOR, RMW_CMP};
 
 // *store is cleared for CMP, which discards its result.
@@ -1159,9 +1171,7 @@ static uint64_t interp_alu_kind(struct cpu *cpu, int kind, uint64_t a, uint64_t 
     case ALU_ADC: return interp_alu_add(cpu, a, b, interp_cf(cpu), width);
     case ALU_SBB: return interp_alu_sub(cpu, a, b, interp_cf(cpu), width);
     case ALU_SUB: return interp_alu_sub(cpu, a, b, 0, width);
-    case ALU_CMP:
-        *store = 0;
-        return interp_alu_sub(cpu, a, b, 0, width);
+    case ALU_CMP: *store = 0; return interp_alu_sub(cpu, a, b, 0, width);
     case ALU_OR: result = (a | b) & interp_mask(width); break;
     case ALU_AND: result = (a & b) & interp_mask(width); break;
     default: result = (a ^ b) & interp_mask(width); break; // ALU_XOR
@@ -1369,16 +1379,13 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
         interp_operand operand = interp_rm(cpu, insn, next);
         // A memory destination is always 16-bit; a register one follows the operand size, so a 32/64-bit
         // register destination zero-extends the selector.
-        interp_rm_write(cpu, insn, &operand, operand.is_memory ? 2 : insn->opsize,
-                        (uint64_t)selector[insn->reg & 7]);
+        interp_rm_write(cpu, insn, &operand, operand.is_memory ? 2 : insn->opsize, (uint64_t)selector[insn->reg & 7]);
         cpu->rip = next;
         return STEP_NEXT;
     }
     // Accepted and discarded: loading a userspace selector has no visible effect without a modify_ldt(2)
     // descriptor, which this engine does not model.
-    case 0x8E:
-        cpu->rip = next;
-        return STEP_NEXT;
+    case 0x8E: cpu->rip = next; return STEP_NEXT;
 
     case 0x8D: {
         if (!insn->is_mem) return interp_undefined(cpu, insn, pc, "LEA with a register operand (#UD encoding)");
@@ -1445,9 +1452,7 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
     }
 
     // FWAIT: no x87 exception is ever pending here
-    case 0x9B:
-        cpu->rip = next;
-        return STEP_NEXT;
+    case 0x9B: cpu->rip = next; return STEP_NEXT;
 
     // PUSHFQ / POPFQ / SAHF / LAHF
     case 0x9C:
@@ -1547,8 +1552,7 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
     case 0xAF: {
         int width = (op & 1) ? insn->opsize : 1;
         int is_scas = (op == 0xAE || op == 0xAF);
-        uint64_t descriptor = (uint64_t)width | ((uint64_t)(is_scas != 0) << 8) |
-                              ((uint64_t)(insn->repne != 0) << 9) |
+        uint64_t descriptor = (uint64_t)width | ((uint64_t)(is_scas != 0) << 8) | ((uint64_t)(insn->repne != 0) << 9) |
                               ((uint64_t)((insn->rep || insn->repne) != 0) << 10) | ((cpu->df & 1) << 11);
         cpu->divop = descriptor;
         return interp_exit(cpu, next, R_REPSTR);
@@ -1637,9 +1641,9 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
                 if (count != 0) {
                     interp_set_cf(cpu, carry);
                     if (count == 1) {
-                        unsigned of = kind == 2 ? (interp_msb(value, width) ^ carry)
-                                                : (interp_msb(value, width) ^
-                                                   (unsigned)((value >> (8 * width - 2)) & 1));
+                        unsigned of = kind == 2
+                                          ? (interp_msb(value, width) ^ carry)
+                                          : (interp_msb(value, width) ^ (unsigned)((value >> (8 * width - 2)) & 1));
                         cpu->nzcv = (cpu->nzcv & ~NZ_V) | ((uint64_t)of << 28);
                     }
                 }
@@ -1696,8 +1700,7 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
     }
 
     // INT3: #BP -> SIGTRAP at the instruction AFTER the trap
-    case 0xCC:
-        return interp_guest_trap(cpu, next, 5 /*SIGTRAP*/, 1 /*TRAP_BRKPT*/);
+    case 0xCC: return interp_guest_trap(cpu, next, 5 /*SIGTRAP*/, 1 /*TRAP_BRKPT*/);
 
     // IRETQ (REX.W CF): the long-mode interrupt frame is RIP, CS, RFLAGS, RSP, SS in increasing addresses.
     // At CPL 3 this is a context restore rather than a return from an interrupt; CS/SS are the fixed
@@ -1873,8 +1876,7 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
     }
 
     // HLT: privileged -> #GP, which Linux reports as SIGSEGV/SI_KERNEL with si_addr 0, not SEGV_ACCERR.
-    case 0xF4:
-        return interp_guest_trap(cpu, pc, 11 /*SIGSEGV*/, 128 /*SI_KERNEL*/);
+    case 0xF4: return interp_guest_trap(cpu, pc, 11 /*SIGSEGV*/, 128 /*SI_KERNEL*/);
 
     default: break;
     }
@@ -1886,10 +1888,26 @@ static int interp_step_one_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
     // INTO. #UD is the whole implementation; routing them to interp_undefined killed the engine with
     // exit 70 where a guest that branched into data must see SIGILL (272 encodings in the sweep).
     switch (op) {
-    case 0x06: case 0x07: case 0x0E: case 0x16: case 0x17: case 0x1E: case 0x1F:
-    case 0x27: case 0x2F: case 0x37: case 0x3F: case 0x60: case 0x61: case 0x82:
-    case 0x9A: case 0xCE: case 0xD4: case 0xD5: case 0xD6: case 0xEA:
-        return interp_guest_trap(cpu, pc, 4 /*SIGILL*/, 2 /*ILL_ILLOPN*/);
+    case 0x06:
+    case 0x07:
+    case 0x0E:
+    case 0x16:
+    case 0x17:
+    case 0x1E:
+    case 0x1F:
+    case 0x27:
+    case 0x2F:
+    case 0x37:
+    case 0x3F:
+    case 0x60:
+    case 0x61:
+    case 0x82:
+    case 0x9A:
+    case 0xCE:
+    case 0xD4:
+    case 0xD5:
+    case 0xD6:
+    case 0xEA: return interp_guest_trap(cpu, pc, 4 /*SIGILL*/, 2 /*ILL_ILLOPN*/);
     default: break;
     }
 
@@ -2025,8 +2043,7 @@ static void interp_simd_rm_get(struct cpu *cpu, const struct insn *insn, int mmx
         interp_sse_rm_get(cpu, insn, next, mmx ? 8u : 16u, out);
 }
 
-static void interp_simd_rm_put(struct cpu *cpu, const struct insn *insn, int mmx, uint64_t next,
-                               const uint8_t in[16]) {
+static void interp_simd_rm_put(struct cpu *cpu, const struct insn *insn, int mmx, uint64_t next, const uint8_t in[16]) {
     if (mmx && !insn->is_mem)
         interp_mm_put(cpu, insn->rm_reg, in);
     else
@@ -2228,10 +2245,10 @@ static int interp_fp_is_scalar(int prefix) {
 // Bytes read from a MEMORY r/m operand: too many faults at the end of a mapping, too few substitutes zeros
 // for real lanes. Trap: "F2/F3 means scalar" is the rule for the ARITHMETIC BLOCK ONLY, hence the list.
 static unsigned interp_fp_source_bytes(uint8_t op, int prefix) {
-    if (op == 0x5A && prefix == SSE_NP) return 8;  // CVTPS2PD: m64, two floats
-    if (op == 0xE6 && prefix == SSE_F3) return 8;  // CVTDQ2PD: m64, two int32
-    if (op == 0xE6 && prefix == SSE_F2) return 16; // CVTPD2DQ: PACKED despite the F2 prefix
-    if (op == 0x5B) return 16;                     // CVTDQ2PS / CVTPS2DQ / CVTTPS2DQ: 4-lane
+    if (op == 0x5A && prefix == SSE_NP) return 8;          // CVTPS2PD: m64, two floats
+    if (op == 0xE6 && prefix == SSE_F3) return 8;          // CVTDQ2PD: m64, two int32
+    if (op == 0xE6 && prefix == SSE_F2) return 16;         // CVTPD2DQ: PACKED despite the F2 prefix
+    if (op == 0x5B) return 16;                             // CVTDQ2PS / CVTPS2DQ / CVTTPS2DQ: 4-lane
     if (op == 0x7C || op == 0x7D || op == 0xD0) return 16; // HADD/HSUB/ADDSUB: packed under 66 AND F2
     // The MMX conversions (no F2/F3): CVTPI2PS/PD read mm/m64, CVTP{S,T}2PI read xmm/m64, and only the
     // 66 forms of 2C/2D (CVT[T]PD2PI) read a full m128.
@@ -2479,12 +2496,18 @@ static int interp_step_sse_fp(struct cpu *cpu, struct insn *insn, uint64_t pc, u
             interp_fp_put_pd(d, a);
         } else {
             __m128 a = interp_fp_get_ps(d), b = interp_fp_get_ps(s);
-            if (op == 0x51 && scalar) INTERP_FP_BIN("sqrtss");
-            else if (op == 0x51) INTERP_FP_BIN("sqrtps");
-            else if (op == 0x52 && scalar) INTERP_FP_BIN("rsqrtss");
-            else if (op == 0x52) INTERP_FP_BIN("rsqrtps");
-            else if (scalar) INTERP_FP_BIN("rcpss");
-            else INTERP_FP_BIN("rcpps");
+            if (op == 0x51 && scalar)
+                INTERP_FP_BIN("sqrtss");
+            else if (op == 0x51)
+                INTERP_FP_BIN("sqrtps");
+            else if (op == 0x52 && scalar)
+                INTERP_FP_BIN("rsqrtss");
+            else if (op == 0x52)
+                INTERP_FP_BIN("rsqrtps");
+            else if (scalar)
+                INTERP_FP_BIN("rcpss");
+            else
+                INTERP_FP_BIN("rcpps");
             interp_fp_put_ps(d, a);
         }
         interp_xmm_put(cpu, destination, d);
@@ -2504,23 +2527,83 @@ static int interp_step_sse_fp(struct cpu *cpu, struct insn *insn, uint64_t pc, u
         if (dbl) {
             __m128d a = interp_fp_get_pd(d), b = interp_fp_get_pd(s);
             switch (op) {
-            case 0x58: if (scalar) INTERP_FP_BIN("addsd"); else INTERP_FP_BIN("addpd"); break;
-            case 0x59: if (scalar) INTERP_FP_BIN("mulsd"); else INTERP_FP_BIN("mulpd"); break;
-            case 0x5C: if (scalar) INTERP_FP_BIN("subsd"); else INTERP_FP_BIN("subpd"); break;
-            case 0x5D: if (scalar) INTERP_FP_BIN("minsd"); else INTERP_FP_BIN("minpd"); break;
-            case 0x5E: if (scalar) INTERP_FP_BIN("divsd"); else INTERP_FP_BIN("divpd"); break;
-            default: if (scalar) INTERP_FP_BIN("maxsd"); else INTERP_FP_BIN("maxpd"); break;
+            case 0x58:
+                if (scalar)
+                    INTERP_FP_BIN("addsd");
+                else
+                    INTERP_FP_BIN("addpd");
+                break;
+            case 0x59:
+                if (scalar)
+                    INTERP_FP_BIN("mulsd");
+                else
+                    INTERP_FP_BIN("mulpd");
+                break;
+            case 0x5C:
+                if (scalar)
+                    INTERP_FP_BIN("subsd");
+                else
+                    INTERP_FP_BIN("subpd");
+                break;
+            case 0x5D:
+                if (scalar)
+                    INTERP_FP_BIN("minsd");
+                else
+                    INTERP_FP_BIN("minpd");
+                break;
+            case 0x5E:
+                if (scalar)
+                    INTERP_FP_BIN("divsd");
+                else
+                    INTERP_FP_BIN("divpd");
+                break;
+            default:
+                if (scalar)
+                    INTERP_FP_BIN("maxsd");
+                else
+                    INTERP_FP_BIN("maxpd");
+                break;
             }
             interp_fp_put_pd(d, a);
         } else {
             __m128 a = interp_fp_get_ps(d), b = interp_fp_get_ps(s);
             switch (op) {
-            case 0x58: if (scalar) INTERP_FP_BIN("addss"); else INTERP_FP_BIN("addps"); break;
-            case 0x59: if (scalar) INTERP_FP_BIN("mulss"); else INTERP_FP_BIN("mulps"); break;
-            case 0x5C: if (scalar) INTERP_FP_BIN("subss"); else INTERP_FP_BIN("subps"); break;
-            case 0x5D: if (scalar) INTERP_FP_BIN("minss"); else INTERP_FP_BIN("minps"); break;
-            case 0x5E: if (scalar) INTERP_FP_BIN("divss"); else INTERP_FP_BIN("divps"); break;
-            default: if (scalar) INTERP_FP_BIN("maxss"); else INTERP_FP_BIN("maxps"); break;
+            case 0x58:
+                if (scalar)
+                    INTERP_FP_BIN("addss");
+                else
+                    INTERP_FP_BIN("addps");
+                break;
+            case 0x59:
+                if (scalar)
+                    INTERP_FP_BIN("mulss");
+                else
+                    INTERP_FP_BIN("mulps");
+                break;
+            case 0x5C:
+                if (scalar)
+                    INTERP_FP_BIN("subss");
+                else
+                    INTERP_FP_BIN("subps");
+                break;
+            case 0x5D:
+                if (scalar)
+                    INTERP_FP_BIN("minss");
+                else
+                    INTERP_FP_BIN("minps");
+                break;
+            case 0x5E:
+                if (scalar)
+                    INTERP_FP_BIN("divss");
+                else
+                    INTERP_FP_BIN("divps");
+                break;
+            default:
+                if (scalar)
+                    INTERP_FP_BIN("maxss");
+                else
+                    INTERP_FP_BIN("maxps");
+                break;
             }
             interp_fp_put_ps(d, a);
         }
@@ -2707,6 +2790,7 @@ static void interp_x87_set(struct cpu *cpu, int index, double value) {
 // empty one). Masked by default (FCW.IM), so the guest sees only the sticky IE|SF -- which is exactly the
 // x87 stack-depth probe real code runs (`fld1` until IE), and which a tag-less model reports as success.
 static void interp_fp_raise(unsigned flags);
+
 static void interp_x87_stack_fault(struct cpu *cpu, unsigned overflow) {
     interp_fp_raise(1u); // IE
     cpu->fpsw = (cpu->fpsw & ~(UINT64_C(1) << 9)) | UINT64_C(0x40) | (overflow ? UINT64_C(1) << 9 : 0);
@@ -2797,7 +2881,9 @@ static unsigned interp_fp_getcsr(void) {
     return value;
 }
 
-static void interp_fp_setcsr(unsigned value) { __asm__ volatile("ldmxcsr %0" : : "m"(value)); }
+static void interp_fp_setcsr(unsigned value) {
+    __asm__ volatile("ldmxcsr %0" : : "m"(value));
+}
 #endif
 
 // Only for exceptions the host FP unit cannot raise itself: the FIST/FISTP out-of-range #IA.
@@ -2880,10 +2966,10 @@ static double interp_x87_narrow(const struct cpu *cpu, double value) {
     rc = (unsigned)((cpu->fpcw >> 10) & 3u);
     // Rounding away from zero == +1 in the last KEPT bit; a carry out of the significand lands in the
     // exponent field, which is exactly the "1.111.. -> 10.000.." renormalise, and 0x7ff => infinity.
-    if (rc == 1 ? negative : rc == 2 ? !negative
+    if (rc == 1   ? negative
+        : rc == 2 ? !negative
         : rc == 3 ? 0
-                  : dropped > (UINT64_C(1) << 28) ||
-                        (dropped == (UINT64_C(1) << 28) && (kept & (UINT64_C(1) << 29))))
+                  : dropped > (UINT64_C(1) << 28) || (dropped == (UINT64_C(1) << 28) && (kept & (UINT64_C(1) << 29))))
         kept += UINT64_C(1) << 29;
     interp_fp_raise(0x20u); // #P: inexact at 24 bits even when it was exact at 53
     memcpy(&value, &kept, sizeof value);
@@ -2999,8 +3085,14 @@ static float interp_x87_sse_narrow32(double a) {
 static double interp_x87_sse2(int kind, double a, double b) {
     return kind == 0 ? a + b : kind == 1 ? a * b : kind == 2 ? a - b : a / b;
 }
-static double interp_x87_sse_sqrt(double a) { return sqrt(a); }
-static float interp_x87_sse_narrow32(double a) { return (float)a; }
+
+static double interp_x87_sse_sqrt(double a) {
+    return sqrt(a);
+}
+
+static float interp_x87_sse_narrow32(double a) {
+    return (float)a;
+}
 #endif
 
 // FSUBR/FDIVR reversed, so the DC/DE digit swap is one decision. Rounded under FCW's RC and PC, not the
@@ -3260,6 +3352,7 @@ static void interp_x87_store_f64(uint64_t address, double value) {
 // report a stack fault -- so screen their operands here. 1 = live, take the exit; 0 = #IS already raised and
 // the instruction's stack effect applied on the indefinite.
 static void interp_x87_push(struct cpu *cpu, double value);
+
 static int interp_x87_transcendental(struct cpu *cpu, int selector) {
     int two = selector == X87_FYL2X || selector == X87_FPATAN || selector == X87_FYL2XP1;
     if (interp_x87_live(cpu, 0, two ? 1 : -1)) return 1;
@@ -3276,7 +3369,9 @@ static int interp_x87_transcendental(struct cpu *cpu, int selector) {
 static void interp_x87_store_indefinite(uint64_t address, int bytes, int integral) {
     if (integral) {
         interp_store(address, (unsigned)bytes,
-                     bytes == 2 ? UINT64_C(0x8000) : bytes == 4 ? UINT64_C(0x80000000) : (UINT64_C(1) << 63));
+                     bytes == 2   ? UINT64_C(0x8000)
+                     : bytes == 4 ? UINT64_C(0x80000000)
+                                  : (UINT64_C(1) << 63));
     } else if (bytes == 10) {
         uint8_t image[10];
         hl_x86_ext80_store(hl_x87_indefinite(), image);
@@ -3288,7 +3383,9 @@ static void interp_x87_store_indefinite(uint64_t address, int bytes, int integra
 
 // An empty ST(0) or ST(i) makes a compare UNORDERED as well as raising #IS: C3:C2:C0 = 111 for FCOM/FUCOM,
 // ZF=PF=CF=1 for FCOMI/FUCOMI (measured).
-static void interp_x87_compare_unordered_fpsw(struct cpu *cpu) { interp_x87_condition(cpu, 1, 0, 1, 1); }
+static void interp_x87_compare_unordered_fpsw(struct cpu *cpu) {
+    interp_x87_condition(cpu, 1, 0, 1, 1);
+}
 
 static void interp_x87_compare_unordered_eflags(struct cpu *cpu) {
     interp_flags_nzcv(cpu, 0, 1, 1, 0);
@@ -3346,10 +3443,10 @@ static int interp_step_x87(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
                     interp_x87_store_indefinite(address, 4, 0);
                 if (reg == 3) interp_x87_pop(cpu);
                 break;
-            case 4: interp_x87_load_environment(cpu, address); break;             // FLDENV m28
-            case 5: cpu->fpcw = HL_X87_FCW(interp_load(address, 2)); break;       // FLDCW m16
-            case 6: interp_x87_store_environment(cpu, address); break;            // FNSTENV m28
-            case 7: interp_store(address, 2, cpu->fpcw & 0xffff); break;          // FNSTCW m16
+            case 4: interp_x87_load_environment(cpu, address); break;       // FLDENV m28
+            case 5: cpu->fpcw = HL_X87_FCW(interp_load(address, 2)); break; // FLDCW m16
+            case 6: interp_x87_store_environment(cpu, address); break;      // FNSTENV m28
+            case 7: interp_store(address, 2, cpu->fpcw & 0xffff); break;    // FNSTCW m16
             default: return interp_undefined(cpu, insn, pc, "x87 D9 memory form");
             }
             cpu->rip = next;
@@ -3590,14 +3687,14 @@ static int interp_step_x87(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
                 cpu->x87_ea = (uint64_t)selector[rm];
                 return interp_exit(cpu, next, R_X87FUNC);
             }
-            if (rm == 4) {                                     // FXTRACT: reads ST0, writes it AND a push
+            if (rm == 4) { // FXTRACT: reads ST0, writes it AND a push
                 if (interp_x87_live(cpu, 0, -1)) {
                     interp_x87_extract(cpu);
                 } else {
                     interp_x87_set(cpu, 0, hl_x87_indefinite());
                     interp_x87_push(cpu, hl_x87_indefinite());
                 }
-            } else if (rm == 5) {                              // FPREM1
+            } else if (rm == 5) { // FPREM1
                 if (interp_x87_live(cpu, 0, 1))
                     interp_x87_remainder(cpu, 1);
                 else
@@ -3617,8 +3714,9 @@ static int interp_step_x87(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
                     interp_x87_set(cpu, 0, hl_x87_indefinite());
                 break;
             case 2: // FSQRT
-                interp_x87_set(cpu, 0, interp_x87_live(cpu, 0, -1) ? interp_x87_sqrt(cpu, interp_x87_get(cpu, 0))
-                                                                   : hl_x87_indefinite());
+                interp_x87_set(cpu, 0,
+                               interp_x87_live(cpu, 0, -1) ? interp_x87_sqrt(cpu, interp_x87_get(cpu, 0))
+                                                           : hl_x87_indefinite());
                 break;
             case 4: { // FRNDINT: per FCW.RC, direction in C1
                 double value = interp_x87_get(cpu, 0);
@@ -3633,9 +3731,10 @@ static int interp_step_x87(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
                 break;
             }
             case 5: // FSCALE
-                interp_x87_set(cpu, 0, interp_x87_live(cpu, 0, 1)
-                                           ? interp_x87_scale(interp_x87_get(cpu, 0), interp_x87_get(cpu, 1))
-                                           : hl_x87_indefinite());
+                interp_x87_set(cpu, 0,
+                               interp_x87_live(cpu, 0, 1)
+                                   ? interp_x87_scale(interp_x87_get(cpu, 0), interp_x87_get(cpu, 1))
+                                   : hl_x87_indefinite());
                 break;
             default: { // F9 FYL2XP1, FB FSINCOS, FE FSIN, FF FCOS
                 static const int selector[8] = {0, X87_FYL2XP1, 0, X87_FSINCOS, 0, 0, X87_FSIN, X87_FCOS};
@@ -3888,7 +3987,7 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
         interp_xmm_get(cpu, destination, d);
         interp_sse_rm_get(cpu, insn, next, 16, s);
         for (int i = 0; i < 16; i++)
-            d[i] = op == 0x54 ? (uint8_t)(d[i] & s[i])
+            d[i] = op == 0x54   ? (uint8_t)(d[i] & s[i])
                    : op == 0x55 ? (uint8_t)(~d[i] & s[i]) // ANDNPS: NOT dest, then AND
                    : op == 0x56 ? (uint8_t)(d[i] | s[i])
                                 : (uint8_t)(d[i] ^ s[i]);
@@ -4188,7 +4287,7 @@ static int interp_step_sse(struct cpu *cpu, struct insn *insn, uint64_t pc, uint
         interp_simd_get(cpu, mmx, destination, d);
         interp_simd_rm_get(cpu, insn, mmx, next, s);
         for (int i = 0; i < wide; i++)
-            d[i] = op == 0xDB ? (uint8_t)(d[i] & s[i])
+            d[i] = op == 0xDB   ? (uint8_t)(d[i] & s[i])
                    : op == 0xDF ? (uint8_t)(~d[i] & s[i]) // PANDN: NOT dest, then AND
                    : op == 0xEB ? (uint8_t)(d[i] | s[i])
                                 : (uint8_t)(d[i] ^ s[i]);
@@ -4362,7 +4461,7 @@ static void interp_xsave_legacy(struct cpu *cpu, uint8_t image[512]) {
     cpu->x87_ea = (uint64_t)(uintptr_t)image;
     hl_x86_fxsave(cpu);
     cpu->x87_ea = saved;
-    uint32_t mxcsr_mask = 0xffffu; // exactly the bits LDMXCSR keeps (case 0xAE below); hl_x86_fxsave leaves
+    uint32_t mxcsr_mask = 0xffffu;      // exactly the bits LDMXCSR keeps (case 0xAE below); hl_x86_fxsave leaves
     memcpy(image + 28, &mxcsr_mask, 4); // this field untouched, and a zero mask reads as "nothing settable"
 }
 
@@ -4403,7 +4502,6 @@ static void interp_xsave_init(uint8_t image[512], uint64_t components) {
         memset(image + 160, 0, 256);
     }
 }
-
 
 // The 0F (two-byte) opcode map.
 
@@ -4462,17 +4560,14 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
 
     switch (op) {
     // SYSCALL (0F 05): rip is pre-advanced past the 0F 05 bytes, so R_SYSCALL in interp_dispatch.h adds none.
-    case 0x05:
-        return interp_exit(cpu, next, R_SYSCALL);
+    case 0x05: return interp_exit(cpu, next, R_SYSCALL);
 
     // CPUID (0F A2)
-    case 0xA2:
-        return interp_exit(cpu, next, R_CPUID);
+    case 0xA2: return interp_exit(cpu, next, R_CPUID);
 
     // UD1/UD2 (0F B9/0F 0B): a trap, not an engine gap
     case 0x0B:
-    case 0xB9:
-        return interp_guest_trap(cpu, pc, 4 /*SIGILL*/, 2 /*ILL_ILLOPN*/);
+    case 0xB9: return interp_guest_trap(cpu, pc, 4 /*SIGILL*/, 2 /*ILL_ILLOPN*/);
 
     // Multi-byte NOPs and hints: 0F 1F, 0F 0D, 0F 18..1E (incl. ENDBR64). No register or memory effect.
     case 0x0D:
@@ -4483,14 +4578,10 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
     case 0x1C:
     case 0x1D:
     case 0x1E:
-    case 0x1F:
-        cpu->rip = next;
-        return STEP_NEXT;
+    case 0x1F: cpu->rip = next; return STEP_NEXT;
 
     // EMMS (0F 77): no MMX tag word exists in this model
-    case 0x77:
-        cpu->rip = next;
-        return STEP_NEXT;
+    case 0x77: cpu->rip = next; return STEP_NEXT;
 
     case 0x01:
         if (insn->has_modrm && insn->modrm == 0xF9) { // RDTSCP: EDX:EAX = counter, ECX = TSC_AUX (0)
@@ -4544,9 +4635,9 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
     case 0xAF: {
         interp_operand operand = interp_rm(cpu, insn, next);
         uint64_t source = interp_rm_read(cpu, insn, &operand, insn->opsize);
-        interp_reg_write(cpu, insn, insn->reg, insn->opsize,
-                         interp_imul_truncating(cpu, interp_reg_read(cpu, insn, insn->reg, insn->opsize), source,
-                                                insn->opsize));
+        interp_reg_write(
+            cpu, insn, insn->reg, insn->opsize,
+            interp_imul_truncating(cpu, interp_reg_read(cpu, insn, insn->reg, insn->opsize), source, insn->opsize));
         cpu->rip = next;
         return STEP_NEXT;
     }
@@ -4634,8 +4725,8 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
                 interp_flags_nzcv(cpu, 0, 1, 0, 0);
                 cpu->pf = 0xff;
             } else {
-                uint64_t result = op == 0xBC ? (uint64_t)__builtin_ctzll(source)
-                                            : (uint64_t)(63 - __builtin_clzll(source));
+                uint64_t result =
+                    op == 0xBC ? (uint64_t)__builtin_ctzll(source) : (uint64_t)(63 - __builtin_clzll(source));
                 interp_flags_nzcv(cpu, 0, 0, 0, 0);
                 cpu->pf = result & 0xff;
                 interp_reg_write(cpu, insn, insn->reg, width, result);
@@ -4678,17 +4769,15 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
                 switch (width) {
                 case 1: {
                     unsigned char expected = (unsigned char)accumulator;
-                    swapped = __atomic_compare_exchange_n((unsigned char *)pointer, &expected,
-                                                          (unsigned char)source, 0, __ATOMIC_SEQ_CST,
-                                                          __ATOMIC_SEQ_CST);
+                    swapped = __atomic_compare_exchange_n((unsigned char *)pointer, &expected, (unsigned char)source, 0,
+                                                          __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
                     observed = expected;
                     break;
                 }
                 case 2: {
                     unsigned short expected = (unsigned short)accumulator;
-                    swapped = __atomic_compare_exchange_n((unsigned short *)pointer, &expected,
-                                                          (unsigned short)source, 0, __ATOMIC_SEQ_CST,
-                                                          __ATOMIC_SEQ_CST);
+                    swapped = __atomic_compare_exchange_n((unsigned short *)pointer, &expected, (unsigned short)source,
+                                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
                     observed = expected;
                     break;
                 }
@@ -4701,8 +4790,8 @@ static int interp_step_two_byte(struct cpu *cpu, struct insn *insn, uint64_t pc,
                 }
                 default: {
                     uint64_t expected = accumulator;
-                    swapped = __atomic_compare_exchange_n((uint64_t *)pointer, &expected, source, 0,
-                                                          __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+                    swapped = __atomic_compare_exchange_n((uint64_t *)pointer, &expected, source, 0, __ATOMIC_SEQ_CST,
+                                                          __ATOMIC_SEQ_CST);
                     observed = expected;
                     break;
                 }

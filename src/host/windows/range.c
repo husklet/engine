@@ -77,8 +77,7 @@ int hl_host_region_query(uintptr_t address, hl_host_region *region) {
         region->protection |= HL_HOST_REGION_READ;
     if (info.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
         region->protection |= HL_HOST_REGION_WRITE;
-    if (info.Protect &
-        (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+    if (info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
         region->protection |= HL_HOST_REGION_EXECUTE;
     return 1;
 }

@@ -58,11 +58,13 @@ extern int g_rwx_guest;
 static uint64_t g_smc_pg[SMC_MAX];
 static int g_smc_n;
 static uint64_t g_smc_flushes; // PROF: number of SMC re-translate events
+
 static uint64_t smc_page_size(void) {
     static uint64_t size;
     if (size == 0) size = (uint64_t)getpagesize();
     return size;
 }
+
 static void smc_protect(uint64_t pc) {
     if (!g_rwx_guest) return; // no JIT guest -> inert (matrix bit-exact)
     const void *canonical = NULL;
@@ -96,7 +98,7 @@ static int smc_on_write(uint64_t a) {
     for (int i = 0; i < g_smc_n; i++)
         if (g_smc_pg[i] == pg) {
             mprotect((void *)pg, (size_t)size, PROT_READ | PROT_WRITE); // let the guest's write through
-            g_smc_pg[i] = g_smc_pg[--g_smc_n];                    // re-protected on next translate
+            g_smc_pg[i] = g_smc_pg[--g_smc_n];                          // re-protected on next translate
             g_smc_flushes++;
             return 1;
         }
@@ -206,7 +208,7 @@ static int smc_on_write(uint64_t a) {
                  * (ldr x21,[slot+8]; br x21), so under the dual-mapped code cache the stored body must be the         \
                  * EXECUTOR (RX) alias -- map_body returns the RW writer alias. J_RX converts it (a no-op when         \
                  * g_rw2rx==0, i.e. NODUALMAP/single-MAP_JIT fallback -> byte-identical to the prior path). Mirrors    \
-                 * the aarch64 IBTC fill's J_RX(bd) in guest/aarch64/dispatch.h. */                                  \
+                 * the aarch64 IBTC fill's J_RX(bd) in guest/aarch64/dispatch.h. */                                    \
                 body = J_RX(body);                                                                                     \
                 if (ibtc1way()) { /* IBTC1WAY=1: exact prior 1-way shared-g_ibtc fill */                               \
                     uint32_t h = (uint32_t)(((c)->rip >> 2) & (IBTC_N - 1));                                           \
@@ -234,9 +236,9 @@ static int smc_on_write(uint64_t a) {
 // Each non-syscall case `continue`s the shared while-loop (so the shared `if (reason==R_TIER2) ...`
 // tail line never re-fires for x86). Verbatim from frontend/x86_64/dispatch.c. `break` exits the loop.
 #define G_DISPATCH_REASON(c)                                                                                           \
-    /* The C instruction emulators come FIRST and do not `continue` unconditionally: they run outside      \
-       run_block, so a guest access they reject leaves a NEW reason (R_SOFTMISS, or R_TRAP for an          \
-       emulated #UD) that the arms below have to see. rip = the insn; do_avx/do_sse3b advance it. */       \
+    /* The C instruction emulators come FIRST and do not `continue` unconditionally: they run outside                  \
+       run_block, so a guest access they reject leaves a NEW reason (R_SOFTMISS, or R_TRAP for an                      \
+       emulated #UD) that the arms below have to see. rip = the insn; do_avx/do_sse3b advance it. */                   \
     if ((c)->reason == R_AVX) { /* VEX/EVEX AVX insn: emulate in C */                                                  \
         hl_x86_avx_run(&g_avx_state, (c));                                                                             \
         if ((c)->reason == R_AVX) continue;                                                                            \
@@ -294,22 +296,22 @@ static int smc_on_write(uint64_t a) {
         hl_x86_rotate_carry(c);                                                                                        \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_CMPXCHG16) { /* atomic 128-bit compare-exchange in C (rip already = next) */                 \
-        hl_x86_cmpxchg16(c);                                                                                          \
+    if ((c)->reason == R_CMPXCHG16) { /* atomic 128-bit compare-exchange in C (rip already = next) */                  \
+        hl_x86_cmpxchg16(c);                                                                                           \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_FXSAVE) { /* fxsave x87-register-DATA + FSW tail (rip already = next) */                     \
+    if ((c)->reason == R_FXSAVE) { /* fxsave x87-register-DATA + FSW tail (rip already = next) */                      \
         hl_x86_fxsave(c);                                                                                              \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_FXRSTOR) { /* fxrstor x87-register-DATA + FSW tail (rip already = next) */                   \
+    if ((c)->reason == R_FXRSTOR) { /* fxrstor x87-register-DATA + FSW tail (rip already = next) */                    \
         hl_x86_fxrstor(c);                                                                                             \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_X87ENV) { /* fnstenv/fldenv m28, fnsave/frstor m108 (rip already = next) */                  \
+    if ((c)->reason == R_X87ENV) { /* fnstenv/fldenv m28, fnsave/frstor m108 (rip already = next) */                   \
         hl_x86_x87_environment(c);                                                                                     \
         continue;                                                                                                      \
-    }                                                          \
+    }                                                                                                                  \
     /* #DE si_code. Linux/x86 reports FPE_INTDIV(1) for the #DE trap WHATEVER raised it -- a zero divisor              \
      * and a quotient overflow alike; this host's silicon is the oracle and tests/compat/completeness/                 \
      * x86_64/div_overflow.c holds its answer. Queueing FPE_INTOVF(2) here diverged for the JIT only:                  \
@@ -321,7 +323,10 @@ static int smc_on_write(uint64_t a) {
     if ((c)->reason == R_DIV) { /* 128/64 unsigned div (rip already = next) */                                         \
         uint64_t d = (c)->divop;                                                                                       \
         if (d == 0 || (c)->r[RDX] >= d) { /* /0, or quotient overflow (high half >= divisor): both #DE */              \
-            if (raise_guest_de(c, 1 /*FPE_INTDIV*/)) { maybe_deliver_signal(c); continue; }                            \
+            if (raise_guest_de(c, 1 /*FPE_INTDIV*/)) {                                                                 \
+                maybe_deliver_signal(c);                                                                               \
+                continue;                                                                                              \
+            }                                                                                                          \
             break; /* raise_guest_de recorded death-by-SIGFPE / set exited+exit_code */                                \
         }                                                                                                              \
         unsigned __int128 num = ((unsigned __int128)(c)->r[RDX] << 64) | (c)->r[RAX];                                  \
@@ -342,21 +347,30 @@ static int smc_on_write(uint64_t a) {
             de = (__int128)(int64_t)q0 != q0;                                                                          \
         }                                                                                                              \
         if (de) {                                                                                                      \
-            if (raise_guest_de(c, 1 /*FPE_INTDIV*/)) { maybe_deliver_signal(c); continue; }                            \
+            if (raise_guest_de(c, 1 /*FPE_INTDIV*/)) {                                                                 \
+                maybe_deliver_signal(c);                                                                               \
+                continue;                                                                                              \
+            }                                                                                                          \
             break;                                                                                                     \
         }                                                                                                              \
         (c)->r[RAX] = (uint64_t)(num / d);                                                                             \
         (c)->r[RDX] = (uint64_t)(num % d);                                                                             \
         continue;                                                                                                      \
     }                                                                                                                  \
-    if ((c)->reason == R_TRAP) { /* int3 -> SIGTRAP, UD2 -> SIGILL: deliver from C (cpu->divop = signo|code<<8) */    \
-        if (raise_guest_trap(c)) { maybe_deliver_signal(c); continue; }                                                \
-        (c)->exited = 1;                   /* no guest handler: default action terminates with the signal */          \
+    if ((c)->reason == R_TRAP) { /* int3 -> SIGTRAP, UD2 -> SIGILL: deliver from C (cpu->divop = signo|code<<8) */     \
+        if (raise_guest_trap(c)) {                                                                                     \
+            maybe_deliver_signal(c);                                                                                   \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        (c)->exited = 1; /* no guest handler: default action terminates with the signal */                             \
         (c)->exit_code = 128 + ((int)((c)->divop & 0xff));                                                             \
         break;                                                                                                         \
     }                                                                                                                  \
     if ((c)->reason == R_BUS) {                                                                                        \
-        if (raise_guest_bus(c)) { maybe_deliver_signal(c); continue; }                                                \
+        if (raise_guest_bus(c)) {                                                                                      \
+            maybe_deliver_signal(c);                                                                                   \
+            continue;                                                                                                  \
+        }                                                                                                              \
         break;                                                                                                         \
     }                                                                                                                  \
     if ((c)->reason == R_SMC) {                                                                                        \
@@ -366,11 +380,11 @@ static int smc_on_write(uint64_t a) {
     }                                                                                                                  \
     if ((c)->reason == R_SYSCALL) {                                                                                    \
         /* Publish emulated MAP_SHARED stores before a write/socket/futex syscall can notify a peer. */                \
-        if ((c)->smc_range_count || (c)->smc_range_overflow) jit86_smc_commit(c);                                     \
+        if ((c)->smc_range_count || (c)->smc_range_overflow) jit86_smc_commit(c);                                      \
         service(c);                                                                                                    \
         if ((c)->exited) break;                                                                                        \
         /* And after: the syscall's own copyout (G_SMC_COPYOUT) may have written an executable alias. */               \
-        if ((c)->smc_range_count || (c)->smc_range_overflow) jit86_smc_commit(c);                                     \
+        if ((c)->smc_range_count || (c)->smc_range_overflow) jit86_smc_commit(c);                                      \
         if ((c)->redirect) (c)->redirect = 0; /* else rip already = next (set at exit) */                              \
     }                                                                                                                  \
     /* R_BRANCH: c->rip already holds the target */

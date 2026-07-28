@@ -423,7 +423,8 @@ static ssize_t io_guest_vector_gather(uint64_t address, size_t count, void *outp
     for (size_t index = 0; index < count && done < capacity; ++index) {
         size_t amount = vectors[index].iov_len;
         if (amount > capacity - done) amount = capacity - done;
-        ssize_t copied = guest_copy_from((uint8_t *)output + done, (uint64_t)(uintptr_t)vectors[index].iov_base, amount);
+        ssize_t copied =
+            guest_copy_from((uint8_t *)output + done, (uint64_t)(uintptr_t)vectors[index].iov_base, amount);
         if (copied <= 0 && amount != 0) return done != 0 ? (ssize_t)done : -EFAULT;
         done += (size_t)copied;
         if ((size_t)copied != amount) break;
@@ -438,7 +439,8 @@ static ssize_t io_guest_vector_scatter(uint64_t address, size_t count, const voi
     for (size_t index = 0; index < count && done < length; ++index) {
         size_t amount = vectors[index].iov_len;
         if (amount > length - done) amount = length - done;
-        ssize_t copied = guest_copy_to((uint64_t)(uintptr_t)vectors[index].iov_base, (const uint8_t *)input + done, amount);
+        ssize_t copied =
+            guest_copy_to((uint64_t)(uintptr_t)vectors[index].iov_base, (const uint8_t *)input + done, amount);
         if (copied <= 0 && amount != 0) return done != 0 ? (ssize_t)done : -EFAULT;
         done += (size_t)copied;
         if ((size_t)copied != amount) break;
@@ -1021,7 +1023,8 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     }
                     if (next > now_ns) {
                         struct kevent future;
-                        EV_SET(&future, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS | NOTE_CRITICAL, next - now_ns, NULL);
+                        EV_SET(&future, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS | NOTE_CRITICAL,
+                               next - now_ns, NULL);
                         (void)kevent(rfd, &future, 1, NULL, 0, NULL);
                     }
                     g_tfd_deadline[tslot] = next;
@@ -1225,7 +1228,8 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
             uint64_t entries[512];
             size_t done = 0;
-            for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); ++i) entries[i] = UINT64_C(1) << 63;
+            for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); ++i)
+                entries[i] = UINT64_C(1) << 63;
             while (done < want) {
                 size_t chunk = want - done < sizeof(entries) ? want - done : sizeof(entries);
                 if (guest_copy_to(a1 + done, entries, chunk) != (ssize_t)chunk) {
@@ -1417,9 +1421,8 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
             ssize_t copied = guest_copy_from(buffer, a1, (size_t)a2);
-            G_RET(c) = copied == (ssize_t)a2
-                           ? (uint64_t)dns_send(wfd, buffer, (size_t)a2, g_sock_stream[wfd])
-                           : (uint64_t)(copied > 0 ? copied : -EFAULT);
+            G_RET(c) = copied == (ssize_t)a2 ? (uint64_t)dns_send(wfd, buffer, (size_t)a2, g_sock_stream[wfd])
+                                             : (uint64_t)(copied > 0 ? copied : -EFAULT);
             free(buffer);
             break;
         }
@@ -1526,13 +1529,12 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             uint8_t buffer[65536];
             struct iovec host = {buffer, sizeof(buffer)};
             ssize_t received = nl_recv((int)a0, &host, 1, 0, NULL);
-            ssize_t copied = received > 0 ? io_guest_vector_scatter(a1, (size_t)a2, buffer, (size_t)received) : received;
+            ssize_t copied =
+                received > 0 ? io_guest_vector_scatter(a1, (size_t)a2, buffer, (size_t)received) : received;
             G_RET(c) = (uint64_t)(int64_t)copied;
             break;
         }
-        if (memf_get((int)a0)) {
-            memf_materialize((int)a0);
-        }
+        if (memf_get((int)a0)) { memf_materialize((int)a0); }
         ssize_t r;       // SA_RESTART: restart a signal-interrupted blocking readv in place (see case 63)
         ts_wait_enter(); // 'S' while readv may block
         do {
@@ -1602,9 +1604,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 break;
             }
         }
-        if (memf_get((int)a0)) {
-            memf_materialize((int)a0);
-        }
+        if (memf_get((int)a0)) { memf_materialize((int)a0); }
         hl_fdcache_fd_evict((int)a0);
         ssize_t r; // SA_RESTART: restart a signal-interrupted blocking writev in place (see case 63)
         do {
@@ -2125,8 +2125,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                         continue;
                     }
                     G_RET(c) = (uint64_t)(int64_t)pout;
-                    if (lcmd == 5 && pout == 0 &&
-                        guest_copy_to(a2, lf, sizeof(lf)) != (ssize_t)sizeof(lf))
+                    if (lcmd == 5 && pout == 0 && guest_copy_to(a2, lf, sizeof(lf)) != (ssize_t)sizeof(lf))
                         G_RET(c) = (uint64_t)(-EFAULT);
                     break;
                 }
@@ -2605,9 +2604,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     // preadv/pwritev: struct iovec layout is identical Linux<->macOS
     case 69: {
-        if (memf_get((int)a0)) {
-            memf_materialize((int)a0);
-        }
+        if (memf_get((int)a0)) { memf_materialize((int)a0); }
         ssize_t r = guest_fd_vector((int)a0, a1, (size_t)a2, (off_t)a3, 1, 1);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;
@@ -2617,9 +2614,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             G_RET(c) = (uint64_t)(-EPERM);
             break;
         } // F_SEAL_WRITE
-        if (memf_get((int)a0)) {
-            memf_materialize((int)a0);
-        }
+        if (memf_get((int)a0)) { memf_materialize((int)a0); }
         ssize_t r = guest_fd_vector((int)a0, a1, (size_t)a2, (off_t)a3, 1, 0);
         G_RET(c) = r < 0 ? (uint64_t)(-errno) : (uint64_t)r;
         break;

@@ -57,7 +57,7 @@
 #include "../../persist.h"
 
 #define PC_MAGIC 0x31304350544a4c48ull // "HLJTPC01" (LE)
-#define PC_VERSION 8 // v8 persists translated guest source ranges.
+#define PC_VERSION 8                   // v8 persists translated guest source ranges.
 #define PC_VERSION_EFF PC_VERSION
 // Fixed guest VA bases (high, reliably free above the kernel-chosen heap/stack and below the dyld shared
 // cache). Probed stable on Apple silicon; PIE images so we choose the base.
@@ -158,8 +158,8 @@ static uint64_t pcache_engine_id(void) {
     }
     h ^= self;
     h *= 1099511628211ull;
-    modes = (uint64_t)(g_fastsys != 0) | ((uint64_t)(g_fastclk != 0) << 1) |
-            ((uint64_t)(g_siginline != 0) << 2) | ((uint64_t)(slimsys_on() != 0) << 3);
+    modes = (uint64_t)(g_fastsys != 0) | ((uint64_t)(g_fastclk != 0) << 1) | ((uint64_t)(g_siginline != 0) << 2) |
+            ((uint64_t)(slimsys_on() != 0) << 3);
     return hl_identity_configuration(h, 2, HL_HOST_CPU_ISA, modes);
 }
 
@@ -270,8 +270,8 @@ static void pcache_note_libmap(uint64_t base, uint64_t len, const hl_host_file_m
         for (uint64_t j = 0; j < g_pc_ndefer; j++) {
             uint64_t gpc = g_pc_defer[j].gpc;
             if (gpc >= base && gpc < base + len && g_pc_defer[j].host_off) {
-                map_put(gpc, g_pc_defer[j].guest_start, g_pc_defer[j].guest_end,
-                        g_cache + g_pc_defer[j].host_off, g_cache + g_pc_defer[j].body_off);
+                map_put(gpc, g_pc_defer[j].guest_start, g_pc_defer[j].guest_end, g_cache + g_pc_defer[j].host_off,
+                        g_cache + g_pc_defer[j].body_off);
                 g_pc_defer[j].host_off = 0; // consumed
                 g_pc_activated++;
             }
@@ -353,7 +353,10 @@ static int pcache_load(uint64_t entry_jump) {
     if (!hl_persist_load_at(&g_pc_directory, path, CACHE_SZ + UINT64_C(134217728), &image, &image_size)) return 0;
     hl_persist_cursor cursor = {image, image_size, 0};
     struct pc_hdr h;
-    if (!hl_persist_take(&cursor, &h, sizeof h)) { free(image); return 0; }
+    if (!hl_persist_take(&cursor, &h, sizeof h)) {
+        free(image);
+        return 0;
+    }
     if (h.magic != PC_MAGIC || h.version != PC_VERSION_EFF || h.cpu_sz != sizeof(struct cpu) || h.map_n != JIT_MAP_N ||
         h.ibtc_n != IBTC_N || h.img_base != PC_IMG_BASE || h.interp_base != PC_INTERP_BASE || h.bin_id != g_pc_binid ||
         h.entry_jump != entry_jump || h.arena_used > CACHE_SZ || h.n_mapent > JIT_MAP_N || h.n_pend > (1u << 16) ||
@@ -411,9 +414,17 @@ static int pcache_load(uint64_t entry_jump) {
         g_pc_nlib = 0;
         return 0;
     }
-    if (!jit_wprot(0)) { free(abuf); g_pc_nlib = 0; return 0; }
+    if (!jit_wprot(0)) {
+        free(abuf);
+        g_pc_nlib = 0;
+        return 0;
+    }
     memcpy(g_cache, abuf, h.arena_used);
-    if (!jit_wprot(1)) { free(abuf); g_pc_nlib = 0; return 0; }
+    if (!jit_wprot(1)) {
+        free(abuf);
+        g_pc_nlib = 0;
+        return 0;
+    }
     free(abuf);
     // rebuild the engine state from the offset-relative records. fixed-image blocks (main+interp,
     // identity-validated by the cache key itself) go live NOW; manifest (library) blocks are DEFERRED
@@ -430,8 +441,7 @@ static int pcache_load(uint64_t entry_jump) {
     uint64_t nlive = 0, ndefer = 0;
     for (uint64_t i = 0; i < h.n_mapent; i++) {
         if (pc_gpc_fixed(me[i].gpc)) {
-            map_put(me[i].gpc, me[i].guest_start, me[i].guest_end,
-                    g_cache + me[i].host_off, g_cache + me[i].body_off);
+            map_put(me[i].gpc, me[i].guest_start, me[i].guest_end, g_cache + me[i].host_off, g_cache + me[i].body_off);
             nlive++;
         } else if (pc_gpc_in_lib(me[i].gpc)) {
             ndefer++;
@@ -472,7 +482,7 @@ static int pcache_load(uint64_t entry_jump) {
 static void pcache_save(void) {
     if (!g_pcache || !g_pc_binid || g_cp == g_cache) return;
     if (g_force_base_failed) return; // #210: mixed-base arena (a fixed-VA image map fell back) -> not revivable
-    if (g_pcache_poison) return; // arena has un-recorded baked host pointers -> not safely relocatable
+    if (g_pcache_poison) return;     // arena has un-recorded baked host pointers -> not safely relocatable
     // NEVER save from a fork child. jit_after_fork rebuilt a FRESH EMPTY arena in the child, but
     // the g_reloc table (and binid/entry identity) survived the fork -- a child save would persist the
     // PARENT's reloc offsets against the child's re-translated arena, and the next load's relocation pass
@@ -537,8 +547,7 @@ static void pcache_save(void) {
             // guest_start/guest_end are vestigial in the on-disk record (restore discards them; the SMC page
             // set is serialized separately). The live map entry no longer stores them, so emit 0 placeholders
             // and keep the pc_mapent layout + PC_VERSION unchanged.
-            struct pc_mapent e = {g_map[i].gpc, 0, 0,
-                                  (uint64_t)((uint8_t *)g_map[i].host - g_cache),
+            struct pc_mapent e = {g_map[i].gpc, 0, 0, (uint64_t)((uint8_t *)g_map[i].host - g_cache),
                                   (uint64_t)((uint8_t *)g_map[i].body - g_cache)};
             memcpy(w, &e, sizeof e);
             w += sizeof e;

@@ -23,12 +23,7 @@ typedef struct ep_provider_watch {
     _Atomic uint32_t callbacks;
 } ep_provider_watch;
 
-enum {
-    EP_PROVIDER_FREE = 0,
-    EP_PROVIDER_ACTIVE = 1,
-    EP_PROVIDER_RESERVED = 2,
-    EP_PROVIDER_RETIRING = 3
-};
+enum { EP_PROVIDER_FREE = 0, EP_PROVIDER_ACTIVE = 1, EP_PROVIDER_RESERVED = 2, EP_PROVIDER_RETIRING = 3 };
 
 static inline uint32_t ep_provider_next(uint32_t value) {
     value++;
@@ -40,8 +35,7 @@ static inline ep_provider_watch *ep_provider_find(ep_provider_watch *watches, ui
                                                   uint32_t descriptor_generation) {
     for (uint32_t index = 0; index < capacity; ++index) {
         ep_provider_watch *watch = &watches[index];
-        if (atomic_load_explicit(&watch->state, memory_order_acquire) == EP_PROVIDER_ACTIVE &&
-            watch->epoll == epoll &&
+        if (atomic_load_explicit(&watch->state, memory_order_acquire) == EP_PROVIDER_ACTIVE && watch->epoll == epoll &&
             watch->epoll_generation == epoll_generation && watch->descriptor == descriptor &&
             watch->descriptor_generation == descriptor_generation)
             return watch;
@@ -59,9 +53,9 @@ static inline ep_provider_watch *ep_provider_alloc(ep_provider_watch *watches, u
     return NULL;
 }
 
-static inline void ep_provider_activate(ep_provider_watch *watch, int epoll, uint32_t epoll_generation,
-                                        int descriptor, uint32_t descriptor_generation, uint32_t serial,
-                                        hl_host_handle handle, uint32_t events, uint32_t interests, uint64_t data) {
+static inline void ep_provider_activate(ep_provider_watch *watch, int epoll, uint32_t epoll_generation, int descriptor,
+                                        uint32_t descriptor_generation, uint32_t serial, hl_host_handle handle,
+                                        uint32_t events, uint32_t interests, uint64_t data) {
     watch->epoll = epoll;
     watch->descriptor = descriptor;
     watch->epoll_generation = epoll_generation;
@@ -81,9 +75,8 @@ static inline void ep_provider_activate(ep_provider_watch *watch, int epoll, uin
 
 static inline int ep_provider_retire_begin(ep_provider_watch *watch) {
     uint32_t expected = EP_PROVIDER_ACTIVE;
-    return watch != NULL && atomic_compare_exchange_strong_explicit(
-                                &watch->state, &expected, EP_PROVIDER_RETIRING,
-                                memory_order_acq_rel, memory_order_acquire);
+    return watch != NULL && atomic_compare_exchange_strong_explicit(&watch->state, &expected, EP_PROVIDER_RETIRING,
+                                                                    memory_order_acq_rel, memory_order_acquire);
 }
 
 static inline void ep_provider_retire_finish(ep_provider_watch *watch) {
@@ -93,8 +86,8 @@ static inline void ep_provider_retire_finish(ep_provider_watch *watch) {
 
 static inline void ep_provider_reservation_cancel(ep_provider_watch *watch) {
     uint32_t expected = EP_PROVIDER_RESERVED;
-    (void)atomic_compare_exchange_strong_explicit(&watch->state, &expected, EP_PROVIDER_FREE,
-                                                  memory_order_release, memory_order_relaxed);
+    (void)atomic_compare_exchange_strong_explicit(&watch->state, &expected, EP_PROVIDER_FREE, memory_order_release,
+                                                  memory_order_relaxed);
 }
 
 static inline int ep_provider_callback_enter(ep_provider_watch *watch, uint64_t token) {
@@ -114,8 +107,7 @@ static inline void ep_provider_callback_leave(ep_provider_watch *watch) {
     atomic_fetch_sub_explicit(&watch->callbacks, 1, memory_order_release);
 }
 
-static inline uint32_t ep_provider_take_ready(ep_provider_watch *watch, uint32_t level_sample,
-                                              int *out_unsubscribe) {
+static inline uint32_t ep_provider_take_ready(ep_provider_watch *watch, uint32_t level_sample, int *out_unsubscribe) {
     uint32_t ready = atomic_exchange(&watch->ready, 0);
     *out_unsubscribe = 0;
     if (ready == 0) return 0;
@@ -130,10 +122,10 @@ static inline uint32_t ep_provider_take_ready(ep_provider_watch *watch, uint32_t
 
 static inline uint32_t ep_provider_linux_events(uint32_t readiness) {
     uint32_t events = 0;
-    if (readiness & UINT32_C(1)) events |= UINT32_C(0x001); /* EPOLLIN */
-    if (readiness & UINT32_C(2)) events |= UINT32_C(0x004); /* EPOLLOUT */
-    if (readiness & UINT32_C(4)) events |= UINT32_C(0x002); /* EPOLLPRI */
-    if (readiness & UINT32_C(8)) events |= UINT32_C(0x008); /* EPOLLERR */
+    if (readiness & UINT32_C(1)) events |= UINT32_C(0x001);  /* EPOLLIN */
+    if (readiness & UINT32_C(2)) events |= UINT32_C(0x004);  /* EPOLLOUT */
+    if (readiness & UINT32_C(4)) events |= UINT32_C(0x002);  /* EPOLLPRI */
+    if (readiness & UINT32_C(8)) events |= UINT32_C(0x008);  /* EPOLLERR */
     if (readiness & UINT32_C(16)) events |= UINT32_C(0x010); /* EPOLLHUP */
     return events;
 }

@@ -99,9 +99,8 @@ int hl_provider_namespace_install(hl_provider_namespace *namespace, const void *
         hl_provider_node *node = &pending->nodes[index];
         const unsigned char *path;
         const unsigned char *target;
-        if (u8(&source, &node->kind) != 0 || u64(&source, &node->service) != 0 ||
-            u32(&source, &node->mode) != 0 || u32(&source, &node->uid) != 0 || u32(&source, &node->gid) != 0 ||
-            u16(&source, &node->path_size) != 0 ||
+        if (u8(&source, &node->kind) != 0 || u64(&source, &node->service) != 0 || u32(&source, &node->mode) != 0 ||
+            u32(&source, &node->uid) != 0 || u32(&source, &node->gid) != 0 || u16(&source, &node->path_size) != 0 ||
             (node->kind != HL_PROVIDER_NODE_SERVICE && node->kind != HL_PROVIDER_NODE_DIRECTORY &&
              node->kind != HL_PROVIDER_NODE_SYMLINK && node->kind != HL_PROVIDER_NODE_CHARACTER &&
              node->kind != HL_PROVIDER_NODE_BLOCK) ||

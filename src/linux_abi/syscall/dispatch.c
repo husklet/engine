@@ -27,8 +27,8 @@ int g_rwx_guest;
 #include "../host_dirent.h" // <dirent.h>, or the Linux dirent shape where the host structure has no d_type
 #include <stdlib.h>
 #include "../host_proc.h" // times(2): CPU accounting (struct tms is layout-compatible with Linux)
-#include "../host_fs.h" // host struct statfs -> translated to the Linux statfs layout
-#include <time.h>      // sysinfo(2) uptime = now - host boot time
+#include "../host_fs.h"   // host struct statfs -> translated to the Linux statfs layout
+#include <time.h>         // sysinfo(2) uptime = now - host boot time
 #include "../errno.h"
 #include "../../host/directory.h"
 #include "../../host/process.h"
@@ -118,7 +118,8 @@ static uint32_t g_ep_provider_serial;
 static void ep_provider_retire(ep_provider_watch *watch) {
     if (!ep_provider_retire_begin(watch)) return;
     hl_provider_files_unsubscribe(watch->handle, watch, atomic_load(&watch->serial));
-    while (atomic_load_explicit(&watch->callbacks, memory_order_acquire) != 0) sched_yield();
+    while (atomic_load_explicit(&watch->callbacks, memory_order_acquire) != 0)
+        sched_yield();
     ep_provider_retire_finish(watch);
 }
 
@@ -142,16 +143,18 @@ static void ep_provider_retire_endpoint(int fd) {
  * epoll_generation reuses g_ep_provider_generations, which is bumped whenever an
  * epoll or watched fd number is closed, so a reused number never matches. */
 #define EP_OBJECT_WATCH_LIMIT 1024u
+
 typedef struct ep_object_watch {
     _Atomic uint32_t active;
     int epoll;
     uint32_t epoll_generation;
     int descriptor;
     uint32_t descriptor_generation;
-    uint32_t events;   /* raw guest epoll event mask (EPOLLONESHOT etc.) */
+    uint32_t events; /* raw guest epoll event mask (EPOLLONESHOT etc.) */
     uint32_t interests;
     uint64_t data;
 } ep_object_watch;
+
 static ep_object_watch g_ep_object_watches[EP_OBJECT_WATCH_LIMIT];
 static uint16_t g_ep_object_count[HL_NFD];
 
@@ -249,6 +252,7 @@ static ssize_t misc_copy_to(void *context, uint64_t destination, const void *sou
 static inline uint64_t nonpie_p(uint64_t a) {
     return nonpie_fold(a); // thread.c owns the one fold; this is its historical name at the syscall seam
 }
+
 #include "nonpie_args.h" // the one per-syscall pointer-argument table (service_local + the sentry share it)
 
 // Overlay: a metadata/rename syscall (chmod/chown/utimensat/rename) confines to the writable upper via
@@ -359,8 +363,8 @@ static void pidfd_forget(int fd) {
 }
 
 // Mint a pidfd for `pid`. Ask the host for a descriptor that becomes persistently readable when the process
-// exits; the macOS backend uses an EVFILT_PROC watch and Linux uses pidfd_open. This is the load-bearing half of CLONE_PIDFD
-// (go/rust/glibc-posix_spawn epoll_wait the returned pidfd to reap their compiler child). If the process is
+// exits; the macOS backend uses an EVFILT_PROC watch and Linux uses pidfd_open. This is the load-bearing half of
+// CLONE_PIDFD (go/rust/glibc-posix_spawn epoll_wait the returned pidfd to reap their compiler child). If the process is
 // already gone or EVFILT_PROC can't arm (e.g. a non-child target), fall back to an always-readable /dev/null
 // fd so a wait returns immediately instead of blocking forever. Registers the fd->pid map for
 // waitid(P_PIDFD)/pidfd_send_signal. Returns -1 only if no fd could be opened at all.
@@ -485,6 +489,7 @@ static void mq_fd_setnb(int fd, int on) {
 static int mq_fd_canwrite(int fd) {
     return mq_qof(fd) >= 0 && g_mqfd_amode[fd] != O_RDONLY; // O_WRONLY or O_RDWR
 }
+
 static int mq_fd_canread(int fd) {
     return mq_qof(fd) >= 0 && g_mqfd_amode[fd] != O_WRONLY; // O_RDONLY or O_RDWR
 }
@@ -816,8 +821,7 @@ static void service_local(struct cpu *c) {
         // a bad pointer doesn't fault the engine in this pre-dispatch cache-invalidation probe. If it is
         // unmapped we simply skip the resolution bump -- the real openat2 handler (svc_fs) returns -EFAULT below.
         uint64_t flags;
-        if (guest_copy_from(&flags, a2, sizeof flags) == sizeof flags &&
-            ((flags & 0x40) || (g_nlower && (flags & 3))))
+        if (guest_copy_from(&flags, a2, sizeof flags) == sizeof flags && ((flags & 0x40) || (g_nlower && (flags & 3))))
             hl_fdcache_resolution_bump();
         break;
     }
@@ -849,7 +853,8 @@ static void service_local(struct cpu *c) {
         }
         double la[3] = {0, 0, 0};
         if (getloadavg(la, 3) == 3)
-            for (int li = 0; li < 3; li++) loads[li] = (uint64_t)(la[li] * 65536.0);
+            for (int li = 0; li < 3; li++)
+                loads[li] = (uint64_t)(la[li] * 65536.0);
         hl_linux_misc_context misc = {
             .hostname = g_hostname,
             .hostname_capacity = sizeof(g_hostname),
