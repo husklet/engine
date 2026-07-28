@@ -3,6 +3,9 @@ use super::{
     Reply, Request, SeekWhence, ServiceFailure, ServiceId, ServiceStat, ServiceTransport,
     TransportError,
 };
+
+#[cfg(test)]
+mod tests;
 struct Description {
     handle: u64,
     offset: Mutex<u64>,
