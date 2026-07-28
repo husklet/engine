@@ -37,6 +37,8 @@ host-wide freezes. Preserve them during engine refactors:
       Linux-compatible.
 - [ ] `fork`, `clone`, `exec`, descriptor inheritance, `CLOEXEC`, signals, and child cleanup remain correct
       under concurrent process creation.
+- [ ] Terminating an exec updates its observable state and reaps its descendants; a killed Chrome process
+      never remains `Running` or leaves an unowned translated process tree.
 
 ## Scheduling and I/O
 
@@ -78,6 +80,12 @@ host-wide freezes. Preserve them during engine refactors:
 - [ ] Render-node and graphics-library projections retain stable identity and permissions.
 - [ ] Shared GPU buffers and synchronization descriptors remain valid while any process or host provider
       owns them.
+- [ ] External allocation identity and generation come from an authoritative provider record, not
+      guest-supplied metadata. Recycled, stale, forged, and generation-zero handles are rejected.
+- [ ] Buffer release means every GPU consumer has finished reading it. Cross-process or cross-queue
+      presentation uses an explicit fence or a bounded buffer ring; producer reuse cannot race scanout.
+- [ ] Graphics capabilities are advertised only when allocation, import, synchronization, presentation,
+      resize, release, and failure recovery are all available end to end.
 - [ ] Provider memory validation, rollback, retention, and release are atomic across failed launches and
       rejected submissions.
 - [ ] GPU submissions have bounded size and work, deterministic backpressure, and no partial mutation before
