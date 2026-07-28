@@ -168,30 +168,14 @@ __attribute__((naked)) static void block_return(void) {
 }
 #endif
 #else
-// Host CPU with a name but no execution backend: the ARM64 bridge has no far end. Define both anyway --
-// run_guest() and the emitters reference them unconditionally -- and abort rather than return, since a silent
-// return replays the previous block's cpu->reason and spins the dispatcher on a PC that never moves. Not
-// hl_fatal_report(): it returns to its caller to unwind, and there is nothing here to unwind to. `static` is
-// load-bearing -- the dual activation archive links both target objects and namespace.h does not rename these
-// two (docs/amd64-host.md §3.7). A backend with its own boundary defines G_OWN_TRAMPOLINES instead.
+// An unsupported host boundary cannot unwind through generated code.
 static void run_block(struct cpu *cpu, void *code) {
     (void)cpu;
     (void)code;
-    fprintf(stderr, "hl: run_block() entered on a " HL_HOST_CPU_NAME " host with no execution backend.\n"
-                    "    A backend supplies translate_block() plus its own run_block()/block_return() and declares\n"
-                    "    G_OWN_TRAMPOLINES so this placeholder is not compiled -- see the host-CPU fork in\n"
-                    "    src/core/target/<guest isa>.c and docs/amd64-host.md. Reaching this means that fork selected\n"
-                    "    an arm that defines neither an ARM64 boundary nor a backend of its own.\n");
     abort();
 }
 
 static void block_return(void) {
-    fprintf(stderr,
-            "hl: block_return() entered on a " HL_HOST_CPU_NAME " host. Only a translated ARM64 block branches\n"
-            "    here, and none can exist on this host -- so its address was baked into something that then ran,\n"
-            "    which means a stale persistent-cache image or a mis-relocated exit was executed. Cache identity\n"
-            "    includes the host ISA (src/translator/identity.c) precisely to make that impossible, so this is\n"
-            "    a bug in the identity key, not a stale directory.\n");
     abort();
 }
 #endif

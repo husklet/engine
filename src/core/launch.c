@@ -326,7 +326,6 @@ int hl_run_config_file_with(const char *path, hl_launch_runner runner) {
         int floor = hl_host_process_fd_private_floor != NULL ? hl_host_process_fd_private_floor() : -1;
         if (floor >= 0) {
             close(fd);
-            fprintf(stderr, "hl-engine: --configfile: cannot reserve private descriptor\n");
             return 78;
         }
     }
