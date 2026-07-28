@@ -76,10 +76,33 @@ pub(crate) struct TerminalSize {
     pub rows: u16,
     pub columns: u16,
 }
+
+impl TerminalSize {
+    pub(crate) fn apply(self, file: &File) -> Result<(), i32> {
+        let status = unsafe { hl_terminal_resize(file.as_raw_fd(), self) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(status)
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct ProcessDomain {
     pub identity: [u64; 2],
+}
+
+impl ProcessDomain {
+    pub(crate) fn terminate(identity: [u64; 2]) -> Result<(), i32> {
+        let status = unsafe { hl_activation_domain_terminate(Self { identity }) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(status)
+        }
+    }
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -185,23 +208,6 @@ pub(crate) fn interrupt_signal() -> c_int {
 pub(crate) fn guest_fd_limit() -> u32 {
     // SAFETY: this query reads the current process resource limit and has no pointer arguments or side effects.
     unsafe { hl_engine_guest_fd_limit() }
-}
-pub(crate) fn resize(file: &File, size: TerminalSize) -> Result<(), i32> {
-    let status = unsafe { hl_terminal_resize(file.as_raw_fd(), size) };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(status)
-    }
-}
-
-pub(crate) fn terminate_domain(identity: [u64; 2]) -> Result<(), i32> {
-    let status = unsafe { hl_activation_domain_terminate(ProcessDomain { identity }) };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(status)
-    }
 }
 pub(crate) fn domain_processes(
     identity: [u64; 2],

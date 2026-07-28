@@ -72,7 +72,9 @@ impl Terminal {
     /// # Errors
     /// Returns a platform error when the terminal has already closed.
     pub fn resize(&self, size: Size) -> Result<(), Error> {
-        ffi::resize(&self.file, size.native()).map_err(|status| Error::Engine { status, detail: 0 })
+        size.native()
+            .apply(&self.file)
+            .map_err(|status| Error::Engine { status, detail: 0 })
     }
 }
 

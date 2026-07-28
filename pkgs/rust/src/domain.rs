@@ -36,6 +36,6 @@ impl Domain {
     /// # Errors
     /// Returns a native process-control failure if a verified member could not be stopped.
     pub fn terminate(self) -> Result<(), Error> {
-        ffi::terminate_domain(self.0).map_err(|status| Error::Engine { status, detail: 0 })
+        ffi::ProcessDomain::terminate(self.0).map_err(|status| Error::Engine { status, detail: 0 })
     }
 }
