@@ -7,6 +7,11 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+#[path = "support/engine_env.rs"]
+mod engine_env;
+#[path = "support/host.rs"]
+mod host;
+
 fn rootfs() -> &'static PathBuf {
     static ROOTFS: OnceLock<PathBuf> = OnceLock::new();
     ROOTFS.get_or_init(|| {
@@ -36,6 +41,11 @@ fn alive(pid: u32) -> bool {
 
 #[test]
 fn private_udp_loopback_preserves_datagrams_and_readiness_across_fork() {
+    if engine_env::skip_without_rootfs(
+        "private_udp_loopback_preserves_datagrams_and_readiness_across_fork",
+    ) {
+        return;
+    }
     let mut child = Engine::new()
         .command(Guest::Aarch64, "/bin/sh")
         .config(
@@ -64,6 +74,9 @@ fn private_udp_loopback_preserves_datagrams_and_readiness_across_fork() {
 
 #[test]
 fn private_udp_loopback_is_shared_by_independent_launches() {
+    if engine_env::skip_without_rootfs("private_udp_loopback_is_shared_by_independent_launches") {
+        return;
+    }
     let config = || {
         Config::new()
             .root(rootfs())
@@ -108,6 +121,11 @@ fn private_udp_loopback_is_shared_by_independent_launches() {
 
 #[test]
 fn process_domain_stops_double_forked_new_session_without_touching_siblings() {
+    if engine_env::skip_without_rootfs(
+        "process_domain_stops_double_forked_new_session_without_touching_siblings",
+    ) {
+        return;
+    }
     let pid_file = rootfs().join("tmp/domain-daemon.pid");
     let _ = fs::remove_file(&pid_file);
     let mut sibling = Command::new("sleep").arg("30").spawn().unwrap();
@@ -148,6 +166,9 @@ fn process_domain_stops_double_forked_new_session_without_touching_siblings() {
 
 #[test]
 fn process_domain_termination_tolerates_an_unreaped_init() {
+    if engine_env::skip_without_rootfs("process_domain_termination_tolerates_an_unreaped_init") {
+        return;
+    }
     let mut child = Engine::new()
         .command(Guest::Aarch64, "/bin/sleep")
         .config(Config::new().root(rootfs()))
@@ -162,6 +183,9 @@ fn process_domain_termination_tolerates_an_unreaped_init() {
 
 #[test]
 fn public_api_runs_real_alpine_shell_with_process_io() {
+    if engine_env::skip_without_rootfs("public_api_runs_real_alpine_shell_with_process_io") {
+        return;
+    }
     let engine = Engine::new();
     let config = Config::new()
         .root(rootfs())
@@ -201,6 +225,9 @@ fn public_api_runs_real_alpine_shell_with_process_io() {
 
 #[test]
 fn production_true_has_empty_stdout_and_stderr() {
+    if engine_env::skip_without_rootfs("production_true_has_empty_stdout_and_stderr") {
+        return;
+    }
     let output = Engine::new()
         .command(Guest::Aarch64, "/bin/true")
         .config(Config::new().root(rootfs()))
@@ -221,6 +248,9 @@ fn production_true_has_empty_stdout_and_stderr() {
 
 #[test]
 fn output_drains_large_stdout_and_stderr_concurrently() {
+    if engine_env::skip_without_rootfs("output_drains_large_stdout_and_stderr_concurrently") {
+        return;
+    }
     let engine = Engine::new();
     let output = engine
         .command(Guest::Aarch64, "/bin/sh")
@@ -240,6 +270,9 @@ fn output_drains_large_stdout_and_stderr_concurrently() {
 
 #[test]
 fn external_term_reaches_the_guest_handler() {
+    if engine_env::skip_without_rootfs("external_term_reaches_the_guest_handler") {
+        return;
+    }
     let mut child = Engine::new()
         .command(Guest::Aarch64, "/bin/sh")
         .config(Config::new().root(rootfs()))
@@ -268,6 +301,9 @@ fn external_term_reaches_the_guest_handler() {
 
 #[test]
 fn piped_streams_enforce_their_direction() {
+    if engine_env::skip_without_rootfs("piped_streams_enforce_their_direction") {
+        return;
+    }
     let engine = Engine::new();
     let mut child = engine
         .command(Guest::Aarch64, "/bin/echo")
@@ -290,22 +326,32 @@ fn piped_streams_enforce_their_direction() {
 
 #[test]
 fn guest_ownership_is_seeded_and_shared_by_inode() {
+    if engine_env::skip_without_rootfs("guest_ownership_is_seeded_and_shared_by_inode") {
+        return;
+    }
     let name = format!("owner-{}", std::process::id());
-    let relative = PathBuf::from("tmp").join(&name);
-    let hard_relative = PathBuf::from("tmp").join(format!("{name}-hard"));
+    // A guest path, so `/`-separated and built as a string. `PathBuf::from("tmp").join(&name)`
+    // renders as `tmp\owner-N` on Windows, which would be handed to `owner()` and interpolated into
+    // the guest script as a path the guest has never heard of -- silently, since nothing here
+    // inspects it. Every guest path in this file is written the way the guest reads it.
+    let relative = format!("tmp/{name}");
+    let hard_relative = format!("tmp/{name}-hard");
     let file = rootfs().join(&relative);
     let hard = rootfs().join(&hard_relative);
     fs::write(&file, b"ownership\n").unwrap();
     fs::hard_link(&file, &hard).unwrap();
 
     let script = format!(
-        "stat -c '%u:%g' /{0}; stat -c '%u:%g' /{1}; (chown 56:78 /{1}); stat -c '%u:%g' /{0}",
-        relative.display(),
-        hard_relative.display()
+        "stat -c '%u:%g' /{relative}; stat -c '%u:%g' /{hard_relative}; \
+         (chown 56:78 /{hard_relative}); stat -c '%u:%g' /{relative}"
     );
     let output = Engine::new()
         .command(Guest::Aarch64, "/bin/sh")
-        .config(Config::new().root(rootfs()).owner(&relative, 12, 34))
+        .config(
+            Config::new()
+                .root(rootfs())
+                .owner(relative.as_str(), 12, 34),
+        )
         .args(["-c", &script])
         .output()
         .unwrap();
@@ -319,8 +365,11 @@ fn guest_ownership_is_seeded_and_shared_by_inode() {
 
 #[test]
 fn guest_ownership_is_seeded_for_overlay_lower_entries() {
+    if engine_env::skip_without_rootfs("guest_ownership_is_seeded_for_overlay_lower_entries") {
+        return;
+    }
     let name = format!("overlay-owner-{}", std::process::id());
-    let relative = PathBuf::from("tmp").join(&name);
+    let relative = format!("tmp/{name}"); // A guest path; see the note above.
     let file = rootfs().join(&relative);
     fs::write(&file, b"ownership\n").unwrap();
     let overlay = std::env::temp_dir().join(format!("hl-{name}"));
@@ -336,9 +385,9 @@ fn guest_ownership_is_seeded_for_overlay_lower_entries() {
         .config(
             Config::new()
                 .overlay(vec![rootfs().clone()], upper, work)
-                .owner(&relative, 12, 34),
+                .owner(relative.as_str(), 12, 34),
         )
-        .args(["-c", "%u:%g", &format!("/{}", relative.display())])
+        .args(["-c", "%u:%g", &format!("/{relative}")])
         .output()
         .unwrap();
 
@@ -351,17 +400,20 @@ fn guest_ownership_is_seeded_for_overlay_lower_entries() {
 
 #[test]
 fn image_symlink_chain_can_open_synthetic_standard_error() {
+    if engine_env::skip_without_rootfs("image_symlink_chain_can_open_synthetic_standard_error") {
+        return;
+    }
     let name = format!("stderr-alias-{}", std::process::id());
-    let relative = PathBuf::from("tmp").join(&name);
+    let relative = format!("tmp/{name}"); // A guest path; see the note above.
     let link = rootfs().join(&relative);
     let _ = fs::remove_file(&link);
-    #[cfg(unix)]
-    std::os::unix::fs::symlink("/dev/stderr", &link).unwrap();
+    // The link target is a *guest* path that does not exist on the host, so this is a dangling
+    // symlink on both hosts by construction. `unwrap` rather than a skip: the gate above already
+    // established that this host can run a guest, and a host that can do that and cannot create a
+    // symlink is a defect worth failing on.
+    host::symlink(std::path::Path::new("/dev/stderr"), &link).unwrap();
 
-    let command = format!(
-        "test -d /proc/self/fd/ && printf SYNTHETIC_STDERR_OK > /{}",
-        relative.display()
-    );
+    let command = format!("test -d /proc/self/fd/ && printf SYNTHETIC_STDERR_OK > /{relative}");
     let output = Engine::new()
         .command(Guest::Aarch64, "/bin/sh")
         .config(Config::new().root(rootfs()))
@@ -376,19 +428,23 @@ fn image_symlink_chain_can_open_synthetic_standard_error() {
 
 #[test]
 fn overlay_image_symlink_chain_can_open_synthetic_standard_output() {
+    if engine_env::skip_without_rootfs(
+        "overlay_image_symlink_chain_can_open_synthetic_standard_output",
+    ) {
+        return;
+    }
     let name = format!("stdout-alias-{}", std::process::id());
-    let relative = PathBuf::from("tmp").join(&name);
+    let relative = format!("tmp/{name}"); // A guest path; see the note above.
     let link = rootfs().join(&relative);
     let _ = fs::remove_file(&link);
-    #[cfg(unix)]
-    std::os::unix::fs::symlink("/dev/stdout", &link).unwrap();
+    host::symlink(std::path::Path::new("/dev/stdout"), &link).unwrap();
     let overlay = std::env::temp_dir().join(format!("hl-{name}"));
     let upper = overlay.join("upper");
     let work = overlay.join("work");
     fs::create_dir_all(&upper).unwrap();
     fs::create_dir_all(&work).unwrap();
 
-    let command = format!("printf SYNTHETIC_STDOUT_OK > /{}", relative.display());
+    let command = format!("printf SYNTHETIC_STDOUT_OK > /{relative}");
     let output = Engine::new()
         .command(Guest::Aarch64, "/bin/sh")
         .config(Config::new().overlay(vec![rootfs().clone()], upper, work))

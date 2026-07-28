@@ -91,6 +91,43 @@ int main(void) {
     HL_CHECK(hl_linux_close(&linux_abi, pipe[0]) == 0);
     HL_CHECK(hl_linux_write(&linux_abi, pipe[1], "x", 1) == -HL_LINUX_EPIPE);
     HL_CHECK(hl_linux_close(&linux_abi, pipe[1]) == 0);
+
+    /* POLLERR/POLLHUP are reported whether or not they were requested. A caller
+     * that polls only for READ on the read end of a pipe with no writers left
+     * must still be told HANGUP, and one that polls only for WRITE on a write
+     * end with no readers must still be told HANGUP -- otherwise the second case
+     * reports nothing ready at all and the caller spins on a descriptor that
+     * will never become writable. Both directions are checked because the two
+     * ends take different branches in the host's readiness probe. */
+    {
+        hl_linux_poll_entry entry;
+        hl_linux_file_status file_status;
+        HL_CHECK(hl_linux_pipe_create(&linux_abi, HL_LINUX_O_NONBLOCK, 0, pipe) == 0);
+        /* fstat reports a FIFO with one link, not a typeless zero-link inode. */
+        HL_CHECK(hl_linux_fstat(&linux_abi, pipe[0], &file_status) == 0);
+        HL_CHECK(file_status.mode == (HL_LINUX_S_IFIFO | 0600u) && file_status.link_count == 1 &&
+                 file_status.size == 0);
+        /* Both ends open: read end is not ready, write end is writable, and
+         * neither reports hangup. */
+        entry = (hl_linux_poll_entry){pipe[0], HL_LINUX_READY_READ, 0};
+        HL_CHECK(hl_linux_object_poll(&linux_abi, &entry, 1, 0) == 0 && entry.readiness == 0);
+        entry = (hl_linux_poll_entry){pipe[1], HL_LINUX_READY_WRITE, 0};
+        HL_CHECK(hl_linux_object_poll(&linux_abi, &entry, 1, 0) == 1 && entry.readiness == HL_LINUX_READY_WRITE);
+        /* Drop the writers: the read end asked only for READ still learns HANGUP. */
+        HL_CHECK(hl_linux_close(&linux_abi, pipe[1]) == 0);
+        entry = (hl_linux_poll_entry){pipe[0], HL_LINUX_READY_READ, 0};
+        HL_CHECK(hl_linux_object_poll(&linux_abi, &entry, 1, 0) == 1 && (entry.readiness & HL_LINUX_READY_HANGUP) != 0);
+        HL_CHECK(hl_linux_close(&linux_abi, pipe[0]) == 0);
+        /* Drop the readers: the write end asked only for WRITE still learns
+         * ERROR. The kernel's pipe_poll is asymmetric here -- a read end with no
+         * writers is EPOLLHUP, a write end with no readers is EPOLLERR -- so
+         * this is the other output-only condition, not the same one twice. */
+        HL_CHECK(hl_linux_pipe_create(&linux_abi, HL_LINUX_O_NONBLOCK, 0, pipe) == 0);
+        HL_CHECK(hl_linux_close(&linux_abi, pipe[0]) == 0);
+        entry = (hl_linux_poll_entry){pipe[1], HL_LINUX_READY_WRITE, 0};
+        HL_CHECK(hl_linux_object_poll(&linux_abi, &entry, 1, 0) == 1 && (entry.readiness & HL_LINUX_READY_ERROR) != 0);
+        HL_CHECK(hl_linux_close(&linux_abi, pipe[1]) == 0);
+    }
     HL_CHECK(hl_linux_abi_validate_fds(&linux_abi) == HL_STATUS_OK);
     HL_CHECK(hl_linux_abi_destroy(&linux_abi) == HL_STATUS_OK);
     hl_host_linux_destroy(host);

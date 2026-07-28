@@ -50,6 +50,11 @@ typedef struct hl_logical_vma_ledger {
     size_t capacity;
     _Atomic(hl_logical_vma_snapshot *) current;
     hl_logical_vma_snapshot *retired;
+    /* Monotonic mapping generation, bumped after every snapshot publication.
+       Readers that cache a derived fact revalidate against it instead of
+       against `current`, whose value a freed-then-reallocated snapshot can
+       reuse (ABA). Never wraps in any realistic run. */
+    _Atomic uint64_t generation;
 } hl_logical_vma_ledger;
 
 enum {
@@ -153,6 +158,18 @@ void hl_logical_vma_global_reclaim_quiescent(void);
 
 /* Translator instruction-fetch seam. See hl_logical_vma_resolve(). */
 int hl_logical_vma_resolve_exec(uint64_t guest, size_t length, const void **host, size_t *contiguous);
+/*
+ * Same tri-state as hl_logical_vma_resolve_exec, but reports the *maximal*
+ * guest interval [first,last) over which the answer holds -- the view for a
+ * hit, the gap between neighbouring views for a miss -- so a caller can cache
+ * one resolution and reuse it for every address inside it.  *generation is the
+ * mapping generation the answer was derived from, read before the snapshot so
+ * a concurrent publication can only make a cached answer look stale.
+ */
+int hl_logical_vma_resolve_exec_span(uint64_t guest, uint64_t *generation, uint64_t *first, uint64_t *last,
+                                     uint64_t *delta);
+/* Address of that generation counter; stable for the process lifetime. */
+const _Atomic uint64_t *hl_logical_vma_global_exec_generation(void);
 int hl_logical_vma_resolve_data(uint64_t guest, size_t length, uint32_t required, void **host, size_t *contiguous);
 typedef void (*hl_logical_vma_alias_visitor)(uint64_t guest_first, uint64_t guest_last, void *opaque);
 int hl_logical_vma_pin_data(uint64_t guest, size_t length, uint32_t required, hl_logical_vma_pin *pin);

@@ -35,8 +35,15 @@ struct cpu {
     uint64_t ic_miss; // IBTC: set by an indirect-branch miss -> dispatcher fills g_ibtc for cpu->rip
     // x87 FPU: a register stack ST(0..7) emulated at DOUBLE precision (enough for printf %f of
     // doubles; loses the 80-bit long-double tail). st[fptop&7]=ST(0). Grows downward (push=--top).
-    double st[8];        // x87 stack slots
-    uint64_t fptop;      // top-of-stack index (only low 3 bits used)
+    double st[8]; // x87 stack slots
+    // Bits 2:0 = top-of-stack. Bits 15:8 + bit 16 carry the x87 TAG state (per-slot "empty" + an ARMED gate)
+    // so the tag word, #IS stack faults and FXAM's "empty" cost no change to sizeof(struct cpu) -- which is
+    // the checkpoint format. See x87state.h for the encoding. lower/x87.c's hl_x86_x87_materialize() stores
+    // TOP with a plain 64-bit str and so CLEARS them, which reads as DISARMED = today's tag-less behaviour;
+    // adopting the model on the JIT side means making that store a read-modify-write and retagging on
+    // push/pop/FFREE. Any other write to this field must preserve bits 63:3.
+    uint64_t fptop;
+
     uint64_t fpsw, fpcw; // status word (C0-C3 in bits 8/9/10/14), control word
     uint64_t x87_ea;     // m80 (80-bit long double) operand address -> handled in C via R_X87*
     uint64_t divop;      // 64-bit div/idiv divisor -> 128/64 division done in C (ARM has no 128/64 divide)
@@ -244,6 +251,10 @@ _Static_assert(__builtin_offsetof(struct cpu, mmscratch) == OFF_MM, "OFF_MM drif
 #define R_SOFTMISS 18
 #define R_SOFTSPAN 19
 #define R_SMC 20
+// FNSTENV/FLDENV m28 and FNSAVE/FRSTOR m108 -> hl_x86_x87_environment(). All four move the tag word, three
+// move TOP and two convert eight ext80 registers, so they are C rather than 200 emitted instructions.
+// cpu->x87_ea = the host EA, cpu->divop = an X87ENV_* selector.
+#define R_X87ENV 21
 #define OFF_SMC_RANGE_COUNT ((int)__builtin_offsetof(struct cpu, smc_range_count))
 #define G_SMC_QUEUE_RESET(c)                                                                                           \
     do {                                                                                                               \
@@ -265,7 +276,24 @@ _Static_assert(__builtin_offsetof(struct cpu, mmscratch) == OFF_MM, "OFF_MM drif
 #define OFF_SOFT_REQUIRED ((int)__builtin_offsetof(struct cpu, soft_required))
 #define G_SOFT_TLB_CLEAR(c) ((c)->soft_snapshot = 0)
 
-enum { X87_F2XM1, X87_FYL2X, X87_FPTAN, X87_FPATAN, X87_FYL2XP1, X87_FSINCOS, X87_FSIN, X87_FCOS };
+// FPREM/FPREM1 join the libm group on the JIT side: the C2 partial-remainder loop, |Q| mod 8 at any
+// magnitude and the #IS screen are all exact-integer work the emitted f64 sequence got wrong (a fused
+// one-step reduction that always reported "complete" and raised a spurious #P deriving the quotient bits).
+enum {
+    X87_F2XM1,
+    X87_FYL2X,
+    X87_FPTAN,
+    X87_FPATAN,
+    X87_FYL2XP1,
+    X87_FSINCOS,
+    X87_FSIN,
+    X87_FCOS,
+    X87_FPREM,
+    X87_FPREM1
+};
+
+// FNSTENV/FLDENV m28 and FNSAVE/FRSTOR m108: cpu->divop selects which, cpu->x87_ea carries the host EA.
+enum { X87ENV_STORE, X87ENV_LOAD, X87ENV_SAVE, X87ENV_RESTORE };
 
 // x86 register encodings (== host reg numbers)
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI };

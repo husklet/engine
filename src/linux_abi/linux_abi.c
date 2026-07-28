@@ -1971,12 +1971,27 @@ static int64_t hl_linux_metadata_owned(hl_linux_abi *linux_abi, hl_linux_ofd_ent
     return result.status == HL_STATUS_OK ? 0 : hl_linux_error((hl_status)result.status);
 }
 
+/* A typed object -- eventfd, pipe, epoll, inotify -- owns no host FILE handle.
+ * Its ofd->host_handle is not a file, so asking the file group to describe it
+ * either fails or describes something else entirely; the object's own status
+ * callback is the only source of truth for what fstat should report. Answering
+ * from the adapter is not an optimisation, it is the difference between
+ * fstat(eventfd) reporting a zero-length regular file the way the kernel's
+ * anonymous inode does and reporting EBADF-ish nonsense that libc treats as a
+ * broken descriptor. */
+static int hl_linux_status_from_object(const hl_linux_ofd_entry *ofd, hl_linux_file_status *output, int64_t *result) {
+    if (ofd->object_ops == NULL || ofd->object_ops->status == NULL) return 0;
+    *result = ofd->object_ops->status(ofd->object_context, output);
+    return 1;
+}
+
 int64_t hl_linux_fstat(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_file_status *output) {
     const hl_linux_ofd_entry *found;
     hl_linux_ofd_entry *ofd;
     hl_host_file_metadata metadata;
     hl_status status;
     int64_t result;
+    int metadata_from_object = 0;
     if (linux_abi == NULL) return -HL_LINUX_EBADF;
     if (output == NULL) return -HL_LINUX_EINVAL;
     hl_linux_lock(linux_abi);
@@ -1989,12 +2004,15 @@ int64_t hl_linux_fstat(hl_linux_abi *linux_abi, hl_linux_fd fd, hl_linux_file_st
     ofd->active_operations++;
     hl_linux_unlock(linux_abi);
     hl_linux_ofd_lock(linux_abi, ofd);
-    result = hl_linux_metadata_owned(linux_abi, ofd, &metadata);
+    if (!hl_linux_status_from_object(ofd, output, &result))
+        result = hl_linux_metadata_owned(linux_abi, ofd, &metadata);
+    else
+        metadata_from_object = 1;
     hl_linux_lock(linux_abi);
     ofd->active_operations--;
     hl_linux_unlock(linux_abi);
     hl_linux_ofd_unlock(linux_abi, ofd);
-    if (result != 0) return result;
+    if (result != 0 || metadata_from_object) return result;
     output->device = metadata.stable_device;
     output->object = metadata.stable_object;
     output->size = metadata.size;

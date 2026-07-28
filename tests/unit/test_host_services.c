@@ -2,6 +2,7 @@
 
 #include "hl/fake.h"
 
+#include <stddef.h>
 #include <string.h>
 
 static int32_t fake_process_entry(void *context) {
@@ -219,6 +220,302 @@ int main(void) {
              HL_STATUS_WOULD_BLOCK);
     HL_CHECK(services.event->close(services.context, pollset.value).status == HL_STATUS_OK);
     HL_CHECK(services.directory->close(services.context, directory_copy.value).status == HL_STATUS_OK);
+    /* HL_HOST_MEMORY_ABI 7 behaviour on the fake provider. It owns no address space, so the honest answer
+     * to a wiring request is the typed unsupported status, not a success that pinned nothing. */
+    HL_CHECK(services.memory->abi == HL_HOST_MEMORY_ABI && services.memory->unmap_address != NULL &&
+             services.memory->wire_range != NULL && services.memory->unwire_range != NULL);
+    HL_CHECK(services.memory->unmap_address(services.context, 0x40000000, 4096).status == HL_STATUS_OK);
+    HL_CHECK(services.memory->unmap_address(services.context, 0, 4096).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->unmap_address(services.context, 0x40000000, 0).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->unmap_address(services.context, 0x40000001, 4096).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->unmap_address(services.context, 0x40000000, 4095).status == HL_STATUS_INVALID_ARGUMENT);
+    hl_fake_host_fail_next(&fake, HL_STATUS_PLATFORM_FAILURE);
+    HL_CHECK(services.memory->unmap_address(services.context, 0x40000000, 4096).status == HL_STATUS_PLATFORM_FAILURE);
+    HL_CHECK(services.memory->unmap_address(services.context, 0x40000000, 4096).status == HL_STATUS_OK);
+    {
+        hl_host_result unsupported = services.memory->wire_range(services.context, 0x40000000, 4096, 0);
+        HL_CHECK(unsupported.status == HL_STATUS_NOT_SUPPORTED && unsupported.detail == (uint64_t)HL_HOST_WIRE_NONE);
+        unsupported = services.memory->unwire_range(services.context, 0x40000000, 4096);
+        HL_CHECK(unsupported.status == HL_STATUS_NOT_SUPPORTED && unsupported.detail == (uint64_t)HL_HOST_WIRE_NONE);
+    }
+    HL_CHECK(services.memory->wire_range(services.context, 0x40000000, 4096, 1).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->wire_range(services.context, 0, 4096, 0).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->wire_range(services.context, 0x40000001, 4096, 0).status == HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->unwire_range(services.context, 0, 4096).status == HL_STATUS_INVALID_ARGUMENT);
+
+    /* An ABI 7 group must carry every appended callback. */
+    malformed_memory = *services.memory;
+    malformed_memory.unmap_address = NULL;
+    truncated = services;
+    truncated.memory = &malformed_memory;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+    malformed_memory = *services.memory;
+    malformed_memory.wire_range = NULL;
+    truncated.memory = &malformed_memory;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+    malformed_memory = *services.memory;
+    malformed_memory.unwire_range = NULL;
+    truncated.memory = &malformed_memory;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+    /* An ABI 6 group stops before them and stays valid: two shipping hosts are still on it. */
+    malformed_memory = *services.memory;
+    malformed_memory.abi = HL_HOST_MEMORY_ABI_MIN;
+    malformed_memory.size = (uint32_t)offsetof(hl_host_memory_services, unmap_address);
+    malformed_memory.unmap_address = NULL;
+    malformed_memory.wire_range = NULL;
+    malformed_memory.unwire_range = NULL;
+    truncated.memory = &malformed_memory;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_OK);
+    /* The code-mapping prefix is inside the ABI 6 group, so it stays reachable there too. */
+    malformed_memory.reserve_code = fake_reserve_code;
+    malformed_memory.repair_code_after_fork = fake_repair_code;
+    truncated.capabilities |= HL_HOST_CAP_CODE_MAPPING;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_CODE_MAPPING) == HL_STATUS_OK);
+    truncated.capabilities = services.capabilities;
+    /* One byte short of the ABI 6 prefix is not a prefix. */
+    malformed_memory.size = (uint32_t)offsetof(hl_host_memory_services, unmap_address) - 1u;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+    /* Neither an unreleased future group nor a retired older one is accepted. */
+    malformed_memory = *services.memory;
+    malformed_memory.abi = HL_HOST_MEMORY_ABI + 1u;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+    malformed_memory.abi = HL_HOST_MEMORY_ABI_MIN - 1u;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+
+    /* HL_HOST_MEMORY_ABI 8: the address-keyed protection and flush the handle-keyed pair could not
+     * reach. The fake owns no address space, so what it can be held to is argument validation and
+     * the absence of any surprise -- the behaviour that needs pages is proven on the real hosts. */
+    HL_CHECK(services.memory->protect_address != NULL && services.memory->sync_address != NULL);
+    HL_CHECK(services.memory->protect_address(services.context, 0x40000000, 4096, HL_HOST_MEMORY_READ).status ==
+             HL_STATUS_OK);
+    HL_CHECK(services.memory->protect_address(services.context, 0, 4096, HL_HOST_MEMORY_READ).status ==
+             HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->protect_address(services.context, 0x40000000, 0, HL_HOST_MEMORY_READ).status ==
+             HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->protect_address(services.context, 0x40000001, 4096, HL_HOST_MEMORY_READ).status ==
+             HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->protect_address(services.context, 0x40000000, 4096, UINT32_MAX).status ==
+             HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory
+                 ->sync_address(services.context, 0x40000000, 4096,
+                                HL_HOST_MEMORY_SYNC_ASYNC | HL_HOST_MEMORY_SYNC_INVALIDATE)
+                 .status == HL_STATUS_OK);
+    HL_CHECK(services.memory->sync_address(services.context, 0x40000001, 4096, 0).status ==
+             HL_STATUS_INVALID_ARGUMENT);
+    HL_CHECK(services.memory->sync_address(services.context, 0x40000000, 4096, UINT32_MAX).status ==
+             HL_STATUS_INVALID_ARGUMENT);
+    /* Rollback: an injected failure leaves the operation refused and nothing half-applied. */
+    hl_fake_host_fail_next(&fake, HL_STATUS_PLATFORM_FAILURE);
+    HL_CHECK(services.memory->protect_address(services.context, 0x40000000, 4096, HL_HOST_MEMORY_READ).status ==
+             HL_STATUS_PLATFORM_FAILURE);
+    HL_CHECK(services.memory->protect_address(services.context, 0x40000000, 4096, HL_HOST_MEMORY_READ).status ==
+             HL_STATUS_OK);
+
+    /* An ABI 8 group must carry both appended callbacks; an ABI 7 group stops before them and is
+     * still accepted, which is the whole point of keeping the prefix valid. */
+    malformed_memory = *services.memory;
+    malformed_memory.protect_address = NULL;
+    truncated = services;
+    truncated.memory = &malformed_memory;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+    malformed_memory = *services.memory;
+    malformed_memory.sync_address = NULL;
+    truncated.memory = &malformed_memory;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+    malformed_memory = *services.memory;
+    malformed_memory.abi = HL_HOST_MEMORY_ABI - 1u;
+    malformed_memory.size = (uint32_t)offsetof(hl_host_memory_services, protect_address);
+    malformed_memory.protect_address = NULL;
+    malformed_memory.sync_address = NULL;
+    truncated.memory = &malformed_memory;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_OK);
+    /* One byte short of the ABI 7 prefix is not a prefix. */
+    malformed_memory.size = (uint32_t)offsetof(hl_host_memory_services, protect_address) - 1u;
+    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
+    {
+        /* HL_HOST_SYNC_ABI 3: the parking trio, and the ABI 2 prefix that must keep validating. */
+        uint64_t word = 0;
+        uint64_t key = (uint64_t)(uintptr_t)&word;
+        HL_CHECK(services.sync->abi == HL_HOST_SYNC_ABI && services.sync->park != NULL &&
+                 services.sync->unpark != NULL && services.sync->interrupt_park != NULL);
+        truncated = services;
+        malformed_sync = *services.sync;
+        malformed_sync.park = NULL;
+        truncated.sync = &malformed_sync;
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_SYNC) == HL_STATUS_ABI_MISMATCH);
+        malformed_sync = *services.sync;
+        malformed_sync.unpark = NULL;
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_SYNC) == HL_STATUS_ABI_MISMATCH);
+        malformed_sync = *services.sync;
+        malformed_sync.interrupt_park = NULL;
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_SYNC) == HL_STATUS_ABI_MISMATCH);
+        malformed_sync = *services.sync;
+        malformed_sync.abi = HL_HOST_SYNC_ABI_MIN;
+        malformed_sync.size = (uint32_t)offsetof(hl_host_sync_services, park);
+        malformed_sync.park = NULL;
+        malformed_sync.unpark = NULL;
+        malformed_sync.interrupt_park = NULL;
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_SYNC) == HL_STATUS_OK);
+        malformed_sync.size = (uint32_t)offsetof(hl_host_sync_services, park) - 1u;
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_SYNC) == HL_STATUS_ABI_MISMATCH);
+        malformed_sync = *services.sync;
+        malformed_sync.abi = HL_HOST_SYNC_ABI + 1u;
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_SYNC) == HL_STATUS_ABI_MISMATCH);
+        malformed_sync.abi = HL_HOST_SYNC_ABI_MIN - 1u;
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_SYNC) == HL_STATUS_ABI_MISMATCH);
+
+        /* Behaviour. This provider never blocks, so what it can answer is the set decided without
+         * waiting: the compare, the interruption record, and a deadline already reached. */
+        HL_CHECK(services.sync->park(services.context, 0, HL_HOST_PARK_PRIVATE, key, &word, 0, 4, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, NULL, 0, 4, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.sync->park(services.context, 1, 5u, key, &word, 0, 4, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, &word, 0, 2, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, (const char *)&word + 1, 0, 4, 0)
+                     .status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, &word, 7, 4, 0).status ==
+                 HL_STATUS_WOULD_BLOCK);
+        HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_SHARED, key, &word, 0, 8, 0).status ==
+                 HL_STATUS_TIMED_OUT);
+        HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, &word, 0, 4,
+                                     HL_HOST_DEADLINE_INFINITE)
+                     .status == HL_STATUS_NOT_SUPPORTED);
+        HL_CHECK(services.sync->unpark(services.context, HL_HOST_PARK_PRIVATE, key, NULL, 1).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.sync->unpark(services.context, 5u, key, &word, 1).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.sync->unpark(services.context, HL_HOST_PARK_PRIVATE, key, &word, UINT32_MAX).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.sync->interrupt_park(services.context, 0).status == HL_STATUS_INVALID_ARGUMENT);
+        /* Recorded against the waiter, so it survives until a block consumes it -- and exactly one
+         * block does. An infinite deadline proves the record is consulted before any waiting. */
+        HL_CHECK(services.sync->interrupt_park(services.context, 55).status == HL_STATUS_OK);
+        HL_CHECK(services.sync->interrupt_park(services.context, 55).status == HL_STATUS_OK);
+        HL_CHECK(services.sync->park(services.context, 55, HL_HOST_PARK_PRIVATE, key, &word, 0, 4,
+                                     HL_HOST_DEADLINE_INFINITE)
+                     .status == HL_STATUS_INTERRUPTED);
+        HL_CHECK(services.sync->park(services.context, 55, HL_HOST_PARK_PRIVATE, key, &word, 0, 4, 0).status ==
+                 HL_STATUS_TIMED_OUT);
+    }
+    {
+        /* The terminal group. It exists because an object-type field cannot answer whether a live,
+         * valid object is a terminal, so the fake models exactly that: one console and one entirely
+         * ordinary file, both perfectly good handles. */
+        hl_host_terminal_services malformed_terminal;
+        hl_host_result console = hl_fake_host_file_create(&fake);
+        hl_host_result ordinary = hl_fake_host_file_create(&fake);
+        hl_host_terminal_size window = {0, 0, 0, 0};
+        hl_host_terminal_size wanted = {100, 40, 0, 0};
+        uint32_t mode = 0;
+        char bytes[8] = {0};
+
+        HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_TERMINAL) == HL_STATUS_OK);
+        HL_CHECK(services.terminal->abi == HL_HOST_TERMINAL_ABI && console.status == HL_STATUS_OK &&
+                 ordinary.status == HL_STATUS_OK);
+
+        HL_CHECK(services.terminal->probe(services.context, console.value).value == 1);
+        HL_CHECK(services.terminal->probe(services.context, ordinary.value).status == HL_STATUS_OK &&
+                 services.terminal->probe(services.context, ordinary.value).value == 0);
+        HL_CHECK(services.terminal->probe(services.context, HL_HOST_HANDLE_INVALID).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        /* Wrong kind: a counter handle is a live host object and still not a terminal. */
+        {
+            hl_host_result counter_handle = services.counter->create(services.context, 0, 0);
+            HL_CHECK(counter_handle.status == HL_STATUS_OK);
+            HL_CHECK(services.terminal->probe(services.context, counter_handle.value).status ==
+                     HL_STATUS_INVALID_ARGUMENT);
+            HL_CHECK(services.counter->close(services.context, counter_handle.value).status == HL_STATUS_OK);
+        }
+
+        HL_CHECK(services.terminal->get_mode(services.context, console.value, &mode).status == HL_STATUS_OK &&
+                 mode == 0);
+        HL_CHECK(services.terminal->get_mode(services.context, console.value, NULL).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.terminal->get_mode(services.context, ordinary.value, &mode).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.terminal
+                     ->set_mode(services.context, console.value,
+                                HL_HOST_TERMINAL_RAW_INPUT | HL_HOST_TERMINAL_OUTPUT_PROCESSING)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services.terminal->get_mode(services.context, console.value, &mode).status == HL_STATUS_OK &&
+                 mode == (HL_HOST_TERMINAL_RAW_INPUT | HL_HOST_TERMINAL_OUTPUT_PROCESSING));
+        HL_CHECK(services.terminal->set_mode(services.context, console.value, UINT32_MAX).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.terminal->get_mode(services.context, console.value, &mode).status == HL_STATUS_OK &&
+                 mode == (HL_HOST_TERMINAL_RAW_INPUT | HL_HOST_TERMINAL_OUTPUT_PROCESSING));
+
+        HL_CHECK(services.terminal->get_size(services.context, console.value, &window).status == HL_STATUS_OK &&
+                 window.columns == 80 && window.rows == 24);
+        HL_CHECK(services.terminal->get_size(services.context, console.value, NULL).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.terminal->set_size(services.context, console.value, &wanted).status == HL_STATUS_OK);
+        HL_CHECK(services.terminal->get_size(services.context, console.value, &window).status == HL_STATUS_OK &&
+                 window.columns == 100 && window.rows == 40);
+        wanted.rows = 0;
+        HL_CHECK(services.terminal->set_size(services.context, console.value, &wanted).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.terminal->set_size(services.context, console.value, NULL).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+
+        HL_CHECK(services.terminal->write(services.context, console.value, (hl_host_const_bytes){"tty", 3}).value ==
+                 3);
+        HL_CHECK(services.terminal->read(services.context, console.value, (hl_host_bytes){bytes, sizeof bytes}).value ==
+                 3);
+        HL_CHECK(memcmp(bytes, "tty", 3) == 0);
+        HL_CHECK(services.terminal->read(services.context, console.value, (hl_host_bytes){bytes, sizeof bytes}).value ==
+                 0);
+        HL_CHECK(services.terminal->write(services.context, ordinary.value, (hl_host_const_bytes){"x", 1}).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+
+        /* The size-change object is independently closeable, and destroying it returns the provider
+         * to the count it started from. */
+        {
+            uint32_t before = fake.live_files;
+            hl_host_result notifier = services.terminal->size_change_event(services.context, console.value);
+            HL_CHECK(notifier.status == HL_STATUS_OK && fake.live_files == before + 1u);
+            HL_CHECK(services.file->close(services.context, notifier.value).status == HL_STATUS_OK &&
+                     fake.live_files == before);
+        }
+        HL_CHECK(services.terminal->size_change_event(services.context, ordinary.value).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+
+        /* Every callback is required, the group ABI is exact, and the pointer must be inside the
+         * caller's declared size. */
+        malformed_terminal = *services.terminal;
+        truncated = services;
+        truncated.terminal = &malformed_terminal;
+        malformed_terminal.probe = NULL;
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_TERMINAL) == HL_STATUS_ABI_MISMATCH);
+        malformed_terminal = *services.terminal;
+        malformed_terminal.size_change_event = NULL;
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_TERMINAL) == HL_STATUS_ABI_MISMATCH);
+        malformed_terminal = *services.terminal;
+        malformed_terminal.abi = HL_HOST_TERMINAL_ABI + 1u;
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_TERMINAL) == HL_STATUS_ABI_MISMATCH);
+        malformed_terminal = *services.terminal;
+        malformed_terminal.size = sizeof(malformed_terminal) - 1u;
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_TERMINAL) == HL_STATUS_ABI_MISMATCH);
+        truncated = services;
+        truncated.terminal = NULL;
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_TERMINAL) == HL_STATUS_ABI_MISMATCH);
+        truncated = services;
+        truncated.size = (uint32_t)offsetof(hl_host_services, terminal);
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_TERMINAL) == HL_STATUS_ABI_MISMATCH);
+        /* A provider that does not claim the capability is not asked for the group at all. */
+        truncated = services;
+        truncated.terminal = NULL;
+        truncated.capabilities &= ~(uint64_t)HL_HOST_CAP_TERMINAL;
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_OK);
+        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_TERMINAL) == HL_STATUS_NOT_SUPPORTED);
+
+        HL_CHECK(services.file->close(services.context, ordinary.value).status == HL_STATUS_OK);
+        HL_CHECK(services.file->close(services.context, console.value).status == HL_STATUS_OK);
+        HL_CHECK(fake.live_files == 0);
+    }
+    truncated = services;
+
     malformed_memory = *services.memory;
     malformed_memory.reserve_code = fake_reserve_code;
     malformed_memory.repair_code_after_fork = fake_repair_code;
@@ -392,6 +689,19 @@ int main(void) {
                                      HL_HOST_MEMORY_PRIVATE, &anonymous)
                      .status == HL_STATUS_OUT_OF_MEMORY);
         HL_CHECK(anonymous.handle == HL_HOST_HANDLE_INVALID && fake.live_mappings == 0);
+        /* A partial unmap_range keeps its handle -- only a full-range unmap consumes one. Retiring
+         * on a partial unmap is what strands a handle over a hole it no longer has. */
+        anonymous = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(anonymous), 0, 0, 0, 0};
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, 8192, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &anonymous)
+                     .status == HL_STATUS_OK &&
+                 fake.live_mappings == 1);
+        HL_CHECK(services.memory->unmap_range(services.context, anonymous.handle, 4096, 4096).status ==
+                     HL_STATUS_OK &&
+                 fake.live_mappings == 1);
+        HL_CHECK(services.memory->unmap_range(services.context, anonymous.handle, 0, 4096).status == HL_STATUS_OK &&
+                 fake.live_mappings == 0);
     }
 
     process = services.process->spawn_cloned(services.context, fake_process_entry, NULL);

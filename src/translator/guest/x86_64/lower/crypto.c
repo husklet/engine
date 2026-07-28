@@ -530,7 +530,8 @@ int hl_x86_lower_crypto(struct insn *I, uint64_t next, hl_x86_crypto_state *stat
         // -> use MXCSR.RC, which ldmxcsr mirrors into the live FPCR.RMode, so FRINTI (round per FPCR.RMode)
         // is exact -- identical to the C reference's __builtin_rint. imm[3] (suppress-precision) affects only
         // the inexact FLAG, not the result: explicit modes use the non-signaling FRINTN/M/P/Z (bit-for-bit
-        // matches qemu's result). NaN/inf/negative-zero pass through like x86 round. Gated by state->optimize.
+        // matches qemu's result), plus an FRINTX when the flag is wanted (see below). NaN/inf/negative-zero
+        // pass through like x86 round. Gated by state->optimize.
         case 0x08:   // ROUNDPS d, s, imm8  (.4s)
         case 0x09:   // ROUNDPD d, s, imm8  (.2d)
         case 0x0A:   // ROUNDSS d, s, imm8  (scalar 32, preserve d[127:32])
@@ -542,15 +543,28 @@ int hl_x86_lower_crypto(struct insn *I, uint64_t next, hl_x86_crypto_state *stat
             int mode = imm & 3;
             int is_pd = (op == 0x09 || op == 0x0B); // double precision
             int is_scalar = (op == 0x0A || op == 0x0B);
+            // imm[3] clear means x86 REPORTS the inexactness: #P iff the rounding changed the value
+            // (measured against native for every imm encoding). Round-to-integral changes x iff x is not
+            // already integral, which does not depend on the mode -- so FRINTX, the one FRINT that reports
+            // Inexact, is exactly that predicate whatever direction it rounds in. Under imm[2] it also
+            // rounds the way FRINTI would, so it REPLACES it and costs nothing; otherwise it runs beside
+            // the mode-specific FRINT for the flag alone, one instruction. imm[3] is set by
+            // _MM_FROUND_NO_EXC, i.e. by every _mm_floor_/_mm_ceil_ the compiler emits, so the hot path
+            // pays nothing either way. #I from an SNaN needs no help: every FRINT raises it.
+            int px = !(imm & 8);               // report #P
+            int frintx_only = px && (imm & 4); // FRINTX also IS the result
             uint32_t enc;
             if (is_scalar) {
                 // scalar FRINT (single/double) writing into scratch v16, then merge lane 0 into d so d's
                 // upper lanes are preserved per x86 scalar semantics. imm[2]=1 -> FRINTI (current FPCR mode).
-                static const uint32_t frs[5] = {0x1E244000u /*N*/, 0x1E254000u /*M*/, 0x1E24C000u /*P*/,
-                                                0x1E25C000u /*Z*/, 0x1E27C000u /*I*/};
-                static const uint32_t frd[5] = {0x1E644000u /*N*/, 0x1E654000u /*M*/, 0x1E64C000u /*P*/,
-                                                0x1E65C000u /*Z*/, 0x1E67C000u /*I*/};
-                enc = (imm & 4) ? (is_pd ? frd[4] : frs[4]) : (is_pd ? frd[mode] : frs[mode]);
+                static const uint32_t frs[6] = {0x1E244000u /*N*/, 0x1E254000u /*M*/, 0x1E24C000u /*P*/,
+                                                0x1E25C000u /*Z*/, 0x1E27C000u /*I*/, 0x1E274000u /*X*/};
+                static const uint32_t frd[6] = {0x1E644000u /*N*/, 0x1E654000u /*M*/, 0x1E64C000u /*P*/,
+                                                0x1E65C000u /*Z*/, 0x1E67C000u /*I*/, 0x1E674000u /*X*/};
+                enc = (imm & 4) ? (is_pd ? frd[frintx_only ? 5 : 4] : frs[frintx_only ? 5 : 4])
+                                : (is_pd ? frd[mode] : frs[mode]);
+                if (px && !frintx_only) // flag-only FRINTX beside the mode-specific round
+                    emit32((is_pd ? frd[5] : frs[5]) | (crypto_reg(s) << 5) | 17);
                 emit32(enc | (crypto_reg(s) << 5) | 16); // v16 = round(s.low)
                 if (is_pd)
                     hl_x86_emit_vector_insert64(D, 0, 16, 0); // d[63:0] = rounded, keep d[127:64]
@@ -558,10 +572,11 @@ int hl_x86_lower_crypto(struct insn *I, uint64_t next, hl_x86_crypto_state *stat
                     hl_x86_emit_vector_insert32(D, 0, 16, 0); // d[31:0] = rounded, keep d[127:32]
             } else {
                 // packed FRINT over all lanes (.4s / .2d). imm[2]=1 -> FRINTI (current FPCR mode).
-                static const uint32_t fr4s[5] = {0x4E218800u /*N*/, 0x4E219800u /*M*/, 0x4EA18800u /*P*/,
-                                                 0x4EA19800u /*Z*/, 0x6EA19800u /*I*/};
-                uint32_t base = (imm & 4) ? fr4s[4] : fr4s[mode];
+                static const uint32_t fr4s[6] = {0x4E218800u /*N*/, 0x4E219800u /*M*/, 0x4EA18800u /*P*/,
+                                                 0x4EA19800u /*Z*/, 0x6EA19800u /*I*/, 0x6E219800u /*X*/};
+                uint32_t base = (imm & 4) ? fr4s[frintx_only ? 5 : 4] : fr4s[mode];
                 enc = is_pd ? (base | 0x400000u) : base; // .2d sets the sz bit (bit22)
+                if (px && !frintx_only) emit32((is_pd ? (fr4s[5] | 0x400000u) : fr4s[5]) | (crypto_reg(s) << 5) | 17);
                 emit32(enc | (crypto_reg(s) << 5) | crypto_reg(D));
             }
             return TX_NEXT;

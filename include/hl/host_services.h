@@ -6,7 +6,12 @@
 HL_EXTERN_C_BEGIN
 
 #define HL_HOST_SERVICES_ABI 4u
-#define HL_HOST_MEMORY_ABI 6u
+#define HL_HOST_MEMORY_ABI 8u
+/* Oldest memory group still accepted. An ABI 6 provider ends at repair_signal_page and an ABI 7
+ * provider ends at unwire_range; callbacks appended after a provider's own version are absent
+ * rather than NULL, so validation checks the prefix that version is required to carry and only
+ * demands an appended callback from a provider that declares the version which added it. */
+#define HL_HOST_MEMORY_ABI_MIN 6u
 #define HL_HOST_FILE_MAPPING_ABI 1u
 #define HL_HOST_MEMORY_MAPPING_ABI 1u
 #define HL_HOST_CLOCK_ABI 4u
@@ -14,10 +19,19 @@ HL_EXTERN_C_BEGIN
 #define HL_HOST_FILE_ABI 23u
 #define HL_HOST_PROCESS_ABI 3u
 #define HL_HOST_EVENT_ABI 2u
-#define HL_HOST_NETWORK_ABI 1u
+#define HL_HOST_NETWORK_ABI 2u
+/* Oldest network group still accepted. An ABI 1 provider ends at close; the fourteen operations
+ * appended in ABI 2 are absent rather than NULL, so validation checks the ABI 1 prefix and only
+ * demands the appended callbacks from an ABI 2 provider. */
+#define HL_HOST_NETWORK_ABI_MIN 1u
 #define HL_HOST_SHARED_MEMORY_ABI 1u
 #define HL_HOST_COUNTER_ABI 2u
-#define HL_HOST_SYNC_ABI 2u
+#define HL_HOST_SYNC_ABI 3u
+/* Oldest sync group still accepted. An ABI 2 provider ends at fork_child; the parking operations
+ * appended in ABI 3 are absent rather than NULL, so validation checks the ABI 2 prefix and only
+ * demands the appended callbacks from an ABI 3 provider. */
+#define HL_HOST_SYNC_ABI_MIN 2u
+#define HL_HOST_TERMINAL_ABI 1u
 #define HL_HOST_TRANSFER_ABI 2u
 #define HL_HOST_DIRECTORY_ABI 1u
 #define HL_HOST_WATCH_ABI 1u
@@ -45,7 +59,8 @@ enum {
     HL_HOST_CAP_DIRECTORY = UINT64_C(1) << 14,
     HL_HOST_CAP_WATCH = UINT64_C(1) << 15,
     HL_HOST_CAP_STREAM = UINT64_C(1) << 16,
-    HL_HOST_CAP_POSIX_ATTACHMENT = UINT64_C(1) << 17
+    HL_HOST_CAP_POSIX_ATTACHMENT = UINT64_C(1) << 17,
+    HL_HOST_CAP_TERMINAL = UINT64_C(1) << 18
 };
 
 enum {
@@ -106,15 +121,223 @@ typedef enum hl_host_network_family {
     HL_HOST_NETWORK_LOCAL = 3
 } hl_host_network_family;
 
-typedef enum hl_host_network_type { HL_HOST_NETWORK_STREAM = 1, HL_HOST_NETWORK_DATAGRAM = 2 } hl_host_network_type;
+typedef enum hl_host_network_type {
+    HL_HOST_NETWORK_STREAM = 1,
+    HL_HOST_NETWORK_DATAGRAM = 2,
+    HL_HOST_NETWORK_SEQPACKET = 3,
+    HL_HOST_NETWORK_RAW = 4
+} hl_host_network_type;
 
+/*
+ * One address in every family this contract carries, written in the contract's own terms rather
+ * than any host's. There is no sockaddr here on purpose: the three hosts disagree about whether
+ * one begins with a length byte, about the numeric value of every family constant, and about how
+ * long a local path may be, and a struct that is memcpy-compatible with one of them is silently
+ * wrong on the other two.
+ *
+ * port is host byte order. A caller never performs the network-order swap and a provider always
+ * does, because the swap is the single place this has historically gone wrong and there is exactly
+ * one side of the seam that can be made to own it.
+ *
+ * size is the significant length of the variable-length part: 4 for IPV4, 16 for IPV6, and the
+ * number of bytes of local_path in use for LOCAL. A LOCAL address of size zero is an unnamed local
+ * socket -- the state a socketpair end and a freshly accepted local peer are in -- and is
+ * distinguishable from a failure to fill the address in, which no provider may report as success.
+ */
 typedef struct hl_host_network_address {
     uint32_t family;
     uint16_t port;
     uint16_t size;
     uint8_t address[16];
     char local_path[108];
+    /* --- appended at HL_HOST_NETWORK_ABI 2. IPV6 only; zero in every other family. --- */
+    uint32_t scope_id;
+    uint32_t flow_info;
 } hl_host_network_address;
+
+/*
+ * What a socket operation ran into, when hl_status is too coarse to say.
+ *
+ * hl_status has four network members and a guest needs roughly twenty distinct errno values out of
+ * this group; connect alone has to be able to report "in progress", "already pending" and "already
+ * connected" as three different things, and a guest that confuses them either spins or gives up.
+ * Rather than grow the shared status enum -- whose range is bounds-checked by callers far from any
+ * socket -- a provider names the precise condition here and carries it in hl_host_result.detail
+ * with detail_domain set to HL_HOST_DETAIL_NETWORK. status still carries the closest coarse
+ * classification, so a caller that ignores the detail is merely imprecise and never wrong.
+ */
+typedef enum hl_host_network_condition {
+    HL_HOST_NETWORK_CONDITION_NONE = 0,
+    HL_HOST_NETWORK_CONDITION_ADDRESS_IN_USE = 1,
+    HL_HOST_NETWORK_CONDITION_ADDRESS_NOT_AVAILABLE = 2,
+    HL_HOST_NETWORK_CONDITION_ALREADY_CONNECTED = 3,
+    HL_HOST_NETWORK_CONDITION_NOT_CONNECTED = 4,
+    HL_HOST_NETWORK_CONDITION_CONNECT_IN_PROGRESS = 5,
+    HL_HOST_NETWORK_CONDITION_CONNECT_PENDING = 6,
+    HL_HOST_NETWORK_CONDITION_CONNECTION_REFUSED = 7,
+    HL_HOST_NETWORK_CONDITION_CONNECTION_RESET = 8,
+    HL_HOST_NETWORK_CONDITION_CONNECTION_ABORTED = 9,
+    HL_HOST_NETWORK_CONDITION_DESTINATION_REQUIRED = 10,
+    HL_HOST_NETWORK_CONDITION_MESSAGE_TOO_LARGE = 11,
+    HL_HOST_NETWORK_CONDITION_FAMILY_NOT_SUPPORTED = 12,
+    HL_HOST_NETWORK_CONDITION_PROTOCOL_NOT_SUPPORTED = 13,
+    HL_HOST_NETWORK_CONDITION_TYPE_NOT_SUPPORTED = 14,
+    HL_HOST_NETWORK_CONDITION_OPTION_NOT_SUPPORTED = 15,
+    HL_HOST_NETWORK_CONDITION_WRONG_PROTOCOL = 16,
+    HL_HOST_NETWORK_CONDITION_NOT_A_SOCKET = 17,
+    HL_HOST_NETWORK_CONDITION_HOST_UNREACHABLE = 18,
+    HL_HOST_NETWORK_CONDITION_NETWORK_UNREACHABLE = 19,
+    HL_HOST_NETWORK_CONDITION_NETWORK_DOWN = 20,
+    HL_HOST_NETWORK_CONDITION_NETWORK_RESET = 21,
+    HL_HOST_NETWORK_CONDITION_BUFFER_EXHAUSTED = 22,
+    /* The local end has been shut down for this direction, or the peer closed the read side. */
+    HL_HOST_NETWORK_CONDITION_SHUT_DOWN = 23,
+    HL_HOST_NETWORK_CONDITION_BROKEN_PIPE = 24,
+    HL_HOST_NETWORK_CONDITION_OPERATION_NOT_SUPPORTED = 25,
+    HL_HOST_NETWORK_CONDITION_TIMED_OUT = 26,
+    HL_HOST_NETWORK_CONDITION_WOULD_BLOCK = 27,
+    HL_HOST_NETWORK_CONDITION_INTERRUPTED = 28
+} hl_host_network_condition;
+
+/*
+ * hl_host_result.detail_domain values that appear on this seam. 1 is errno (the POSIX backends),
+ * 2 and 3 are Win32 and NTSTATUS. 4 says the detail is an hl_host_network_condition and belongs to
+ * no host at all -- it is the only domain a caller may act on without knowing which host it has.
+ */
+enum {
+    HL_HOST_DETAIL_NONE = 0u,
+    HL_HOST_DETAIL_ERRNO = 1u,
+    HL_HOST_DETAIL_WIN32 = 2u,
+    HL_HOST_DETAIL_NT = 3u,
+    HL_HOST_DETAIL_NETWORK = 4u
+};
+
+/*
+ * Transfer flags. Deliberately NOT the Linux numbers: raw MSG_DONTWAIT (0x40) handed to a Winsock
+ * send is WSAEOPNOTSUPP, and MSG_WAITALL is 0x100 on Linux against 0x8 on Winsock, so a word that
+ * is passed through rather than translated either fails outright or asks for a different thing.
+ * The first five are inputs; the last four are outputs a provider reports back in
+ * hl_host_network_message.flags and never accepts as input.
+ */
+enum {
+    HL_HOST_MSG_PEEK = 1u << 0,
+    HL_HOST_MSG_OUT_OF_BAND = 1u << 1,
+    HL_HOST_MSG_DONT_WAIT = 1u << 2,
+    HL_HOST_MSG_WAIT_ALL = 1u << 3,
+    HL_HOST_MSG_DONT_ROUTE = 1u << 4,
+    /* Suppress process-directed notification of a write to a closed peer. Hosts differ about
+     * whether this is a per-call flag or a socket option; both spellings satisfy it. */
+    HL_HOST_MSG_NO_SIGNAL = 1u << 5,
+    HL_HOST_MSG_END_OF_RECORD = 1u << 6,
+    HL_HOST_MSG_MORE = 1u << 7,
+    /* Outputs. */
+    HL_HOST_MSG_TRUNCATED = 1u << 16,
+    HL_HOST_MSG_CONTROL_TRUNCATED = 1u << 17,
+    HL_HOST_MSG_RECEIVED_OUT_OF_BAND = 1u << 18,
+    HL_HOST_MSG_RECEIVED_END_OF_RECORD = 1u << 19
+};
+
+enum { HL_HOST_SHUTDOWN_READ = 1, HL_HOST_SHUTDOWN_WRITE = 2, HL_HOST_SHUTDOWN_BOTH = 3 };
+
+/* Status flags that live in the open socket description rather than in a descriptor, so a
+ * duplicate observes what its origin was set to. */
+enum { HL_HOST_SOCKET_NONBLOCK = 1u << 0 };
+
+/*
+ * Socket options as a FLAT NEUTRAL enum, not a (level, name) pair. That is the whole point of this
+ * list and it is worth the space: Windows SO_ACCEPTCONN is 2, Linux SO_REUSEADDR is 2, and Linux
+ * IP_TTL is 2. Any interface that carries a level and a name separately can express "level 1,
+ * option 2" and mean three different things depending on which host reads it, and a provider that
+ * forgets one break in one switch sets a different option than the caller asked for -- silently,
+ * because setting an option produces no observable result. A flat name cannot be mistranslated,
+ * only refused, and a refusal is HL_STATUS_NOT_SUPPORTED with nothing changed.
+ *
+ * Values are neutral too, and the width is fixed per option rather than per host:
+ *   - the boolean and integer options carry exactly one uint32_t;
+ *   - LINGER carries hl_host_network_linger, because Windows' struct linger is four bytes and
+ *     Linux's is eight;
+ *   - SEND_TIMEOUT/RECEIVE_TIMEOUT carry one uint64_t of NANOSECONDS, because Windows takes
+ *     milliseconds in a DWORD and Linux takes a struct timeval;
+ *   - ERROR carries one uint32_t which is an hl_status, never a host error number, with the host's
+ *     own number left in hl_host_result.detail;
+ *   - PEER_CREDENTIALS carries hl_host_network_credentials.
+ *
+ * REUSE_ADDRESS is defined by BEHAVIOUR and not by name: "permit rebinding an address left in a
+ * post-close wait state; still refuse to bind over a live listener". That definition is what makes
+ * it implementable on a host whose option of the same name means the opposite -- there, the
+ * contract's default is already the requested behaviour and the value 0 is the one that needs an
+ * action. A host that mapped this by name would hand a guest the ability to steal another
+ * process's bound port.
+ */
+typedef enum hl_host_socket_option {
+    HL_HOST_SOCKOPT_REUSE_ADDRESS = 1,
+    HL_HOST_SOCKOPT_REUSE_PORT = 2,
+    HL_HOST_SOCKOPT_KEEP_ALIVE = 3,
+    HL_HOST_SOCKOPT_BROADCAST = 4,
+    HL_HOST_SOCKOPT_DONT_ROUTE = 5,
+    HL_HOST_SOCKOPT_OUT_OF_BAND_INLINE = 6,
+    HL_HOST_SOCKOPT_SEND_BUFFER = 7,
+    HL_HOST_SOCKOPT_RECEIVE_BUFFER = 8,
+    HL_HOST_SOCKOPT_SEND_LOW_WATER = 9,
+    HL_HOST_SOCKOPT_RECEIVE_LOW_WATER = 10,
+    HL_HOST_SOCKOPT_SEND_TIMEOUT = 11,
+    HL_HOST_SOCKOPT_RECEIVE_TIMEOUT = 12,
+    HL_HOST_SOCKOPT_LINGER = 13,
+    HL_HOST_SOCKOPT_ERROR = 14,
+    HL_HOST_SOCKOPT_TYPE = 15,
+    HL_HOST_SOCKOPT_PROTOCOL = 16,
+    HL_HOST_SOCKOPT_DOMAIN = 17,
+    HL_HOST_SOCKOPT_ACCEPT_CONNECTIONS = 18,
+    HL_HOST_SOCKOPT_PEER_CREDENTIALS = 19,
+    HL_HOST_SOCKOPT_PASS_CREDENTIALS = 20,
+    HL_HOST_SOCKOPT_NO_SIGNAL = 21,
+    HL_HOST_SOCKOPT_TCP_NO_DELAY = 32,
+    HL_HOST_SOCKOPT_TCP_KEEP_IDLE = 33,
+    HL_HOST_SOCKOPT_TCP_KEEP_INTERVAL = 34,
+    HL_HOST_SOCKOPT_TCP_KEEP_COUNT = 35,
+    HL_HOST_SOCKOPT_TCP_MAX_SEGMENT = 36,
+    HL_HOST_SOCKOPT_TCP_CORK = 37,
+    HL_HOST_SOCKOPT_TCP_QUICK_ACK = 38,
+    HL_HOST_SOCKOPT_TCP_USER_TIMEOUT = 39,
+    HL_HOST_SOCKOPT_IP_TIME_TO_LIVE = 64,
+    HL_HOST_SOCKOPT_IP_TYPE_OF_SERVICE = 65,
+    HL_HOST_SOCKOPT_IP_HEADER_INCLUDED = 66,
+    HL_HOST_SOCKOPT_IP_MULTICAST_TTL = 67,
+    HL_HOST_SOCKOPT_IP_MULTICAST_LOOP = 68,
+    HL_HOST_SOCKOPT_IP_MULTICAST_INTERFACE = 69,
+    HL_HOST_SOCKOPT_IP_ADD_MEMBERSHIP = 70,
+    HL_HOST_SOCKOPT_IP_DROP_MEMBERSHIP = 71,
+    HL_HOST_SOCKOPT_IP_PACKET_INFO = 72,
+    HL_HOST_SOCKOPT_IPV6_ONLY = 96,
+    HL_HOST_SOCKOPT_IPV6_UNICAST_HOPS = 97,
+    HL_HOST_SOCKOPT_IPV6_MULTICAST_HOPS = 98,
+    HL_HOST_SOCKOPT_IPV6_MULTICAST_LOOP = 99,
+    HL_HOST_SOCKOPT_IPV6_MULTICAST_INTERFACE = 100,
+    HL_HOST_SOCKOPT_IPV6_ADD_MEMBERSHIP = 101,
+    HL_HOST_SOCKOPT_IPV6_DROP_MEMBERSHIP = 102,
+    HL_HOST_SOCKOPT_IPV6_PACKET_INFO = 103
+} hl_host_socket_option;
+
+typedef struct hl_host_network_linger {
+    uint32_t enabled;
+    uint32_t seconds;
+} hl_host_network_linger;
+
+typedef struct hl_host_network_credentials {
+    int32_t process;
+    uint32_t user;
+    uint32_t group;
+    uint32_t reserved;
+} hl_host_network_credentials;
+
+/* The membership payload for the four multicast options above. IPV4 uses the first four bytes of
+ * each address; IPV6 uses all sixteen of the group and only the interface index. */
+typedef struct hl_host_network_membership {
+    uint8_t group[16];
+    uint8_t interface_address[16];
+    uint32_t interface_index;
+    uint32_t reserved;
+} hl_host_network_membership;
 
 #define HL_HOST_HANDLE_CWD UINT64_MAX
 
@@ -128,6 +351,26 @@ enum {
 };
 
 enum { HL_HOST_CODE_DUAL_ALIAS = 1u << 0 };
+
+/* What sync_address is being asked to guarantee when it returns. Zero -- no bit set -- is the
+ * strong form and matches the handle-keyed sync: the range is durable in its backing object
+ * before the call returns. These are named rather than passed through as native flag words so a
+ * host is never handed a number it has to reinterpret, and so the mutually exclusive pair that
+ * the POSIX word encodes cannot be expressed at all: ASYNC set means "scheduled", ASYNC clear
+ * means "durable", and there is no third state to reject. */
+enum { HL_HOST_MEMORY_SYNC_ASYNC = 1u << 0, HL_HOST_MEMORY_SYNC_INVALIDATE = 1u << 1 };
+
+/* What a host actually does when asked to wire a range. A caller must not assume that a
+ * successful wire means the same thing everywhere: Linux and Darwin mlock(2) pin pages
+ * against reclaim, while the nearest Windows primitive (VirtualLock) only grows the
+ * process working set and leaves the pages reclaimable. Whose limit applies and what a
+ * refusal means differ with it, so wire_range reports the kind it applied instead of
+ * letting the caller guess from the name. */
+typedef enum hl_host_wire_kind {
+    HL_HOST_WIRE_NONE = 0,
+    HL_HOST_WIRE_RESIDENT = 1,
+    HL_HOST_WIRE_WORKING_SET = 2
+} hl_host_wire_kind;
 
 enum { HL_HOST_EVENT_ADD = 1, HL_HOST_EVENT_MODIFY = 2, HL_HOST_EVENT_DELETE = 3 };
 
@@ -220,6 +463,68 @@ typedef struct hl_host_memory_services {
      * operation first protects an existing exact range, then claims a vacant
      * exact range without replacement. It never invalidates an owned mapping. */
     int (*repair_signal_page)(void *context, uint64_t address, uint64_t size, uint32_t protection);
+    /* --- appended in HL_HOST_MEMORY_ABI 7 --- */
+    /*
+     * Release a page-aligned range the engine owns NO mapping handle for. Two populations
+     * reach it: a range a provider placed at a fixed address, and a range whose ownership
+     * handle a later fixed placement already retired. unmap_range cannot express either,
+     * because it is keyed on an owning handle and by construction there is none.
+     *
+     * This is deliberately not a handle-free alias for unmap_range. A range that overlaps
+     * any live mapping handle is refused whole with HL_STATUS_BUSY and nothing is unmapped,
+     * so an address-keyed caller can never silently invalidate owned memory or strand a
+     * handle over a hole. A range with no mapping at all succeeds, matching the host.
+     */
+    hl_host_result (*unmap_address)(void *context, uint64_t address, uint64_t size);
+    /*
+     * Wire a range into memory. address is page aligned; size follows the host rule for
+     * wiring and is rounded up to whole pages. flags is reserved and must be zero.
+     * On success detail is the hl_host_wire_kind the host applied. A host with no wiring
+     * primitive returns HL_STATUS_NOT_SUPPORTED with detail HL_HOST_WIRE_NONE; callers
+     * whose contract is best-effort (guest mlockall) treat that as a range left pageable.
+     */
+    hl_host_result (*wire_range)(void *context, uint64_t address, uint64_t size, uint32_t flags);
+    hl_host_result (*unwire_range)(void *context, uint64_t address, uint64_t size);
+    /* --- appended in HL_HOST_MEMORY_ABI 8 --- */
+    /*
+     * Change the protection of a range keyed by address rather than by an ownership handle.
+     * protect() and sync() are keyed on a mapping handle; a caller holding only an address --
+     * the same two populations unmap_address serves, plus every range a guest may legitimately
+     * re-protect -- cannot reach them at all. These complete that pair.
+     *
+     * address is page aligned. size is non-zero and is rounded up to whole pages, which is what
+     * the underlying host operations do. This differs deliberately from unmap_address, which
+     * demands an exact multiple: rounding an unmap up destroys pages the caller did not name,
+     * so it must state them, while rounding a protect or a flush up only touches pages it was
+     * already going to leave intact.
+     *
+     * protect_address does NOT carry unmap_address's live-handle refusal, and the difference is
+     * the point. unmap_address refuses a range overlapping a live handle because unmapping it
+     * would leave that handle claiming address space which no longer exists, and a later
+     * whole-handle teardown would then unmap whatever the host had since placed there -- an
+     * unrecoverable, non-local corruption. Re-protecting has no such consequence: the frame, the
+     * hole set, the contents and the handle all survive verbatim, the owner can restore the
+     * protection through the handle-keyed protect() at any time, and no registry invariant reads
+     * protection at all. Refusing here would also refuse the ordinary case, since re-protecting
+     * a mapping you own is exactly what mprotect is for.
+     *
+     * One population is still refused whole with HL_STATUS_BUSY and nothing changed: a range
+     * overlapping a live CODE mapping. There the protection is an engine invariant rather than a
+     * caller preference -- it is what the per-thread W^X gate and the writable/executable alias
+     * pair are made of -- and an address-keyed caller cannot restore it, because it does not hold
+     * the handle that knows the pair. That is the narrow case where the unmap argument does
+     * apply, so it keeps the unmap answer.
+     *
+     * protection uses HL_HOST_MEMORY_*; zero means no access.
+     */
+    hl_host_result (*protect_address)(void *context, uint64_t address, uint64_t size, uint32_t protection);
+    /*
+     * Flush a range keyed by address. flags is an HL_HOST_MEMORY_SYNC_* mask; zero is a durable
+     * flush. A range with no shared backing carries nothing to write back, so a host is free to
+     * succeed for it. No live-handle rule: flushing changes neither the address space nor any
+     * protection, so there is nothing an owner could observe as taken away.
+     */
+    hl_host_result (*sync_address)(void *context, uint64_t address, uint64_t size, uint32_t flags);
 } hl_host_memory_services;
 
 typedef struct hl_host_clock_services {
@@ -479,14 +784,118 @@ typedef struct hl_host_event_services {
     hl_host_result (*disarm_timer)(void *context, hl_host_handle pollset, uint64_t token);
 } hl_host_event_services;
 
+/*
+ * One scatter/gather message. Carries no C library object and no native descriptor: the buffers
+ * are (address, size) pairs in the caller's own address space and control is an opaque byte range
+ * whose encoding is agreed above this seam, never a cmsghdr chain -- a cmsghdr's alignment and
+ * length fields differ between the hosts, and one of the hosts has no such structure at all.
+ *
+ * On send, flags is ignored and control_size is the number of control bytes present. On receive,
+ * control_size is the capacity on the way in and the number of bytes produced on the way out, and
+ * flags is written with the HL_HOST_MSG_* output bits and nothing else.
+ */
+typedef struct hl_host_network_message {
+    hl_host_network_address *address; /* NULL when the message carries no address */
+    const hl_host_iovec *buffers;
+    uint32_t buffer_count;
+    uint32_t reserved;
+    uint8_t *control;
+    uint32_t control_size;
+    uint32_t flags;
+} hl_host_network_message;
+
+/*
+ * Sockets, as objects rather than as descriptor numbers.
+ *
+ * Nothing in this group takes or returns a native descriptor, an address family number, an option
+ * level, or a host flag word. Every one of those is a place where two hosts assign the same number
+ * to different meanings, and the group is shaped so that a mistranslation cannot be written down
+ * rather than so that it is merely avoided; see hl_host_socket_option for the case that forces it.
+ *
+ * Byte order is the provider's job throughout: hl_host_network_address.port is host order on both
+ * sides of the seam.
+ *
+ * Blocking is the provider's job too. A socket whose HL_HOST_SOCKET_NONBLOCK flag is clear blocks
+ * until the operation makes progress; one whose flag is set returns HL_STATUS_WOULD_BLOCK instead.
+ * A host with no way to ask a socket which mode it is in keeps the flag itself -- the flag lives in
+ * the open socket description, which is why set_status_flags names a socket and not a descriptor,
+ * and why a duplicate observes what its origin was set to.
+ */
 typedef struct hl_host_network_services {
     HL_ABI_HEADER;
     hl_host_result (*socket)(void *context, uint32_t family, uint32_t type, uint32_t protocol);
     hl_host_result (*bind)(void *context, hl_host_handle socket, const hl_host_network_address *address);
+    /*
+     * A connect on a non-blocking socket that has not completed reports HL_STATUS_WOULD_BLOCK with
+     * detail HL_HOST_NETWORK_CONDITION_CONNECT_IN_PROGRESS, and a second connect while that one is
+     * outstanding reports _CONNECT_PENDING. Those are three distinct answers a caller acts on
+     * differently, which is why the condition detail exists at all.
+     */
     hl_host_result (*connect)(void *context, hl_host_handle socket, const hl_host_network_address *address);
+    /* flags is a HL_HOST_MSG_* set, never a host flag word. value is the byte count transferred. */
     hl_host_result (*send)(void *context, hl_host_handle socket, hl_host_const_bytes data, uint32_t flags);
+    /* value is the byte count; a value of zero on a stream socket is an orderly peer shutdown. */
     hl_host_result (*receive)(void *context, hl_host_handle socket, hl_host_bytes data, uint32_t flags);
     hl_host_result (*close)(void *context, hl_host_handle socket);
+    /* --- appended at HL_HOST_NETWORK_ABI 2 --- */
+    hl_host_result (*listen)(void *context, hl_host_handle socket, uint32_t backlog);
+    /*
+     * value is a new, independently closeable socket handle. peer may be NULL; when it is not, it
+     * is filled in even for a peer with no name, in which case family is LOCAL and size is zero.
+     * flags is a HL_HOST_SOCKET_* set applied to the accepted socket, not to the listener.
+     */
+    hl_host_result (*accept)(void *context, hl_host_handle socket, hl_host_network_address *peer, uint32_t flags);
+    /*
+     * A connected pair with no name, both ends ours. This is a callback of its own and not a
+     * composition of socket/bind/listen/connect/accept because both ends being private is what
+     * makes it legal for a provider to frame the wire -- a host with no local datagram socket can
+     * reproduce message boundaries over a local stream, and no third party can ever observe the
+     * framing. A pair built out of the public operations could later be handed outside, so the same
+     * technique there would be a wire-format change nobody agreed to.
+     */
+    hl_host_result (*pair)(void *context, uint32_t family, uint32_t type, uint32_t protocol, hl_host_handle ends[2]);
+    /* direction is one of HL_HOST_SHUTDOWN_*. */
+    hl_host_result (*shutdown)(void *context, hl_host_handle socket, uint32_t direction);
+    hl_host_result (*local_address)(void *context, hl_host_handle socket, hl_host_network_address *address);
+    hl_host_result (*peer_address)(void *context, hl_host_handle socket, hl_host_network_address *address);
+    /*
+     * option is an hl_host_socket_option and value carries exactly the width that option is
+     * defined to carry. An option this host cannot honour is HL_STATUS_NOT_SUPPORTED with nothing
+     * changed -- never a silent success, because an option that reports success without taking
+     * effect is read back by nobody and changes behaviour the caller then assumes.
+     */
+    hl_host_result (*get_option)(void *context, hl_host_handle socket, uint32_t option, hl_host_bytes value);
+    hl_host_result (*set_option)(void *context, hl_host_handle socket, uint32_t option, hl_host_const_bytes value);
+    hl_host_result (*send_message)(void *context, hl_host_handle socket, const hl_host_network_message *message,
+                                   uint32_t flags);
+    hl_host_result (*receive_message)(void *context, hl_host_handle socket, hl_host_network_message *message,
+                                      uint32_t flags);
+    /*
+     * Non-blocking, non-consuming; value is a HL_HOST_READY_* mask and detail is the number of bytes
+     * that can be read without blocking, or zero from a host that cannot say.
+     *
+     * The byte count rides here rather than in an operation of its own because it is the same
+     * question readiness already asks, only finer, and every host answers both from one place. A
+     * guest asking "how much is queued" is common enough that synthesising an answer from a mask
+     * would be a lie with a number on it.
+     */
+    hl_host_result (*readiness)(void *context, hl_host_handle socket, uint32_t interests);
+    /*
+     * Whether this socket has a waitable form the event group will accept, so a caller can choose
+     * between blocking in a pollset and re-deriving readiness on a timer. value is non-zero when
+     * event.control may be handed this socket and will produce real wakeups for it;
+     * HL_STATUS_NOT_SUPPORTED when the host has no waitable form and the caller must poll.
+     *
+     * It answers a question rather than handing over an object because the only currency that
+     * crosses this seam is an hl_host_handle, and the socket already is one -- a host's native
+     * waitable object is exactly the kind of thing this contract exists to keep on one side.
+     * Readiness is re-derived through readiness() after every wake in either case, so a host is
+     * free to make its wakeups edge-triggered and approximate.
+     */
+    hl_host_result (*wait_handle)(void *context, hl_host_handle socket);
+    hl_host_result (*set_status_flags)(void *context, hl_host_handle socket, uint32_t flags);
+    /* Aliases the same socket and the same open socket description, as dup(2) does. */
+    hl_host_result (*duplicate)(void *context, hl_host_handle socket);
 } hl_host_network_services;
 
 typedef struct hl_host_shared_memory_services {
@@ -584,6 +993,18 @@ typedef struct hl_host_directory_services {
     hl_host_result (*close)(void *context, hl_host_handle instance);
 } hl_host_directory_services;
 
+/*
+ * Which population of processes can see a parking spot.
+ *
+ * PRIVATE spots are visible only inside the calling process and may be identified by a plain
+ * virtual address. SHARED spots must be reachable from a process that has never seen the waiter's
+ * address, so the caller supplies a key it has already canonicalised across processes as well as
+ * its own mapping of the word. A host is free to use either -- one whose primitive is keyed on
+ * physical page identity ignores the key, one whose primitive is a named kernel object ignores
+ * the address -- so a caller must supply both consistently rather than choosing.
+ */
+enum { HL_HOST_PARK_PRIVATE = 0, HL_HOST_PARK_SHARED = 1 };
+
 /* Opaque, non-recursive host mutexes. Callers must pair lock/unlock and exclude close while in use. */
 typedef struct hl_host_sync_services {
     HL_ABI_HEADER;
@@ -594,6 +1015,62 @@ typedef struct hl_host_sync_services {
     hl_host_result (*fork_prepare)(void *context);
     hl_host_result (*fork_parent)(void *context);
     hl_host_result (*fork_child)(void *context);
+    /* --- appended in HL_HOST_SYNC_ABI 3 --- */
+    /*
+     * Compare-and-block on a word, the one primitive the contract had no form of at all. A guest
+     * futex, a process-shared mutex, a semaphore and a thread join are all this operation plus
+     * bookkeeping the guest layer already owns; without it each one is a busy loop or a lie.
+     *
+     * waiter names the blocking thread in the CALLER's own numbering. It is deliberately not a
+     * native thread id: no other operation in this contract hands out or accepts one, the caller
+     * already has a thread table, and a provider only needs the identity to be stable and unique
+     * among live waiters. A waiter identity may be reused once its previous owner is gone.
+     *
+     * The compare and the enqueue must be one indivisible step, which is why expected and
+     * compare_size are here and not left to the caller: a caller that tests the word itself and
+     * then asks to sleep has already lost the wake that landed in between. compare_size is 4 or
+     * 8; a host whose primitive cannot compare that width answers HL_STATUS_NOT_SUPPORTED rather
+     * than comparing a different one.
+     *
+     * deadline_ns is an absolute host monotonic timestamp; HL_HOST_DEADLINE_INFINITE blocks
+     * without one and zero polls.
+     *
+     * Spurious wakes are permitted: HL_STATUS_OK means only "re-read the word". That is the
+     * futex contract, and it is what lets a host wake at queue or bucket granularity instead of
+     * pretending to an exactness its primitive does not have.
+     *
+     *   HL_STATUS_OK             woken, or spuriously woken -- re-check and decide
+     *   HL_STATUS_WOULD_BLOCK    the word already differed; nothing was enqueued
+     *   HL_STATUS_TIMED_OUT      deadline reached
+     *   HL_STATUS_INTERRUPTED    interrupt_park named this waiter
+     *   HL_STATUS_NOT_SUPPORTED  this scope or width has no host primitive
+     */
+    hl_host_result (*park)(void *context, uint64_t waiter, uint32_t scope, uint64_t key, const void *address,
+                           uint64_t expected, uint32_t compare_size, uint64_t deadline_ns);
+    /*
+     * Release at most count waiters on (scope, key, address); UINT32_MAX releases all of them.
+     * value is the number the host can prove it released, which may be fewer than it actually
+     * woke -- a host waking a whole queue reports what it knows and leaves exact selection to the
+     * caller's own bookkeeping. The word is NOT read: releasing a waiter whose word is unchanged
+     * is legal and is what makes interruption expressible at all.
+     */
+    hl_host_result (*unpark)(void *context, uint32_t scope, uint64_t key, const void *address, uint32_t count);
+    /*
+     * Make one waiter's park return HL_STATUS_INTERRUPTED, so a guest signal can be delivered to
+     * a thread blocked in a wait. This is why park exists in this contract rather than being left
+     * to whatever the guest layer could build over a mutex: EINTR on a wait is load-bearing for
+     * signal delivery, and a wait primitive that cannot be interrupted cannot carry it.
+     *
+     * The interruption is recorded against the waiter, not against an outstanding wait, so the
+     * signal that arrives just before the thread parks is not lost: the next park consumes the
+     * record and returns HL_STATUS_INTERRUPTED without blocking. It is consumed by exactly one
+     * park -- a repeated call before that park still interrupts once.
+     *
+     * Idempotent, safe to call whether or not the waiter is parked or has ever parked, and usable
+     * from a signal-delivery context: providers must not allocate, take a lock that ordinary code
+     * can hold, or log.
+     */
+    hl_host_result (*interrupt_park)(void *context, uint64_t waiter);
 } hl_host_sync_services;
 
 enum {
@@ -649,6 +1126,80 @@ typedef struct hl_host_stream_services {
                            uint64_t destination_offset, uint64_t size, uint32_t flags);
 } hl_host_stream_services;
 
+/*
+ * What the host device itself is doing to the byte stream. Abstract capabilities, not a native
+ * mode word: a host is asked which of these it is applying and told which to apply, and nothing
+ * about the guest's terminal vocabulary crosses the seam.
+ */
+enum {
+    /* Input bytes arrive as the device produced them: no host line editing or buffering. */
+    HL_HOST_TERMINAL_RAW_INPUT = 1u << 0,
+    /* The host echoes input bytes to the display. */
+    HL_HOST_TERMINAL_ECHO = 1u << 1,
+    /* The host turns interrupt/quit/suspend keys into an out-of-band event of its own instead of
+     * delivering them as bytes. Clearing this is what makes those keys readable. */
+    HL_HOST_TERMINAL_SIGNALS = 1u << 2,
+    /* The host consumes start/stop flow-control bytes rather than delivering them. */
+    HL_HOST_TERMINAL_FLOW_CONTROL = 1u << 3,
+    /* The host rewrites outbound bytes (line endings, escape handling). */
+    HL_HOST_TERMINAL_OUTPUT_PROCESSING = 1u << 4
+};
+
+typedef struct hl_host_terminal_size {
+    uint32_t columns;
+    uint32_t rows;
+    uint32_t pixel_width;
+    uint32_t pixel_height;
+} hl_host_terminal_size;
+
+/*
+ * Facts about a terminal device, and nothing about Linux.
+ *
+ * This group exists because file.metadata provably cannot answer "is this a terminal": a host
+ * whose null device reports the same character-device type as its console makes the file type a
+ * necessary and not a sufficient test, so a guest isatty answered from metadata alone would say
+ * yes to /dev/null. probe is the discriminator, and it is the reason this is a group rather than
+ * a field.
+ *
+ * The split is deliberate and is the whole design. The host owns facts about the DEVICE: whether
+ * it is one, the bytes it produces and accepts, which processing it is applying, its size, and
+ * when that size changes. The guest layer owns everything about LINUX: the terminal attribute
+ * structure and its control characters, canonical-mode buffering and line editing, echo policy,
+ * signal generation, minimum-and-timeout reads, output post-processing. Putting a generic
+ * device-control call in this contract instead would push Linux request numbers and structure
+ * layouts into every host, which is precisely what every other group here is typed to avoid.
+ *
+ * Handles are the same opaque file handles the file group produces.
+ */
+typedef struct hl_host_terminal_services {
+    HL_ABI_HEADER;
+    /* value is non-zero when the handle names an interactive terminal. */
+    hl_host_result (*probe)(void *context, hl_host_handle handle);
+    hl_host_result (*get_mode)(void *context, hl_host_handle handle, uint32_t *mode);
+    /* Apply exactly the named HL_HOST_TERMINAL_* set. A host that cannot express one of them
+     * refuses rather than applying a near miss: leaving echo on when it was asked to be off is a
+     * disclosure, not a cosmetic difference. */
+    hl_host_result (*set_mode)(void *context, hl_host_handle handle, uint32_t mode);
+    hl_host_result (*get_size)(void *context, hl_host_handle handle, hl_host_terminal_size *size);
+    hl_host_result (*set_size)(void *context, hl_host_handle handle, const hl_host_terminal_size *size);
+    /* Raw bytes to and from the device. value is the count transferred. read must not block on
+     * device activity that yields no bytes -- a size change is such activity on at least one host,
+     * where the input object is signalled and a blocking read of it then never returns. */
+    hl_host_result (*read)(void *context, hl_host_handle handle, hl_host_bytes output);
+    hl_host_result (*write)(void *context, hl_host_handle handle, hl_host_const_bytes input);
+    /*
+     * A borrowed, independently closeable object that becomes ready when the size changes, for a
+     * caller that must learn about a resize without reading. This is an operation rather than a
+     * size query alone because on a host where the resize is delivered in the input stream, the
+     * obvious composition -- wait for input, then read it -- deadlocks: the wait is satisfied by
+     * the resize and the read then blocks for a keystroke that never comes.
+     *
+     * A host that delivers resizes by some other means it does not own -- a process-directed
+     * signal, say -- answers HL_STATUS_NOT_SUPPORTED, and its caller uses that other means.
+     */
+    hl_host_result (*size_change_event)(void *context, hl_host_handle handle);
+} hl_host_terminal_services;
+
 /* Optional POSIX-host adapter for native ancillary descriptor transport. A borrow aliases the same
  * open-file description, is CLOEXEC, and must be released on every path. */
 typedef struct hl_host_posix_attachment_services {
@@ -677,6 +1228,7 @@ typedef struct hl_host_services {
     const hl_host_watch_services *watch;
     const hl_host_stream_services *stream;
     const hl_host_posix_attachment_services *posix_attachment;
+    const hl_host_terminal_services *terminal;
 } hl_host_services;
 
 HL_API hl_status hl_host_services_validate(const hl_host_services *services, uint64_t required_capabilities);

@@ -8,6 +8,11 @@ use std::{
     time::Duration,
 };
 
+#[path = "support/engine_env.rs"]
+mod engine_env;
+#[path = "support/host.rs"]
+mod host;
+
 fn rootfs() -> &'static PathBuf {
     static ROOTFS: OnceLock<PathBuf> = OnceLock::new();
     ROOTFS.get_or_init(|| {
@@ -28,14 +33,6 @@ fn rootfs() -> &'static PathBuf {
     })
 }
 
-fn open_files() -> usize {
-    #[cfg(target_os = "linux")]
-    let directory = "/proc/self/fd";
-    #[cfg(target_os = "macos")]
-    let directory = "/dev/fd";
-    fs::read_dir(directory).unwrap().count()
-}
-
 fn terminal_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock()
@@ -44,6 +41,9 @@ fn terminal_lock() -> std::sync::MutexGuard<'static, ()> {
 
 #[test]
 fn typed_terminal_preserves_explicit_environment() {
+    if engine_env::skip_without_rootfs("typed_terminal_preserves_explicit_environment") {
+        return;
+    }
     let _terminal_lock = terminal_lock();
     let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/sh");
     spec.process
@@ -68,8 +68,11 @@ fn typed_terminal_preserves_explicit_environment() {
 
 #[test]
 fn terminal_is_controlling_merged_resizable_and_reaped() {
+    if engine_env::skip_without_rootfs("terminal_is_controlling_merged_resizable_and_reaped") {
+        return;
+    }
     let _terminal_lock = terminal_lock();
-    let files = open_files();
+    let files = host::open_handles();
     let initial = Size::new(24, 80).unwrap();
     let mut child = Engine::new()
         .command(Guest::Aarch64, "/bin/sh")
@@ -118,14 +121,17 @@ fn terminal_is_controlling_merged_resizable_and_reaped() {
     assert!(text.contains("LINE=hello"), "{text}");
     drop(terminal);
     assert_eq!(
-        open_files(),
+        host::open_handles(),
         files,
-        "terminal launch leaked a host descriptor"
+        "terminal launch leaked a host descriptor or handle"
     );
 }
 
 #[test]
 fn interactive_terminal_echoes_before_newline() {
+    if engine_env::skip_without_rootfs("interactive_terminal_echoes_before_newline") {
+        return;
+    }
     let _terminal_lock = terminal_lock();
     let mut child = Engine::new()
         .command(Guest::Aarch64, "/bin/sh")
@@ -208,6 +214,9 @@ exec sh -c '
     printf "EXEC TERM=%s TTY=%s REOPEN=%s\n" "$TERM" "$t" "$r"
 '
 "#;
+    if engine_env::skip_without_rootfs("terminal_identity_and_environment_survive_fork_and_exec") {
+        return;
+    }
     let _terminal_lock = terminal_lock();
     let mut child = Engine::new()
         .command(Guest::Aarch64, "/bin/sh")

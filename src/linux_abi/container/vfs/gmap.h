@@ -30,6 +30,8 @@ uint64_t hl_gmap_find_length(uint64_t address);
 uint64_t hl_gmap_find_guest_length(uint64_t address);
 int hl_gmap_contains(uint64_t address, uint64_t length);
 void hl_gmap_unmap_range(uint64_t start, uint64_t end);
+/* Split the registry around a MAP_FIXED that replaced the range, without releasing any host mapping. */
+void hl_gmap_supersede_range(uint64_t start, uint64_t end);
 void hl_gmap_reset(void);
 
 /* Loader allocations have opaque host ownership independent of guest VMA splits. */

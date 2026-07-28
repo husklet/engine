@@ -193,7 +193,7 @@ impl SinkServer {
     }
 
     /// Serves one engine process until it closes its channel.
-    fn serve(self: &Arc<Self>, channel: &mut std::os::unix::net::UnixStream, id: u64) {
+    fn serve(self: &Arc<Self>, channel: &mut crate::sys::Stream, id: u64) {
         loop {
             let mut header = [0_u8; REQUEST_BYTES];
             match channel.read_exact(&mut header) {

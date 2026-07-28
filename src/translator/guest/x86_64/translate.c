@@ -1,6 +1,7 @@
 // translator/guest/x86_64 -- the x86-64 -> arm64 translator (flag synthesis, SSE/x87 lowering, the
 // big translate_block) + host entry trampolines.
 
+#include "../../../host/host_cpu.h" // HL_HOST_CPU_*: the host entry trampolines at the end are AArch64-only
 #include "lower/primitives.h"
 #include "lower/alu.h"
 #include "lower/crypto.h"
@@ -320,6 +321,24 @@ static void g_ldr_d_ea(int t, struct insn *I, uint64_t next) {
     emit_ea(I, next);
     if (emit_soft_memory_active()) emit_memory_guard(17, 8, next - (uint64_t)I->len, X86_SOFT_READ);
     g_ldr_d(t, 17);
+}
+
+// Integer-SIMD r/m operand at the width the prefix selects. MMX is 8 bytes: a 128-bit load here reads 8
+// bytes the guest never addressed and #PFs when the operand ends a mapped page. LDR D zero-extends, which
+// is the invariant the lane-local arms below rely on.
+static void g_ldr_vec_ea(int t, struct insn *I, uint64_t next, int mmx) {
+    if (mmx)
+        g_ldr_d_ea(t, I, next);
+    else
+        g_ldr_q_ea(t, I, next);
+}
+
+// The opcodes with BOTH a 64-bit MMX (no prefix) and a 128-bit SSE2 (66) form -- interp.c's integer_simd
+// set, kept in sync with it. 0x77 (emms) and 0xE6/0xD6 (prefix-only) are deliberately outside.
+static int sse_mmx_capable(int op) {
+    return (op >= 0x60 && op <= 0x76) || op == 0x7E || op == 0x7F || op == 0xC4 || op == 0xC5 ||
+           (op >= 0xD1 && op <= 0xD5) || (op >= 0xD7 && op <= 0xE5) || (op >= 0xE7 && op <= 0xEF) ||
+           (op >= 0xF1 && op <= 0xFE);
 }
 
 static void g_str_d_ea(int t, struct insn *I, uint64_t next) {
@@ -1236,6 +1255,9 @@ static void emit_nan_input_gate(int vd, int s, int dbl, uint64_t gpc) {
 // Result is left in `acc`. Generated-NaN sign fixup (0*inf, inf-inf: x86 yields the negative QNaN
 // indefinite, ARM the positive default NaN -- same payload, opposite sign) is applied over the THREE
 // inputs exactly like the SSE emit_dnan_pre/post, keyed on "result is NaN AND no input was NaN".
+// A NaN INPUT never reaches here: the caller's gate exits to R_AVX first, and avx.c's fma_x86_f32/f64
+// owns the operand-selection rule, which no FMLA sequence reproduces (ARM is SNaN-first-then-addend,
+// x86 is first-NaN-in-a*b+c-order). So the "no input was NaN" arm of the fixup is the only live one.
 // rA/rB are the multiplicands, rC the addend (all distinct host vregs); acc/mt1/mt2 are scratch vregs
 // distinct from the sources. dbl: 1 -> .2d (pd), 0 -> .4s (ps).
 static void emit_fma_group(int rA, int rB, int rC, int acc, int mt1, int mt2, int neg, int fmls, int dbl) {
@@ -1315,6 +1337,14 @@ static void emit_guest_signal(uint64_t rip, int lsig, int code) {
 // loaded MXCSR back so a guest that CLEARS the sticky flags (feclearexcept) actually clears the host FPSR.
 static const int g_mxcsr_fpsr_bit[6] = {0, 7, 1, 2, 3, 4};
 
+// DE(1) cannot be taken at face value. ARM raises IDC ONLY when FPCR.FZ flushed a denormal input, i.e.
+// exactly in the mode where x86 must NOT report #D -- FZ carries the guest's DAZ, which zeroes the source
+// before the operation. Measured: with DAZ set no SSE op raises #D, against 105 of 192 probe lines that
+// were spuriously #D here. It also keeps the word self-consistent: stmxcsr reports DAZ from this same bit.
+// Costs, both accepted: a lone FTZ sets FZ too and x86 DOES raise #D there, but a lone FTZ already flushes
+// INPUTS on this host so those results are wrong regardless; and a guest that loads DE=1 under FZ cannot
+// read it back, the sticky flags living only in FPSR. The converse gap -- #D with DAZ clear, which ARM
+// cannot report at all -- is left open on cost; see tests/compat/completeness/x86_64/denorm_flags.c.
 static void emit_fpsr_to_mxcsr(int dst) { // OR the host FPSR sticky flags into `dst` at MXCSR bits 0..5
     emit32(0xD53B4420u | 22);             // mrs x22, fpsr
     e_movconst(21, 0);                    // accumulator
@@ -1324,6 +1354,10 @@ static void emit_fpsr_to_mxcsr(int dst) { // OR the host FPSR sticky flags into 
         e_rrr(A_AND, 20, 20, 19, 0, 0);
         e_rrr(A_ORR, 21, 21, 20, 0, i); // x21 |= bit << i
     }
+    emit32(0xD53B4400u | 22);       // mrs x22, fpcr
+    e_lsr_i(22, 22, 24, 0);         // x22 = FPCR>>24 (FZ -> bit0)
+    e_rrr(A_AND, 22, 22, 19, 0, 0); // x19 is still 1
+    e_rrr(A_BIC, 21, 21, 22, 0, 1); // FZ (== reported DAZ) -> drop DE
     e_rrr(A_ORR, dst, dst, 21, 0, 0);
 }
 
@@ -1413,19 +1447,30 @@ static void emit_stmxcsr(struct insn *I, uint64_t next) {
 // FPCR.RMode from the x87 RC (same two-bit swap as ldmxcsr), FRINTI, then restore FPCR so SSE rounding is
 // untouched. Scratch x20/x21/x22/x23; x19 (the store EA at every caller) is left intact.
 static void emit_x87_round_st0(void) {
-    e_ldr(20, 28, OFF_FPCW);                                          // w20 = cpu->fpcw
-    emit32(0x53000000u | (10u << 16) | (11u << 10) | (20 << 5) | 20); // ubfx w20,w20,#10,#2 -> RC (0..3)
-    e_movconst(21, 1);
-    e_rrr(A_AND, 22, 20, 21, 0, 0);       // w22 = RC & 1
-    e_lsr_i(21, 20, 1, 0);                // w21 = RC >> 1
-    e_rrr(A_ORR, 22, 21, 22, 0, 1);       // w22 = (RC>>1) | (RC&1)<<1 = ARM RMode (x87 RC bits swapped)
-    emit32(0xD53B4400u | 23);             // mrs x23, fpcr  (save the live -- SSE -- rounding mode)
-    e_movconst(21, 3u << 22);             // RMode mask
-    e_rrr(A_BIC, 20, 23, 21, 1, 0);       // x20 = fpcr & ~RMode
-    e_rrr(A_ORR, 20, 20, 22, 1, 22);      // x20 = | (ARM RMode << 22)
-    emit32(0xD51B4400u | 20);             // msr fpcr, x20  (x87 rounding mode)
+    hl_x86_emit_vector_copy(19, 16); // the unrounded value, for C1
+    hl_x86_x87_rc_enter();
     emit32(0x1E67C000u | (16 << 5) | 16); // frinti d16, d16 (round to integral per FPCR.RMode)
-    emit32(0xD51B4400u | 23);             // msr fpcr, x23  (restore SSE rounding mode)
+    hl_x86_x87_rc_leave();
+    hl_x86_x87_rounded_up(16, 19); // C1 = the magnitude grew
+}
+
+// A masked #IS on an integer store delivers the INTEGER indefinite of the destination width, and the form
+// still pops. x22 carries hl_x86_x87_live()'s verdict; `value` holds the normally-converted result.
+static void emit_x87_integer_indefinite(int value, int bytes) {
+    e_movconst(17, bytes == 2 ? UINT64_C(0x8000) : bytes == 4 ? UINT64_C(0x80000000) : (UINT64_C(1) << 63));
+    e_subi_s(31, 22, 0, 1);
+    e_csel(value, value, 17, 0 /*EQ: live*/, 1);
+}
+
+// FNSTENV/FLDENV m28, FNSAVE/FRSTOR m108 -> hl_x86_x87_environment(). All four rewrite the tag word, three
+// rewrite TOP and two convert eight ext80 registers; doing that inline would be two hundred instructions for
+// four instructions that appear once per setjmp-shaped guest. x19 = the translated host EA. Ends the block.
+static void emit_x87_environment(int selector, uint64_t next) {
+    hl_x86_x87_drop(); // the helper owns cpu->fptop from here
+    e_str(19, 28, OFF_X87EA);
+    e_movconst(16, (uint64_t)selector);
+    e_str(16, 28, OFF_DIVOP);
+    emit_exit_const(next, R_X87ENV);
 }
 
 // A JIT guest unmapped / remapped an executable VA range: any block translations we cached for guest PCs in
@@ -1785,13 +1830,17 @@ static void emit_vcmp_lane(int out, int a, int b, int p, int dbl) {
 // overflow. -ovf already lands on INT_MIN==0x80000000 (matches), so only NaN and +ovf (f>=2^31) need
 // fixing. Compute the NEON result, then blend 0x80000000 into every lane where (f>=2^31 OR f is NaN).
 // `trunc`=1 truncates (FCVTZS direct); trunc=0 rounds under the current FPCR.RMode (== guest MXCSR.RC,
-// threaded by ldmxcsr) via FRINTI, then FCVTZS the now-integral value.
+// threaded by ldmxcsr) via FRINTX, then FCVTZS the now-integral value.
 //   c2p31 = 2^31 as f32 (0x4F000000) broadcast; cindef = 0x80000000 broadcast; t1,t2 scratch.
+// FRINTX, not FRINTI: x86 raises #P for an inexact conversion and only the X form reports Inexact. The
+// FRINTX trap that bites the f64 path (it also reports #P for an out-of-range inexact source, where x86
+// raises #I alone) CANNOT arise at this width -- every f32 at or above 2^31 is already an integer, and no
+// f32 below 2^31 can round up to it -- so here the X form is exactly x86 and needs no suppression.
 static void emit_ps2dq_128(int out, int sf, int trunc, int c2p31, int cindef, int t1, int t2) {
     if (trunc) {
         emit32(0x4EA1B800u | (sf << 5) | out); // FCVTZS.4s out, sf   (round toward zero)
     } else {
-        emit32(0x6EA19800u | (sf << 5) | out);  // FRINTI.4s out, sf  (round to integral, current mode)
+        emit32(0x6E219800u | (sf << 5) | out);  // FRINTX.4s out, sf  (round to integral, current mode)
         emit32(0x4EA1B800u | (out << 5) | out); // FCVTZS.4s out, out (integral value -> exact)
     }
     emit32(0x6E20E400u | (c2p31 << 16) | (sf << 5) | t1); // FCMGE.4s t1, sf, 2^31   (all-ones where f>=2^31)
@@ -1802,24 +1851,38 @@ static void emit_ps2dq_128(int out, int sf, int trunc, int c2p31, int cindef, in
     e_vmov(out, t1);
 }
 
-// ---- packed float64 (.2d) -> int32, one 128-bit source (2 doubles). Produces r = FCVTZS.2d int64 lanes
-// and m = per-64-bit fixup mask (all-ones where the x86 result must be 0x80000000: f>=2^31 OR f<-2^31 OR
-// NaN). Unlike the ps case BOTH overflow directions need the fixup, because the subsequent int64->int32
-// narrowing (XTN) would otherwise wrap a saturated INT64 bound to garbage. `trunc`=1 truncates, else
-// rounds under current FPCR.RMode. c2p31d/cneg2p31d = +/-2^31 as f64 broadcast; t1 scratch.
-static void emit_pd2i32_pieces(int r, int m, int sd, int trunc, int c2p31d, int cneg2p31d, int t1) {
-    if (trunc) {
-        emit32(0x4EE1B800u | (sd << 5) | r); // FCVTZS.2d r, sd
-    } else {
-        emit32(0x6EE19800u | (sd << 5) | r); // FRINTI.2d r, sd
-        emit32(0x4EE1B800u | (r << 5) | r);  // FCVTZS.2d r, r
-    }
-    emit32(0x6E60E400u | (c2p31d << 16) | (sd << 5) | m);     // FCMGE.2d m, sd, 2^31       (f>=2^31)
-    emit32(0x6EE0E400u | (sd << 16) | (cneg2p31d << 5) | t1); // FCMGT.2d t1, -2^31, sd     (-2^31 > f)
-    e_v3(0x4EA01C00u, m, m, t1);                              // ORR m |= (f < -2^31)
-    emit32(0x4E60E400u | (sd << 16) | (sd << 5) | t1);        // FCMEQ.2d t1, sd, sd        (NOT NaN)
-    emit32(0x6E205800u | (t1 << 5) | t1);                     // MVN t1                     (NaN)
-    e_v3(0x4EA01C00u, m, m, t1);                              // ORR m |= NaN
+// ---- packed float64 (.2d) -> int32, one 128-bit source (2 doubles). Produces r = int64 lanes and m =
+// per-64-bit fixup mask (all-ones where the x86 result must be 0x80000000). `trunc`=1 truncates, else
+// rounds under current FPCR.RMode. c2p31d/cneg2p31d = +/-2^31 as f64 broadcast; t1,t2 scratch.
+//
+// f64 -> int32 is the ONE width pair with out-of-range NON-integers (every f32 above 2^31, and every f64
+// above 2^63, is already integral), so it is the only place where x86's three flag rules can be told
+// apart, and all three were wrong here. Measured on Zen 4 across the four RC modes:
+//   * #I when the ROUNDED value leaves int32 -- so the mask must come from the rounded value, not the
+//     source: 2147483647.5 rounds to 2^31 under RC=near/up and is then out of range. A .2d convert
+//     targets int64 and cannot see that, so two scalar FCVTZS Wd,Dn over the (already integral) lanes
+//     raise it instead -- the same idiom CVT[T]PD2PI uses.
+//   * #P when the value stays in range and the rounding changed it -- so FRINTI, which reports nothing,
+//     under-reports it.
+//   * #P SUPPRESSED when the result is the indefinite, even from an inexact source -- so a bare FRINTX
+//     over-reports it, and the truncating FCVTZS.2d does too (it is an in-int64-range inexact convert).
+// Hence: round exception-free (FRINTZ/FRINTI), build the mask from the rounded value, take #I from the
+// scalar pair, and take #P from an FRINTX over the source with the out-of-range lanes replaced by +0.0
+// (exact, and it reports nothing). The result path itself is then flag-free.
+static void emit_pd2i32_pieces(int r, int m, int sd, int trunc, int c2p31d, int cneg2p31d, int t1, int t2) {
+    emit32((trunc ? 0x4EE19800u : 0x6EE19800u) | (sd << 5) | t2); // FRINTZ/FRINTI.2d t2, sd (no exception)
+    emit32(0x6E60E400u | (c2p31d << 16) | (t2 << 5) | m);         // FCMGE.2d m, t2, 2^31    (rounded >= 2^31)
+    emit32(0x6EE0E400u | (t2 << 16) | (cneg2p31d << 5) | t1);     // FCMGT.2d t1, -2^31, t2  (-2^31 > rounded)
+    e_v3(0x4EA01C00u, m, m, t1);                                  // ORR m |= (rounded < -2^31)
+    emit32(0x4E60E400u | (t2 << 16) | (t2 << 5) | t1);            // FCMEQ.2d t1, t2, t2     (NOT NaN)
+    emit32(0x6E205800u | (t1 << 5) | t1);                         // MVN t1                  (NaN)
+    e_v3(0x4EA01C00u, m, m, t1);                                  // ORR m |= NaN
+    emit32(0x1E780000u | (t2 << 5) | 16);                         // FCVTZS w16, d(t2)  lane 0 -> #I only
+    emit32(0x5E180400u | (t2 << 5) | t1);                         // DUP    d(t1), t2.d[1]
+    emit32(0x1E780000u | (t1 << 5) | 16);                         // FCVTZS w16, d(t1)  lane 1 -> #I only
+    e_v3(0x4E601C00u, t1, sd, m);                                 // BIC t1 = sd & ~m   (out-of-range -> +0.0)
+    emit32(0x6E619800u | (t1 << 5) | t1);                         // FRINTX.2d t1, t1   -> #P only
+    emit32(0x4EE1B800u | (t2 << 5) | r);                          // FCVTZS.2d r, t2    (integral -> exact)
 }
 
 // Returns 1 if the VEX insn was lowered inline (caller does gpc = next; continue), else 0 (fall through
@@ -2721,13 +2784,13 @@ static int avx_lower(struct insn *I, uint64_t next) {
             emit32(0x4E040C00u | (16 << 5) | 27); // v27.4s = 0x80000000
             // Compute the int64 results + per-64 fixup masks for BOTH halves first (they consume the +/-2^31
             // consts in v25/v26), THEN narrow -- the narrow step reuses v25 for the packed 32-bit mask.
-            emit_pd2i32_pieces(22, 18, src, trunc, 25, 26, 28); // lo: r=v22, mask=v18
+            emit_pd2i32_pieces(22, 18, src, trunc, 25, 26, 28, 21); // lo: r=v22, mask=v18
             if (l256) {
                 if (I->is_mem)
                     g_ldr_q(20, 17, 16);
                 else
-                    avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);         // src.hi
-                emit_pd2i32_pieces(23, 19, 20, trunc, 25, 26, 28); // hi: r=v23, mask=v19
+                    avx_cpu_ldr_q(20, OFF_VHI + 16 * s2r);             // src.hi
+                emit_pd2i32_pieces(23, 19, 20, trunc, 25, 26, 28, 21); // hi: r=v23, mask=v19
             }
             emit32(0x0EA12800u | (22 << 5) | 24); // XTN.2s  v24, v22  (low 2 int32)
             emit32(0x0EA12800u | (18 << 5) | 25); // XTN.2s  v25, v18  (low 2 mask lanes)
@@ -3976,9 +4039,9 @@ static void *translate_block(uint64_t gpc) {
 #define FDd(d, n, m) emit32(0x1E601800u | ((m) << 16) | ((n) << 5) | (d)) /* fdiv d */
 // fucomi/fcomi/fucomip/fcomip set integer EFLAGS exactly like COMISD (ZF/PF/CF, unordered -> all 1), so
 // use the same unordered+PF fixup (this also writes the real PF lane the setp/setnp consumers read).
-#define FCMPd(n, m)                                                                                                    \
+#define FCMPd(n, m, sig)                                                                                               \
     do {                                                                                                               \
-        emit32(0x1E602000u | ((m) << 16) | ((n) << 5));                                                                \
+        emit32(0x1E602000u | ((sig) ? 0x10u : 0u) | ((m) << 16) | ((n) << 5));                                         \
         e_nzcv_save_fcmp();                                                                                            \
     } while (0)
                 if (I.is_mem) {
@@ -3990,13 +4053,13 @@ static void *translate_block(uint64_t gpc) {
                     if (op == 0xD9)
                         x87_bytes = reg == 6 || reg == 4 ? 28 : (reg == 5 || reg == 7 ? 2 : 4);
                     else if (op == 0xDD)
-                        x87_bytes = reg == 7 ? 2 : 8;
+                        x87_bytes = reg == 7 ? 2 : (reg == 4 || reg == 6 ? 108 : 8); // FRSTOR/FNSAVE m108
                     else if (op == 0xDB)
                         x87_bytes = reg == 5 || reg == 7 ? 10 : 4;
                     else if (op == 0xDF)
                         x87_bytes = reg == 5 || reg == 7 ? 8 : 2;
                     int x87_store = (op == 0xD9 && (reg == 2 || reg == 3 || reg == 6 || reg == 7)) ||
-                                    (op == 0xDD && (reg == 2 || reg == 3 || reg == 7)) ||
+                                    (op == 0xDD && (reg == 2 || reg == 3 || reg == 6 || reg == 7)) ||
                                     (op == 0xDB && (reg == 2 || reg == 3 || reg == 7)) ||
                                     (op == 0xDF && (reg == 3 || reg == 7));
                     if (x87_bytes)
@@ -4016,55 +4079,39 @@ static void *translate_block(uint64_t gpc) {
                     if (op == 0xD9) {    // f32 mem
                         if (reg == 0) {
                             g_ldr_s(16, 19);
+                            e_fmov_from_s(20, 16);
+                            hl_x86_x87_denormal(20, 1);
                             emit32(0x1E22C000u | (16 << 5) | 16);
                             hl_x86_x87_push(16);
                         } // fld m32
                         else if (reg == 2 || reg == 3) {
+                            hl_x86_x87_live(0, -1);
                             hl_x86_x87_load(16, 0);
+                            hl_x86_x87_rc_enter(); // the one x87 store that ROUNDS, so the one that needs RC
                             emit32(0x1E624000u | (16 << 5) | 16);
+                            hl_x86_x87_rc_leave();
+                            e_movconst(20, 0xffc00000u); // masked #IS delivers the m32 REAL indefinite
+                            e_fmov_to_s(17, 20);
+                            e_subi_s(31, 22, 0, 1);
+                            emit32(0x1E200C00u | (17 << 16) | (0u << 12) | (16 << 5) | 16); // fcsel s16,s16,s17,eq
                             g_str_s(16, 19);
-                            if (reg == 3) hl_x86_x87_adjust_top(1);
+                            if (reg == 3) hl_x86_x87_pop();
                         } // fst/fstp
                         else if (reg == 5) { // fldcw m16: load the x87 control word (RC/PC/exception masks)
                             emit32(0x79400000u | (19 << 5) | 16); // ldrh w16, [x19]
-                            e_str(16, 28, OFF_FPCW);              // cpu->fpcw = CW (honored by fist rounding)
-                        } else if (reg == 7) {                    // fnstcw m16: store the live x87 control word
+                            e_movconst(17, 0x1f3f);               // FCW is not stored verbatim: bit 6 reads
+                            e_rrr(A_AND, 16, 16, 17, 1, 0);       // back 1, bit 7 and 15:13 as 0 (measured:
+                            e_movconst(17, 0x40);                 // fldcw ffff -> fnstcw 1f7f)
+                            e_rrr(A_ORR, 16, 16, 17, 1, 0);
+                            e_str(16, 28, OFF_FPCW); // cpu->fpcw = CW (honored by fist rounding)
+                        } else if (reg == 7) {       // fnstcw m16: store the live x87 control word
                             e_ldr(16, 28, OFF_FPCW);
                             emit32(0x79000000u | (19 << 5) | 16); // strh w16, [x19]
                         } // fnstcw
-                        else if (reg == 6) {
-                            // FNSTENV m28: store the 28-byte 32-bit protected-mode x87 environment --
-                            // FCW@0, FSW@4 (TOP in bits 11:13), FTW@8, then FIP/FCS/FOO/FOS @12/16/20/24.
-                            // The engine keeps no per-reg tags, so emit the live FCW (cpu->fpcw, mirrors fnstcw)
-                            // and FTW=0xffff (all-empty); the instruction/data pointers are zeroed. OpenBLAS (R
-                            // startup, the only caller) just saves/restores FCW/FSW/FTW.
-                            // x19 = EA. hl_x86_x87_status() materializes cpu->fptop and yields FSW in x16.
-                            e_ldr(16, 28, OFF_FPCW);
-                            emit32(0x79000000u | (0u << 10) | (19 << 5) | 16); // strh FCW, [x19,#0]
-                            hl_x86_x87_status();                               // x16 = FSW | (TOP<<11)
-                            emit32(0x79000000u | (2u << 10) | (19 << 5) | 16); // strh FSW, [x19,#4]
-                            e_movconst(16, 0xffff);
-                            emit32(0x79000000u | (4u << 10) | (19 << 5) | 16); // strh FTW, [x19,#8]
-                            emit32(0xB9000000u | (3u << 10) | (19 << 5) | 31); // str  wzr, [x19,#12] FIP
-                            emit32(0xB9000000u | (4u << 10) | (19 << 5) | 31); // str  wzr, [x19,#16] FCS
-                            emit32(0xB9000000u | (5u << 10) | (19 << 5) | 31); // str  wzr, [x19,#20] FOO
-                            emit32(0xB9000000u | (6u << 10) | (19 << 5) | 31); // str  wzr, [x19,#24] FOS
-                            // FNSTENV then masks all FP exceptions in FCW; the engine's FCW is the fixed
-                            // default 0x037f (exception-mask bits 0-5 already set), so nothing to update.
-                        } // fnstenv m28
-                        else if (reg == 4) {
-                            // FLDENV m28: reload the x87 environment (inverse of FNSTENV). Restore the FCW
-                            // (so a later fist rounds per the reloaded RC) and the FSW condition codes + TOP;
-                            // FTW (no per-reg tags) is ignored. The reloaded TOP is unknown at translate
-                            // time, so leave the static-top model -> runtime-top addressing afterwards.
-                            hl_x86_x87_drop();
-                            emit32(0x79400000u | (0u << 10) | (19 << 5) | 16); // ldrh w16, [x19,#0]  (FCW)
-                            e_str(16, 28, OFF_FPCW);                           // cpu->fpcw = FCW
-                            emit32(0x79400000u | (2u << 10) | (19 << 5) | 16); // ldrh w16, [x19,#4]  (FSW)
-                            e_str(16, 28, OFF_FPSW);                           // cpu->fpsw  = FSW
-                            emit32(0x53000000u | (11u << 16) | (13u << 10) | (16 << 5) | 17); // ubfx w17,w16,#11,#3
-                            e_str(17, 28, OFF_FPTOP);                                         // cpu->fptop = TOP
-                        } // fldenv m28
+                        else if (reg == 4 || reg == 6) {
+                            emit_x87_environment(reg == 6 ? X87ENV_STORE : X87ENV_LOAD, next);
+                            break;
+                        } // fnstenv / fldenv m28
                         else {
                             report_unimpl(gpc, &I);
                             break;
@@ -4072,13 +4119,21 @@ static void *translate_block(uint64_t gpc) {
                     } else if (op == 0xDD) { // f64 mem
                         if (reg == 0) {
                             g_ldr_d(16, 19);
+                            e_fmov_from_d(20, 16);
+                            hl_x86_x87_denormal(20, 0);
                             hl_x86_x87_push(16);
                         } // fld m64
                         else if (reg == 2 || reg == 3) {
+                            hl_x86_x87_live(0, -1);
                             hl_x86_x87_load(16, 0);
+                            hl_x86_x87_indefinite(16);
                             g_str_d(16, 19);
-                            if (reg == 3) hl_x86_x87_adjust_top(1);
+                            if (reg == 3) hl_x86_x87_pop();
                         } // fst/fstp
+                        else if (reg == 4 || reg == 6) {
+                            emit_x87_environment(reg == 6 ? X87ENV_SAVE : X87ENV_RESTORE, next);
+                            break;
+                        } // fnsave / frstor m108
                         else if (reg == 7) {
                             hl_x86_x87_status();
                             emit32(0x79000000u | (19 << 5) | 16);
@@ -4094,11 +4149,13 @@ static void *translate_block(uint64_t gpc) {
                             hl_x86_x87_push(16);
                         } // fild m32
                         else if (reg == 2 || reg == 3) {
+                            hl_x86_x87_live(0, -1);
                             hl_x86_x87_load(16, 0);
                             emit_x87_round_st0();                 // round per x87 control word (default: nearest)
                             emit32(0x1E780000u | (16 << 5) | 16); // FCVTZS w16,d16 (exact: d16 already integral)
+                            emit_x87_integer_indefinite(16, 4);
                             emit32(0xB9000000u | (19 << 5) | 16);
-                            if (reg == 3) hl_x86_x87_adjust_top(1);
+                            if (reg == 3) hl_x86_x87_pop();
                         } // fist/fistp m32
                         else if (reg == 5) {
                             e_str(19, 28, OFF_X87EA);
@@ -4121,11 +4178,13 @@ static void *translate_block(uint64_t gpc) {
                             hl_x86_x87_push(16);
                         } // fild m16 (ldrsh)
                         else if (reg == 3) {
+                            hl_x86_x87_live(0, -1);
                             hl_x86_x87_load(16, 0);
                             emit_x87_round_st0();                 // round per x87 control word (default: nearest)
                             emit32(0x1E780000u | (16 << 5) | 16); // FCVTZS w16,d16 (exact: d16 already integral)
+                            emit_x87_integer_indefinite(16, 2);
                             emit32(0x79000000u | (19 << 5) | 16);
-                            hl_x86_x87_adjust_top(1);
+                            hl_x86_x87_pop();
                         } // fistp m16
                         else if (reg == 5) {
                             e_ldr(16, 19, 0);
@@ -4133,11 +4192,13 @@ static void *translate_block(uint64_t gpc) {
                             hl_x86_x87_push(16);
                         } // fild m64
                         else if (reg == 7) {
+                            hl_x86_x87_live(0, -1);
                             hl_x86_x87_load(16, 0);
                             emit_x87_round_st0();                 // round per x87 control word (default: nearest)
                             emit32(0x9E780000u | (16 << 5) | 16); // FCVTZS x16,d16 (exact: d16 already integral)
+                            emit_x87_integer_indefinite(16, 8);
                             e_str(16, 19, 0);
-                            hl_x86_x87_adjust_top(1);
+                            hl_x86_x87_pop();
                         } // fistp m64
                         else {
                             report_unimpl(gpc, &I);
@@ -4150,6 +4211,8 @@ static void *translate_block(uint64_t gpc) {
                         // fsubr(5)/fdiv(6)/fdivr(7) encoding for all four opcodes).
                         if (op == 0xD8) { // m32 float
                             g_ldr_s(16, 19);
+                            e_fmov_from_s(20, 16);
+                            hl_x86_x87_denormal(20, 1);
                             emit32(0x1E22C000u | (16 << 5) | 16); // fcvt d16, s16
                         } else if (op == 0xDA) {                  // m32 signed integer
                             emit32(0xB9400000u | (19 << 5) | 16); // ldr   w16, [x19]
@@ -4157,16 +4220,25 @@ static void *translate_block(uint64_t gpc) {
                         } else if (op == 0xDE) {                  // m16 signed integer
                             emit32(0x79C00000u | (19 << 5) | 16); // ldrsh w16, [x19]
                             emit32(0x1E620000u | (16 << 5) | 16); // scvtf d16, w16
-                        } else                                    // 0xDC: m64 float
+                        } else {                                  // 0xDC: m64 float
                             g_ldr_d(16, 19);
+                            e_fmov_from_d(20, 16);
+                            hl_x86_x87_denormal(20, 0);
+                        }
+                        hl_x86_x87_live(0, -1);
                         if (reg == 2 || reg == 3) {
                             hl_x86_x87_load(18, 0);
-                            e_fcom_setfpsw(18, 16);
-                            if (reg == 3) hl_x86_x87_adjust_top(1);
+                            hl_x86_x87_indefinite(18); // an empty ST0 compares UNORDERED as well as faulting
+                            hl_x86_x87_indefinite(16);
+                            e_fcom_setfpsw(18, 16, 1);
+                            if (reg == 3) hl_x86_x87_pop();
                             gpc = next;
                             continue;
                         } // fcom/fcomp
                         hl_x86_x87_load(18, 0);
+                        hl_x86_x87_indefinite(18);
+                        hl_x86_x87_indefinite(16);
+                        hl_x86_x87_rc_enter();
                         hl_x86_x87_dnan_pre(18, 16); // x86 indefinite is NEGATIVE; ARM's default NaN is not
                         if (reg == 0)
                             FAd(18, 18, 16);
@@ -4185,6 +4257,8 @@ static void *translate_block(uint64_t gpc) {
                             break;
                         }
                         hl_x86_x87_dnan_post(18);
+                        hl_x86_x87_narrow(18); // FCW.PC, inside the RC scope so it rounds the same way
+                        hl_x86_x87_rc_leave();
                         hl_x86_x87_store(18, 0);
                     }
                     gpc = next;
@@ -4193,23 +4267,33 @@ static void *translate_block(uint64_t gpc) {
                 // ---- register forms (mod=3) ----
                 if (op == 0xD9) {
                     if (reg == 0) {
-                        hl_x86_x87_load(16, rm);
+                        hl_x86_x87_live(rm, -1); // an empty SOURCE underflows; the PUSHED slot takes the
+                        hl_x86_x87_load(16, rm); // indefinite and the source stays empty
+                        hl_x86_x87_indefinite(16);
                         hl_x86_x87_push(16);
                     } // fld ST(i)
                     else if (reg == 1) {
+                        // FXCH: the exchange happens either way, then ST0 takes the indefinite -- ST(i) keeps
+                        // the old ST0 and is tagged live (measured on `fld1; fxch %st(1)`).
+                        hl_x86_x87_live(0, rm);
                         hl_x86_x87_load(16, 0);
                         hl_x86_x87_load(18, rm);
+                        hl_x86_x87_indefinite(18);
                         hl_x86_x87_store(18, 0);
                         hl_x86_x87_store(16, rm);
                     } // fxch
                     else if (reg == 4 && rm == 0) {
+                        hl_x86_x87_live(0, -1);
                         hl_x86_x87_load(16, 0);
                         emit32(0x1E614000u | (16 << 5) | 16);
+                        hl_x86_x87_indefinite(16);
                         hl_x86_x87_store(16, 0);
                     } // fchs
                     else if (reg == 4 && rm == 1) {
+                        hl_x86_x87_live(0, -1);
                         hl_x86_x87_load(16, 0);
                         emit32(0x1E60C000u | (16 << 5) | 16);
+                        hl_x86_x87_indefinite(16);
                         hl_x86_x87_store(16, 0);
                     } // fabs
                     else if (reg == 5) { // fld const
@@ -4225,14 +4309,20 @@ static void *translate_block(uint64_t gpc) {
                         e_fmov_to_d(16, 16);
                         hl_x86_x87_push(16);
                     } else if (reg == 7 && rm == 2) {
+                        hl_x86_x87_live(0, -1);
                         hl_x86_x87_load(16, 0);
+                        hl_x86_x87_indefinite(16);
+                        hl_x86_x87_rc_enter();
                         hl_x86_x87_dnan_pre(16, 16); // fsqrt(-x): x86 yields the NEGATIVE indefinite
                         emit32(0x1E61C000u | (16 << 5) | 16);
                         hl_x86_x87_dnan_post(16);
+                        hl_x86_x87_narrow(16);
+                        hl_x86_x87_rc_leave();
                         hl_x86_x87_store(16, 0);
                     } // fsqrt
                     else if (reg == 2 && rm == 0) { /* fnop */
                     } else if (reg == 4 && rm == 4) {
+                        hl_x86_x87_live(0, -1);
                         hl_x86_x87_test();
                     } // ftst
                     else if (reg == 4 && rm == 5) {
@@ -4255,10 +4345,12 @@ static void *translate_block(uint64_t gpc) {
                         break;
                     } // fpatan
                     else if (reg == 6 && rm == 4) {
+                        hl_x86_x87_live(0, -1);
                         hl_x86_x87_extract();
                     } // fxtract
                     else if (reg == 6 && rm == 5) {
-                        hl_x86_x87_remainder(1);
+                        hl_x86_x87_function(X87_FPREM1, next);
+                        break;
                     } // fprem1
                     else if (reg == 6 && rm == 6) {
                         hl_x86_x87_adjust_top(-1);
@@ -4267,7 +4359,8 @@ static void *translate_block(uint64_t gpc) {
                         hl_x86_x87_adjust_top(1);
                     } // fincstp
                     else if (reg == 7 && rm == 0) {
-                        hl_x86_x87_remainder(0);
+                        hl_x86_x87_function(X87_FPREM, next);
+                        break;
                     } // fprem
                     else if (reg == 7 && rm == 1) {
                         hl_x86_x87_function(X87_FYL2XP1, next);
@@ -4278,9 +4371,11 @@ static void *translate_block(uint64_t gpc) {
                         break;
                     } // fsincos
                     else if (reg == 7 && rm == 4) {
+                        hl_x86_x87_live(0, -1);
                         hl_x86_x87_round();
                     } // frndint
                     else if (reg == 7 && rm == 5) {
+                        hl_x86_x87_live(0, 1);
                         hl_x86_x87_scale();
                     } // fscale
                     else if (reg == 7 && rm == 6) {
@@ -4296,13 +4391,16 @@ static void *translate_block(uint64_t gpc) {
                         break;
                     }
                 } else if (op == 0xD8 || op == 0xDC || op == 0xDE) { // arith ST0/ST(i) [+pop for DE]
+                    hl_x86_x87_live(0, rm);
                     hl_x86_x87_load(18, 0);
-                    hl_x86_x87_load(16, rm);           // v18=ST0, v16=ST(rm)
+                    hl_x86_x87_load(16, rm); // v18=ST0, v16=ST(rm)
+                    hl_x86_x87_indefinite(18);
+                    hl_x86_x87_indefinite(16);
                     int dst_i = (op == 0xD8) ? 0 : rm; // D8 -> ST0; DC/DE -> ST(i)
                     if (reg == 2 || reg == 3) {
-                        e_fcom_setfpsw(18, 16);
-                        if (op == 0xDE && rm == 1) hl_x86_x87_adjust_top(1);
-                        if (reg == 3) hl_x86_x87_adjust_top(1);
+                        e_fcom_setfpsw(18, 16, 1);
+                        if (op == 0xDE && rm == 1) hl_x86_x87_pop();
+                        if (reg == 3) hl_x86_x87_pop();
                         gpc = next;
                         continue;
                     } // fcom[p]/fcompp
@@ -4311,6 +4409,7 @@ static void *translate_block(uint64_t gpc) {
                         a = 16;
                         b = 18;
                     } // DC/DE: dst=ST(i)=v16, other=ST0=v18
+                    hl_x86_x87_rc_enter();
                     hl_x86_x87_dnan_pre(18, 16); // x86 indefinite is NEGATIVE; ARM's default NaN is not
                     if (reg == 0)
                         FAd(a, a, b);
@@ -4342,24 +4441,29 @@ static void *translate_block(uint64_t gpc) {
                         break;
                     }
                     hl_x86_x87_dnan_post(a);
+                    hl_x86_x87_narrow(a); // FCW.PC, inside the RC scope so it rounds the same way
+                    hl_x86_x87_rc_leave();
+                    hl_x86_x87_indefinite(a);
                     hl_x86_x87_store(a, dst_i);
-                    if (op == 0xDE) hl_x86_x87_adjust_top(1); // pop
+                    if (op == 0xDE) hl_x86_x87_pop();
                 } else if (op == 0xDD) {
-                    if (reg == 0) { /* ffree: no tag tracking -> nop */
-                    } else if (reg == 2) {
+                    if (reg == 0) {
+                        hl_x86_x87_tag(rm, 1); // FFREE: punch a hole no depth model can express
+                    } else if (reg == 2 || reg == 3) {
+                        hl_x86_x87_live(0, -1);
                         hl_x86_x87_load(16, 0);
+                        hl_x86_x87_indefinite(16);
                         hl_x86_x87_store(16, rm);
-                    } // fst ST(i)
-                    else if (reg == 3) {
-                        hl_x86_x87_load(16, 0);
-                        hl_x86_x87_store(16, rm);
-                        hl_x86_x87_adjust_top(1);
-                    } // fstp ST(i)
+                        if (reg == 3) hl_x86_x87_pop();
+                    } // fst/fstp ST(i)
                     else if (reg == 4 || reg == 5) {
+                        hl_x86_x87_live(0, rm);
                         hl_x86_x87_load(18, 0);
                         hl_x86_x87_load(16, rm);
-                        e_fcom_setfpsw(18, 16);
-                        if (reg == 5) hl_x86_x87_adjust_top(1);
+                        hl_x86_x87_indefinite(18);
+                        hl_x86_x87_indefinite(16);
+                        e_fcom_setfpsw(18, 16, 0);
+                        if (reg == 5) hl_x86_x87_pop();
                     } // fucom[p]
                     else {
                         report_unimpl(gpc, &I);
@@ -4367,10 +4471,12 @@ static void *translate_block(uint64_t gpc) {
                     }
                 } else if (op == 0xDB) {
                     if (reg == 4 && rm == 3) {
-                        // FNINIT: reset TOP=0, FCW=0x037f (all exceptions masked, round-nearest, 64-bit),
-                        // clear FSW (condition codes) and the host FPSR sticky exception flags.
-                        e_movconst(16, 0);
+                        // FNINIT: TOP=0 and every slot EMPTY (st[] itself is untouched, which is why a later
+                        // FLDENV can re-tag and read the old values), FCW=0x037f (all exceptions masked,
+                        // round-nearest, 64-bit), FSW and the host FPSR sticky exception flags cleared.
+                        e_movconst(16, HL_X87_EMPTY_ALL | HL_X87_ARMED);
                         e_str(16, 28, OFF_FPTOP);
+                        e_movconst(16, 0);
                         e_str(16, 28, OFF_FPSW);
                         e_movconst(16, 0x037f);
                         e_str(16, 28, OFF_FPCW);
@@ -4384,10 +4490,13 @@ static void *translate_block(uint64_t gpc) {
                     } // fnclex: clear sticky exception flags
                     else if (reg == 4) { /* fneni/fndisi/fnsetpm: no-op */
                     } else if (reg == 5 || reg == 6) {
+                        hl_x86_x87_live(0, rm);
                         hl_x86_x87_load(18, 0);
                         hl_x86_x87_load(16, rm);
-                        FCMPd(18, 16);
-                    } // fucomi/fcomi
+                        hl_x86_x87_indefinite(18); // empty -> ZF=PF=CF=1, the unordered answer
+                        hl_x86_x87_indefinite(16);
+                        FCMPd(18, 16, reg == 6);
+                    } // fucomi(5, quiet) / fcomi(6, signals on any NaN)
                     else {
                         report_unimpl(gpc, &I);
                         break;
@@ -4398,11 +4507,14 @@ static void *translate_block(uint64_t gpc) {
                         e_bfi(RAX, 16, 0, 16, 1);
                     } // fnstsw ax
                     else if (reg == 5 || reg == 6) {
+                        hl_x86_x87_live(0, rm);
                         hl_x86_x87_load(18, 0);
                         hl_x86_x87_load(16, rm);
-                        FCMPd(18, 16);
-                        hl_x86_x87_adjust_top(1);
-                    } // fucomip/fcomip
+                        hl_x86_x87_indefinite(18);
+                        hl_x86_x87_indefinite(16);
+                        FCMPd(18, 16, reg == 6);
+                        hl_x86_x87_pop();
+                    } // fucomip(5, quiet) / fcomip(6, signals on any NaN)
                     else {
                         report_unimpl(gpc, &I);
                         break;
@@ -4418,11 +4530,14 @@ static void *translate_block(uint64_t gpc) {
                                17); // fcsel d17, STi, ST0, cond
                         hl_x86_x87_store(17, 0);
                     } else if (reg == 5 && rm == 1) { // DA E9: fucompp (compare ST0,ST1; pop twice)
+                        hl_x86_x87_live(0, 1);
                         hl_x86_x87_load(18, 0);
                         hl_x86_x87_load(16, 1);
-                        e_fcom_setfpsw(18, 16);
-                        hl_x86_x87_adjust_top(1);
-                        hl_x86_x87_adjust_top(1);
+                        hl_x86_x87_indefinite(18);
+                        hl_x86_x87_indefinite(16);
+                        e_fcom_setfpsw(18, 16, 0);
+                        hl_x86_x87_pop();
+                        hl_x86_x87_pop();
                     } else {
                         report_unimpl(gpc, &I);
                         break;
@@ -4542,7 +4657,21 @@ static void *translate_block(uint64_t gpc) {
                 mark_vdirty(); // SSE lowering writes guest xmm (v0..v15) -> mark cpu->V dirty
                 int handled = 1;
                 int vd = I.reg, vm = I.rm_reg;
-                if (op == 0x6E) { // movd/movq xmm, r/m  (66)
+                // MMX = the no-prefix form of an integer-SIMD opcode: the SAME operation at 64 bits, on
+                // mm0-7, which alias v0..v7's low halves here (see interp.c's register-file comment). Two
+                // things carry the width: g_ldr_vec_ea makes the memory operand an 8-byte load, and
+                // `mmx_wb` narrows the destination on write-back. Everything between is lane-local, so it
+                // computes the right low 64 on the zero-extension and the narrow drops the rest -- the
+                // cross-lane arms (punpck, pack, pmulh, pmaddwd, pmovmskb) are the ones that instead need
+                // their own 64-bit form below. REX.R/REX.B do not extend an MMX operand, hence the mask.
+                int mmx = sse_mmx_capable(op) && !I.p66 && !I.rep && !I.repne;
+                if (mmx) {
+                    vd &= 7;
+                    vm &= 7;
+                }
+                int mmx_wb = mmx ? vd : -1; // vector register the 64-bit write-back must narrow, or -1
+                if (op == 0x6E) { // movd/movq xmm, r/m  (66; bare = MMX movd/movq mm, r/m)
+                    mmx_wb = -1;  // LDR S/D and FMOV S/D already zero-extend
                     if (I.is_mem) {
                         emit_ea(&I, next);
                         emit_memory_guard(17, I.rexW ? 8u : 4u, gpc, X86_SOFT_READ);
@@ -4563,7 +4692,8 @@ static void *translate_block(uint64_t gpc) {
                         g_ldr_d(vd, 17);
                     } else
                         e_vmov8(vd, vm);
-                } else if (op == 0x7E) { // 66 0F 7E: movd/movq r/m, xmm
+                } else if (op == 0x7E) { // 66 0F 7E: movd/movq r/m, xmm  (bare = MMX movd/movq r/m, mm)
+                    mmx_wb = -1;         // destination is a GPR or memory, not mm
                     if (I.is_mem) {
                         emit_ea(&I, next);
                         emit_memory_guard(17, I.rexW ? 8u : 4u, gpc, X86_SOFT_WRITE);
@@ -4578,8 +4708,22 @@ static void *translate_block(uint64_t gpc) {
                         else
                             e_fmov_from_s(I.rm_reg, vd);
                     }
-                } else if (op == 0xD6) { // 66 0F D6: movq xmm/m64, xmm
-                    if (I.is_mem) {
+                } else if (op == 0xD6) { // 0F D6: the mandatory prefix picks the REGISTER FILE on each side.
+                    // 66 = MOVQ xmm/m64, xmm; F3 = MOVQ2DQ xmm, mm; F2 = MOVDQ2Q mm, xmm. The two MMX forms
+                    // were not lowered at all -- the destination was left untouched, silently. mm_n aliases
+                    // v[n&7]'s low half here, so each is a single 64-bit MOV, which also supplies MOVQ2DQ's
+                    // upper-half zeroing. REX.R/REX.B do not extend the MMX side, hence the masks.
+                    // NP 0F D6 has no encoding, and F3/F2 name a REGISTER operand (Nq/Uq), so NP or a memory
+                    // ModRM under F3/F2 is #UD -- verified native (SIGILL/ILL_ILLOPN).
+                    if ((!I.p66 && !I.rep && !I.repne) || (I.is_mem && !I.p66)) {
+                        emit_sigill(gpc);
+                        break;
+                    }
+                    if (I.rep)
+                        e_vmov8(vd, vm & 7); // MOVQ2DQ xmm[reg] <- mm[rm]
+                    else if (I.repne)
+                        e_vmov8(vd & 7, vm); // MOVDQ2Q mm[reg] <- xmm[rm].q[0]
+                    else if (I.is_mem) {
                         emit_ea(&I, next);
                         emit_memory_guard(17, 8, gpc, X86_SOFT_WRITE);
                         g_str_d(vd, 17);
@@ -4587,6 +4731,7 @@ static void *translate_block(uint64_t gpc) {
                     } else
                         e_vmov8(vm, vd);
                 } else if (op == 0x6F && !I.p66 && !I.rep && !I.repne) { // MMX movq mm, mm/m64 (NO prefix): 64-bit
+                    mmx_wb = -1;                                         // g_ldr_d / e_vmov8 below already zero-extend
                     // Plain 0F 6F is the 64-bit MMX movq (66=movdqa / F3=movdqu are the 128-bit forms below).
                     // Loading/storing 128 bits here read/WROTE 8 bytes past the 64-bit MMX operand -> a store
                     // corrupted the adjacent 8 bytes of guest memory. Keep MMX at its architectural 64-bit width.
@@ -4597,6 +4742,7 @@ static void *translate_block(uint64_t gpc) {
                     } else
                         e_vmov8(vd, vm);
                 } else if (op == 0x7F && !I.p66 && !I.rep && !I.repne) { // MMX movq mm/m64, mm (NO prefix): 64-bit
+                    mmx_wb = -1; // destination is memory, or the vm that e_vmov8 below already narrows
                     if (I.is_mem) {
                         emit_ea(&I, next);
                         emit_memory_guard(17, 8, gpc, X86_SOFT_WRITE);
@@ -4753,7 +4899,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0x54 || op == 0x55 || op == 0x56 ||
                            op == 0x57) { // andps/andnps/orps/xorps (FP bitwise)
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     if (op == 0x54)
                         e_v3(0x4E201C00u, vd, vd, s); // and
                     else if (op == 0x55)
@@ -4764,7 +4910,7 @@ static void *translate_block(uint64_t gpc) {
                         e_v3(0x6E201C00u, vd, vd, s); // xor
                 } else if (op == 0xC6 && I.p66) {     // shufpd: 64-bit lanes (d[0]<-dst, d[1]<-src)
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     unsigned im = (unsigned)I.imm;
                     e_vmov(18, vd);
                     e_ins_d(17, 0, 18, im & 1);
@@ -4772,7 +4918,7 @@ static void *translate_block(uint64_t gpc) {
                     e_vmov(vd, 17);
                 } else if (op == 0xC6) { // shufps xmm,xmm/m,imm8 (lanes 0,1 from dst; 2,3 from src)
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     unsigned im = (unsigned)I.imm;
                     e_vmov(18, vd);
                     e_ins_s(17, 0, 18, im & 3);
@@ -4785,14 +4931,15 @@ static void *translate_block(uint64_t gpc) {
                         esz = op == 0x71   ? 16
                               : op == 0x72 ? 32
                                            : 64,
-                        sh = (int)(I.imm & 0xff), x = I.rm_reg;
+                        sh = (int)(I.imm & 0xff), x = vm; // the shift's destination is r/m, NOT reg
+                    mmx_wb = mmx ? x : -1;                // ...so the MMX narrow must follow it there
                     if (sub == 2)
                         e_vshr_imm(x, x, esz, sh, 0); // psrl
                     else if (sub == 4)
                         e_vshr_imm(x, x, esz, sh, 1); // psra
                     else if (sub == 6)
                         e_vshl_imm(x, x, esz, sh);                   // psll
-                    else if (op == 0x73 && (sub == 3 || sub == 7)) { // psrldq / pslldq (byte shifts)
+                    else if (op == 0x73 && (sub == 3 || sub == 7) && !mmx) { // psrldq / pslldq (66 only; #UD bare)
                         if (sh > 15) {                               // x86: count > 15 -> result is all-zero
                             e_v3(0x6E201C00u, x, x, x);
                         } else if (sh) { // count 0 is the identity -> emit nothing
@@ -4810,7 +4957,7 @@ static void *translate_block(uint64_t gpc) {
                     }
                 } else if (op == 0x70 && I.p66) { // pshufd xmm, xmm/m, imm8
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     unsigned im = (unsigned)I.imm & 0xff;
                     // AES-endgame perf: single-insn forms for the shuffles crypto/ghash loops actually use.
                     if (im == 0xE4) { // identity {0,1,2,3}
@@ -4831,7 +4978,7 @@ static void *translate_block(uint64_t gpc) {
                     }
                 } else if (op == 0x70 && (I.rep || I.repne)) { // pshufhw(F3=high) / pshuflw(F2=low): shuffle 4 words
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     unsigned im = (unsigned)I.imm;
                     int hi = I.rep; // F3 shuffles the HIGH 4 words, F2 the LOW 4
                     e_vmov(17, s);  // v17 = src (the un-shuffled half is preserved)
@@ -4845,11 +4992,11 @@ static void *translate_block(uint64_t gpc) {
                     e_vmov(vd, 17);
                 } else if (op == 0xEF) { // pxor
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     e_v3(0x6E201C00u, vd, vd, s);
                 } else if (op == 0xDB || op == 0xEB || op == 0xDF) { // pand / por / pandn
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     if (op == 0xDB)
                         e_v3(0x4E201C00u, vd, vd, s);
                     else if (op == 0xEB)
@@ -4858,17 +5005,17 @@ static void *translate_block(uint64_t gpc) {
                         e_v3(0x4E601C00u, vd, s, vd);                // pandn: vd = ~vd & s  -> BIC vd, s, vd
                 } else if (op == 0x74 || op == 0x75 || op == 0x76) { // pcmpeqb/w/d
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     uint32_t b = op == 0x74 ? 0x6E208C00u : op == 0x75 ? 0x6E608C00u : 0x6EA08C00u;
                     e_v3(b, vd, vd, s);
                 } else if (op == 0x64 || op == 0x65 || op == 0x66) { // pcmpgtb/w/d -> CMGT (signed)
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     uint32_t b = op == 0x64 ? 0x4E203400u : op == 0x65 ? 0x4E603400u : 0x4EA03400u;
                     e_v3(b, vd, vd, s);
                 } else if (op == 0xDE || op == 0xDA || op == 0xEE || op == 0xEA) { // pmaxub/pminub/pmaxsw/pminsw
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     uint32_t b = op == 0xDE   ? 0x6E206400u  // pmaxub -> UMAX  .16B (lane-wise, NOT UMAXP)
                                  : op == 0xDA ? 0x6E206C00u  // pminub -> UMIN  .16B (lane-wise, NOT UMINP)
                                  : op == 0xEE ? 0x4E606400u  // pmaxsw -> SMAX  .8H  (lane-wise, NOT SMAXP)
@@ -4876,7 +5023,7 @@ static void *translate_block(uint64_t gpc) {
                     e_v3(b, vd, vd, s);
                 } else if (op == 0xFC || op == 0xFD || op == 0xFE || op == 0xD4) { // paddb/w/d/q
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     uint32_t b = op == 0xFC   ? 0x4E208400u
                                  : op == 0xFD ? 0x4E608400u
                                  : op == 0xFE ? 0x4EA08400u
@@ -4884,7 +5031,7 @@ static void *translate_block(uint64_t gpc) {
                     e_v3(b, vd, vd, s);
                 } else if (op == 0xF8 || op == 0xF9 || op == 0xFA || op == 0xFB) { // psubb/w/d/q
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     uint32_t b = op == 0xF8   ? 0x6E208400u
                                  : op == 0xF9 ? 0x6E608400u
                                  : op == 0xFA ? 0x6EA08400u
@@ -4893,7 +5040,7 @@ static void *translate_block(uint64_t gpc) {
                 } else if (op == 0xDC || op == 0xDD || op == 0xEC || op == 0xED || op == 0xD8 || op == 0xD9 ||
                            op == 0xE8 || op == 0xE9) { // saturating add/sub: paddus/padds/psubus/psubs b/w
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     uint32_t b = op == 0xDC   ? 0x6E200C00u  // paddusb -> UQADD .16b
                                  : op == 0xDD ? 0x6E600C00u  // paddusw -> UQADD .8h
                                  : op == 0xEC ? 0x4E200C00u  // paddsb  -> SQADD .16b
@@ -4905,31 +5052,38 @@ static void *translate_block(uint64_t gpc) {
                     e_v3(b, vd, vd, s);
                 } else if (op == 0xE0 || op == 0xE3) { // pavgb/pavgw: unsigned rounding average -> URHADD
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     e_v3(op == 0xE0 ? 0x6E201400u : 0x6E601400u, vd, vd, s); // .16b : .8h
                 } else if (op == 0xD5) { // pmullw: packed signed 16x16 -> low 16 bits -> MUL .8h
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     e_v3(0x4E609C00u, vd, vd, s);
                 } else if (op == 0xE5 || op == 0xE4) { // pmulhw(signed)/pmulhuw(unsigned): 16x16 -> high 16 bits
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     // widen-multiply the low/high 4 lanes to 32-bit products, then UZP2 picks the high 16 of each.
                     uint32_t lo = op == 0xE5 ? 0x0E60C000u : 0x2E60C000u; // SMULL/UMULL  v18.4s, vd.4h, s.4h
                     uint32_t hi = op == 0xE5 ? 0x4E60C000u : 0x6E60C000u; // SMULL2/UMULL2 v19.4s, vd.8h, s.8h
                     emit32(lo | (s << 16) | (vd << 5) | 18);
-                    emit32(hi | (s << 16) | (vd << 5) | 19);
-                    emit32(0x4E405800u | (19 << 16) | (18 << 5) | vd); // uzp2 vd.8h, v18.8h, v19.8h
+                    if (mmx) { // 4 words in, 4 words out: the SMULL2 half has no MMX operand to multiply
+                        emit32(0x0F108400u | (18 << 5) | vd); // shrn vd.4h, v18.4s, #16
+                    } else {
+                        emit32(hi | (s << 16) | (vd << 5) | 19);
+                        emit32(0x4E405800u | (19 << 16) | (18 << 5) | vd); // uzp2 vd.8h, v18.8h, v19.8h
+                    }
                 } else if (op == 0xF5) { // pmaddwd: signed 16x16, add adjacent pairs -> 32-bit lanes
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
-                    emit32(0x0E60C000u | (s << 16) | (vd << 5) | 18);  // smull  v18.4s, vd.4h, s.4h
-                    emit32(0x4E60C000u | (s << 16) | (vd << 5) | 19);  // smull2 v19.4s, vd.8h, s.8h
-                    emit32(0x4EA0BC00u | (19 << 16) | (18 << 5) | vd); // addp  vd.4s, v18.4s, v19.4s
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
+                    emit32(0x0E60C000u | (s << 16) | (vd << 5) | 18); // smull  v18.4s, vd.4h, s.4h
+                    // MMX has only the 4 low words, so the pair-sums come from v18 alone; ADDP's own second
+                    // operand repeats them into the high 64, which the write-back narrow then drops.
+                    int p = mmx ? 18 : 19;
+                    if (!mmx) emit32(0x4E60C000u | (s << 16) | (vd << 5) | 19); // smull2 v19.4s, vd.8h, s.8h
+                    emit32(0x4EA0BC00u | (p << 16) | (18 << 5) | vd);           // addp  vd.4s, v18.4s, vP.4s
                 } else if (op == 0xF1 || op == 0xF2 || op == 0xF3 || op == 0xD1 || op == 0xD2 || op == 0xD3 ||
                            op == 0xE1 || op == 0xE2) { // psll/psrl/psra w/d/q by xmm/m (variable count)
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     int left = (op == 0xF1 || op == 0xF2 || op == 0xF3);
                     int arith = (op == 0xE1 || op == 0xE2);
                     int esize = (op == 0xF1 || op == 0xD1 || op == 0xE1)   ? 16
@@ -4938,7 +5092,7 @@ static void *translate_block(uint64_t gpc) {
                     e_sse_var_shift(vd, vd, s, esize, left, arith);
                 } else if (op == 0x14 || op == 0x15) { // unpckl/hp{s,d}: interleave float lanes -> ZIP1/ZIP2
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     int hi = (op == 0x15);  // unpckh* -> ZIP2
                     int sz = I.p66 ? 3 : 2; // 66=pd (64-bit lanes, .2d); none=ps (32-bit lanes, .4s)
                     uint32_t b = (hi ? 0x4E007800u : 0x4E003800u) | ((uint32_t)sz << 22);
@@ -4952,57 +5106,67 @@ static void *translate_block(uint64_t gpc) {
                     emit32(0x0F20A400u | (s << 5) | 16);  // SXTL v16.2d, vs.2s  (sign-extend the 2 int32)
                     emit32(0x4E61D800u | (16 << 5) | vd); // SCVTF vd.2d, v16.2d (int64 -> double)
                 } else if (op == 0xE6 && (I.p66 || I.repne)) {
-                    // cvttpd2dq (66, truncate) / cvtpd2dq (F2, round-to-nearest): 2 packed f64 -> 2 packed
-                    // s32 in the low 64 bits of dst; the high 64 bits are zeroed (SQXTN with Q=0).
+                    // cvttpd2dq (66, truncate) / cvtpd2dq (F2, rounds by MXCSR.RC): 2 packed f64 -> 2 packed
+                    // s32 in the low 64 bits of dst; the high 64 bits are zeroed (the Q=0 XTN does that).
+                    // Shares emit_pd2i32_pieces with the VEX form, which is the point: this arm used to emit
+                    // FCVTNS unconditionally and so ignored MXCSR.RC while VEX honoured it -- legacy and VEX
+                    // disagreeing with each other, on top of both being wrong about #I and #P.
                     int s = vm;
                     if (I.is_mem) {
                         g_ldr_q_ea(16, &I, next);
                         s = 16;
                     }
-                    uint32_t cvt = I.p66 ? 0x4EE1B800u  // FCVTZS v16.2d, vs.2d (toward zero)
-                                         : 0x4E61A800u; // FCVTNS v16.2d, vs.2d (round to nearest even)
-                    // x86 CVT(T)PD2DQ yields the integer indefinite (0x80000000) on NaN or out-of-range input;
-                    // ARM FCVT*S saturates NaN->0 and SQXTN saturates positive overflow to INT32_MAX (negative
-                    // overflow already agrees at INT32_MIN == indefinite). Per lane force 0x80000000 where the
-                    // rounded s64 exceeds INT32_MAX (catches the round-up boundary too) OR the source is NaN. The
-                    // NaN mask MUST be taken from the source doubles BEFORE the convert (which writes v16 and, for
-                    // a memory operand where s==16, would otherwise clobber the doubles first).
-                    emit32(0x4E60E400u | (s << 16) | (s << 5) | 18); // FCMEQ v18.2d, s, s  -> ordered (0 where NaN)
-                    emit32(0x6E205800u | (18 << 5) | 18);            // NOT  v18.16b       -> NaN mask
-                    emit32(cvt | (s << 5) | 16);                     // FCVT*S v16.2d = cvt(s)  (rounded s64/lane)
-                    e_movconst(19, 0x7fffffffull);
-                    emit32(0x4E080C00u | (19 << 5) | 19);              // DUP  v19.2d, x19   -> INT32_MAX threshold
-                    emit32(0x4EE03400u | (19 << 16) | (16 << 5) | 17); // CMGT v17.2d, v16.2d, v19.2d -> overflow mask
-                    e_v3(0x4EA01C00u, 17, 17, 18);                     // ORR  v17.16b       -> make-indefinite mask
-                    emit32(0x0EA12800u | (17 << 5) | 17);              // XTN  v17.2s, v17.2d (mask -> low 2 lanes)
-                    emit32(0x0EA14800u | (16 << 5) | 20);              // SQXTN v20.2s, v16.2d (saturating result)
+                    int trunc = I.p66 != 0;
+                    e_movconst(19, 0x41E0000000000000ull);
+                    emit32(0x4E080C00u | (19 << 5) | 25); // v25.2d = 2^31 (f64)
+                    e_movconst(19, 0xC1E0000000000000ull);
+                    emit32(0x4E080C00u | (19 << 5) | 26); // v26.2d = -2^31
                     e_movconst(19, 0x80000000ull);
-                    emit32(0x0E040C00u | (19 << 5) | 18);              // DUP  v18.2s, w19   -> 0x80000000 per lane
-                    emit32(0x2E601C00u | (20 << 16) | (18 << 5) | 17); // BSL  v17.8b -> mask?indef:result (hi 64=0)
-                    e_vmov(vd, 17);
+                    emit32(0x0E040C00u | (19 << 5) | 27);                  // v27.2s = integer indefinite
+                    emit_pd2i32_pieces(22, 18, s, trunc, 25, 26, 28, 21);  // v22 = int64 lanes, v18 = fixup mask
+                    emit32(0x0EA12800u | (22 << 5) | 24);                  // XTN v24.2s, v22.2d (result)
+                    emit32(0x0EA12800u | (18 << 5) | 25);                  // XTN v25.2s, v18.2d (mask)
+                    emit32(0x2E601C00u | (24 << 16) | (27 << 5) | 25);     // BSL v25.8b -> mask?indef:result
+                    e_vmov(vd, 25);
                 } else if (op == 0x60 || op == 0x61 || op == 0x62 || op == 0x6C || op == 0x68 || op == 0x69 ||
                            op == 0x6A || op == 0x6D) { // punpck l/h bw/wd/dq/qdq -> ZIP1/ZIP2
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     int hi = (op == 0x68 || op == 0x69 || op == 0x6A || op == 0x6D); // punpckh*; 0x6C(lqdq) is LOW
                     int sz = (op == 0x60 || op == 0x68)   ? 0
                              : (op == 0x61 || op == 0x69) ? 1
                              : (op == 0x62 || op == 0x6A) ? 2
                                                           : 3;
+                    if (mmx && sz == 3) { // 0F 6C/6D have no MMX form; #UD, and .1D would be a reserved ZIP
+                        report_unimpl(gpc, &I);
+                        break;
+                    }
                     uint32_t b = (hi ? 0x4E007800u : 0x4E003800u) | ((uint32_t)sz << 22);
+                    // Q=0 is the whole MMX fix: ZIP1/ZIP2 .8B/.4H/.2S interleave the halves of a 64-bit
+                    // operand, which is exactly punpckl/h at MMX width (Q=1 ZIP2 reads bytes 8..15 instead).
+                    if (mmx) b &= ~0x40000000u;
                     e_v3(b, vd, vd, s);
                 } else if (op == 0x67 || op == 0x63 || op == 0x6B) {
                     // pack with saturation: 0x67 PACKUSWB (16->u8), 0x63 PACKSSWB (16->s8),
                     // 0x6B PACKSSDW (32->s16). dst.low half from dst's lanes, dst.high half from src's.
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     uint32_t sz = (op == 0x6B) ? 1u : 0u;     // source element: 0x6B = 16-bit, else 8-bit dest
                     uint32_t lo = (op == 0x67) ? 0x2E212800u  // SQXTUN  (signed->unsigned narrow)
                                                : 0x0E214800u; // SQXTN   (signed->signed narrow)
                     uint32_t hi = (op == 0x67) ? 0x6E212800u : 0x4E214800u; // ...2 (Q=1, high half)
-                    emit32(lo | (sz << 22) | (vd << 5) | 17);               // narrow dst's lanes -> v17 low
-                    emit32(hi | (sz << 22) | (s << 5) | 17);                // narrow src's lanes -> v17 high
-                    e_vmov(vd, 17);
+                    if (mmx) {
+                        // MMX packs 4+4 source lanes into 8 bytes, so both operands' lanes must first sit
+                        // in ONE 128-bit register: ZIP1 .2D concatenates the two 64-bit halves, then a
+                        // single Q=0 narrow yields all 8 result bytes. (The Q=1 pair above narrows 8 of
+                        // dst's lanes and 8 of src's -- at MMX width those upper lanes do not exist.)
+                        emit32(0x4EC03800u | (s << 16) | (vd << 5) | 17); // zip1 v17.2d, vd.2d, s.2d
+                        emit32(lo | (sz << 22) | (17 << 5) | vd);
+                    } else {
+                        emit32(lo | (sz << 22) | (vd << 5) | 17); // narrow dst's lanes -> v17 low
+                        emit32(hi | (sz << 22) | (s << 5) | 17);  // narrow src's lanes -> v17 high
+                        e_vmov(vd, 17);
+                    }
                 } else if (op == 0xD7 && !nosseopt()) { // pmovmskb -> NEON (W3b SSE-SIMD idiom upgrade)
                     // Gather the 16 byte-MSBs into the low 16 bits of I.reg with a cascading
                     // shift-accumulate that needs NO memory round-trip and NO constant load
@@ -5015,15 +5179,29 @@ static void *translate_block(uint64_t gpc) {
                     //   umov wREG,  v17.b[8]          ; mask bits 8..15
                     //   orr  wREG,  w16, wREG, lsl #8 ; combine (W-form zero-extends to 64)
                     g_pmovmskb_n++;
-                    e_vshr_imm(17, vm, 8, 7, 0);                           // ushr v17.16b, vm.16b, #7
+                    // MMX yields an 8-BIT mask. This cascade reads all 16 source bytes, so zero-extend the
+                    // 64-bit operand first: bytes 8..15 then contribute nothing and the b[8] half is 0.
+                    int ms = vm;
+                    if (mmx) {
+                        e_vmov8(18, vm);
+                        ms = 18;
+                    }
+                    mmx_wb = -1;                                           // destination is a GPR
+                    e_vshr_imm(17, ms, 8, 7, 0);                           // ushr v17.16b, ms.16b, #7
                     emit32(0x6F001400u | (25u << 16) | (17 << 5) | 17);    // usra v17.8h, v17.8h, #7
                     emit32(0x6F001400u | (50u << 16) | (17 << 5) | 17);    // usra v17.4s, v17.4s, #14
                     emit32(0x6F001400u | (100u << 16) | (17 << 5) | 17);   // usra v17.2d, v17.2d, #28
                     emit32(0x0E003C00u | (1u << 16) | (17 << 5) | 16);     // umov w16, v17.b[0]
                     emit32(0x0E003C00u | (17u << 16) | (17 << 5) | I.reg); // umov wREG, v17.b[8]
                     e_rrr(A_ORR, I.reg, 16, I.reg, 0, 8);                  // orr wREG, w16, wREG, lsl #8
-                } else if (op == 0xD7) {       // pmovmskb scalar fallback (NOSSEOPT=1 -> baseline codegen)
-                    e_str_q(vm, 28, OFF_MM);   // spill the 16 bytes to scratch
+                } else if (op == 0xD7) { // pmovmskb scalar fallback (NOSSEOPT=1 -> baseline codegen)
+                    int ms = vm;
+                    if (mmx) { // 8-bit mask: zero the spilled bytes 8..15 (see the NEON arm above)
+                        e_vmov8(18, vm);
+                        ms = 18;
+                    }
+                    mmx_wb = -1;               // destination is a GPR
+                    e_str_q(ms, 28, OFF_MM);   // spill the 16 bytes to scratch
                     e_addi(17, 28, OFF_MM, 1); // x17 = &scratch
                     e_movz(I.reg, 0, 0);       // result = 0
                     for (int i = 0; i < 16; i++) {
@@ -5031,6 +5209,75 @@ static void *translate_block(uint64_t gpc) {
                         emit32(0x53071C00u | (16 << 5) | 16);                       // ubfx w16,w16,#7,#1
                         emit32(0x2A000000u | (16 << 16) | ((unsigned)i << 10) | (I.reg << 5) |
                                I.reg); // orr reg,reg,w16,lsl#i
+                    }
+                } else if ((op == 0x2A || op == 0x2C || op == 0x2D) && !I.rep && !I.repne) {
+                    // The MMX conversions: without F2/F3, 0F 2A/2C/2D name an mm operand, not a GPR --
+                    // CVTPI2PS/PD (2A), CVT[T]PS2PI and CVT[T]PD2PI (2C trunc / 2D rounds by MXCSR.RC).
+                    // They used to fall into the scalar cvtsi2ss/cvttss2si arms below, which read the wrong
+                    // register file entirely; every line of the fixture was wrong.
+                    // The float->int direction MUST stay at .2s (Q=0) for the NP forms: they read only two
+                    // of xmm's four floats, and a 4-wide host convert would raise the upper lanes' #I/#P
+                    // into the guest's MXCSR. mm_n aliases v[n&7]; REX does not extend an MMX operand.
+                    mmx_wb = -1; // each arm writes its own width
+                    int trunc = (op == 0x2C);
+                    if (op == 0x2A) { // mm/m64 = 2 int32 -> xmm
+                        int s = vm & 7;
+                        if (I.is_mem) {
+                            g_ldr_d_ea(16, &I, next);
+                            s = 16;
+                        }
+                        if (I.p66) { // CVTPI2PD: 2 doubles, writes all 128 bits (int32->f64 is exact)
+                            emit32(0x0F20A400u | (s << 5) | 18);  // SXTL  v18.2d, vs.2s
+                            emit32(0x4E61D800u | (18 << 5) | 18); // SCVTF v18.2d, v18.2d
+                            e_vmov(vd, 18);
+                        } else {                                 // CVTPI2PS: 2 floats, MERGED into vd[63:0]
+                            emit32(0x0E21D800u | (s << 5) | 18); // SCVTF v18.2s, vs.2s (rounds by FPCR.RMode)
+                            e_ins_d(vd, 0, 18, 0);
+                        }
+                    } else if (I.p66) { // CVT[T]PD2PI: xmm/m128 = 2 doubles -> 2 int32 in mm
+                        int s = vm;
+                        if (I.is_mem) {
+                            g_ldr_q_ea(16, &I, next);
+                            s = 16;
+                        }
+                        e_movconst(16, 0x41E0000000000000ull);
+                        emit32(0x4E080C00u | (16 << 5) | 19); // v19.2d = 2^31 (f64)
+                        e_movconst(16, 0xC1E0000000000000ull);
+                        emit32(0x4E080C00u | (16 << 5) | 20); // v20.2d = -2^31
+                        // The pre-rounding FRINTX that used to sit here reported #P for an out-of-range
+                        // inexact source, where x86 raises #I alone; emit_pd2i32_pieces now owns the whole
+                        // round-and-flag rule for this width.
+                        emit_pd2i32_pieces(24, 22, s, trunc, 19, 20, 23, 21); // v24 = int64 lanes, v22 = mask
+                        emit32(0x0EA12800u | (24 << 5) | 24);                 // XTN v24.2s, v24.2d
+                        emit32(0x0EA12800u | (22 << 5) | 22);                 // XTN v22.2s, v22.2d
+                        e_movconst(16, 0x80000000ull);
+                        emit32(0x0E040C00u | (16 << 5) | 18);              // v18.2s = 0x80000000 (integer indefinite)
+                        emit32(0x2E601C00u | (24 << 16) | (18 << 5) | 22); // BSL v22.8b = mask ? indef : result
+                        e_vmov8(vd & 7, 22);
+                    } else { // CVT[T]PS2PI: xmm/m64 = 2 floats -> 2 int32 in mm
+                        int s = vm;
+                        if (I.is_mem) {
+                            g_ldr_d_ea(16, &I, next);
+                            s = 16;
+                        }
+                        if (trunc) {
+                            emit32(0x0EA1B800u | (s << 5) | 21); // FCVTZS.2s v21, vs
+                        } else {
+                            // FRINTX, not FRINTI: x86 raises #P when the conversion is inexact, and only the
+                            // X form reports Inexact. Then FCVTZS of the now-integral value is exact.
+                            emit32(0x2E219800u | (s << 5) | 21);  // FRINTX.2s v21, vs (current FPCR.RMode)
+                            emit32(0x0EA1B800u | (21 << 5) | 21); // FCVTZS.2s v21, v21
+                        }
+                        e_movconst(16, 0x4F000000ull);
+                        emit32(0x0E040C00u | (16 << 5) | 17);             // v17.2s = 2^31 (f32)
+                        emit32(0x2E20E400u | (17 << 16) | (s << 5) | 19); // FCMGE.2s v19, vs, 2^31
+                        emit32(0x0E20E400u | (s << 16) | (s << 5) | 20);  // FCMEQ.2s v20, vs, vs (0 where NaN)
+                        emit32(0x2E205800u | (20 << 5) | 20);             // MVN.8b v20 -> NaN mask
+                        e_v3(0x0EA01C00u, 19, 19, 20);                    // ORR.8b v19 = (f>=2^31 OR NaN)
+                        e_movconst(16, 0x80000000ull);
+                        emit32(0x0E040C00u | (16 << 5) | 18);              // v18.2s = integer indefinite
+                        emit32(0x2E601C00u | (21 << 16) | (18 << 5) | 19); // BSL v19.8b = mask ? indef : result
+                        e_vmov8(vd & 7, 19);
                     }
                 } else if (op == 0x2A) { // cvtsi2sd/ss: int r/m -> xmm (F2=double,F3=single)
                     int src;
@@ -5060,6 +5307,7 @@ static void *translate_block(uint64_t gpc) {
                             g_ldr_s(16, 17);
                         s = 16;
                     }
+                    int s0 = s;       // the source, before 0x2D rounds it (the #P probe below needs it)
                     if (op == 0x2D) { // cvtsd2si: honor MXCSR.RC -> round to integral (FRINTI uses FPCR.RMode)...
                         uint32_t frinti = I.repne ? 0x1E67C000u : 0x1E27C000u; // double : single
                         emit32(frinti | (s << 5) | 18);                        // frinti d18, ds
@@ -5089,9 +5337,30 @@ static void *translate_block(uint64_t gpc) {
                         // restore it, so a later jcc/setcc/cmov/adc sees the integer flags it must.
                         // (The old comment claimed the top-of-loop had already flushed g_fl_pending
                         // here; a `cmp`; `cvttsd2si`; `js` sequence shows that it had not.)
-                        emit32(0xD53B4200u | 21);                                              // mrs x21, nzcv
-                        emit32((I.repne ? 0x1E602000u : 0x1E202000u) | (19 << 16) | (s << 5)); // FCMP s, v19
-                        e_movconst(20, sf ? 0x8000000000000000ull : 0x80000000ull);            // integer indefinite
+                        uint32_t fcmp = I.repne ? 0x1E602000u : 0x1E202000u;
+                        emit32(0xD53B4200u | 21);                     // mrs x21, nzcv
+                        emit32(fcmp | (19 << 16) | (s << 5));         // FCMP s, v19
+                        if (op == 0x2D) {
+                            // #P. FCVTZS above reports it for 0x2C (an in-range inexact truncation) but not
+                            // for 0x2D, whose FRINTI value is already integral -- and FRINTI itself reports
+                            // nothing. FRINTX would, but it also reports #P for an OUT-OF-RANGE inexact
+                            // source, where x86 raises #I alone; f64 -> int32 is the one width pair where
+                            // such a value exists, and 2147483648.25 is the case that proves it. So run
+                            // FRINTX over the source with the out-of-range case replaced by +0.0, which is
+                            // exact. Out of range is CS from the FCMP above (>= +thr, or NaN) or MI against
+                            // -thr; the result path only needs the former, because negative overflow lands
+                            // on FCVTZS's INT_MIN == the indefinite, but #P must be suppressed for both.
+                            emit32(0xDA9F33E0u | 22);                                       // csetm x22, cs
+                            emit32((I.repne ? 0x1E614000u : 0x1E214000u) | (19 << 5) | 20); // FNEG v20, v19 (-thr)
+                            emit32(fcmp | (20 << 16) | (s << 5));                           // FCMP s, -thr
+                            emit32(0xDA9F53E0u | 23);                                       // csetm x23, mi
+                            e_rrr(A_ORR, 22, 22, 23, 1, 0);                                 // x22 = out-of-range mask
+                            e_fmov_to_d(20, 22);
+                            e_v3(0x0E601C00u, 20, s0, 20);                                  // BIC v20 = src & ~mask
+                            emit32((I.repne ? 0x1E674000u : 0x1E274000u) | (20 << 5) | 20); // FRINTX v20 -> #P only
+                            emit32(fcmp | (19 << 16) | (s << 5)); // redo FCMP: the CSEL below reads its NZCV
+                        }
+                        e_movconst(20, sf ? 0x8000000000000000ull : 0x80000000ull); // integer indefinite
                         e_csel(I.reg, 20, I.reg, 2 /*CS: s>=thr or NaN*/, sf);
                         emit32(0xD51B4200u | 21); // msr nzcv, x21
                     }
@@ -5135,9 +5404,12 @@ static void *translate_block(uint64_t gpc) {
                         else
                             e_ins_s(vd, 0, 17, 0);
                     }
-                } else if (op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E || op == 0x51) {
+                } else if (op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E || op == 0x51 ||
+                           ((op == 0x52 || op == 0x53) && !I.p66 && !I.repne)) {
                     // add/mul/sub/div/min/max/sqrt. Prefix selects width: F2=scalar double, F3=scalar
                     // single, 66=PACKED double (.2d), none=PACKED single (.4s).
+                    // 0F 52 RSQRTPS/SS and 0F 53 RCPPS/SS join the UNARY group with sqrt: baseline SSE1,
+                    // single-precision only (66/F2 are reserved, excluded above -> UNIMPL as before).
                     int packed = !I.repne && !I.rep;
                     int s = vm;
                     if (I.is_mem) {
@@ -5154,7 +5426,14 @@ static void *translate_block(uint64_t gpc) {
                         s = 16;
                     }
                     int dbl = packed ? I.p66 : I.repne; // element type: double vs single
-                    if (packed && op != 0x51) {
+                    int unary = (op == 0x51 || op == 0x52 || op == 0x53);
+                    // RSQRT/RCP raise NO SIMD FP exception at all (SDM; measured against native for a
+                    // denormal, an overflow, a zero, a negative and both NaN classes). The FSQRT/FDIV
+                    // standing in for the hardware table DO raise #D/#O/#P/#Z, so park FPSR across the
+                    // whole sequence -- the same rule avx.c applies to the VEX forms.
+                    int park = (op == 0x52 || op == 0x53);
+                    if (park) emit32(0xD53B4420u | 16); // mrs x16, fpsr
+                    if (packed && !unary) {
                         // ---- packed add/sub/mul/div: RESULT gate ----
                         // Replaces the NaN-INPUT gate + emit_dnan_pre/post pair used below (which cost 16
                         // host instructions for one guest op -- 30 of the 53 instructions the float_simd
@@ -5199,7 +5478,7 @@ static void *translate_block(uint64_t gpc) {
                         *p_cbnz = 0x35000000u | ((uint32_t)(((Lfast - (uint8_t *)p_cbnz) / 4) & 0x7FFFF) << 5) | 16;
                         e_vmov(vd, 18);
                     } else {
-                        if (op != 0x51) {
+                        if (!unary) {
                             // ---- NaN-input gate ----
                             // NEON FADD/FMUL/FSUB/FDIV + emit_dnan is bit-exact to x86 for finite inputs, for a
                             // GENERATED NaN (fixed up below), and for a SINGLE NaN input (propagated + quieted,
@@ -5230,15 +5509,23 @@ static void *translate_block(uint64_t gpc) {
                             *p_cbz = cbz | ((uint32_t)(((Lfast - (uint8_t *)p_cbz) / 4) & 0x7FFFF) << 5) | 16;
                         }
                         int fixnan = fpdnan_on();
-                        if (fixnan) emit_dnan_pre(vd, s, op != 0x51, dbl); // capture "no input NaN" (uses v20/v21)
-                        if (packed) {                                      // vector FP: 66 -> .2d (sz bit), none -> .4s
+                        if (fixnan) emit_dnan_pre(vd, s, !unary, dbl); // capture "no input NaN" (uses v20/v21)
+                        if (packed) {                                  // vector FP: 66 -> .2d (sz bit), none -> .4s
                             uint32_t d = I.p66 ? 0x00400000u : 0;
                             uint32_t b = op == 0x58   ? 0x4E20D400u  // FADD
                                          : op == 0x59 ? 0x6E20DC00u  // FMUL
                                          : op == 0x5C ? 0x4EA0D400u  // FSUB
                                          : op == 0x5E ? 0x6E20FC00u  // FDIV
                                                       : 0x6EA1F800u; // FSQRT (2-reg)  [min/max: see 0x5D/0x5F above]
-                            if (op == 0x51)
+                            if (op == 0x52 || op == 0x53) {
+                                emit32(0x4F03F600u | 19); // fmov v19.4s, #1.0
+                                int n = s;
+                                if (op == 0x52) {
+                                    emit32(0x6EA1F800u | (s << 5) | 18); // fsqrt v18.4s, s.4s
+                                    n = 18;
+                                }
+                                emit32(0x6E20FC00u | (n << 16) | (19 << 5) | vd); // fdiv vd.4s, v19.4s, vn.4s
+                            } else if (op == 0x51)
                                 emit32(b | d | (s << 5) | vd); // FSQRT vd.T, s.T
                             else
                                 emit32(b | d | (s << 16) | (vd << 5) | vd); // op vd.T, vd.T, s.T
@@ -5253,7 +5540,15 @@ static void *translate_block(uint64_t gpc) {
                             // element; the rest of the destination is architecturally PRESERVED. The ARM
                             // scalar forms zero everything above the element, so land the result in
                             // scratch v18 (which the default-NaN fixup then stamps) and INS it back.
-                            if (op == 0x51)
+                            if (op == 0x52 || op == 0x53) {
+                                emit32(0x1E2E1000u | 19); // fmov s19, #1.0
+                                int n = s;
+                                if (op == 0x52) {
+                                    emit32(0x1E21C000u | (s << 5) | 18); // fsqrt s18, s
+                                    n = 18;
+                                }
+                                emit32(0x1E201800u | (n << 16) | (19 << 5) | 18); // fdiv s18, s19, sn
+                            } else if (op == 0x51)
                                 emit32(b | ty | (s << 5) | 18); // FSQRT s18/d18, s
                             else
                                 emit32(b | ty | (s << 16) | (vd << 5) | 18); // FADD/... s18/d18, vd, s
@@ -5267,6 +5562,7 @@ static void *translate_block(uint64_t gpc) {
                                 e_ins_s(vd, 0, 18, 0);
                         }
                     }
+                    if (park) emit32(0xD51B4420u | 16); // msr fpsr, x16
                 } else if (op == 0x5A) {
                     // 0F 5A is FOUR instructions, selected by the mandatory prefix:
                     //   F2 cvtsd2ss   F3 cvtss2sd   66 cvtpd2ps (PACKED)   none cvtps2pd (PACKED)
@@ -5302,7 +5598,7 @@ static void *translate_block(uint64_t gpc) {
                         e_ins_d(vd, 0, 18, 0);
                     }
                 } else if (op == 0xC4) { // pinsrw: insert low 16 bits of r/m16 into xmm H-lane (imm8 & 7)
-                    int lane = (int)I.imm & 7;
+                    int lane = (int)I.imm & (mmx ? 3 : 7); // mm has 4 words: hardware wraps $4 to lane 0
                     int src;
                     if (I.is_mem) {
                         emit_ea(&I, next);
@@ -5315,7 +5611,8 @@ static void *translate_block(uint64_t gpc) {
                     // INS vd.H[lane], Wsrc  (imm5 = lane<<2 | 0b10 selects H)
                     emit32(0x4E001C00u | ((((unsigned)lane << 2) | 2u) << 16) | (src << 5) | vd);
                 } else if (op == 0xC5) { // pextrw: extract xmm H-lane (imm8 & 7) -> r32, zero-extended (reg src only)
-                    int lane = (int)I.imm & 7;
+                    int lane = (int)I.imm & (mmx ? 3 : 7); // mm has 4 words (see pinsrw)
+                    mmx_wb = -1;                           // destination is a GPR
                     // UMOV Wreg, Vm.H[lane]  (imm5 = lane<<2 | 0b10 selects H; zero-extends into the GPR)
                     emit32(0x0E003C00u | ((((unsigned)lane << 2) | 2u) << 16) | (vm << 5) | I.reg);
                 } else if (op == 0xC2) { // cmpps/pd/ss/sd: FP compare with predicate imm -> all-1s/0 mask
@@ -5394,7 +5691,7 @@ static void *translate_block(uint64_t gpc) {
                     // Gather the even (0,2) 32-bit lanes of each operand into the low 2 lanes (UZP1),
                     // then widening multiply -> two 64-bit products. Bit-exact, 3 NEON insns.
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     emit32(0x4E801800u | (vd << 16) | (vd << 5) | 17); // uzp1 v17.4s, vd.4s, vd.4s -> [d0,d2,..]
                     emit32(0x4E801800u | (s << 16) | (s << 5) | 18);   // uzp1 v18.4s, s.4s,  s.4s  -> [s0,s2,..]
                     emit32(0x2EA0C000u | (18 << 16) | (17 << 5) | vd); // umull vd.2d, v17.2s, v18.2s
@@ -5419,37 +5716,24 @@ static void *translate_block(uint64_t gpc) {
                         s = 16;
                     }
                     if (I.rep || I.p66) {
-                        // H13 (packed): x86 float->int32 gives the integer indefinite (0x80000000) per lane on
-                        // out-of-range or NaN; ARM saturates positive overflow to INT_MAX and NaN to 0 (negative
-                        // overflow already agrees at INT_MIN). Per lane, build the "make-indefinite" mask =
-                        //   (s >= 2^31)  OR  (s != s)   -- FCMGE against a 2^31 broadcast, ORed with ~FCMEQ(s,s)
-                        // and BSL 0x80000000 over the saturating result.
-                        // The mask MUST be built from the source floats BEFORE the convert: for the (common)
-                        // `cvttps2dq %xmm7,%xmm7` in-place form s == vd, so converting first would leave the
-                        // mask reading the INTEGER result reinterpreted as f32 -- an all-ones lane (-1) then
-                        // looks like a NaN and was wrongly forced to the indefinite, while a genuine
-                        // indefinite lane (0x80000000 == -0.0f) looked ordered and kept ARM's NaN->0. Same
-                        // hazard, and the same ordering, as the cvt(t)pd2dq lowering (0F E6) above.
-                        e_v3(0x4E20E400u, 17, s, s);          // FCMEQ v17.4s, s, s  -> ordered lanes (0 where NaN)
-                        emit32(0x6E205800u | (17 << 5) | 17); // NOT v17.16b       -> NaN mask
-                        e_movconst(19, 0x4F000000u);          // 2^31 as f32
-                        emit32(0x4E040C00u | (19 << 5) | 18); // DUP v18.4s, w19   -> threshold
-                        e_v3(0x6E20E400u, 18, s, 18);         // FCMGE v18.4s, s, thr -> s>=2^31 mask
-                        e_v3(0x4EA01C00u, 17, 17, 18);        // ORR v17.16b       -> combined make-indefinite mask
-                        if (I.rep)
-                            emit32(0x4EA1B800u | (s << 5) | vd); // F3: cvttps2dq -> FCVTZS .4S (truncate)
-                        else
-                            emit32(0x4E21A800u | (s << 5) | vd); // 66: cvtps2dq -> FCVTNS .4S (round to nearest)
+                        // Same emit as the VEX form: 66 cvtps2dq used to emit FCVTNS unconditionally and so
+                        // ignored MXCSR.RC, while vcvtps2dq honoured it. emit_ps2dq_128 builds the
+                        // "make-indefinite" mask from the SOURCE floats before converting, which the
+                        // in-place `cvttps2dq %xmm7,%xmm7` form requires: reading it back from the integer
+                        // result would see an all-ones lane (-1) as a NaN, and the indefinite (== -0.0f) as
+                        // ordered.
+                        e_movconst(19, 0x4F000000u);
+                        emit32(0x4E040C00u | (19 << 5) | 25); // v25.4s = 2^31 (f32)
                         e_movconst(19, 0x80000000u);
-                        emit32(0x4E040C00u | (19 << 5) | 18); // DUP v18.4s, w19   -> 0x80000000 per lane
-                        e_v3(0x6E601C00u, 17, 18, vd);        // BSL v17.16b, indef, result -> mask?indef:result
+                        emit32(0x4E040C00u | (19 << 5) | 26); // v26.4s = integer indefinite
+                        emit_ps2dq_128(17, s, I.rep != 0, 25, 26, 27, 28);
                         e_vmov(vd, 17);
                     } else {
                         emit32(0x4E21D800u | (s << 5) | vd); // NP: cvtdq2ps -> SCVTF .4S (s32->f32)
                     }
                 } else if (op == 0xF6) { // psadbw (66): sum of abs byte diffs per 64-bit half
                     int s = I.is_mem ? 16 : vm;
-                    if (I.is_mem) { g_ldr_q_ea(16, &I, next); }
+                    if (I.is_mem) { g_ldr_vec_ea(16, &I, next, mmx); }
                     emit32(0x6E207400u | (s << 16) | (vd << 5) | 17); // uabd   v17.16b, vd.16b, s.16b
                     emit32(0x6E202800u | (17 << 5) | 17);             // uaddlp v17.8h,  v17.16b
                     emit32(0x6E602800u | (17 << 5) | 17);             // uaddlp v17.4s,  v17.8h
@@ -5473,6 +5757,10 @@ static void *translate_block(uint64_t gpc) {
                 } else
                     handled = 0;
                 if (handled) {
+                    // MMX write-back: mm is 64 bits, so drop bits 127:64 that the arms above computed at
+                    // NEON's 128-bit width. Without this a `paddb %mm0,%mm0` clobbers xmm0's high half,
+                    // which the aliasing register model makes guest-visible.
+                    if (mmx_wb >= 0) e_vmov8(mmx_wb, mmx_wb);
                     gpc = next;
                     continue;
                 }
@@ -6263,7 +6551,9 @@ static void report_unimpl(uint64_t pc, struct insn *I) {
 }
 
 // ---------------- host entry trampolines (adapted from jit.c, x86 reg set) ----------------
-#if defined(__GNUC__) && !defined(__clang__)
+// The arch test is as load-bearing as the compiler test: both arms below are AArch64 assembly, and the
+// guard once selected between them on the COMPILER alone. Same macro core/dispatch.c gates its copy on.
+#if defined(__GNUC__) && !defined(__clang__) && defined(HL_HOST_CPU_AARCH64)
 /* GCC ignores naked on AArch64 functions.  Define the two ABI trampolines as
    assembler functions so no compiler-generated prologue can corrupt SP or the
    callee-saved register image. */
@@ -6289,7 +6579,7 @@ __asm__(".hidden run_block\n"
         "ldr q12,[x28,#336]\n ldr q13,[x28,#352]\n ldr q14,[x28,#368]\n ldr q15,[x28,#384]\n"
         "ldr x9,[x28,#168]\n mov sp,x9\n ldr x28,[x28,#248]\n ret\n"
         ".size block_return, .-block_return\n");
-#else
+#elif defined(HL_HOST_CPU_AARCH64)
 __attribute__((naked)) static void run_block(struct cpu *cpu, void *code) {
     __asm__ volatile( // x0=cpu, x1=code
         "str x19,[x0,#176]\n str x20,[x0,#184]\n str x21,[x0,#192]\n str x22,[x0,#200]\n"
@@ -6311,5 +6601,21 @@ __attribute__((naked)) static void block_return(void) {
         "ldr x9,[x28,#168]\n mov sp, x9\n" // host sp
         "ldr x28,[x28,#248]\n"             // restore host x28 LAST (was using it as base)
         "ret\n");
+}
+#else
+// Non-AArch64 host: the emitters here write ARM64, so no trampoline can enter anything. These exist only
+// so the engine links -- block_return's ADDRESS is baked into emitted blocks and anchors cache.c's image
+// slide, and dispatch.c CALLS run_block. `static` matches emit.c's declaration and keeps the dual
+// archive's two definitions from colliding (findings 3.7). Abort: reaching either is a build error.
+static void run_block(struct cpu *cpu, void *code) {
+    (void)cpu;
+    (void)code;
+    fprintf(stderr, "[hl] x86-64 guest: no host back end for " HL_HOST_CPU_NAME " (the emitters target arm64)\n");
+    abort();
+}
+
+static void block_return(void) {
+    fprintf(stderr, "[hl] x86-64 guest: no host back end for " HL_HOST_CPU_NAME " (the emitters target arm64)\n");
+    abort();
 }
 #endif

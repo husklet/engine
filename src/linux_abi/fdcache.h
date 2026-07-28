@@ -4,6 +4,7 @@
 void hl_fdcache_runtime_init(void);
 
 #include "container/namespace.h"
+#include "fdhandle.h" /* the other descriptor-keyed side table this TU owns */
 #include "hl/host_services.h"
 
 #include <stddef.h>

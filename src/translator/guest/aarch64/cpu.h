@@ -138,13 +138,24 @@ struct cpu {
 // advertise.  HWCAP_CPUID is deliberately absent, so EL1 ID registers trap at EL0.
 struct hl_aarch64_cpu_model {
     uint64_t hwcap;
+    uint64_t hwcap2;
     uint64_t ctr_el0;
     uint64_t dczid_el0;
     int user_id_registers;
 };
 
+// A bit is set here only when BOTH backends implement the whole feature exactly: the interpreter computes it,
+// and the JIT (a same-ISA transliterator) either copies it to silicon that has it or lowers it exactly.
+//   HWCAP  bit 20 ASIMDDP  = FEAT_DotProd, mandatory from Armv8.4-A, so the verbatim copy always lands.
+//   HWCAP2 bit 13 I8MM / bit 14 BF16 stay CLEAR: Apple Silicon before M4 has neither, so the JIT must use
+//     translate.c's baseline lowerings -- which cover only 3 of I8MM's 6 forms and 2 of BF16's 7, and whose
+//     BFDOT is not bit-exact (round-to-odd; see the note there). Both are implemented far enough that a guest
+//     reaching past the contract still runs, but not far enough to invite one in.
+// hwcap2 must exist even at 0: arm64's ARCH_DLINFO always emits AT_HWCAP2, so an absent entry is the one
+// shape a real kernel never produces.
 static const struct hl_aarch64_cpu_model g_aarch64_cpu_model = {
-    .hwcap = 0x1fb,
+    .hwcap = 0x1fb | (1u << 20),
+    .hwcap2 = 0,
     .ctr_el0 = 0x9444C004,
     .dczid_el0 = 4,
     .user_id_registers = 0,

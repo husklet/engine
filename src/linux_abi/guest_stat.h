@@ -2,6 +2,7 @@
 #define HL_LINUX_ABI_GUEST_STAT_H
 
 #include "encode.h"
+#include "host_stat.h" // the struct stat members that are not on every host's structure
 
 #if !defined(HL_GUEST_STAT_SIZE) || !defined(HL_GUEST_STAT_ENCODE) || !defined(HL_GUEST_BOUND_STAT)
 #error "guest stat layout macros must be defined by the target"
@@ -20,13 +21,13 @@ static void fill_linux_stat(uint8_t *destination, const struct stat *status, con
         status->st_nlink,
         status->st_rdev,
         (uint64_t)status->st_size,
-        (uint64_t)status->st_blocks,
-        status->st_atimespec.tv_sec,
-        (uint64_t)status->st_atimespec.tv_nsec,
-        status->st_mtimespec.tv_sec,
-        (uint64_t)status->st_mtimespec.tv_nsec,
-        status->st_ctimespec.tv_sec,
-        (uint64_t)status->st_ctimespec.tv_nsec,
+        HL_HOST_STAT_BLOCKS(status),
+        HL_HOST_STAT_ATIME_SEC(status),
+        HL_HOST_STAT_ATIME_NSEC(status),
+        HL_HOST_STAT_MTIME_SEC(status),
+        HL_HOST_STAT_MTIME_NSEC(status),
+        HL_HOST_STAT_CTIME_SEC(status),
+        HL_HOST_STAT_CTIME_NSEC(status),
         stat_virt_mode(status, host_path, descriptor),
         user,
         group,

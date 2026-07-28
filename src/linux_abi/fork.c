@@ -4,15 +4,16 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
+#include "host_fd.h"
+#include "host_poll.h"
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/wait.h>
+#include "host_socket.h"
+#include "host_socket.h"
+#include "host_wait.h"
 #include <unistd.h>
 
 #include "../host/child.h"
@@ -73,7 +74,7 @@
 // launch config, read once at --server startup. Guest-visible env + the per-request container env the
 // Cold-path launch options such as volumes, namespace, cwd, and published ports come from each client request.
 
-#include <sys/wait.h> // waitpid + W* status macros (also pulled in by sentry.c; idempotent)
+#include "host_wait.h" // waitpid + W* status macros (also pulled in by sentry.c; idempotent)
 
 extern char **environ;
 
@@ -102,15 +103,33 @@ static uint64_t loaded_span(const struct loaded *L) {
 #ifndef FSRV_WARM_CHDIR_ROOTFS // x86's container model chdir()s the engine into the rootfs
 #define FSRV_WARM_CHDIR_ROOTFS() ((void)0)
 #endif
-// Around the pristine-image restore memcpy: aarch64's load_elf applies per-segment W^X (.text R+X,
-// .rodata R; and the prewarm guest may have mprotect()ed more, e.g. musl's RELRO) so the restore must
-// open the span RW first and re-apply the PRISTINE load-time protections after. x86's loader keeps the
-// whole guest image writable (guest code is only ever read by the translator there), so no-op default.
+// Around the pristine-image restore memcpy. Both loaders apply per-segment W^X (.text R+X, .rodata R)
+// and the prewarm guest may have narrowed more (musl's RELRO), so the restore opens the span RW, copies,
+// then re-applies the PRISTINE load-time protections AND read-only registry -- through the loaders' own
+// hl_elf_protect_segments, so "pristine" means the same thing on both sides of the fork. Without the
+// re-open the first restore memcpy faults on the now-R+X .text.
+static void fsrv_restore_prep(const struct loaded *L, uint64_t span) {
+    (void)mprotect((void *)(uintptr_t)L->base, (size_t)span, PROT_READ | PROT_WRITE);
+}
+
+static void fsrv_restore_done(const struct loaded *L, uint64_t span) {
+    (void)span;
+    const uint8_t *ph = (const uint8_t *)L->phdr;
+    uint64_t minv = ~0ull;
+    for (int i = 0; i < L->phnum; i++) {
+        const uint8_t *p = ph + (size_t)i * (size_t)L->phent;
+        if (hl_elf_ph32(p) != 1) continue; // PT_LOAD
+        uint64_t v = hl_elf_ph64(p + 16);
+        if (v < minv) minv = v;
+    }
+    hl_elf_protect_segments(NULL, ph, L->phnum, L->phent, L->base - (minv & ~0xFFFull)); // load_elf's bias
+}
+
 #ifndef FSRV_RESTORE_PREP
-#define FSRV_RESTORE_PREP(L, span) ((void)0)
+#define FSRV_RESTORE_PREP(L, span) fsrv_restore_prep((L), (span))
 #endif
 #ifndef FSRV_RESTORE_DONE
-#define FSRV_RESTORE_DONE(L, span) ((void)0)
+#define FSRV_RESTORE_DONE(L, span) fsrv_restore_done((L), (span))
 #endif
 // Per-guest host-service table init that hl_run_linux_guest() performs before it runs a guest (the
 // futex / seq-ref / eventfd-counter / fdvis / task-state SHARED arenas). The prewarm path runs guests via
@@ -346,7 +365,7 @@ static int hl_server_main(int argc, char **argv) {
         // cover not just the shared ld.so+startup but the per-APPLET code paths too, we run a small
         // UNION of common busybox applets -- COW lets every later warm worker inherit all of them.
         // The pristine image is restored between runs so each applet starts from clean memory.
-        int devnull = open("/dev/null", O_WRONLY);
+        int devnull = open(HL_LINUX_HOST_NULL_DEVICE, O_WRONLY);
         int sv1 = dup(1), sv2 = dup(2);
         if (devnull >= 0) {
             dup2(devnull, 1);

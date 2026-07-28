@@ -137,6 +137,9 @@ void hl_aarch64_signal_restore(struct cpu *c) {
 // cpu, leaving the stolen regs untouched. block_return (jit/dispatch.c, included later) unwinds a block back
 // to the dispatcher: it restores the host callee-saved state run_block saved at block entry and returns to
 // the run_guest loop, which then sees cpu->pc == handler and runs it.
+//
+// That 1:1 reading confines the two functions below to an AArch64 HOST (HL_HOST_HAS_A64_CONTEXT).
+#if defined(HL_HOST_HAS_A64_CONTEXT)
 int hl_aarch64_signal_capture(struct cpu *c, void *ucv, hl_aarch64_signal_cache_fn cache_contains,
                               void *callback_context) {
     ucontext_t *uc = (ucontext_t *)ucv;
@@ -158,3 +161,23 @@ void hl_aarch64_signal_resume(struct cpu *c, void *ucv, uintptr_t dispatcher_ret
     memcpy(HL_HOST_UC_REGS(uc), &cpu_address, sizeof(cpu_address)); // block_return reads &cpu from x0
     HL_HOST_UC_PC(uc) = (uint64_t)dispatcher_return;
 }
+#else
+// Non-AArch64 host: this transliterator emitted no host code, so a host fault is never a fault inside a
+// translated block. Return 0 -- os/linux/signal.c reads that as "not the guest's own CPU fault" and
+// re-raises, whereas 1 synthesises a guest frame from an uninitialised capture and swallows a real engine
+// crash. Resume is unreachable but must still exist to link.
+int hl_aarch64_signal_capture(struct cpu *c, void *ucv, hl_aarch64_signal_cache_fn cache_contains,
+                              void *callback_context) {
+    (void)c;
+    (void)ucv;
+    (void)cache_contains;
+    (void)callback_context;
+    return 0;
+}
+
+void hl_aarch64_signal_resume(struct cpu *c, void *ucv, uintptr_t dispatcher_return) {
+    (void)c;
+    (void)ucv;
+    (void)dispatcher_return;
+}
+#endif

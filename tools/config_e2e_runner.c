@@ -22,6 +22,44 @@
 static volatile sig_atomic_t interrupted_signal;
 static volatile sig_atomic_t active_group;
 
+/* Per-launch guest budget and its host-backend scale; tools/matrix_runner.c is the reference, docs/ci-green.md
+   the reasoning, and the knob is identical in all six runners. 30s assumes a JIT host; without one a correct
+   launch is terminated and reported as a hang. This runner is also the perf.linux-warm-cache-* payload, and
+   the budget is PER LAUNCH: every one of that case's REPETITIONS samples must fit inside it. */
+enum { CASE_TIMEOUT_MS = 30000, TIMEOUT_SCALE_MAX = 100 };
+
+static unsigned long timeout_scale = 1;
+
+static unsigned int case_timeout_ms(void) {
+    return (unsigned int)((unsigned long)CASE_TIMEOUT_MS * timeout_scale);
+}
+
+static int load_timeout_scale(void) {
+    const char *value = getenv("HL_MATRIX_TIMEOUT_SCALE");
+    char *end = NULL;
+    unsigned long parsed;
+    if (value == NULL || *value == 0) return 0;
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    /* strtoul() accepts a sign, wrapping "-1" to ULONG_MAX, so the first character is checked directly. */
+    if (value[0] < '0' || value[0] > '9' || errno != 0 || end == value || *end != 0 || parsed < 1 ||
+        parsed > TIMEOUT_SCALE_MAX) {
+        fprintf(stderr,
+                "config-e2e-runner: HL_MATRIX_TIMEOUT_SCALE=\"%s\" is not a decimal factor in [1, %d]; refusing "
+                "to run rather than silently using the unscaled per-case timeout\n",
+                value, TIMEOUT_SCALE_MAX);
+        return 1;
+    }
+    timeout_scale = parsed;
+    /* On stdout, in a PASSING case: a green scaled lane must not read as evidence of comparable speed. */
+    if (timeout_scale == 1) return 0;
+    printf("config-e2e-runner: per-case timeout scaled x%lu to %ums (HL_MATRIX_TIMEOUT_SCALE); this run "
+           "tolerates slow-but-correct guest execution and is NOT evidence of speed comparable to an unscaled "
+           "lane\n",
+           timeout_scale, case_timeout_ms());
+    return 0;
+}
+
 static void interrupt_runner(int signal_number) {
     sig_atomic_t group = active_group;
     interrupted_signal = signal_number;
@@ -175,6 +213,7 @@ static int read_result(const char *path, int expected_exit) {
 static int run_config(const char *bridge, const char *engine, const char *config_path, const char *result_path,
                       int expected_exit) {
     const struct timespec tick = {0, 10000000};
+    const unsigned int budget_ms = case_timeout_ms();
     unsigned int elapsed_ms = 0;
     pid_t child = fork();
     if (child < 0) return 1;
@@ -186,7 +225,7 @@ static int run_config(const char *bridge, const char *engine, const char *config
     }
     (void)setpgid(child, child);
     active_group = (sig_atomic_t)child;
-    while (elapsed_ms < 30000) {
+    while (elapsed_ms < budget_ms) {
         int status;
         pid_t result = waitpid(child, &status, WNOHANG);
         if (result == child) {
@@ -209,6 +248,11 @@ static int run_config(const char *bridge, const char *engine, const char *config
         nanosleep(&tick, NULL);
         elapsed_ms += 10;
     }
+    /* Silent at scale 1, as this path has always been; a launch killed at 900s with no explanation is the
+       diagnostic the scale exists to avoid. */
+    if (timeout_scale != 1)
+        fprintf(stderr, "%s config launch: timed out after %ums (HL_MATRIX_TIMEOUT_SCALE=%lu)\n", engine, budget_ms,
+                timeout_scale);
     terminate(child);
     unlink(config_path);
     return 1;
@@ -226,6 +270,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: config-e2e-runner BRIDGE ENGINE GUEST EXPECTED_EXIT [REPETITIONS [CACHE]]\n");
         return 2;
     }
+    /* Before the first launch, so a malformed scale is one line at the top of the log, not a verdict. */
+    if (load_timeout_scale() != 0) return 2;
     expected_exit = atoi(argv[4]);
     if (argc == 6) {
         char *end = NULL;

@@ -108,8 +108,15 @@ void jit_guest_bus_transition_end(void *opaque) {
 // run_block/block_return (frontend/x86_64/translate.c, included before this file) and defines
 // G_OWN_TRAMPOLINES to suppress these aarch64 ones. (engine-dedup §B.1/§B.3: the register model is the
 // one irreducible divergence; the shared loop only CALLS run_block, never bakes its offsets.)
+//
+// Hand-written ARM64: the HOST-CPU axis. HL_HOST_CPU_AARCH64 (src/host/host_cpu.h) decides whether an ARM64
+// boundary exists; only inside it does the compiler pick the spelling. One combined `__aarch64__` test handed
+// ARM64 mnemonics to the x86 assembler. guest/aarch64/{stubs,cache}.c and guest/x86_64/emit.c must match this
+// pair exactly.
 #ifndef G_OWN_TRAMPOLINES
-#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+#include "../host/host_cpu.h"
+#if defined(HL_HOST_CPU_AARCH64)
+#if defined(__GNUC__) && !defined(__clang__)
 /* GCC has no AArch64 naked-function implementation.  Assembly symbols keep
    the host boundary free of a compiler-generated frame. */
 extern void run_block(struct cpu *cpu, void *code) __attribute__((visibility("hidden")));
@@ -158,6 +165,34 @@ __attribute__((naked)) static void block_return(void) {
                      // host sp
                      "ldr x9, [x0, #280]\n mov sp, x9\n"
                      "ret\n");
+}
+#endif
+#else
+// Host CPU with a name but no execution backend: the ARM64 bridge has no far end. Define both anyway --
+// run_guest() and the emitters reference them unconditionally -- and abort rather than return, since a silent
+// return replays the previous block's cpu->reason and spins the dispatcher on a PC that never moves. Not
+// hl_fatal_report(): it returns to its caller to unwind, and there is nothing here to unwind to. `static` is
+// load-bearing -- the dual activation archive links both target objects and namespace.h does not rename these
+// two (docs/amd64-host.md §3.7). A backend with its own boundary defines G_OWN_TRAMPOLINES instead.
+static void run_block(struct cpu *cpu, void *code) {
+    (void)cpu;
+    (void)code;
+    fprintf(stderr, "hl: run_block() entered on a " HL_HOST_CPU_NAME " host with no execution backend.\n"
+                    "    A backend supplies translate_block() plus its own run_block()/block_return() and declares\n"
+                    "    G_OWN_TRAMPOLINES so this placeholder is not compiled -- see the host-CPU fork in\n"
+                    "    src/core/target/<guest isa>.c and docs/amd64-host.md. Reaching this means that fork selected\n"
+                    "    an arm that defines neither an ARM64 boundary nor a backend of its own.\n");
+    abort();
+}
+
+static void block_return(void) {
+    fprintf(stderr,
+            "hl: block_return() entered on a " HL_HOST_CPU_NAME " host. Only a translated ARM64 block branches\n"
+            "    here, and none can exist on this host -- so its address was baked into something that then ran,\n"
+            "    which means a stale persistent-cache image or a mis-relocated exit was executed. Cache identity\n"
+            "    includes the host ISA (src/translator/identity.c) precisely to make that impossible, so this is\n"
+            "    a bug in the identity key, not a stale directory.\n");
+    abort();
 }
 #endif
 #endif // G_OWN_TRAMPOLINES
@@ -228,7 +263,7 @@ static void run_guest(struct cpu *c) {
         G_CKPT_POLL(c);
 #endif
         if (G_PC(c) == SIGRETURN_PC) {
-            do_sigreturn(c);
+            sigreturn_frame(c); // do_sigreturn + the non-PIE frame fold (linux_abi/signal.c)
             // A handler just returned: release exactly ITS deferred set (the signals that were pending when it
             // was entered) so they become deliverable again, then immediately deliver the next still-pending
             // signal BEFORE resuming the interrupted context -- a batch of signals unblocked together runs
@@ -245,7 +280,9 @@ static void run_guest(struct cpu *c) {
         }
         // A non-PIE image's un-relocated absolute jump lands on its (unmapped) low link vaddr; redirect it
         // into the biased image so we translate real code instead of faulting on the unmapped low address.
-        if (g_nonpie_lo && G_PC(c) >= g_nonpie_lo && G_PC(c) < g_nonpie_hi) G_PC(c) += g_nonpie_bias;
+        // (The one place the folded value is deliberately CARRIED rather than used and dropped: the running
+        // PC stays high, and pcrel_base/lea un-bias it again whenever an address is materialised.)
+        G_PC(c) = nonpie_fold(G_PC(c));
         // Frontend hook: top-of-loop debug instrumentation (x86-only; empty on aarch64).
         G_DISPATCH_DEBUG(c);
         // With threads, the WHOLE cache lookup is under the lock: an unlocked

@@ -15,6 +15,43 @@
 
 enum { HL_E2E_OUTPUT_LIMIT = 1024 * 1024 };
 
+/* Per-case guest budget and its host-backend scale; tools/matrix_runner.c is the reference, docs/ci-green.md
+   the reasoning, and the knob is identical in all six runners. 30s assumes a JIT host; without one a correct
+   case is killed and reported as a hang. Scale 1 is bit-for-bit the unscaled runner; a bad value is refused,
+   not rounded to 1. */
+enum { CASE_TIMEOUT_MS = 30000, TIMEOUT_SCALE_MAX = 100 };
+
+static unsigned long timeout_scale = 1;
+
+static unsigned int case_timeout_ms(void) {
+    return (unsigned int)((unsigned long)CASE_TIMEOUT_MS * timeout_scale);
+}
+
+static int load_timeout_scale(void) {
+    const char *value = getenv("HL_MATRIX_TIMEOUT_SCALE");
+    char *end = NULL;
+    unsigned long parsed;
+    if (value == NULL || *value == 0) return 0;
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    /* strtoul() accepts a sign, wrapping "-1" to ULONG_MAX, so the first character is checked directly. */
+    if (value[0] < '0' || value[0] > '9' || errno != 0 || end == value || *end != 0 || parsed < 1 ||
+        parsed > TIMEOUT_SCALE_MAX) {
+        fprintf(stderr,
+                "e2e-runner: HL_MATRIX_TIMEOUT_SCALE=\"%s\" is not a decimal factor in [1, %d]; refusing to run "
+                "rather than silently using the unscaled per-case timeout\n",
+                value, TIMEOUT_SCALE_MAX);
+        return 1;
+    }
+    timeout_scale = parsed;
+    /* On stdout, in a PASSING case: a green scaled lane must not read as evidence of comparable speed. */
+    if (timeout_scale == 1) return 0;
+    printf("e2e-runner: per-case timeout scaled x%lu to %ums (HL_MATRIX_TIMEOUT_SCALE); this run tolerates "
+           "slow-but-correct guest execution and is NOT evidence of speed comparable to an unscaled lane\n",
+           timeout_scale, case_timeout_ms());
+    return 0;
+}
+
 typedef struct hl_e2e_result {
     char *output;
     size_t output_size;
@@ -99,9 +136,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: e2e-runner BRIDGE ENGINE GUEST EXPECTED_EXIT [NATIVE_ORACLE]\n");
         return 2;
     }
+    if (load_timeout_scale() != 0) return 2;
     expected_exit = atoi(argv[4]);
     if (argc == 6) {
-        status = run_process(NULL, NULL, argv[5], 30000, &oracle);
+        /* The oracle is a HOST-native binary run without the engine, so the scale never applies to it; the
+           unscaled budget keeps the hang detector sharp where it still works. */
+        status = run_process(NULL, NULL, argv[5], CASE_TIMEOUT_MS, &oracle);
         if (status != 0 || !exit_matches(&oracle, expected_exit)) {
             fprintf(stderr, "native oracle %s failed or timed out (status=%d raw=%d)\n", argv[5], status,
                     oracle.status);
@@ -110,11 +150,15 @@ int main(int argc, char **argv) {
     } else {
         memset(&oracle, 0, sizeof oracle);
     }
-    status = run_process(argv[1], argv[2], argv[3], 30000, &guest);
+    status = run_process(argv[1], argv[2], argv[3], case_timeout_ms(), &guest);
     if (guest.output_size != 0) (void)fwrite(guest.output, 1, guest.output_size, stdout);
     if (status != 0 || !exit_matches(&guest, expected_exit)) {
         fprintf(stderr, "%s running %s: expected exit %d, status=%d raw=%d\n", argv[2], argv[3], expected_exit, status,
                 guest.status);
+        /* Only when scaled, so unscaled failure output stays verbatim rather than naming a budget. */
+        if (status == 2 && timeout_scale != 1)
+            fprintf(stderr, "%s running %s: timed out after %ums (HL_MATRIX_TIMEOUT_SCALE=%lu)\n", argv[2], argv[3],
+                    case_timeout_ms(), timeout_scale);
         return 1;
     }
     if (argc == 6 &&

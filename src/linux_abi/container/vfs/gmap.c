@@ -3,7 +3,9 @@
 
 #include <errno.h>
 #include <stdlib.h>
+#if !defined(_WIN32)
 #include <sys/mman.h>
+#endif
 
 #define MLK_N 1024
 #define HL_GUEST_RLIMIT_MEMLOCK 8
@@ -37,6 +39,53 @@ typedef struct hl_exec_mapping {
 
 static hl_exec_mapping g_exec_mappings[HL_EXEC_MAPPING_CAPACITY];
 static size_t g_exec_mapping_count;
+
+/* Teardown for a registry range the engine holds NO ownership handle for. Everything this registry mapped
+ * itself is released through the seam -- discard() and release() above and below -- and only two populations
+ * reach here: a provider mapping the provider placed at a fixed address and a loader range whose handle a
+ * later MAP_FIXED already retired. The seam cannot express their release, because unmap_range() is keyed on
+ * the owning handle and by construction there is none. An address-keyed teardown operation on
+ * hl_host_memory_services is what would retire this, and that is an ABI decision for the seam and its four
+ * backends, not something this file can settle.
+ *
+ * Windows never populates either case, because both of these arrive from paths the Windows host does not
+ * run, so there is no range here to release and no reachable behaviour to preserve. */
+static void gmap_release_unowned(uint64_t address, uint64_t length) {
+#if defined(_WIN32)
+    (void)address;
+    (void)length;
+#else
+    (void)munmap((void *)(uintptr_t)address, (size_t)length);
+#endif
+}
+
+/* Guest mlock/mlockall wiring, applied to real host pages so /proc residency is honest rather than merely
+ * tracked. The seam has no wiring operation at all, on any host: mlock(2) is reached directly here.
+ *
+ * Windows spells the nearest thing VirtualLock, but that grows the process WORKING SET rather than pinning a
+ * page against reclaim, and the two differ in whose limit applies and what a refusal means -- so it belongs
+ * behind a host backend that can state which it implements, not behind a name substituted here. A refusal is
+ * reported as one, and the caller's contract already covers it: mlockall wires best-effort and a range the
+ * host declines is left pageable while the call still succeeds, which is how an exhausted RLIMIT_MEMLOCK
+ * already behaves on Linux. The guest's lock STATE is registry bookkeeping and stays exact either way. */
+static int gmap_wire(uint64_t address, uint64_t length) {
+#if defined(_WIN32)
+    (void)address;
+    (void)length;
+    return -1;
+#else
+    return mlock((void *)(uintptr_t)address, (size_t)length);
+#endif
+}
+
+static void gmap_unwire(uint64_t address, uint64_t length) {
+#if defined(_WIN32)
+    (void)address;
+    (void)length;
+#else
+    (void)munlock((void *)(uintptr_t)address, (size_t)length);
+#endif
+}
 
 static struct hl_gmap_context g_gmap;
 
@@ -154,18 +203,46 @@ int hl_gmap_find_physical(uint64_t address, uint64_t *physical_address, uint64_t
     return 0;
 }
 
+/* Is every page of [address, address+length) mapped?  The UNION of the entries answers this, not any single
+   one: mprotect, mlock, mremap and mincore all operate across adjacent VMAs on Linux, and the registry
+   splits an entry whenever a MAP_FIXED or a partial munmap divides it -- so a single-entry test rejected a
+   range the guest had mapped in two pieces (mincore over a region MAP_FIXED'd in the middle returned
+   ENOMEM).  Strictly wider than the old test, so nothing a single entry covered stops being covered. */
 int hl_gmap_contains(uint64_t address, uint64_t length) {
-    uint64_t end = address + length;
+    uint64_t end = address + length, at = address;
     if (end < address) return 0;
-    for (size_t index = 0; index < g_gmap.mapping_count; index++) {
-        const hl_gmap_entry *entry = &g_gmap.mappings[index];
-        if (entry->address <= address && end <= entry->address + entry->length) return 1;
+    for (int extended = 1; at < end && extended;) {
+        extended = 0;
+        for (size_t index = 0; index < g_gmap.mapping_count; index++) {
+            const hl_gmap_entry *entry = &g_gmap.mappings[index];
+            if (entry->address <= at && at < entry->address + entry->length) {
+                at = entry->address + entry->length;
+                extended = 1;
+                break;
+            }
+        }
     }
-    return 0;
+    return at >= end;
+}
+
+static void hl_gmap_split_range(uint64_t start, uint64_t end);
+
+/* MAP_FIXED replaces whatever the range held, so the registry entries it overlapped must be split the way
+   the kernel splits the VMAs -- otherwise the superseded reservation stays whole and /proc/[pid]/maps emits
+   overlapping rows (ld.so's whole-span reservation plus every segment it MAP_FIXED inside it), violating the
+   ascending non-overlapping invariant the file's readers assume.  Ledger only: the host mapping was replaced
+   in place by the caller's own mmap, so the exec-mapping handles must NOT be discarded here. */
+void hl_gmap_supersede_range(uint64_t start, uint64_t end) {
+    if (end <= start) return;
+    hl_gmap_split_range(start, end);
 }
 
 void hl_gmap_unmap_range(uint64_t start, uint64_t end) {
     if (end > start) hl_exec_mapping_discard_range(start, end - start);
+    hl_gmap_split_range(start, end);
+}
+
+static void hl_gmap_split_range(uint64_t start, uint64_t end) {
     for (size_t index = 0; index < g_gmap.mapping_count;) {
         hl_gmap_entry *entry = &g_gmap.mappings[index];
         uint64_t base = entry->address;
@@ -225,7 +302,7 @@ void hl_gmap_reset(void) {
     for (size_t index = 0; index < g_gmap.mapping_count; index++) {
         const hl_gmap_entry *entry = &g_gmap.mappings[index];
         if (!hl_exec_mapping_owns(entry->address, entry->length))
-            (void)munmap((void *)(uintptr_t)entry->physical_address, (size_t)entry->physical_length);
+            gmap_release_unowned(entry->physical_address, entry->physical_length);
     }
     hl_exec_mapping_reset();
     g_gmap.mapping_count = 0;
@@ -293,7 +370,7 @@ void hl_exec_mapping_reset(void) {
             if (g_gmap.host != NULL && g_gmap.host->memory != NULL && g_gmap.host->memory->release != NULL)
                 (void)g_gmap.host->memory->release(g_gmap.host->context, entry->handle);
         } else {
-            (void)munmap((void *)(uintptr_t)entry->address, (size_t)entry->length);
+            gmap_release_unowned(entry->address, entry->length);
         }
         entry->handle = HL_HOST_HANDLE_INVALID;
     }
@@ -353,7 +430,7 @@ int hl_gmap_lock_wire_current(void) {
     for (size_t index = 0; index < g_gmap.mapping_count; index++) {
         hl_gmap_entry *entry = &g_gmap.mappings[index];
         if (!entry->address || !entry->length) continue;
-        if (mlock((void *)(uintptr_t)entry->address, (size_t)entry->length) != 0) failed++;
+        if (gmap_wire(entry->address, entry->length) != 0) failed++;
     }
     return failed;
 }
@@ -362,7 +439,7 @@ void hl_gmap_lock_unwire_all(void) {
     for (size_t index = 0; index < g_gmap.mapping_count; index++) {
         hl_gmap_entry *entry = &g_gmap.mappings[index];
         if (!entry->address || !entry->length) continue;
-        munlock((void *)(uintptr_t)entry->address, (size_t)entry->length);
+        gmap_unwire(entry->address, entry->length);
     }
 }
 

@@ -18,6 +18,10 @@ categories = ["emulators", "api-bindings"]
 # package. Dropping them took 0.1.27 from 11.3 MB (over the limit, rejected) to
 # under it. assets/lib/** keeps the archives; assets/alpine and assets/PROVENANCE
 # are excluded.
+#
+# The budget also keeps PUBLISHED archives a subset of SUPPORTED hosts: each is
+# ~24 MB and the two here leave no room, so x86_64-unknown-linux-gnu is supported
+# but its archive is built from the checkout (build.rs names the target).
 include = [
     "Cargo.toml",
     "README.md",

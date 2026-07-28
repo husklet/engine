@@ -24,6 +24,10 @@
 extern void hl_host_private_init(void) __attribute__((weak));
 extern int hl_host_process_fd_private_add(int descriptor) __attribute__((weak));
 extern void hl_host_process_fd_private_remove(int descriptor) __attribute__((weak));
+/* Distinguishes "this host has no private band" (negative) from "it has one and
+ * the add still failed", which is the difference between a tolerable refusal and
+ * a real error at the registration site below. */
+extern int hl_host_process_fd_private_floor(void) __attribute__((weak));
 
 // Read exactly `n` bytes from `fd` into `buf`, looping over short reads. Returns 0 on success, -1 on
 // EOF/error -- a truncated buffer is a hard failure (a partial config must never launch a container).
@@ -319,8 +323,12 @@ int hl_run_config_file_with(const char *path, hl_launch_runner runner) {
      * decoded from it.  It is engine control state, never a guest descriptor. */
     if (hl_host_private_init != NULL) hl_host_private_init();
     if (hl_host_process_fd_private_add != NULL && hl_host_process_fd_private_add(fd) != 0) {
-        close(fd);
-        return 78;
+        int floor = hl_host_process_fd_private_floor != NULL ? hl_host_process_fd_private_floor() : -1;
+        if (floor >= 0) {
+            close(fd);
+            fprintf(stderr, "hl-engine: --configfile: cannot reserve private descriptor\n");
+            return 78;
+        }
     }
     unlink(path);
     int rc = hl_read_config_file(fd, runner);

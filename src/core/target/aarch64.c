@@ -14,19 +14,19 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/mman.h>
+#include "../../linux_abi/host_mman.h" // <sys/mman.h>, or the typed VM seam where the host has none
 #include <sys/stat.h>
 #include <pthread.h>
 #include <errno.h>
 #include <limits.h>
 #include <time.h>
 #include <sys/time.h>
-#include <sys/uio.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/un.h>
-#include <poll.h>
+#include "../../linux_abi/host_uio.h" // <sys/uio.h>, or the guest iovec layout where the host has none
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_poll.h" // <poll.h>, or a typed absence where the host has no mixed-handle readiness
 #include "../../host/native_compat.h"
 #include "../../host/native_context.h"
 #include <signal.h>
@@ -36,10 +36,10 @@
 #include <mach/mach_vm.h> // Mach exception diagnostics; JIT mappings belong to src/host/macos
 #include <sys/event.h>
 #endif
-#include <termios.h>
-#include <sys/ioctl.h>
-#include <sys/resource.h>
-#include <sys/wait.h>
+#include "../../linux_abi/host_tty.h"
+#include "../../linux_abi/host_tty.h"
+#include "../../linux_abi/host_proc.h"
+#include "../../linux_abi/host_wait.h"
 #include <stdatomic.h>
 #include <dlfcn.h>
 
@@ -97,6 +97,14 @@ static void filemap_refresh_emulated(uint64_t lo, uint64_t hi);
 
 // code cache + block map + chaining
 #include "../../translator/cache.c"
+#include "../../translator/guest_memory.h"
+#include "../../linux_abi/logical_vma.h"
+
+// The translator may not link the Linux ABI (DOCS.md 3), so the engine hands it the ledger lookup the
+// instruction fetch needs. The data/non-PIE entries are x86-only; an aarch64 guest never uses them.
+static const hl_guest_memory_ops g_guest_memory_ops = {
+    hl_logical_vma_resolve_exec,          NULL, NULL, NULL, NULL, hl_logical_vma_resolve_exec_span,
+    hl_logical_vma_global_exec_generation};
 
 static const hl_host_services *effective_host_services(void) {
     return hl_target_services_effective(&g_target_services);
@@ -108,6 +116,10 @@ static void emit_crash_diagnostic(const char *message, size_t size) {
         host->log->emit(host->context, HL_LOG_TAG_SIGNAL, message, size);
 }
 
+// Host-CPU fork: an AArch64 host takes the same-ISA transliterating JIT below; any other takes interp.c,
+// which supplies the same seam by decoding AArch64. Both share struct cpu: it is the checkpoint format.
+#include "../../host/host_cpu.h"
+#if defined(HL_HOST_CPU_AARCH64)
 // Keep the unity consumers' compact encoder vocabulary while the assembler itself is an independently
 // compiled, explicitly-stateful translator component.
 #include "../../translator/host/aarch64/asm.h"
@@ -141,6 +153,9 @@ static void e_ldp_q(int rt, int rt2, int rn, int off) { hl_a64_ldp_q(&g_emit, rt
 #include "../../translator/guest/aarch64/stubs.c"
 // transliterate + mangle + §B + LSE + depth-gate
 #include "../../translator/guest/aarch64/translate.c"
+#else
+#include "../../translator/guest/aarch64/interp.c"
+#endif
 // clone/futex/threads (declares run_guest)
 #include "../../linux_abi/thread.c"
 // signal delivery
@@ -178,6 +193,10 @@ static void do_sigreturn(struct cpu *c) {
     hl_aarch64_signal_restore(c);
 }
 
+// Fault capture is per BACKEND: the JIT reconstructs guest state from the host mcontext and refines the host
+// PC via the provenance map and cpu->mscratch folds; the interpreter has cpu->pc current. Both return 0 for
+// "not a guest fault".
+#if defined(HL_HOST_CPU_AARCH64)
 static int sigframe_capture_fault(struct cpu *c, void *native_context) {
     if (!hl_aarch64_signal_capture(c, native_context, signal_cache_contains, NULL)) return 0;
     uint64_t exact_pc;
@@ -198,10 +217,22 @@ static int sigframe_capture_fault(struct cpu *c, void *native_context) {
     }
     return 1;
 }
+#else
+static int sigframe_capture_fault(struct cpu *c, void *native_context) {
+    return interp_signal_capture(c, native_context);
+}
+#endif
 
+// The JIT returns into block_return to unwind the translated frame; the interpreter siglongjmps to run_block.
+#if defined(HL_HOST_CPU_AARCH64)
 static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {
     hl_aarch64_signal_resume(c, native_context, (uintptr_t)block_return);
 }
+#else
+static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {
+    interp_signal_resume(c, native_context);
+}
+#endif
 // path jail + overlay + /proc synth
 #include "../../linux_abi/container/vfs.c"
 #include "../../linux_abi/image.h"
@@ -340,7 +371,13 @@ static void diag_crash(int s, siginfo_t *si, void *uc) {
     if (deliver_guest_fault(s, si, uc)) return;
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
     ucontext_t *u = (ucontext_t *)uc;
+#if defined(HL_HOST_HAS_A64_CONTEXT)
+    // These are the JIT's scratch and link registers -- which trampoline was mid-flight -- and mean nothing
+    // under another register file. Keep the column layout; they read zero.
     uint64_t *regs = u ? HL_HOST_UC_REGS(u) : NULL;
+#else
+    uint64_t *regs = NULL;
+#endif
     uint64_t hpc = u ? (uint64_t)HL_HOST_UC_PC(u) : 0;
     uint64_t hx0 = regs ? regs[0] : 0;
     uint64_t hx1 = regs ? regs[1] : 0;
@@ -782,7 +819,7 @@ static int container_init(const char *rootfs) {
         const char *owner_lowers[8];
         for (int i = 0; i < g_nlower; ++i) owner_lowers[i] = g_lower[i].canon;
         g_rootfs = (char *)rootfs;
-        if (root_handle_bind(g_rootfs) != 0) return -1;
+        if (root_handle_bind(g_rootfs) != 0 || root_native_require(g_rootfs) != 0) return -1;
         if (hl_owner_seed(g_rootfs, hl_option_get("HL_FILE_OWNERS"), owner_lowers, (size_t)g_nlower) != 0) return -1;
         container_populate_dev();        // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         container_populate_machine_id(); // /etc/machine-id agreeing with boot_id (if image ships none)
@@ -822,6 +859,7 @@ static int guest_fetch_direct_valid(uint64_t address, size_t length) {
 }
 
 static int engine_global_init(void) {
+    hl_guest_memory_bind(&g_guest_memory_ops);
     hl_guest_fetch_set_direct_validator(guest_fetch_direct_valid);
     if (hl_target_services_bind(&g_target_services) != 0) return 1;
     if (g_engine_inited) return 0;
@@ -1109,44 +1147,9 @@ int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const ch
 }
 
 // resident engine fork server (server/client/worker), shared with the x86-64 target through the
-// container-init/engine-init/load/run seam above. aarch64 has no
-// g_loadbase and its container model never chdir()s the engine into the rootfs (those knobs stay
-// default no-ops), but its load_elf applies per-segment W^X to the guest image (.text R+X, .rodata R;
-// the prewarm run's guest may mprotect more, e.g. musl RELRO) -- so the fork-server's pristine-image
-// restore must open the span RW and re-apply the PRISTINE load-time protections afterwards, mirroring
-// load_elf's p_flags loop. Without this the first restore memcpy SIGBUSes on the R+X .text.
-static void fsrv_restore_prep_a64(const struct loaded *L, uint64_t span) {
-    mprotect((void *)L->base, span, PROT_READ | PROT_WRITE);
-}
-
-static void fsrv_restore_done_a64(const struct loaded *L, uint64_t span) {
-    (void)span;
-    size_t host_page = hl_host_page_size();
-    const uint8_t *ph = (const uint8_t *)L->phdr;
-    uint64_t minv = ~0ull;
-    for (int i = 0; i < L->phnum; i++) {
-        const uint8_t *p = ph + (size_t)i * (size_t)L->phent;
-        if (rd32(p) != 1) continue; // PT_LOAD
-        uint64_t v = rd64(p + 16);
-        if (v < minv) minv = v;
-    }
-    uint64_t bias = L->base - (minv & ~0xFFFull); // load_elf: bias = host base - link basepage
-    for (int i = 0; i < L->phnum; i++) {
-        const uint8_t *p = ph + (size_t)i * (size_t)L->phent;
-        if (rd32(p) != 1) continue;
-        uint32_t fl = rd32(p + 4); // PF_X=1, PF_W=2, PF_R=4
-        uint64_t v = rd64(p + 16), msz = rd64(p + 40);
-        uint64_t s = (v + bias) & ~0xFFFull, e = (v + bias + msz + 0xFFFull) & ~0xFFFull;
-        int prot = PROT_READ | ((fl & 2) ? PROT_WRITE : 0) | ((fl & 1) ? PROT_EXEC : 0);
-        // Reapply only protections that do not round across a neighboring guest segment on a larger
-        // macOS page. load_elf uses the same independently-protectable-range rule.
-        if (e > s && host_page && !(s & (host_page - 1)) && !(e & (host_page - 1)))
-            mprotect((void *)s, e - s, prot);
-    }
-}
-
-#define FSRV_RESTORE_PREP(L, span) fsrv_restore_prep_a64((L), (span))
-#define FSRV_RESTORE_DONE(L, span) fsrv_restore_done_a64((L), (span))
+// container-init/engine-init/load/run seam above. aarch64 has no g_loadbase and its container model never
+// chdir()s the engine into the rootfs, so those knobs stay default no-ops; the pristine-image restore
+// around the guest image's W^X is now the shared default too (fork.c, fsrv_restore_prep/done).
 // Bind the same per-guest host-service tables a cold hl_run_linux_guest() would, so the fork-server prewarm
 // parent (which runs guests via run_loaded()) allocates them once and every warm COW worker inherits them.
 #define FSRV_GUEST_HOST_INIT()                                                                                          \

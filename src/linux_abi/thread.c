@@ -1,6 +1,7 @@
 // hl/linux_abi -- threads & futex (clone -> pthread; per-thread cpu; futex via condvars).
 
 #include "../host/range.h"
+#include "page.h" // hl_linux_host_map_granularity
 #include "../host/system.h"
 #include "bus.h"
 #include "logical_vma.h"
@@ -329,6 +330,78 @@ static inline struct futex_bucket *fbk_of(const void *uaddr) {
 
 // PROF: fast (no-lock) wakes, slow (locked) wakes, eagain pre-checks
 static uint64_t g_futex_wake_fast, g_futex_wake_slow, g_futex_wait_n;
+
+// ===================== non-PIE image placement, per host ========================================
+// Where a non-PIE ET_EXEC is mapped is a HOST property. It is the entire reason the next block exists,
+// and the reason the next block is dormant here.
+//   Linux: nothing owns the low 4 GB (vm.mmap_min_addr is 64 KiB, the link vaddr is 0x400000 for both
+//     guest ISAs, and the engine itself is PIE at ET_DYN_BASE), so the loader maps the image AT its link
+//     address. base == basepage, so the bias is 0, g_nonpie_lo stays 0, and one image byte has ONE name.
+//     Every fold below and every workaround built on it is then inert BY CONSTRUCTION, not by care.
+//   macOS: __PAGEZERO reserves the low 4 GB and no MAP_FIXED can get in, so the image must go HIGH and
+//     the two coordinate systems of the next block are unavoidable.
+// The machinery stays compiled in on both hosts: a checkpoint image records g_nonpie_lo/hi/bias and a
+// restore replays the placement its capture used, so a Linux engine must still be able to run folded.
+#if defined(__linux__)
+#define HL_NONPIE_LINK_PLACEMENT 1 // loaders (linux_abi/x86.c, linux_abi/elf.c) place ET_EXEC at p_vaddr
+#else
+#define HL_NONPIE_LINK_PLACEMENT 0
+#endif
+
+// Reserve [basepage, basepage+span) EXACTLY, or report failure by returning 0 with *mapping untouched.
+// MAP_FIXED_NOREPLACE, never MAP_FIXED: if anything already owns the link range -- a host below
+// vm.mmap_min_addr, an execve whose predecessor image has not been released, a kernel too old to honour
+// NOREPLACE -- the caller falls back to the biased placement rather than clobbering a live mapping.
+static uint64_t nonpie_place_at_link_address(uint64_t basepage, uint64_t span, hl_host_memory_mapping *mapping) {
+    if (!HL_NONPIE_LINK_PLACEMENT || basepage == 0 || span == 0) return 0;
+    const hl_host_services *host = effective_host_services();
+    hl_host_memory_mapping placed = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(placed), 0, 0, 0, 0};
+    hl_host_result result =
+        host->memory->map_anonymous(host->context, basepage, span, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                    HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED_NOREPLACE, &placed);
+    if (result.status != HL_STATUS_OK) return 0;
+    if (placed.address != basepage) { // pre-4.17 kernel: NOREPLACE degraded to a hint
+        (void)host->memory->release(host->context, placed.handle);
+        return 0;
+    }
+    *mapping = placed;
+    return basepage;
+}
+
+// ===================== non-PIE coordinates: the one rule ========================================
+// When the image IS folded (macOS, or a restored image captured folded) it is mapped HIGH at
+// +g_nonpie_bias but carries no dynamic relocations, so every address BAKED INTO IT stays at the LOW
+// link vaddr. One image byte therefore has two names, and which one is correct is not a judgement call:
+//
+//   GUEST (low) is canonical. Anything the guest can name, is handed, or asks about -- a baked
+//   pointer, a syscall argument, AT_PHDR/AT_ENTRY, a sigaltstack ss_sp, a /proc/self/maps row, a
+//   protection-registry key -- is the LOW value, because the fold is the loader's private business
+//   and nothing inside the guest knows it happened.
+//
+//   HOST (high) is STORAGE, and the only thing it is ever right for is one host dereference. Fold
+//   at the instant of the dereference and throw the result away; never store it, never return it,
+//   never key a registry on it.
+//
+// Eight defects on this branch were one half of that rule missed: rip-relative LEA and mov r64,imm32
+// materialising the wrong half; vfs.c and maps_phdr_segs dereferencing an unfolded AT_PHDR; a queued
+// signal delivered to an unfolded handler; the protection registries keyed HOST by the loader and GUEST
+// by mprotect; sigaltstack's ss_sp; a fault's si_addr handed back as storage.
+// nonpie_fold is total. nonpie_unfold is only for an address that is storage by construction -- a
+// hardware fault address, or a caller that already folded -- and is unambiguous only because the image
+// occupies [lo+bias,hi+bias), where no other guest mapping can be. Both inert for PIE (g_nonpie_lo == 0).
+// Tentatively defined here: thread.c is the earliest linux_abi member of the unity TU. dispatch.c's
+// nonpie_p is nonpie_fold under its historical name.
+static uint64_t g_nonpie_lo, g_nonpie_hi, g_nonpie_bias;
+
+static inline uint64_t nonpie_fold(uint64_t guest) {
+    return (g_nonpie_lo && guest >= g_nonpie_lo && guest < g_nonpie_hi) ? guest + g_nonpie_bias : guest;
+}
+
+static inline uint64_t nonpie_unfold(uint64_t storage) {
+    return (g_nonpie_lo && storage >= g_nonpie_lo + g_nonpie_bias && storage < g_nonpie_hi + g_nonpie_bias)
+               ? storage - g_nonpie_bias
+               : storage;
+}
 
 // ===================== guest PROT_NONE region registry ==========================================
 // hl maps every guest anon page R+W on the host (case 222 ORs in PROT_READ|WRITE) so that a later
@@ -824,7 +897,7 @@ static void filemap_resize_identity(uint64_t device, uint64_t inode, uint64_t ol
             if (!mapping->shared) {
                 mapping->follow_lo = old_accessible;
                 mapping->follow_hi = new_accessible;
-                long hp = sysconf(_SC_PAGESIZE);
+                long hp = (long)hl_linux_host_map_granularity();
                 uint64_t cursor = old_accessible;
                 while (hp > 0 && cursor < new_accessible) {
                     uint64_t absolute = mapping->lo + cursor;
@@ -1295,6 +1368,7 @@ static void gna_clear_raw(uint64_t lo, uint64_t hi) {
 // True iff any byte of [a,a+len) lies in a tracked guest PROT_NONE region.
 static int gna_hit(uint64_t a, uint64_t len) {
     if (!len || __atomic_load_n(&g_ngna, __ATOMIC_ACQUIRE) == 0) return 0;
+    a = nonpie_unfold(a); // registry keys are guest coordinates; callers may hold either (see the rule above)
     uint64_t end = a + len;
     uint64_t generation = atomic_load_explicit(&g_gna_generation, memory_order_acquire);
     uint64_t first_page = a >> 12, last_page = (end - 1) >> 12;
@@ -1313,12 +1387,24 @@ static int gna_hit(uint64_t a, uint64_t len) {
     return 0;
 }
 
+// True iff EVERY guest page of [a,a+len) is in a tracked guest PROT_NONE region -- the whole-MAPPING
+// question, which gna_hit ("any byte") must not be used for: a glibc pthread stack is one mmap whose first
+// page is the guard. Walks pages: gna_add does not coalesce a piecewise-mprotect'd reservation's intervals.
+static int gna_all(uint64_t a, uint64_t len) {
+    if (!len || __atomic_load_n(&g_ngna, __ATOMIC_ACQUIRE) == 0) return 0;
+    uint64_t end = a + len;
+    for (uint64_t page = a & ~(uint64_t)0xfff; page < end; page += 0x1000)
+        if (!gna_hit(page, 1)) return 0;
+    return 1;
+}
+
 // How many LEADING bytes of [a,a+len) are outside every tracked guest PROT_NONE region. Linux's
 // copy_to_user is byte-granular: a read(2) whose destination straddles a PROT_NONE page copies the good
 // prefix and returns that SHORT count, reporting EFAULT only when the prefix is empty. gna_hit alone
 // cannot express that (it is all-or-nothing), so the read family clamps its count with this instead.
 static uint64_t gna_prefix(uint64_t a, uint64_t len) {
     if (!len || __atomic_load_n(&g_ngna, __ATOMIC_ACQUIRE) == 0) return len;
+    a = nonpie_unfold(a); // guest-keyed registry; the return is a LENGTH, so the coordinate cancels
     uint64_t end = a + len;
     for (int i = 0; i < g_ngna; i++)
         if (a < g_gna[i].hi && end > g_gna[i].lo) {
@@ -1383,6 +1469,7 @@ static void gro_clear_raw(uint64_t lo, uint64_t hi) {
 
 static int gro_hit(uint64_t a, uint64_t len) {
     if (!len || __atomic_load_n(&g_ngro, __ATOMIC_ACQUIRE) == 0) return 0;
+    a = nonpie_unfold(a); // guest-keyed registry; a hardware fault address arrives in storage coordinates
     uint64_t end = a + len;
     // RETRY the seqlock instead of answering "read-only" while a writer is mid-update: any concurrent
     // mprotect/mmap (a peer's thread-stack allocation) otherwise EFAULTs an unrelated writable address.
@@ -1537,6 +1624,26 @@ static void uninstall_host_sigaltstack(void) {
 // exception port intercepts EXC_BAD_ACCESS before the POSIX guards) and HL_NOFASTHRM=1 keep the
 // byte-identical mach_vm_region path.
 #include <setjmp.h>
+#if defined(_WIN32)
+// The host fault primitive already owns this exact operation, pad and all: it arms its own landing site,
+// touches each page (with an atomic OR of zero when the caller asked about writes, so the access really is
+// a write and still cannot lose a concurrent update), and reports whether every page was reachable. Its
+// probe window is consulted by the vectored handler BEFORE the engine classifier runs, which is exactly the
+// ordering the POSIX arm gets from calling hrm_fault_hook first -- a probe fault is the probe's answer and
+// nothing else's, so it can never be mis-served as a lazy mapping or reach guest-signal delivery.
+//
+// Measured, and the reason that ordering is stated rather than assumed: consulting the window after a
+// DECLINE instead is not equivalent, because the engine's classifier has no decline for a fault it cannot
+// serve -- it terminates the guest. A probe of an unmapped page (an mprotect hole check, a syscall's EFAULT
+// check) killed the process before the window was reached.
+//
+// So there is nothing left for a second implementation to do, and the two thread-locals and the fault hook
+// below have no Windows arm at all. What the primitive additionally buys, which no POSIX arm can, is the
+// kernel-write hole: a kernel touching an inaccessible user page on the caller's behalf raises no exception
+// anywhere, so every host call that hands guest memory to the kernel has to make the pages good from user
+// mode first, and that is this same probe.
+#include "../host/windows/fault.h"
+#endif
 static _Thread_local sigjmp_buf g_hrm_jb;                   // probe return point (valid while g_hrm_hi != 0)
 static _Thread_local volatile uintptr_t g_hrm_lo, g_hrm_hi; // page range being probed; probing iff hi != 0
 static int g_hrm_slow = -1; // HL_NOFASTHRM=1 / crash diagnostics -> per-page mach_vm_region
@@ -1546,6 +1653,12 @@ static int g_hrm_slow = -1; // HL_NOFASTHRM=1 / crash diagnostics -> per-page ma
 // entry and siglongjmp(.,0) does not restore masks, so unblock it here or the NEXT probe fault would be
 // force-killed instead of caught. Returns 0 (fault not ours) in every other case.
 static int hrm_fault_hook(siginfo_t *si) {
+#if defined(_WIN32)
+    // Never claims anything: the probe window lives inside the host fault primitive, and its dispatcher
+    // tests it directly. A hook that answered here would be a second, stale copy of that window.
+    (void)si;
+    return 0;
+#else
     if (!g_hrm_hi) return 0;
     uintptr_t va = (uintptr_t)(si ? si->si_addr : NULL);
     if (va < g_hrm_lo || va >= g_hrm_hi) return 0; // not the probe access -> normal fault handling
@@ -1555,6 +1668,7 @@ static int hrm_fault_hook(siginfo_t *si) {
     sigaddset(&s, SIGBUS);
     pthread_sigmask(SIG_UNBLOCK, &s, NULL);
     siglongjmp(g_hrm_jb, 1); // never returns
+#endif
 }
 
 static int host_range_mapped(uintptr_t a, size_t len) {
@@ -1564,6 +1678,11 @@ static int host_range_mapped(uintptr_t a, size_t len) {
     // A guest PROT_NONE mapping is physically R+W under hl (see the g_gna registry above), so the page
     // probe below would call it mapped; the kernel's copy_to/from_user faults it. Reject up front.
     if (gna_hit((uint64_t)a, (uint64_t)len) || hl_linux_bus_hit((uint64_t)a, (uint64_t)len)) return 0;
+#if defined(_WIN32)
+    // The registry rejections above are still ours -- they encode guest-visible protection this host's
+    // page tables do not carry -- and everything below them is the host primitive's job.
+    return hl_windows_fault_probe((uint64_t)a, (uint64_t)len, 0);
+#else
     uintptr_t lo = a & ~(uintptr_t)0xfff;
     if (g_hrm_slow < 0) g_hrm_slow = 0;
     if (g_hrm_slow) {
@@ -1592,6 +1711,7 @@ static int host_range_mapped(uintptr_t a, size_t len) {
     g_hrm_lo = 0;
     g_hrm_hi = 0; // probe window closed (hook inert again)
     return ok;
+#endif
 }
 
 /* Prove that every guest-page fragment in a range accepts stores without ever
@@ -1604,7 +1724,16 @@ static int host_range_writable(uintptr_t a, size_t len) {
     if (end < a || gna_hit((uint64_t)a, (uint64_t)len) || gro_hit((uint64_t)a, (uint64_t)len) ||
         hl_linux_bus_hit((uint64_t)a, (uint64_t)len))
         return 0;
+#if defined(_WIN32)
+    // A WRITE probe, not the read probe host_range_mapped issues. Two things follow from that on this host
+    // and neither is available to the POSIX arm: a page that is mapped but not writable answers correctly
+    // without consulting any registry, and the page is left present and dirty -- which is what closes the
+    // kernel-write hole for the call this validation precedes, where a kernel store into a not-yet-good
+    // page fails with no exception raised anywhere and no handler entered.
+    return hl_windows_fault_probe((uint64_t)a, (uint64_t)len, 1);
+#else
     return host_range_mapped(a, len);
+#endif
 }
 
 static void abs_from_rel(struct timespec *abs, const struct timespec *ts) {
@@ -2092,6 +2221,7 @@ static long futex_op(struct cpu *c, int *uaddr, const void *key, int op, int pri
 
 static void futex_wake_addr(uint64_t uaddr) {
     if (!uaddr) return;
+    uaddr = nonpie_fold(uaddr); // clear_child_tid is stored in guest coordinates; this is its deref
     // CLONE_CHILD_CLEARTID: zero the word then wake joiners (pthread_join FUTEX_WAITs on this word). A
     // DETACHED guest thread (e.g. musl's __unmapself) munmaps its OWN stack -- which also holds the thread
     // descriptor with this CLEARTID word -- and only THEN issues the exit syscall, so by the time we run
@@ -2454,7 +2584,7 @@ static void thread_exit_others(struct cpu *self) {
 // high-mapped list head. Translate each link before validating or dereferencing it; for PIE, heap, stack,
 // and mmap pointers this is an identity operation.
 static inline uint64_t robust_guest_to_host(uint64_t address) {
-    return (g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi) ? address + g_nonpie_bias : address;
+    return nonpie_fold(address);
 }
 
 static int robust_pin(uint64_t address, size_t length, uint32_t protection, hl_logical_vma_pin *pin, void **host) {
@@ -2511,7 +2641,10 @@ static void futex_robust_exit(struct cpu *c) {
     // Like clear-child-tid, Linux's kernel-driven robust-list wake has no FUTEX_PRIVATE_FLAG and uses the
     // shared key class. Keep it aligned with glibc's robust owner-death wait path.
     g_fbk_active = g_fbk;
-    uint64_t head = c->robust_list;
+    // The head is a guest pointer like every list entry below it (set_robust_list stores it unfolded).
+    // Left raw, an in-image head simply failed robust_copy_from and the whole walk was silently skipped --
+    // and the `entry == head` wrap test compared a folded entry against an unfolded head.
+    uint64_t head = robust_guest_to_host(c->robust_list);
     c->robust_list = 0;
     uint8_t head_copy[24];
     if (!head || !robust_copy_from(head_copy, head, sizeof(head_copy))) return;
@@ -2623,10 +2756,11 @@ static int spawn_thread(struct cpu *parent, uint64_t flags, uint64_t stack_top, 
     int tid = __sync_add_and_fetch(&g_next_tid, 1);
     // This thread's gettid() identity (see proc.c case 178): a unique id, distinct from the init's pid 1.
     child->tid = tid;
-    // CLONE_PARENT_SETTID
-    if ((flags & 0x00100000) && ptid) *(int *)ptid = tid;
-    // CLONE_CHILD_SETTID
-    if ((flags & 0x01000000) && ctid) *(int *)ctid = tid;
+    // CLONE_PARENT_SETTID / CLONE_CHILD_SETTID. clone(2)'s tid slots are ordinary guest pointers and a
+    // non-PIE guest may hand over a .bss one, so fold for the store (thread.c's rule); c->ctid keeps the
+    // guest value, and futex_wake_addr folds again at thread exit.
+    if ((flags & 0x00100000) && ptid) *(int *)nonpie_fold(ptid) = tid;
+    if ((flags & 0x01000000) && ctid) *(int *)nonpie_fold(ctid) = tid;
     // CLONE_CHILD_CLEARTID
     child->ctid = (flags & 0x00200000) ? ctid : 0;
     // robust list is per-thread and NOT inherited: a new thread starts empty and re-registers via

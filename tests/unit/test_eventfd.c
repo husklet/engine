@@ -58,6 +58,49 @@ int main(void) {
     value = 1;
     HL_CHECK(hl_linux_write(&linux_abi, (hl_linux_fd)fd, &value, sizeof(value)) == -HL_LINUX_EAGAIN);
     HL_CHECK(hl_linux_close(&linux_abi, (hl_linux_fd)fd) == 0);
+
+    /* The kernel's read/write size asymmetry (fs/eventfd.c). read takes any
+     * buffer of eight bytes or more and transfers exactly one counter into it;
+     * write takes eight and nothing else. An exact-8 rule on the read side is
+     * the gap this covers: it rejects the ordinary "read into a field of a
+     * wider struct" idiom that every eventfd user is entitled to write. */
+    {
+        unsigned char wide[16];
+        uint32_t half = 0;
+        fd = hl_linux_eventfd_create(&linux_abi, 0, HL_LINUX_EVENTFD_NONBLOCK, 0);
+        HL_CHECK(fd >= 0);
+        value = 5;
+        HL_CHECK(hl_linux_write(&linux_abi, (hl_linux_fd)fd, &value, 8) == 8);
+        /* write rejects every size but 8, and leaves the counter alone. */
+        HL_CHECK(hl_linux_write(&linux_abi, (hl_linux_fd)fd, &value, 16) == -HL_LINUX_EINVAL);
+        HL_CHECK(hl_linux_write(&linux_abi, (hl_linux_fd)fd, &value, 9) == -HL_LINUX_EINVAL);
+        HL_CHECK(hl_linux_write(&linux_abi, (hl_linux_fd)fd, &value, 4) == -HL_LINUX_EINVAL);
+        /* read below 8 is EINVAL and consumes nothing. */
+        HL_CHECK(hl_linux_read(&linux_abi, (hl_linux_fd)fd, &half, 4) == -HL_LINUX_EINVAL);
+        /* an oversized buffer transfers ONE counter, returns 8, and leaves the
+         * bytes past it untouched. */
+        memset(wide, 0xAA, sizeof wide);
+        HL_CHECK(hl_linux_read(&linux_abi, (hl_linux_fd)fd, wide, sizeof wide) == 8);
+        memcpy(&value, wide, sizeof(value));
+        HL_CHECK(value == 5 && wide[8] == 0xAA && wide[15] == 0xAA);
+        /* and the counter really was drained by that one read. */
+        HL_CHECK(hl_linux_read(&linux_abi, (hl_linux_fd)fd, wide, sizeof wide) == -HL_LINUX_EAGAIN);
+        /* a write of zero is admitted (returns 8) but is a pure no-op. */
+        value = 0;
+        HL_CHECK(hl_linux_write(&linux_abi, (hl_linux_fd)fd, &value, 8) == 8);
+        HL_CHECK(hl_linux_read(&linux_abi, (hl_linux_fd)fd, wide, 8) == -HL_LINUX_EAGAIN);
+        /* UINT64_MAX is the reserved value and never reaches the counter. */
+        value = UINT64_MAX;
+        HL_CHECK(hl_linux_write(&linux_abi, (hl_linux_fd)fd, &value, 8) == -HL_LINUX_EINVAL);
+        /* fstat reports the anonymous inode the kernel builds: a zero-length
+         * regular file, not a FIFO and not a typeless mode. */
+        {
+            hl_linux_file_status status;
+            HL_CHECK(hl_linux_fstat(&linux_abi, (hl_linux_fd)fd, &status) == 0);
+            HL_CHECK(status.mode == (HL_LINUX_S_IFREG | 0600u) && status.size == 0 && status.link_count == 1);
+        }
+        HL_CHECK(hl_linux_close(&linux_abi, (hl_linux_fd)fd) == 0);
+    }
     HL_CHECK(hl_linux_abi_validate_fds(&linux_abi) == HL_STATUS_OK);
     HL_CHECK(hl_linux_abi_destroy(&linux_abi) == HL_STATUS_OK);
     return 0;

@@ -1,8 +1,9 @@
 // hl/linux_abi/container -- termios (Linux<->macOS) + NET-ns private loopback (127/8 -> AF_UNIX).
 
-#include <netdb.h> // container DNS: getaddrinfo/getnameinfo via the macOS host resolver (dns_* below)
+#include "../host_socket.h" // container DNS: getaddrinfo/getnameinfo via the macOS host resolver (dns_* below)
 
 #include "../shared.h"
+#include "../../host/libc_compat.h" // hl_compat_mkdir: the UCRT's mkdir takes no mode
 #include "../checkpoint.h"
 #include "socket_identity.h"
 
@@ -212,7 +213,7 @@ static void termios_m2l(const struct termios *M, uint8_t *L) {
 
 // Linux MSG_* -> macOS MSG_* (they differ for TRUNC/DONTWAIT/EOR/WAITALL).
 static int msgflags_l2m(int lf) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     return lf;
 #else
     // OOB/PEEK/DONTROUTE identical
@@ -233,7 +234,7 @@ static int msgflags_l2m(int lf) {
 // returned-flags set differs: notably MSG_CTRUNC is macOS 0x20 / Linux 0x8, MSG_TRUNC macOS 0x10 /
 // Linux 0x20, MSG_EOR macOS 0x8 / Linux 0x80. OOB/DONTROUTE map straight through.
 static int msgflags_m2l(int mf) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     return mf;
 #else
     // MSG_OOB(0x1)/MSG_DONTROUTE(0x4) identical; MSG_PEEK isn't a returned flag but is harmless
@@ -1449,8 +1450,20 @@ static size_t cmsg_add_cred(uint8_t *g, size_t off, size_t cap, int pid, int uid
 }
 
 // SOL_SOCKET option name: Linux -> macOS (they differ). -1 = ignore (unsupported here).
+/*
+ * Windows takes the identity arm with Linux, and that is not an oversight worth
+ * re-litigating later: the socket vocabulary this layer calls on that host --
+ * src/linux_abi/host_socket.h -- is written in LINUX constants throughout and
+ * translates to the neutral host contract itself. Sending it the BSD numbers
+ * below would be the classic cross-level aliasing defect rather than a
+ * translation: BSD SO_ACCEPTCONN is 0x0002, and 2 is what Linux SO_REUSEADDR
+ * already is, so a "translated" SO_REUSEADDR arrives as a request to read a
+ * different option -- silently, since setting an option reports nothing.
+ * Measured before this arm existed: SO_RCVBUF(8) became 0x1002, which the
+ * neutral option table does not name, so a get-after-set reported failure.
+ */
 static int so_opt_l2m(int o) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     return o;
 #else
     switch (o) {
@@ -1492,7 +1505,7 @@ static int so_opt_l2m(int o) {
 // socket so a server's reply is never delivered until close (breaks redis & every keepalive-setting
 // server). Map the known ones; ignore (-1) unknown rather than pass through and accidentally cork.
 static int tcp_opt_l2m(int o) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     return o;
 #else
     switch (o) {
@@ -1947,7 +1960,33 @@ static uint8_t g_tcp_listen[HL_NFD];     // fd -> 1 once listen(2) succeeded (ro
 static int g_sock_backlog[HL_NFD];
 
 static int lo_on(void) {
+#if defined(_WIN32)
+    /*
+     * The private loopback namespace is off on this host, and the reason is
+     * structural rather than a missing feature.
+     *
+     * lo_swap() implements it by MINTING A FRESH AF_UNIX SOCKET AND dup2()ING IT
+     * OVER THE GUEST'S DESCRIPTOR, so that an INET socket the guest still holds
+     * is quietly backed by a local one. That requires two things this host does
+     * not have. First, a descriptor number here is the C library's, and the
+     * socket behind it lives in a side table that a C library dup2() does not
+     * move -- the swap would leave the guest's number pointing at the ORIGINAL
+     * socket while the new one is bound, which is exactly the failure measured
+     * before this guard existed: bind() answering EAFNOSUPPORT because an INET
+     * socket was handed a local address. Second, the rendezvous is a filesystem
+     * path under the guest's own /tmp, and a local socket here is bound with a
+     * host path, so the name the switch agrees on does not exist to bind to.
+     *
+     * With it off, a guest's 127.0.0.1 reaches the real host loopback. What is
+     * lost is ISOLATION between containers on one machine -- two guests would
+     * see each other's localhost -- not any socket behaviour, which is why the
+     * guard is here and not at the call sites: every one of them is correct
+     * unconditionally once the answer is "no namespace".
+     */
+    return 0;
+#else
     return g_netns[0] != 0;
+#endif
 }
 
 static int lo_is(const uint8_t *sa, socklen_t l) {
@@ -2301,7 +2340,7 @@ static void br_init(void) {
             g_netif[g_netif_count].ip = br_parse_ip(ip);
             if (!g_netif[g_netif_count].ip) break;
             g_netif[g_netif_count].prefix = (uint8_t)prefix;
-            mkdir(g_netif[g_netif_count].path, 0700);
+            hl_compat_mkdir(g_netif[g_netif_count].path, 0700);
             g_netif_count++;
             line = *end ? end + 1 : end;
         }
@@ -2313,7 +2352,7 @@ static void br_init(void) {
             g_netif[0].ip = br_parse_ip(dip);
             if (g_netif[0].ip) {
                 g_netif[0].prefix = 16;
-                mkdir(g_netif[0].path, 0700);
+                hl_compat_mkdir(g_netif[0].path, 0700);
                 g_netif_count = 1;
             }
         }
@@ -2953,7 +2992,7 @@ static void *udp_fwd_thread(void *p) {
     }
     f->hs = hs;
     snprintf(f->pdir, sizeof f->pdir, "/tmp/.hl-udp.%d.%u", (int)getpid(), (unsigned)f->hport);
-    mkdir(f->pdir, 0700);
+    hl_compat_mkdir(f->pdir, 0700);
     char buf[65536];
     for (;;) {
         struct pollfd pf[1 + UDP_FWD_MAXPEERS];
@@ -3509,7 +3548,7 @@ static void abs_init(void) {
     g_abs_init = 1;
     const char *ns = hl_option_get("HL_NETNS"); // same key used by ipc_ns_key (service.c)
     snprintf(g_absdir, sizeof g_absdir, "/tmp/.hl-abstract-%.40s", (ns && ns[0]) ? ns : "default");
-    mkdir(g_absdir, 0700); // EEXIST fine; peers share it (0700, guest is path-jailed)
+    hl_compat_mkdir(g_absdir, 0700); // EEXIST fine; peers share it (0700, guest is path-jailed)
 }
 
 // Is this guest sockaddr an abstract AF_UNIX addr? family u16==AF_UNIX, sun_path[0]==NUL, name>=1B.

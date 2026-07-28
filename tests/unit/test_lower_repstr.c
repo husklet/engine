@@ -4,8 +4,8 @@
 #include <string.h>
 
 #include "../../src/translator/guest/x86_64/cpu.h"
+#include "../../src/translator/guest/x86_64/lower/primitives.h"
 #include "../../src/translator/guest/x86_64/lower/repstr.h"
-#include "../../src/linux_abi/logical_vma.h"
 
 static unsigned movs_count;
 static unsigned stos_count;
@@ -33,25 +33,7 @@ static void store_committed(uint64_t address, uint64_t size) {
     committed_count++;
 }
 
-int hl_logical_vma_global_active(void) {
-    return 0;
-}
-
-int hl_logical_vma_pin_data(uint64_t address, size_t length, unsigned access, hl_logical_vma_pin *pin) {
-    (void)address;
-    (void)length;
-    (void)access;
-    (void)pin;
-    return 0;
-}
-
-void hl_logical_vma_unpin(hl_logical_vma_pin *pin) {
-    (void)pin;
-}
-
-uint64_t hl_x86_guest_pointer(uint64_t address) {
-    return address;
-}
+// The guest-memory seam stays unbound: no ledger, no non-PIE window, guest address == host address.
 
 void hl_x86_count_rep_movs(void) {
     movs_count++;

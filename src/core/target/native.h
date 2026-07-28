@@ -8,6 +8,8 @@
 
 #if defined(__APPLE__)
 #define HL_NATIVE_HOST_NAME "macos"
+#elif defined(_WIN32)
+#define HL_NATIVE_HOST_NAME "windows"
 #elif defined(__linux__)
 #define HL_NATIVE_HOST_NAME "linux"
 #else

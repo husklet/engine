@@ -2,7 +2,12 @@
 // IC, exit trampolines, block chaining. The engine's emission semantics, built on the host ARM64 assembler
 // (host/arm64/asm.c, #included before this file). Split out of the former engine/emit_arm64.c (C7).
 
-#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+// block_return lives in core/dispatch.c, later in this unity TU; this forward-declares it so the exits below
+// can bake its address. The two forms are not interchangeable at link time, so the condition MUST be
+// character-for-character dispatch.c's: an __asm__-block global under GCC (no AArch64 naked function), a
+// naked static under clang. The HOST decides it, hence HL_HOST_CPU_AARCH64.
+#include "../../../host/host_cpu.h"
+#if defined(__GNUC__) && !defined(__clang__) && defined(HL_HOST_CPU_AARCH64)
 extern void block_return(void) __attribute__((visibility("hidden")));
 #else
 static void block_return(void);

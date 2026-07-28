@@ -5,6 +5,7 @@
 #endif
 #include "../object.h"
 #include "../epoll.h"
+#include "../eventfd.h"
 #include "../watch.h"
 #include "../bus.h"
 #include "../../core/provider/files.h"
@@ -34,13 +35,19 @@ static int bound_sentinel_vacate(int target) {
     int relocated = fcntl(g_bound_sentinel, F_DUPFD_CLOEXEC, target < 64 ? 64 : target + 1);
     if (relocated < 0) return -errno;
     int adopted = hl_host_process_fd_private_adopt(relocated);
-    if (adopted < 0) {
+    /* No private band on this host means nothing to hoist into, and the guest
+     * asked only that this NUMBER be free -- which the relocation above already
+     * made it. Failing here instead would answer an ordinary F_DUPFD with EMFILE
+     * purely because its floor happened to be the sentinel's number. Same test
+     * bound_shadow_activate makes of the same refusal. */
+    if (adopted < 0 && hl_host_process_fd_private_floor() >= 0) {
         close(relocated);
         return -ENOSPC;
     }
     hl_host_process_fd_private_remove(g_bound_sentinel);
+    (void)hl_fdhandle_forget(g_bound_sentinel);
     close(g_bound_sentinel);
-    g_bound_sentinel = adopted;
+    g_bound_sentinel = adopted >= 0 ? adopted : relocated;
     return 0;
 }
 
@@ -1062,25 +1069,41 @@ static int bound_shadow_activate(void) {
         }
         return 0;
     }
-    opened = open("/dev/null", O_RDWR | O_CLOEXEC);
+    /* openat(AT_FDCWD, ...) IS open() on every host, and on a host whose
+       descriptors carry no metadata of their own it is also the call that files
+       the descriptor's access mode and close-on-exec in the handle table. The
+       bare open() left the sentinel unrecorded there, and the very next line
+       asks fcntl to duplicate it -- which on such a host can only answer for a
+       descriptor the table knows. */
+    opened = openat(AT_FDCWD, HL_LINUX_HOST_NULL_DEVICE, O_RDWR | O_CLOEXEC);
     if (opened < 0) return -1;
     g_bound_sentinel = bound_private_dup(opened, 64);
     if (g_bound_sentinel < 0) {
         int error = errno;
+        (void)hl_fdhandle_forget(opened);
         close(opened);
         errno = error;
         return -1;
     }
+    /* The record is only ever as good as the number it is filed under, and this
+       number is about to be free for reuse by a path that publishes nothing. */
+    (void)hl_fdhandle_forget(opened);
     close(opened);
     int adopted = hl_host_process_fd_private_adopt(g_bound_sentinel);
-    if (adopted < 0) {
+    /* A host that publishes no private descriptor band cannot hoist anything,
+       and refusing to activate on that account would refuse the typed box
+       outright. The sentinel then simply stays at the number bound_private_dup
+       chose, which is what an unhoisted engine descriptor is everywhere: a
+       collision hazard if a guest names it, not an incorrect answer. Same test
+       activation.c already makes of the same refusal. */
+    if (adopted < 0 && hl_host_process_fd_private_floor() >= 0) {
         int error = ENOSPC;
         close(g_bound_sentinel);
         g_bound_sentinel = -1;
         errno = error;
         return -1;
     }
-    g_bound_sentinel = adopted;
+    if (adopted >= 0) g_bound_sentinel = adopted;
     for (fd = 0; fd < g_linux_box->fd_capacity; ++fd) {
         int shadow;
         if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) != HL_STATUS_OK) continue;
@@ -2126,10 +2149,381 @@ static int64_t bound_rename_exchange(hl_host_handle old_dir, const char *old_pat
     return 0;
 }
 
+#if defined(_WIN32)
+/*
+ * The descriptor-shaped operations on a socket, on the one host where a socket
+ * descriptor is not a kernel descriptor.
+ *
+ * Everything the socket FAMILY names -- socket, bind, connect, sendmsg and the
+ * rest of 198..212 -- already reaches the network group through svc_net and the
+ * REAL vocabulary in host_socket.h, and none of it comes through here. What
+ * comes through here is the operations that are NOT about sockets and happen to
+ * be applied to one: read, write, close, dup, fcntl, ioctl and the two waits.
+ * Those resolve to the C library on this host, and the C library's descriptor
+ * table does not know that this number names a socket.
+ *
+ * It is routed here rather than inside those calls because this is the first
+ * router the dispatcher consults, and because it runs BEFORE the bound-slot
+ * gate below -- a socket descriptor is not a bound slot, and on this host there
+ * are no bound slots at all.
+ */
+static int64_t bound_socket_transfer(uint64_t address, uint64_t count, int descriptor, int writing) {
+    void *buffer;
+    int64_t result;
+    size_t size = count > (uint64_t)(1u << 20) ? (size_t)(1u << 20) : (size_t)count;
+    buffer = malloc(size != 0 ? size : 1);
+    if (buffer == NULL) return -ENOMEM;
+    if (writing) {
+        if (size != 0 && guest_copy_from(buffer, address, size) != (ssize_t)size) {
+            free(buffer);
+            return -EFAULT;
+        }
+        result = (int64_t)hl_linux_socket_write(descriptor, buffer, size);
+    } else {
+        result = (int64_t)hl_linux_socket_read(descriptor, buffer, size);
+        if (result > 0 && guest_copy_to(address, buffer, (size_t)result) != (ssize_t)result) {
+            free(buffer);
+            return -EFAULT;
+        }
+    }
+    if (result < 0) result = -(int64_t)errno;
+    free(buffer);
+    return result;
+}
+
+/* readv/writev are coalesced through one buffer rather than issued per vector.
+ * That is not an optimisation: a datagram socket must produce or consume one
+ * message per call, and a loop over the vectors would turn one datagram into
+ * several. */
+static int64_t bound_socket_vector(struct cpu *c, uint64_t address, uint64_t count, int descriptor, int writing) {
+    struct iovec vectors[64];
+    unsigned char *buffer;
+    uint64_t total = 0;
+    uint64_t index;
+    int64_t result;
+    (void)c;
+    if (count > HL_ARRAY_COUNT(vectors)) return -EINVAL;
+    if (count != 0 && guest_copy_from(vectors, address, (size_t)count * sizeof(vectors[0])) !=
+                          (ssize_t)((size_t)count * sizeof(vectors[0])))
+        return -EFAULT;
+    for (index = 0; index < count; ++index) {
+        if (vectors[index].iov_len > (size_t)(1u << 20)) return -EINVAL;
+        total += (uint64_t)vectors[index].iov_len;
+    }
+    if (total > (uint64_t)(1u << 22)) return -EINVAL;
+    buffer = malloc(total != 0 ? (size_t)total : 1);
+    if (buffer == NULL) return -ENOMEM;
+    if (writing) {
+        uint64_t offset = 0;
+        for (index = 0; index < count; ++index) {
+            const size_t length = vectors[index].iov_len;
+            if (length != 0 &&
+                guest_copy_from(buffer + offset, (uint64_t)(uintptr_t)vectors[index].iov_base, length) !=
+                    (ssize_t)length) {
+                free(buffer);
+                return -EFAULT;
+            }
+            offset += length;
+        }
+        result = (int64_t)hl_linux_socket_write(descriptor, buffer, (size_t)total);
+    } else {
+        result = (int64_t)hl_linux_socket_read(descriptor, buffer, (size_t)total);
+        if (result > 0) {
+            uint64_t remaining = (uint64_t)result;
+            uint64_t offset = 0;
+            for (index = 0; index < count && remaining != 0; ++index) {
+                size_t length = vectors[index].iov_len;
+                if ((uint64_t)length > remaining) length = (size_t)remaining;
+                if (length != 0 &&
+                    guest_copy_to((uint64_t)(uintptr_t)vectors[index].iov_base, buffer + offset, length) !=
+                        (ssize_t)length) {
+                    free(buffer);
+                    return -EFAULT;
+                }
+                offset += length;
+                remaining -= length;
+            }
+        }
+    }
+    if (result < 0) result = -(int64_t)errno;
+    free(buffer);
+    return result;
+}
+
+static short bound_socket_poll_events(uint32_t ready, short requested) {
+    short revents = 0;
+    if ((ready & HL_HOST_READY_READ) != 0) revents |= (short)(POLLIN & requested);
+    if ((ready & HL_HOST_READY_WRITE) != 0) revents |= (short)(POLLOUT & requested);
+    /* POLLERR and POLLHUP are reported whether or not they were asked for; that
+     * is poll(2)'s rule and the reason a caller may pass events == 0. */
+    if ((ready & HL_HOST_READY_ERROR) != 0) revents |= POLLERR;
+    if ((ready & HL_HOST_READY_HANGUP) != 0) revents |= (short)(POLLHUP | (POLLRDHUP & requested));
+    return revents;
+}
+
+/*
+ * poll over a set whose every member is a socket. A mixed set is declined and
+ * falls through to the ambient path, because the two populations have no shared
+ * waitable form on this host yet and half-answering a set is worse than not
+ * claiming it.
+ *
+ * The wait is a bounded re-derivation loop rather than a block, which is the
+ * readiness model this contract is built on: nothing here is woken by name, and
+ * a caller asks again. The slice is short enough that a guest select() with a
+ * millisecond timeout still behaves like one.
+ */
+static int bound_socket_poll(struct cpu *c, uint64_t address, uint64_t count, int64_t timeout_ms, int64_t *out) {
+    struct pollfd entries[64];
+    uint64_t index;
+    uint64_t elapsed = 0;
+    (void)c;
+    if (count == 0 || count > HL_ARRAY_COUNT(entries)) return 0;
+    if (guest_copy_from(entries, address, (size_t)count * sizeof(entries[0])) !=
+        (ssize_t)((size_t)count * sizeof(entries[0])))
+        return 0;
+    for (index = 0; index < count; ++index)
+        if (entries[index].fd >= 0 && !hl_linux_socket_is(entries[index].fd)) return 0;
+    for (;;) {
+        int ready_count = 0;
+        for (index = 0; index < count; ++index) {
+            uint32_t ready = 0;
+            entries[index].revents = 0;
+            if (entries[index].fd < 0) continue;
+            if (hl_linux_socket_readiness(entries[index].fd, 0, &ready) != 0) {
+                entries[index].revents = POLLNVAL;
+                ready_count++;
+                continue;
+            }
+            entries[index].revents = bound_socket_poll_events(ready, entries[index].events);
+            if (entries[index].revents != 0) ready_count++;
+        }
+        if (ready_count != 0 || timeout_ms == 0) {
+            if (guest_copy_to(address, entries, (size_t)count * sizeof(entries[0])) !=
+                (ssize_t)((size_t)count * sizeof(entries[0])))
+                *out = -EFAULT;
+            else
+                *out = ready_count;
+            return 1;
+        }
+        if (timeout_ms > 0 && (int64_t)elapsed >= timeout_ms) {
+            *out = 0;
+            return 1;
+        }
+        {
+            struct timespec slice = {0, 1000000};
+            nanosleep(&slice, NULL);
+        }
+        elapsed++;
+    }
+}
+
+static int bound_socket_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
+    int64_t result;
+    const int descriptor = (int)(int32_t)a0;
+    /* execve keeps the descriptor numbering and drops the close-on-exec ones.
+     * Done here and NOT claimed -- the exec itself belongs to whoever handles it
+     * -- because a socket's close-on-exec bit lives in this layer's own record
+     * and no other sweep can see it. Harmless if the exec then fails: the guest
+     * asked for these to be gone the moment it succeeded, and a failed execve
+     * that left them open would be the surprising outcome. */
+    if (nr == 221 || nr == 281) {
+        (void)hl_linux_socket_release_cloexec();
+        return 0;
+    }
+    switch (nr) {
+    case 57: /* close */
+        if (!hl_linux_socket_is(descriptor)) return 0;
+        result = hl_linux_socket_close(descriptor) == 0 ? 0 : -(int64_t)errno;
+        break;
+    case 63: /* read */
+        if (!hl_linux_socket_is(descriptor)) return 0;
+        result = bound_socket_transfer(a1, a2, descriptor, 0);
+        break;
+    case 64: /* write */
+        if (!hl_linux_socket_is(descriptor)) return 0;
+        result = bound_socket_transfer(a1, a2, descriptor, 1);
+        break;
+    case 65: /* readv */
+        if (!hl_linux_socket_is(descriptor)) return 0;
+        result = bound_socket_vector(c, a1, a2, descriptor, 0);
+        break;
+    case 66: /* writev */
+        if (!hl_linux_socket_is(descriptor)) return 0;
+        result = bound_socket_vector(c, a1, a2, descriptor, 1);
+        break;
+    case 23: /* dup */
+        if (!hl_linux_socket_is(descriptor)) return 0;
+        result = hl_linux_socket_dup(descriptor, -1);
+        if (result < 0) result = -(int64_t)errno;
+        break;
+    case 24: /* dup3, and the legacy dup2 the normalizer folds into it */
+        if (!hl_linux_socket_is(descriptor)) return 0;
+        if ((int)(int32_t)a1 == descriptor) {
+            /* dup2 of a descriptor onto itself is a no-op that must NOT close
+             * it; dup3 of the same pair is EINVAL. G_IS_DUP2_COMPAT tells the
+             * two apart on the arch where both exist. */
+            result = G_IS_DUP2_COMPAT() ? (int64_t)descriptor : -EINVAL;
+            break;
+        }
+        result = hl_linux_socket_dup(descriptor, (int)(int32_t)a1);
+        if (result >= 0 && (a2 & (uint64_t)HL_LINUX_O_CLOEXEC) != 0)
+            (void)hl_linux_socket_set_cloexec((int)(int32_t)a1, 1);
+        if (result < 0) result = -(int64_t)errno;
+        break;
+    case 25: { /* fcntl */
+        uint32_t flags = 0;
+        if (!hl_linux_socket_is(descriptor)) return 0;
+        if (hl_linux_socket_get_flags(descriptor, &flags) != 0) return 0;
+        switch ((int32_t)a1) {
+        case HL_LINUX_F_DUPFD:
+        case HL_LINUX_F_DUPFD_CLOEXEC:
+            result = hl_linux_socket_dup(descriptor, -1);
+            if (result >= 0 && (int32_t)a1 == HL_LINUX_F_DUPFD_CLOEXEC)
+                (void)hl_linux_socket_set_cloexec((int)result, 1);
+            if (result < 0) result = -(int64_t)errno;
+            break;
+        case HL_LINUX_F_GETFD:
+            result = (flags & HL_LINUX_SOCKET_CLOEXEC) != 0 ? HL_LINUX_FD_CLOEXEC : 0;
+            break;
+        case HL_LINUX_F_SETFD:
+            result = hl_linux_socket_set_cloexec(descriptor, (a2 & HL_LINUX_FD_CLOEXEC) != 0) == 0 ? 0
+                                                                                                  : -(int64_t)errno;
+            break;
+        case HL_LINUX_F_GETFL:
+            /* A socket is always readable and writable, so the access mode is
+             * O_RDWR; the only settable bit this layer records is O_NONBLOCK. */
+            result = (int64_t)(uint64_t)(HL_LINUX_O_RDWR |
+                                         ((flags & HL_LINUX_SOCKET_NONBLOCK) != 0 ? HL_LINUX_O_NONBLOCK : 0u));
+            break;
+        case HL_LINUX_F_SETFL:
+            result = hl_linux_socket_set_nonblock(descriptor, (a2 & HL_LINUX_O_NONBLOCK) != 0) == 0
+                         ? 0
+                         : -(int64_t)errno;
+            break;
+        default: result = -EINVAL; break;
+        }
+        break;
+    }
+    case 29: { /* ioctl */
+        uint32_t ready = 0;
+        if (!hl_linux_socket_is(descriptor)) return 0;
+        if ((uint32_t)a1 == 0x5421u) { /* FIONBIO */
+            int requested = 0;
+            if (guest_copy_from(&requested, a2, sizeof(requested)) != (ssize_t)sizeof(requested))
+                result = -EFAULT;
+            else
+                result = hl_linux_socket_set_nonblock(descriptor, requested != 0) == 0 ? 0 : -(int64_t)errno;
+            break;
+        }
+        if ((uint32_t)a1 == 0x541bu) { /* FIONREAD */
+            uint64_t pending = 0;
+            int available;
+            if (hl_linux_socket_readiness_and_pending(descriptor, 0, &ready, &pending) != 0) {
+                result = -(int64_t)errno;
+                break;
+            }
+            available = pending > (uint64_t)INT_MAX ? INT_MAX : (int)pending;
+            result = guest_copy_to(a2, &available, sizeof(available)) == (ssize_t)sizeof(available) ? 0 : -EFAULT;
+            break;
+        }
+        result = -EINVAL;
+        break;
+    }
+    case 73: { /* ppoll */
+        struct timespec timeout;
+        int64_t milliseconds = -1;
+        if (a2 != 0) {
+            if (guest_copy_from(&timeout, a2, sizeof(timeout)) != (ssize_t)sizeof(timeout)) return 0;
+            milliseconds = (int64_t)timeout.tv_sec * 1000 + timeout.tv_nsec / 1000000;
+        }
+        if (!bound_socket_poll(c, a0, a1, milliseconds, &result)) return 0;
+        break;
+    }
+    default: return 0;
+    }
+    (void)a3;
+    G_RET(c) = (uint64_t)result;
+    return 1;
+}
+#endif /* _WIN32 */
+
 static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
     hl_linux_fd_snapshot source;
     int64_t result;
     int source_bound = !g_bound_source_native && bound_snapshot(a0, &source);
+#if defined(_WIN32)
+    if (!g_bound_source_native && bound_socket_route(c, nr, a0, a1, a2, a3)) return 1;
+    /* eventfd2 over the typed counter provider.
+     *
+     * Windows only. The emulated eventfd is a host pipe pair plus a counter in a
+     * shared arena, and on a host with no pipe there is nothing under it; the
+     * typed provider is a real counter object with the kernel's own semantics.
+     * Every other host keeps the emulation, which is mature and cross-process,
+     * so this arm is deliberately not taken there.
+     *
+     * The shadow-descriptor reservation is the same one inotify_init1 does below
+     * and for the same reason: the object lives only in the typed box table, so
+     * without a real kernel descriptor holding the identical number a later
+     * non-bound open is handed that number and silently aliases the eventfd.
+     *
+     * Flag validation matches fs/eventfd.c -- only EFD_SEMAPHORE, EFD_CLOEXEC
+     * and EFD_NONBLOCK, everything else EINVAL. glibc's EventFD probe calls
+     * eventfd2(0, ~0) and REQUIRES it to fail, so a permissive mask here is a
+     * feature-detection lie rather than a harmless leniency. */
+    if (nr == 19 && g_linux_box != NULL) {
+        const uint64_t semaphore = UINT64_C(0x1), nonblock = UINT64_C(0x800), cloexec = UINT64_C(0x80000);
+        struct fdvis_reservation fdvis;
+        hl_linux_fd_reservation reservation;
+        hl_status status;
+        int shadow;
+        if ((a1 & ~(semaphore | nonblock | cloexec)) != 0) {
+            G_RET(c) = (uint64_t)(int64_t)-EINVAL;
+            return 1;
+        }
+        shadow = bound_shadow_reserve(0);
+        if (shadow < 0) {
+            G_RET(c) = (uint64_t)(int64_t)-(int64_t)errno;
+            return 1;
+        }
+        if (shadow >= guest_nofile_cur()) {
+            close(shadow);
+            G_RET(c) = (uint64_t)(int64_t)-EMFILE;
+            return 1;
+        }
+        if (proc_fdvis_reserve(&fdvis) != 0) {
+            close(shadow);
+            G_RET(c) = (uint64_t)(int64_t)-ENOSPC;
+            return 1;
+        }
+        for (;;) {
+            status = hl_linux_fd_reserve_at(g_linux_box, (hl_linux_fd)shadow, &reservation);
+            if (status != HL_STATUS_ALREADY_EXISTS) break;
+            close(shadow);
+            shadow = bound_shadow_reserve(shadow + 1);
+            if (shadow < 0 || shadow >= guest_nofile_cur()) break;
+        }
+        if (status != HL_STATUS_OK || shadow < 0 || shadow >= guest_nofile_cur()) {
+            if (shadow >= 0) close(shadow);
+            proc_fdvis_reservation_cancel(&fdvis);
+            G_RET(c) = (uint64_t)(int64_t)-EMFILE;
+            return 1;
+        }
+        /* The token only proves the slot is free; the installer publishes it. */
+        (void)hl_linux_fd_cancel(g_linux_box, &reservation);
+        result = hl_linux_eventfd_create_at(g_linux_box, (hl_linux_fd)shadow, a0,
+                                            (uint32_t)(((a1 & semaphore) != 0 ? HL_LINUX_EVENTFD_SEMAPHORE : 0u) |
+                                                       ((a1 & nonblock) != 0 ? HL_LINUX_EVENTFD_NONBLOCK : 0u)),
+                                            (a1 & cloexec) != 0 ? HL_LINUX_FD_CLOEXEC : 0);
+        if (result < 0) {
+            close(shadow);
+            proc_fdvis_reservation_cancel(&fdvis);
+        } else {
+            proc_fdvis_reservation_publish(&fdvis, (int)result, HL_HOST_FD_OTHER, 0, 0);
+        }
+        G_RET(c) = (uint64_t)result;
+        return 1;
+    }
+#endif
     if (nr == 26 && g_linux_box != NULL) {
         bound_inotify_provider *provider;
         struct fdvis_reservation fdvis;

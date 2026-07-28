@@ -10,11 +10,41 @@ extern "C" {
 
 typedef struct hl_activation_process hl_activation_process;
 
+/* A borrowed host descriptor as this API carries it, and the one spelling of "absent".
+ *
+ * The older int32_t entry points below spell absence as -1. That is a fine non-descriptor on a POSIX
+ * host, and an unusable one elsewhere: on Win32 the same bit pattern, (HANDLE)-1, is simultaneously
+ * INVALID_HANDLE_VALUE and the pseudo-handle GetCurrentProcess() returns. An "absent" value that is also
+ * a live handle to the calling process cannot be made safe by documenting it: the first caller that
+ * forwards the value unchecked has handed something a handle to the embedder itself. So the sentinel
+ * moves off -1 entirely rather than being reinterpreted per host.
+ *
+ * HL_ACTIVATION_DESCRIPTOR_NONE is 0, which no host in this API's reach ever hands out as a live
+ * descriptor: NULL is never a valid Win32 handle, and a POSIX caller holding descriptor 0 duplicates it
+ * before passing it here. That costs nothing in practice -- absence already means "inherit this
+ * application's stream", which for `input` is descriptor 0 anyway -- and it makes a zeroed structure
+ * mean "nothing attached" instead of "attach descriptor 0", which is the safer of the two defaults.
+ *
+ * The width is for the type, not the range. Descriptor values remain 32-bit significant by contract;
+ * 64 bits only keeps the type from being mistaken for, or silently interconverted with, the signed
+ * descriptor numbers it replaces. Values above INT32_MAX are rejected, not truncated. */
+typedef uint64_t hl_activation_descriptor;
+#define HL_ACTIVATION_DESCRIPTOR_NONE ((hl_activation_descriptor)0)
+
+/* Borrowed host descriptors for the three process streams. HL_ACTIVATION_DESCRIPTOR_NONE inherits the
+ * application's stream; any other value is duplicated into the reexecuted child during start.
+ * Ownership never transfers, and the caller may close a descriptor as soon as start returns, whether
+ * start succeeds or fails. */
+typedef struct hl_activation_streams {
+    hl_activation_descriptor input;
+    hl_activation_descriptor output;
+    hl_activation_descriptor error;
+} hl_activation_streams;
+
+/* The pre-hl_activation_descriptor form of hl_activation_streams, retained unchanged for existing
+ * callers. -1 in a field inherits the application's stream; a nonnegative descriptor is duplicated into
+ * the reexecuted child. Same ownership rules. New code should prefer hl_activation_streams. */
 typedef struct hl_activation_stdio {
-    /* Borrowed host descriptors. A nonnegative descriptor is duplicated into
-     * the reexecuted child during start; -1 inherits the application's stream.
-     * Ownership never transfers, and the caller may close it as soon as start
-     * returns, whether start succeeds or fails. */
     int32_t input;
     int32_t output;
     int32_t error;
@@ -57,10 +87,23 @@ HL_API hl_status hl_activation_start_terminal_with_transport(const char *executa
                                                              const char *config_path, hl_terminal_size size,
                                                              int32_t transport, int32_t *out_master,
                                                              hl_activation_process **out_process);
-/* General activation entry point: any combination of stdio OR a controlling terminal, an optional provider
- * transport, and an optional checkpoint broker (include/hl/checkpoint_stream.h). Both descriptors are
- * borrowed and transferred with SCM_RIGHTS; neither is a guest descriptor. `size` non-NULL selects the
- * terminal form and requires `out_master`; `stdio` and `size` are mutually exclusive. */
+/* General activation entry point: any combination of process streams OR a controlling terminal, an optional
+ * provider transport, and an optional checkpoint broker (include/hl/checkpoint_stream.h). Every descriptor
+ * is borrowed and transferred with SCM_RIGHTS; none of them is a guest descriptor. `size` non-NULL selects
+ * the terminal form and requires `out_master`; `streams` and `size` are mutually exclusive. `transport`,
+ * `checkpoint` and `trigger` are HL_ACTIVATION_DESCRIPTOR_NONE when not requested. `out_master` receives the
+ * caller-owned terminal master, or HL_ACTIVATION_DESCRIPTOR_NONE when no terminal was requested and on every
+ * failure path. */
+HL_API hl_status hl_activation_start_with_streams(const char *executable, uint32_t guest_isa, const char *config_path,
+                                                  const hl_activation_streams *streams, const hl_terminal_size *size,
+                                                  hl_activation_descriptor transport,
+                                                  hl_activation_descriptor checkpoint,
+                                                  hl_activation_descriptor trigger,
+                                                  hl_activation_descriptor *out_master,
+                                                  hl_activation_process **out_process);
+HL_API hl_status hl_activation_terminal_resize(hl_activation_descriptor master, hl_terminal_size size);
+/* The pre-hl_activation_descriptor forms of the two calls above, retained unchanged for existing callers.
+ * They are the same operations with -1 in place of HL_ACTIVATION_DESCRIPTOR_NONE. */
 HL_API hl_status hl_activation_start_with_channels(const char *executable, uint32_t guest_isa, const char *config_path,
                                                    const hl_activation_stdio *stdio, const hl_terminal_size *size,
                                                    int32_t transport, int32_t checkpoint, int32_t trigger,

@@ -4,6 +4,71 @@
 
 #include "checkpoint_channel.h"
 
+/* The checkpoint transport is not a protocol that happens to use POSIX; it IS four POSIX mechanisms.
+ * The broker is an AF_UNIX socketpair, engine processes announce themselves by passing a live descriptor
+ * over SCM_RIGHTS, the per-process channel is re-created after fork() because a shared stream socket would
+ * interleave two processes' frames, and the trigger is a memfd mapped MAP_SHARED so every fork descendant
+ * polls one counter with a plain load. Windows has none of the four, and the descriptor-passing half is
+ * already declared absent for this host: fork_wire.c, which sends and receives those descriptors, is left
+ * out of the Windows host archive for exactly that reason.
+ *
+ * So the feature is guarded whole rather than emulated. Every entry point still exists, and each reports
+ * the absence in its own already-defined failure channel -- the -1 that callers handle when no broker was
+ * published or a connect failed -- so nothing here can be mistaken for a checkpoint that was taken. A named
+ * pipe plus DuplicateHandle could carry this protocol one day; that is a transport to design, not a spelling
+ * to shim, and inventing half of it here would produce a channel that accepts requests and captures nothing. */
+#if defined(_WIN32)
+
+void hl_ckpt_channel_publish(int broker) { (void)broker; }
+int hl_ckpt_channel_broker(void) { return -1; }
+int hl_ckpt_channel_adopt(const char *broker, const char *trigger) {
+    (void)broker;
+    (void)trigger;
+    return -1;
+}
+int hl_ckpt_channel_acquire(void) { return -1; }
+int hl_ckpt_channel_call(hl_ckpt_request *request, const char *name, const void *payload, hl_ckpt_reply *reply,
+                         void *out, size_t capacity) {
+    (void)request;
+    (void)name;
+    (void)payload;
+    (void)reply;
+    (void)out;
+    (void)capacity;
+    return -1;
+}
+void hl_ckpt_trigger_publish(int descriptor) { (void)descriptor; }
+int hl_ckpt_trigger_descriptor(void) { return -1; }
+int hl_ckpt_broker_pair(hl_activation_descriptor *out_parent, hl_activation_descriptor *out_child) {
+    if (out_parent != NULL) *out_parent = HL_ACTIVATION_DESCRIPTOR_NONE;
+    if (out_child != NULL) *out_child = HL_ACTIVATION_DESCRIPTOR_NONE;
+    return -1;
+}
+hl_activation_descriptor hl_ckpt_broker_accept(hl_activation_descriptor broker, int timeout_ms,
+                                               uint64_t *out_host_pid) {
+    (void)broker;
+    (void)timeout_ms;
+    (void)out_host_pid;
+    return HL_ACTIVATION_DESCRIPTOR_NONE;
+}
+int hl_ckpt_trigger_create(hl_activation_descriptor *out_descriptor, void **out_mapping) {
+    if (out_descriptor != NULL) *out_descriptor = HL_ACTIVATION_DESCRIPTOR_NONE;
+    if (out_mapping != NULL) *out_mapping = NULL;
+    return -1;
+}
+/* A trigger that was never created has no generation to advance. Zero is what a NULL mapping already
+ * returns on every host, so a caller that skipped the failed create() sees one answer everywhere. */
+uint32_t hl_ckpt_trigger_bump(void *mapping) {
+    (void)mapping;
+    return 0;
+}
+void hl_ckpt_trigger_destroy(void *mapping, hl_activation_descriptor descriptor) {
+    (void)mapping;
+    (void)descriptor;
+}
+
+#else
+
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -158,9 +223,23 @@ int hl_ckpt_channel_call(hl_ckpt_request *request, const char *name, const void 
     return 0;
 }
 
-int hl_ckpt_broker_pair(int *out_parent, int *out_child) {
+/* HL_ACTIVATION_DESCRIPTOR_NONE is 0, so a descriptor that landed on 0 -- which every allocator here will
+ * hand out if this process closed its standard input -- is a live descriptor indistinguishable from
+ * "absent". Move it off zero at the source rather than teaching each caller to second-guess the sentinel.
+ * Returns the (possibly new) descriptor, or -1 after closing the original when it cannot be moved. */
+static int checkpoint_reserve_descriptor(int descriptor) {
+    int moved;
+    if (descriptor != 0) return descriptor;
+    moved = fcntl(descriptor, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+    (void)close(descriptor);
+    return moved;
+}
+
+int hl_ckpt_broker_pair(hl_activation_descriptor *out_parent, hl_activation_descriptor *out_child) {
     int pair[2];
     if (out_parent == NULL || out_child == NULL) return -1;
+    *out_parent = HL_ACTIVATION_DESCRIPTOR_NONE;
+    *out_child = HL_ACTIVATION_DESCRIPTOR_NONE;
     /* Datagram framing: an arbitrary number of engine processes announce themselves concurrently and each
      * sendmsg is one indivisible record carrying one descriptor. */
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) != 0) return -1;
@@ -173,34 +252,48 @@ int hl_ckpt_broker_pair(int *out_parent, int *out_child) {
         (void)close(pair[1]);
         return -1;
     }
-    *out_parent = pair[0];
-    *out_child = pair[1];
+    pair[0] = checkpoint_reserve_descriptor(pair[0]);
+    pair[1] = checkpoint_reserve_descriptor(pair[1]);
+    if (pair[0] < 0 || pair[1] < 0) {
+        if (pair[0] >= 0) (void)close(pair[0]);
+        if (pair[1] >= 0) (void)close(pair[1]);
+        return -1;
+    }
+    *out_parent = (hl_activation_descriptor)pair[0];
+    *out_child = (hl_activation_descriptor)pair[1];
     return 0;
 }
 
-int hl_ckpt_broker_accept(int broker, int timeout_ms, uint64_t *out_host_pid) {
-    struct pollfd waiting = {.fd = broker, .events = POLLIN};
+hl_activation_descriptor hl_ckpt_broker_accept(hl_activation_descriptor broker, int timeout_ms,
+                                               uint64_t *out_host_pid) {
+    struct pollfd waiting;
     hl_ckpt_hello hello;
     int descriptors[8];
     int count = 0;
     int ready;
-    if (broker < 0) return -1;
+    int channel;
+    if (broker == HL_ACTIVATION_DESCRIPTOR_NONE || broker > (hl_activation_descriptor)INT32_MAX)
+        return HL_ACTIVATION_DESCRIPTOR_NONE;
+    waiting = (struct pollfd){.fd = (int)broker, .events = POLLIN};
     do {
         ready = poll(&waiting, 1, timeout_ms);
     } while (ready < 0 && errno == EINTR);
-    if (ready <= 0) return -1;
-    if (hl_fork_wire_receive_descriptors(broker, &hello, sizeof hello, descriptors, &count) != (int)sizeof hello) {
+    if (ready <= 0) return HL_ACTIVATION_DESCRIPTOR_NONE;
+    if (hl_fork_wire_receive_descriptors(waiting.fd, &hello, sizeof hello, descriptors, &count) !=
+        (int)sizeof hello) {
         while (count > 0)
             (void)close(descriptors[--count]);
-        return -1;
+        return HL_ACTIVATION_DESCRIPTOR_NONE;
     }
     if (count != 1 || hello.magic != HL_CKPT_STREAM_MAGIC_HELLO || hello.abi != HL_CKPT_STREAM_ABI) {
         while (count > 0)
             (void)close(descriptors[--count]);
-        return -1;
+        return HL_ACTIVATION_DESCRIPTOR_NONE;
     }
+    channel = checkpoint_reserve_descriptor(descriptors[0]);
+    if (channel < 0) return HL_ACTIVATION_DESCRIPTOR_NONE;
     if (out_host_pid != NULL) *out_host_pid = hello.host_pid;
-    return descriptors[0];
+    return (hl_activation_descriptor)channel;
 }
 
 static int checkpoint_anonymous_descriptor(void) {
@@ -219,14 +312,14 @@ static int checkpoint_anonymous_descriptor(void) {
 #endif
 }
 
-int hl_ckpt_trigger_create(int *out_descriptor, void **out_mapping) {
+int hl_ckpt_trigger_create(hl_activation_descriptor *out_descriptor, void **out_mapping) {
     int descriptor;
     void *mapping;
     if (out_descriptor == NULL || out_mapping == NULL) return -1;
-    *out_descriptor = -1;
+    *out_descriptor = HL_ACTIVATION_DESCRIPTOR_NONE;
     *out_mapping = NULL;
     /* An anonymous shared file: no name in any namespace the guest or the filesystem can see. */
-    descriptor = checkpoint_anonymous_descriptor();
+    descriptor = checkpoint_reserve_descriptor(checkpoint_anonymous_descriptor());
     if (descriptor < 0) return -1;
     if (ftruncate(descriptor, (off_t)sizeof(uint32_t)) != 0) {
         (void)close(descriptor);
@@ -237,7 +330,7 @@ int hl_ckpt_trigger_create(int *out_descriptor, void **out_mapping) {
         (void)close(descriptor);
         return -1;
     }
-    *out_descriptor = descriptor;
+    *out_descriptor = (hl_activation_descriptor)descriptor;
     *out_mapping = mapping;
     return 0;
 }
@@ -251,7 +344,10 @@ uint32_t hl_ckpt_trigger_bump(void *mapping) {
     return next;
 }
 
-void hl_ckpt_trigger_destroy(void *mapping, int descriptor) {
+void hl_ckpt_trigger_destroy(void *mapping, hl_activation_descriptor descriptor) {
     if (mapping != NULL) (void)munmap(mapping, sizeof(uint32_t));
-    if (descriptor >= 0) (void)close(descriptor);
+    if (descriptor != HL_ACTIVATION_DESCRIPTOR_NONE && descriptor <= (hl_activation_descriptor)INT32_MAX)
+        (void)close((int)descriptor);
 }
+
+#endif

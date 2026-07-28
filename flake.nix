@@ -42,14 +42,34 @@
       ];
 
       # Host backends implementing the hl_host_services contract, one per
-      # src/host/<name>/. `supported` gates whether outputs are produced at all:
-      # src/host/windows/ is currently a reserved boundary (README only, no code
-      # and no Makefile/CMake wiring), so a windows host evaluates but builds
-      # nothing. When that backend lands, flip the flag.
+      # src/host/<name>/. `supported` gates whether outputs are produced at all.
+      #
+      # windows = false no longer means "no backend". src/host/windows/ is a real
+      # backend now -- it builds, links a production engine and runs Linux guests --
+      # and it is reached through cmake/toolchains/x86_64-windows.cmake with
+      # mingw-w64 clang, or x86_64-windows-msvc.cmake for the crate archive.
+      #
+      # What the flag says is that NIX is not the route to it. Nix does not run
+      # natively on Windows, so nothing here can produce a Windows output for a
+      # Windows user; a nix build could only ever cross-compile one from Linux,
+      # which is not a supported configuration and which nothing tests. Flipping
+      # this to true would advertise outputs that do not exist.
+      #
+      # The consequence to know: canBuildGuests is false for a windows host, so the
+      # guest fixture corpus is not built here. It is cross-built from a WSL2 Linux
+      # by tools/windows/build_guest_fixtures.sh and consumed from a digest-checked
+      # cache -- see cmake/GuestFixtures.cmake's Windows arm.
       hostBackends = {
         linux = { supported = true; };
         macos = { supported = true; };
         windows = { supported = false; };
+      };
+
+      # Host CPUs, the OTHER half of the host platform: hostBackends above is keyed
+      # by host OS alone, and the two axes compose. Same axis as host_cpu.h.
+      hostCPUs = {
+        aarch64 = { supported = true; };
+        x86_64 = { supported = true; };
       };
 
       # Everything host- and guest-dependent, derived once from `pkgs`.
@@ -88,13 +108,27 @@
         rec {
           inherit host hostCpu nativeCC isNative pkgsFor;
           backend = hostBackends.${backendName};
-          # Can this host build guest fixtures at all?
-          canBuildGuests = backend.supported;
-          # Hosts that can execute a built engine, and therefore get the Rust
-          # package. A predicate, not an allowlist of system strings.
-          canRunGuests = backend.supported && hostCpu == "aarch64";
+          cpu = hostCPUs.${hostCpu} or { supported = false; };
+          # Can this host build guest fixtures at all? Both axes must be supported:
+          # a guest fixture is cross-compiled, but the engine that will run it is not.
+          canBuildGuests = backend.supported && cpu.supported;
+          # Hosts that get the publishable Rust crate -- NOT the same as "can run
+          # guests". The crate links a FROZEN prebuilt archive per host triple
+          # (pkgs/rust/assets/lib/<triple>/) and only the two aarch64 triples have
+          # one. Named after the archive so a newly supported host cannot enable a
+          # crate build with nothing to link.
+          hasCrateArchive = backend.supported && hostCpu == "aarch64";
 
           crossCompilers = map ccPkgFor guestISAs;
+
+          # qemu-user for the emulated-aarch64 lane (cmake/Phase3Gates.cmake 9b),
+          # which executes the cross-built aarch64 host engines this host builds and
+          # otherwise never runs. x86_64 Linux only, for the same reason. The version
+          # is the lane's ORACLE (docs/emulated-aarch64.md), pinned by flake.lock and
+          # by nothing else -- no store path anywhere -- so a nixpkgs bump moves it
+          # and the lane must be re-measured. `qemu-user`, not `qemu`: same binaries,
+          # 208MB of closure instead of 3.7GB.
+          emulators = lib.optional (host.isLinux && hostCpu == "x86_64") pkgs.qemu-user;
 
           # Exactly the variable names the Makefile and cmake/toolchains/* read.
           # Note the two distinct prefixes that already exist in the tree:
@@ -177,7 +211,7 @@
               mainProgram = "hl-engine-runner";
             };
           };
-        } // lib.optionalAttrs tc.canRunGuests {
+        } // lib.optionalAttrs tc.hasCrateArchive {
           rust = pkgs.rustPlatform.buildRustPackage {
             pname = "hl-engine";
             inherit version;
@@ -254,7 +288,7 @@
             doCheck = true;
             installPhase = "touch $out";
           };
-        } // lib.optionalAttrs tc.canRunGuests {
+        } // lib.optionalAttrs tc.hasCrateArchive {
           rust = self.packages.${pkgs.stdenv.hostPlatform.system}.rust;
         });
 
@@ -296,7 +330,7 @@
               pkgs.cargo
               pkgs.rustfmt
               pkgs.clippy
-            ] ++ lib.optionals tc.canBuildGuests tc.crossCompilers;
+            ] ++ lib.optionals tc.canBuildGuests tc.crossCompilers ++ tc.emulators;
 
             # Each cc's setup-hook assigns $CC as it runs, so whichever cross
             # compiler happens to be listed last silently won -- which left $CC

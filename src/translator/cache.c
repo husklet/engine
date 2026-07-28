@@ -2,9 +2,11 @@
 // One W^X MAP_JIT arena; blocks appended + chained (b/bl backpatch). Host-ISA engine state.
 
 // ---------------- JIT code cache ----------------
-#include <sys/mman.h>
+#include "../linux_abi/host_mman.h"
 #include "../../include/hl/log.h"
 #include "../host/clock.h"
+#include "../host/host_cpu.h"
+#include "../host/range.h"
 #include "../core/fatal.h"
 #include "arena.h"
 #include "emit.h"
@@ -91,11 +93,17 @@ static int jit_publish_code(const void *address, size_t size) {
 }
 
 static int code_mapping_reserve(hl_host_code_mapping *mapping, int dual_alias) {
+    uint64_t alignment;
     if (hl_host_services_validate(&g_jit_services,
                                   HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_CODE_MAPPING) != HL_STATUS_OK)
         return -1;
     if (g_jit_log.host == NULL) (void)hl_log_context_init(&g_jit_log, &g_jit_services, hl_option_get("HL_LOG"));
-    return hl_arena_reserve(&g_jit_services, CACHE_SZ, 16384, dual_alias, mapping);
+    /* Must start on a host page boundary: reserve_code rejects anything smaller, and the dual-alias path
+       maps the object twice at that granularity so RW and RX differ by whole pages (making g_rw2rx a constant
+       delta).  16384 is the fallback for a host that cannot answer. */
+    alignment = (uint64_t)hl_host_page_size();
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) alignment = 16384u;
+    return hl_arena_reserve(&g_jit_services, CACHE_SZ, alignment, dual_alias, mapping);
 }
 
 static int jit_cache_init(void) {
@@ -661,7 +669,36 @@ typedef struct {
    ibtc_clear_lazy) instead of a COW-faulting memset, while still satisfying the
    16-byte alignment the atomic ldp/stp entry access requires. */
 #define IBTC_PAGE_ALIGN 65536u
-_Alignas(IBTC_PAGE_ALIGN) static ibtc_ent g_ibtc[IBTC_N];
+/* PE/COFF caps the alignment a section may request; the object-file field is a
+   4-bit log2 code whose largest value is 8192, so a 64 KiB _Alignas is a hard
+   compile error on this object format rather than a wasted-space trade-off.
+   Nothing correctness-bearing is lost: the 64 KiB figure buys the whole-pages
+   property MADV_DONTNEED wants, and MADV_DONTNEED is a Linux call this host
+   does not have -- the fork child on a PE host clears the table by writing it.
+   The 16-byte granule the atomic pair publish actually depends on is asserted
+   below and is satisfied by either value. */
+#if defined(_WIN32) && defined(_MSC_VER)
+/* MSVC-ABI Windows caps this a second time, and for a different reason than the
+   object-format one above. 8192 IS representable in the section header, and
+   ld.lld accepts it by raising the image's section alignment to match; link.exe
+   does not -- its default /ALIGN is one 4 KiB page, and an object asking for
+   more is the hard error "LNK1164: section alignment greater than /ALIGN
+   value", raised in whatever consumer links the archive rather than here.
+   Raising /ALIGN instead was rejected: it is a property of every downstream
+   image, not of this object, so it would make the engine archive impossible to
+   link without a flag no consumer can be expected to pass. The 16-byte granule
+   the atomic pair publish depends on is unaffected, and is asserted below. */
+#define IBTC_ALIGN 4096u
+#elif defined(_WIN32)
+#define IBTC_ALIGN 8192u
+#else
+#define IBTC_ALIGN IBTC_PAGE_ALIGN
+#endif
+_Alignas(IBTC_ALIGN) static ibtc_ent g_ibtc[IBTC_N];
+/* Both publish paths rest on this: AArch64's stp is single-copy atomic only within a 16-byte granule (a
+   grown ibtc_ent silently reintroduces torn dispatch), and movdqa #GP-faults if misaligned. */
+_Static_assert(sizeof(ibtc_ent) == 16, "ibtc_ent must be one 16-byte granule for the atomic pair publish");
+_Static_assert(IBTC_ALIGN % 16u == 0u, "the ibtc table's alignment must keep every entry 16-byte aligned");
 
 /* Wholesale-invalidate the inline-branch cache.  In a fork child the table is
    COW-inherited fully populated, so a memset first faults in every page (~190us
@@ -698,12 +735,25 @@ static uint64_t g_mtfill;
 // so it is mutually atomic with the reader's plain `ldp`. We use explicit asm rather than a
 // 16-byte __atomic (which could lower to a lock-based libatomic call that would NOT be atomic
 // against the lock-free ldp reader). Layout: target at +0, body at +8 (matches struct ibtc_ent).
+// ORDERING is free on x86-TSO: all that survives of `dmb ish` is the "memory" clobber. SINGLE-COPY ATOMICITY
+// of the 16-byte access is needed on BOTH sides -- the READER's plain load is equally load-bearing -- hence
+// movdqa, not `lock cmpxchg16b`: LOCK cannot make a plain load indivisible, and the reader is emitted
+// fast-path code that must not become a locked RMW. Intel and AMD document aligned 16-byte SSE/AVX as atomic
+// on AVX-capable parts. A future emit_ibranch MUST use one aligned 16-byte load, not two 8-byte ones.
 static inline void ibtc_publish(ibtc_ent *e, uint64_t target, void *body) {
+#if defined(HL_HOST_CPU_AARCH64)
     __asm__ volatile("dmb ish\n\t"
                      "stp %1, %2, [%0]\n\t"
                      :
                      : "r"(e), "r"(target), "r"(body)
                      : "memory");
+#else
+    // The vector type only gives the "x" constraint something to hold; a 16-byte __atomic_store would
+    // lower to a lock-taking libatomic call.
+    typedef unsigned long long ibtc_pair __attribute__((vector_size(16)));
+    ibtc_pair pair = {target, (unsigned long long)(uintptr_t)body}; // target at +0, body at +8: ibtc_ent order
+    __asm__ volatile("movdqa %1, %0" : "=m"(*e) : "x"(pair) : "memory");
+#endif
 }
 
 static uint64_t g_prof_miss, g_prof_sys, g_lse_n;
@@ -1422,6 +1472,12 @@ static int stw_checkpoint_cpus(struct cpu **out, int capacity) {
     int count = 0;
     for (int i = 0; i < STW_MAXTHREAD; i++) {
         if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
+        /* A used slot with no cpu is not a guest thread and has no state to capture. stw_after_fork() leaves
+           exactly that behind whenever a process forks BEFORE its own guest thread registers -- which is the
+           shape of every restore refork (ckpt_fork_children runs ahead of run_guest), so the child's later
+           stw_register() takes a SECOND slot and the phantom stays. Counting it made a re-capture of a
+           restored tree dereference NULL and die silently mid-dump. */
+        if (g_stw_threads[i].cpu == NULL) continue;
         if (count < capacity) out[count] = g_stw_threads[i].cpu;
         count++;
     }
@@ -1705,6 +1761,21 @@ static int jit_after_fork(void) {
        is never preservable). */
     if (g_pcache && !g_threaded && g_dualmap) preserve = 1;
 #endif
+#elif defined(_WIN32)
+    /* Windows joins the Linux default, and for a reason that is stronger here
+       than there.  The dual-alias arena is a pagefile-backed SECTION mapped
+       twice, and this host's address-space clone carries a section view as a
+       GENUINELY SHARED view -- not a copy-on-write copy.  So a fork child does
+       not merely inherit a snapshot of the parent's code cache; it inherits the
+       parent's code cache itself, and the first block it translated would be
+       written into memory the parent is executing.  The child must therefore get
+       a new backing object, and once the backing object is new the inherited
+       host addresses are gone -- which is exactly preserve = 0.  The single-
+       alias fallback arena is private committed memory and IS copy-on-write, but
+       it takes the same branch: with no way to tell a preserved arena from a
+       rebuilt one at this level, the conservative answer is the correct one and
+       the cost is a re-translate the child would have paid anyway. */
+    preserve = 0;
 #else
     preserve = !g_threaded || !g_dualmap;
 #endif

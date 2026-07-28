@@ -36,7 +36,7 @@
 // statically-predicted-not-taken branch. Byte-identical to baseline by construction.
 
 #include <sched.h>
-#include <sys/wait.h>
+#include "host_wait.h"
 #include <stdatomic.h>
 
 #include "shared.h"
@@ -1823,82 +1823,23 @@ static void syscall_route(struct cpu *c) {
     if (G_NORMALIZE(c)) return;
     uint64_t nr = G_NR(c);
 
-    /* service_local normally rebases pointer arguments from a biased ET_EXEC's Linux link range to the
-     * host mapping. Forwarded calls are marshaled before service_local runs, so perform the same operation
-     * at the trust boundary; otherwise static x86 strings/buffers are copied from their unmapped low link
-     * addresses (observed as empty paths and zero-filled pipe writes after exec). */
-    if (g_nonpie_lo) {
-        switch (nr) {
-        case 48:
-        case 56:
-        case 439: G_A1(c) = nonpie_p(G_A1(c)); break;
-        case 78:
-        case 79:
-            G_A1(c) = nonpie_p(G_A1(c));
-            G_A2(c) = nonpie_p(G_A2(c));
-            break;
-        case 279: G_A0(c) = nonpie_p(G_A0(c)); break;
-        case 71: G_A2(c) = nonpie_p(G_A2(c)); break;
-        case 76:
-        case 285:
-            G_A1(c) = nonpie_p(G_A1(c));
-            G_A3(c) = nonpie_p(G_A3(c));
-            break;
-        case 291:
-            G_A1(c) = nonpie_p(G_A1(c));
-            G_A4(c) = nonpie_p(G_A4(c));
-            break;
-        case 61:
-        case 63:
-        case 64:
-        case 67:
-        case 68:
-        case 80:
-        case 200:
-        case 203:
-        case 65:
-        case 66: G_A1(c) = nonpie_p(G_A1(c)); break;
-        case 202:
-        case 242:
-        case 204:
-        case 205:
-            G_A1(c) = nonpie_p(G_A1(c));
-            G_A2(c) = nonpie_p(G_A2(c));
-            break;
-        case 206:
-            G_A1(c) = nonpie_p(G_A1(c));
-            G_A4(c) = nonpie_p(G_A4(c));
-            break;
-        case 207:
-            G_A1(c) = nonpie_p(G_A1(c));
-            G_A4(c) = nonpie_p(G_A4(c));
-            G_A5(c) = nonpie_p(G_A5(c));
-            break;
-        case 208: G_A3(c) = nonpie_p(G_A3(c)); break;
-        case 209:
-            G_A3(c) = nonpie_p(G_A3(c));
-            G_A4(c) = nonpie_p(G_A4(c));
-            break;
-        case 21: G_A3(c) = nonpie_p(G_A3(c)); break;
-        case 22: G_A1(c) = nonpie_p(G_A1(c)); break;
-        case 25:
-        case 29: G_A2(c) = nonpie_p(G_A2(c)); break;
-        case 59: G_A0(c) = nonpie_p(G_A0(c)); break;
-        case 199: G_A3(c) = nonpie_p(G_A3(c)); break;
-        case 72:
-            G_A1(c) = nonpie_p(G_A1(c));
-            G_A2(c) = nonpie_p(G_A2(c));
-            G_A3(c) = nonpie_p(G_A3(c));
-            G_A4(c) = nonpie_p(G_A4(c));
-            break;
-        case 73:
-            G_A0(c) = nonpie_p(G_A0(c));
-            G_A2(c) = nonpie_p(G_A2(c));
-            break;
-        case 211:
-        case 212: G_A1(c) = nonpie_p(G_A1(c)); break;
-        default: break;
-        }
+    /* service_local rebases pointer arguments from a biased ET_EXEC's Linux link range to the host mapping.
+     * A FORWARDED call is marshaled before service_local runs, so apply the same table here -- the same
+     * table, from nonpie_args.h, restricted to what we forward, because anything else reaches service_local
+     * and gets it there. (Two independently maintained copies of this list is what let static x86 strings
+     * and buffers be copied from their unmapped low link addresses: empty paths, zero-filled pipe writes.)
+     * The fold is idempotent, so a forwarded call that also falls through to service_local is unharmed. */
+    if (g_nonpie_lo && sentry_forwarded(nr)) {
+        uint64_t reb[6] = {G_A0(c), G_A1(c), G_A2(c), G_A3(c), G_A4(c), G_A5(c)};
+        nonpie_rebase_args(nr, reb);
+        G_A0(c) = reb[0];
+        G_A1(c) = reb[1];
+        G_A2(c) = reb[2];
+        G_A3(c) = reb[3];
+        G_A4(c) = reb[4];
+        G_A5(c) = reb[5];
+        // No nonpie_rebase_iov here: readv/writev copy the payload into the ring instead of handing the
+        // array to a host syscall, and fold each iov_base inside the flatten (case 65/66 below).
     }
 
     // exit(93)/exit_group(94): service_local() _exit()s this worker. exit_group ends the PROCESS so the

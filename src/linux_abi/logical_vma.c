@@ -1,13 +1,25 @@
 #include "logical_vma.h"
 
+#include "fdhandle.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#endif
+
+/* The backing's private reference to the object the guest descriptor named.  At
+ * most one member is live: a duplicate descriptor where a descriptor IS the
+ * object, a duplicate host handle where it is not. */
+typedef struct logical_backing_ref {
+    int fd;
+    hl_host_handle handle;
+} logical_backing_ref;
 
 struct hl_logical_vma_backing {
     void *mapping;
@@ -16,7 +28,7 @@ struct hl_logical_vma_backing {
     uint64_t device;
     uint64_t inode;
     uint64_t file_offset;
-    int fd;
+    logical_backing_ref retained;
     int writable;
 };
 
@@ -28,6 +40,134 @@ struct hl_logical_vma_plan {
 static hl_logical_vma_ledger g_logical_vmas;
 static pthread_once_t g_logical_vmas_once = PTHREAD_ONCE_INIT;
 static _Atomic int g_fail_next_prepare;
+
+/* The reference a guest descriptor denotes: the descriptor itself where a descriptor IS the object, and the
+ * handle filed under it where it is not.  A descriptor with no binding on such a host fails here rather than
+ * later, because the number denotes nothing at all and the caller must unwind rather than map something
+ * else. */
+static int logical_backing_ref_open(int fd, logical_backing_ref *reference) {
+    reference->fd = -1;
+    reference->handle = HL_HOST_HANDLE_INVALID;
+#if defined(_WIN32)
+    if (!hl_fdhandle_lookup(fd, &reference->handle)) {
+        errno = ENOSYS;
+        return -1;
+    }
+#else
+    reference->fd = fd;
+#endif
+    return 0;
+}
+
+/* The canonical host backing behind a shared logical mapping.  This is the one operation in this file that
+ * the typed memory seam ought to own -- map_file() is its exact shape, down to the offset and the shared
+ * flag -- and the single thing that used to be in the way is that the whole logical-VMA API was keyed on a
+ * NATIVE descriptor: the guest mmap path hands down the host fd that the Linux fd table holds, while the
+ * seam speaks in opaque handles.  The descriptor -> host-handle table (fdhandle.h) is what closes that, and
+ * keeping both halves behind these calls is what made it the edit it is.
+ *
+ * A descriptor with no binding still reports its absence through the same NULL-and-errno channel a refused
+ * mmap already uses; every caller below unwinds on that, so no half-built backing and no unbacked ledger
+ * entry can result. */
+static void *logical_backing_map(const logical_backing_ref *reference, size_t length, uint64_t offset,
+                                 int writable) {
+#if defined(_WIN32)
+    const hl_host_services *host = hl_fdhandle_host();
+    hl_host_file_mapping mapping = {HL_HOST_FILE_MAPPING_ABI, sizeof(mapping), 0, 0, 0, 0};
+    hl_host_result result;
+    if (reference->handle == HL_HOST_HANDLE_INVALID || host == NULL || host->memory == NULL ||
+        host->memory->map_file == NULL) {
+        errno = ENOSYS;
+        return NULL;
+    }
+    /* Canonical storage is engine-private and RW; SHARED because the whole point of this backing is that
+       every logical view of the same file region observes one another's stores. */
+    result = host->memory->map_file(host->context, reference->handle, 0, offset, (uint64_t)length,
+                                    HL_HOST_MEMORY_READ | (writable ? HL_HOST_MEMORY_WRITE : 0u),
+                                    HL_HOST_MEMORY_SHARED, &mapping);
+    if (result.status != HL_STATUS_OK) {
+        errno = hl_fdhandle_errno(result.status);
+        return NULL;
+    }
+    /* The ledger keeps an address, not a token, and unmaps by address below; a live ownership handle over
+       this range would make that address-keyed release refuse. */
+    if (host->memory->discard != NULL) (void)host->memory->discard(host->context, mapping.handle);
+    return (void *)(uintptr_t)mapping.address;
+#else
+    /* Canonical storage is engine-private and RW. Guest permission checks stay
+       in the logical entry and never depend on host VMA protection. */
+    void *mapping =
+        mmap(NULL, length, PROT_READ | (writable ? PROT_WRITE : 0), MAP_SHARED, reference->fd, (off_t)offset);
+    return mapping == MAP_FAILED ? NULL : mapping;
+#endif
+}
+
+static void logical_backing_unmap(void *mapping, size_t length) {
+#if defined(_WIN32)
+    const hl_host_services *host = hl_fdhandle_host();
+    if (host == NULL || host->memory == NULL || host->memory->unmap_address == NULL) return;
+    (void)host->memory->unmap_address(host->context, (uint64_t)(uintptr_t)mapping, (uint64_t)length);
+#else
+    (void)munmap(mapping, length);
+#endif
+}
+
+/* The backing outlives the guest descriptor it was built from, so it keeps a private duplicate: the guest may
+ * close its fd, and a checkpoint re-maps from this one. Close-on-exec is not decoration -- the engine execve's
+ * a fresh guest image in place, and an inherited canonical descriptor would be a stray open file the guest
+ * descriptor scan cannot account for. Where the reference is a host handle rather than a descriptor that
+ * concern does not arise at all: clone_for_fork() produces an independent reference to the same open file
+ * description, and a handle is not in the descriptor namespace an exec sweep walks. */
+static int logical_backing_retain(const logical_backing_ref *source, logical_backing_ref *reference) {
+    reference->fd = -1;
+    reference->handle = HL_HOST_HANDLE_INVALID;
+#if defined(_WIN32)
+    {
+        const hl_host_services *host = hl_fdhandle_host();
+        hl_host_result cloned;
+        if (source->handle == HL_HOST_HANDLE_INVALID || host == NULL || host->file == NULL ||
+            host->file->clone_for_fork == NULL) {
+            errno = ENOSYS;
+            return -1;
+        }
+        cloned = host->file->clone_for_fork(host->context, source->handle);
+        if (cloned.status != HL_STATUS_OK || cloned.value == HL_HOST_HANDLE_INVALID) {
+            errno = hl_fdhandle_errno(cloned.status);
+            return -1;
+        }
+        reference->handle = (hl_host_handle)cloned.value;
+        return 0;
+    }
+#else
+    {
+        int retained = fcntl(source->fd, F_DUPFD, 0);
+        if (retained < 0) return -1;
+        if (fcntl(retained, F_SETFD, FD_CLOEXEC) != 0) {
+            int saved = errno;
+            close(retained);
+            errno = saved;
+            return -1;
+        }
+        reference->fd = retained;
+        return 0;
+    }
+#endif
+}
+
+static void logical_backing_release(logical_backing_ref *reference) {
+    if (reference->fd >= 0) {
+        close(reference->fd);
+        reference->fd = -1;
+    }
+#if defined(_WIN32)
+    if (reference->handle != HL_HOST_HANDLE_INVALID) {
+        const hl_host_services *host = hl_fdhandle_host();
+        if (host != NULL && host->file != NULL && host->file->close != NULL)
+            (void)host->file->close(host->context, reference->handle);
+        reference->handle = HL_HOST_HANDLE_INVALID;
+    }
+#endif
+}
 
 static int power_of_two(size_t value) {
     return value != 0 && (value & (value - 1)) == 0;
@@ -52,8 +192,8 @@ static int grow(hl_logical_vma_ledger *ledger, size_t need) {
 
 static void backing_put(hl_logical_vma_backing *backing) {
     if (atomic_fetch_sub_explicit(&backing->references, 1, memory_order_acq_rel) != 1) return;
-    (void)munmap(backing->mapping, backing->length);
-    if (backing->fd >= 0) close(backing->fd);
+    logical_backing_unmap(backing->mapping, backing->length);
+    logical_backing_release(&backing->retained);
     free(backing);
 }
 
@@ -103,6 +243,10 @@ static void publish_locked(hl_logical_vma_ledger *ledger, hl_logical_vma_snapsho
     }
     qsort(snapshot->views, snapshot->count, sizeof(*snapshot->views), view_compare);
     hl_logical_vma_snapshot *old = atomic_exchange_explicit(&ledger->current, snapshot, memory_order_acq_rel);
+    /* Bump AFTER the exchange: a reader samples the generation first, so this
+       order lets it see a stale snapshot with a stale generation (harmless --
+       it refills) but never a stale snapshot with a fresh one. */
+    atomic_fetch_add_explicit(&ledger->generation, 1, memory_order_release);
     if (old != NULL) {
         old->next = ledger->retired;
         ledger->retired = old;
@@ -155,6 +299,7 @@ int hl_logical_vma_init(hl_logical_vma_ledger *ledger) {
     }
     *ledger = (hl_logical_vma_ledger){0};
     atomic_init(&ledger->current, NULL);
+    atomic_init(&ledger->generation, 1);
     return pthread_mutex_init(&ledger->lock, NULL);
 }
 
@@ -164,6 +309,7 @@ void hl_logical_vma_destroy(hl_logical_vma_ledger *ledger) {
     while (ledger->count != 0)
         backing_put(ledger->entries[--ledger->count].backing);
     hl_logical_vma_snapshot *snapshot = atomic_exchange_explicit(&ledger->current, NULL, memory_order_acq_rel);
+    atomic_fetch_add_explicit(&ledger->generation, 1, memory_order_release);
     snapshot_free(snapshot);
     while (ledger->retired != NULL) {
         snapshot = ledger->retired;
@@ -221,8 +367,13 @@ int hl_logical_vma_map_shared(hl_logical_vma_ledger *ledger, uint64_t guest_firs
     uint64_t canonical_last = (requested_last + host_page - 1) & ~((uint64_t)host_page - 1);
     int requested_writable = (protection & HL_LOGICAL_VMA_WRITE) != 0;
     int canonical_writable = requested_writable;
-    int mapping_fd = fd;
+    logical_backing_ref mapping_ref;
     int expanded;
+    if (logical_backing_ref_open(fd, &mapping_ref) != 0) {
+        free(next_snapshot);
+        pthread_mutex_unlock(&ledger->lock);
+        return -1;
+    }
     do {
         expanded = 0;
         for (size_t index = 0; index < ledger->count; ++index) {
@@ -232,7 +383,9 @@ int hl_logical_vma_map_shared(hl_logical_vma_ledger *ledger, uint64_t guest_firs
             if (candidate_last < canonical_first || candidate->file_offset > canonical_last) continue;
             if (candidate->writable) {
                 canonical_writable = 1;
-                if (!requested_writable) mapping_fd = candidate->fd;
+                /* A read-only request widening onto a writable backing has to map through a writable
+                   reference, and the candidate's retained one is the only one in reach. */
+                if (!requested_writable) mapping_ref = candidate->retained;
             }
             if (candidate->file_offset < canonical_first) {
                 canonical_first = candidate->file_offset;
@@ -252,11 +405,8 @@ int hl_logical_vma_map_shared(hl_logical_vma_ledger *ledger, uint64_t guest_firs
         return -1;
     }
     size_t mapped_length = (size_t)(canonical_last - canonical_first);
-    /* Canonical storage is engine-private and RW. Guest permission checks stay
-       in the logical entry and never depend on host VMA protection. */
-    int canonical_protection = PROT_READ | (canonical_writable ? PROT_WRITE : 0);
-    void *mapping = mmap(NULL, mapped_length, canonical_protection, MAP_SHARED, mapping_fd, (off_t)canonical_first);
-    if (mapping == MAP_FAILED) {
+    void *mapping = logical_backing_map(&mapping_ref, mapped_length, canonical_first, canonical_writable);
+    if (mapping == NULL) {
         free(next_snapshot);
         pthread_mutex_unlock(&ledger->lock);
         return -1;
@@ -264,22 +414,16 @@ int hl_logical_vma_map_shared(hl_logical_vma_ledger *ledger, uint64_t guest_firs
     hl_logical_vma_backing *backing = malloc(sizeof(*backing));
     if (backing == NULL) {
         int saved = errno;
-        (void)munmap(mapping, mapped_length);
+        logical_backing_unmap(mapping, mapped_length);
         free(next_snapshot);
         pthread_mutex_unlock(&ledger->lock);
         errno = saved;
         return -1;
     }
-    int retained = fcntl(mapping_fd, F_DUPFD, 0);
-    if (retained >= 0 && fcntl(retained, F_SETFD, FD_CLOEXEC) != 0) {
+    logical_backing_ref retained;
+    if (logical_backing_retain(&mapping_ref, &retained) != 0) {
         int saved = errno;
-        close(retained);
-        retained = -1;
-        errno = saved;
-    }
-    if (retained < 0) {
-        int saved = errno;
-        (void)munmap(mapping, mapped_length);
+        logical_backing_unmap(mapping, mapped_length);
         free(backing);
         free(next_snapshot);
         pthread_mutex_unlock(&ledger->lock);
@@ -368,6 +512,7 @@ void hl_logical_vma_commit_shared(hl_logical_vma_plan *plan) {
 
     hl_logical_vma_snapshot *next = atomic_exchange_explicit(&plan->staged.current, NULL, memory_order_acq_rel);
     hl_logical_vma_snapshot *old = atomic_exchange_explicit(&live->current, next, memory_order_acq_rel);
+    atomic_fetch_add_explicit(&live->generation, 1, memory_order_release); /* publish_locked's rule, applied here */
     if (old != NULL) {
         old->next = live->retired;
         live->retired = old;
@@ -648,6 +793,49 @@ int hl_logical_vma_resolve_exec(uint64_t guest, size_t length, const void **host
         *contiguous = resolution.contiguous;
     }
     return result;
+}
+
+int hl_logical_vma_resolve_exec_span(uint64_t guest, uint64_t *generation, uint64_t *first, uint64_t *last,
+                                     uint64_t *delta) {
+    (void)pthread_once(&g_logical_vmas_once, global_init);
+    if (generation == NULL || first == NULL || last == NULL || delta == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    *generation = atomic_load_explicit(&g_logical_vmas.generation, memory_order_acquire);
+    hl_logical_vma_snapshot *snapshot = atomic_load_explicit(&g_logical_vmas.current, memory_order_acquire);
+    size_t count = snapshot != NULL ? snapshot->count : 0;
+    size_t low = 0, high = count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        const hl_logical_vma_view *candidate = &snapshot->views[middle];
+        if (guest < candidate->guest_first)
+            high = middle;
+        else if (guest >= candidate->guest_last)
+            low = middle + 1;
+        else {
+            if ((candidate->protection & HL_LOGICAL_VMA_EXEC) == 0) {
+                errno = EACCES;
+                return -1;
+            }
+            *first = candidate->guest_first;
+            *last = candidate->guest_last;
+            *delta = candidate->host_delta;
+            return 1;
+        }
+    }
+    /* Miss: views are sorted and disjoint, so `low` is the first view past
+       `guest` and low-1 the last one before it.  The gap between them is
+       ordinary for its whole width. */
+    *first = low != 0 ? snapshot->views[low - 1].guest_last : 0;
+    *last = low != count ? snapshot->views[low].guest_first : UINT64_MAX;
+    *delta = 0;
+    return 0;
+}
+
+const _Atomic uint64_t *hl_logical_vma_global_exec_generation(void) {
+    (void)pthread_once(&g_logical_vmas_once, global_init);
+    return &g_logical_vmas.generation;
 }
 
 int hl_logical_vma_resolve_data(uint64_t guest, size_t length, uint32_t required, void **host, size_t *contiguous) {

@@ -13,7 +13,10 @@
 #      touched only what it owns.
 #
 # Step 3 is the real assertion: it proves the installed headers + .a + link
-# line are self-sufficient for a downstream consumer.
+# line are self-sufficient for a downstream consumer. Its link line is
+# hl-engine.pc's Libs: verbatim, so a change to one that is not made in the
+# other fails here. libhl-translator.a is not in it and is not installed --
+# step 4's activation archive is the complete engine (Phase4Install.cmake).
 #
 # Steps 4-5 run real guests through the activation API (posix_spawn-self, JIT,
 # domain daemons), so this case is not just a link check: it can fail for any
@@ -108,7 +111,7 @@ endif()
 
 run("link the C consumer against the staged SDK"
     ${CC} -I${STAGE}/include ${SOURCE_DIR}/tests/integration/package.c
-    -L${STAGE}/lib -lhl-host-${PACKAGE_HOST} -lhl-engine -lhl-translator -lhl-linux-abi
+    -L${STAGE}/lib -lhl-host-${PACKAGE_HOST} -lhl-engine -lhl-linux-abi
     -pthread -o ${BUILD_DIR}/package-consumer/package)
 run("run the C consumer" ${BUILD_DIR}/package-consumer/package)
 

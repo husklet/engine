@@ -26,5 +26,16 @@ test.db
 # Scratch dirs created in the CWD by the filesystem/error-matrix compat cases.
 hl_errmat_*/
 
+# Test artifact: tests/compat/filesystem/pcachex/libmap.c writes this into the CWD when the
+# fixture is run without the explicit blob path the manifest passes.
+pclib_blob_*.bin
+
 # CMake build trees
 build-*/
+
+# Agent working directory: nix devshell helper and transient probes.
+scratchpad/
+
+# Corpus measurement logs (tools/windows/run_corpus.sh). Large, machine-specific,
+# and regenerated on demand -- the numbers belong in commit messages, not the tree.
+corpus-logs*/

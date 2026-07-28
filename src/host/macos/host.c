@@ -2,6 +2,7 @@
 
 #include "hl/macos.h"
 #include "probe.h"
+#include "../range.h"
 #include "../system.h"
 #include "../resolve.h"
 #include "../sync.h"
@@ -24,6 +25,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/event.h>
@@ -33,6 +35,7 @@
 #include <sys/sem.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -55,6 +58,10 @@ typedef struct hl_macos_mapping {
     void *writable;
     void *executable;
     uint64_t size;
+    /* The subranges of [writable, writable + size) a partial unmap gave back. writable and size
+     * stay the addressing frame every offset-keyed call is measured against, so what the handle
+     * still holds has to be recorded beside them rather than folded into them. */
+    hl_host_hole_set retired;
 } hl_macos_mapping;
 
 typedef struct hl_macos_stream_shared {
@@ -400,6 +407,39 @@ static hl_macos_mapping *hl_macos_lookup(hl_host_macos *host, hl_host_handle han
     return &host->mappings[index];
 }
 
+/* Retire a mapping slot. The frame, the record of what it gave back, and the active bit go
+ * together: keeping them apart is what once left a handle claiming a hole it had already unmapped. */
+static void hl_macos_retire_mapping_locked(hl_macos_mapping *mapping) {
+    hl_host_hole_set_release(&mapping->retired);
+    mapping->active = 0;
+    mapping->writable = NULL;
+    mapping->executable = NULL;
+    mapping->size = 0;
+}
+
+/* True when [low, high) touches a byte this mapping still holds. The frame alone is not the answer,
+ * because a partial unmap gives bytes back without consuming the handle. Both aliases of a code
+ * mapping count, because releasing either one out from under the owner is the failure the callers
+ * of this exist to prevent; only the writable alias is reachable by a subrange unmap, so only it
+ * carries holes. */
+static inline int hl_macos_mapping_holds_locked(const hl_macos_mapping *mapping, uintptr_t low, uintptr_t high) {
+    if (!mapping->active || mapping->size == 0) return 0;
+    if (mapping->writable != NULL) {
+        uintptr_t base = (uintptr_t)mapping->writable;
+        uintptr_t end = base + (uintptr_t)mapping->size;
+        if (low < end && base < high) {
+            uint64_t from = low > base ? (uint64_t)(low - base) : 0;
+            uint64_t to = high < end ? (uint64_t)(high - base) : mapping->size;
+            if (hl_host_hole_set_holds(&mapping->retired, from, to - from)) return 1;
+        }
+    }
+    if (mapping->executable != NULL) {
+        uintptr_t base = (uintptr_t)mapping->executable;
+        if (low < base + (uintptr_t)mapping->size && base < high) return 1;
+    }
+    return 0;
+}
+
 static hl_host_result hl_macos_register(hl_host_macos *host, void *writable, void *executable, uint64_t size) {
     uint32_t index;
     hl_host_handle handle = 0;
@@ -407,6 +447,9 @@ static hl_host_result hl_macos_register(hl_host_macos *host, void *writable, voi
     for (index = 0; index < host->mapping_capacity; index++) {
         hl_macos_mapping *mapping = &host->mappings[index];
         if (!mapping->active) {
+            /* A reused slot must not inherit the previous tenant's holes. Every mapping retirement
+             * already drops them; this is the belt that makes that impossible to get wrong. */
+            hl_host_hole_set_release(&mapping->retired);
             mapping->generation++;
             if (mapping->generation == 0) mapping->generation = 1;
             mapping->active = 1;
@@ -522,15 +565,23 @@ static hl_host_result hl_macos_release(void *context, hl_host_handle handle) {
         pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    result = munmap(mapping->writable, (size_t)mapping->size);
+    /* Unmap what the handle still holds, not the frame. A partial unmap can have given a subrange
+     * back, and the address space is free to have handed that subrange to someone else since. With
+     * no holes this is the one whole-frame munmap it has always been. */
+    {
+        uint64_t held_offset;
+        uint64_t held_size;
+        uint32_t part = 0;
+        result = 0;
+        while (result == 0 &&
+               hl_host_hole_set_held_range(&mapping->retired, mapping->size, part, &held_offset, &held_size)) {
+            result = munmap((char *)mapping->writable + held_offset, (size_t)held_size);
+            ++part;
+        }
+    }
     if (mapping->executable != NULL && mapping->executable != mapping->writable)
         (void)munmap(mapping->executable, (size_t)mapping->size);
-    if (result == 0) {
-        mapping->active = 0;
-        mapping->writable = NULL;
-        mapping->executable = NULL;
-        mapping->size = 0;
-    }
+    if (result == 0) hl_macos_retire_mapping_locked(mapping);
     pthread_mutex_unlock(&host->lock);
     return result == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
 }
@@ -544,10 +595,7 @@ static hl_host_result hl_macos_discard(void *context, hl_host_handle handle) {
         pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
-    mapping->active = 0;
-    mapping->writable = NULL;
-    mapping->executable = NULL;
-    mapping->size = 0;
+    hl_macos_retire_mapping_locked(mapping);
     pthread_mutex_unlock(&host->lock);
     return hl_macos_result(HL_STATUS_OK, 0, 0);
 }
@@ -700,13 +748,8 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
         pthread_mutex_lock(&host->lock);
         for (uint32_t index = 0; index < host->mapping_capacity; ++index) {
             hl_macos_mapping *old = &host->mappings[index];
-            uintptr_t old_low = (uintptr_t)old->writable, old_high = old_low + (uintptr_t)old->size;
-            if (old->active && old->writable != NULL && low < old_high && old_low < low + total) {
-                old->active = 0;
-                old->writable = NULL;
-                old->executable = NULL;
-                old->size = 0;
-            }
+            if (hl_macos_mapping_holds_locked(old, (uintptr_t)low, (uintptr_t)(low + total)))
+                hl_macos_retire_mapping_locked(old);
         }
         pthread_mutex_unlock(&host->lock);
         if (!hl_macos_mapping_fill(host, registered.value, address, total)) abort();
@@ -753,19 +796,15 @@ static hl_host_result hl_macos_map_file(void *context, hl_host_handle file, uint
                            MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0);
         }
     }
-    /* MAP_FIXED replaced these VMAs atomically. Retire stale handles without unmapping the replacement. */
+    /* MAP_FIXED replaced these VMAs atomically. Retire stale handles without unmapping the
+     * replacement -- but only the ones that still held a byte of it. A handle whose overlap with
+     * this range is entirely inside a hole it already gave back kept nothing here to go stale. */
     if (placement == HL_HOST_MEMORY_FIXED) {
         uintptr_t low = (uintptr_t)address, high = low + (uintptr_t)size;
         pthread_mutex_lock(&host->lock);
         for (uint32_t index = 0; index < host->mapping_capacity; ++index) {
             hl_macos_mapping *old = &host->mappings[index];
-            uintptr_t old_low = (uintptr_t)old->writable, old_high = old_low + (uintptr_t)old->size;
-            if (old->active && old->writable != NULL && low < old_high && old_low < high) {
-                old->active = 0;
-                old->writable = NULL;
-                old->executable = NULL;
-                old->size = 0;
-            }
+            if (hl_macos_mapping_holds_locked(old, low, high)) hl_macos_retire_mapping_locked(old);
         }
         pthread_mutex_unlock(&host->lock);
     }
@@ -821,13 +860,7 @@ static hl_host_result hl_macos_map_anonymous(void *context, uint64_t requested_a
         pthread_mutex_lock(&host->lock);
         for (uint32_t index = 0; index < host->mapping_capacity; ++index) {
             hl_macos_mapping *old = &host->mappings[index];
-            uintptr_t old_low = (uintptr_t)old->writable, old_high = old_low + (uintptr_t)old->size;
-            if (old->active && old->writable != NULL && low < old_high && old_low < high) {
-                old->active = 0;
-                old->writable = NULL;
-                old->executable = NULL;
-                old->size = 0;
-            }
+            if (hl_macos_mapping_holds_locked(old, low, high)) hl_macos_retire_mapping_locked(old);
         }
         pthread_mutex_unlock(&host->lock);
     }
@@ -873,13 +906,132 @@ static hl_host_result hl_macos_unmap_range(void *context, hl_host_handle handle,
         return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     }
     status = munmap((char *)mapping->writable + offset, (size_t)size);
-    if (status == 0 && offset == 0 && size == mapping->size) {
-        mapping->active = 0;
-        mapping->writable = NULL;
-        mapping->size = 0;
+    if (status == 0) {
+        /* A full-range unmap consumes the handle. A partial one keeps it, so the subrange it just
+         * gave back has to leave the handle's coverage too -- otherwise the handle goes on claiming
+         * a hole the address space is free to hand to someone else. When repeated partial unmaps
+         * finally leave nothing held, the handle is consumed exactly as a single full one would
+         * have consumed it: a live mapping handle always holds at least one byte.
+         *
+         * If the record cannot grow, the subrange stays claimed. That refuses a reuse that would
+         * have been legal, which is recoverable; the other direction is not. */
+        if ((offset == 0 && size == mapping->size) ||
+            (hl_host_hole_set_retire(&mapping->retired, offset, size) &&
+             !hl_host_hole_set_holds(&mapping->retired, 0, mapping->size)))
+            hl_macos_retire_mapping_locked(mapping);
     }
     pthread_mutex_unlock(&host->lock);
     return status == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+}
+
+/* True while any live mapping handle still holds a byte of [low, high). */
+static int hl_macos_range_owned_locked(hl_host_macos *host, uintptr_t low, uintptr_t high) {
+    for (uint32_t index = 0; index < host->mapping_capacity; ++index)
+        if (hl_macos_mapping_holds_locked(&host->mappings[index], low, high)) return 1;
+    return 0;
+}
+
+/* Reject before acting, so a refused range is left exactly as it was found. */
+static hl_host_result hl_macos_unmap_address(void *context, uint64_t address, uint64_t size) {
+    hl_host_macos *host = context;
+    long page = sysconf(_SC_PAGESIZE);
+    uintptr_t low;
+    int status;
+    if (address == 0 || size == 0 || size > SIZE_MAX || page <= 0 || address > UINTPTR_MAX ||
+        address % (uint64_t)page != 0 || size % (uint64_t)page != 0 || size > (uint64_t)UINTPTR_MAX - address)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    low = (uintptr_t)address;
+    pthread_mutex_lock(&host->lock);
+    if (hl_macos_range_owned_locked(host, low, low + (uintptr_t)size)) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_BUSY, 0, 0);
+    }
+    status = munmap((void *)low, (size_t)size);
+    pthread_mutex_unlock(&host->lock);
+    return status == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+}
+
+/* True while any live CODE mapping still holds a byte of [low, high). A code mapping is the one
+ * whose protection an address-keyed caller must not touch: the writable and executable views are a
+ * pair, the per-thread write gate flips between them, and a caller holding only an address cannot
+ * put back what it changed because it does not hold the handle that knows the other view. */
+static int hl_macos_code_range_owned_locked(hl_host_macos *host, uintptr_t low, uintptr_t high) {
+    for (uint32_t index = 0; index < host->mapping_capacity; ++index) {
+        const hl_macos_mapping *mapping = &host->mappings[index];
+        if (mapping->executable != NULL && hl_macos_mapping_holds_locked(mapping, low, high)) return 1;
+    }
+    return 0;
+}
+
+/* Page-align an address-keyed span the way mprotect(2) and msync(2) do: the address must already be
+ * aligned and the length is rounded up. Returns zero when the request cannot be expressed. */
+static int hl_macos_address_span(uint64_t address, uint64_t size, uintptr_t *low, size_t *span) {
+    long page = sysconf(_SC_PAGESIZE);
+    uint64_t rounded;
+    if (address == 0 || size == 0 || page <= 0 || address > UINTPTR_MAX || address % (uint64_t)page != 0) return 0;
+    rounded = size + ((uint64_t)page - 1u);
+    if (rounded < size) return 0;
+    rounded -= rounded % (uint64_t)page;
+    if (rounded > SIZE_MAX || rounded > (uint64_t)UINTPTR_MAX - address) return 0;
+    *low = (uintptr_t)address;
+    *span = (size_t)rounded;
+    return 1;
+}
+
+/* Reject before acting, so a refused range is left exactly as it was found. */
+static hl_host_result hl_macos_protect_address(void *context, uint64_t address, uint64_t size, uint32_t protection) {
+    hl_host_macos *host = context;
+    uintptr_t low;
+    size_t span;
+    int status;
+    if ((protection & ~(uint32_t)(HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE | HL_HOST_MEMORY_EXECUTE)) != 0 ||
+        !hl_macos_address_span(address, size, &low, &span))
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    pthread_mutex_lock(&host->lock);
+    if (hl_macos_code_range_owned_locked(host, low, low + (uintptr_t)span)) {
+        pthread_mutex_unlock(&host->lock);
+        return hl_macos_result(HL_STATUS_BUSY, 0, 0);
+    }
+    status = mprotect((void *)low, span, hl_macos_protection(protection));
+    pthread_mutex_unlock(&host->lock);
+    return status == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+}
+
+static hl_host_result hl_macos_sync_address(void *context, uint64_t address, uint64_t size, uint32_t flags) {
+    uintptr_t low;
+    size_t span;
+    int native_flags;
+    (void)context;
+    if ((flags & ~(uint32_t)(HL_HOST_MEMORY_SYNC_ASYNC | HL_HOST_MEMORY_SYNC_INVALIDATE)) != 0 ||
+        !hl_macos_address_span(address, size, &low, &span))
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    native_flags = (flags & HL_HOST_MEMORY_SYNC_ASYNC) != 0 ? MS_ASYNC : MS_SYNC;
+    if ((flags & HL_HOST_MEMORY_SYNC_INVALIDATE) != 0) native_flags |= MS_INVALIDATE;
+    /* No ownership question is asked. Flushing takes nothing away from a handle that covers the
+     * range: the mapping, its protection and its contents are all exactly as they were. */
+    return msync((void *)low, span, native_flags) == 0 ? hl_macos_result(HL_STATUS_OK, 0, 0) : hl_macos_errno();
+}
+
+/* Darwin mlock(2) pins against reclaim and charges RLIMIT_MEMLOCK exactly as Linux does, so this host
+ * reports HL_HOST_WIRE_RESIDENT. The length follows mlock's own rule and is rounded up to whole pages. */
+static hl_host_result hl_macos_wire_range(void *context, uint64_t address, uint64_t size, uint32_t flags) {
+    long page = sysconf(_SC_PAGESIZE);
+    (void)context;
+    if (address == 0 || size == 0 || size > SIZE_MAX || page <= 0 || address > UINTPTR_MAX || flags != 0 ||
+        address % (uint64_t)page != 0 || size > (uint64_t)UINTPTR_MAX - address)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (mlock((void *)(uintptr_t)address, (size_t)size) != 0) return hl_macos_errno();
+    return hl_macos_result(HL_STATUS_OK, 0, (uint64_t)HL_HOST_WIRE_RESIDENT);
+}
+
+static hl_host_result hl_macos_unwire_range(void *context, uint64_t address, uint64_t size) {
+    long page = sysconf(_SC_PAGESIZE);
+    (void)context;
+    if (address == 0 || size == 0 || size > SIZE_MAX || page <= 0 || address > UINTPTR_MAX ||
+        address % (uint64_t)page != 0 || size > (uint64_t)UINTPTR_MAX - address)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (munlock((void *)(uintptr_t)address, (size_t)size) != 0) return hl_macos_errno();
+    return hl_macos_result(HL_STATUS_OK, 0, (uint64_t)HL_HOST_WIRE_RESIDENT);
 }
 
 static hl_host_result hl_macos_publish(void *context, hl_host_handle handle, uint64_t offset, uint64_t size) {
@@ -4298,6 +4450,170 @@ static hl_host_result hl_macos_mutex_close(void *context, hl_host_handle handle)
     return hl_host_sync_mutex_close(host->sync, handle);
 }
 
+static hl_host_result hl_macos_park(void *context, uint64_t waiter, uint32_t scope, uint64_t key, const void *address,
+                                    uint64_t expected, uint32_t compare_size, uint64_t deadline_ns) {
+    hl_host_macos *host = context;
+    return hl_host_sync_park(host->sync, waiter, scope, key, address, expected, compare_size, deadline_ns);
+}
+
+static hl_host_result hl_macos_unpark(void *context, uint32_t scope, uint64_t key, const void *address,
+                                      uint32_t count) {
+    hl_host_macos *host = context;
+    return hl_host_sync_unpark(host->sync, scope, key, address, count);
+}
+
+static hl_host_result hl_macos_interrupt_park(void *context, uint64_t waiter) {
+    hl_host_macos *host = context;
+    return hl_host_sync_interrupt_park(host->sync, waiter);
+}
+
+/* --- terminal ---------------------------------------------------------------------------
+ *
+ * The device, and only the device. Everything the guest's terminal vocabulary is made of -- the
+ * attribute structure, its control characters, canonical buffering, line editing, signal
+ * generation, minimum-and-timeout reads, output post-processing -- is above this and is not
+ * reachable from here on purpose.
+ *
+ * The five mode bits are the abstract capabilities the contract names, mapped onto the five native
+ * flags that carry the same meaning. Nothing else in the native attributes is read or written, so
+ * a caller that sets a mode gets exactly the change it named and no adjacent policy it did not.
+ */
+static hl_host_result hl_macos_terminal_probe(void *context, hl_host_handle handle) {
+    hl_host_macos *host = context;
+    int descriptor = hl_macos_file_descriptor(host, handle, 0);
+    if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    /* Answered from the terminal line discipline itself rather than from the object type, which is
+     * the distinction the contract exists for: a character device is not a terminal. */
+    return hl_macos_result(HL_STATUS_OK, isatty(descriptor) != 0 ? 1u : 0u, 0);
+}
+
+static hl_host_result hl_macos_terminal_get_mode(void *context, hl_host_handle handle, uint32_t *mode) {
+    hl_host_macos *host = context;
+    struct termios attributes;
+    int descriptor;
+    uint32_t value = 0;
+    if (mode == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    descriptor = hl_macos_file_descriptor(host, handle, 0);
+    if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (tcgetattr(descriptor, &attributes) != 0) return hl_macos_errno();
+    if ((attributes.c_lflag & ICANON) == 0) value |= HL_HOST_TERMINAL_RAW_INPUT;
+    if ((attributes.c_lflag & ECHO) != 0) value |= HL_HOST_TERMINAL_ECHO;
+    if ((attributes.c_lflag & ISIG) != 0) value |= HL_HOST_TERMINAL_SIGNALS;
+    if ((attributes.c_iflag & IXON) != 0) value |= HL_HOST_TERMINAL_FLOW_CONTROL;
+    if ((attributes.c_oflag & OPOST) != 0) value |= HL_HOST_TERMINAL_OUTPUT_PROCESSING;
+    *mode = value;
+    return hl_macos_result(HL_STATUS_OK, value, 0);
+}
+
+static hl_host_result hl_macos_terminal_set_mode(void *context, hl_host_handle handle, uint32_t mode) {
+    hl_host_macos *host = context;
+    struct termios attributes;
+    int descriptor;
+    if ((mode & ~(uint32_t)(HL_HOST_TERMINAL_RAW_INPUT | HL_HOST_TERMINAL_ECHO | HL_HOST_TERMINAL_SIGNALS |
+                            HL_HOST_TERMINAL_FLOW_CONTROL | HL_HOST_TERMINAL_OUTPUT_PROCESSING)) != 0)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    descriptor = hl_macos_file_descriptor(host, handle, 0);
+    if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    if (tcgetattr(descriptor, &attributes) != 0) return hl_macos_errno();
+    if ((mode & HL_HOST_TERMINAL_RAW_INPUT) != 0)
+        attributes.c_lflag &= (tcflag_t)~ICANON;
+    else
+        attributes.c_lflag |= (tcflag_t)ICANON;
+    if ((mode & HL_HOST_TERMINAL_ECHO) != 0)
+        attributes.c_lflag |= (tcflag_t)ECHO;
+    else
+        attributes.c_lflag &= (tcflag_t)~ECHO;
+    if ((mode & HL_HOST_TERMINAL_SIGNALS) != 0)
+        attributes.c_lflag |= (tcflag_t)ISIG;
+    else
+        attributes.c_lflag &= (tcflag_t)~ISIG;
+    if ((mode & HL_HOST_TERMINAL_FLOW_CONTROL) != 0)
+        attributes.c_iflag |= (tcflag_t)IXON;
+    else
+        attributes.c_iflag &= (tcflag_t)~IXON;
+    if ((mode & HL_HOST_TERMINAL_OUTPUT_PROCESSING) != 0)
+        attributes.c_oflag |= (tcflag_t)OPOST;
+    else
+        attributes.c_oflag &= (tcflag_t)~OPOST;
+    /* Applied now rather than after the queued output drains: a caller turning echo off before
+     * asking for a secret cannot be made to wait on a writer it does not control. */
+    if (tcsetattr(descriptor, TCSANOW, &attributes) != 0) return hl_macos_errno();
+    return hl_macos_result(HL_STATUS_OK, mode, 0);
+}
+
+static hl_host_result hl_macos_terminal_get_size(void *context, hl_host_handle handle, hl_host_terminal_size *size) {
+    hl_host_macos *host = context;
+    struct winsize window;
+    int descriptor;
+    if (size == NULL) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    descriptor = hl_macos_file_descriptor(host, handle, 0);
+    if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memset(&window, 0, sizeof(window));
+    if (ioctl(descriptor, TIOCGWINSZ, &window) != 0) return hl_macos_errno();
+    size->columns = window.ws_col;
+    size->rows = window.ws_row;
+    size->pixel_width = window.ws_xpixel;
+    size->pixel_height = window.ws_ypixel;
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_macos_terminal_set_size(void *context, hl_host_handle handle,
+                                                 const hl_host_terminal_size *size) {
+    hl_host_macos *host = context;
+    struct winsize window;
+    int descriptor;
+    if (size == NULL || size->columns > UINT16_MAX || size->rows > UINT16_MAX || size->pixel_width > UINT16_MAX ||
+        size->pixel_height > UINT16_MAX)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    descriptor = hl_macos_file_descriptor(host, handle, 0);
+    if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    memset(&window, 0, sizeof(window));
+    window.ws_col = (unsigned short)size->columns;
+    window.ws_row = (unsigned short)size->rows;
+    window.ws_xpixel = (unsigned short)size->pixel_width;
+    window.ws_ypixel = (unsigned short)size->pixel_height;
+    if (ioctl(descriptor, TIOCSWINSZ, &window) != 0) return hl_macos_errno();
+    return hl_macos_result(HL_STATUS_OK, 0, 0);
+}
+
+static hl_host_result hl_macos_terminal_read(void *context, hl_host_handle handle, hl_host_bytes output) {
+    hl_host_macos *host = context;
+    int descriptor;
+    ssize_t count;
+    if ((output.size != 0 && output.data == NULL) || output.size > SSIZE_MAX)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    descriptor = hl_macos_file_descriptor(host, handle, 0);
+    if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    count = read(descriptor, output.data, output.size);
+    return count >= 0 ? hl_macos_result(HL_STATUS_OK, (uint64_t)count, 0) : hl_macos_errno();
+}
+
+static hl_host_result hl_macos_terminal_write(void *context, hl_host_handle handle, hl_host_const_bytes input) {
+    hl_host_macos *host = context;
+    int descriptor;
+    ssize_t count;
+    if ((input.size != 0 && input.data == NULL) || input.size > SSIZE_MAX)
+        return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    descriptor = hl_macos_file_descriptor(host, handle, 0);
+    if (descriptor < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    count = write(descriptor, input.data, input.size);
+    return count >= 0 ? hl_macos_result(HL_STATUS_OK, (uint64_t)count, 0) : hl_macos_errno();
+}
+
+/*
+ * Typed absence, not an oversight. On this host a resize is delivered as a process-directed signal
+ * that the engine's own signal machinery already owns end to end, so there is no separate object
+ * for this to hand back -- and manufacturing one would mean installing a process-wide handler
+ * underneath the layer that is already handling that signal, which is a worse bargain than saying
+ * so. The operation exists in the contract for a host where the resize arrives in the input stream
+ * instead, where waiting for input and then reading it is a deadlock rather than a composition.
+ */
+static hl_host_result hl_macos_terminal_size_change_event(void *context, hl_host_handle handle) {
+    hl_host_macos *host = context;
+    if (hl_macos_file_descriptor(host, handle, 0) < 0) return hl_macos_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
+    return hl_macos_result(HL_STATUS_NOT_SUPPORTED, 0, 0);
+}
+
 static hl_host_result hl_macos_fork_prepare(void *context) {
     hl_host_macos *host = context;
     hl_host_result result;
@@ -4352,6 +4668,10 @@ static hl_host_result hl_macos_fork_complete(void *context) {
 static hl_host_result hl_macos_fork_child(void *context) {
     hl_host_macos *host = context;
     hl_host_result result = hl_host_sync_fork_complete(host->sync);
+    /* Only the forking thread exists here, so every waiter record inherited from the parent is about
+     * a thread this process does not have. Left in place they would hand a reused waiter identity
+     * someone else's outstanding interruption. */
+    hl_host_sync_park_reset(host->sync);
     for (uint32_t index = 0; index < host->counter_subscription_capacity; ++index) {
         hl_macos_counter_subscription *subscription = host->counter_subscriptions[index];
         if (subscription == NULL) continue;
@@ -4529,7 +4849,9 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
         HL_HOST_MEMORY_ABI,        sizeof(memory),          hl_macos_reserve,      hl_macos_protect,
         hl_macos_release,          hl_macos_publish,        hl_macos_reserve_code, hl_macos_repair_code,
         hl_macos_begin_code_write, hl_macos_end_code_write, hl_macos_map_file,     hl_macos_mapping_sync,
-        hl_macos_unmap_range,      hl_macos_map_anonymous,  hl_macos_discard,      hl_macos_repair_signal_page};
+        hl_macos_unmap_range,      hl_macos_map_anonymous,  hl_macos_discard,      hl_macos_repair_signal_page,
+        hl_macos_unmap_address,    hl_macos_wire_range,     hl_macos_unwire_range,  hl_macos_protect_address,
+        hl_macos_sync_address};
     static const hl_host_clock_services clock = {.abi = HL_HOST_CLOCK_ABI,
                                                  .size = sizeof(clock),
                                                  .monotonic_ns = hl_macos_monotonic,
@@ -4594,9 +4916,15 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     static const hl_host_shared_memory_services shared_memory = {HL_HOST_SHARED_MEMORY_ABI, sizeof(shared_memory),
                                                                  hl_macos_shared_create,    hl_macos_shared_open,
                                                                  hl_macos_shared_resize,    hl_macos_file_close};
-    static const hl_host_sync_services sync = {HL_HOST_SYNC_ABI,      sizeof(sync),           hl_macos_mutex_create,
-                                               hl_macos_mutex_lock,   hl_macos_mutex_unlock,  hl_macos_mutex_close,
-                                               hl_macos_fork_prepare, hl_macos_fork_complete, hl_macos_fork_child};
+    static const hl_host_sync_services sync = {
+        HL_HOST_SYNC_ABI,      sizeof(sync),           hl_macos_mutex_create, hl_macos_mutex_lock,
+        hl_macos_mutex_unlock, hl_macos_mutex_close,   hl_macos_fork_prepare, hl_macos_fork_complete,
+        hl_macos_fork_child,   hl_macos_park,          hl_macos_unpark,       hl_macos_interrupt_park};
+    static const hl_host_terminal_services terminal = {
+        HL_HOST_TERMINAL_ABI,       sizeof(terminal),           hl_macos_terminal_probe,
+        hl_macos_terminal_get_mode, hl_macos_terminal_set_mode, hl_macos_terminal_get_size,
+        hl_macos_terminal_set_size, hl_macos_terminal_read,     hl_macos_terminal_write,
+        hl_macos_terminal_size_change_event};
     static const hl_host_counter_services counter = {
         HL_HOST_COUNTER_ABI,          sizeof(counter),
         hl_macos_counter_create,      hl_macos_counter_read,
@@ -4719,7 +5047,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
                                  HL_HOST_CAP_PROCESS | HL_HOST_CAP_EVENT_TIMER | HL_HOST_CAP_SHARED_MEMORY |
                                  HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_SYNC | HL_HOST_CAP_EVENT | HL_HOST_CAP_COUNTER |
                                  HL_HOST_CAP_DIRECTORY | HL_HOST_CAP_TRANSFER | HL_HOST_CAP_WATCH | HL_HOST_CAP_STREAM |
-                                 HL_HOST_CAP_POSIX_ATTACHMENT;
+                                 HL_HOST_CAP_POSIX_ATTACHMENT | HL_HOST_CAP_TERMINAL;
     out_services->context = host;
     out_services->memory = &memory;
     out_services->clock = &clock;
@@ -4735,6 +5063,7 @@ hl_status hl_host_macos_create(hl_host_macos **out_host, hl_host_services *out_s
     out_services->watch = &watch;
     out_services->stream = &stream;
     out_services->posix_attachment = &posix_attachment;
+    out_services->terminal = &terminal;
     *out_host = host;
     return HL_STATUS_OK;
 }
@@ -4800,10 +5129,16 @@ void hl_host_macos_destroy(hl_host_macos *host) {
     pthread_mutex_unlock(&host->lock);
     for (index = 0; index < host->mapping_capacity; index++) {
         hl_macos_mapping *mapping = &host->mappings[index];
+        uint64_t held_offset;
+        uint64_t held_size;
         if (!mapping->active) continue;
-        munmap(mapping->writable, (size_t)mapping->size);
+        /* Teardown gives back only what is still held, for the same reason release does. */
+        for (uint32_t part = 0;
+             hl_host_hole_set_held_range(&mapping->retired, mapping->size, part, &held_offset, &held_size); ++part)
+            munmap((char *)mapping->writable + held_offset, (size_t)held_size);
         if (mapping->executable != NULL && mapping->executable != mapping->writable)
             munmap(mapping->executable, (size_t)mapping->size);
+        hl_host_hole_set_release(&mapping->retired);
     }
     for (index = 0; index < host->file_capacity; ++index) {
         hl_macos_file *file = &host->files[index];

@@ -21,7 +21,7 @@ int main(void) {
  * and this case is only selected for the aarch64 suite via the manifest isas
  * column. Print the golden token so a wrong-arch run would still match. */
 int main(void) {
- puts("cpu-discovery hwcap=1fb cpuid=0 sha3=0 sm3=0 sm4=0 ctr=9444c004 dczid=4 proc_clean=1 id_sigill=1");
+ puts("cpu-discovery hwcap=1001fb cpuid=0 sha3=0 sm3=0 sm4=0 ctr=9444c004 dczid=4 proc_clean=1 id_sigill=1");
  return 0;
 }
 #endif

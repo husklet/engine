@@ -134,7 +134,7 @@ fn validate_extension_namespace(
             error.field.clone_from(&field);
             error
         })?;
-        if entry.path() == std::path::Path::new("/") {
+        if crate::sys::guest_path::is_root(crate::sys::guest_path::bytes(entry.path())) {
             return Err(spec_error(
                 SpecErrorCategory::Conflict,
                 field,

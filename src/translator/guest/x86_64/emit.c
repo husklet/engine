@@ -2,6 +2,7 @@
 // (ST(i) at double precision) + prologue/spill/exits.
 // ---------------- ARM64 instruction emitters ----------------
 #include "encoding.h"
+#include "../../../host/host_cpu.h" // HL_HOST_CPU_*: the host-feature probes here are AArch64-only
 // (the same-ISA-independent half: these emit HOST code, copied from jit.c +
 //  a few width-typed loads/stores the x86 front-end needs.)
 
@@ -12,8 +13,10 @@
 // runs, by a constructor. It is enabled ONLY on a Linux host: the LDAPR unaligned-crossing alignment-fault
 // fixup (ldapr_align_fixup) is wired solely into the Linux SIGBUS run path (jit86_lazyguard), so on any
 // other host the fast path stays OFF (== baseline behavior, no unhandled BUS_ADRALN).
+// The probe is AArch64-only: AT_HWCAP is a PER-ARCHITECTURE bit vector, and bit 15 of the same word on
+// x86-64 is CPUID.1:EDX CMOV -- set everywhere, so probing it would pin the LDAPR path ON forever.
 int g_host_lrcpc = 0;
-#if defined(__linux__)
+#if defined(__linux__) && defined(HL_HOST_CPU_AARCH64)
 #include <sys/auxv.h>
 #ifndef HWCAP_LRCPC
 #define HWCAP_LRCPC (1u << 15) // AArch64 AT_HWCAP bit 15
@@ -703,13 +706,16 @@ static void e_st_addr(int xa, int i) { // xa = &cpu->st[(fptop+i)&7]   (clobbers
     emit32(0x8B000000u | (16 << 16) | (3 << 10) | (xa << 5) | xa);           // add xa,xa,x16,lsl#3
 }
 
-void e_fp_settop(int delta) { // fptop = (fptop+delta) & 7   (clobbers x16)
+// fptop = (fptop+delta) & 7, keeping bits 63:3 -- the x87 tag word and its ARMED bit live there
+// (x87state.h), so this is a bfi rather than the mask-and-store it used to be. (clobbers x16/x17)
+void e_fp_settop(int delta) {
     e_ldr(16, 28, OFF_FPTOP);
+    e_mov_rr(17, 16, 0);
     if (delta < 0)
-        emit32(0x51000000u | ((unsigned)(-delta) << 10) | (16 << 5) | 16); // sub w16,w16,#n
+        emit32(0x51000000u | ((unsigned)(-delta) << 10) | (17 << 5) | 17); // sub w17,w17,#n
     else if (delta)
-        emit32(0x11000000u | ((unsigned)delta << 10) | (16 << 5) | 16); // add w16,w16,#n
-    emit32(0x12000800u | (16 << 5) | 16);                               // and w16,w16,#7
+        emit32(0x11000000u | ((unsigned)delta << 10) | (17 << 5) | 17); // add w17,w17,#n
+    e_bfi(16, 17, 0, 3, 1);
     e_str(16, 28, OFF_FPTOP);
 }
 
@@ -731,18 +737,26 @@ void e_fp_push(int vs) {
 
 // fcom-family compare: FCMP dn,dm then set cpu->fpsw bits C0(8)/C2(10)/C3(14) so a
 // following fnstsw ax + sahf reproduces x86 ZF/PF/CF. (clobbers x16/x17/x20)
-void e_fcom_setfpsw(int n, int m) {
-    emit32(0x1E602000u | (m << 16) | (n << 5)); // fcmp dn, dm
-    e_cset(16, 3, 0);                           // less       (LO: C clear)
-    e_cset(20, 6, 0);                           // unordered  (VS)
-    e_rrr(A_ORR, 16, 16, 20, 0, 0);             // C0 = less | unordered
-    e_cset(17, 0, 0);                           // equal      (EQ)
-    e_rrr(A_ORR, 17, 17, 20, 0, 0);             // C3 = equal | unordered
+// `signaling` picks FCMPE over FCMP: FCOM/FCOMP/FCOMPP/FTST raise #IA on ANY NaN, FUCOM* only on an
+// SNaN, which is exactly ARM's FCMPE/FCMP split. FCMP for both left FSW.IE clear where hardware sets it,
+// since the FSW exception bits are projected from the host FPSR (fp_project_exceptions).
+void e_fcom_setfpsw(int n, int m, int signaling) {
+    uint32_t cmp = 0x1E602000u | (signaling ? 0x10u : 0u);
+    emit32(cmp | (m << 16) | (n << 5)); // fcmp/fcmpe dn, dm
+    e_cset(16, 3, 0);                   // less       (LO: C clear)
+    e_cset(20, 6, 0);                   // unordered  (VS)
+    e_rrr(A_ORR, 16, 16, 20, 0, 0);     // C0 = less | unordered
+    e_cset(17, 0, 0);                   // equal      (EQ)
+    e_rrr(A_ORR, 17, 17, 20, 0, 0);     // C3 = equal | unordered
     e_lsl_i(16, 16, 8, 0);
     e_lsl_i(20, 20, 10, 0);
     e_rrr(A_ORR, 16, 16, 20, 0, 0); // | C2<<10
     e_lsl_i(17, 17, 14, 0);
     e_rrr(A_ORR, 16, 16, 17, 0, 0); // | C3<<14
+    e_ldr(17, 28, OFF_FPSW);        // SF (bit 6) is sticky: a condition-code write must not clear it
+    e_movconst(20, 0x40);
+    e_rrr(A_AND, 17, 17, 20, 1, 0);
+    e_rrr(A_ORR, 16, 16, 17, 1, 0);
     e_str(16, 28, OFF_FPSW);
 }
 
@@ -812,7 +826,8 @@ static int64_t sext(uint64_t v, int bits) {
     return (int64_t)((v ^ m) - m);
 }
 
-#if defined(__GNUC__) && !defined(__clang__) && defined(__aarch64__)
+// Must select the same arm as translate.c's trampoline definitions, or the two disagree on linkage.
+#if defined(__GNUC__) && !defined(__clang__) && defined(HL_HOST_CPU_AARCH64)
 extern void block_return(void) __attribute__((visibility("hidden")));
 #else
 static void block_return(void);
@@ -1190,6 +1205,14 @@ static uint64_t g_sig_inline_count;   // # rt_sigprocmask served inline (written
 static uint64_t g_yield_inline_count; // # sched_yield served inline
 
 static void s1_calibrate(void) {
+#if !defined(HL_HOST_CPU_AARCH64)
+    // The inline time fast path is inseparable from the AArch64 generic timer (CNTFRQ_EL0/CNTVCT_EL0, read
+    // below and at the emitted `syscall` site). Another counter would not fail loudly, just hand the guest
+    // a wrong clock, so turn BOTH gates off; g_fastsys == 0 also drops the inline
+    // rt_sigprocmask/sched_yield arms.
+    g_fastsys = 0;
+    g_fastclk = 0;
+#else
     uint64_t freq;
     hl_host_result effective_frequency;
     const hl_host_services *host = effective_host_services();
@@ -1233,6 +1256,7 @@ static void s1_calibrate(void) {
     }
     g_cal_mono_ns = (uint64_t)tm.tv_sec * 1000000000ull + (uint64_t)tm.tv_nsec;
     g_cal_real_ns = (uint64_t)tr.tv_sec * 1000000000ull + (uint64_t)tr.tv_nsec;
+#endif
 }
 
 // Emitted at the guest `syscall` site. Guest GPRs are live in x0..x15 (rax=x0, rsi=x6, rdi=x7),

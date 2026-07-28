@@ -64,10 +64,12 @@ pub(super) fn validate(
             "this backend cannot select an argv[0] different from the executable",
         ));
     }
-    let cwd = std::path::Path::new(&spec.process.cwd);
-    if !cwd.is_absolute()
-        || cwd.as_os_str().as_encoded_bytes().contains(&0)
-        || cwd.as_os_str().as_encoded_bytes().len() > capabilities.limits.path_bytes as usize
+    // The working directory is a *guest* path, so its absoluteness is a guest question: on a Windows
+    // host `Path::new("/").is_absolute()` is `false`, and the default cwd is `/`.
+    let cwd = spec.process.cwd.as_encoded_bytes();
+    if !crate::sys::guest_path::is_absolute(cwd)
+        || cwd.contains(&0)
+        || cwd.len() > capabilities.limits.path_bytes as usize
     {
         return Err(spec_error(
             SpecErrorCategory::Invalid,
@@ -264,7 +266,7 @@ pub(super) fn validate(
             capabilities.limits.path_bytes,
             "filesystem.ownership",
         )?;
-        if ownership.path == std::path::Path::new("/")
+        if crate::sys::guest_path::is_root(crate::sys::guest_path::bytes(&ownership.path))
             || !ownership_paths.insert(&ownership.path)
             || ownership
                 .path
@@ -564,7 +566,6 @@ fn validate_selected_runtime(
                 }
             }
             if let NamespaceEntry::Socket(socket) = entry {
-                use std::os::unix::fs::FileTypeExt as _;
                 let metadata = std::fs::symlink_metadata(&socket.host).map_err(|_| {
                     resource_error(
                         SpecErrorCategory::Invalid,
@@ -573,7 +574,7 @@ fn validate_selected_runtime(
                         "projected socket must name an existing host socket",
                     )
                 })?;
-                if !metadata.file_type().is_socket() {
+                if !crate::sys::is_socket(&metadata) {
                     return Err(resource_error(
                         SpecErrorCategory::Invalid,
                         "extensions.namespace",

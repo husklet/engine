@@ -1,4 +1,5 @@
-// hl/linux_abi -- x86-64 ELF loader (load PT_LOAD high; static-PIE + dynamic via ld.so) + stack.
+// hl/linux_abi -- x86-64 ELF loader (ET_EXEC at its link address on Linux, biased high on macOS;
+// static-PIE + dynamic via ld.so) + stack. Placement rule: thread.c, "non-PIE image placement, per host".
 #include "placement.h"
 #include "goimage.h"
 
@@ -19,12 +20,20 @@ static void *elf_host_map(void *context, void *address, size_t length, uint32_t 
 }
 
 #include <stdatomic.h>
+/* <sys/ucontext.h> only where a ucontext_t comes from a system header. On a host
+ * with no signals there is no such header and no such type: native_context.h's
+ * cell for that host names the register file the fault primitive delivers
+ * instead, so it is the only include that is unconditional here. */
+#if !defined(_WIN32)
 #include <sys/ucontext.h>
+#endif
 #include "../host/native_context.h"
 
 #include "../host/range.h"
 #include "page.h"
+#include "elf_protect.h" // the loader's protection contract, shared with linux_abi/elf.c
 #include "image.h"
+#include "../translator/guest/x86_64/cpuid.h" // AT_HWCAP derives from the guest CPUID model, not the host
 
 static int x86_image_read(const char *path, hl_linux_image *image) {
     if (g_initial_executable_image != NULL)
@@ -334,14 +343,21 @@ static void load_elf(const char *path, struct loaded *out) {
     }
     uint64_t basepage = minv & ~0xFFFull;
     uint64_t span = (maxv - basepage + 0xFFFF) & ~0xFFFFull;
+    int etype = rd16(f + 16);
+    struct elf_host_map_context map_context = {
+        .mapping = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(hl_host_memory_mapping), 0, 0, 0, 0}};
+    uint8_t *base = NULL;
+    // Placement: thread.c, "non-PIE image placement, per host". On Linux an ET_EXEC goes AT its link
+    // address, so bias == 0 and the whole fold family below never arms. That address is also already
+    // deterministic across runs, which is the only thing g_force_base exists to provide -- consume it.
+    if (etype == 2) base = (uint8_t *)(uintptr_t)nonpie_place_at_link_address(basepage, span, &map_context.mapping);
     // opt8: the persistent cache needs deterministic guest bases across runs so the translated bytes
     // (RIP-relative leas, baked branch targets, block-map keys) are byte-identical. When g_force_base is
     // set, map MAP_FIXED at the caller-requested address; the image is PIE so basepage is ~0 and the chosen
     // base becomes out->base, deriving all guest PCs/addresses identically each run. One-shot per image.
-    struct elf_host_map_context map_context = {
-        .mapping = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(hl_host_memory_mapping), 0, 0, 0, 0}};
-    uint8_t *base;
-    if (g_force_base) {
+    if (base != NULL) {
+        g_force_base = 0; // one-shot, consumed by the link-address placement
+    } else if (g_force_base) {
         void *want = (void *)(g_force_base + basepage);
         int fixed_failed;
         g_force_base = 0; // one-shot: consumed for THIS load
@@ -375,17 +391,15 @@ static void load_elf(const char *path, struct loaded *out) {
     }
     hl_gmap_add((uint64_t)base, span);
     uint64_t bias = (uint64_t)base - basepage;
-    // W6A item 1: a non-PIE ET_EXEC (etype==2) links at a fixed low vaddr (e.g. 0x400000) but macOS
-    // __PAGEZERO reserves the low 4GB, so the loader (above) biases it to a high mmap. Its un-relocated
-    // ABSOLUTE refs then point at the original low vaddr (unmapped/__PAGEZERO) and fault. Record the
-    // original link range + bias so the dispatcher can redirect absolute CODE jumps and the SIGSEGV
-    // handler (nonpie_fixup) can serve absolute DATA loads/stores at +bias. PIE/static-PIE leave these
-    // 0 -> no redirect, no fixup, byte-identical. Coexists with the opt8 g_force_base path above (that
-    // only fires for PIE images under HL_PCACHE; a non-PIE ET_EXEC takes the NULL-hint branch).
+    // W6A item 1: a non-PIE ET_EXEC's un-relocated ABSOLUTE refs name its link vaddr, so whenever the
+    // loader could not place it there (macOS __PAGEZERO) those refs land on an unmapped address. Record
+    // the link range + bias so the dispatcher can redirect absolute CODE jumps and the SIGSEGV handler
+    // (nonpie_fixup) can serve absolute DATA loads/stores at +bias. Armed on `bias != 0`, not on
+    // `etype == 2`: a link-address placement (the Linux path above) has one coordinate system, and
+    // leaving lo/hi set with bias 0 would keep every workaround below reachable for no reason.
     // NONPIE_NOFIXUP=1 disables (legacy: code jump still faults on the low vaddr). g_nonpie_* live in the
     // shared os/linux/container/vfs.c; service.c resets them across execve (case 221) for re-loaded images.
-    int etype = rd16(f + 16);
-    if (etype == 2) {
+    if (etype == 2 && bias != 0) {
         g_nonpie_lo = basepage;
         g_nonpie_hi = basepage + span;
         g_nonpie_bias = bias;
@@ -396,15 +410,6 @@ static void load_elf(const char *path, struct loaded *out) {
         if (rd32(ph) != 1) continue;
         uint64_t off = rd64(ph + 8), v = rd64(ph + 16), fsz = rd64(ph + 32);
         memcpy((void *)(v + bias), f + off, fsz);
-        uint64_t msz = rd64(ph + 40);
-        uint64_t lo = (v + bias) & ~0xfffull;
-        uint64_t hi = (v + bias + msz + 0xfffull) & ~0xfffull;
-        if (hi > lo) {
-            if (rd32(ph + 4) & 2)
-                gro_clear(lo, hi);
-            else
-                gro_add(lo, hi);
-        }
     }
     // W6A item 1: for a biased non-PIE Go image, rebase firstmoduledata so the runtime's findfunc()
     // resolves the biased code PCs (otherwise runtime.pcdatavalue nil-derefs). Gated on g_nonpie_lo
@@ -414,10 +419,10 @@ static void load_elf(const char *path, struct loaded *out) {
     // baked `mov r32,imm` materialization to the high mapping -- see translate.c g_nonpie_blob_code. Only for a
     // biased non-PIE image that actually carries the symbol (node/mongosh/any embedded-V8 ET_EXEC); 0 otherwise
     // (PIE, Go, stripped, non-V8) -> inert. NOV8BLOB=1 disables for A/B.
-    // Gate on THIS image being the non-PIE ET_EXEC (etype==2), not on the persistent g_nonpie_lo: the
+    // Gate on THIS image being the BIASED non-PIE ET_EXEC, not on the persistent g_nonpie_lo: the
     // interpreter (ld.so, a DYN loaded by a SECOND load_elf in the same process) has no v8 symbol and would
     // otherwise reset the value the main image just recorded. Only the main non-PIE exe carries the blob.
-    if (etype == 2) g_nonpie_blob_code = go_symval(f, image.size, "v8_Default_embedded_blob_code_");
+    if (etype == 2 && bias != 0) g_nonpie_blob_code = go_symval(f, image.size, "v8_Default_embedded_blob_code_");
     // a biased non-PIE ET_EXEC (e.g. static glibc jq) carries baked ABSOLUTE pointers in
     // .data.rel.ro AND .data (pointer tables) that the static linker resolved to LINK addresses with NO
     // runtime relocation entry. After we bias the image high (macOS __PAGEZERO blocks the low link range)
@@ -426,8 +431,8 @@ static void load_elf(const char *path, struct loaded *out) {
     // abort (jq --version; same class as the gcc-ld / git / rustc SIGSEGVs). Re-relocate every 8-byte word
     // in those sections whose value lands in the original link range by +bias (what an R_X86_64_RELATIVE
     // would do). .data is mixed, so a non-pointer qword that happens to fall in [lo,hi) is a (rare) false
-    // positive -- the fully robust fix is to map the image AT its link address (engine with a small
-    // __PAGEZERO). Gated by NORELRO=1 for A/B. ET_EXEC only; static-PIE carries real relocs, never here.
+    // positive -- which is why a Linux host maps the image AT its link address instead and never gets
+    // here. Gated by NORELRO=1 for A/B. Biased ET_EXEC only; static-PIE carries real relocs, never here.
     // Skip GO binaries: go_rebase_nonpie above already rebased their moduledata/.data pointers; a blind
     // .data scan here double-biases the Go name/type tables (etcd -> "nameOff ... not in ranges"). Detect
     // Go via .gopclntab (present in every Go binary, stripped or not).
@@ -469,9 +474,10 @@ static void load_elf(const char *path, struct loaded *out) {
             }
         }
     }
-    (void)effective_host_services()->memory->protect(effective_host_services()->context, map_context.mapping.handle, 0,
-                                                     span, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE |
-                                                               HL_HOST_MEMORY_EXECUTE);
+    // Per-segment W^X + read-only registry, once the rebases above have finished writing into the image.
+    // This used to force the whole span R|W|X while registering the read-only segments anyway, so a store
+    // into .rodata found a physically writable page and was silently kept -- elf_protect.h, the contract.
+    hl_elf_protect_segments(&map_context.mapping, f + phoff, phnum, phentsize, bias);
     // A dynamic ET_EXEC remains a LOW-address Linux object even though macOS forces its storage HIGH.
     // ld.so derives the main link_map bias and lookup range from AT_ENTRY/AT_PHDR; publishing host-biased
     // values makes dladdr/dlsym miss every LOW function pointer. The dispatcher already translates LOW
@@ -494,6 +500,23 @@ static void load_elf(const char *path, struct loaded *out) {
 
 // Build the SysV x86-64 process stack (identical layout to aarch64). Returns rsp.
 static char *g_guest_env[] = {"PATH=/usr/bin:/bin", "HOME=/root", "TERM=dumb", "LANG=C", NULL};
+
+// AT_HWCAP on x86-64 is CPUID.1:EDX (arch/x86/include/asm/elf.h ELF_HWCAP; measured 0x178bfbff natively
+// here). It was hardcoded 0. glibc hid that -- getauxval(AT_HWCAP) returns its own _dl_hwcap, not the kernel
+// word, which is why the `auxval` fixture still read hwcap_nz=1 -- but a /proc/self/auxv reader saw a CPU with
+// no features at all.
+//
+// Not the host's word: the guest never executes on this CPU. The one model is hl_x86_cpuid()'s leaf 1, where
+// -- the rule guest/aarch64/cpu.h records -- a bit is set only when BOTH backends implement the whole feature
+// exactly, and which the guest reads directly with `cpuid`. Ask it rather than restate it, so the two surfaces
+// cannot disagree. AT_HWCAP2 is 0 by the same derivation, not omission: its bits are RING3MWAIT and FSGSBASE,
+// and leaf 7 EBX bit 0 is clear in that model. Linux emits it unconditionally, so the entry must exist at 0.
+static uint64_t x86_guest_hwcap(void) {
+    struct cpu probe = {0}; // hl_x86_cpuid reads RAX/RCX and writes RAX..RDX; nothing else is touched
+    probe.r[RAX] = 1;
+    hl_x86_cpuid(&probe);
+    return (uint64_t)(uint32_t)probe.r[RDX];
+}
 
 static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t at_base) {
     size_t SZ = 8u << 20, GUARD = 0x10000;
@@ -621,16 +644,20 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         {7, at_base},
         {8, 0},
         {9, lm->entry},
-        {11, 0},
-        {12, 0},
-        {13, 0}, // AT_UID/EUID/GID -> container root
-        {14, 0},
-        {16, 0},
+        // AT_UID/EUID/GID/EGID: 0 with a "container root" comment, but cuid()/cgid() ARE the container
+        // identity (state.c: configured id, else the host's) and are what container_init seeds g_ruid/g_euid
+        // from -- so the constant did not mean root, it meant auxv contradicted this guest's own getuid() and
+        // the aarch64 engine. Measured: aarch64 guest 1000, x86-64 guest 0, same uncontainerised run.
+        {11, (uint64_t)cuid()},
+        {12, (uint64_t)cuid()},
+        {13, (uint64_t)cgid()},
+        {14, (uint64_t)cgid()},
+        {16, x86_guest_hwcap()},
         {15, plat},
         {25, rnd},
         {23, 0},       // AT_SECURE 0
         {17, 100},     // AT_CLKTCK
-        {26, 0},       // AT_HWCAP2
+        {26, 0},       // AT_HWCAP2 -- 0 by derivation, see x86_guest_hwcap()
         {31, execfn}, // AT_EXECFN -> execve pathname string (glibc/Rust/uutils multicall read it). Missing it
                       // made getauxval(AT_EXECFN)==0 -> strlen(0) -> SIGSEGV.
         {0, 0},        // AT_NULL terminator
@@ -722,6 +749,10 @@ static void lazy_diag(void) {
 // data. Gated on g_nonpie_lo (set only for ET_EXEC) -> PIE/static-PIE never enter here. OUT OF SCOPE
 // (documented residual, a separate broad g2h change): syscall POINTER args that point into the low
 // non-PIE image are read 1:1 in service.c and are NOT redirected here.
+
+// HOST-CPU GATE to the end of nonpie_fixup: it decodes a 4-byte A64 word at the host PC out of
+// HL_HOST_UC_REGS/VREGS, so another host backend needs its own absolute-DATA fixup in the #else arm.
+#if defined(HL_HOST_HAS_A64_CONTEXT)
 
 // Atomic RMW helpers (truly atomic, width-typed) used by the LSE/CAS fixup paths below.
 static int nonpie_lse_rmw(void *p, int size, int opc, uint64_t v, uint64_t *old) {
@@ -903,6 +934,17 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
     return 1;
 }
 
+#else
+
+// Not an AArch64 host: nothing to decode. 0 ("not handled") keeps the fault on the deliver/re-raise path.
+static int nonpie_fixup(siginfo_t *si, void *ucv) {
+    (void)si;
+    (void)ucv;
+    return 0;
+}
+
+#endif
+
 // Unaligned guest ATOMIC (LSE) alignment-fault fixup.
 //
 // x86 makes `xchg reg,mem` implicitly locked and lets `lock` prefix any of add/adc/sub/sbb/and/or/xor/
@@ -921,6 +963,11 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
 // address; making that work would require stopping the world on every atomic (what qemu-user does via
 // cpu_loop_exit_atomic) and would tax every correctly-aligned lock in every guest. The trade is
 // deliberate and documented: correctness for split-lock programs, no cost on the aligned path.
+
+// HOST-CPU GATE, as for nonpie_fixup: this decodes A64 LSE/CASAL, and only AArch64 faults on an unaligned
+// atomic at all (x86's `lock`/`xchg` are legal at any address), so on x86-64 that SIGBUS cannot arise.
+#if defined(HL_HOST_HAS_A64_CONTEXT)
+
 static _Atomic unsigned g_unaligned_atomic_lock;
 
 static int lse_align_fixup(int sig, siginfo_t *si, void *ucv) {
@@ -986,6 +1033,18 @@ static int lse_align_fixup(int sig, siginfo_t *si, void *ucv) {
     return 1;
 }
 
+#else
+
+// Not an AArch64 host: no LSE atomic was emitted. 0 ("not handled") lets a real SIGBUS reach the crash path.
+static int lse_align_fixup(int sig, siginfo_t *si, void *ucv) {
+    (void)sig;
+    (void)si;
+    (void)ucv;
+    return 0;
+}
+
+#endif
+
 // x86-TSO LDAPR alignment-fault fixup. Guest loads are emitted as LDAPR (Load-AcquirePC) to supply the
 // x86-TSO LoadLoad+LoadStore ordering in one instruction (emit.c). On a FEAT_LSE2 host an unaligned LDAPR
 // that crosses a 16-byte granule raises SIGBUS/BUS_ADRALN. x86 permits every unaligned normal load, and a
@@ -995,6 +1054,11 @@ static int lse_align_fixup(int sig, siginfo_t *si, void *ucv) {
 // plus DMB ISHLD (the exact LoadLoad+LoadStore acquire edges LDAPR provides -- identical to the old
 // LDR+DMB ISHLD sequence), write the zero-extended value into Rt, and step the host PC past the LDAPR.
 // Returns 1 iff handled; declines (0) for anything that is not one of our LDAPRs so real faults flow on.
+
+// HOST-CPU GATE, third of the same kind: LDAPR is A64, and x86-64 (TSO gives the acquire edge free) emits
+// none and never alignment-faults a load.
+#if defined(HL_HOST_HAS_A64_CONTEXT)
+
 static int ldapr_align_fixup(int sig, siginfo_t *si, void *ucv) {
     extern int g_host_lrcpc;                     // set from host AT_HWCAP (emit.c); 0 => no LDAPR emitted
     if (!g_host_lrcpc || sig != SIGBUS || !si || !ucv) return 0; // inert on the LDR+DMB fallback path
@@ -1027,6 +1091,18 @@ static int ldapr_align_fixup(int sig, siginfo_t *si, void *ucv) {
     HL_HOST_UC_PC(uc) += 4;
     return 1;
 }
+
+#else
+
+// Not an AArch64 host: no LDAPR was emitted. 0 ("not handled") lets a genuine alignment fault be reported.
+static int ldapr_align_fixup(int sig, siginfo_t *si, void *ucv) {
+    (void)sig;
+    (void)si;
+    (void)ucv;
+    return 0;
+}
+
+#endif
 
 void jit86_lazyguard(int sig, siginfo_t *si, void *uc) {
     // x86-TSO LDAPR unaligned-crossing alignment fault -> emulate + resume. First, before any classifier:
@@ -1204,6 +1280,62 @@ static void jit86_install_sync_fault_guards(void) {
 #ifndef HL_EMBEDDED_BUILD
 __attribute__((constructor)) static void jit86_sync_fault_guards_constructor(void) {
     jit86_install_sync_fault_guards();
+}
+#endif
+
+#if defined(_WIN32)
+#include "../host/windows/fault.h"
+/*
+ * The single classifier the host's vectored exception handler calls, standing in for all five sigactions
+ * the POSIX arms install.
+ *
+ * It does no classification of its own. The two guards above already are the classifier -- 200 lines of
+ * ordering that decides between a probe fault, an LDAPR/LSE alignment emulation, a non-PIE absolute-data
+ * fixup, a PROT_NONE registry hit, a read-only registry hit, self-modifying code, a lazy page grow, guest
+ * signal delivery, and a faithful guest termination -- and that ordering is not host-specific. Reproducing
+ * it against the host fault record would create a second copy that must stay in step with the first, and
+ * the two would diverge on exactly the rare path neither is tested on.
+ *
+ * So the record is translated INTO the shape the guards already read. That translation is nearly free
+ * because the host primitive reports kind and code as the Linux signal number and si_code for the pair; the
+ * only field it carries that no POSIX siginfo_t has is `access`, which says whether the instruction read,
+ * wrote or executed. si_addr says where, never whether, so sites that today infer write-ness ("a read would
+ * have been legal under this protection, so it must have been a write") could stop inferring here. They are
+ * left inferring for now: the inference is correct for both registries that use it, and changing it is a
+ * behaviour change to a shared path rather than a port.
+ *
+ * Two things this deliberately does NOT do:
+ *
+ *   - it never returns DECLINE after calling a guard. A guard that cannot serve the fault does not return:
+ *     it terminates the guest faithfully, or restores SIG_DFL and re-raises, which on this host aborts the
+ *     process. Returning RESUME after a guard returned therefore always means the guard fixed something.
+ *     Returning RESUME on a fault nobody fixed would re-execute the faulting instruction forever, and a
+ *     spin is a far worse failure than a crash.
+ *   - it takes no lock, allocates nothing and logs nothing on the fast path, because a vectored handler is
+ *     entered synchronously from the faulting instruction and may be inside a lock this thread already
+ *     holds. The guards obey the same rule; the lazy-map path calls only the host service's explicitly
+ *     signal-context-safe page repair for that reason.
+ */
+static int hl_windows_guest_fault(hl_windows_fault *fault, void *context) {
+    siginfo_t info;
+    (void)context;
+    memset(&info, 0, sizeof info);
+    info.si_signo = (int)fault->kind;
+    info.si_code = (int)fault->code;
+    info.si_addr = (fault->flags & HL_WINDOWS_FAULT_HAS_ADDRESS) ? (void *)(uintptr_t)fault->address : NULL;
+    switch (fault->kind) {
+    case HL_WINDOWS_FAULT_SEGV:
+    case HL_WINDOWS_FAULT_BUS: jit86_lazyguard((int)fault->kind, &info, fault->context); return HL_WINDOWS_FAULT_RESUME;
+    case HL_WINDOWS_FAULT_ILL:
+    case HL_WINDOWS_FAULT_FPE:
+    case HL_WINDOWS_FAULT_TRAP: jit86_syncguard((int)fault->kind, &info, fault->context); return HL_WINDOWS_FAULT_RESUME;
+    default:
+        /* Not a class any guard models -- a C++ throw, a debugger breakpoint the
+         * debugger owns, a language exception from a loaded DLL. Declining lets
+         * the frame-based handlers that DO own it run, which is the whole reason
+         * a vectored handler has a decline verdict at all. */
+        return HL_WINDOWS_FAULT_DECLINE;
+    }
 }
 #endif
 

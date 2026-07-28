@@ -2,6 +2,102 @@
 #include "demux.h"
 
 #include <errno.h>
+
+/* The demultiplexer's arena is MAP_SHARED|MAP_ANONYMOUS and its mutexes and condition variables are
+ * PTHREAD_PROCESS_SHARED for one reason: a guest that forks keeps talking to the same provider, so waiters
+ * are keyed by getpid(), a fork child re-owns its own pumps, and teardown unmaps the arena instead of
+ * destroying synchronization objects a dead foreign owner may still be parked on. Every one of those is a
+ * property of fork(2). Windows has no fork, winpthreads implements no process-shared attribute at all, and
+ * the wire underneath is an AF_UNIX stream with MSG_NOSIGNAL.
+ *
+ * Routing only the arena through the memory seam would compile nothing further and would claim a portability
+ * this file does not have, so the feature is guarded whole. A Windows demultiplexer wants a private heap
+ * arena, ordinary intra-process locks and a duplicated handle per child -- a different object with the same
+ * interface, not this one with its allocator swapped. Until it exists, every entry point reports -ENOSYS in
+ * the negative-errno channel callers already check, so a caller sees a provider that is unavailable rather
+ * than one that accepted a request it will never answer. */
+#if defined(_WIN32)
+
+int hl_provider_demux_create(hl_provider_demux **out, int fd, uint32_t max_payload, uint32_t max_waiters,
+                             uint32_t max_subscriptions, uint32_t event_capacity) {
+    (void)fd;
+    (void)max_payload;
+    (void)max_waiters;
+    (void)max_subscriptions;
+    (void)event_capacity;
+    if (out != NULL) *out = NULL;
+    return -ENOSYS;
+}
+
+int hl_provider_demux_begin(hl_provider_demux *d, const void *bytes, uint32_t size, hl_provider_ticket *ticket) {
+    (void)d;
+    (void)bytes;
+    (void)size;
+    (void)ticket;
+    return -ENOSYS;
+}
+
+int hl_provider_demux_wait(hl_provider_demux *d, hl_provider_ticket ticket, uint32_t timeout_ms,
+                           hl_provider_reply *reply) {
+    (void)d;
+    (void)ticket;
+    (void)timeout_ms;
+    (void)reply;
+    return -ENOSYS;
+}
+
+int hl_provider_demux_cancel(hl_provider_demux *d, hl_provider_ticket ticket) {
+    (void)d;
+    (void)ticket;
+    return -ENOSYS;
+}
+
+int hl_provider_demux_subscribe(hl_provider_demux *d, uint64_t id, hl_provider_wake_fn wake, void *context) {
+    (void)d;
+    (void)id;
+    (void)wake;
+    (void)context;
+    return -ENOSYS;
+}
+
+int hl_provider_demux_subscribe_remote(hl_provider_demux *d, uint64_t id, const void *bytes, uint32_t size,
+                                       hl_provider_wake_fn wake, void *context) {
+    (void)d;
+    (void)id;
+    (void)bytes;
+    (void)size;
+    (void)wake;
+    (void)context;
+    return -ENOSYS;
+}
+
+int hl_provider_demux_next(hl_provider_demux *d, uint64_t id, hl_provider_event *event, uint64_t *lost) {
+    (void)d;
+    (void)id;
+    (void)event;
+    (void)lost;
+    return -ENOSYS;
+}
+
+int hl_provider_demux_unsubscribe(hl_provider_demux *d, uint64_t id) {
+    (void)d;
+    (void)id;
+    return -ENOSYS;
+}
+
+int hl_provider_demux_unsubscribe_remote(hl_provider_demux *d, uint64_t id) {
+    (void)d;
+    (void)id;
+    return -ENOSYS;
+}
+
+/* No create() ever succeeded, so no event carries storage and no demultiplexer exists to tear down. Both
+ * releases stay callable so an error path that unwinds unconditionally still compiles and runs. */
+void hl_provider_event_destroy(hl_provider_event *event) { (void)event; }
+void hl_provider_demux_destroy(hl_provider_demux *d) { (void)d; }
+
+#else
+
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -780,3 +876,5 @@ void hl_provider_demux_destroy(hl_provider_demux *d) {
      * pthread_*_destroy can otherwise wait forever on a dead foreign owner. */
     (void)munmap(d, d->mapping_size);
 }
+
+#endif

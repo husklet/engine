@@ -75,11 +75,21 @@ impl Child {
             .kill()
             .map_err(Self::native_error)
     }
+    /// Delivers a numbered host signal to the launch process.
+    ///
+    /// The one process-control operation still issued from Rust rather than through the C engine, and
+    /// deliberately so. The engine's two signal-shaped entry points do not cover it: `hl_activation_kill`
+    /// takes no signal number (it force-stops the whole process group), and the engine's SIGNAL request
+    /// takes an in-process engine handle, which an embedder never holds — activation runs the engine in a
+    /// re-executed child. That child installs its own handlers and makes the SIGNAL request itself, so
+    /// the host signal sent here *is* the documented way to reach it. Routing this through C would
+    /// relocate the gap rather than close it: no Win32 call delivers a stop, continue or user signal to
+    /// another process either, which is why the Windows arm of `signal_process` reports Unsupported.
     pub(crate) fn signal(&self, signal: i32) -> Result<(), Error> {
         if self.completed {
             return Err(Error::InvalidState);
         }
-        ffi::Process::signal(self.id(), signal).map_err(Error::Io)
+        crate::sys::signal_process(self.id(), signal).map_err(Error::Io)
     }
 
     pub(crate) const fn completed(&self) -> bool {

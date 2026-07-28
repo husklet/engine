@@ -42,10 +42,14 @@ static int64_t pipe_write(void *opaque, const void *buffer, size_t size) {
         object->host->stream->write(object->host->context, object->stream, (hl_host_const_bytes){buffer, size}));
 }
 
+/* fstat on a pipe reports a zero-length FIFO with exactly one link. The link
+ * count is not decoration: code that stats a descriptor to decide whether it is
+ * a real file reads st_nlink == 0 as a deleted inode. */
 static int64_t pipe_status(void *opaque, hl_linux_file_status *status) {
     (void)opaque;
     memset(status, 0, sizeof(*status));
     status->mode = HL_LINUX_S_IFIFO | 0600u;
+    status->link_count = 1;
     return 0;
 }
 
@@ -55,20 +59,29 @@ static int64_t pipe_set_status_flags(void *opaque, uint32_t flags) {
     return pipe_error(object->host->stream->set_status_flags(object->host->context, object->stream, host_flags));
 }
 
+/* POLLERR and POLLHUP are OUTPUT-ONLY conditions: poll(2) and epoll(7) report
+ * them whether or not the caller asked, because a descriptor whose peer has gone
+ * cannot be un-asked about. Deriving the host interest set from the guest's
+ * interests -- and then masking the answer by it again -- hid both. A guest
+ * waiting POLLIN on the read end of a pipe whose writers have all closed saw a
+ * bare POLLIN and had to infer hangup from a zero-length read; a guest waiting
+ * POLLOUT on a broken write end saw nothing at all and spun. So the host is
+ * always asked for the full set, and the answer keeps ERROR and HANGUP through
+ * the final mask. (hl_linux_object_ready applies the same rule one layer up; the
+ * bug was that nothing survived to reach it.) */
 static uint32_t pipe_readiness(void *opaque, uint32_t interests) {
     pipe_object *object = opaque;
-    uint32_t host_interests = 0, ready = 0;
-    if ((interests & HL_LINUX_READY_READ) != 0) host_interests |= HL_HOST_READY_READ;
-    if ((interests & HL_LINUX_READY_WRITE) != 0) host_interests |= HL_HOST_READY_WRITE;
-    if ((interests & HL_LINUX_READY_ERROR) != 0) host_interests |= HL_HOST_READY_ERROR;
-    if ((interests & HL_LINUX_READY_HANGUP) != 0) host_interests |= HL_HOST_READY_HANGUP;
-    hl_host_result result = object->host->stream->readiness(object->host->context, object->stream, host_interests);
-    if (result.status != HL_STATUS_OK) return HL_LINUX_READY_ERROR & interests;
+    uint32_t ready = 0;
+    const uint32_t unmaskable = HL_LINUX_READY_ERROR | HL_LINUX_READY_HANGUP;
+    hl_host_result result = object->host->stream->readiness(object->host->context, object->stream,
+                                                            HL_HOST_READY_READ | HL_HOST_READY_WRITE |
+                                                                HL_HOST_READY_ERROR | HL_HOST_READY_HANGUP);
+    if (result.status != HL_STATUS_OK) return HL_LINUX_READY_ERROR;
     if ((result.value & HL_HOST_READY_READ) != 0) ready |= HL_LINUX_READY_READ;
     if ((result.value & HL_HOST_READY_WRITE) != 0) ready |= HL_LINUX_READY_WRITE;
     if ((result.value & HL_HOST_READY_ERROR) != 0) ready |= HL_LINUX_READY_ERROR;
     if ((result.value & HL_HOST_READY_HANGUP) != 0) ready |= HL_LINUX_READY_HANGUP;
-    return ready & interests;
+    return ready & (interests | unmaskable);
 }
 
 static hl_host_result pipe_wait_handle(void *opaque) {

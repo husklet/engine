@@ -28,3 +28,11 @@ if(_hl_cc)
   string(JOIN " " _hl_cc_extra ${_hl_cc})
   set(CMAKE_C_FLAGS_INIT "${_hl_cc_extra}")
 endif()
+
+# Mirror of the block in x86_64-linux.cmake: this file is the NATIVE one on an aarch64 host and a CROSS file
+# on any other, and only the cross case may refuse to probe the host for tools and libraries.
+if(NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+  set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+  set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+  set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+endif()

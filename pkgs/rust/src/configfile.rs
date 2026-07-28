@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -12,17 +12,14 @@ pub(crate) struct ConfigFile {
 }
 impl ConfigFile {
     pub(crate) fn create(bytes: &[u8]) -> std::io::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
         let path = crate::host::HostPaths::temporary(&format!(
             "hl-engine-config-{}-{}",
             std::process::id(),
             UNIQUE.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)?;
+        // Private, not merely new: this file is the complete launch configuration and it lives in a
+        // directory every local account can write to.
+        let mut file = crate::sys::create_private_file(&path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         Ok(Self { path })

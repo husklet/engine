@@ -1,0 +1,41 @@
+# Line endings, pinned.
+#
+# Without this file a Windows checkout with the default core.autocrlf=true
+# rewrites 3976 tracked files LF -> CRLF, which breaks the build and the test
+# corpus in three separate ways:
+#
+#   * tests/**/*.out -- 1616 byte-exact goldens. The compat matrix compares guest
+#     output against these verbatim, so a trailing \r fails every case that passes
+#     on Linux. This is silent: the diff looks identical on screen.
+#   * tests/**/*.tsv -- the case manifests. tools/matrix_runner.c splits on \t and
+#     reads a fixed column count; \r lands inside the last field, which is the
+#     disposition column that decides whether a case is active or excluded.
+#   * tools/*.sh -- 20 scripts CMake invokes through HL_BASH_EXECUTABLE. A CRLF
+#     shebang fails as `bad interpreter: /usr/bin/env bash^M`.
+#
+# The engine's own build and test flow is LF throughout on every host, so LF is
+# checked out on every host. Windows tooling in this repo (clang, CMake, Ninja,
+# MSYS2 bash, PowerShell) all read LF correctly; nothing here needs CRLF.
+* text=auto eol=lf
+
+# Guest fixtures and prebuilt artifacts: never touched, never diffed as text.
+# Git already infers -text for these, but inference reads the first 8000 bytes,
+# and a cross-built guest ELF whose header happens to be NUL-free would be
+# misclassified and silently corrupted. Naming them is cheap insurance.
+*.a           binary
+*.o           binary
+*.tar.gz      binary
+*.exe         binary
+*.dll         binary
+*.lib         binary
+*.pdb         binary
+
+pkgs/rust/assets/lib/**   binary
+pkgs/rust/testdata/**     binary
+
+# Cross-built static-glibc guest binaries, committed without an extension.
+tests/compat/isa/**            binary
+tests/compat/core/regress/go_cgo_stackgrow_arm  binary
+
+# Checkpoint images are captured guest memory: byte-exact by definition.
+*.ckpt        binary

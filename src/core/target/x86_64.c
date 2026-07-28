@@ -37,29 +37,30 @@
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <sys/mman.h>
+#include "../../linux_abi/host_fd.h" // <fcntl.h> + <unistd.h>, or the descriptor vocabulary where the host has none
+#include "../../linux_abi/host_mman.h" // <sys/mman.h>, or the typed VM seam where the host has none
 #include <sys/stat.h>
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
 #include <sys/time.h>
-#include <sys/uio.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/un.h>
-#include <arpa/inet.h>
-#include <sys/times.h>
-#include <sys/wait.h>
-#include <poll.h>
+#include "../../linux_abi/host_uio.h" // <sys/uio.h>, or the guest iovec layout where the host has none
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_socket.h"
+#include "../../linux_abi/host_proc.h"
+#include "../../linux_abi/host_wait.h"
+#include "../../linux_abi/host_poll.h" // <poll.h>, or a typed absence where the host has no mixed-handle readiness
 #include "../../host/native_compat.h"
 #include "../../host/native_context.h"
 #include "../../linux_abi/logical_vma.h"
-#include <dirent.h>
-#include <signal.h>
-#include <termios.h>
-#include <sys/ioctl.h>
+#include "../../linux_abi/host_dirent.h" // <dirent.h>, or the Linux dirent shape where the host structure has no d_type
+#include "../../linux_abi/host_system.h"  // sysconf/major/minor/arc4random_buf/fork: the residue no single POSIX header owns
+#include "../../linux_abi/host_signal.h" // <signal.h>, or the Linux signal vocabulary where the host has no signals
+#include "../../linux_abi/host_tty.h"
+#include "../../linux_abi/host_tty.h"
 #include <stdatomic.h>
 
 #include "hl/engine.h"
@@ -95,8 +96,14 @@ static int jit_guest_soft_active(void);
 
 #include "../../translator/guest/x86_64/cpu.h"
 #include "../../translator/guest/x86_64/frame.h"
-#include "../../translator/guest/x86_64/abi.h"      // cpu-interface seam (G_* contract + sysmap + normalize)
+#include "../../translator/guest/x86_64/abi.h" // cpu-interface seam (G_* contract + sysmap + normalize)
+// The dispatch seam is per (guest ISA, HOST CPU): dispatch.h patches AArch64 branch encodings.
+#include "../../host/host_cpu.h"
+#if defined(HL_HOST_CPU_AARCH64)
 #include "../../translator/guest/x86_64/dispatch.h" // x86 dispatch seam for the SHARED engine/dispatch.c
+#else
+#include "../../translator/guest/x86_64/interp_dispatch.h"
+#endif
 #define HL_GUEST_STAT_SIZE HL_LINUX_STAT_X86_64_SIZE
 #define HL_GUEST_STAT_ENCODE hl_linux_stat_encode_x86_64
 #define HL_GUEST_BOUND_STAT hl_linux_stat_x86_64
@@ -121,7 +128,9 @@ static const hl_x86_avx_state g_avx_state = {&g_nonpie_lo, &g_nonpie_hi, &g_nonp
                                              jit86_avx_memory_write};
 #include "../../translator/guest/x86_64/glue.h" // independently compiled x86 target state
 #include "../../translator/guest_fetch.h"
-#include "../../translator/cache.c" // SHARED translator: code cache + block map
+#include "../../translator/guest_memory.h"
+#include "../../translator/guest/x86_64/rep_runtime.h" // string-op helpers + the hooks engine_global_init sets
+#include "../../translator/cache.c"                    // SHARED translator: code cache + block map
 
 uint64_t hl_x86_guest_pointer(uint64_t address) {
     return g_nonpie_lo && address >= g_nonpie_lo && address < g_nonpie_hi ? address + g_nonpie_bias : address;
@@ -170,6 +179,53 @@ static int jit86_avx_memory_write(uint64_t guest, const void *source, size_t len
     return 1;
 }
 
+/*
+ * The translator's guest-memory seam (translator/guest_memory.h): the ledger
+ * and the non-PIE window are engine knowledge, so the engine hands them over
+ * rather than letting the translator archive link the Linux ABI.
+ *
+ * These are not the AVX pair above: an ORDINARY address is reported as 0 with
+ * nothing copied, because the string-op caller must run its own direct-access
+ * validator first, and an ordinary span that reaches into a logical VMA before
+ * `length` is a fault rather than a raw host copy.
+ */
+static int jit86_guest_memory_read(uint64_t guest, void *destination, size_t length) {
+    hl_logical_vma_pin pin = {0};
+    int logical = hl_logical_vma_pin_data(guest, length, HL_LOGICAL_VMA_READ, &pin);
+    if (logical < 0) return -1;
+    if (pin.contiguous < length) {
+        hl_logical_vma_unpin(&pin);
+        return -1;
+    }
+    if (logical == 0) return 0;
+    memcpy(destination, pin.host, length);
+    hl_logical_vma_unpin(&pin);
+    return 1;
+}
+
+static int jit86_guest_memory_write(uint64_t guest, const void *source, size_t length) {
+    hl_logical_vma_pin pin = {0};
+    int logical = hl_logical_vma_pin_data(guest, length, HL_LOGICAL_VMA_WRITE, &pin);
+    if (logical < 0) return -1;
+    if (pin.contiguous < length) {
+        hl_logical_vma_unpin(&pin);
+        return -1;
+    }
+    if (logical == 0) return 0;
+    memcpy(pin.host, source, length);
+    hl_logical_vma_unpin(&pin);
+    return 1;
+}
+
+static const hl_guest_memory_ops g_guest_memory_ops = {
+    hl_logical_vma_resolve_exec,          jit86_guest_memory_read, jit86_guest_memory_write,
+    hl_logical_vma_global_active,         hl_x86_guest_pointer,    hl_logical_vma_resolve_exec_span,
+    hl_logical_vma_global_exec_generation};
+
+// Host-CPU fork: an AArch64 host takes the x86-64 -> ARM64 translator below (register model at the top of
+// this file); any other takes interp.c, which decodes x86-64 directly. Both share struct cpu: it is the
+// checkpoint format.
+#if defined(HL_HOST_CPU_AARCH64)
 #include "../../translator/guest/x86_64/emit.c" // x86 engine: arm64 emitters + SSE + x87
 #include "../../translator/guest/x86_64/address.h"
 
@@ -299,7 +355,18 @@ void emit_load_mem(struct insn *insn, uint64_t next, int width, int rt) {
 
 #include "../../translator/guest/x86_64/translate.c" // x86-64 translate_block + trampolines
 #include "../../translator/guest/x86_64/cache.c"     // persistent translated-code cache (HL_PCACHE=1)
-#include "../../linux_abi/thread.c"                  // SHARED: clone->pthread, per-thread cpu, futex
+// The same-ISA transliterator is a THIRD arm of this fork and belongs to the interpreter's side of it
+// (translator/guest/x86_64/translit/, included by interp.c). The two hooks the rest of this file calls
+// exist here too, so the ARM64 host arm needs no #ifdef at either call site.
+static int translit_enabled(void) {
+    return 0;
+}
+static void translit_report(void) {}
+#else
+// interp.c defines the same names emit.c/translate.c/cache.c do, so everything below is host-identical.
+#include "../../translator/guest/x86_64/interp.c"
+#endif
+#include "../../linux_abi/thread.c" // SHARED: clone->pthread, per-thread cpu, futex
 
 /*
  * Queue the bytes a store actually wrote into an emulated MAP_SHARED mapping,
@@ -485,6 +552,14 @@ static int soft_tlb_miss(struct cpu *c) {
             c->fault_addr = address;
             return raise_guest_data_map_fault(c);
         }
+        /* The string-op helper rejects a store into a read-only mapping itself (it copies with the host
+           memcpy, several C frames below translated code, where a hardware fault is unattributable) and
+           lands here.  Answering "writable" would re-run the same rejected element forever, so this is
+           where a bulk store learns the same answer the MMU gives a scalar one: mapped, not writable. */
+        if ((required & HL_LOGICAL_VMA_WRITE) && gro_hit(address, width)) {
+            c->fault_addr = address;
+            return raise_guest_fetch_fault(c);
+        }
         uint64_t end = address + width;
         uint64_t last = (address & ~UINT64_C(4095)) + UINT64_C(4096);
         if (end > last) last = end;
@@ -540,6 +615,10 @@ static void do_sigreturn(struct cpu *c) {
     hl_x86_signal_restore(c);
 }
 
+// Fault capture is per BACKEND: the JIT reconstructs guest state from the host mcontext and refines a
+// block-granular host PC via the provenance map, which the interpreter must NOT use (it maps HOST addresses
+// and this backend emits none; cpu->rip is already current). Both return 0 for "not a guest fault".
+#if defined(HL_HOST_CPU_AARCH64)
 static int sigframe_capture_fault(struct cpu *c, void *native_context) {
     if (!hl_x86_signal_capture(c, native_context, x86_signal_cache_contains, NULL)) return 0;
     // Recover the EXACT faulting guest RIP from the per-instruction provenance map (translate.c records
@@ -551,10 +630,22 @@ static int sigframe_capture_fault(struct cpu *c, void *native_context) {
     if (jit_instruction_guest_pc(host_pc, &exact_pc)) c->rip = exact_pc;
     return 1;
 }
+#else
+static int sigframe_capture_fault(struct cpu *c, void *native_context) {
+    return interp_signal_capture(c, native_context);
+}
+#endif
 
+// The JIT returns into block_return to unwind the translated frame; the interpreter siglongjmps to run_block.
+#if defined(HL_HOST_CPU_AARCH64)
 static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {
     hl_x86_signal_resume(c, native_context, (uintptr_t)block_return);
 }
+#else
+static void sigframe_resume_dispatch(struct cpu *c, void *native_context) {
+    interp_signal_resume(c, native_context);
+}
+#endif
 
 static int fastclk_fault_fixup(siginfo_t *info, void *native_context) {
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
@@ -606,6 +697,15 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
 static int64_t legacy_time_seconds(void *context) {
     (void)context;
     return (int64_t)time(NULL);
+}
+
+// legacy.c dereferences a few guest pointers itself (arch_prctl GET_FS/GS, time's tloc, the legacy
+// timeval/utimbuf buffers). Same span validity the syscall handlers use, injected because the translator
+// may not reach into linux_abi. `address` arrives already folded to storage.
+static int legacy_access_ok(void *context, uint64_t address, uint64_t length, int write) {
+    (void)context;
+    return write ? host_range_writable((uintptr_t)address, (size_t)length)
+                 : host_range_mapped((uintptr_t)address, (size_t)length);
 }
 
 static int legacy_set_alarm(void *context, uint64_t seconds, uint64_t *remaining_seconds) {
@@ -699,7 +799,7 @@ static int container_init(const char *rootfs) {
     }
     if (rootfs && rootfs[0]) { // the shared container jails against the canonical rootfs + its dir fd
         g_rootfs = (char *)rootfs;
-        if (root_handle_bind(g_rootfs) != 0) return -1;
+        if (root_handle_bind(g_rootfs) != 0 || root_native_require(g_rootfs) != 0) return -1;
         container_populate_dev();        // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         container_populate_machine_id(); // /etc/machine-id agreeing with boot_id (if image ships none)
         // Container identity = root (0) by default; HL_UID/HL_GID or typed launch fields override it.
@@ -787,6 +887,7 @@ static int guest_rep_access_special(uint64_t address, size_t length, int write) 
 
 static int engine_global_init(void) {
     hl_x86_decode_set_instruction_fetch(hl_guest_fetch_exec);
+    hl_guest_memory_bind(&g_guest_memory_ops);
     hl_guest_fetch_set_direct_validator(guest_fetch_direct_valid);
     hl_x86_rep_set_store_commit(jit86_store_alias_changed, jit86_store_alias_observation_active);
     hl_x86_rep_set_access_validators(guest_fetch_direct_valid, guest_store_direct_valid, guest_rep_access_special);
@@ -822,13 +923,34 @@ static int engine_global_init(void) {
     g_prof = 0;
     g_fwdskip = 8;
     g_notier2x = 0;
+    extern void jit86_lazyguard(int, siginfo_t *, void *);
+#if defined(_WIN32)
+    // One process-wide vectored exception handler in place of two sigactions. It is not a preference: a
+    // deliberate probe read is issued from between translated blocks and an absolute-data fixup can fire
+    // from anywhere, so no frame-scoped mechanism spans the fault sites this engine actually has, while a
+    // vectored handler fires on every thread wherever the fault happened -- which is the property a POSIX
+    // signal handler has and the reason the classifier below is the SAME function the POSIX arms install.
+    //
+    // The classifier is fed a synthesized siginfo_t rather than being rewritten to speak the host fault
+    // record, because the host record's kind/code fields are already numerically the Linux signal number
+    // and si_code for the pair -- so the translation is a struct fill, and the alternative would be a
+    // second copy of a 200-line classifier that must stay in step with the first.
+    if (!hl_windows_fault_install(hl_windows_guest_fault, NULL)) {
+        fprintf(stderr, "hl-engine: unable to install the fault handler\n");
+        return 1;
+    }
+#else
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
-    sa.sa_flags = SA_SIGINFO;
-    extern void jit86_lazyguard(int, siginfo_t *, void *);
+    // SA_ONSTACK only for the transliterator: it is the one backend whose HOST stack IS the guest stack, so
+    // a guest stack overflow leaves no room to build the SIGSEGV frame and the handler that would deliver
+    // the guest's signal never runs. The interpreter runs on its own host stack and does not need it, and
+    // adding the flag there would change an existing lane for nothing.
+    sa.sa_flags = SA_SIGINFO | (translit_enabled() ? SA_ONSTACK : 0);
     sa.sa_sigaction = jit86_lazyguard;
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+#endif
     // Untrusted-guest isolation (the sentry process-split). OFF by default -> trusted path unchanged.
     g_untrusted = hl_option_get("HL_UNTRUSTED") != NULL;
     g_sentry_sandbox = hl_option_get("HL_SANDBOX") != NULL;
@@ -925,6 +1047,7 @@ static int run_loaded(int argc, char *const argv[], struct loaded *lm, uint64_t 
     if (g_untrusted) sentry_shutdown(); // signal quit + waitpid (reap, no orphan)
     if (g_fast_count)
         fprintf(stderr, "[fastsys] enabled=%d inline-served=%llu\n", g_fastsys, (unsigned long long)g_fast_count);
+    translit_report();
     if (g_prof)
         fprintf(stderr, "[prof] dispatcher round-trips=%llu  IBTC fills=%llu  (IBTC %s)\n",
                 (unsigned long long)g_disp_n, (unsigned long long)g_ibtc_fill, g_noibtc ? "OFF" : "ON");

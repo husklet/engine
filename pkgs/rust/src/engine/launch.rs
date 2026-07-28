@@ -1,7 +1,7 @@
 use super::lowering::{Launch, ServiceLaunch};
 use super::{
-    ffi, wire, Arc, AsRawFd, CString, Child, Config, ConfigFile, Duration, Error, File, Guest,
-    Instant, OpenOptions, OsStr, OsStrExt, Size, Stdio, EXECUTABLE,
+    ffi, sys, wire, Arc, CString, Child, Config, ConfigFile, Duration, Error, File, Guest, Instant,
+    OsStr, Size, Stdio, EXECUTABLE,
 };
 
 pub(super) fn start(
@@ -69,22 +69,27 @@ where
 {
     let mut argv = vec![program.as_ref().to_owned()];
     argv.extend(arguments.into_iter().map(|value| value.as_ref().to_owned()));
-    if argv[0].as_bytes().is_empty() {
+    if argv[0].is_empty() {
         return Err(Error::InvalidConfig("program must not be empty"));
     }
     let encoded = wire::LaunchWire::encode(config, &argv, None)?;
     let domain = crate::Domain::from_identity(wire::LaunchWire::domain(&encoded));
     let config = ConfigFile::create(&encoded)?;
+    // The executable and config paths are *host* paths handed to the C engine as NUL-terminated
+    // byte strings, so they go through the same encoding policy as everything else in the pool.
     let executable = EXECUTABLE
         .get_or_init(|| {
             let path = std::env::current_exe().map_err(|error| error.to_string())?;
-            CString::new(path.as_os_str().as_bytes())
-                .map_err(|_| "current executable contains NUL".into())
+            let bytes = sys::os_bytes(path.as_os_str())
+                .ok_or_else(|| "current executable path is not representable".to_owned())?;
+            CString::new(bytes).map_err(|_| "current executable contains NUL".into())
         })
         .as_ref()
         .map_err(|message| Error::Distribution(message.clone()))?;
-    let config_path = CString::new(config.path().as_os_str().as_bytes())
-        .map_err(|_| Error::InvalidConfig("config path contains NUL"))?;
+    let config_bytes = sys::os_bytes(config.path().as_os_str())
+        .ok_or(Error::InvalidConfig("config path is not representable"))?;
+    let config_path =
+        CString::new(config_bytes).map_err(|_| Error::InvalidConfig("config path contains NUL"))?;
     // Compose rather than choose: gather whichever descriptors this launch requested — a provider
     // transport, a checkpoint broker and its trigger — and hand them to the engine in ONE combined call
     // alongside the process I/O (stdio or a PTY). Any subset may be present simultaneously.
@@ -99,7 +104,7 @@ where
     } else {
         (None, None)
     };
-    let transport = transport_socket.as_ref().map_or(-1, AsRawFd::as_raw_fd);
+    let transport = transport_socket.as_ref().map_or(-1, sys::Stream::raw);
     let (checkpoint, trigger) =
         channels.map_or((-1, -1), |(checkpoint, trigger)| (checkpoint, trigger));
 
@@ -157,7 +162,7 @@ where
 fn prepare_services(
     launch: ServiceLaunch,
     authority: &crate::extension::Authorities,
-) -> Result<(std::os::unix::net::UnixStream, std::thread::JoinHandle<()>), Error> {
+) -> Result<(sys::Stream, std::thread::JoinHandle<()>), Error> {
     let handles = authority
         .provider(&launch.provider)
         .and_then(|provider| provider.handles.as_ref())
@@ -174,7 +179,7 @@ fn prepare_services(
         .max(1);
     let payload = crate::service::encode_namespace_install(&launch.projections, 64, 4096)
         .map_err(|_| Error::InvalidConfig("invalid service namespace transaction"))?;
-    let (parent, child) = std::os::unix::net::UnixStream::pair()?;
+    let (parent, child) = sys::stream_pair()?;
     let channel = Arc::new(
         crate::transport::Channel::from_stream(
             parent,
@@ -214,16 +219,13 @@ fn prepare(value: Stdio, input: bool) -> Result<(i32, Option<File>, Option<File>
     match value {
         Stdio::Inherit => Ok((-1, None, None)),
         Stdio::Null => {
-            let file = OpenOptions::new()
-                .read(input)
-                .write(!input)
-                .open("/dev/null")?;
-            Ok((file.as_raw_fd(), None, Some(file)))
+            let file = sys::null_stdio(input)?;
+            Ok((sys::file_raw(&file), None, Some(file)))
         }
         Stdio::Piped => {
-            let (read, write) = ffi::pipe_pair()?;
+            let (read, write) = sys::pipe_pair()?;
             let (parent, child) = if input { (write, read) } else { (read, write) };
-            Ok((child.as_raw_fd(), Some(parent), Some(child)))
+            Ok((sys::file_raw(&child), Some(parent), Some(child)))
         }
     }
 }

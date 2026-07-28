@@ -1,6 +1,7 @@
 // hl/linux_abi -- the ELF loader (map PT_LOAD high; static-PIE + dynamic via ld.so; build stack).
 
 #include "page.h"
+#include "elf_protect.h" // the loader's protection contract, shared with linux_abi/x86.c
 #include "image.h"
 #include "goimage.h"
 
@@ -56,6 +57,11 @@ static int elf_interp(const char *path, char *out, size_t n) {
 // PC past the faulting instruction, and resumes. Inert unless a non-PIE image is loaded (g_nonpie_lo == 0
 // for PIE / static-PIE, the only state the test matrix ever sees). A form we cannot decode returns 0 so
 // the guard re-raises = a clean abort, never silent wrong data.
+
+// HOST-CPU GATE for the helpers below and nonpie_fixup: it decodes a 4-byte A64 word at HL_HOST_UC_PC, so
+// a non-PIE ET_EXEC guest on another host needs the equivalent decoder for that host's ISA in the #else arm.
+#if defined(HL_HOST_HAS_A64_CONTEXT)
+
 static int64_t nonpie_sext(uint64_t v, int bits) {
     uint64_t m = 1ull << (bits - 1);
     return (int64_t)((v ^ m) - m);
@@ -555,6 +561,17 @@ static int nonpie_fixup(siginfo_t *si, void *ucv) {
     return 1;
 }
 
+#else
+
+// Not an AArch64 host: nothing to decode. 0 ("not handled") keeps nonpie_guard's crash path.
+static int nonpie_fixup(siginfo_t *si, void *ucv) {
+    (void)si;
+    (void)ucv;
+    return 0;
+}
+
+#endif
+
 // SIGSEGV/SIGBUS guard installed on the normal aarch64 run path. Serves a non-PIE absolute data access at
 // +bias (nonpie_fixup); anything else re-raises with the default action (a real crash). Inert for PIE.
 static void nonpie_guard(int sig, siginfo_t *si, void *uc) {
@@ -705,10 +722,10 @@ static hl_host_memory_mapping elf_map_checked(void *hint, size_t len, uint32_t p
     }
 }
 
-// Narrow a segment's protection (W^X hardening) -- BEST-EFFORT, never fatal. The image is already fully
-// mapped R+W by the base reservation, and this JIT only READS guest code to translate it (it never
-// executes guest pages directly), so a segment left un-narrowed stays readable+writable = still fully
-// backed, never a hole. Two failures are expected and benign: EINVAL (segment bounds round to 4 KB but
+// Narrow a mapped range's protection -- BEST-EFFORT, never fatal. Used for the stack guard gap; the image
+// segments go through hl_elf_protect_segments, which owes the read-only registry the same answer. A range
+// left un-narrowed stays readable+writable = still fully backed, never a hole. Two failures are expected
+// and benign: EINVAL (segment bounds round to 4 KB but
 // Apple-Silicon mprotect needs 16 KB-aligned ranges, so adjacent segments share a host page) and, under
 // memory pressure, ENOMEM (XNU cannot allocate a vm_map_entry to split the span). Retry only the
 // transient ENOMEM a few times so the tightening still applies once pressure clears; give up quietly on
@@ -765,16 +782,22 @@ static void load_elf(const char *path, struct loaded *out) {
     uint64_t basepage = minv & ~0xFFFull;
     uint64_t span = (maxv - basepage + 0xFFFF) & ~0xFFFFull;
     int etype = rd16(f + 16);
-    // NULL: non-colliding (main + interp). A non-PIE ET_EXEC gets biased here; the dispatcher redirects its
-    // absolute code jumps (g_nonpie_*) and the nonpie_guard SIGSEGV handler re-serves its absolute DATA refs
-    // to the low link vaddr at +bias (see nonpie_fixup above).
+    // NULL: non-colliding (main + interp). A non-PIE ET_EXEC that could NOT take the link address gets
+    // biased here; the dispatcher redirects its absolute code jumps (g_nonpie_*) and the nonpie_guard
+    // SIGSEGV handler re-serves its absolute DATA refs to the low link vaddr at +bias (nonpie_fixup above).
     // Map the whole image span [basepage, basepage+span) in one anon reservation, then copy each PT_LOAD
     // and narrow protections per segment below. elf_map_checked retries under transient host memory
     // pressure and aborts loudly on persistent failure, so the full range is guaranteed backed here (a
     // partial/failed map never slips through to become a SIGSEGV on the guest's own text/data).
     hl_host_memory_mapping image_mapping = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(image_mapping), 0, 0, 0, 0};
-    uint8_t *base;
-    if (g_force_base) {
+    uint8_t *base = NULL;
+    // Placement: thread.c, "non-PIE image placement, per host". On Linux an ET_EXEC goes AT its link
+    // address, so bias == 0 and nothing below arms. The link address is deterministic across runs, which
+    // is all the g_force_base / snapshot-arena hints below exist to provide -- consume the one-shot.
+    if (etype == 2) base = (uint8_t *)(uintptr_t)nonpie_place_at_link_address(basepage, span, &image_mapping);
+    if (base != NULL) {
+        g_force_base = 0; // one-shot, consumed by the link-address placement
+    } else if (g_force_base) {
         // map this image at a FIXED VA (one-shot) so the translated arena -- block-map keys AND any
         // guest address baked into host code (pcrel_base literals, non-PIE ranges) -- is byte-identical
         // across runs, hence reusable from the persistent cache. On failure fall back to a kernel-chosen
@@ -809,7 +832,9 @@ static void load_elf(const char *path, struct loaded *out) {
     }
     hl_gmap_add((uint64_t)base, span);
     uint64_t bias = (uint64_t)base - basepage;
-    if (etype == 2) {
+    // Armed on `bias != 0`, not on `etype == 2`: a link-address placement has one coordinate system, and
+    // leaving lo/hi set with bias 0 keeps the fold's whole workaround family reachable for no reason.
+    if (etype == 2 && bias != 0) {
         g_nonpie_lo = basepage;
         g_nonpie_hi = basepage + span;
         g_nonpie_bias = bias;
@@ -820,24 +845,8 @@ static void load_elf(const char *path, struct loaded *out) {
         uint64_t off = rd64(ph + 8), v = rd64(ph + 16), fsz = rd64(ph + 32);
         memcpy((void *)(v + bias), f + off, fsz);
     }
-    // per-segment W^X from p_flags: .text R+X, .rodata R, .data R+W
-    for (int i = 0; i < phnum; i++) {
-        uint8_t *ph = f + phoff + (uint64_t)i * phentsize;
-        if (rd32(ph) != 1) continue;
-        // PF_X=1, PF_W=2, PF_R=4
-        uint32_t fl = rd32(ph + 4);
-        uint64_t v = rd64(ph + 16), msz = rd64(ph + 40);
-        uint64_t s = (v + bias) & ~0xFFFull, e = (v + bias + msz + 0xFFFull) & ~0xFFFull;
-        uint32_t protection = HL_HOST_MEMORY_READ | ((fl & 2) ? HL_HOST_MEMORY_WRITE : 0) |
-                              ((fl & 1) ? HL_HOST_MEMORY_EXECUTE : 0);
-        if (e > s) {
-            elf_mprotect_besteffort(&image_mapping, (void *)s, e - s, protection, "image segment");
-            if (fl & 2)
-                gro_clear(s, e);
-            else
-                gro_add(s, e);
-        }
-    }
+    // per-segment W^X from p_flags: .text R+X, .rodata R, .data R+W -- elf_protect.h, the contract.
+    hl_elf_protect_segments(&image_mapping, f + phoff, phnum, phentsize, bias);
     // for a non-PIE ET_EXEC the engine maps the image HIGH (+bias) but keeps every GUEST-VISIBLE
     // address at its LOW link value (baked absolute pointers, un-biased `bl` return vaddrs, the dispatcher
     // re-biases only at execution). The auxv AT_ENTRY/AT_PHDR must therefore ALSO be LOW: glibc derives the
@@ -1018,6 +1027,10 @@ static uint64_t build_stack(int argc, char **argv, struct loaded *lm, uint64_t a
         {13, (uint64_t)cgid()},
         {14, (uint64_t)cgid()},
         {16, g_aarch64_cpu_model.hwcap},
+        // AT_HWCAP2 is where arm64 keeps BF16/I8MM/SVE2/MTE/BTI. arm64's ARCH_DLINFO emits it unconditionally,
+        // so omitting it was not "advertise nothing" but a shape no kernel produces; the value stays 0 until
+        // both backends implement one of those features outright (cpu.h).
+        {26, g_aarch64_cpu_model.hwcap2},
         {17, 100},
         {15, plat},
         {25, rnd},

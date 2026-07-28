@@ -17,9 +17,13 @@
 static int mq_check_timeout(uint64_t p, struct timespec *dl, int *have_dl) {
     *have_dl = 0;
     if (!p) return 0;
-    long ts[2];
+    /* The guest's struct timespec is two 64-bit words on every guest this engine
+       targets, so the buffer it is copied into must be 64-bit wide REGARDLESS of
+       what the host calls `long`. Spelled `long` this read 8 bytes instead of 16
+       on an LLP64 host and every deadline came back as garbage. */
+    int64_t ts[2];
     if (guest_copy_from(ts, p, sizeof(ts)) != sizeof(ts)) return -EFAULT;
-    long sec = ts[0], nsec = ts[1];
+    int64_t sec = ts[0], nsec = ts[1];
     if (nsec < 0 || nsec >= 1000000000L || sec < 0) return -EINVAL;
     dl->tv_sec = sec;
     dl->tv_nsec = nsec;
@@ -373,8 +377,12 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         const char *name = name_storage;
         int oflag = (int)a1;
-        long attr_storage[4];
-        const long *at = NULL; // struct mq_attr: {flags, maxmsg, msgsize, curmsgs, ...}
+        /* struct mq_attr is four 64-bit words in the GUEST's ABI. Same LLP64 trap
+           as mq_check_timeout above: spelled `long` this copied 16 bytes of a
+           32-byte structure, so mq_maxmsg read back as the high half of mq_flags
+           (zero) and every create with an explicit attr returned EINVAL. */
+        int64_t attr_storage[4];
+        const int64_t *at = NULL; // struct mq_attr: {flags, maxmsg, msgsize, curmsgs, ...}
         if (!name) {
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
@@ -425,7 +433,7 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             G_RET(c) = (uint64_t)(int64_t)(-EEXIST);
             break;
         }
-        int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        int fd = open(HL_LINUX_HOST_NULL_DEVICE, O_RDONLY | O_CLOEXEC);
         if (fd < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;
@@ -787,7 +795,8 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         G_RET(c) = r < 0 ? (uint64_t)(int64_t)(-errno) : 0;
         break;
 #else
-        long new_attribute[4], old_attribute[4];
+        /* Guest struct mq_attr, four 64-bit words -- see the note in case 180. */
+        int64_t new_attribute[4], old_attribute[4];
         if ((a1 && guest_copy_from(new_attribute, a1, sizeof(new_attribute)) != sizeof(new_attribute)) ||
             (a2 && guest_accessible_prefix(a2, sizeof(old_attribute), PROT_WRITE) != sizeof(old_attribute))) {
             G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
@@ -800,14 +809,14 @@ static int svc_rare(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         struct mq_queue *q = &g_mqq[qi];
         if (a2) { // oldattr: current flags/geometry (reported before applying newattr)
-            long *o = old_attribute;
+            int64_t *o = old_attribute;
             o[0] = mq_fd_nonblock((int)a0) ? MQ_O_NONBLOCK : 0;
             o[1] = q->maxmsg;
             o[2] = q->msgsize;
             o[3] = q->n;
         }
         if (a1) { // newattr: only mq_flags' O_NONBLOCK bit is honoured
-            long nf = new_attribute[0];
+            int64_t nf = new_attribute[0];
             mq_fd_setnb((int)a0, (nf & MQ_O_NONBLOCK) != 0);
         }
         if (a2 && guest_copy_to(a2, old_attribute, sizeof(old_attribute)) != sizeof(old_attribute)) {

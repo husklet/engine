@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
+#include "../host_mman.h"
 #include <sys/stat.h>
 #include <unistd.h>
 

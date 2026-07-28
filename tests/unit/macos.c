@@ -31,6 +31,38 @@ static int32_t child_exit_37(void *context) {
     return 37;
 }
 
+/* Shared state for the parking cases: a parked thread has to be reachable from the thread that
+ * releases or interrupts it. */
+typedef struct park_probe {
+    const hl_host_services *services;
+    uint64_t waiter;
+    uint32_t *word;
+    uint64_t deadline_ns;
+    int32_t status;
+    uint64_t value;
+} park_probe;
+
+static uint64_t monotonic_now_ns(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
+static void sleep_ms(long milliseconds) {
+    struct timespec delay = {milliseconds / 1000, (milliseconds % 1000) * 1000000L};
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+}
+
+static void *park_once(void *context) {
+    park_probe *probe = context;
+    hl_host_result result =
+        probe->services->sync->park(probe->services->context, probe->waiter, HL_HOST_PARK_PRIVATE,
+                                    (uint64_t)(uintptr_t)probe->word, probe->word, 0, 4, probe->deadline_ns);
+    probe->status = result.status;
+    probe->value = result.value;
+    return NULL;
+}
+
 typedef struct stream_fork_close_context {
     const hl_host_services *services;
     hl_host_handle input;
@@ -158,6 +190,357 @@ int main(void) {
     char moved_path[160];
     char contents[3] = {0};
     HL_CHECK(hl_host_macos_create(&host, &services) == HL_STATUS_OK);
+    {
+        /* What a mapping handle covers after a partial unmap_range.
+         *
+         * A partial unmap keeps the handle -- only a full-range unmap consumes it -- but the
+         * subrange it gave back has to leave the handle's coverage, because the registry answers
+         * the ownership question from it. While the hole stayed inside the handle's frame, the
+         * registry claimed memory the owner no longer had: a genuinely vacant address was refused
+         * with BUSY, and a whole-handle teardown would have unmapped whatever the address space
+         * had placed in that hole in the meantime.
+         *
+         * The addressing frame itself cannot move. protect, sync and unmap_range are all keyed on
+         * an offset from the base the mapping was placed at, so shrinking the frame would shift
+         * every one of them; what changes is which bytes of the frame are still held. */
+        long frame_page_value = sysconf(_SC_PAGESIZE);
+        uint64_t frame_page = frame_page_value > 0 ? (uint64_t)frame_page_value : UINT64_C(16384);
+        hl_host_memory_mapping frame = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(frame), 0, 0, 0, 0};
+        hl_host_memory_mapping tenant = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(tenant), 0, 0, 0, 0};
+        uint64_t base;
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, frame_page * 3, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &frame)
+                     .status == HL_STATUS_OK);
+        base = frame.address;
+        HL_CHECK(services.memory->unmap_range(services.context, frame.handle, frame_page, frame_page).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(msync((void *)(uintptr_t)base, (size_t)frame_page, MS_ASYNC) == 0);
+        HL_CHECK(msync((void *)(uintptr_t)(base + frame_page), (size_t)frame_page, MS_ASYNC) != 0);
+        HL_CHECK(msync((void *)(uintptr_t)(base + frame_page * 2), (size_t)frame_page, MS_ASYNC) == 0);
+        /* The handle survived, and offsets still mean what they meant when it was created. */
+        HL_CHECK(services.memory
+                     ->protect(services.context, frame.handle, frame_page * 2, frame_page, HL_HOST_MEMORY_READ)
+                     .status == HL_STATUS_OK);
+        /* The hole is vacant, so an address-keyed release of it must succeed. */
+        HL_CHECK(services.memory->unmap_address(services.context, base + frame_page, frame_page).status ==
+                 HL_STATUS_OK);
+        /* What the handle kept is still refused, on either side of the hole and across all three. */
+        HL_CHECK(services.memory->unmap_address(services.context, base, frame_page).status == HL_STATUS_BUSY);
+        HL_CHECK(services.memory->unmap_address(services.context, base + frame_page * 2, frame_page).status ==
+                 HL_STATUS_BUSY);
+        HL_CHECK(services.memory->unmap_address(services.context, base, frame_page * 3).status == HL_STATUS_BUSY);
+        /* A placement is free to take the hole; the exact-address form proves it really is vacant. */
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, base + frame_page, frame_page,
+                                     HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE | HL_HOST_MEMORY_FIXED_NOREPLACE, &tenant)
+                     .status == HL_STATUS_OK &&
+                 tenant.address == base + frame_page);
+        ((unsigned char *)(uintptr_t)tenant.address)[0] = 0xc3;
+        /* Busy again, for the right reason: a second handle holds it now. */
+        HL_CHECK(services.memory->unmap_address(services.context, tenant.address, frame_page).status ==
+                 HL_STATUS_BUSY);
+        /* Tearing the first handle down gives back only what it still held. */
+        HL_CHECK(services.memory->release(services.context, frame.handle).status == HL_STATUS_OK);
+        HL_CHECK(msync((void *)(uintptr_t)base, (size_t)frame_page, MS_ASYNC) != 0);
+        HL_CHECK(msync((void *)(uintptr_t)(base + frame_page * 2), (size_t)frame_page, MS_ASYNC) != 0);
+        HL_CHECK(msync((void *)(uintptr_t)tenant.address, (size_t)frame_page, MS_ASYNC) == 0);
+        HL_CHECK(((unsigned char *)(uintptr_t)tenant.address)[0] == 0xc3);
+        HL_CHECK(services.memory->release(services.context, tenant.handle).status == HL_STATUS_OK);
+
+        /* Piecewise complete: when the last held byte goes the handle is consumed exactly as a
+         * single full-range unmap consumes it, so a live mapping handle always holds a byte. */
+        frame = (hl_host_memory_mapping){HL_HOST_MEMORY_MAPPING_ABI, sizeof(frame), 0, 0, 0, 0};
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, frame_page * 2, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &frame)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services.memory->unmap_range(services.context, frame.handle, frame_page, frame_page).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.memory->unmap_range(services.context, frame.handle, 0, frame_page).status == HL_STATUS_OK);
+        HL_CHECK(services.memory->release(services.context, frame.handle).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->unmap_address(services.context, frame.address, frame_page * 2).status ==
+                 HL_STATUS_OK);
+    }
+    {
+        /* Address-keyed release and range wiring, appended in HL_HOST_MEMORY_ABI 7. Both populations that
+         * need an address key hold no mapping handle: a range a provider placed at a fixed address, and a
+         * range whose ownership handle a later fixed placement retired. discard() reproduces the second.
+         *
+         * BUSY is answered from the registry rather than from the address space, so the case is set up
+         * from mappings this block owns end to end rather than from whatever earlier blocks left behind. */
+        long page_value = sysconf(_SC_PAGESIZE);
+        uint64_t page = page_value > 0 ? (uint64_t)page_value : UINT64_C(16384);
+        hl_host_memory_mapping owned = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(owned), 0, 0, 0, 0};
+        hl_host_memory_mapping wired_map = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(wired_map), 0, 0, 0, 0};
+        hl_host_result wired;
+        uint64_t base;
+        HL_CHECK(services.memory->abi == HL_HOST_MEMORY_ABI && services.memory->size >= sizeof(*services.memory));
+        HL_CHECK(services.memory->unmap_address(services.context, 0, page).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->unmap_address(services.context, page, 0).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->unmap_address(services.context, page + 1, page).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->unmap_address(services.context, page, page - 1).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->unmap_address(services.context, UINT64_MAX - page + 1, page * 2).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, page * 2, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &owned)
+                     .status == HL_STATUS_OK);
+        base = owned.address;
+        /* A live handle refuses the whole range, whether the overlap is total or partial, and nothing moves. */
+        HL_CHECK(services.memory->unmap_address(services.context, base, page * 2).status == HL_STATUS_BUSY);
+        HL_CHECK(services.memory->unmap_address(services.context, base + page, page).status == HL_STATUS_BUSY);
+        ((unsigned char *)(uintptr_t)base)[0] = 0xc3;
+        HL_CHECK(msync((void *)(uintptr_t)base, (size_t)(page * 2), MS_ASYNC) == 0);
+
+        /* Retiring the handle leaves the address space untouched: that is the range gmap is left holding. */
+        HL_CHECK(services.memory->discard(services.context, owned.handle).status == HL_STATUS_OK);
+        HL_CHECK(((unsigned char *)(uintptr_t)base)[0] == 0xc3);
+        HL_CHECK(services.memory->unmap_address(services.context, base, page).status == HL_STATUS_OK);
+        HL_CHECK(msync((void *)(uintptr_t)base, (size_t)page, MS_ASYNC) != 0);
+        HL_CHECK(msync((void *)(uintptr_t)(base + page), (size_t)page, MS_ASYNC) == 0);
+        /* A vacant range succeeds, exactly as munmap does, so a repeated teardown is not an error. */
+        HL_CHECK(services.memory->unmap_address(services.context, base, page).status == HL_STATUS_OK);
+        HL_CHECK(services.memory->unmap_address(services.context, base + page, page).status == HL_STATUS_OK);
+        /* The retired handle stays retired and never becomes an alias for the reused address. */
+        HL_CHECK(services.memory->unmap_range(services.context, owned.handle, 0, page).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->release(services.context, owned.handle).status == HL_STATUS_INVALID_ARGUMENT);
+
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, page, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &wired_map)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services.memory->wire_range(services.context, wired_map.address, page, 1).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->wire_range(services.context, 0, page, 0).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->wire_range(services.context, wired_map.address + 1, page, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->wire_range(services.context, wired_map.address, 0, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->unwire_range(services.context, 0, page).status == HL_STATUS_INVALID_ARGUMENT);
+        wired = services.memory->wire_range(services.context, wired_map.address, page, 0);
+        /* Darwin has mlock(2), so this host never answers NOT_SUPPORTED; an exhausted RLIMIT_MEMLOCK stays
+         * a refusal and is never reported as a success that pinned nothing. */
+        HL_CHECK(wired.status != HL_STATUS_NOT_SUPPORTED);
+        if (wired.status == HL_STATUS_OK) {
+            HL_CHECK(wired.detail == (uint64_t)HL_HOST_WIRE_RESIDENT);
+            HL_CHECK(services.memory->unwire_range(services.context, wired_map.address, page).status == HL_STATUS_OK);
+        }
+        HL_CHECK(services.memory->release(services.context, wired_map.handle).status == HL_STATUS_OK);
+        if (msync((void *)(uintptr_t)wired_map.address, (size_t)page, MS_ASYNC) != 0)
+            HL_CHECK(services.memory->wire_range(services.context, wired_map.address, page, 0).status != HL_STATUS_OK);
+    }
+    {
+        /* Address-keyed protection and flush, appended in HL_HOST_MEMORY_ABI 8.
+         *
+         * The ruling this block pins down: protect_address does NOT inherit unmap_address's
+         * live-handle refusal. Unmapping a range a handle still holds leaves that handle claiming
+         * address space that no longer exists, and a later teardown then unmaps whatever replaced
+         * it. Re-protecting leaves the frame, the hole set, the contents and the handle exactly as
+         * they were, and the owner can put the protection back through the handle-keyed call -- so
+         * refusing would refuse the ordinary case, which is what mprotect is for. The one range
+         * that keeps the refusal is a code mapping, where the protection is an engine invariant
+         * made of two views and an address-keyed caller holds neither the handle nor the other. */
+        long page_value = sysconf(_SC_PAGESIZE);
+        uint64_t page = page_value > 0 ? (uint64_t)page_value : UINT64_C(16384);
+        hl_host_memory_mapping owned = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(owned), 0, 0, 0, 0};
+        hl_host_memory_mapping loose = {HL_HOST_MEMORY_MAPPING_ABI, sizeof(loose), 0, 0, 0, 0};
+        hl_host_code_mapping executable;
+
+        HL_CHECK(services.memory->protect_address != NULL && services.memory->sync_address != NULL);
+        HL_CHECK(services.memory->protect_address(services.context, 0, page, HL_HOST_MEMORY_READ).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->protect_address(services.context, page, 0, HL_HOST_MEMORY_READ).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->protect_address(services.context, page + 1, page, HL_HOST_MEMORY_READ).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->protect_address(services.context, page, page, UINT32_MAX).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->protect_address(services.context, UINT64_MAX - page + 1, page * 2,
+                                                  HL_HOST_MEMORY_READ)
+                     .status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->sync_address(services.context, 0, page, 0).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->sync_address(services.context, page, 0, 0).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->sync_address(services.context, page + 1, page, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.memory->sync_address(services.context, page, page, UINT32_MAX).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, page * 2, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &owned)
+                     .status == HL_STATUS_OK);
+        ((unsigned char *)(uintptr_t)owned.address)[0] = 0x5a;
+        /* A live ordinary handle covers this range, and the call still goes through. */
+        HL_CHECK(services.memory->protect_address(services.context, owned.address, page, HL_HOST_MEMORY_READ).status ==
+                 HL_STATUS_OK);
+        /* Nothing was taken away: the range is still mapped, still readable, and the handle can put
+         * the protection back through the offset-keyed call it has always used. */
+        HL_CHECK(msync((void *)(uintptr_t)owned.address, (size_t)page, MS_ASYNC) == 0);
+        HL_CHECK(((unsigned char *)(uintptr_t)owned.address)[0] == 0x5a);
+        HL_CHECK(services.memory
+                     ->protect(services.context, owned.handle, 0, page * 2,
+                               HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE)
+                     .status == HL_STATUS_OK);
+        ((unsigned char *)(uintptr_t)owned.address)[0] = 0x5b;
+        /* An unaligned length is rounded up to whole pages, as the host operation itself does. */
+        HL_CHECK(services.memory->protect_address(services.context, owned.address, page + 1,
+                                                  HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services.memory->sync_address(services.context, owned.address, page * 2, 0).status == HL_STATUS_OK);
+        HL_CHECK(services.memory
+                     ->sync_address(services.context, owned.address, page * 2, HL_HOST_MEMORY_SYNC_ASYNC)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services.memory->release(services.context, owned.handle).status == HL_STATUS_OK);
+
+        /* The population the blocked caller actually holds: pages whose ownership handle is gone. */
+        HL_CHECK(services.memory
+                     ->map_anonymous(services.context, 0, page, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
+                                     HL_HOST_MEMORY_PRIVATE, &loose)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services.memory->discard(services.context, loose.handle).status == HL_STATUS_OK);
+        HL_CHECK(services.memory->protect_address(services.context, loose.address, page, HL_HOST_MEMORY_READ).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.memory->unmap_address(services.context, loose.address, page).status == HL_STATUS_OK);
+        /* A range with nothing mapped is refused rather than silently succeeding: a guest whose
+         * protection change reports success without changing anything turns a fault into a store. */
+        HL_CHECK(services.memory->protect_address(services.context, loose.address, page, HL_HOST_MEMORY_READ).status !=
+                 HL_STATUS_OK);
+
+        /* Code mappings keep the refusal, whole and with nothing changed. */
+        memset(&executable, 0, sizeof(executable));
+        HL_CHECK(services.memory->reserve_code(services.context, page, page, 0, &executable).status == HL_STATUS_OK);
+        HL_CHECK(services.memory
+                     ->protect_address(services.context, executable.executable_address, page, HL_HOST_MEMORY_READ)
+                     .status == HL_STATUS_BUSY);
+        HL_CHECK(services.memory
+                     ->protect_address(services.context, executable.writable_address, page, HL_HOST_MEMORY_READ)
+                     .status == HL_STATUS_BUSY);
+        /* Flushing it is not a protection change and is not refused. */
+        HL_CHECK(services.memory->sync_address(services.context, executable.writable_address, page, 0).status ==
+                 HL_STATUS_OK);
+        HL_CHECK(services.memory->release(services.context, executable.handle).status == HL_STATUS_OK);
+    }
+    {
+        /* The parking trio, appended in HL_HOST_SYNC_ABI 3. This host has no address-keyed wait
+         * exposed to userspace, so it runs the portable arm: process-local queues, which serve the
+         * private tier honestly and cannot serve the shared one at all. That refusal is typed. */
+        uint32_t word = 0;
+        uint64_t key = (uint64_t)(uintptr_t)&word;
+        pthread_t worker;
+        park_probe probe;
+        hl_host_result parked;
+
+        HL_CHECK(services.sync->abi == HL_HOST_SYNC_ABI && services.sync->park != NULL &&
+                 services.sync->unpark != NULL && services.sync->interrupt_park != NULL);
+
+        HL_CHECK(services.sync->park(services.context, 0, HL_HOST_PARK_PRIVATE, key, &word, 0, 4, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, NULL, 0, 4, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.sync->park(services.context, 1, 7u, key, &word, 0, 4, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, &word, 0, 3, 0).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, (const char *)&word + 1, 0, 4, 0)
+                     .status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.sync->unpark(services.context, HL_HOST_PARK_PRIVATE, key, NULL, 1).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.sync->unpark(services.context, 9u, key, &word, 1).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.sync->interrupt_park(services.context, 0).status == HL_STATUS_INVALID_ARGUMENT);
+        /* Typed absence rather than a wait that is private while claiming to be shared. */
+        HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_SHARED, key, &word, 0, 4, 0).status ==
+                 HL_STATUS_NOT_SUPPORTED);
+        HL_CHECK(services.sync->unpark(services.context, HL_HOST_PARK_SHARED, key, &word, 1).status ==
+                 HL_STATUS_NOT_SUPPORTED);
+
+        /* The compare is the provider's, and it happens before anything is enqueued. */
+        HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, &word, 99, 4,
+                                     HL_HOST_DEADLINE_INFINITE)
+                     .status == HL_STATUS_WOULD_BLOCK);
+        HL_CHECK(services.sync->park(services.context, 1, HL_HOST_PARK_PRIVATE, key, &word, 0, 4, 1).status ==
+                 HL_STATUS_TIMED_OUT);
+        parked = services.sync->unpark(services.context, HL_HOST_PARK_PRIVATE, key, &word, 1);
+        HL_CHECK(parked.status == HL_STATUS_OK);
+
+        /* An interruption recorded before the block is consumed by it and never blocks. An infinite
+         * deadline is used deliberately: if the record were kept against an outstanding wait rather
+         * than against the waiter, this call would never return. */
+        HL_CHECK(services.sync->interrupt_park(services.context, 4242).status == HL_STATUS_OK);
+        HL_CHECK(services.sync->park(services.context, 4242, HL_HOST_PARK_PRIVATE, key, &word, 0, 4,
+                                     HL_HOST_DEADLINE_INFINITE)
+                     .status == HL_STATUS_INTERRUPTED);
+        HL_CHECK(services.sync->park(services.context, 4242, HL_HOST_PARK_PRIVATE, key, &word, 0, 4, 1).status ==
+                 HL_STATUS_TIMED_OUT);
+
+        /* Released by another thread, with the word changed under it. */
+        probe = (park_probe){&services, 11, &word, monotonic_now_ns() + UINT64_C(5000000000), -1, 0};
+        HL_CHECK(pthread_create(&worker, NULL, park_once, &probe) == 0);
+        sleep_ms(80);
+        __atomic_store_n(&word, 1u, __ATOMIC_RELEASE);
+        HL_CHECK(services.sync->unpark(services.context, HL_HOST_PARK_PRIVATE, key, &word, 1).status == HL_STATUS_OK);
+        HL_CHECK(pthread_join(worker, NULL) == 0);
+        HL_CHECK(probe.status == HL_STATUS_OK);
+
+        /* Interrupted while blocked, with the word deliberately unchanged. This is the case a wait
+         * that can only be woken by a value change cannot express, and it is what carries a guest
+         * signal to a thread sitting in a wait nobody was going to end. */
+        __atomic_store_n(&word, 0u, __ATOMIC_RELEASE);
+        probe = (park_probe){&services, 12, &word, monotonic_now_ns() + UINT64_C(5000000000), -1, 0};
+        HL_CHECK(pthread_create(&worker, NULL, park_once, &probe) == 0);
+        sleep_ms(80);
+        HL_CHECK(services.sync->interrupt_park(services.context, 12).status == HL_STATUS_OK);
+        HL_CHECK(pthread_join(worker, NULL) == 0);
+        HL_CHECK(probe.status == HL_STATUS_INTERRUPTED && __atomic_load_n(&word, __ATOMIC_ACQUIRE) == 0);
+    }
+    {
+        /* The terminal group. What it answers is device facts; what it must never be asked is
+         * anything Linux-shaped, and nothing here has a shape to pass one. */
+        hl_host_terminal_size window;
+        uint32_t mode = 0;
+        hl_host_result ordinary;
+        char terminal_path[128];
+
+        HL_CHECK((services.capabilities & HL_HOST_CAP_TERMINAL) != 0 && services.terminal != NULL &&
+                 services.terminal->abi == HL_HOST_TERMINAL_ABI);
+        HL_CHECK(hl_host_services_validate(&services, HL_HOST_CAP_TERMINAL) == HL_STATUS_OK);
+        HL_CHECK(services.terminal->probe(services.context, HL_HOST_HANDLE_INVALID).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+
+        snprintf(terminal_path, sizeof(terminal_path), "/tmp/hl_terminal_probe_%ld", (long)getpid());
+        ordinary = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, terminal_path,
+                                                strlen(terminal_path), HL_HOST_FILE_READ | HL_HOST_FILE_WRITE,
+                                                HL_HOST_FILE_CREATE | HL_HOST_FILE_TRUNCATE, 0600);
+        HL_CHECK(ordinary.status == HL_STATUS_OK);
+        /* The point of the group: a live, valid, entirely ordinary object that is not a terminal.
+         * A file-type field cannot separate these two cases on every host; this can. */
+        HL_CHECK(services.terminal->probe(services.context, ordinary.value).status == HL_STATUS_OK &&
+                 services.terminal->probe(services.context, ordinary.value).value == 0);
+        HL_CHECK(services.terminal->get_mode(services.context, ordinary.value, &mode).status != HL_STATUS_OK);
+        HL_CHECK(services.terminal->get_size(services.context, ordinary.value, &window).status != HL_STATUS_OK);
+        HL_CHECK(services.terminal->get_mode(services.context, ordinary.value, NULL).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.terminal->get_size(services.context, ordinary.value, NULL).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.terminal->set_size(services.context, ordinary.value, NULL).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.terminal->set_mode(services.context, ordinary.value, UINT32_MAX).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        /* Typed absence, not a missing callback: this host delivers a resize by a means the
+         * operation does not describe. */
+        HL_CHECK(services.terminal->size_change_event(services.context, ordinary.value).status ==
+                 HL_STATUS_NOT_SUPPORTED);
+        HL_CHECK(services.file->close(services.context, ordinary.value).status == HL_STATUS_OK);
+        /* Stale: the handle is gone and every operation says so rather than reaching a reused slot. */
+        HL_CHECK(services.terminal->probe(services.context, ordinary.value).status == HL_STATUS_INVALID_ARGUMENT);
+        HL_CHECK(services.terminal->size_change_event(services.context, ordinary.value).status ==
+                 HL_STATUS_INVALID_ARGUMENT);
+        (void)services.file->unlink_relative(services.context, HL_HOST_HANDLE_CWD, terminal_path,
+                                             strlen(terminal_path));
+    }
     {
         hl_host_result root = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, "/", 1,
                                                            HL_HOST_FILE_PATH_ONLY | HL_HOST_FILE_DIRECTORY, 0, 0);

@@ -448,33 +448,52 @@ pub(super) fn validate_network(
     Ok(())
 }
 
+/// The crate's central guest-path check: mounts, ownership entries and every projected namespace
+/// node come through here.
+///
+/// Every question below is asked of the path's *bytes*. A guest path is a Linux path — an arbitrary
+/// `/`-separated byte string consumed by the Linux guest — and `std::path::Path` is the host's path
+/// parser, which gives a different answer on a Windows host with no diagnostic:
+/// `Path::new("/etc/passwd").is_absolute()` is `false` there, and `Path` splits `a\b` into two
+/// components rather than reading it as one filename.
+///
+/// Passing this check is also the precondition that lets the *structural* `std::path` operations
+/// above it (`parent`, `ancestors`, `starts_with`, `components().count()`) stay as they are: once a
+/// path is `/`-rooted with no `\` in any segment, those agree on every host.
 pub(super) fn validate_guest_path(
     path: &std::path::Path,
     maximum: u32,
     field: &'static str,
 ) -> Result<(), SpecError> {
-    if !path.is_absolute() || path.as_os_str().as_encoded_bytes().len() > maximum as usize {
+    use crate::sys::guest_path;
+    let bytes = guest_path::bytes(path);
+    if !guest_path::is_absolute(bytes) || bytes.len() > maximum as usize {
         return Err(spec_error(
             SpecErrorCategory::Invalid,
             field,
             "guest paths must be absolute and within the engine path limit",
         ));
     }
-    if path.as_os_str().as_encoded_bytes().contains(&0) {
+    if bytes.contains(&0) {
         return Err(spec_error(
             SpecErrorCategory::Invalid,
             field,
             "guest paths must not contain NUL",
         ));
     }
-    if path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
+    if guest_path::escapes(bytes) {
         return Err(spec_error(
             SpecErrorCategory::Invalid,
             field,
             "guest paths must not escape through '..'",
+        ));
+    }
+    if guest_path::segments(bytes).any(|segment| segment.contains(&b'\\')) {
+        return Err(spec_error(
+            SpecErrorCategory::Invalid,
+            field,
+            "guest path segments must not contain '\\', which names one file on a Linux guest and \
+             separates two components on a Windows host",
         ));
     }
     Ok(())

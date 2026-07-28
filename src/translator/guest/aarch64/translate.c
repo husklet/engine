@@ -145,6 +145,10 @@ static int uses_x18(uint32_t in, int mask) {
    ADDV therefore preserves the exact 32-bit modular accumulation semantics.
    USMMLA is U8*S8: reinterpret (u8 - 128) as s8, then add 128*sum(s8) for
    each right-hand row. */
+// FEAT_DotProd, by contrast, IS advertised (cpu.h, AT_HWCAP bit 20) and needs no probe or lowering here:
+// it is mandatory from Armv8.4-A, so SDOT/UDOT -- vector and by-element alike, neither of which touches a
+// stolen GPR -- reach the verbatim emit at the bottom of the loop and land on silicon that has them. That is
+// the same host assumption the already-advertised FEAT_LSE/AES/SHA2/CRC32 bits make.
 // FEAT_I8MM / FEAT_BF16 are OPTIONAL, and the engine's CPU model does not advertise them, so a guest that
 // uses them is already reaching past the contract. Where the HOST implements them the honest answer is the
 // architectural one: copy the instruction verbatim (same ISA, same silicon, bit-exact and faster). The
@@ -154,7 +158,12 @@ static int uses_x18(uint32_t in, int mask) {
 // reproduce (the differential ISA fuzzer, tests/fuzz/isa/aarch64, showed 1-ulp results, wrong NaN payloads
 // and a spurious FPSR.UFC). Probed once, before any translation runs.
 static int g_host_i8mm, g_host_bf16;
-#if defined(__linux__)
+// Both probes ask the HOST CPU for the extension, so both are gated on an AArch64 host: AT_HWCAP2 exists
+// everywhere and its bits are architecture-defined, so on x86_64 bit 13 is not HWCAP2_I8MM and the translator
+// would copy I8MM/BF16 opcodes verbatim on the strength of it. 0 selects baseline lowerings. Include
+// host_cpu.h rather than trusting the unity TU: an undefined macro drops the probe on a REAL host.
+#include "../../../host/host_cpu.h"
+#if defined(__linux__) && defined(HL_HOST_CPU_AARCH64)
 #include <sys/auxv.h>
 #ifndef HWCAP2_I8MM
 #define HWCAP2_I8MM (1u << 13)
@@ -167,7 +176,7 @@ __attribute__((constructor)) static void hl_detect_host_matrix_ext(void) {
     g_host_i8mm = (h2 & HWCAP2_I8MM) ? 1 : 0;
     g_host_bf16 = (h2 & HWCAP2_BF16) ? 1 : 0;
 }
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && defined(HL_HOST_CPU_AARCH64)
 #include <sys/sysctl.h>
 static int hl_sysctl_flag(const char *name) {
     int v = 0;

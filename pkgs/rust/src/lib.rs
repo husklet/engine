@@ -2,11 +2,18 @@
 //!
 #![deny(unsafe_code)]
 
+// Keep in step with the `HOSTS` table in build.rs: that decides what can be
+// LINKED, this what can be COMPILED. Archive presence is build.rs's problem.
 #[cfg(not(any(
     all(target_arch = "aarch64", target_os = "macos"),
-    all(target_arch = "aarch64", target_os = "linux")
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "x86_64", target_os = "windows", target_env = "msvc")
 )))]
-compile_error!("hl-engine supports only aarch64-apple-darwin and aarch64-unknown-linux-gnu hosts");
+compile_error!(
+    "hl-engine supports only the aarch64-apple-darwin, aarch64-unknown-linux-gnu, \
+     x86_64-unknown-linux-gnu and x86_64-pc-windows-msvc hosts"
+);
 
 pub(crate) mod model;
 pub(crate) mod protocol;
@@ -34,6 +41,8 @@ mod result;
 #[allow(dead_code)]
 mod service;
 pub mod spec;
+/// The crate's single host-platform boundary. Everything above it is host-neutral.
+mod sys;
 mod terminal;
 pub mod transport;
 mod wire;

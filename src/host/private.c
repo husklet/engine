@@ -250,7 +250,12 @@ int hl_host_process_fd_private_floor(void) {
     const rlim_t reserve = HL_HOST_PRIVATE_DESCRIPTOR_MINIMUM;
     const rlim_t maximum_guest = HL_LINUX_FD_LIMIT;
     if (limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur > INT32_MAX) limit.rlim_cur = INT32_MAX;
-    if (limit.rlim_cur <= HL_HOST_GUEST_DESCRIPTOR_MINIMUM + reserve) return -EMFILE;
+    /* Anchor the private interval just under the real ceiling rather than refusing when the soft limit does
+     * not clear HL_HOST_GUEST_DESCRIPTOR_MINIMUM: below that minimum it is not the true ceiling (same as the
+     * Darwin branch above).  Refusing broke engine-in-engine, where the inner guest reports RLIMIT_NOFILE
+     * 20480 < MINIMUM + reserve.  Do NOT raise our own soft limit instead -- hl_engine_guest_fd_limit()
+     * derives the GUEST-VISIBLE ceiling from it and that must stay golden-stable. */
+    if (limit.rlim_cur <= reserve + 1u) return -EMFILE;
     rlim_t guest = limit.rlim_cur - reserve;
     if (guest > maximum_guest) guest = maximum_guest;
     return (int)guest;

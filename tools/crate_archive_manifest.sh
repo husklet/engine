@@ -45,8 +45,16 @@ fi
 # LC_ALL=C keeps the ordering locale-independent; the per-file digests make the
 # hash sensitive to content, and the paths make it sensitive to files being
 # added, removed or renamed.
+#
+# The trailing carriage return is stripped because CMake's file(WRITE) uses the
+# PLATFORM newline, so the list arrives CRLF-terminated on a Windows host and
+# every path would otherwise carry a literal CR -- sha256sum then reports "no
+# such file" for every entry. Stripping it also keeps the digest identical on
+# all three hosts, which matters more than the failure: a manifest that differed
+# by host would make every cross-host freshness check disagree.
 files=()
 while read -r file; do
+	file=${file%$'\r'}
 	[ -n "$file" ] || continue
 	files+=("$file")
 done < <(LC_ALL=C sort -u "$source_list")

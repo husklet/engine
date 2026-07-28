@@ -5,6 +5,8 @@ use hl_engine::{
 
 #[path = "support/checkpoint_env.rs"]
 mod checkpoint_env;
+#[path = "support/engine_env.rs"]
+mod engine_env;
 
 use std::{
     fs,
@@ -33,6 +35,9 @@ fn fixture(status: i32, guest: Guest) -> PathBuf {
 
 #[test]
 fn both_guest_isas_report_typed_exit_42() {
+    if engine_env::skip_without_guest("both_guest_isas_report_typed_exit_42") {
+        return;
+    }
     let engine = Engine::new();
     for guest in [Guest::Aarch64, Guest::X86_64] {
         let exit = engine.command(guest, fixture(42, guest)).status().unwrap();
@@ -42,6 +47,9 @@ fn both_guest_isas_report_typed_exit_42() {
 
 #[test]
 fn guest_exit_70_remains_distinct_from_engine_failure() {
+    if engine_env::skip_without_guest("guest_exit_70_remains_distinct_from_engine_failure") {
+        return;
+    }
     let engine = Engine::new();
     for guest in [Guest::Aarch64, Guest::X86_64] {
         let exit = engine.command(guest, fixture(70, guest)).status().unwrap();
@@ -51,6 +59,9 @@ fn guest_exit_70_remains_distinct_from_engine_failure() {
 
 #[test]
 fn initial_executable_authority_is_not_reused_by_exec() {
+    if engine_env::skip_without_guest("initial_executable_authority_is_not_reused_by_exec") {
+        return;
+    }
     let engine = Engine::new();
     for guest in [Guest::Aarch64, Guest::X86_64] {
         let executable = fixture_named("exec-denied", guest);
@@ -67,6 +78,9 @@ fn initial_executable_authority_is_not_reused_by_exec() {
 
 #[test]
 fn rust_api_checkpoints_and_restores_a_three_process_tree() {
+    if engine_env::skip_without_guest("rust_api_checkpoints_and_restores_a_three_process_tree") {
+        return;
+    }
     // Both arches: the x86_64 fd-restore bug (a dup2'd fd came back pointing at the
     // launcher's stdio) is fixed -- x86 dup2 (33) now maps to canonical dup3 (24) so
     // checkpoint captures dup2'd descriptors. See tests/policy.rs.
@@ -138,6 +152,9 @@ fn checkpoints_and_restores_a_three_process_tree(guest: Guest) {
 
 #[test]
 fn rust_api_restores_buffered_cross_process_pipe_state() {
+    if engine_env::skip_without_guest("rust_api_restores_buffered_cross_process_pipe_state") {
+        return;
+    }
     // Both arches: x86_64 fd restore is fixed (x86 dup2 now maps to canonical dup3
     // so checkpoint captures dup2'd descriptors). See tests/policy.rs.
     if checkpoint_env::skip_if_unavailable("rust_api_restores_buffered_cross_process_pipe_state") {
@@ -204,6 +221,10 @@ fn restores_buffered_cross_process_pipe_state(guest: Guest) {
 
 #[test]
 fn rust_api_restores_unlinked_regular_file_content_and_offset() {
+    if engine_env::skip_without_guest("rust_api_restores_unlinked_regular_file_content_and_offset")
+    {
+        return;
+    }
     // Both arches: x86_64 fd restore is fixed (x86 dup2 now maps to canonical dup3
     // so checkpoint captures dup2'd descriptors). See tests/policy.rs.
     if checkpoint_env::skip_if_unavailable(
@@ -282,6 +303,9 @@ const READY_DEADLINE: Duration = Duration::from_secs(60);
 /// prove the guest survived both hops instead of being relaunched.
 #[test]
 fn rust_api_restores_while_arming_the_next_capture() {
+    if engine_env::skip_without_guest("rust_api_restores_while_arming_the_next_capture") {
+        return;
+    }
     // Both arches: x86_64 fd restore is fixed (x86 dup2 now maps to canonical dup3
     // so checkpoint captures dup2'd descriptors). See tests/policy.rs.
     if checkpoint_env::skip_if_unavailable("rust_api_restores_while_arming_the_next_capture") {

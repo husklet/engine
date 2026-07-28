@@ -1,0 +1,277 @@
+name: Windows x86-64
+
+# The x86_64 Windows HOST lane. One workflow file per host token, as I13/I14
+# require and as I20 now enforces by iterating HL_CI_HOSTS rather than testing a
+# literal.
+#
+# SCOPE, stated as what this workflow PROVES and what it does not, because a
+# lane that claims coverage it does not have is worse than no lane:
+#
+#   proves   the tree configures with mingw-w64 clang; all five static archives
+#            compile AND the runner executable links; the shell-backed CI
+#            metadata gates run; the declared `unit` lane is non-empty and
+#            green; the built Windows binaries import nothing that would kill a
+#            cloned process; and the Rust crate checks, lints and formats clean
+#            against the MSVC host target.
+#   does NOT no guest executes here, nothing built here is RUN beyond the gates
+#            named below, the crate cannot LINK here (no Windows archive under
+#            pkgs/rust/assets/lib), and no compat, production, checkpoint,
+#            lifecycle, package or perf lane exists on this host. None of them
+#            is listed below, and none may be added before it has been measured
+#            green on this runner.
+#
+# This host declares exactly ONE lane: HL_CI_DIRECT_WINDOWS is `unit`. It is a
+# SMALLER label here than on Linux or Darwin -- no host unit binary registers
+# yet, cmake/Phase3Units.cmake returns at its Windows guard -- so the `-L unit`
+# step below is not the same body of work the name carries elsewhere. What it
+# selects is measured, not assumed: the two CI metadata gates, the PE import
+# gate, gate.ci-lane-parity, and the two cargo cases from cmake/RustLint.cmake.
+#
+# `package` is deliberately NOT declared and NOT run: package.consumer-link
+# registers here and fails, because tests/integration/package.c has no Windows
+# arm. It carries the `package` label only, never `unit`, so the lane below
+# stays green without suppressing anything -- which is why no step here runs a
+# bare `ctest`, and why none may gain `-k 0`: both would turn that known red
+# case into this lane's verdict.
+#
+# NO compat shard, and none may be added while Windows-x86_64 is absent from
+# HL_CI_COMPAT_HOSTS: I20 requires a non-compat host's workflow to name no lane
+# at all, and the sharded matrix job and the HL_CI_COMPAT_HOSTS entry have to
+# land in the same change -- declaring the token is what turns I20 off, so a
+# workflow that shards nothing while exempt has no structural guard left.
+#
+# publish.yml deliberately does not need this job, and P1 still pins
+# `needs: [linux, mac]`: a release ships nothing built here.
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # As linux.yml and linux-x86_64.yml: a main commit keeps its own group so
+  # every main commit gets a verdict; other refs coalesce by ref.
+  group: windows-x86-64-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+defaults:
+  run:
+    # Git Bash, which is what lets tools/*.sh and the HL_BASH_EXECUTABLE-driven
+    # CTest cases run unmodified. It ships awk, which those scripts need.
+    shell: bash
+
+jobs:
+  windows-x86-64:
+    runs-on: windows-2025
+    # Five static archives, one executable and the `unit` lane; the pacman
+    # install still dominates.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      # MSYS2's CLANG64 environment: clang, lld, compiler-rt and the LLVM
+      # binutils. llvm-readobj is not optional here -- it is what reads the PE
+      # import tables for the gate at the end of this job.
+      #
+      # Known weakness, recorded rather than hidden: MSYS2's repository is
+      # rolling, so the compiler can change under this lane between two runs of
+      # the same commit and produce a failure that is not about the change under
+      # test. A pinned, SHA-256-verified llvm-mingw tarball would fix that and
+      # is the right end state; it is a separate change with its own
+      # verification, and pinning the wrong thing quietly is worse than a stated
+      # weakness.
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: CLANG64
+          update: false
+          # inherit, so the runner's own cmake, ninja and git stay on PATH and
+          # only the toolchain comes from MSYS2.
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-lld
+            mingw-w64-clang-x86_64-compiler-rt
+
+      - name: Put the CLANG64 toolchain on PATH
+        timeout-minutes: 2
+        run: echo "${{ steps.msys2.outputs.msys2-location }}/clang64/bin" >> "$GITHUB_PATH"
+
+      # Runner facts as a ::notice, because the job-log endpoint needs admin
+      # rights and a toolchain-version difference is the first thing anyone will
+      # want when this lane disagrees with a developer's box. tools/ci_env.sh is
+      # deliberately not used: it reads /proc/meminfo and /sys/fs/cgroup and
+      # would print "memory: ? bytes" here, which is worse than saying less.
+      - name: Runner environment
+        timeout-minutes: 5
+        run: |
+          {
+            printf 'runner: windows-2025\n'
+            printf 'clang: %s\n' "$(clang --version | head -1)"
+            printf 'cmake: %s\n' "$(cmake --version | head -1)"
+            printf 'ninja: %s\n' "$(ninja --version)"
+            printf 'readobj: %s\n' "$(llvm-readobj --version | tr '\n' ' ')"
+            printf 'bash: %s\n' "$(bash --version | head -1)"
+          } | tee /tmp/env.txt
+          printf '::notice title=Windows runner environment::%s\n' "$(tr '\n' ' ' < /tmp/env.txt)"
+
+      # The toolchain file pins the compiler when PATH also carries MSVC (it
+      # does on a hosted image) and holds the -static link decision.
+      - name: Configure (CMake)
+        timeout-minutes: 10
+        run: |
+          cmake -G Ninja -B build-ci \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/x86_64-windows.cmake
+
+      # ONLY the targets measured green on this host, named one by one rather
+      # than a bare `ninja`. A blanket build would drag in targets that do not
+      # build here and say nothing about whether these regressed -- and adding
+      # `-k 0` to paper over that would make the step's verdict meaningless.
+      # Add a target here when it builds; that is the milestone, and this list
+      # is the record of it.
+      #
+      # hl-engine-runner is the newest entry and the most load-bearing: it is an
+      # EXECUTABLE, so it proves the engine, translator, linux-abi and Windows
+      # host provider LINK together here, not merely that each compiles. It is
+      # also the only PE image this job produces, and therefore the only thing
+      # gate.windows-imports can read an import table from -- without it that
+      # gate inspects archives alone and its PE arm is vacuous.
+      - name: Build the archives and the runner
+        timeout-minutes: 25
+        run: |
+          set -e
+          for t in hl-translator hl-host-fake hl-engine hl-linux-abi \
+                   hl-host-windows hl-engine-runner; do
+            cmake --build build-ci --target "$t"
+          done
+          for a in libhl-translator.a libhl-host-fake.a libhl-engine.a \
+                   libhl-linux-abi.a libhl-host-windows.a; do
+            test -f "build-ci/$a"
+          done
+          test -f build-ci/bin/hl-engine-runner.exe
+          llvm-nm --print-armap build-ci/libhl-translator.a > /dev/null
+
+      # THE declared lane, replacing the by-name list this step used to carry.
+      # Windows-x86_64 is in HL_CI_HOSTS and HL_CI_DIRECT_WINDOWS is `unit`, so
+      # this host now owns a label and running it by label is what the
+      # declaration means. `--no-tests=error` is mandatory (I15): `ctest -L`
+      # exits 0 on an empty selection, so without it a deleted or renamed label
+      # reports green.
+      #
+      # Note what is NOT here: no `-E` exclusion, no `-k 0`, no bare `ctest`.
+      # The lane is green as declared or this step is red.
+      - name: Test the unit lane
+        timeout-minutes: 15
+        run: |
+          ctest --test-dir build-ci -L '^unit$' --no-tests=error --output-on-failure ||
+            { printf '::error title=Windows unit lane::the `unit` lane declared for Windows-x86_64 in cmake/CiLanes.cmake is red on this runner\n'; exit 1; }
+
+      # gate.ci-lane-parity by name as well, and this is not redundant with the
+      # step above. That gate is what proves every lane this host declares is a
+      # NON-EMPTY CTest selection -- but it is registered conditionally (it needs
+      # bash on PATH and this host's token declared), and a gate that fails to
+      # register simply vanishes from `-L unit`, which then passes with one
+      # fewer case and no signal at all. `-R` plus `--no-tests=error` turns that
+      # silent disappearance into a failure, which is the same class of bug the
+      # gate itself exists to catch, one level up.
+      - name: Gate the declared lane set against the CTest registry
+        timeout-minutes: 5
+        run: |
+          ctest --test-dir build-ci -R '^gate\.ci-lane-parity$' --no-tests=error --output-on-failure ||
+            { printf '::error title=Windows lane parity::a lane declared for Windows-x86_64 in cmake/CiLanes.cmake selects zero tests here, or the gate did not register at all\n'; exit 1; }
+
+      # The gate this job exists for. It is inside `-L unit` too, and running it
+      # a second time here costs ~0.2s and buys two things the lane cannot give:
+      # a verdict legible in the checks list rather than buried in a lane
+      # summary, and -V rather than --output-on-failure. That last is the point
+      # -- CTest prints NOTHING for a skipped test and counts SKIPPED as a pass,
+      # so inside `-L unit` this gate reporting "nothing was built to inspect"
+      # is indistinguishable from it having audited every binary. -V makes it
+      # say which images it actually read.
+      #
+      # What it asserts: every PE image and archive built above imports (or
+      # references) only KERNEL32, ntdll and the api-ms-win-* apisets. A USER32
+      # import loads IMM32, whose DLL_THREAD_DETACH handler access-violates
+      # inside a process cloned by RtlCloneUserProcess -- which is how guest
+      # fork() is served on this host. The crash needs a guest to fork and THEN
+      # create and join a thread, so it appears in JVM/Go/Node workloads and
+      # never in a smoke test. That is why it is gated at build time.
+      - name: Gate the Windows import surface
+        timeout-minutes: 5
+        run: |
+          ctest --test-dir build-ci -R '^gate\.windows-imports$' --no-tests=error -V ||
+            { printf '::error title=Windows import surface::a built binary imports a DLL outside the KERNEL32/ntdll/api-ms-win-* allowlist; it would crash after a guest fork\n'; exit 1; }
+
+  # The Rust crate against the MSVC host target, in its OWN job.
+  #
+  # WHY SEPARATE, given `-L unit` above already runs rust.fmt and rust.clippy
+  # through cmake/RustLint.cmake:
+  #
+  #   1. It does not need MSYS2. The job above installs a rolling toolchain from
+  #      a repository that can change between two runs of the same commit, so a
+  #      crate regression and a pacman regression are currently the same red
+  #      tick. Split, they are two.
+  #   2. It names the TARGET TRIPLE. RustLint's cases inherit whatever rustup
+  #      calls the host; this job asserts x86_64-pc-windows-msvc explicitly,
+  #      which is the triple pkgs/rust/build.rs branches on and the one the C
+  #      build here (mingw-w64, x86_64-w64-windows-gnu) is NOT.
+  #   3. `cargo check --tests` compiles the test targets. `cargo clippy --tests`
+  #      lints them.
+  #
+  # What this does NOT prove, and must not be extended to claim: nothing here
+  # LINKS. pkgs/rust/assets/lib has no x86_64-pc-windows-msvc archive, so
+  # build.rs emits a warning branch and any `cargo test` or `cargo build` would
+  # fail on undefined hl_engine_* symbols. `cargo test` is therefore absent, and
+  # adding it before that archive is committed would make this job red for a
+  # reason that has nothing to do with the crate source.
+  windows-rust:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      # The hosted image ships rustup with cargo, clippy and rustfmt; this
+      # asserts all three rather than discovering their absence as a confusing
+      # failure three steps later, and records the versions for the same reason
+      # the job above records its clang version.
+      - name: Rust toolchain facts
+        timeout-minutes: 5
+        run: |
+          {
+            printf 'rustc: %s\n' "$(rustc --version)"
+            printf 'cargo: %s\n' "$(cargo --version)"
+            printf 'clippy: %s\n' "$(cargo clippy --version)"
+            printf 'rustfmt: %s\n' "$(cargo fmt --version)"
+            printf 'host: %s\n' "$(rustc -vV | sed -n 's/^host: //p')"
+          } | tee /tmp/rust-env.txt ||
+            { printf '::error title=Windows Rust toolchain::the runner has no usable cargo, clippy or rustfmt\n'; exit 1; }
+          printf '::notice title=Windows Rust toolchain::%s\n' "$(tr '\n' ' ' < /tmp/rust-env.txt)"
+
+      # --locked, so a drifted Cargo.lock fails here instead of resolving to
+      # something no other lane ever built.
+      - name: Check the crate for the MSVC host target
+        timeout-minutes: 15
+        run: |
+          cargo check --manifest-path pkgs/rust/Cargo.toml --tests --locked \
+            --target x86_64-pc-windows-msvc ||
+            { printf '::error title=Windows Rust check::pkgs/rust does not compile for x86_64-pc-windows-msvc\n'; exit 1; }
+
+      # -D warnings, so a warning is a failure here. linux.yml lints the same
+      # crate the same way; the value of repeating it is that a cfg branch taken
+      # only on Windows is invisible to that lane.
+      - name: Lint the crate (clippy)
+        timeout-minutes: 15
+        run: |
+          cargo clippy --manifest-path pkgs/rust/Cargo.toml --tests --locked \
+            -- -D warnings ||
+            { printf '::error title=Windows Rust lint::clippy reported a warning or error for pkgs/rust on the MSVC host\n'; exit 1; }
+
+      - name: Check the crate formatting
+        timeout-minutes: 5
+        run: |
+          cargo fmt --manifest-path pkgs/rust/Cargo.toml --check ||
+            { printf '::error title=Windows Rust formatting::pkgs/rust is not rustfmt-clean; run `cargo fmt --manifest-path pkgs/rust/Cargo.toml`\n'; exit 1; }

@@ -2,6 +2,8 @@
 
 #include "environment.h"
 
+#include "../host/libc_compat.h"
+
 #include <errno.h>
 #include <stdlib.h>
 
@@ -17,7 +19,7 @@ int hl_environment_take_activation_descriptor(long *descriptor) {
     if (value == NULL) return 0;
     errno = 0;
     parsed = strtol(value, &end, 10);
-    (void)unsetenv("HL_ACTIVATION_FD");
+    (void)hl_compat_unsetenv("HL_ACTIVATION_FD");
     if (errno != 0 || end == value || *end != 0) return -1;
     *descriptor = parsed;
     return 1;

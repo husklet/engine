@@ -1,8 +1,15 @@
 #include "avx.h"
 #include "cpu.h"
 #include "decoder.h"
+#include "rep_runtime.h" // the bound guest-access validators + X86_SOFT_READ/WRITE
+#include "../../../host/host_cpu.h" // HL_HOST_CPU_*: the half-precision converter forks per host CPU
 
+#include <fenv.h>
+#include <setjmp.h>
 #include <math.h>
+#if defined(HL_HOST_CPU_X86_64)
+#include <xmmintrin.h> // _mm_getcsr == STMXCSR: on this host the guest MXCSR IS the host MXCSR
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -154,16 +161,70 @@ static uint64_t avx_ea(const hl_x86_avx_state *state, struct cpu *c, struct insn
     return hl_x86_avx_address(state, a);
 }
 
-static int avx_memory_read(const hl_x86_avx_state *state, uint64_t guest, void *destination, size_t length) {
+// ---- The guest-access fault bracket. -----------------------------------------------------------------
+// do_avx/do_sse3b run from the DISPATCH LOOP, not from inside run_block, so neither backend's fault pad is
+// armed here: a host SIGSEGV on a guest-chosen address kills the ENGINE where hardware faults the GUEST.
+// Measured before this: `vmovdqu ymm0,[0x1000]` and `pshufb xmm0,[0x1000]` both exited 139 instead of
+// running the guest's SIGSEGV handler -- and the VEX gathers, whose address is base + a GUEST-DATA vector
+// element * scale, reach any host page at all.
+//
+// So nothing is dereferenced before it is proven, exactly as the string helpers do it (rep_runtime.c).
+// A rejected access ABANDONS the instruction with nothing committed and exits to the dispatcher with
+// R_SOFTMISS -- the same protocol emit.c's memory guard emits -- which either resolves a logical mapping
+// and retries or delivers the guest SIGSEGV with the right si_addr and si_code. cpu->rip stays ON the
+// instruction, so a retry re-executes it. The abandon is a plain longjmp, not a signal pad: the decision
+// is taken BEFORE the access, so no signal is ever raised and there is no mask to restore.
+static __thread jmp_buf g_avx_pad;
+static __thread struct cpu *g_avx_cpu; // the cpu the pad was armed for
+static __thread uint64_t g_avx_pc;     // the architectural PC of the instruction being emulated
+
+static void avx_abandon(uint64_t guest, uint64_t length, uint32_t required) {
+    struct cpu *c = g_avx_cpu;
+    c->bus_ea = guest;
+    c->soft_width = length;
+    c->soft_required = required;
+    c->rip = g_avx_pc;
+    c->reason = R_SOFTMISS;
+    longjmp(g_avx_pad, 1);
+}
+
+// #UD from an emulated instruction: SIGILL/ILL_ILLOPN with si_addr = the instruction, as interp.c raises it.
+static void avx_undefined(void) {
+    struct cpu *c = g_avx_cpu;
+    c->divop = 4u | (2u << 8); // (linux_signo | si_code<<8)
+    c->rip = g_avx_pc;
+    c->reason = R_TRAP;
+    longjmp(g_avx_pad, 1);
+}
+
+// Non-abandoning probe+transfer. 1 = done, 0 = the guest may not touch this span and NOTHING was copied.
+// The gathers need this form: a faulting element must still commit the elements that completed.
+static int avx_try_read(const hl_x86_avx_state *state, uint64_t guest, void *destination, size_t length) {
     int handled = state != NULL && state->memory_read != NULL ? state->memory_read(guest, destination, length) : 0;
-    if (handled == 0) memcpy(destination, (const void *)(uintptr_t)guest, length);
-    return handled >= 0;
+    if (handled < 0) return 0;
+    if (handled > 0) return 1;
+    if (!hl_x86_guest_readable(guest, length)) return 0;
+    memcpy(destination, (const void *)(uintptr_t)guest, length);
+    return 1;
+}
+
+static int avx_try_write(const hl_x86_avx_state *state, uint64_t guest, const void *source, size_t length) {
+    int handled = state != NULL && state->memory_write != NULL ? state->memory_write(guest, source, length) : 0;
+    if (handled < 0) return 0;
+    if (handled > 0) return 1;
+    if (!hl_x86_guest_writable(guest, length)) return 0;
+    memcpy((void *)(uintptr_t)guest, source, length);
+    return 1;
+}
+
+static int avx_memory_read(const hl_x86_avx_state *state, uint64_t guest, void *destination, size_t length) {
+    if (!avx_try_read(state, guest, destination, length)) avx_abandon(guest, length, X86_SOFT_READ);
+    return 1;
 }
 
 static int avx_memory_write(const hl_x86_avx_state *state, uint64_t guest, const void *source, size_t length) {
-    int handled = state != NULL && state->memory_write != NULL ? state->memory_write(guest, source, length) : 0;
-    if (handled == 0) memcpy((void *)(uintptr_t)guest, source, length);
-    return handled >= 0;
+    if (!avx_try_write(state, guest, source, length)) avx_abandon(guest, length, X86_SOFT_WRITE);
+    return 1;
 }
 
 // Read the r/m operand (register or memory) into buf as `wbytes` bytes.
@@ -203,53 +264,39 @@ static void avx_put_rm(const hl_x86_avx_state *state, struct cpu *c, struct insn
 // CLEAR (0x7FC00000 / 0x7FF8000000000000) -- identical payload, opposite sign. A NaN PROPAGATED from an
 // input keeps that input's sign on both ISAs, so only the generated case (result NaN AND neither input
 // NaN) is fixed up here. Matches the legacy-SSE inline fixup (translate.c emit_dnan_pre/post).
-// NaN classification (exponent all-ones, mantissa nonzero; QNaN = mantissa MSB set).
+// NaN classification (exponent all-ones, mantissa nonzero).
 static int nan32(uint32_t u) {
     return (u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu) != 0;
-}
-
-static int qnan32(uint32_t u) {
-    return nan32(u) && (u & 0x00400000u) != 0;
 }
 
 static int nan64(uint64_t u) {
     return (u & 0x7ff0000000000000ull) == 0x7ff0000000000000ull && (u & 0x000fffffffffffffull) != 0;
 }
 
-static int qnan64(uint64_t u) {
-    return nan64(u) && (u & 0x0008000000000000ull) != 0;
-}
-
 // x86 add/sub/mul/div result NaN handling. Two distinct rules, both of which the host NEON FADD/FMUL/FSUB/
 // FDIV that computed `r` gets WRONG, so we recompute from the operands here:
-//   (1) INPUT NaN: a single NaN input is returned, quieted. When BOTH inputs are NaN the operand is
-//       selected by the rule the reference oracle (qemu-x86_64) applies to SSE, which is softfloat's
-//       `float_2nan_prop_x87`: a QNaN beats an SNaN; between two NaNs of the SAME kind the one with
-//       the LARGER significand wins; on a significand tie the POSITIVE one wins. It is fully
-//       COMMUTATIVE -- which is why the horizontal ops below need not care whether x86 pairs
-//       odd+even or even+odd. Measured exhaustively against qemu-x86_64 (see the NaN-selection note
-//       in tests/fuzz/isa/x86_64/README.md, which also records that the SDM instead specifies plain
-//       first-operand priority for SSE, i.e. oracle and manual disagree here).
-//       The chosen NaN is quieted by setting its mantissa MSB (payload + sign preserved).
+//   (1) INPUT NaN: plain SRC1 PRIORITY, quieted -- src1 if it is a NaN, else src2, with the mantissa MSB
+//       set (payload + sign preserved). Not commutative, so HADD/HSUB's pairing order below is observable.
+//       Measured on Zen 4 across all 64 ordered pairs of {+-SNaN min/max payload, +-QNaN min/max payload},
+//       single and double, for ADD/SUB/MUL/DIV in SSE, SSE scalar, VEX, and the SSE3 horizontal/addsub
+//       family: src1 wins every non-degenerate pair, on every one of them.
+//       This used to implement softfloat's `float_2nan_prop_x87` (QNaN beats SNaN, then larger significand,
+//       then positive) because qemu-x86_64 was taken as the oracle where it disagreed with the SDM. The
+//       SDM was right and the oracle was modelling the x87 rule for SSE; that cost 107 golden lines.
+//       ARM's rule is SNaN-first-else-src1, which agrees with x86 on 12 of 16 NaN pairs and diverges on
+//       exactly (src1 QNaN, src2 SNaN) -- so the JIT's NaN-input gate into this code is still load-bearing.
 //   (2) GENERATED NaN (result NaN, NO input NaN: 0/0, inf/inf, 0*inf, inf-inf): x86 yields the QNaN
 //       floating-point INDEFINITE with the sign bit SET (0xFFC00000 / 0xFFF8000000000000); ARM yields the
 //       positive default NaN. Same payload, opposite sign.
+// MIN/MAX are NOT covered here: they return src2 VERBATIM (not even quieted) on any NaN, which is what the
+// `x < y ? x : y` ternaries in avx_fp_arith_* already produce. Confirmed on the same sweep.
 static float avx_dnan_f32(float r, float x, float y) {
     uint32_t xb, yb;
     memcpy(&xb, &x, 4);
     memcpy(&yb, &y, 4);
     int xn = nan32(xb), yn = nan32(yb);
     if (xn || yn) {
-        uint32_t w;
-        if (!xn || !yn) {
-            w = xn ? xb : yb; // exactly one NaN input -> that one
-        } else if (qnan32(xb) != qnan32(yb)) {
-            w = qnan32(xb) ? xb : yb; // quiet beats signaling
-        } else {
-            uint32_t fx = xb & 0x007fffffu, fy = yb & 0x007fffffu; // same kind -> larger significand
-            w = (fx > fy) ? xb : (fy > fx) ? yb : ((xb >> 31) <= (yb >> 31) ? xb : yb); // tie -> positive
-        }
-        w |= 0x00400000u; // quiet the selected NaN (x86)
+        uint32_t w = (xn ? xb : yb) | 0x00400000u; // src1 priority, quieted
         memcpy(&r, &w, 4);
         return r;
     }
@@ -266,16 +313,7 @@ static double avx_dnan_f64(double r, double x, double y) {
     memcpy(&yb, &y, 8);
     int xn = nan64(xb), yn = nan64(yb);
     if (xn || yn) {
-        uint64_t w;
-        if (!xn || !yn) {
-            w = xn ? xb : yb; // exactly one NaN input -> that one
-        } else if (qnan64(xb) != qnan64(yb)) {
-            w = qnan64(xb) ? xb : yb; // quiet beats signaling
-        } else {
-            uint64_t fx = xb & 0x000fffffffffffffull, fy = yb & 0x000fffffffffffffull;  // larger significand
-            w = (fx > fy) ? xb : (fy > fx) ? yb : ((xb >> 63) <= (yb >> 63) ? xb : yb); // tie -> positive
-        }
-        w |= 0x0008000000000000ull; // quiet the selected NaN (x86)
+        uint64_t w = (xn ? xb : yb) | 0x0008000000000000ull; // src1 priority, quieted
         memcpy(&r, &w, 8);
         return r;
     }
@@ -286,24 +324,237 @@ static double avx_dnan_f64(double r, double x, double y) {
     return r;
 }
 
-// FMA generates a default NaN (inf*0, or an inf-inf in the fused add) with the x86 indefinite
-// sign SET whenever the result is NaN and none of the three operands is NaN; a NaN propagated
-// from any operand keeps that operand's sign on both ISAs. Three-operand analogue of avx_dnan_*.
-static float fma_dnan_f32(float r, float x, float y, float z) {
-    if (r != r && x == x && y == y && z == z) {
+static void fma_raise_ie(void) {
+    volatile double z = 0.0, q = z / z; // 0/0 raises #I and nothing else, on either host
+    (void)q;
+}
+
+// x86 FMA, three-operand analogue of avx_dnan_*. Computes the SDM's a*b+c with `nmul`/`nadd`
+// selecting the fmsub/fnmadd/fnmsub sign variants; a and b are the multiplicands, c the addend.
+// Measured on Zen 4 over all 1728 triples of {+-SNaN,+-QNaN}x{min,max payload} + {1.0, +0, +-inf}
+// for every form (132/213/231), every sign variant, both widths, scalar and packed:
+//   (1) OPERAND NaN: the FIRST NaN in a*b+c ORDER wins -- a, then b, then c -- propagated VERBATIM
+//       (sign and payload) with only the quiet bit forced. The addend never beats a multiplicand
+//       and b never beats a, so the product/addend negation never touches the propagated sign. The
+//       only flag raised is #I, and only for an SNaN operand: a NaN operand suppresses even the #D
+//       of a denormal operand, and the #I that 0*inf would otherwise raise. So the host FMA must
+//       NOT run here. aarch64 FMADD answers this case SNaN-first-then-ADDEND-first, and for 0*inf
+//       with a QNaN addend the ARM ARM mandates DefaultNaN + IOC (measured on bare NEON under
+//       qemu, so it is the ISA and not the emulator). An x86-64 host is no better: which
+//       multiplicand lands in the encoding's first slot is the compiler's choice, and it chose the
+//       wrong one for the float path -- 13008 of 43680 NaN triples were wrong on THIS host.
+//   (2) GENERATED NaN (no NaN operand: 0*inf, or an inf-inf in the fused add): x86 yields the QNaN
+//       indefinite with the sign SET, ARM the positive default NaN -- same payload, opposite sign.
+// The negations are FNEG, not a multiply by -1: exact, and it cannot raise a flag of its own.
+static float fma_x86_f32(float a, float b, float c, int nmul, int nadd) {
+    uint32_t ab, bb, cb;
+    memcpy(&ab, &a, 4);
+    memcpy(&bb, &b, 4);
+    memcpy(&cb, &c, 4);
+    if (nan32(ab) || nan32(bb) || nan32(cb)) {
+        // #I follows ANY SNaN operand, not the winner: a QNaN a beside an SNaN b still raises it.
+        if ((nan32(ab) && !(ab & 0x00400000u)) || (nan32(bb) && !(bb & 0x00400000u)) ||
+            (nan32(cb) && !(cb & 0x00400000u)))
+            fma_raise_ie();
+        uint32_t w = (nan32(ab) ? ab : nan32(bb) ? bb : cb) | 0x00400000u;
+        memcpy(&a, &w, 4);
+        return a;
+    }
+    float r = __builtin_fmaf(nmul ? -a : a, b, nadd ? -c : c);
+    if (r != r) {
         uint32_t u = 0xFFC00000u;
         memcpy(&r, &u, 4);
     }
     return r;
 }
 
-static double fma_dnan_f64(double r, double x, double y, double z) {
-    if (r != r && x == x && y == y && z == z) {
+static double fma_x86_f64(double a, double b, double c, int nmul, int nadd) {
+    uint64_t ab, bb, cb;
+    memcpy(&ab, &a, 8);
+    memcpy(&bb, &b, 8);
+    memcpy(&cb, &c, 8);
+    if (nan64(ab) || nan64(bb) || nan64(cb)) {
+        // #I follows ANY SNaN operand, not the winner: a QNaN a beside an SNaN b still raises it.
+        if ((nan64(ab) && !(ab & 0x0008000000000000ull)) || (nan64(bb) && !(bb & 0x0008000000000000ull)) ||
+            (nan64(cb) && !(cb & 0x0008000000000000ull)))
+            fma_raise_ie();
+        uint64_t w = (nan64(ab) ? ab : nan64(bb) ? bb : cb) | 0x0008000000000000ull;
+        memcpy(&a, &w, 8);
+        return a;
+    }
+    double r = __builtin_fma(nmul ? -a : a, b, nadd ? -c : c);
+    if (r != r) {
         uint64_t u = 0xFFF8000000000000ull;
         memcpy(&r, &u, 8);
     }
     return r;
 }
+
+// Live guest rounding mode in the MXCSR.RC encoding {0=nearest,1=down,2=up,3=truncate}. The guest MXCSR IS
+// the host control register on both hosts: MXCSR itself here, FPCR.RMode on aarch64 -- where ldmxcsr swaps
+// the two directed modes on the way in, so this swaps them back.
+static int cvt_host_rc(void) {
+#if defined(HL_HOST_CPU_X86_64)
+    return (int)((_mm_getcsr() >> 13) & 3u);
+#elif defined(HL_HOST_CPU_AARCH64)
+    unsigned long fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    unsigned m = (unsigned)((fpcr >> 22) & 3u);
+    return m == 1 ? 2 : m == 2 ? 1 : (int)m;
+#else
+    switch (fegetround()) {
+    case FE_DOWNWARD: return 1;
+    case FE_UPWARD: return 2;
+    case FE_TOWARDZERO: return 3;
+    default: return 0;
+    }
+#endif
+}
+
+// Host sticky FP exception state, parked across the rounding step below. Volatile asm, not the _mm_*csr
+// intrinsics or fenv: the intrinsics are ordinary function-like and can be reordered around the FP they
+// are meant to bracket, and glibc's fesetexceptflag also writes the x87 status word, which is live guest
+// state here.
+static unsigned cvt_fp_flags(void) {
+#if defined(HL_HOST_CPU_X86_64)
+    unsigned v;
+    __asm__ volatile("stmxcsr %0" : "=m"(v));
+    return v & 0x3fu;
+#elif defined(HL_HOST_CPU_AARCH64)
+    unsigned long f;
+    __asm__ volatile("mrs %0, fpsr" : "=r"(f));
+    return (unsigned)(f & 0x9ful); // IOC/DZC/OFC/UFC/IXC + IDC(7)
+#else
+    fexcept_t f = 0;
+    fegetexceptflag(&f, FE_ALL_EXCEPT);
+    return (unsigned)f;
+#endif
+}
+
+static void cvt_fp_flags_set(unsigned keep) {
+#if defined(HL_HOST_CPU_X86_64)
+    unsigned v;
+    __asm__ volatile("stmxcsr %0" : "=m"(v));
+    v = (v & ~0x3fu) | keep;
+    __asm__ volatile("ldmxcsr %0" : : "m"(v));
+#elif defined(HL_HOST_CPU_AARCH64)
+    unsigned long f;
+    __asm__ volatile("mrs %0, fpsr" : "=r"(f));
+    f = (f & ~0x9ful) | keep;
+    __asm__ volatile("msr fpsr, %0" : : "r"(f));
+#else
+    fexcept_t f = (fexcept_t)keep;
+    fesetexceptflag(&f, FE_ALL_EXCEPT);
+#endif
+}
+
+// Round to integral in the live mode, contributing NO exception of its own -- the caller raises #I and #P
+// itself, and must be able to raise NEITHER. No rounding primitive here is trustworthy enough to do that
+// unaided: __builtin_rint on x86-64 with no ROUNDSD assumable becomes |x| + 2^52 - 2^52 with the sign
+// reapplied, which rounds the MAGNITUDE (RC=down returned -1 for -1.5); on aarch64 it is FRINTX, which
+// reports #P; and glibc's own trunc/floor resolve to a ROUNDSD that reports #P for an inexact source and
+// #D for a denormal one, neither of which an x86 convert raises. So park the sticky flags across it.
+#define CVT_ROUND(name, ty, sfx)                                                                                       \
+    static ty name(ty x, int trunc) {                                                                                  \
+        unsigned parked = cvt_fp_flags();                                                                              \
+        ty r;                                                                                                          \
+        switch (trunc ? 3 : cvt_host_rc()) {                                                                           \
+        case 1: r = __builtin_floor##sfx(x); break;                                                                    \
+        case 2: r = __builtin_ceil##sfx(x); break;                                                                     \
+        case 3: r = __builtin_trunc##sfx(x); break;                                                                    \
+        default: r = __builtin_roundeven##sfx(x); break;                                                               \
+        }                                                                                                              \
+        cvt_fp_flags_set(parked);                                                                                      \
+        return r;                                                                                                      \
+    }
+CVT_ROUND(cvt_round_d, double, )
+CVT_ROUND(cvt_round_f, float, f)
+
+static void cvt_raise_pe(void) {
+    volatile double a = 1.0, b = 3.0, q = a / b; // 1/3 is inexact in every mode and raises only #P
+    (void)q;
+}
+
+// OR an exact set of exceptions, named by MXCSR bit (SSE_XI..SSE_XP), into the host sticky state. Setting
+// the bits beats synthesising each one with an arithmetic op (cvt_raise_pe's 1/3 above): no operation
+// raises exactly one exception in every case, and on aarch64 no operation raises #D at all.
+#define SSE_XI 0x01u // invalid
+#define SSE_XD 0x02u // denormal operand
+#define SSE_XZ 0x04u // divide by zero
+#define SSE_XO 0x08u // overflow
+#define SSE_XU 0x10u // underflow
+#define SSE_XP 0x20u // precision
+
+static void sse_raise(unsigned mxcsr_bits) {
+    if (!mxcsr_bits) return;
+#if defined(HL_HOST_CPU_AARCH64)
+    static const unsigned to_fpsr[6] = {0, 7, 1, 2, 3, 4}; // IE<-IOC DE<-IDC ZE<-DZC OE<-OFC UE<-UFC PE<-IXC
+    unsigned host = 0;
+    for (unsigned i = 0; i < 6; i++)
+        if (mxcsr_bits & (1u << i)) host |= 1u << to_fpsr[i];
+    cvt_fp_flags_set(cvt_fp_flags() | host);
+#else
+    cvt_fp_flags_set(cvt_fp_flags() | mxcsr_bits);
+#endif
+}
+
+// Guest denormals-are-zero. On an x86-64 host the guest MXCSR IS the host MXCSR, so read DAZ(6) directly;
+// on aarch64 the guest's FTZ|DAZ is carried by FPCR.FZ(24), which ldmxcsr set (see translate.c).
+static int sse_daz_active(void) {
+#if defined(HL_HOST_CPU_AARCH64)
+    unsigned long f;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(f));
+    return (f >> 24) & 1u;
+#elif defined(HL_HOST_CPU_X86_64)
+    return (_mm_getcsr() >> 6) & 1u;
+#else
+    return 0;
+#endif
+}
+
+// A denormal SOURCE, decided on the BIT PATTERN. Any FP comparison would do it in fewer lines and is not
+// available: COMISD/UCOMISD themselves report #D for a denormal operand, so the test would raise the flag
+// it is measuring. Exponent field zero with a nonzero significand; +-0 is not denormal.
+static int sse_is_denorm_f32(uint32_t b) {
+    return (b & 0x7f800000u) == 0 && (b & 0x007fffffu) != 0;
+}
+
+static int sse_is_denorm_f64(uint64_t b) {
+    return (b & UINT64_C(0x7ff0000000000000)) == 0 && (b & UINT64_C(0x000fffffffffffff)) != 0;
+}
+
+// x86 CVT[T]xx2{SI,DQ,PI}, the whole rule, for every convert the C emulator owns. Measured on Zen 4 over
+// the four RC modes and a kit whose out-of-range values include NON-INTEGERS -- the only ones that can
+// tell these three apart, and they exist only for an f64 source with a 32-bit destination:
+//   * out of range AFTER rounding, or NaN -> the integer indefinite and #I ALONE. Not #P, even from an
+//     inexact source; not #D, even from a denormal one. So no host FP op may run on that path.
+//   * in range -> #P iff the rounding changed the value, and nothing else.
+// The rounding itself is exception-free, so both flags are raised explicitly. Everything here used to be
+// absent: the VEX scalar forms raised no MXCSR bit at all on either host.
+// "Is it NaN" and "did the rounding change it" are decided on the BIT PATTERN, not with == : UCOMISD/
+// COMISD report #D for a denormal operand (SDM, and measured), and a convert must not. Bitwise inequality
+// is exactly inexactness here, because round-to-integral keeps the sign of a zero and NaN is already out.
+#define CVT_TO_INT(name, ty, uty, isnan, rnd)                                                                          \
+    static int64_t name(ty x, int trunc, int w64) {                                                                    \
+        ty lim = w64 ? (ty)9223372036854775808.0 : (ty)2147483648.0;                                                   \
+        int64_t indef = w64 ? (int64_t)0x8000000000000000ull : (int64_t)(int32_t)0x80000000u;                          \
+        uty xb, rb;                                                                                                    \
+        memcpy(&xb, &x, sizeof xb);                                                                                    \
+        if (isnan(xb)) {                                                                                               \
+            fma_raise_ie();                                                                                            \
+            return indef;                                                                                              \
+        }                                                                                                              \
+        ty r = rnd(x, trunc);                                                                                          \
+        if (r >= lim || r < -lim) { /* r is integral, never denormal, so these cannot report #D */                     \
+            fma_raise_ie();                                                                                            \
+            return indef;                                                                                              \
+        }                                                                                                              \
+        memcpy(&rb, &r, sizeof rb);                                                                                    \
+        if (rb != xb) cvt_raise_pe();                                                                                  \
+        return (int64_t)r;                                                                                             \
+    }
+CVT_TO_INT(cvt_x86_d2i, double, uint64_t, nan64, cvt_round_d)
+CVT_TO_INT(cvt_x86_f2i, float, uint32_t, nan32, cvt_round_f)
 
 static float avx_fp_arith_f32(int op, float x, float y) {
     switch (op) {
@@ -361,7 +612,81 @@ static int avx_cmp_pred(double x, double y, int pred) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 
+#if !defined(HL_HOST_CPU_AARCH64)
+// Portable single->half for every host CPU that is not AArch64. NOT the F16C intrinsic (_cvtss_sh), which
+// needs -mf16c that this build cannot assume of the host micro-architecture, and not a _Float16 cast,
+// which is round-to-nearest-even whatever the FP environment says. `mode` is the x86 rounding control as
+// ROUND* imm[1:0]: 0=nearest-even, 1=down, 2=up, 3=truncate. A NaN result is QUIET even from a signalling
+// source; overflow gives Infinity only when the mode rounds away from zero.
+// `flags`, when non-NULL, receives the MXCSR bits VCVTPS2PH raises -- measured against native for all six
+// imm encodings over the overflow, underflow and denormal boundaries. Every clause falls out of a value
+// this function already had: #P from round|sticky, #U from "tiny BEFORE rounding, and inexact" (which is
+// exponent < -14, so 65519.996 -> 0x03ff under RM is #U even though it lands on a normal), #O from the
+// same exponent16 >= 0x1f the return below tests (so +65520 under RM, which rounds DOWN to the largest
+// finite, is correctly NOT an overflow), and #I from an SNaN. #D is the CALLER's: it is the one bit both
+// host paths need alike, and the caller already inspects the source for DAZ.
+static uint16_t avx_f32_to_f16_software(float f, unsigned mode, unsigned *flags) {
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    uint32_t sign = bits >> 31;
+    uint32_t biased_exponent = (bits >> 23) & 0xffu;
+    uint32_t mantissa = bits & 0x7fffffu;
+    uint16_t sign16 = (uint16_t)(sign << 15);
+    // Directed modes round by sign alone; the same predicate picks Infinity vs largest-finite on overflow.
+    uint32_t away = ((mode == 1 && sign != 0) || (mode == 2 && sign == 0)) ? 1u : 0u;
+    if (biased_exponent == 0xffu) {
+        if (flags && mantissa != 0 && !(mantissa & 0x400000u)) *flags = SSE_XI; // SNaN
+        return mantissa == 0 ? (uint16_t)(sign16 | 0x7c00u) : (uint16_t)(sign16 | 0x7e00u | (uint16_t)(mantissa >> 13));
+    }
+    if (biased_exponent == 0 && mantissa == 0) return sign16; // +-0 exact, sign preserved
+    // significand * 2^(exponent-23), implicit bit explicit (a binary32 subnormal has none; exponent -126).
+    uint32_t significand = biased_exponent == 0 ? mantissa : (mantissa | 0x800000u);
+    int32_t exponent = (int32_t)(biased_exponent == 0 ? 1u : biased_exponent) - 127;
+    // Bits to drop to reach the half's ulp: 13 normally, more when subnormal (ulp pinned at 2^-24). The
+    // clamp at 25 only avoids UB; a wider shift gives the same round/sticky.
+    int32_t shift = exponent >= -14 ? 13 : -1 - exponent;
+    if (shift > 25) shift = 25;
+    uint32_t half = significand >> shift;
+    uint32_t round_bit = (significand >> (shift - 1)) & 1u;
+    uint32_t sticky = (significand & ((1u << (shift - 1)) - 1u)) != 0 ? 1u : 0u;
+    if (mode == 0)
+        half += round_bit & (sticky | (half & 1u)); // nearest-even: up on >half, or half-to-even
+    else
+        half += away & (round_bit | sticky);
+    if (flags && (round_bit | sticky)) *flags |= SSE_XP | (exponent < -14 ? SSE_XU : 0u);
+    if (exponent < -14) return (uint16_t)(sign16 | half); // subnormal; a carry out lands on 0x0400
+    int32_t exponent16 = exponent + 15;
+    if (half >> 11) { // the increment carried into the next binade
+        half >>= 1;
+        exponent16++;
+    }
+    if (exponent16 >= 0x1f) {
+        if (flags) *flags |= SSE_XO | SSE_XP;
+        return (uint16_t)(sign16 | (away != 0 || mode == 0 ? 0x7c00u : 0x7bffu));
+    }
+    return (uint16_t)(sign16 | ((uint32_t)exponent16 << 10) | (half & 0x3ffu)); // implicit bit 0x400 drops out
+}
+#endif
+
+#if defined(HL_HOST_CPU_X86_64)
+// Live MXCSR.RC in the ROUND*-immediate encoding; defined with sse_round_d.
+static int sse_host_rounding_control(void);
+#endif
+
+// The two host paths reach the same exception set from opposite directions: the aarch64 FCVT raises #I/#U/
+// #O/#P itself and can only miss #D (ARM reports IDC solely when FPCR.FZ flushed an input), while the
+// software converter raises nothing and reports the whole set through its out-param.
 static uint16_t avx_f32_to_f16(float f, int imm) {
+    uint32_t fb;
+    memcpy(&fb, &f, 4);
+    if (sse_is_denorm_f32(fb)) { // DAZ zeroes the source first, making the conversion exact and flagless
+        if (sse_daz_active()) {
+            fb &= 0x80000000u;
+            memcpy(&f, &fb, 4);
+        } else
+            sse_raise(SSE_XD);
+    }
+#if defined(HL_HOST_CPU_AARCH64)
     _Float16 h;
     uint16_t o;
     if (imm & 4) { // imm[2]=1: MXCSR-controlled (current host FPCR mirrors guest MXCSR rounding)
@@ -377,6 +702,28 @@ static uint16_t avx_f32_to_f16(float f, int imm) {
     __asm__ volatile("msr fpcr, %0\n\tisb" ::"r"(fpcr_orig));
     memcpy(&o, &h, 2);
     return o;
+#else
+    // imm[2]=1 asks for the MXCSR-controlled mode; with no host FPCR, use the host FP environment.
+    unsigned mode = (unsigned)(imm & 3);
+    if (imm & 4) {
+#if defined(HL_HOST_CPU_X86_64)
+        // NOT fegetround(): glibc's x86-64 fegetround reads the **x87** control word, not the guest's
+        // MXCSR (written by LDMXCSR, not FLDCW). MXCSR.RC already uses this encoding.
+        mode = (unsigned)sse_host_rounding_control();
+#else
+        switch (fegetround()) {
+        case FE_DOWNWARD: mode = 1; break;
+        case FE_UPWARD: mode = 2; break;
+        case FE_TOWARDZERO: mode = 3; break;
+        default: mode = 0; break;
+        }
+#endif
+    }
+    unsigned flags = 0;
+    uint16_t o = avx_f32_to_f16_software(f, mode, &flags);
+    sse_raise(flags);
+    return o;
+#endif
 }
 
 static float avx_f16_to_f32(uint16_t bits) {
@@ -387,8 +734,8 @@ static float avx_f16_to_f32(uint16_t bits) {
 
 #pragma GCC diagnostic pop
 
-static double sse_round_d(double x, int mode, int use_mxcsr);
-static float sse_round_f(float x, int mode, int use_mxcsr);
+static double sse_round_d(double x, int imm); // imm = the ROUND* imm8 (mode, MXCSR-select, #P suppress)
+static float sse_round_f(float x, int imm);
 
 // AES round primitives (defined with the legacy do_sse3b block below) reused by the VEX AES forms.
 static const uint8_t k_aes_sbox[256];
@@ -398,7 +745,26 @@ static void aes_shiftrows(const uint8_t in[16], uint8_t out[16], int inv);
 static void aes_mixcolumns(uint8_t s[16], int inv);
 static inline int sat_s16(int v);
 
+static void do_avx(const hl_x86_avx_state *state, struct cpu *c);
+static void do_sse3b(const hl_x86_avx_state *state, struct cpu *c);
+
+// Arm the abandon pad, then emulate. A rejected guest access longjmps back here with *c already carrying
+// R_SOFTMISS (or R_TRAP for #UD) and cpu->rip left on the instruction.
 void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
+    g_avx_cpu = c;
+    g_avx_pc = c->rip;
+    if (setjmp(g_avx_pad) != 0) return;
+    do_avx(state, c);
+}
+
+void hl_x86_sse_run(const hl_x86_avx_state *state, struct cpu *c) {
+    g_avx_cpu = c;
+    g_avx_pc = c->rip;
+    if (setjmp(g_avx_pad) != 0) return;
+    do_sse3b(state, c);
+}
+
+static void do_avx(const hl_x86_avx_state *state, struct cpu *c) {
     struct insn I;
     hl_x86_decode(c->rip, &I);
     uint64_t next = c->rip + (uint64_t)I.len;
@@ -751,31 +1117,17 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
         {
             int dbl = (pp == 3), es = dbl ? 8 : 4, trunc = (op == 0x2C), w64 = I.vex_w;
             avx_get_rm(state, c, &I, next, es, b);
-            // x86 float->int yields the "integer indefinite" (INT_MIN bit pattern) on NaN, infinity, or an
-            // out-of-range value; a raw C cast is undefined there (the legacy SSE path applies the same fixup,
-            // translate.c 0x2C/0x2D). Round in the float domain (0x2D honors MXCSR via the host FPCR rounding
-            // mode; 0x2C truncates toward zero), then range-check before narrowing.
-            int64_t res = 0;
-            int indef;
+            int64_t res;
             if (dbl) {
                 double x;
                 memcpy(&x, b, 8);
-                double r = trunc ? __builtin_trunc(x) : __builtin_rint(x);
-                indef = isnan(x) || (w64 ? (r >= 9223372036854775808.0 || r < -9223372036854775808.0)
-                                         : (r >= 2147483648.0 || r < -2147483648.0));
-                if (!indef) res = (int64_t)r;
+                res = cvt_x86_d2i(x, trunc, w64);
             } else {
                 float x;
                 memcpy(&x, b, 4);
-                float r = trunc ? __builtin_truncf(x) : __builtin_rintf(x);
-                indef = isnan(x) || (w64 ? (r >= 9223372036854775808.0f || r < -9223372036854775808.0f)
-                                         : (r >= 2147483648.0f || r < -2147483648.0f));
-                if (!indef) res = (int64_t)r;
+                res = cvt_x86_f2i(x, trunc, w64);
             }
-            if (indef)
-                c->r[rd] = w64 ? 0x8000000000000000ull : 0x80000000ull;
-            else
-                c->r[rd] = w64 ? (uint64_t)res : (uint32_t)res; // 32-bit dst zero-extends
+            c->r[rd] = w64 ? (uint64_t)res : (uint32_t)res; // 32-bit dst zero-extends
             goto done;
         }
         case 0x5A: {       // vcvtss2sd/sd2ss (scalar) or vcvtps2pd/pd2ps (packed) per pp
@@ -906,9 +1258,25 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             goto done;
         }
         case 0x52:   // vrsqrtps(NP)/ss(F3): approximate reciprocal square root
-        case 0x53: { // vrcpps(NP)/ss(F3): approximate reciprocal. Modeled at full float precision to
-            // match the reference x86 oracle (qemu) and the native-aarch64 golden, both of which use the
-            // full-precision 1/x rather than the hardware's ~12-bit table.
+        case 0x53: { // vrcpps(NP)/ss(F3): approximate reciprocal.
+            // VALUE: the EXACT reciprocal, not the hardware estimate -- the same choice the legacy 0F 52/53
+            // lowering makes (translate.c), decided once for both encodings. The SDM specifies only a bound,
+            // |relerr| <= 1.5*2^-12, never a value, and the exact result satisfies it with error 0. There is
+            // no single hardware answer to copy: the 12-bit table is microarchitecture-specific (unlike
+            // VRCP14PS, which IS defined), so "match hardware" means "match one vendor's ROM" and a guest
+            // that depends on the raw bits already breaks when moved between native x86 parts. Measured on
+            // this host (Zen 4, legacy and VEX bit-identical): rcpps worst relative error 2^-11.63,
+            // rsqrtps 2^-11.92, both inside the bound. On the aarch64 host there is no cheap conforming
+            // approximation either -- FRECPE is an 8-bit estimate, outside the x86 bound, so it would need a
+            // Newton step anyway, at which point exact is simpler and strictly closer.
+            // FLAGS: these raise NO SIMD floating-point exception whatsoever -- measured against native for
+            // a denormal source, an overflow, a zero, a negative and both NaN classes -- but the 1.0f/x
+            // standing in for the table is a real division and reports #D, #O, #P and (under DAZ) #Z. Park
+            // the sticky flags across the whole loop; the result is untouched.
+            // NaN: avx_dnan_f32 applies x86's rules host-independently -- a NaN input propagates quieted
+            // (7f800001 -> 7fc00001), and rsqrt of a negative yields x86's NEGATIVE indefinite ffc00000,
+            // where a bare ARM FSQRT would produce 7fc00000.
+            unsigned parked = cvt_fp_flags();
             int rsqrt = (op == 0x52), scalar = (pp == 2);
             avx_get_rm(state, c, &I, next, scalar ? 4 : W, b);
             if (scalar) {
@@ -916,18 +1284,19 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                 memcpy(d, a, 16);
                 float x;
                 memcpy(&x, b, 4);
-                float y = rsqrt ? 1.0f / __builtin_sqrtf(x) : 1.0f / x;
+                float y = avx_dnan_f32(rsqrt ? 1.0f / __builtin_sqrtf(x) : 1.0f / x, x, x);
                 memcpy(d, &y, 4);
                 avx_put(c, rd, d, 16);
             } else {
                 for (int i = 0; i < W; i += 4) {
                     float x;
                     memcpy(&x, b + i, 4);
-                    float y = rsqrt ? 1.0f / __builtin_sqrtf(x) : 1.0f / x;
+                    float y = avx_dnan_f32(rsqrt ? 1.0f / __builtin_sqrtf(x) : 1.0f / x, x, x);
                     memcpy(d + i, &y, 4);
                 }
                 avx_put(c, rd, d, W);
             }
+            cvt_fp_flags_set(parked);
             goto done;
         }
         // logical: dst = src1 OP src2  (src1=vvvv, src2=rm). byte-wise over W.
@@ -997,8 +1366,7 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                         for (int i = 0; i < 4; i++)
                             o[i] =
                                 (i & 1) ? avx_dnan_f32(x[i] + y[i], x[i], y[i]) : avx_dnan_f32(x[i] - y[i], x[i], y[i]);
-                    } else { // hadd/hsub (the NaN selection rule is commutative, so the addend order of
-                             // HADD -- SDM: SRC[63:32]+SRC[31:0] -- is not observable)
+                    } else { // hadd/hsub pair EVEN-lane-first (measured: the even lane is the NaN src1)
                         o[0] = sub ? avx_dnan_f32(x[0] - x[1], x[0], x[1]) : avx_dnan_f32(x[0] + x[1], x[0], x[1]);
                         o[1] = sub ? avx_dnan_f32(x[2] - x[3], x[2], x[3]) : avx_dnan_f32(x[2] + x[3], x[2], x[3]);
                         o[2] = sub ? avx_dnan_f32(y[0] - y[1], y[0], y[1]) : avx_dnan_f32(y[0] + y[1], y[0], y[1]);
@@ -1345,15 +1713,10 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                     memcpy(&v, b + i, 4);
                     float f = (float)v;
                     memcpy(d + i, &f, 4);
-                } else { // cvtps2dq(66, round)/cvttps2dq(F3, truncate) -> int32; x86 indefinite on overflow/NaN
+                } else { // cvtps2dq(66, round)/cvttps2dq(F3, truncate) -> int32
                     float f;
                     memcpy(&f, b + i, 4);
-                    int32_t r;
-                    if (!(f == f) || f >= 2147483648.0f || f < -2147483648.0f)
-                        r = (int32_t)0x80000000; // integer indefinite
-                    else
-                        r = (int32_t)(pp == 2 ? __builtin_truncf(f)
-                                              : __builtin_rintf(f)); // F3(pp==2)=truncate, 66(pp==1)=round
+                    int32_t r = (int32_t)cvt_x86_f2i(f, pp == 2, 0); // F3(pp==2)=truncate, 66(pp==1)=round
                     memcpy(d + i, &r, 4);
                 }
             }
@@ -1377,11 +1740,7 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                 for (int i = 0; i < n; i++) {
                     double f;
                     memcpy(&f, b + 8 * i, 8);
-                    int32_t r;
-                    if (!(f == f) || f >= 2147483648.0 || f < -2147483648.0)
-                        r = (int32_t)0x80000000; // integer indefinite
-                    else
-                        r = (int32_t)(pp == 1 ? __builtin_trunc(f) : __builtin_rint(f));
+                    int32_t r = (int32_t)cvt_x86_d2i(f, pp == 1, 0); // 66(pp==1)=truncate, F2(pp==3)=round
                     memcpy(d + 4 * i, &r, 4);
                 }
                 avx_put(c, rd, d, W / 2);
@@ -1868,11 +2227,26 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
         case 0x92:   // vgatherd{ps,pd}: 32-bit indices (same addressing; element bits are float)
         case 0x91:   // vpgatherq{d,q}: 64-bit (qword) indices
         case 0x93: { // vgatherq{ps,pd}: 64-bit indices
-            // AVX2 masked gather. VSIB: index is a VECTOR register (I.m_index) scaled by 1<<m_scale off a
-            // GPR base+disp. Mask = VEX.vvvv; per element the top bit selects "load", and the WHOLE mask
-            // register is zeroed afterwards (Intel SDM). elem = dst element size (W0=dword, W1=qword).
+            // AVX2 masked gather. VSIB: the index is a VECTOR register (I.m_index) scaled by 1<<m_scale off
+            // a GPR base+disp; the mask is VEX.vvvv, one element per destination element, tested on its top
+            // bit. elem = destination element size (W0=dword, W1=qword), isz = index element size.
+            //
+            // THE ADDRESS IS GUEST DATA: base + (int)index_element * scale spans the whole 64-bit space
+            // whatever the base register holds, so every element goes through the fault bracket above.
+            //
+            // RESTARTABILITY is what the mask semantics exist for, and it is exact here (measured on
+            // silicon: a gather whose 3rd element hits a guard page faults ONCE, and after the handler maps
+            // the page the completed elements are NOT re-gathered while the remaining ones read the page's
+            // new contents). So: clear each mask element as its element COMPLETES, and on a fault commit the
+            // partial destination and the partially cleared mask before abandoning -- rip is left on the
+            // instruction, so the retry gathers exactly the elements whose mask bit survived. The whole
+            // mask register is cleared only on full completion.
+            if (I.evex) goto avx_unimpl; // EVEX gathers mask on k1, not vvvv; emulating them as VEX is wrong
+            // #UD if any two of destination, index and mask are the same register (SDM); measured: SIGILL,
+            // ILL_ILLOPN. `c4 e2 78 91 04 8b` -- dest == mask == xmm0 -- is this case, not a memory fault.
+            if (rd == I.m_index || rd == vv || vv == I.m_index) avx_undefined();
             int elem = I.vex_w ? 8 : 4;
-            int isz = (op == 0x90 || op == 0x92) ? 4 : 8; // index element size
+            int isz = (op == 0x90 || op == 0x92) ? 4 : 8;
             int nlanes = (isz == 4) ? (W / elem) : (W / 8);
             int result_bytes = nlanes * elem;
             uint8_t idxv[64], mask[64];
@@ -1898,13 +2272,20 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                         memcpy(&index, idxv + i * 8, 8);
                     }
                     uint64_t addr = hl_x86_avx_address(state, base + (uint64_t)(index * scale));
-                    (void)avx_memory_read(state, addr, d + i * elem, (size_t)elem);
+                    if (!avx_try_read(state, addr, d + i * elem, (size_t)elem)) {
+                        // Suspended, not abandoned: elements < i are done and must survive. 64-byte writes,
+                        // so nothing this instruction has not touched moves (no upper-zeroing on a fault).
+                        avx_put(c, rd, d, 64);
+                        avx_put(c, vv, mask, 64);
+                        avx_abandon(addr, (uint64_t)elem, X86_SOFT_READ);
+                    }
                 }
+                memset(mask + i * elem, 0, (size_t)elem); // this element is complete
             }
             avx_put(c, rd, d, result_bytes); // dst above the result width is zeroed
             uint8_t zero[64];
             memset(zero, 0, 64);
-            avx_put(c, vv, zero, W); // the entire mask register is cleared after the gather
+            avx_put(c, vv, zero, W); // the entire mask register is cleared after a completed gather
             goto done;
         }
         case 0x2B: { // vpackusdw: signed dword -> unsigned word, saturate (per-128-lane; a low, b high)
@@ -1989,14 +2370,14 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                     memcpy(&x, m1 + i, 8);
                     memcpy(&y, m2 + i, 8);
                     memcpy(&z, ad + i, 8);
-                    double res = fma_dnan_f64(__builtin_fma(x, y, sub ? -z : z), x, y, z);
+                    double res = fma_x86_f64(x, y, z, 0, sub);
                     memcpy(d + i, &res, 8);
                 } else {
                     float x, y, z;
                     memcpy(&x, m1 + i, 4);
                     memcpy(&y, m2 + i, 4);
                     memcpy(&z, ad + i, 4);
-                    float res = fma_dnan_f32(__builtin_fmaf(x, y, sub ? -z : z), x, y, z);
+                    float res = fma_x86_f32(x, y, z, 0, sub);
                     memcpy(d + i, &res, 4);
                 }
             }
@@ -2032,8 +2413,8 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
             int scalar = op & 1;
             int dbl = I.vex_w;
             int es = dbl ? 8 : 4;
-            int sneg_mul = (base == 0x0C || base == 0x0E) ? -1 : 1;
-            int sneg_add = (base == 0x0A || base == 0x0E) ? -1 : 1;
+            int nmul = (base == 0x0C || base == 0x0E); // fnmadd/fnmsub negate the product
+            int nadd = (base == 0x0A || base == 0x0E); // fmsub/fnmsub negate the addend
             uint8_t dst[64];
             avx_get(c, rd, dst);
             avx_get(c, vv, a);
@@ -2050,14 +2431,14 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
                     memcpy(&x, m1 + i, 8);
                     memcpy(&y, m2 + i, 8);
                     memcpy(&z, ad + i, 8);
-                    double res = fma_dnan_f64(__builtin_fma(sneg_mul * x, y, sneg_add * z), x, y, z);
+                    double res = fma_x86_f64(x, y, z, nmul, nadd);
                     memcpy(d + i, &res, 8);
                 } else {
                     float x, y, z;
                     memcpy(&x, m1 + i, 4);
                     memcpy(&y, m2 + i, 4);
                     memcpy(&z, ad + i, 4);
-                    float res = fma_dnan_f32(__builtin_fmaf((float)sneg_mul * x, y, (float)sneg_add * z), x, y, z);
+                    float res = fma_x86_f32(x, y, z, nmul, nadd);
                     memcpy(d + i, &res, 4);
                 }
             }
@@ -2090,18 +2471,17 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
         case 0x08:   // vroundps
         case 0x09: { // vroundpd -- single source (rm), imm[3:0] rounding control
             avx_get_rm(state, c, &I, next, W, b);
-            int use = (imm & 4) != 0, mode = imm & 3;
             if (op == 0x08) {
                 float a4[8], o[8];
                 memcpy(a4, b, (size_t)W);
                 for (int i = 0; i < W / 4; i++)
-                    o[i] = sse_round_f(a4[i], mode, use);
+                    o[i] = sse_round_f(a4[i], imm);
                 memcpy(d, o, (size_t)W);
             } else {
                 double a2[4], o[4];
                 memcpy(a2, b, (size_t)W);
                 for (int i = 0; i < W / 8; i++)
-                    o[i] = sse_round_d(a2[i], mode, use);
+                    o[i] = sse_round_d(a2[i], imm);
                 memcpy(d, o, (size_t)W);
             }
             avx_put(c, rd, d, W);
@@ -2109,19 +2489,18 @@ void hl_x86_avx_run(const hl_x86_avx_state *state, struct cpu *c) {
         }
         case 0x0A:   // vroundss: low dword = round(rm low), rest of low-128 from src1(vvvv)
         case 0x0B: { // vroundsd: low qword = round(rm low)
-            int use = (imm & 4) != 0, mode = imm & 3;
             avx_get(c, vv, a);
             avx_get_rm(state, c, &I, next, op == 0x0A ? 4 : 8, b);
             memcpy(d, a, 16);
             if (op == 0x0A) {
                 float x;
                 memcpy(&x, b, 4);
-                float y = sse_round_f(x, mode, use);
+                float y = sse_round_f(x, imm);
                 memcpy(d, &y, 4);
             } else {
                 double x;
                 memcpy(&x, b, 8);
-                double y = sse_round_d(x, mode, use);
+                double y = sse_round_d(x, imm);
                 memcpy(d, &y, 8);
             }
             avx_put(c, rd, d, 16);
@@ -2528,24 +2907,106 @@ static uint32_t crc32c_step(uint32_t crc, uint64_t v, int nbytes) {
 // it here (fixes the "treated as nearest" gap). The explicit modes 0..3 must instead force that specific
 // direction regardless of MXCSR: floor/ceil/trunc already do, and explicit nearest is round-to-nearest-
 // EVEN independent of the current mode (__builtin_roundeven), not __builtin_rint (which would follow RC).
-static double sse_round_d(double x, int mode, int use_mxcsr) {
-    if (use_mxcsr) return __builtin_rint(x); // honor MXCSR.RC (mirrored into host FPCR by ldmxcsr)
-    switch (mode & 3) {
-    case 1: return __builtin_floor(x);
-    case 2: return __builtin_ceil(x);
-    case 3: return __builtin_trunc(x);
-    default: return __builtin_roundeven(x); // explicit round-to-nearest-even
+//
+// __builtin_rint cannot serve that on an x86-64 host, and fails silently: with no ROUNDSD available
+// (-msse4.1 is not assumable) gcc inlines `|x| + 2^52 - 2^52` with the sign re-applied, rounding the
+// MAGNITUDE -- valid only under round-to-nearest, i.e. not the mode LDMXCSR just set. So resolve MXCSR.RC
+// (bit-for-bit the ROUND* imm[1:0] encoding) instead. AArch64 keeps the builtin; it lowers to FRINTX.
+#if defined(HL_HOST_CPU_X86_64)
+static int sse_host_rounding_control(void) {
+    return (int)((_mm_getcsr() >> 13) & 3u); // MXCSR bits 14:13 = RC
+}
+#endif
+
+// ROUND* raises a SMALLER set than any rounding primitive available here, so the whole step runs with the
+// sticky flags parked and the caller's set is raised explicitly. Measured on Zen 4, all imm encodings:
+//   #P iff the result differs from the source, and imm[3] (the suppress-precision bit) is clear;
+//   #I iff the source is an SNaN, which the result also QUIETS (imm[3] suppresses neither);
+//   NOTHING else -- notably NEVER #D, which is what glibc's trunc/floor add via ROUNDSD (roundps of a
+//   denormal reported 22 here against native's 20).
+// Difference is decided on the BIT PATTERN: an FP compare of the two is a COMISD, which raises #D for a
+// denormal operand, and the sign of a zero must count (trunc(-0.4) = -0.0 is inexact). DAZ has to be
+// applied by hand for the same reason -- the hardware zeroes a denormal source before ROUND* runs, making
+// it exact, but a bit-pattern comparison against the UNzeroed source would call it inexact.
+static double sse_round_d(double x, int imm) {
+    unsigned parked = cvt_fp_flags(), raise = 0;
+    uint64_t xb;
+    memcpy(&xb, &x, 8);
+    if (sse_daz_active() && sse_is_denorm_f64(xb)) { // DAZ: the source reads as a zero of the same sign
+        xb &= UINT64_C(0x8000000000000000);
+        memcpy(&x, &xb, 8);
     }
+    int mode = imm & 3, use_mxcsr = (imm & 4) != 0;
+#if defined(HL_HOST_CPU_X86_64)
+    if (use_mxcsr) {
+        mode = sse_host_rounding_control();
+        use_mxcsr = 0;
+    }
+#endif
+    double r;
+    if (use_mxcsr)
+        r = __builtin_rint(x); // honor MXCSR.RC (mirrored into host FPCR by ldmxcsr)
+    else
+        switch (mode) {
+        case 1: r = __builtin_floor(x); break;
+        case 2: r = __builtin_ceil(x); break;
+        case 3: r = __builtin_trunc(x); break;
+        default: r = __builtin_roundeven(x); break; // explicit round-to-nearest-even
+        }
+    uint64_t rb;
+    memcpy(&rb, &r, 8);
+    if ((xb & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000) &&
+        (xb & UINT64_C(0x000fffffffffffff)) != 0) { // NaN
+        if (!(xb & UINT64_C(0x0008000000000000))) { // signalling
+            raise = SSE_XI;
+            rb = xb | UINT64_C(0x0008000000000000); // x86 returns it QUIET; glibc trunc/floor do not
+            memcpy(&r, &rb, 8);
+        }
+    } else if (rb != xb && !(imm & 8))
+        raise = SSE_XP;
+    cvt_fp_flags_set(parked);
+    sse_raise(raise);
+    return r;
 }
 
-static float sse_round_f(float x, int mode, int use_mxcsr) {
-    if (use_mxcsr) return __builtin_rintf(x);
-    switch (mode & 3) {
-    case 1: return __builtin_floorf(x);
-    case 2: return __builtin_ceilf(x);
-    case 3: return __builtin_truncf(x);
-    default: return __builtin_roundevenf(x);
+static float sse_round_f(float x, int imm) {
+    unsigned parked = cvt_fp_flags(), raise = 0;
+    uint32_t xb;
+    memcpy(&xb, &x, 4);
+    if (sse_daz_active() && sse_is_denorm_f32(xb)) {
+        xb &= 0x80000000u;
+        memcpy(&x, &xb, 4);
     }
+    int mode = imm & 3, use_mxcsr = (imm & 4) != 0;
+#if defined(HL_HOST_CPU_X86_64)
+    if (use_mxcsr) {
+        mode = sse_host_rounding_control();
+        use_mxcsr = 0;
+    }
+#endif
+    float r;
+    if (use_mxcsr)
+        r = __builtin_rintf(x);
+    else
+        switch (mode) {
+        case 1: r = __builtin_floorf(x); break;
+        case 2: r = __builtin_ceilf(x); break;
+        case 3: r = __builtin_truncf(x); break;
+        default: r = __builtin_roundevenf(x); break;
+        }
+    uint32_t rb;
+    memcpy(&rb, &r, 4);
+    if ((xb & 0x7f800000u) == 0x7f800000u && (xb & 0x007fffffu) != 0) {
+        if (!(xb & 0x00400000u)) {
+            raise = SSE_XI;
+            rb = xb | 0x00400000u;
+            memcpy(&r, &rb, 4);
+        }
+    } else if (rb != xb && !(imm & 8))
+        raise = SSE_XP;
+    cvt_fp_flags_set(parked);
+    sse_raise(raise);
+    return r;
 }
 
 static inline int sat_s16(int v) {
@@ -2697,7 +3158,7 @@ static void sse42_mask(struct cpu *c, int res, int imm, int n) {
     memcpy(&c->v[0], out, 16); // XMM0 == c->v[0..1]; legacy SSE leaves the upper YMM bits intact
 }
 
-void hl_x86_sse_run(const hl_x86_avx_state *state, struct cpu *c) {
+static void do_sse3b(const hl_x86_avx_state *state, struct cpu *c) {
     struct insn I;
     hl_x86_decode(c->rip, &I);
     uint64_t next = c->rip + (uint64_t)I.len;
@@ -2741,10 +3202,10 @@ void hl_x86_sse_run(const hl_x86_avx_state *state, struct cpu *c) {
     // ---- Legacy (non-VEX) SSE3 horizontal / addsub FP (0F 7C haddp*, 0F 7D hsubp*, 0F D0 addsubp*) ------
     // Same NaN-INPUT gate as the vertical arithmetic above: the JIT inlines these as NEON UZP+FADD/FSUB
     // (translate.c), which selects the ARM way (SNaN-priority, else src1) when a result lane has two NaN
-    // inputs, where x86 wants QNaN(first-operand)-priority, else the second operand. translate.c exits here
-    // whenever any checked input lane is a NaN. Note HADD's first addend is the ODD lane of the pair (SDM:
-    // DEST[63:0] <- SRC1[127:64] + SRC1[63:0]); HSUB's is the even one. Commutative for values, NOT for NaN
-    // selection. 66 -> double lanes, F2 -> single. Legacy SSE preserves the upper YMM bits -> write only D.
+    // inputs, where x86 takes src1 unconditionally. translate.c exits here whenever any checked input lane
+    // is a NaN. Both HADD and HSUB take the EVEN lane of the pair as src1 (measured on Zen 4 -- and the
+    // order IS observable, since the x86 rule is not commutative). 66 -> double lanes, F2 -> single.
+    // Legacy SSE preserves the upper YMM bits -> write only D.
     if (I.two && map == 0 && (op == 0x7C || op == 0x7D || op == 0xD0)) {
         int dbl = I.p66 != 0;
         int sub = (op == 0x7D);
@@ -2792,6 +3253,8 @@ void hl_x86_sse_run(const hl_x86_avx_state *state, struct cpu *c) {
                 uint64_t a = avx_ea(state, c, &I, next, nb);
                 v = 0;
                 (void)avx_memory_read(state, a, &v, (size_t)nb);
+            } else if (nb == 1 && !I.has_rex && I.rm_reg >= 4 && I.rm_reg <= 7) {
+                v = (c->r[I.rm_reg - 4] >> 8) & 0xff; // no REX: r/m8 4..7 is AH/CH/DH/BH, not SPL/BPL/SIL/DIL
             } else {
                 v = c->r[I.rm_reg];
             }
@@ -3393,30 +3856,28 @@ void hl_x86_sse_run(const hl_x86_avx_state *state, struct cpu *c) {
         case 0x08:
         case 0x09:
         case 0x0A:
-        case 0x0B: { // roundps/pd/ss/sd, mode in imm[3:0]; bit2 set = use MXCSR.RC (current host FPCR)
-            int use_mxcsr = (imm & 4) != 0;
-            int mode = imm & 3;
+        case 0x0B: {          // roundps/pd/ss/sd, mode in imm[3:0]; bit2 set = use MXCSR.RC (current host FPCR)
             if (op == 0x08) { // roundps
                 float a[4], o[4];
                 memcpy(a, s, 16);
                 for (int i = 0; i < 4; i++)
-                    o[i] = sse_round_f(a[i], mode, use_mxcsr);
+                    o[i] = sse_round_f(a[i], imm);
                 memcpy(r, o, 16);
             } else if (op == 0x09) { // roundpd
                 double a[2], o[2];
                 memcpy(a, s, 16);
                 for (int i = 0; i < 2; i++)
-                    o[i] = sse_round_d(a[i], mode, use_mxcsr);
+                    o[i] = sse_round_d(a[i], imm);
                 memcpy(r, o, 16);
             } else if (op == 0x0A) { // roundss: low lane from src, rest from dst
                 float a;
                 memcpy(&a, s, 4);
-                a = sse_round_f(a, mode, use_mxcsr);
+                a = sse_round_f(a, imm);
                 memcpy(r, &a, 4);
             } else { // roundsd
                 double a;
                 memcpy(&a, s, 8);
-                a = sse_round_d(a, mode, use_mxcsr);
+                a = sse_round_d(a, imm);
                 memcpy(r, &a, 8);
             }
             break;

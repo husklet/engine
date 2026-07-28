@@ -7,7 +7,7 @@
 #
 # The flavors the Makefile builds on a Linux host:
 #   build/linux-production/hl-engine-linux-{aarch64,x86_64}  <- native Linux
-#   build/package/linux-aarch64/libhl-engine.a              <- dual embedded
+#   build/package/linux-<host arch>/libhl-engine.a           <- dual embedded
 #   (the two build/production/* mac engines + mac dual .a are Phase 4)
 #
 # Key Makefile subtleties reproduced here:
@@ -61,6 +61,175 @@ function(hl_object name src)
     set_source_files_properties(${src} PROPERTIES OBJECT_DEPENDS "${_HL_UNITY_DEPS}")
   endif()
 endfunction()
+
+# ---- Windows: unity-TU compile probe --------------------------------------
+# The production engine is not a Windows artifact yet -- there is no Windows
+# `hl_run_linux_guest` and no host archive that could satisfy its link. What
+# this arm buys is the ONLY thing that can measure the remaining port surface:
+# an OBJECT library over the same unity TU, with the same minimal flag set the
+# Linux engine uses, so `ninja -k 0` enumerates every missing header and symbol
+# in one pass instead of a survey guessing at them.
+#
+# Deliberately compile-only (no executable, no archive, no link) so a failure
+# here is a compiler diagnostic about a specific line and never a link error
+# with no provenance. Removed once the TU compiles and a real Windows engine
+# target replaces it.
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  hl_object(win_unity_probe_x86_64 src/core/target/x86_64.c
+            FLAGS -D_GNU_SOURCE -O2 UNITY)
+  set_target_properties(win_unity_probe_x86_64 PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+  # ---- the x86-64 Windows production engine -------------------------------
+  # Same composition as the Linux arm below -- unity target TU + lifecycle core
+  # + the six separately compiled provider TUs -- against the Windows host
+  # archive.  It is EXCLUDE_FROM_ALL for exactly as long as the probe above is
+  # non-empty: a `ninja` with no arguments must not start failing for everyone
+  # while the unity TU is still acquiring its host seams.  Ask for it by name.
+  #
+  # The aarch64 guest engine is deliberately absent.  Its unity TU has had no
+  # measurement on this host at all, and a target that has never been compiled
+  # is a claim, not a build product.
+  #
+  # -lpthread is winpthreads, the mingw-w64 pthread implementation, and it is
+  # NOT linked by default on this toolchain -- measured: the link fails on
+  # pthread_key_create/pthread_once/sched_yield without it. -lm is in the
+  # default runtime and is not repeated.
+  set(_win_prov environment provider/client provider/demux provider/files
+                provider/handles provider/namespace)
+  set(_win_prov_objs "")
+  foreach(p ${_win_prov})
+    string(REPLACE "/" "_" tn "win_prov_${p}")
+    hl_object(${tn} src/core/${p}.c FLAGS -D_GNU_SOURCE -O2)
+    set_target_properties(${tn} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    list(APPEND _win_prov_objs $<TARGET_OBJECTS:${tn}>)
+  endforeach()
+
+  hl_object(win_target_x86_64 src/core/target/x86_64.c
+            FLAGS -D_GNU_SOURCE -O2 UNITY)
+  # lifecycle-core: no -D_GNU_SOURCE, matching every other host's lane.
+  hl_object(win_life_x86_64 src/core/lifecycle.c
+            FLAGS -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2)
+  set_target_properties(win_target_x86_64 win_life_x86_64 PROPERTIES
+    EXCLUDE_FROM_ALL TRUE)
+
+  add_executable(hl-engine-windows-x86_64
+    $<TARGET_OBJECTS:win_target_x86_64>
+    $<TARGET_OBJECTS:win_life_x86_64>
+    ${_win_prov_objs})
+  # The engine archives are mutually recursive. Under the mingw-w64 toolchain
+  # this is the GNU-style clang driver over ld.lld, which makes a single pass
+  # and needs the explicit group, exactly as the Linux runner link does. Under
+  # the MSVC-ABI toolchain the linker rescans on its own and REJECTS the feature
+  # at configure time, and there is no winpthreads to link either.
+  # HL_LINK_GROUP_RESCAN in CMakeLists.txt is that decision.
+  if(HL_LINK_GROUP_RESCAN)
+    target_link_libraries(hl-engine-windows-x86_64 PRIVATE
+      "$<LINK_GROUP:RESCAN,hl-engine,hl-translator,hl-linux-abi,hl-host-windows>"
+      pthread)
+  else()
+    target_link_libraries(hl-engine-windows-x86_64 PRIVATE
+      hl-engine hl-translator hl-linux-abi hl-host-windows)
+  endif()
+  set_target_properties(hl-engine-windows-x86_64 PROPERTIES
+    EXCLUDE_FROM_ALL TRUE
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/windows-production)
+
+  # ---- tier-0 probe --------------------------------------------------------
+  # The engine above starts the guest in a CHILD process, and this host's spawn
+  # cannot yet carry the entry context to a cold child. The probe runs the same
+  # guest entry IN PROCESS, so the loader/translator/syscall half can be measured
+  # while the process half is built. Its own target TU object, because the target
+  # root defines main() and the probe supplies its own.
+  #
+  # A measurement tool, not a product: it is EXCLUDE_FROM_ALL and lands beside
+  # the engine rather than in bin/, and tools/windows/tier0_probe.c says why it
+  # must not be mistaken for one.
+  hl_object(win_target_x86_64_nomain src/core/target/x86_64.c
+            FLAGS -D_GNU_SOURCE -DHL_ENGINE_NO_MAIN=1 -O2 UNITY)
+  set_target_properties(win_target_x86_64_nomain PROPERTIES EXCLUDE_FROM_ALL TRUE)
+  add_executable(hl-tier0-probe-x86_64
+    tools/windows/tier0_probe.c
+    $<TARGET_OBJECTS:win_target_x86_64_nomain>
+    $<TARGET_OBJECTS:win_life_x86_64>
+    ${_win_prov_objs})
+  if(HL_LINK_GROUP_RESCAN)
+    target_link_libraries(hl-tier0-probe-x86_64 PRIVATE hl_cpp_flags
+      "$<LINK_GROUP:RESCAN,hl-engine,hl-translator,hl-linux-abi,hl-host-windows>"
+      pthread)
+  else()
+    target_link_libraries(hl-tier0-probe-x86_64 PRIVATE hl_cpp_flags
+      hl-engine hl-translator hl-linux-abi hl-host-windows)
+  endif()
+  set_target_properties(hl-tier0-probe-x86_64 PROPERTIES
+    EXCLUDE_FROM_ALL TRUE
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/windows-production)
+
+  # ---- the Rust crate's embedded archive ----------------------------------
+  # ${HL_PACKAGE_ARCH_DIR}/hl-engine.lib -- the Windows counterpart of the Linux
+  # dual archive below and of the Darwin one in Phase4Mac.cmake. It is what
+  # pkgs/rust/build.rs links, and it is the reason the MSVC-ABI toolchain exists:
+  # rustup's default host triple here is x86_64-pc-windows-msvc, and a
+  # mingw-w64 archive cannot be linked into that ABI.
+  #
+  # MSVC-ABI ONLY. Under the mingw-w64 toolchain this target is not defined at
+  # all, because an archive built there would satisfy no rustc on a stock
+  # Windows machine, and offering one would invite it to be published.
+  #
+  # SINGLE guest ISA, unlike the Linux and Darwin archives, which carry both and
+  # dispatch through src/core/target/dual.c. The x86-64 guest is the one this
+  # host has been measured on; the aarch64 unity TU has not been compiled here
+  # at all, and dual.c's dispatch would pull in an hl_aarch64_run_linux_guest
+  # that nothing defines. Adding the second ISA is additive and needs no change
+  # to this shape.
+  #
+  # COMPLETE. src/core/activation.c is listed explicitly below rather than
+  # through CORE_SOURCES because it is not a core source on any host: the Linux
+  # and Darwin lanes each compile it into their own OBJECT library (dual_activation,
+  # macdual_activation) so it lands in the production archive and nowhere else,
+  # and this is the Windows counterpart of that. It carries the nine
+  # hl_activation_* entry points pkgs/rust/src/ffi.rs declares and the activation
+  # constructor with them; the remaining six (hl_ckpt_*, hl_engine_guest_fd_limit)
+  # come from CORE_SOURCES and the Windows host archive.
+  if(NOT HL_LINK_GROUP_RESCAN)
+    # Full embedded rebuild of the engine, exactly as the Linux arm does below:
+    # the archive is self-contained and shares no object with the Phase-1
+    # libraries, which are built without HL_EMBEDDED_BUILD.
+    add_library(hl-windows-embedded-objs OBJECT
+      ${CORE_SOURCES} src/core/activation.c ${IR_SOURCES} ${LINUX_ABI_SOURCES} ${WINDOWS_HOST_SOURCES})
+    target_link_libraries(hl-windows-embedded-objs PRIVATE hl_engine_cflags)
+    target_compile_options(hl-windows-embedded-objs PRIVATE -D_GNU_SOURCE -DHL_EMBEDDED_BUILD=1)
+
+    # The guest-target unity TU and its lifecycle core, both with
+    # HL_EMBEDDED_BUILD and NO main(): the target root defines one, and an
+    # archive that carries main() would collide with the Rust test harness's.
+    hl_object(win_embed_target_x86_64 src/core/target/x86_64.c
+      FLAGS -D_GNU_SOURCE -DHL_EMBEDDED_BUILD=1 -DHL_ENGINE_NO_MAIN=1 -O2 UNITY)
+    # lifecycle-core: no -D_GNU_SOURCE, matching every other host's lane.
+    hl_object(win_embed_life_x86_64 src/core/lifecycle.c
+      FLAGS -DHL_EMBEDDED_BUILD=1 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2)
+
+    foreach(_stamped hl-windows-embedded-objs win_embed_target_x86_64 win_embed_life_x86_64)
+      hl_stamp_archive_object(${_stamped})
+    endforeach()
+
+    add_library(hl-engine-crate-archive STATIC
+      $<TARGET_OBJECTS:win_embed_target_x86_64>
+      $<TARGET_OBJECTS:win_embed_life_x86_64>
+      $<TARGET_OBJECTS:hl-windows-embedded-objs>
+      # The POSIX seam. It belongs IN the archive rather than beside it: it
+      # resolves references made by the objects above, and a consumer that had
+      # to link a second library to satisfy them would be a consumer that can
+      # get it wrong.
+      ${CMAKE_SOURCE_DIR}/cmake/toolchains/msvc-posix/posix.c)
+    set_target_properties(hl-engine-crate-archive PROPERTIES
+      EXCLUDE_FROM_ALL TRUE
+      ARCHIVE_OUTPUT_DIRECTORY ${HL_PACKAGE_ARCH_DIR}
+      # rustc's native-library search wants `hl-engine.lib` on a *-windows-msvc
+      # target; the toolchain file already set the empty prefix and .lib suffix.
+      OUTPUT_NAME hl-engine)
+  endif()
+  return()
+endif()
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   return()
@@ -122,7 +291,8 @@ hl_linux_production(aarch64 AARCH64 "-pthread;-lm;-ldl;-latomic")
 hl_linux_production(x86_64  X86_64  "-pthread;-lm")
 
 # ---- Linux dual-backend embedded activation archive -----------------------
-# libhl-engine-activation.a == build/package/linux-aarch64/libhl-engine.a.
+# libhl-engine-activation.a == ${HL_PACKAGE_ARCH_DIR}/libhl-engine.a. That
+# directory names the HOST CPU, not a guest ISA -- both ISAs are in this archive.
 # Members: the namespaced dual TUs + activation/dispatch + a FULL embedded
 # rebuild of core/ir/abi/host with -DHL_EMBEDDED_BUILD.
 set(EMBEDDED_SOURCES ${CORE_SOURCES} ${IR_SOURCES} ${LINUX_ABI_SOURCES} ${LINUX_HOST_SOURCES})
@@ -159,7 +329,7 @@ add_library(hl-engine-activation STATIC
   $<TARGET_OBJECTS:dual_dispatch>       $<TARGET_OBJECTS:dual_activation>
   $<TARGET_OBJECTS:hl-embedded-objs>)
 set_target_properties(hl-engine-activation PROPERTIES
-  ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/package/linux-aarch64
+  ARCHIVE_OUTPUT_DIRECTORY ${HL_PACKAGE_ARCH_DIR}
   OUTPUT_NAME hl-engine)   # emits libhl-engine.a, matching the Makefile artifact
 
 # link-test: dual_backend_e2e_runner linked with --whole-archive (Makefile 1612).
@@ -171,4 +341,4 @@ target_link_options(dual-backend-link-test PRIVATE
   -pthread -ldl -lm -latomic)
 add_dependencies(dual-backend-link-test hl-engine-activation)
 set_target_properties(dual-backend-link-test PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/package/linux-aarch64)
+  RUNTIME_OUTPUT_DIRECTORY ${HL_PACKAGE_ARCH_DIR})

@@ -8,7 +8,7 @@
 #
 # Layout:
 #     libhl-engine.a       <- CORE_SOURCES
-#     libhl-translator.a   <- IR_SOURCES        (incl. aarch64 host codegen)
+#     libhl-translator.a   <- IR_SOURCES        (incl. the ARM64 host assembler)
 #     libhl-linux-abi.a    <- LINUX_ABI_SOURCES
 #     libhl-host-fake.a    <- FAKE_HOST_SOURCES
 #     libhl-host-linux.a   <- LINUX_HOST_SOURCES (Linux host only)
@@ -24,7 +24,71 @@
 cmake_minimum_required(VERSION 3.20)
 project(hl_engine LANGUAGES C)
 
-find_program(HL_BASH_EXECUTABLE NAMES bash REQUIRED)
+# The shell. OPTIONAL, and found exactly once: cmake/Phase3CiConfig.cmake and
+# cmake/LaneParity.cmake used to repeat this call with REQUIRED, so three
+# separate sites could fail a configure over a tool that only two CTest cases
+# and a handful of developer/release targets actually need. A Windows host has
+# no bash unless MSYS2/Git-for-Windows is installed, and nothing in the compile
+# graph needs one (cmake/ArchiveStamp.cmake's command is only pulled in by the
+# Linux and Darwin production lanes). So: find it, say so when it is missing,
+# and let each bash-backed target/test gate on it -- the pattern
+# cmake/Format.cmake, cmake/Lint.cmake and cmake/RustLint.cmake already use for
+# clang-format, the linter and cargo.
+find_program(HL_BASH_EXECUTABLE NAMES bash)
+if(NOT HL_BASH_EXECUTABLE)
+  message(STATUS
+    "bash not found -- the shell-backed CTest cases (unit.ci-workflow-invariants, "
+    "unit.publish-gating, gate.ci-lane-parity, gate.archive-closure) and the "
+    "crate-archive targets (check-crate-archives, refresh-crate-archives*) are NOT "
+    "registered. The libraries, engines and runner still build. Install MSYS2 or "
+    "Git for Windows to get them.")
+endif()
+
+# The host-CPU axis. DOCS.md section 1's "host platform" is really two axes, host
+# OS and host CPU, and only the first ever had a name here. Name it once and
+# normalise the spelling. Values match HL_HOST_CPU_* in src/host/host_cpu.h.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+  set(HL_HOST_ARCH aarch64)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+  set(HL_HOST_ARCH x86_64)
+else()
+  message(FATAL_ERROR
+    "hl-engine has no host-CPU support for CMAKE_SYSTEM_PROCESSOR='${CMAKE_SYSTEM_PROCESSOR}'. "
+    "Supported host CPUs are aarch64 and x86_64.")
+endif()
+
+# Where the packaged host archives land. The name encodes the HOST platform, not
+# a guest ISA: spelled inline, an x86_64 host overwrites the aarch64 artifact and
+# gets published as the aarch64 crate asset.
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  set(HL_PACKAGE_ARCH_DIR ${CMAKE_BINARY_DIR}/package/macos-${HL_HOST_ARCH})
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  set(HL_PACKAGE_ARCH_DIR ${CMAKE_BINARY_DIR}/package/windows-${HL_HOST_ARCH})
+else()
+  set(HL_PACKAGE_ARCH_DIR ${CMAKE_BINARY_DIR}/package/linux-${HL_HOST_ARCH})
+endif()
+
+# Whether the C link needs an EXPLICIT archive group. The engine archives are
+# mutually recursive, so GNU ld has to be handed --start-group/--end-group,
+# which CMake spells $<LINK_GROUP:RESCAN,...>. Two of this tree's linkers reject
+# that generator expression at CONFIGURE time -- "Feature 'RESCAN' ... is not
+# supported for the 'C' link language" -- and neither needs it, because both
+# rescan archives to a fixed point on their own:
+#
+#   * Apple's linker, on a Darwin host.
+#   * the MSVC linker, reached through the clang driver when the target ABI is
+#     *-windows-msvc (cmake/toolchains/x86_64-windows-msvc.cmake). Note this is
+#     an ABI test and NOT a host-OS test: the mingw-w64 Windows toolchain drives
+#     ld.lld with the GNU driver and DOES need the group.
+#
+# Named once here because three call sites need the same answer and each had
+# been deriving it separately -- Phase 4's from the host OS alone, which was
+# right until a second Windows ABI existed.
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_C_COMPILER_TARGET MATCHES "windows-msvc")
+  set(HL_LINK_GROUP_RESCAN FALSE)
+else()
+  set(HL_LINK_GROUP_RESCAN TRUE)
+endif()
 
 # ---------------------------------------------------------------------------
 # Static-analysis target family (lint, format checks, CI-quality gates).
@@ -50,6 +114,12 @@ endif()
 
 set(HL_DEBUG_LOGGING "0" CACHE STRING "HL_ENABLE_LOGGING value")
 
+# --- x86-64 same-ISA transliterator -----------------------------------------
+# Always COMPILED (so one binary reaches both backends and HL_X86_TRANSLIT=1 selects at run time); this
+# only moves the default. OFF because the interpreter is the correct-by-construction lane and the
+# transliterator is additive -- see docs/amd64-host.md. Inert on any host that is not x86-64.
+option(HL_TRANSLIT "default the x86-64 guest to the same-ISA transliterator instead of the interpreter" OFF)
+
 # --- flags in ONE place, as INTERFACE libraries (no directory-scope leakage) -
 # Interface libs are used instead of add_compile_options() so that Phase-2
 # production TUs (which need a DIFFERENT, minimal flag set) do not inherit the
@@ -58,7 +128,8 @@ set(HL_DEBUG_LOGGING "0" CACHE STRING "HL_ENABLE_LOGGING value")
 # dep flags never affect object contents.)
 add_library(hl_cpp_flags INTERFACE)
 target_include_directories(hl_cpp_flags INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_compile_definitions(hl_cpp_flags INTERFACE HL_ENABLE_LOGGING=${HL_DEBUG_LOGGING})
+target_compile_definitions(hl_cpp_flags INTERFACE HL_ENABLE_LOGGING=${HL_DEBUG_LOGGING}
+  HL_TRANSLIT_DEFAULT=$<BOOL:${HL_TRANSLIT}>)
 
 add_library(hl_engine_cflags INTERFACE)
 target_link_libraries(hl_engine_cflags INTERFACE hl_cpp_flags)
@@ -67,8 +138,19 @@ target_compile_options(hl_engine_cflags INTERFACE
   -std=c11
   -Wall -Wextra -Wpedantic -Wconversion -Wshadow
   -Wstrict-prototypes -Wmissing-prototypes
-  -Werror=implicit-function-declaration -Werror=implicit-int
-  -fvisibility=hidden)
+  -Werror=implicit-function-declaration -Werror=implicit-int)
+
+# -fvisibility=hidden is an ELF/Mach-O concept with no PE/COFF equivalent:
+# Windows exports are per-symbol (__declspec(dllexport)) or by a .def file, and
+# only mean anything at a DLL boundary. This project builds STATIC archives and
+# executables exclusively, so on Windows the flag is at best a no-op and at
+# worst a per-TU warning. Appended (rather than left inline above) so the flag
+# ORDER on Linux and Darwin is byte-identical to what it was.
+# Nothing replaces it: introducing a dllexport/dllimport HL_API macro is a
+# public-ABI decision, not a Windows-port detail.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  target_compile_options(hl_engine_cflags INTERFACE -fvisibility=hidden)
+endif()
 
 # --- source lists -----------------------------------------------------------
 set(PROVIDER_SOURCES
@@ -83,23 +165,16 @@ set(CORE_SOURCES
   src/core/target/run.c src/core/target/services.c ${PROVIDER_SOURCES})
 
 set(IR_SOURCES
-  src/translator/arena.c src/translator/codegen.c src/translator/digest.c src/translator/guest_fetch.c
+  src/translator/arena.c src/translator/digest.c src/translator/guest_fetch.c
+  src/translator/guest_memory.c
   src/translator/identity.c src/translator/persist.c src/translator/reloc.c
   src/translator/window.c src/translator/guest/x86_64/decode.c
-  src/translator/guest/x86_64/address.c src/translator/host/aarch64/codegen.c
+  src/translator/guest/x86_64/address.c
   src/translator/guest/x86_64/glue.c src/translator/guest/x86_64/avx.c
   src/translator/host/aarch64/asm.c
   src/translator/guest/x86_64/cpuid.c src/translator/guest/x86_64/cmpxchg.c
   src/translator/guest/x86_64/legacy.c
-  src/translator/guest/x86_64/lower/alu.c
-  src/translator/guest/x86_64/lower/crypto.c
-  src/translator/guest/x86_64/lower/mov.c
-  src/translator/guest/x86_64/lower/repstr.c
-  src/translator/guest/x86_64/lower/shift.c
-  src/translator/guest/x86_64/lower/sse4x.c
-  src/translator/guest/x86_64/lower/trace.c
-  src/translator/guest/x86_64/lower/x87.c
-  src/translator/guest/x86_64/lower/x87_stack.c
+  src/translator/guest/x86_64/rep_runtime.c
   src/translator/guest/x86_64/rep.c
   src/translator/guest/x86_64/rotate.c
   src/translator/guest/x86_64/x87math.c
@@ -107,9 +182,25 @@ set(IR_SOURCES
   src/translator/guest/aarch64/signal.c
   src/translator/guest/x86_64/signal.c
   src/translator/guest/x86_64/operand.c
-  src/translator/guest/x86_64/flags.c
-  src/translator/host/x86_64/codegen.c src/translator/ir/interpreter.c
-  src/translator/ir/ir.c)
+  src/translator/guest/x86_64/flags.c)
+
+# guest/x86_64/lower/ emits ARM64 and calls emit.c's emitters, which only
+# core/target/x86_64.c's AArch64 arm defines. Compiled anywhere else these
+# objects are unresolvable, and a linker pulls archive members on demand, so
+# nothing said so until a link happened to reference one. Host-gated here and
+# again by the #error in lower/primitives.h.
+if(HL_HOST_ARCH STREQUAL "aarch64")
+  list(APPEND IR_SOURCES
+    src/translator/guest/x86_64/lower/alu.c
+    src/translator/guest/x86_64/lower/crypto.c
+    src/translator/guest/x86_64/lower/mov.c
+    src/translator/guest/x86_64/lower/repstr.c
+    src/translator/guest/x86_64/lower/shift.c
+    src/translator/guest/x86_64/lower/sse4x.c
+    src/translator/guest/x86_64/lower/trace.c
+    src/translator/guest/x86_64/lower/x87.c
+    src/translator/guest/x86_64/lower/x87_stack.c)
+endif()
 
 set(LINUX_ABI_SOURCES
   src/linux_abi/affinity.c src/linux_abi/container/key.c src/linux_abi/container/pidmap.c
@@ -140,6 +231,31 @@ set(MACOS_HOST_SOURCES
   src/host/macos/directory.c src/host/macos/host.c src/host/macos/process.c
   src/host/macos/range.c src/host/macos/system.c)
 
+# The Windows archive deliberately does NOT pull COMMON_HOST_SOURCES wholesale:
+# resolve.c needs the *at() family and private.c needs a fork-inherited shared
+# mapping, neither of which this host has. sync.c and range.c are the two
+# members that are portable -- sync.c's registry bookkeeping is host independent
+# and only its ~30-line primitive layer is POSIX (selected per host); range.c is
+# pure arithmetic over the two per-host predicates in windows/range.c -- so both
+# are listed on their own.
+#
+# child.c and fork_wire.c are NOT the POSIX files: windows/child.c and
+# windows/fork_wire.c stand in their place, because SIGCHLD and SCM_RIGHTS have
+# no Windows analogue this group's signatures can carry. They are typed
+# absences, not implementations, and each states which of the two missing pieces
+# (the notification mechanism, or the descriptor it would be published on)
+# blocks it.
+set(WINDOWS_HOST_SOURCES
+  src/host/windows/host.c src/host/windows/memory.c src/host/windows/clock.c
+  src/host/windows/fault.c
+  src/host/windows/ntpath.c src/host/windows/file.c src/host/windows/process.c
+  src/host/windows/range.c src/host/windows/system.c src/host/windows/directory.c
+  src/host/windows/child.c src/host/windows/fork_wire.c
+  src/host/windows/counter.c src/host/windows/event.c src/host/windows/stream.c
+  src/host/windows/socket.c
+  src/host/windows/private.c src/host/windows/resolve.c src/host/windows/math.c
+  src/host/range.c src/host/file.c src/host/clock.c src/host/sync.c)
+
 # --- archives ---------------------------------------------------------------
 # Each links the engine flag interface PRIVATE so the exact ENGINE_CFLAGS apply.
 add_library(hl-engine     STATIC ${CORE_SOURCES})
@@ -160,6 +276,13 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     ${MACOS_HOST_SOURCES} ${COMMON_HOST_SOURCES}
     src/host/clock.c src/host/file.c)
   target_link_libraries(hl-host-macos PRIVATE hl_engine_cflags)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  # libhl-host-windows currently implements memory (incl. code mapping), clock,
+  # log and sync, and advertises exactly those capability bits. The remaining
+  # groups land as further src/host/windows/*.c files on this same list; nothing
+  # downstream tests the OS, it asks `if(TARGET hl-host-windows)`.
+  add_library(hl-host-windows STATIC ${WINDOWS_HOST_SOURCES})
+  target_link_libraries(hl-host-windows PRIVATE hl_engine_cflags)
 endif()
 
 # --- Phase 2: Linux production engines + dual embedded activation archive ----
@@ -189,14 +312,23 @@ if(HL_BUILD_TESTS)
     #   cmake --build <dir> --target compat-engines compat-<lane>-fixtures
     # Declared here because the two hosts build the engines in different
     # phases (Phase 2 on Linux, Phase4Mac on Darwin).
-    set(_compat_engines hl-engine-linux-aarch64 hl-engine-linux-x86_64
-        matrix-runner forkserver-runner)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-      list(APPEND _compat_engines linux-production-remote-supervisor deny-icmp)
-    else()
-      list(APPEND _compat_engines hl-remote-supervisor)
+    #
+    # Not declared on Windows. A Windows host can now HAVE the fixture corpus --
+    # it is cross-built from a WSL2 Linux and staged from a digest-checked cache
+    # -- so HL_HAVE_GUEST_CC no longer implies the engines exist. The engines
+    # named here are Phase-2 Linux production targets and Phase4Mac Darwin ones,
+    # and neither phase runs on Windows, so declaring the target would give
+    # `ninja compat-engines` a dependency with no rule.
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
+      set(_compat_engines hl-engine-linux-aarch64 hl-engine-linux-x86_64
+          matrix-runner forkserver-runner)
+      if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND _compat_engines linux-production-remote-supervisor deny-icmp)
+      else()
+        list(APPEND _compat_engines hl-remote-supervisor)
+      endif()
+      add_custom_target(compat-engines DEPENDS ${_compat_engines})
     endif()
-    add_custom_target(compat-engines DEPENDS ${_compat_engines})
   endif()
 endif()
 
@@ -213,7 +345,7 @@ endif()
 # Preserve the Linux-to-macOS transport entry point.  The real Darwin build
 # and CTest registry remain authoritative; this target only drives them over
 # OrbStack's shared-checkout `mac` command.
-if(HL_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(HL_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND HL_BASH_EXECUTABLE)
   add_custom_target(perf-macos-remote
     COMMAND ${HL_BASH_EXECUTABLE}
             ${CMAKE_SOURCE_DIR}/tools/run_remote_macos_ctest.sh
@@ -224,30 +356,36 @@ if(HL_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     USES_TERMINAL)
 endif()
 
-add_custom_target(check-crate-archives
-  COMMAND ${HL_BASH_EXECUTABLE}
-          ${CMAKE_SOURCE_DIR}/tools/check_crate_archives.sh
-  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-  USES_TERMINAL)
+# Release/developer targets, all four of them shell scripts. Gated on the shell
+# rather than on the OS: tools/refresh_crate_archives.sh refuses a non-Linux
+# `uname -s` of its own accord, so the OS test would be a second, weaker copy of
+# a rule the script already enforces. Absent bash they are simply not declared.
+if(HL_BASH_EXECUTABLE)
+  add_custom_target(check-crate-archives
+    COMMAND ${HL_BASH_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tools/check_crate_archives.sh
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    USES_TERMINAL)
 
-add_custom_target(refresh-crate-archives
-  COMMAND ${CMAKE_COMMAND} -E env
-          BUILD=${CMAKE_BINARY_DIR}/crate-archives
-          ${HL_BASH_EXECUTABLE}
-          ${CMAKE_SOURCE_DIR}/tools/refresh_crate_archives.sh
-  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-  USES_TERMINAL)
-
-# The halves, for a host that is not both aarch64 Linux and Apple silicon.
-foreach(_half linux darwin provenance)
-  add_custom_target(refresh-crate-archives-${_half}
+  add_custom_target(refresh-crate-archives
     COMMAND ${CMAKE_COMMAND} -E env
             BUILD=${CMAKE_BINARY_DIR}/crate-archives
             ${HL_BASH_EXECUTABLE}
-            ${CMAKE_SOURCE_DIR}/tools/refresh_crate_archives.sh --${_half}
+            ${CMAKE_SOURCE_DIR}/tools/refresh_crate_archives.sh
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     USES_TERMINAL)
-endforeach()
+
+  # The halves, for a host that is not both aarch64 Linux and Apple silicon.
+  foreach(_half linux darwin provenance)
+    add_custom_target(refresh-crate-archives-${_half}
+      COMMAND ${CMAKE_COMMAND} -E env
+              BUILD=${CMAKE_BINARY_DIR}/crate-archives
+              ${HL_BASH_EXECUTABLE}
+              ${CMAKE_SOURCE_DIR}/tools/refresh_crate_archives.sh --${_half}
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      USES_TERMINAL)
+  endforeach()
+endif()
 
 # --- clang-format targets ---------------------------------------------------
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Format.cmake)

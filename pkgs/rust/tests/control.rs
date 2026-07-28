@@ -8,6 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/engine_env.rs"]
+mod engine_env;
+
 use hl_engine::{
     spec::TreeSource, AttachRequest, AttachmentKind, ControlErrorCategory, Engine, Exit, Guest,
     MachineSpec, ProcessIo, ResourceUpdate, ShutdownPolicy, Signal, SignalTarget, Stdio,
@@ -41,6 +44,9 @@ fn launch_spec(program: &str) -> MachineSpec {
 
 #[test]
 fn typed_signal_and_shutdown_control_the_initial_process() {
+    if engine_env::skip_without_rootfs("typed_signal_and_shutdown_control_the_initial_process") {
+        return;
+    }
     let mut spec = launch_spec("/bin/sleep");
     spec.process.argv.push("30".into());
     let machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
@@ -63,6 +69,11 @@ fn typed_signal_and_shutdown_control_the_initial_process() {
 /// `spawn` hid this: that raced ahead of the fork.
 #[test]
 fn a_running_default_disposition_guest_dies_from_an_external_term() {
+    if engine_env::skip_without_rootfs(
+        "a_running_default_disposition_guest_dies_from_an_external_term",
+    ) {
+        return;
+    }
     let mut spec = launch_spec("/bin/sleep");
     spec.process.argv.push("30".into());
     let machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
@@ -75,6 +86,9 @@ fn a_running_default_disposition_guest_dies_from_an_external_term() {
 
 #[test]
 fn pause_guards_are_reference_counted() {
+    if engine_env::skip_without_rootfs("pause_guards_are_reference_counted") {
+        return;
+    }
     let mut spec = launch_spec("/bin/sleep");
     spec.process.argv.push("30".into());
     let mut machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
@@ -91,6 +105,9 @@ fn pause_guards_are_reference_counted() {
 
 #[test]
 fn attachment_transfers_only_requested_streams() {
+    if engine_env::skip_without_rootfs("attachment_transfers_only_requested_streams") {
+        return;
+    }
     let mut spec = launch_spec("/bin/echo");
     spec.process.argv.push("typed-attachment".into());
     let io = ProcessIo {
@@ -116,6 +133,11 @@ fn attachment_transfers_only_requested_streams() {
 
 #[test]
 fn unavailable_resource_mutations_fail_with_typed_unsupported_errors() {
+    if engine_env::skip_without_rootfs(
+        "unavailable_resource_mutations_fail_with_typed_unsupported_errors",
+    ) {
+        return;
+    }
     let mut spec = launch_spec("/bin/sleep");
     spec.process.argv.push("30".into());
     let mut machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
@@ -129,6 +151,11 @@ fn unavailable_resource_mutations_fail_with_typed_unsupported_errors() {
 
 #[test]
 fn process_inventory_tracks_initial_descendants_and_finished_lifecycle() {
+    if engine_env::skip_without_rootfs(
+        "process_inventory_tracks_initial_descendants_and_finished_lifecycle",
+    ) {
+        return;
+    }
     let mut spec = launch_spec("/bin/sh");
     spec.process
         .argv

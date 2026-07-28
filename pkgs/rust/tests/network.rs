@@ -1,6 +1,9 @@
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
+#[path = "support/engine_env.rs"]
+mod engine_env;
+
 use hl_engine::network::{Bridge, Namespace, Rule};
 use hl_engine::{Config, Engine, Error, Exit, Guest};
 
@@ -10,6 +13,9 @@ fn fixture() -> PathBuf {
 
 #[test]
 fn typed_network_configuration_reaches_the_native_launcher() {
+    if engine_env::skip_without_guest("typed_network_configuration_reaches_the_native_launcher") {
+        return;
+    }
     let config = Config::new()
         .network_namespace(Namespace::new("rust-net-integration").unwrap())
         .network_bridge(Bridge::new("rust-bridge-integration").unwrap())

@@ -1,1 +1,2 @@
-bf16 r=190 round=3f80,3f82,7fc0
+bf16 cvt 3f80 3f82 3f80 3f81 bf80 bf82 7fc0 7fff 7fc0 ffc0 7f80 ff80 0000 8000 7f80 ff80 0000 0000 0002
+bf16 dot=unadvertised

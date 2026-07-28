@@ -8,14 +8,12 @@ use crate::{
         NetworkMode, ProcessIo, SpawnError, SpecError, SpecErrorCategory, TreeSource, Validation,
         Version,
     },
-    wire, Child, Command as GuestCommand, Config, Error, Guest, Machine, Mount, Size, Stdio,
+    sys, wire, Child, Command as GuestCommand, Config, Error, Guest, Machine, Mount, Size, Stdio,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{CString, OsStr},
-    fs::{File, OpenOptions},
-    os::fd::AsRawFd,
-    os::unix::ffi::OsStrExt,
+    fs::File,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };

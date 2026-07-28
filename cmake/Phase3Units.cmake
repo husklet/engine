@@ -25,6 +25,22 @@
 # always agree here.
 # ---------------------------------------------------------------------------
 
+# Windows: not yet. Two independent blockers, both structural rather than
+# cosmetic. (1) The `_hostl` archive below resolves to hl-host-linux on any host
+# that is not Darwin, and no host archive exists on Windows at all until M4, so
+# fourteen unit binaries would be handed a library name with no target behind it.
+# (2) The archive-less cases name Linux sources directly (src/host/linux/
+# directory.c, process.c, system.c). Registering this lane needs
+# _HL_WINDOWS_EXCLUDED_UNITS, the Windows sibling of _HL_DARWIN_EXCLUDED_UNITS
+# below, and that list cannot be written before the archive it excludes against
+# exists.
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  message(STATUS
+    "Windows host -- the host unit lane is not registered yet (needs "
+    "libhl-host-windows and a _HL_WINDOWS_EXCLUDED_UNITS list).")
+  return()
+endif()
+
 set(_HL_UNIT_DEFAULT_LIBS hl-engine hl-translator hl-linux-abi hl-host-fake)
 set(_HL_DARWIN_EXCLUDED_UNITS
   directory directory_services eventfd_fork linux_fork native pipe_linux
@@ -161,12 +177,25 @@ hl_unit(resolve      SOURCES src/host/resolve.c)
 hl_unit(reloc        SOURCES src/translator/reloc.c)
 hl_unit(digest       SOURCES src/translator/digest.c)
 hl_unit(x87_stack    SOURCES src/translator/guest/x86_64/lower/x87_stack.c)
-hl_unit(lower_x87    SOURCES src/translator/guest/x86_64/lower/x87.c
+# The lower_* cases supply their own ARM64 emitters and assert the encodings the
+# real ones would produce, so they compile these files on ANY host -- the one
+# legitimate use of lower/primitives.h's HL_X86_LOWER_STANDALONE escape. They
+# also have to name the .c explicitly rather than fish it out of
+# libhl-translator.a, which no longer carries it off an AArch64 host.
+set(_lower_flags -DHL_X86_LOWER_STANDALONE=1)
+hl_unit(lower_x87    FLAGS ${_lower_flags}
+                     SOURCES src/translator/guest/x86_64/lower/x87.c
                              src/translator/guest/x86_64/lower/x87_stack.c)
-hl_unit(lower_sse4x  SOURCES src/translator/guest/x86_64/lower/sse4x.c)
-hl_unit(lower_repstr SOURCES src/translator/guest/x86_64/lower/repstr.c)
-hl_unit(lower_crypto SOURCES src/translator/guest/x86_64/lower/crypto.c)
-hl_unit(lower_trace  SOURCES src/translator/guest/x86_64/lower/trace.c)
+hl_unit(lower_sse4x  FLAGS ${_lower_flags} SOURCES src/translator/guest/x86_64/lower/sse4x.c)
+hl_unit(lower_alu    FLAGS ${_lower_flags} SOURCES src/translator/guest/x86_64/lower/alu.c)
+hl_unit(lower_mov    FLAGS ${_lower_flags} SOURCES src/translator/guest/x86_64/lower/mov.c)
+hl_unit(lower_shift  FLAGS ${_lower_flags} SOURCES src/translator/guest/x86_64/lower/shift.c)
+hl_unit(lower_repstr FLAGS ${_lower_flags}
+                     SOURCES src/translator/guest/x86_64/lower/repstr.c
+                             src/translator/guest/x86_64/rep_runtime.c
+                             src/translator/guest_memory.c)
+hl_unit(lower_crypto FLAGS ${_lower_flags} SOURCES src/translator/guest/x86_64/lower/crypto.c)
+hl_unit(lower_trace  FLAGS ${_lower_flags} SOURCES src/translator/guest/x86_64/lower/trace.c)
 hl_unit(window       SOURCES src/translator/window.c)
 hl_unit(identity     SOURCES src/translator/identity.c)
 hl_unit(clock        SOURCES src/host/clock.c src/host/fake/host.c)
@@ -179,10 +208,10 @@ hl_unit(system       SOURCES src/host/linux/system.c src/host/private.c)
 
 # --- the generic sweep (UNIT_NAMES) ----------------------------------------
 set(HL_UNIT_NAMES
-  a64_asm address affinity arena avx bus child ckptinoq cli clock codegen config cpuid
+  a64_asm address affinity arena avx bus child ckptinoq cli clock config cpuid
   cmpxchg decoder device digest directory directory_services emit epoll eventfd
   environment eventfd_fork fatal fdcache file flags fork_wire glue gmap guest_fetch host_services
-  guest_naked identity image inotify ir key launch legacy lifecycle_identity linux_abi
+  guest_naked identity image inotify key launch legacy lifecycle_identity linux_abi
   linux_fork logical_vma lower_alu lower_crypto lower_mov lower_repstr lower_shift
   lower_sse4x lower_trace lower_x87 misc native open_plan operand options_environment owner persist
   pidmap pipe pipe_linux placement ports private process provider_client provider_demux

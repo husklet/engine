@@ -134,7 +134,10 @@ void hl_x86_signal_restore(struct cpu *c) {
 // host x0..x15 and xmm0..15 in host v0..v15, with cpu pinned in host x28. Reconstruct the guest GPR/xmm
 // state from the host fault context (the deferred-flag NZCV is left as last spilled). block_return
 // (frontend/x86_64/translate.c) unwinds the block back to the run_guest loop, which runs cpu->rip == handler.
+// The only host-dependent code here (with the two functions after it): the frame builders above are pure
+// guest ABI, this reads the AArch64 host register file.
 int hl_x86_signal_capture(struct cpu *c, void *ucv, hl_x86_signal_cache_fn cache_contains, void *callback_context) {
+#if defined(HL_HOST_HAS_A64_CONTEXT)
     ucontext_t *uc = (ucontext_t *)ucv;
     uint64_t hpc = (uint64_t)HL_HOST_UC_PC(uc);
     if (!cache_contains(callback_context, hpc)) return 0; // host PC outside the code cache -> a genuine engine fault
@@ -145,13 +148,30 @@ int hl_x86_signal_capture(struct cpu *c, void *ucv, hl_x86_signal_cache_fn cache
         c->r[i] = X[i];           // rax..r15 == host x0..x15
     memcpy(c->v, V, sizeof c->v); // xmm0..15 == host v0..v15
     return 1;
+#else
+    // Nothing to reconstruct from. Return the SAME 0 as an out-of-cache host PC: both callers read 0 as
+    // "not a guest fault in a translated block" and re-raise, which is right when no block can run.
+    (void)c;
+    (void)ucv;
+    (void)cache_contains;
+    (void)callback_context;
+    return 0;
+#endif
 }
 
 void hl_x86_signal_resume(struct cpu *c, void *ucv, uintptr_t dispatcher_return) {
+#if defined(HL_HOST_HAS_A64_CONTEXT)
     ucontext_t *uc = (ucontext_t *)ucv;
     uint64_t cpu_address = (uint64_t)c;
     memcpy(HL_HOST_UC_REGS(uc) + 28, &cpu_address, sizeof(cpu_address));
     HL_HOST_UC_PC(uc) = (uint64_t)dispatcher_return;
+#else
+    // Unreachable: the only caller runs after hl_x86_signal_capture returned 1. Empty, not abort --
+    // aborting inside a signal handler turns a diagnosable "unsupported host" into a second fault.
+    (void)c;
+    (void)ucv;
+    (void)dispatcher_return;
+#endif
 }
 
 // recover a fast-clock GUARDED store fault (emit_fast_syscall's clock_gettime/gettimeofday inline
@@ -170,12 +190,19 @@ int hl_x86_signal_fast_clock_fault(struct cpu *c, uintptr_t va, void *ucv) {
     // offset instead: an in-window fault has (va - fastclk_ptr) in [0,16); every other value (including
     // va < fastclk_ptr, which underflows to a huge number) is >= 16. Correct for both bounds and wrap.
     if ((uint64_t)(va - c->fastclk_ptr) >= 16) return 0; // fault outside the guarded 16B window
+#if defined(HL_HOST_HAS_A64_CONTEXT)
     ucontext_t *uc = (ucontext_t *)ucv;
     uint64_t result = (uint64_t)(int64_t)(-EFAULT);
     memcpy(HL_HOST_UC_REGS(uc), &result, sizeof(result)); // guest rax = -EFAULT
     HL_HOST_UC_PC(uc) = c->fastclk_resume;                // resume at the in-block EFAULT tail
     c->fastclk_resume = 0;                                // window closed
     return 1;
+#else
+    // Dead: cpu->fastclk_resume is written only by the emitted ARM64 fast-clock arm, which s1_calibrate
+    // leaves disabled, so the window test above already returned 0. "Not handled" beats faking an EFAULT.
+    (void)ucv;
+    return 0;
+#endif
 }
 
 // Integer divide-by-zero (#DE) reaches the dispatcher as R_DIV/R_IDIV with divop==0. The host cannot

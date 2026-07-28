@@ -8,6 +8,8 @@ use hl_engine::{
 };
 #[path = "support/checkpoint_env.rs"]
 mod checkpoint_env;
+#[path = "support/engine_env.rs"]
+mod engine_env;
 
 use std::{
     collections::BTreeMap,
@@ -58,6 +60,11 @@ fn io() -> ProcessIo {
 /// its own state survived -- it exits 0 only if every process came back and observed what it had before.
 #[test]
 fn a_three_process_tree_is_captured_into_memory_and_restored_from_it() {
+    if engine_env::skip_without_guest(
+        "a_three_process_tree_is_captured_into_memory_and_restored_from_it",
+    ) {
+        return;
+    }
     if checkpoint_env::skip_if_unavailable(
         "a_three_process_tree_is_captured_into_memory_and_restored_from_it",
     ) {
@@ -139,6 +146,9 @@ fn captured_into_memory_and_restored(guest: Guest) {
 fn a_store_captures_while_a_terminal_is_attached() {
     use std::io::Read;
 
+    if engine_env::skip_without_guest("a_store_captures_while_a_terminal_is_attached") {
+        return;
+    }
     if checkpoint_env::skip_if_unavailable("a_store_captures_while_a_terminal_is_attached") {
         return;
     }
@@ -245,6 +255,11 @@ impl CheckpointStore for FailsAfter {
 /// undo it, and never presents it as a checkpoint.
 #[test]
 fn a_store_error_mid_capture_fails_the_capture_without_committing() {
+    if engine_env::skip_without_guest(
+        "a_store_error_mid_capture_fails_the_capture_without_committing",
+    ) {
+        return;
+    }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join(format!("checkpoint-store-failure-{}", std::process::id()));

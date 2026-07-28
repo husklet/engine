@@ -37,7 +37,16 @@
 // Engine seam (engine-dedup PR2): the shared jit/dispatch.c run_guest() loop calls four hooks at the spots
 // where the dispatcher diverges per guest arch. The aarch64 definitions expand to EXACTLY the code that was
 // inline before, so the aarch64 engine stays bit-identical; the x86 frontend defines its own in a later PR.
+//
+// The seam is per (guest ISA, HOST CPU): dispatch.h patches AArch64 branch encodings and assumes guest
+// registers live in the matching host registers, so it is the AArch64-host arm. Everything ABOVE this line
+// is pure guest ABI, shared by both.
+#include "../../../host/host_cpu.h"
+#if defined(HL_HOST_CPU_AARCH64)
 #include "dispatch.h"
+#else
+#include "interp_dispatch.h"
+#endif
 
 // PC / SP / TLS / §B shadow-stack reset — the remaining per-arch cpu state os/linux touches.
 #define G_PC(c) ((c)->pc)

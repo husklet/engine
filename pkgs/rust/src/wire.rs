@@ -1,4 +1,8 @@
-use crate::{config::NetworkTransport, Access, Config, Error, Sandbox};
+use crate::{
+    config::NetworkTransport,
+    sys::{self, guest_path},
+    Access, Config, Error, Sandbox,
+};
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
@@ -6,13 +10,15 @@ pub(crate) struct LaunchWire;
 
 impl LaunchWire {
     fn checked_bytes(value: &OsStr) -> Result<&[u8], Error> {
-        use std::os::unix::ffi::OsStrExt;
-        if value.as_bytes().contains(&0) {
+        let bytes = sys::os_bytes(value).ok_or(Error::InvalidConfig(
+            "configuration strings must use the host byte encoding",
+        ))?;
+        if bytes.contains(&0) {
             Err(Error::InvalidConfig(
                 "configuration strings must not contain NUL",
             ))
         } else {
-            Ok(value.as_bytes())
+            Ok(bytes)
         }
     }
 }
@@ -136,6 +142,15 @@ impl Pool {
         }
         Ok(offset)
     }
+
+    fn bytes(&mut self, value: Option<&[u8]>) -> Result<u32, Error> {
+        let Some(value) = value else { return Ok(0) };
+        let offset = u32::try_from(self.0.len())
+            .map_err(|_| Error::InvalidConfig("launch configuration is too large"))?;
+        self.0.extend_from_slice(value);
+        self.0.push(0);
+        Ok(offset)
+    }
 }
 
 struct Header([u8; HEADER_SIZE]);
@@ -166,8 +181,7 @@ impl Header {
 }
 
 impl LaunchWire {
-    fn environment(config: &Config) -> Result<Option<OsString>, Error> {
-        use std::os::unix::ffi::OsStringExt;
+    fn environment(config: &Config) -> Result<Option<Vec<u8>>, Error> {
         if config.environment.is_empty() {
             return Ok(None);
         }
@@ -189,11 +203,10 @@ impl LaunchWire {
             output.push(b'=');
             output.extend_from_slice(value);
         }
-        Ok(Some(OsString::from_vec(output)))
+        Ok(Some(output))
     }
 
-    fn file_owners(config: &Config) -> Result<Option<OsString>, Error> {
-        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    fn file_owners(config: &Config) -> Result<Option<Vec<u8>>, Error> {
         if config.file_owners.is_empty() {
             return Ok(None);
         }
@@ -201,15 +214,10 @@ impl LaunchWire {
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         let mut output = Vec::new();
         for (index, (path, uid, gid)) in entries.into_iter().enumerate() {
-            let bytes = path.as_os_str().as_bytes();
-            if path.is_absolute()
-                || bytes.is_empty()
-                || bytes.contains(&0)
+            let bytes = Self::checked_bytes(path.as_os_str())?;
+            if !guest_path::is_normalized_relative(bytes)
                 || bytes.contains(&b'\n')
                 || bytes.contains(&b'\t')
-                || path
-                    .components()
-                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
             {
                 return Err(Error::InvalidConfig(
                     "file owner paths must be normalized and relative",
@@ -224,11 +232,10 @@ impl LaunchWire {
             output.push(b'\t');
             output.extend_from_slice(gid.to_string().as_bytes());
         }
-        Ok(Some(OsString::from_vec(output)))
+        Ok(Some(output))
     }
 
-    fn volumes(config: &Config) -> Result<Option<OsString>, Error> {
-        use std::os::unix::ffi::OsStringExt;
+    fn volumes(config: &Config) -> Result<Option<Vec<u8>>, Error> {
         if config.mounts.is_empty() && config.namespace_links.is_empty() {
             return Ok(None);
         }
@@ -280,7 +287,7 @@ impl LaunchWire {
             output.extend_from_slice(host);
             index += 1;
         }
-        Ok(Some(OsString::from_vec(output)))
+        Ok(Some(output))
     }
 
     fn validate_publish(config: &Config) -> Result<(), Error> {
@@ -335,8 +342,7 @@ impl LaunchWire {
         Ok(())
     }
 
-    fn interfaces(config: &Config) -> Option<OsString> {
-        use std::os::unix::ffi::OsStringExt;
+    fn interfaces(config: &Config) -> Option<Vec<u8>> {
         if config.network_interfaces.is_empty() {
             return None;
         }
@@ -351,7 +357,7 @@ impl LaunchWire {
             bytes.push(b'/');
             bytes.extend_from_slice(interface.prefix().to_string().as_bytes());
         }
-        Some(OsString::from_vec(bytes))
+        Some(bytes)
     }
 }
 
@@ -379,7 +385,7 @@ impl LaunchWire {
         let hostname = pool.string(config.hostname.as_deref())?;
         let workdir = pool.string(config.working_directory.as_deref())?;
         let environment = Self::environment(config)?;
-        let environment = pool.string(environment.as_deref())?;
+        let environment = pool.bytes(environment.as_deref())?;
         let cache = pool.path(config.translation_cache.as_deref())?;
         let namespace = pool.string(
             config
@@ -398,13 +404,13 @@ impl LaunchWire {
             .map(|value| OsString::from(value.to_string()));
         let ipv4 = pool.string(ipv4.as_deref())?;
         let interfaces = Self::interfaces(config);
-        let interfaces = pool.string(interfaces.as_deref())?;
+        let interfaces = pool.bytes(interfaces.as_deref())?;
         let file_owners = Self::file_owners(config)?;
-        let file_owners = pool.string(file_owners.as_deref())?;
+        let file_owners = pool.bytes(file_owners.as_deref())?;
         let filesystem_generation = pool.path(config.filesystem_generation.as_deref())?;
         let publish = pool.publish(&config.publish)?;
         let volumes = Self::volumes(config)?;
-        let volumes = pool.string(volumes.as_deref())?;
+        let volumes = pool.bytes(volumes.as_deref())?;
         let result = pool.path(result)?;
         let arguments = pool.arguments(arguments)?;
         let pool_size = u32::try_from(pool.0.len())

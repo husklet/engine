@@ -1,3 +1,4 @@
+#include "../../guest_memory.h" // smc_protect's guest->host resolve, through the seam rather than linux_abi
 #include "cpuid.h"
 #include "cmpxchg.h"
 #include "rotate.h"
@@ -66,7 +67,11 @@ static void smc_protect(uint64_t pc) {
     if (!g_rwx_guest) return; // no JIT guest -> inert (matrix bit-exact)
     const void *canonical = NULL;
     size_t contiguous = 0;
-    int resolved = hl_logical_vma_resolve_exec(pc, 1, &canonical, &contiguous);
+    // The last hl_logical_vma_resolve_exec call in the translator (f98ae9cf): same tri-state, same
+    // arguments, but reached through the bound seam so translator -> linux_abi stays an arrow DOCS.md 3.3
+    // does not draw. core/target/x86_64.c binds the logical-VMA implementation in engine_global_init, which
+    // runs long before any block is translated, so the answer is unchanged.
+    int resolved = hl_guest_memory_resolve_exec(pc, 1, &canonical, &contiguous);
     if (resolved < 0) return;
     if (resolved > 0) pc = (uint64_t)(uintptr_t)canonical;
     uint64_t size = smc_page_size();
@@ -229,6 +234,17 @@ static int smc_on_write(uint64_t a) {
 // Each non-syscall case `continue`s the shared while-loop (so the shared `if (reason==R_TIER2) ...`
 // tail line never re-fires for x86). Verbatim from frontend/x86_64/dispatch.c. `break` exits the loop.
 #define G_DISPATCH_REASON(c)                                                                                           \
+    /* The C instruction emulators come FIRST and do not `continue` unconditionally: they run outside      \
+       run_block, so a guest access they reject leaves a NEW reason (R_SOFTMISS, or R_TRAP for an          \
+       emulated #UD) that the arms below have to see. rip = the insn; do_avx/do_sse3b advance it. */       \
+    if ((c)->reason == R_AVX) { /* VEX/EVEX AVX insn: emulate in C */                                                  \
+        hl_x86_avx_run(&g_avx_state, (c));                                                                             \
+        if ((c)->reason == R_AVX) continue;                                                                            \
+    }                                                                                                                  \
+    if ((c)->reason == R_SSE3B) { /* legacy 0F38/0F3A insn: emulate in C */                                            \
+        hl_x86_sse_run(&g_avx_state, (c));                                                                             \
+        if ((c)->reason == R_SSE3B) continue;                                                                          \
+    }                                                                                                                  \
     if ((c)->reason == R_SOFTMISS) {                                                                                   \
         if (soft_tlb_miss(c)) maybe_deliver_signal(c);                                                                 \
         continue;                                                                                                      \
@@ -258,14 +274,6 @@ static int smc_on_write(uint64_t a) {
         hl_x86_cpuid(c);                                                                                               \
         continue;                                                                                                      \
     } /* rip already = next */                                                                                         \
-    if ((c)->reason == R_AVX) { /* VEX/EVEX AVX insn: emulate in C; rip = the insn, do_avx advances it */              \
-        hl_x86_avx_run(&g_avx_state, (c));                                                                             \
-        continue;                                                                                                      \
-    }                                                                                                                  \
-    if ((c)->reason == R_SSE3B) { /* legacy 0F38/0F3A insn: emulate in C; rip = the insn, do_sse3b advances it */      \
-        hl_x86_sse_run(&g_avx_state, (c));                                                                             \
-        continue;                                                                                                      \
-    }                                                                                                                  \
     if ((c)->reason == R_REPSTR) {                                                                                     \
         hl_x86_rep_compare(c, g_nonpie_lo, g_nonpie_hi, g_nonpie_bias);                                                \
         continue;                                                                                                      \
@@ -298,15 +306,23 @@ static int smc_on_write(uint64_t a) {
         hl_x86_fxrstor(c);                                                                                             \
         continue;                                                                                                      \
     }                                                                                                                  \
+    if ((c)->reason == R_X87ENV) { /* fnstenv/fldenv m28, fnsave/frstor m108 (rip already = next) */                  \
+        hl_x86_x87_environment(c);                                                                                     \
+        continue;                                                                                                      \
+    }                                                          \
+    /* #DE si_code. Linux/x86 reports FPE_INTDIV(1) for the #DE trap WHATEVER raised it -- a zero divisor              \
+     * and a quotient overflow alike; this host's silicon is the oracle and tests/compat/completeness/                 \
+     * x86_64/div_overflow.c holds its answer. Queueing FPE_INTOVF(2) here diverged for the JIT only:                  \
+     * the interpreter reports overflow by exiting with divop == 0, so it lands in the /0 arm (1328eac3).              \
+     * Overflow is also ruled on BEFORE dividing: RDX:RAX == INT128_MIN over -1 is signed-overflow UB, and             \
+     * deciding that the GUEST's idiv faults must not depend on how the host's __divti3 answers it. (It does           \
+     * NOT trap on either host -- measured on x86-64 and aarch64 at -O0 and -O2 -- so this is UB removal, not          \
+     * a crash fix; 1328eac3's message says otherwise and is wrong on that point.) */                                  \
     if ((c)->reason == R_DIV) { /* 128/64 unsigned div (rip already = next) */                                         \
         uint64_t d = (c)->divop;                                                                                       \
-        if (d == 0) {                                                                                                  \
+        if (d == 0 || (c)->r[RDX] >= d) { /* /0, or quotient overflow (high half >= divisor): both #DE */              \
             if (raise_guest_de(c, 1 /*FPE_INTDIV*/)) { maybe_deliver_signal(c); continue; }                            \
             break; /* raise_guest_de recorded death-by-SIGFPE / set exited+exit_code */                                \
-        }                                                                                                              \
-        if ((c)->r[RDX] >= d) { /* quotient overflow (high half >= divisor): x86 #DE, same as /0 */                    \
-            if (raise_guest_de(c, 2 /*FPE_INTOVF*/)) { maybe_deliver_signal(c); continue; }                            \
-            break;                                                                                                     \
         }                                                                                                              \
         unsigned __int128 num = ((unsigned __int128)(c)->r[RDX] << 64) | (c)->r[RAX];                                  \
         (c)->r[RAX] = (uint64_t)(num / d);                                                                             \
@@ -315,17 +331,21 @@ static int smc_on_write(uint64_t a) {
     }                                                                                                                  \
     if ((c)->reason == R_IDIV) { /* 128/64 signed idiv */                                                              \
         int64_t d = (int64_t)(c)->divop;                                                                               \
+        __int128 num = ((__int128)(int64_t)(c)->r[RDX] << 64) | (c)->r[RAX];                                           \
+        int de;                                                                                                        \
         if (d == 0) {                                                                                                  \
+            de = 1;                                                                                                    \
+        } else if (d == -1) { /* the only divisor whose quotient overflows __int128 too: test, don't divide */         \
+            de = num < -(__int128)INT64_MAX || num > -(__int128)INT64_MIN;                                             \
+        } else {                                                                                                       \
+            __int128 q0 = num / d;                                                                                     \
+            de = (__int128)(int64_t)q0 != q0;                                                                          \
+        }                                                                                                              \
+        if (de) {                                                                                                      \
             if (raise_guest_de(c, 1 /*FPE_INTDIV*/)) { maybe_deliver_signal(c); continue; }                            \
             break;                                                                                                     \
         }                                                                                                              \
-        __int128 num = ((__int128)(int64_t)(c)->r[RDX] << 64) | (c)->r[RAX];                                           \
-        __int128 q = num / d;                                                                                          \
-        if ((__int128)(int64_t)q != q) { /* quotient doesn't fit int64 (incl. INT_MIN/-1): x86 #DE */                  \
-            if (raise_guest_de(c, 2 /*FPE_INTOVF*/)) { maybe_deliver_signal(c); continue; }                            \
-            break;                                                                                                     \
-        }                                                                                                              \
-        (c)->r[RAX] = (uint64_t)q;                                                                                     \
+        (c)->r[RAX] = (uint64_t)(num / d);                                                                             \
         (c)->r[RDX] = (uint64_t)(num % d);                                                                             \
         continue;                                                                                                      \
     }                                                                                                                  \

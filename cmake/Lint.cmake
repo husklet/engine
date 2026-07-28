@@ -61,13 +61,16 @@ add_executable(hl_lint
   linter/src/hl_lint.c
   ${_hl_lint_process_source})
 
+target_compile_features(hl_lint PRIVATE c_std_11)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(hl_lint PRIVATE
     -O2 -g
     -Wall -Wextra -Wpedantic -Wconversion -Wshadow
     -Wstrict-prototypes -Wmissing-prototypes
-    -Werror=implicit-function-declaration -Werror=implicit-int
-    -fvisibility=hidden)
+    -Werror=implicit-function-declaration -Werror=implicit-int)
+  if(NOT WIN32)
+    target_compile_options(hl_lint PRIVATE -fvisibility=hidden)
+  endif()
 endif()
 
 set_target_properties(hl_lint PROPERTIES

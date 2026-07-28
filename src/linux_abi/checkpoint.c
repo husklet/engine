@@ -48,8 +48,9 @@
 // tree, then exits it. Restore: HL_RESTORE (or `--restore`) calls the restore path. Both directions carry
 // bytes over the socket activation handed the engine; the embedder owns the other end.
 
-#include <sys/wait.h>   // waitid/waitpid: coordinator peer-reap; multi-thread refusal probe
-#include <termios.h>    // the controlling terminal's line discipline is captured and replayed
+#include "host_fd.h"     // the null-device spelling behind the placeholder descriptors below
+#include "host_wait.h"   // waitid/waitpid: coordinator peer-reap; multi-thread refusal probe
+#include "host_tty.h"    // the controlling terminal's line discipline is captured and replayed
 
 #include "../host/file.h"
 #include "../host/system.h"
@@ -735,7 +736,7 @@ static int ckpt_capture_socket_state(int fd, uint64_t identity, int require_quie
     state.local_size = local_size;
     if (state.guest_family == AF_UNIX && state.host_family == 0) {
         state.host_family = AF_UNIX;
-#if !defined(__linux__)
+#if defined(__APPLE__)
         ((struct sockaddr *)&state.local)->sa_len = (uint8_t)local_size;
 #endif
         ((struct sockaddr *)&state.local)->sa_family = AF_UNIX;
@@ -1183,6 +1184,15 @@ static void ckpt_interrupt_threads(struct cpu *self) {
         pthread_kill(g_threg[i].th, STW_SIG);
     }
     pthread_mutex_unlock(&g_threg_m);
+}
+
+// A peer's image group is named proc.<GUEST pid> -- what the peer itself uses (ckpt_poll) -- and its guest
+// pid equals its host pid only until the first restore. A restored tree keeps its guest pids in g_pidmap
+// while every process carries a fresh host pid, so naming the rendezvous group from the host pid made the
+// coordinator wait for proc.<new host pid> while the peer had committed proc.<guest pid>: re-capturing a
+// restored multi-process tree always refused as an incomplete manifest. Identity outside a restore.
+static int ckpt_peer_gpid(int64_t host_pid) {
+    return (int)hl_linux_pidmap_guest(&g_pidmap, (int32_t)host_pid);
 }
 
 static int ckpt_is_descendant(int64_t candidate, int64_t root) {
@@ -1810,7 +1820,10 @@ static int ckpt_dump_pages(struct ckpt_sink *sink, struct ckpt_sink_stream *f, s
         reg.len = len;
         reg.glen = glen;
         reg.prot = ckpt_region_prot(addr, glen);
-        reg.is_gna = gna_hit(addr, 1);
+        // is_gna is a WHOLE-REGION claim (restore gna_adds the whole region), so ask it as one: gna_hit's
+        // first-page test is true of every glibc pthread stack guard, which poisoned whole stacks on restore
+        // -> -EFAULT in pthread_join's futex -> abort. docs/amd64-host.md 3.8.
+        reg.is_gna = gna_all(addr, glen ? glen : 1);
         pthread_mutex_lock(&g_filemap_lock);
         for (int map_index = 0; map_index < g_nfilemap; map_index++) {
             struct guest_file_mapping *filemap = &g_filemap[map_index];
@@ -1961,7 +1974,7 @@ static int ckpt_dump_self_locked(struct cpu *c, const char *group) {
     }
     struct ckpt_sink_stream *fp = NULL, *ff = NULL;
     int ok = 0;
-    size_t pagesz = (size_t)getpagesize();
+    size_t pagesz = hl_linux_host_map_granularity();
 
     struct ckpt_meta m;
     memset(&m, 0, sizeof m);
@@ -2103,7 +2116,7 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
         for (int i = 0; i < nfoll; i++) {
             if (completed[i]) continue;
             char pd[64];
-            snprintf(pd, sizeof pd, "proc.%lld", (long long)foll[i].identity);
+            snprintf(pd, sizeof pd, "proc.%d", ckpt_peer_gpid(foll[i].identity));
             // Rendezvous through the sink, not through the store: "that peer finished" is defined as
             // "its group was committed", which is exactly what group_commit means for every implementation.
             if (ckpt_sink_group_present(sink, pd) == 1) {
@@ -2121,9 +2134,9 @@ static void ckpt_coordinate_and_exit(struct cpu *c) {
         for (int i = 0; i < nfoll; i++)
             if (!completed[i])
                 fprintf(stderr,
-                        "[ckpt] participant %lld never committed proc.%lld (it did not reach a checkpoint "
+                        "[ckpt] participant %lld never committed proc.%d (it did not reach a checkpoint "
                         "safepoint, or its dump was refused); refusing incomplete manifest\n",
-                        (long long)foll[i].identity, (long long)foll[i].identity);
+                        (long long)foll[i].identity, ckpt_peer_gpid(foll[i].identity));
         _exit(70);
     }
 
@@ -2385,6 +2398,21 @@ static void ckpt_restore_backings_close(void) {
     g_nrestore_backings = 0;
 }
 
+// Name whatever already holds [lo, hi). Only reached from the collision path below, where "what is in the
+// way" is the whole question and a bare address answers none of it.
+static void ckpt_report_overlap(uint64_t lo, uint64_t hi) {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    char line[512];
+    if (maps == NULL) return;
+    while (fgets(line, sizeof line, maps) != NULL) {
+        unsigned long long start = 0, end = 0;
+        if (sscanf(line, "%llx-%llx", &start, &end) != 2) continue;
+        if (end <= lo || start >= hi) continue;
+        fprintf(stderr, "[restore]   in the way: %s", line);
+    }
+    fclose(maps);
+}
+
 // Rebuild this process's guest memory (MAP_FIXED) + the mapping side-registries from `procdir`. For the init
 // this runs BEFORE engine init (so MAP_FIXED lands on free VAs); a re-forked child calls hl_gmap_reset() +
 // clears the anon/gna counters FIRST (dropping the COW-inherited init mappings) so its own RAM lands clean.
@@ -2446,7 +2474,7 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
             int seed = ckpt_restore_backing_seed(procdir, reg.backing_object, seed_size);
             if (seed < 0 ||
                 hl_logical_vma_global_restore_shared(reg.addr, reg.glen, (uint32_t)reg.prot, seed,
-                                                     reg.backing_offset, (size_t)getpagesize()) != 0) {
+                                                     reg.backing_offset, hl_linux_host_map_granularity()) != 0) {
                 fprintf(stderr, "[restore] cannot rebuild logical guest region %llx+%llx: %s\n",
                         (unsigned long long)reg.addr, (unsigned long long)reg.glen, strerror(errno));
                 goto fail;
@@ -2468,7 +2496,23 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
                 map_flags = MAP_FIXED | (reg.backing_shared ? MAP_SHARED : MAP_PRIVATE);
                 map_offset = (off_t)reg.backing_offset;
             }
-            void *r = mmap((void *)a, (size_t)reg.len, PROT_READ | PROT_WRITE, map_flags, map_fd, map_offset);
+            // A guest mmap's VA is an ordinary host mmap result, so a saved region can name VA the restoring
+            // process is already using for ENGINE state -- and MAP_FIXED would replace it silently. Probe
+            // with MAP_FIXED_NOREPLACE first so the collision is named; the retry keeps the guest's VA (the
+            // guest's own pointers are unrelocatable), but a corrupted engine is now diagnosed, not silent.
+#ifdef MAP_FIXED_NOREPLACE
+            int probe_flags = map_flags | MAP_FIXED_NOREPLACE;
+#else
+            int probe_flags = map_flags;
+#endif
+            void *r = mmap((void *)a, (size_t)reg.len, PROT_READ | PROT_WRITE, probe_flags, map_fd, map_offset);
+            if (r == MAP_FAILED || (uint64_t)(uintptr_t)r != a) {
+                if (r != MAP_FAILED) munmap(r, (size_t)reg.len);
+                fprintf(stderr, "[restore] guest region %llx+%llx overlaps a live host mapping; reclaiming it\n",
+                        (unsigned long long)a, (unsigned long long)reg.len);
+                ckpt_report_overlap(a, e);
+                r = mmap((void *)a, (size_t)reg.len, PROT_READ | PROT_WRITE, map_flags, map_fd, map_offset);
+            }
             if (r == MAP_FAILED || (uint64_t)(uintptr_t)r != a) {
                 fprintf(stderr, "[restore] cannot map guest region %llx+%llx: %s\n", (unsigned long long)a,
                         (unsigned long long)reg.len, strerror(errno));
@@ -2500,6 +2544,9 @@ static int ckpt_restore_mem_dir(const char *procdir, const struct ckpt_meta *m) 
         hl_linux_snapshot_advance(&g_ckpt_snapshot, reg.addr + reg.len);
         hl_gmap_add(reg.addr, reg.len);
         hl_gmap_set_guest_length(reg.addr, reg.glen);
+        // ONE verdict per region, so PROT_NONE sub-intervals of a piecewise-mprotect'd region are dropped (a
+        // restored guard page reads accessible). Do NOT widen the claim back to any-page: whole-region
+        // poisoning is far worse.
         if (reg.is_gna)
             gna_add(reg.addr & ~(uint64_t)0xfff, (reg.addr + reg.glen + 0xfff) & ~(uint64_t)0xfff);
         else
@@ -3239,7 +3286,9 @@ static int ckpt_restore_fds_dir(const char *procdir) {
                     close(timer);
                     return -1;
                 }
-                if (source >= 0) hl_native_kqueue_duplicate(source, r.gfd);
+                // dup2 moved the timer onto the guest's fd number; a shim kqueue keys its queue by descriptor
+                // NUMBER, so it must be told or the arming kevent() below is EBADF.
+                hl_native_kqueue_relocate(timer, r.gfd);
                 close(timer);
             }
             if (fcntl(r.gfd, F_SETFD, (r.descriptor_flags & FD_CLOEXEC) ? FD_CLOEXEC : 0) != 0) {
@@ -3321,7 +3370,7 @@ static int ckpt_restore_fds_dir(const char *procdir) {
                         free(image);
                         return -1;
                     }
-                    int shadow = open("/dev/null", O_RDONLY | ((r.descriptor_flags & FD_CLOEXEC) ? O_CLOEXEC : 0));
+                    int shadow = open(HL_LINUX_HOST_NULL_DEVICE, O_RDONLY | ((r.descriptor_flags & FD_CLOEXEC) ? O_CLOEXEC : 0));
                     if (shadow < 0 || (shadow != r.gfd && dup2(shadow, r.gfd) < 0)) {
                         fprintf(stderr, "[restore] inotify %d cannot reserve native shadow: %s\n", r.gfd,
                                 strerror(errno));
@@ -3514,7 +3563,8 @@ static int ckpt_restore_fds_dir(const char *procdir) {
                 close(instance);
                 return -1;
             }
-            if (source >= 0) hl_native_kqueue_duplicate(source, r.gfd);
+            // Same shim-kqueue descriptor-number identity as the timerfd path above.
+            hl_native_kqueue_relocate(instance, r.gfd);
             close(instance);
         }
         if (fcntl(r.gfd, F_SETFD, (r.descriptor_flags & FD_CLOEXEC) ? FD_CLOEXEC : 0) != 0) return -1;
@@ -4186,8 +4236,17 @@ static int ckpt_restore_right_prepare(const struct ckpt_fd *record) {
                        (unsigned long long)record->ofd_id), -1;
     int fd = -1;
     if (record->kind == CKF_EPOLL) {
-        fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
-        if (fd < 0) return -1;
+        // Any open descriptor will do as the placeholder, but it must not stay where open(2) put it: it is
+        // closed AFTER the guest's own descriptors are dup2'd into place, so a low number destroys whichever
+        // guest descriptor now owns it (it landed on 4, a socketpair endpoint). Hoist it into the private
+        // high band, like every other queued right.
+        int placeholder = open(HL_LINUX_HOST_NULL_DEVICE, O_RDONLY | O_CLOEXEC);
+        if (placeholder < 0) return -1;
+        fd = hl_host_process_fd_private_adopt(placeholder);
+        if (fd < 0) {
+            close(placeholder);
+            return -1;
+        }
         g_restore_rights[g_nrestore_rights++] =
             (struct ckpt_restore_right){record->ofd_id, record->object_id, fd, 1};
         return fd;
@@ -4458,9 +4517,13 @@ static int ckpt_restore_right_prepare(const struct ckpt_fd *record) {
             if (timer < 0) return -1;
             timerfd->fd = hl_host_process_fd_private_adopt(timer);
             if (timerfd->fd < 0) {
+                hl_native_kqueue_close(timer);
                 close(timer);
                 return -1;
             }
+            // adopt() moves the descriptor and closes the original, so a number-keyed shim kqueue must move
+            // with it or the arming kevent() below is EBADF.
+            hl_native_kqueue_relocate(timer, timerfd->fd);
             timerfd->slot = timerfd->fd;
             struct timespec now;
             hl_production_clock_gettime(effective_host_services(), HL_PRODUCTION_CLOCK_MONOTONIC, &now);
@@ -4819,13 +4882,25 @@ static int ckpt_restore_socket_queue_load(struct ckpt_restore_socket_endpoint *e
     return 0;
 }
 
+// SO_RCVBUF/SO_SNDBUF do not round-trip on Linux: the kernel stores twice what setsockopt gets, getsockopt
+// reports the doubled value, so replaying a capture doubles the buffer each generation. Halve on the way in
+// (Linux only -- macOS stores what it is given).
+static int ckpt_restore_socket_buffer(int fd, int name, int32_t captured) {
+    int value = captured;
+#if defined(__linux__)
+    value = captured / 2;
+#endif
+    return setsockopt(fd, SOL_SOCKET, name, &value, sizeof value);
+}
+
 static int ckpt_restore_socket_options(int fd, const struct ckpt_socket_state *state) {
 #define CKPT_RESTORE_SOCKET_OPTION(name, field)                                                                       \
     do {                                                                                                               \
         if (setsockopt(fd, SOL_SOCKET, name, &state->field, sizeof state->field) != 0) return -1;                     \
     } while (0)
-    CKPT_RESTORE_SOCKET_OPTION(SO_RCVBUF, receive_buffer);
-    CKPT_RESTORE_SOCKET_OPTION(SO_SNDBUF, send_buffer);
+    if (ckpt_restore_socket_buffer(fd, SO_RCVBUF, state->receive_buffer) != 0 ||
+        ckpt_restore_socket_buffer(fd, SO_SNDBUF, state->send_buffer) != 0)
+        return -1;
     CKPT_RESTORE_SOCKET_OPTION(SO_REUSEADDR, reuse_address);
     CKPT_RESTORE_SOCKET_OPTION(SO_REUSEPORT, reuse_port);
     CKPT_RESTORE_SOCKET_OPTION(SO_KEEPALIVE, keepalive);
@@ -5335,6 +5410,23 @@ static void ckpt_restore_proc_run(int gpid) {
     struct ckpt_meta m;
     if (ckpt_read_meta_dir(pd, &m) != 0) _exit(70);
 
+    // adopt our restored identity BEFORE any pid-reporting syscall or /proc publish
+    g_self_gpid = m.self_gpid;
+    g_self_gppid = m.ppid_gpid;
+
+    // The cpu image is read from the store, not from guest RAM, so it is available before the memory restore
+    // -- which fork_child_hooks needs, and which now has to run FIRST. See below.
+    struct cpu c, *images = NULL;
+    if (ckpt_restore_cpu_dir(pd, &m, &images) != 0 || ckpt_restore_leader(images, m.n_threads, &c) != 0)
+        _exit(70);
+    // BEFORE the memory restore, not after. jit_after_fork() inside this hook rebuilds the translated-code
+    // arena at a fresh VA and UNMAPS the ~64MB pair inherited from the restoring parent -- and a guest
+    // mapping's saved VA is an ordinary host mmap result, so the child's MAP_FIXED regions frequently land
+    // INSIDE that inherited arena. Run after the restore, the release then punched the restored guest pages
+    // back out: x86_64 checkpoint.threads died with a host SIGSEGV on the resumed peer's own stack
+    // (si_addr == sp, pc at glibc's __syscall_cancel_arch_end).
+    fork_child_hooks(&c);       // shared after-fork engine reset (cache re-alias, kqueue rebuild, lock/threg/Mach)
+
     // drop the COW-inherited parent guest memory + registries, then load our own
     /* The forked restorer inherited a COW copy of the parent's typed VMA ledger and
      * host mapping ownership. Release those handles before forgetting the generic
@@ -5346,14 +5438,6 @@ static void ckpt_restore_proc_run(int gpid) {
     gna_reset();
     if (ckpt_restore_mem_dir(pd, &m) != 0) _exit(70);
 
-    // adopt our restored identity BEFORE any pid-reporting syscall or /proc publish
-    g_self_gpid = m.self_gpid;
-    g_self_gppid = m.ppid_gpid;
-
-    struct cpu c, *images = NULL;
-    if (ckpt_restore_cpu_dir(pd, &m, &images) != 0 || ckpt_restore_leader(images, m.n_threads, &c) != 0)
-        _exit(70);
-    fork_child_hooks(&c);       // shared after-fork engine reset (cache re-alias, kqueue rebuild, lock/threg/Mach)
     ckpt_reinstall_sigacts(&m); // restore guest signal dispositions (AFTER the fork hooks reset host state)
 
     if (ckpt_restore_fds_dir(pd) != 0 || ckpt_restore_signal_state(pd) != 0) _exit(70);

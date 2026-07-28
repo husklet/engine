@@ -17,8 +17,12 @@ set(_hl_fmt_files
   ${CORE_SOURCES} ${IR_SOURCES} ${LINUX_ABI_SOURCES}
   ${FAKE_HOST_SOURCES} ${COMMON_HOST_SOURCES} ${LINUX_HOST_SOURCES}
   src/runner/main.c)
+# guest/x86_64/lower/ leaves IR_SOURCES on a non-AArch64 host (CMakeLists.txt).
+# Formatting is host-independent, so name the directory instead of inheriting
+# that gate and quietly formatting nine files on one host only.
 file(GLOB _hl_fmt_extra
   ${CMAKE_SOURCE_DIR}/include/hl/*.h
+  ${CMAKE_SOURCE_DIR}/src/translator/guest/x86_64/lower/*.c
   ${CMAKE_SOURCE_DIR}/tests/unit/*.c ${CMAKE_SOURCE_DIR}/tests/unit/*.h
   ${CMAKE_SOURCE_DIR}/tools/*.c)
 list(APPEND _hl_fmt_files ${_hl_fmt_extra})

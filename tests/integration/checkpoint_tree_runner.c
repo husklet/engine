@@ -16,7 +16,44 @@
 #include <time.h>
 #include <unistd.h>
 
-enum { TIMEOUT_SECONDS = 15 };
+enum { TIMEOUT_SECONDS = 15, TIMEOUT_SCALE_MAX = 100 };
+
+/* Per-wait guest budget and its host-backend scale; tools/matrix_runner.c is the reference, docs/ci-green.md
+   the reasoning, and the knob is identical in all six runners. 15s assumes a JIT host, and without one an
+   expired deadline here reads as WRONG rather than slow: wait_child() returns 124, which several scenarios
+   read as "the engine refused", and wait_for_ready() names markers the guest had not reached yet. */
+static unsigned long timeout_scale = 1;
+
+/* Every deadline here is `now + one budget`, so the budget is only ever needed as a deadline. */
+static time_t case_deadline(void) {
+    return time(NULL) + (time_t)((unsigned long)TIMEOUT_SECONDS * timeout_scale);
+}
+
+static int load_timeout_scale(void) {
+    const char *value = getenv("HL_MATRIX_TIMEOUT_SCALE");
+    char *end = NULL;
+    unsigned long parsed;
+    if (value == NULL || *value == 0) return 0;
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    /* strtoul() accepts a sign, wrapping "-1" to ULONG_MAX, so the first character is checked directly. */
+    if (value[0] < '0' || value[0] > '9' || errno != 0 || end == value || *end != 0 || parsed < 1 ||
+        parsed > TIMEOUT_SCALE_MAX) {
+        fprintf(stderr,
+                "checkpoint runner: HL_MATRIX_TIMEOUT_SCALE=\"%s\" is not a decimal factor in [1, %d]; refusing "
+                "to run rather than silently using the unscaled per-case timeout\n",
+                value, TIMEOUT_SCALE_MAX);
+        return 1;
+    }
+    timeout_scale = parsed;
+    /* On stdout, in a PASSING case: a green scaled lane must not read as evidence of comparable speed. */
+    if (timeout_scale == 1) return 0;
+    printf("checkpoint runner: per-wait timeout scaled x%lu to %lus (HL_MATRIX_TIMEOUT_SCALE); this run "
+           "tolerates slow-but-correct guest execution and is NOT evidence of speed comparable to an unscaled "
+           "lane\n",
+           timeout_scale, (unsigned long)TIMEOUT_SECONDS * timeout_scale);
+    return 0;
+}
 
 /* ---------------------------------------------------------------- checkpoint store server
  *
@@ -560,6 +597,16 @@ static void store_reset_channels(void) {
     g_claim_count = 0;
 }
 
+/* Forget the whole committed image, so a SECOND capture into this store is a fresh one. Without it the
+ * coordinator's group_present rendezvous would read the first capture's groups as "this peer is already
+ * done", and a shrinking tree would leave the previous run's proc.<gpid> objects behind. */
+static void store_reset_image(void) {
+    for (int index = 0; index < g_object_count; ++index) free(g_objects[index].bytes);
+    g_object_count = 0;
+    g_committed_group_count = 0;
+    g_store_committed = 0;
+}
+
 /* --- corruption injection -------------------------------------------------
  * The corrupt-image cases used to edit files in the workspace. The image lives in this process now, so they
  * edit it here instead -- same five damage shapes, applied after COMMIT, and restore must still refuse. */
@@ -638,6 +685,25 @@ static int output_count(const char *path, const char *needle) {
     data[size] = 0;
     for (char *cursor = data; (cursor = strstr(cursor, needle)) != NULL; cursor += strlen(needle)) count++;
     return count;
+}
+
+/* The cycle fixture's per-stage counter. Read back the `STAGE <role> <n> <counter>` line that role wrote and
+ * return its counter, or 0 if the stage is absent -- a value only a live, never-relaunched process can have
+ * advanced, which is the whole point of the case. */
+static unsigned long output_stage_counter(const char *path, const char *role, int stage) {
+    char data[16384], needle[64];
+    int fd = open(path, O_RDONLY);
+    ssize_t size;
+    char *at;
+    if (fd < 0) return 0;
+    size = read(fd, data, sizeof(data) - 1);
+    close(fd);
+    if (size < 0) return 0;
+    data[size] = 0;
+    snprintf(needle, sizeof needle, "STAGE %s %d ", role, stage);
+    at = strstr(data, needle);
+    if (at == NULL) return 0;
+    return strtoul(at + strlen(needle), NULL, 10);
 }
 
 /* Capture completion is the explicit COMMIT, not a file appearing. */
@@ -729,7 +795,10 @@ static int g_broker_child = -1;
 static int g_trigger_descriptor = -1;
 static volatile uint32_t *g_trigger;
 
-/* `policy` is the --restore-policy argument, or NULL to leave the policy unset (the permissive default). */
+/* `policy` is the --restore-policy argument, or NULL to leave the policy unset (the permissive default).
+ * `restore`: 0 = capture a fresh guest, 1 = restore the image the store holds, 2 = restore it AND re-arm
+ * capture, so the SAME tree can be checkpointed a second time (the cycle case). */
+enum { LAUNCH_CAPTURE = 0, LAUNCH_RESTORE = 1, LAUNCH_RESTORE_RECAPTURE = 2 };
 static pid_t launch(const char *engine, const char *guest, const char *release,
                     const char *output, int restore, const char *policy,
                     const char *guest_mode) {
@@ -739,7 +808,9 @@ static pid_t launch(const char *engine, const char *guest, const char *release,
     snprintf(trigger, sizeof trigger, "%d", g_trigger_descriptor);
     pid = fork();
     if (pid != 0) return pid;
-    if (!restore && setsid() < 0) _exit(126);
+    /* A tree that will be captured again has to lead its own session: the coordinator enumerates the tree as
+     * "every engine process in the init's session", and inside the runner's session that is not the tree. */
+    if ((restore == LAUNCH_CAPTURE || restore == LAUNCH_RESTORE_RECAPTURE) && setsid() < 0) _exit(126);
     {
         int fd = open(output, O_WRONLY | O_CREAT | O_APPEND, 0600);
         if (fd < 0 || dup2(fd, STDOUT_FILENO) < 0 || dup2(fd, STDERR_FILENO) < 0) _exit(126);
@@ -747,7 +818,9 @@ static pid_t launch(const char *engine, const char *guest, const char *release,
     }
     /* The engine inherits these two; everything else the runner holds stays close-on-exec. */
     if (fcntl(g_broker_child, F_SETFD, 0) != 0 || fcntl(g_trigger_descriptor, F_SETFD, 0) != 0) _exit(126);
-    if (restore && policy)
+    if (restore == LAUNCH_RESTORE_RECAPTURE)
+        execl(engine, engine, "--restore", "--checkpoint", "--checkpoint-store", broker, trigger, (char *)NULL);
+    else if (restore && policy)
         execl(engine, engine, "--restore-policy", policy, "--restore", "--checkpoint-store", broker, trigger,
               (char *)NULL);
     else if (restore)
@@ -835,6 +908,112 @@ static void scratch_cleanup(void) {
     g_scratch_root[0] = '\0';
 }
 
+/* Kick the tree to its next safepoint. The reserved engine interrupt only forces the exit; the generation
+ * word (already bumped) is what says "checkpoint". */
+static int trigger_capture(pid_t tree) {
+    *g_trigger = *g_trigger + 1u;
+#ifdef SIGINFO
+    return kill(tree, SIGINFO);
+#else
+    return kill(tree, SIGURG);
+#endif
+}
+
+/* ---------------------------------------------------------------- cycle: capture -> restore -> CAPTURE AGAIN
+ *
+ * Every other case here restores ONCE, and a single restore cannot see a lossy capture: whatever the image
+ * failed to carry, the restored process usually still runs. Checkpointing the RESTORED tree closes that --
+ * the second image is written from state that only the first restore reconstructed, so anything the capture
+ * dropped is missing from the second image too, and the third launch is what notices.
+ *
+ * The fixture (tests/e2e/checkpoint_cycle.c) makes both halves observable in its output: it prints BOOT once
+ * per genuinely fresh process -- it forks, so exactly two -- and each STAGE line carries a counter it only
+ * ever advances while running. A third BOOT line means a restore relaunched a process instead of resuming it;
+ * a counter that did not grow across a stage means the restored process was not the one that had been running.
+ */
+static const char *const CYCLE_ROLES[2] = {"parent", "child"};
+
+static int run_cycle_case(const char *capture_engine, const char *restore_engine, const char *guest,
+                          const char *release, const char *output) {
+    char go[2][560];
+    unsigned long counter[2][3];
+    pid_t child;
+    int fd, result, stage, role;
+    for (stage = 0; stage < 2; stage++) snprintf(go[stage], sizeof go[0], "%s.go%d", release, stage + 1);
+
+    /* Stage 1: a fresh two-process tree, captured where both halves wait for .go1. */
+    child = launch(capture_engine, guest, release, output, LAUNCH_CAPTURE, NULL, NULL);
+    if (child < 0) return 3;
+    if (wait_for_output_count(output, "STAGE parent 1 ", 1, case_deadline()) != 0 ||
+        wait_for_output_count(output, "STAGE child 1 ", 1, case_deadline()) != 0) {
+        fprintf(stderr, "checkpoint cycle: tree never reached stage 1\n");
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        return 3;
+    }
+    if (trigger_capture(child) != 0) return 5;
+    result = wait_child(child, case_deadline());
+    if (result != 0 || wait_for_commit(case_deadline()) != 0) {
+        fprintf(stderr, "checkpoint cycle: first capture result=%d committed=%d\n", result, g_store_committed);
+        return 6;
+    }
+
+    /* Stage 2: restore that image with capture RE-ARMED, let the guest advance one stage, capture again.
+     * The store is emptied first, so the second image cannot inherit a single object from the first. */
+    store_reset_channels();
+    child = launch(restore_engine, guest, release, output, LAUNCH_RESTORE_RECAPTURE, NULL, NULL);
+    if (child < 0) return 8;
+    fd = open(go[0], O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0 || fsync(fd) != 0) return 7;
+    close(fd);
+    if (wait_for_output_count(output, "STAGE parent 2 ", 1, case_deadline()) != 0 ||
+        wait_for_output_count(output, "STAGE child 2 ", 1, case_deadline()) != 0) {
+        fprintf(stderr, "checkpoint cycle: restored tree never reached stage 2\n");
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        return 9;
+    }
+    store_reset_image();
+    if (trigger_capture(child) != 0) return 5;
+    result = wait_child(child, case_deadline());
+    if (result != 0 || wait_for_commit(case_deadline()) != 0) {
+        fprintf(stderr, "checkpoint cycle: second capture result=%d committed=%d\n", result, g_store_committed);
+        return 10;
+    }
+
+    /* Stage 3: restore the SECOND image and run the guest out. */
+    store_reset_channels();
+    child = launch(restore_engine, guest, release, output, LAUNCH_RESTORE, NULL, NULL);
+    if (child < 0) return 11;
+    fd = open(go[1], O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0 || fsync(fd) != 0) return 7;
+    close(fd);
+    result = wait_child(child, case_deadline());
+    if (result != 0 || wait_for_output_count(output, "CYCLE-RESTORED ", 2, case_deadline()) != 0) {
+        fprintf(stderr, "checkpoint cycle: second restore result=%d finished=%d\n", result,
+                output_count(output, "CYCLE-RESTORED "));
+        return 12;
+    }
+    if (output_count(output, "BOOT ") != 2) {
+        fprintf(stderr, "checkpoint cycle: %d BOOT lines, expected 2 -- a restore relaunched a process\n",
+                output_count(output, "BOOT "));
+        return 13;
+    }
+    for (role = 0; role < 2; role++)
+        for (stage = 0; stage < 3; stage++)
+            counter[role][stage] = output_stage_counter(output, CYCLE_ROLES[role], stage + 1);
+    for (role = 0; role < 2; role++)
+        if (counter[role][0] == 0 || counter[role][1] <= counter[role][0] ||
+            counter[role][2] <= counter[role][1]) {
+            fprintf(stderr, "checkpoint cycle: %s stage counters %lu %lu %lu are not strictly increasing\n",
+                    CYCLE_ROLES[role], counter[role][0], counter[role][1], counter[role][2]);
+            return 14;
+        }
+    printf("checkpoint cycle restore: ok (parent %lu->%lu->%lu, child %lu->%lu->%lu)\n", counter[0][0],
+           counter[0][1], counter[0][2], counter[1][0], counter[1][1], counter[1][2]);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     char temporary[1024];
     char output[512], release[512], release_error[520];
@@ -843,6 +1022,8 @@ int main(int argc, char **argv) {
     int pipe_case = argc == 4 && strcmp(argv[3], "pipe") == 0;
     int deleted_case = argc == 4 && strcmp(argv[3], "deleted") == 0;
     int threads_case = argc == 4 && strcmp(argv[3], "threads") == 0;
+    int cycle_case = argc == 4 && strcmp(argv[3], "cycle") == 0;
+    int handler_case = argc == 4 && strcmp(argv[3], "handler") == 0;
     int memfd_case = argc == 4 && strcmp(argv[3], "memfd") == 0;
     int eventfd_case = argc == 4 && strcmp(argv[3], "eventfd") == 0;
     int timerfd_case = argc == 4 && strcmp(argv[3], "timerfd") == 0;
@@ -873,13 +1054,19 @@ int main(int argc, char **argv) {
                                 !strcmp(argv[3], "io-fifo-refusal") ||
                                 !strcmp(argv[3], "io-queued-device") || !strcmp(argv[3], "io-queued-missing"));
     const char *capture_engine = argv[1];
+    /* Cross-backend restore: the engine that reads the image back need not be the one that wrote it --
+     * struct cpu IS the format, precisely so the interpreter and the JIT can read each other's guest
+     * state. Overriding only the restore side is what makes that testable from one runner. */
+    const char *restore_engine = getenv("HL_CHECKPOINT_RESTORE_ENGINE");
+    if (restore_engine == NULL || restore_engine[0] == 0) restore_engine = argv[1];
     const char *guest_mode = io_case ? argv[3] + 3 : NULL;
     int io_capture_refusal = io_case && !strcmp(guest_mode, "fifo-refusal");
     int io_strict_restore = io_case && !strcmp(guest_mode, "missing-child-strict");
     /* Same image as the strict case, restored with no policy at all: the default must prune, not refuse. */
     int io_default_restore = io_case && !strcmp(guest_mode, "missing-child-default");
     if (io_case && !io_capture_refusal && !io_strict_restore && !io_default_restore) permissive_case = 1;
-    if ((argc != 3 && !pipe_case && !deleted_case && !threads_case && !memfd_case && !eventfd_case &&
+    if ((argc != 3 && !pipe_case && !deleted_case && !threads_case && !cycle_case && !handler_case &&
+         !memfd_case && !eventfd_case &&
          !timerfd_case && !inotify_case && !epoll_case && !socketpair_case && !socket_state_case &&
          !connected_socket_case && !signal_case && !connecting_refusal_case && !connecting_fallback_case && !corrupt_magic_case &&
          !corrupt_truncated_case && !corrupt_content_case && !corrupt_missing_case && !corrupt_extra_case &&
@@ -888,6 +1075,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: checkpoint-tree-runner ENGINE GUEST [SCENARIO]\n");
         return 2;
     }
+    /* Before the first launch, so a malformed scale is one line at the top of the log, not a verdict. */
+    if (load_timeout_scale() != 0) return 2;
     {
         const char *root = scratch_root();
         if (root == NULL) return 2;
@@ -914,10 +1103,12 @@ int main(int argc, char **argv) {
     snprintf(release_error, sizeof release_error, "%s.error", release);
 
     if (store_channel_open() != 0) return 2;
+    /* Three launches and two captures, none of which fit the single-capture flow below. */
+    if (cycle_case) return run_cycle_case(capture_engine, restore_engine, argv[2], release, output);
     child = launch(capture_engine, argv[2], release, output, 0,
                    permissive_case ? "discard-optional" : NULL, guest_mode);
     if (child < 0) return 3;
-    if (wait_for_ready(output, (deleted_case || threads_case || memfd_case || inotify_case || epoll_case ||
+    if (wait_for_ready(output, (deleted_case || threads_case || handler_case || memfd_case || inotify_case || epoll_case ||
                                 signal_case || connecting_refusal_case || connecting_fallback_case || modified_external_case ||
                                 (io_case && strcmp(guest_mode, "type-change") && strcmp(guest_mode, "permission") &&
                                  strcmp(guest_mode, "directory-change") && strcmp(guest_mode, "missing-child-strict") &&
@@ -925,20 +1116,15 @@ int main(int argc, char **argv) {
                                    (socketpair_case || connected_socket_case) ? 2 : socket_state_case ? 1 :
                                    (pipe_case || eventfd_case || timerfd_case || permissive_case || io_strict_restore ||
                                     io_default_restore) ? 2 : 3,
-                       time(NULL) + TIMEOUT_SECONDS) != 0) {
+                       case_deadline()) != 0) {
         fprintf(stderr, "checkpoint runner: readiness timeout one=%d two=%d three=%d\n",
                 output_has(output, "READY 1"), output_has(output, "READY 2"), output_has(output, "READY 3"));
         kill(child, SIGKILL);
         waitpid(child, NULL, 0);
         return 3;
     }
-    *g_trigger = *g_trigger + 1u;
-#ifdef SIGINFO
-    if (kill(child, SIGINFO) != 0) return 5;
-#else
-    if (kill(child, SIGURG) != 0) return 5;
-#endif
-    result = wait_child(child, time(NULL) + TIMEOUT_SECONDS);
+    if (trigger_capture(child) != 0) return 5;
+    result = wait_child(child, case_deadline());
     if (io_capture_refusal) {
         if (result != 70 || g_store_committed || !output_has(output, "incomplete")) return 6;
         printf("checkpoint io named-fifo refusal: ok\n");
@@ -953,7 +1139,7 @@ int main(int argc, char **argv) {
         printf("checkpoint connecting-socket refusal: ok\n");
         return 0;
     }
-    if (result != 0 || wait_for_commit(time(NULL) + TIMEOUT_SECONDS) != 0) return 6;
+    if (result != 0 || wait_for_commit(case_deadline()) != 0) return 6;
 
     if (permissive_case && !connecting_fallback_case && !io_case) {
         char external[640];
@@ -1019,12 +1205,12 @@ int main(int argc, char **argv) {
     if (corrupt_missing_case && store_remove("proc.1/signals") != 0) return 7;
     if (corrupt_extra_case && store_add("unexpected", "unexpected", 10) != 0) return 7;
     store_reset_channels();
-    child = launch(argv[1], argv[2], release, output, 1,
+    child = launch(restore_engine, argv[2], release, output, 1,
                    io_strict_restore ? "refuse" : permissive_case ? "discard-optional" : NULL, NULL);
     if (child < 0) return 8;
-    result = wait_child(child, time(NULL) + TIMEOUT_SECONDS);
+    result = wait_child(child, case_deadline());
     if (io_default_restore) {
-        if (result != 0 || wait_for_output(output, "IO-PARENT-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
+        if (result != 0 || wait_for_output(output, "IO-PARENT-RESTORED", case_deadline()) != 0 ||
             output_has(output, "IO-CHILD-RESTORED") || !store_has("RECOVERY.jsonl", "\"outcome\":\"stopped\"") ||
             !store_has("RECOVERY.jsonl", "required external")) {
             fprintf(stderr,
@@ -1071,7 +1257,7 @@ int main(int argc, char **argv) {
         char marker[128];
         if (!strcmp(guest_mode, "type-change") || !strcmp(guest_mode, "permission") ||
             !strcmp(guest_mode, "directory-change")) {
-            if (wait_for_output(output, "IO-PARENT-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
+            if (wait_for_output(output, "IO-PARENT-RESTORED", case_deadline()) != 0 ||
                 output_has(output, "IO-CHILD-RESTORED") ||
                 !store_has("RECOVERY.jsonl", "\"outcome\":\"stopped\""))
                 return 9;
@@ -1079,38 +1265,45 @@ int main(int argc, char **argv) {
             snprintf(marker, sizeof marker, "IO-%s-RESTORED", guest_mode);
             for (char *p = marker; *p; ++p)
                 if (*p >= 'a' && *p <= 'z') *p = (char)(*p - 'a' + 'A');
-            if (wait_for_output(output, marker, time(NULL) + TIMEOUT_SECONDS) != 0 ||
+            if (wait_for_output(output, marker, case_deadline()) != 0 ||
                 !store_has("RECOVERY.jsonl", "\"outcome\":\"reconnected\""))
                 return 9;
         }
         if (!strcmp(guest_mode, "repeat")) {
             store_reset_channels();
-            child = launch(argv[1], argv[2], release, output, 1,
+            child = launch(restore_engine, argv[2], release, output, 1,
                            permissive_case ? "discard-optional" : NULL, NULL);
-            if (child < 0 || wait_child(child, time(NULL) + TIMEOUT_SECONDS) != 0 ||
-                wait_for_output_count(output, "IO-REPEAT-RESTORED", 2, time(NULL) + TIMEOUT_SECONDS) != 0)
+            if (child < 0 || wait_child(child, case_deadline()) != 0 ||
+                wait_for_output_count(output, "IO-REPEAT-RESTORED", 2, case_deadline()) != 0)
                 return 9;
         }
         printf("checkpoint io %s: ok\n", guest_mode);
         return 0;
     }
     if (connecting_fallback_case) {
-        if (wait_for_output(output, "CONNECTING-FALLBACK-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
+        if (wait_for_output(output, "CONNECTING-FALLBACK-RESTORED", case_deadline()) != 0 ||
             !store_has("RECOVERY.jsonl", "\"outcome\":\"reconnected\""))
             return 9;
         printf("checkpoint connecting-socket fallback: ok\n");
         return 0;
     }
     if (permissive_case) {
-        if (wait_for_output(output, "PARENT-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
+        if (wait_for_output(output, "PARENT-RESTORED", case_deadline()) != 0 ||
             output_has(output, "CHILD-RESTORED") ||
             !store_has("RECOVERY.jsonl", "\"outcome\":\"stopped\"") || !store_has("RECOVERY.jsonl", "required external path"))
             return 9;
         printf("checkpoint missing-external pruning: ok\n");
         return 0;
     }
+    if (handler_case) {
+        /* The frame the capture froze was a signal handler's; the guest reports the marker only once it has
+         * returned from it into the interrupted main flow with both halves' state intact. */
+        if (wait_for_output(output, "HANDLER-RESTORED ", case_deadline()) != 0) return 9;
+        printf("checkpoint signal-handler restore: ok\n");
+        return 0;
+    }
     if (modified_external_case) {
-        if (wait_for_output(output, "MODIFIED-EXTERNAL-RESTORED", time(NULL) + TIMEOUT_SECONDS) != 0 ||
+        if (wait_for_output(output, "MODIFIED-EXTERNAL-RESTORED", case_deadline()) != 0 ||
             !store_has("RECOVERY.jsonl", "\"outcome\":\"reconnected\""))
             return 9;
         printf("checkpoint modified-external current-state restore: ok\n");
@@ -1119,7 +1312,7 @@ int main(int argc, char **argv) {
     if (wait_for_restored(output, pipe_case, deleted_case, threads_case, memfd_case, eventfd_case, timerfd_case,
                           signal_case ? 6 : connected_socket_case ? 5 : socket_state_case ? 4 : socketpair_case ? 3 :
                           epoll_case ? 2 : inotify_case,
-                          time(NULL) + TIMEOUT_SECONDS) != 0)
+                          case_deadline()) != 0)
         return 9;
     printf("checkpoint %s restore: ok\n",
            signal_case ? "signal" : connected_socket_case ? "connected-socket" : socket_state_case ? "socket-state" :

@@ -7,7 +7,14 @@ typedef struct hl_host_child_watch {
     int read_descriptor;
     int write_descriptor;
     int active;
+    /* The SIGCHLD disposition this watch displaced, so close() can put it back.
+     * Absent on a host with no sigaction: struct sigaction is not merely
+     * unimplemented there, it is undeclared, and an incomplete member would make
+     * this whole structure unusable rather than one field unavailable. Nothing
+     * outside the POSIX implementation reads it. */
+#if !defined(_WIN32)
     struct sigaction previous;
+#endif
 } hl_host_child_watch;
 
 int hl_host_child_watch_init(hl_host_child_watch *watch);

@@ -174,7 +174,7 @@ static long seccomp_install_filter(uint64_t fprog_ptr, uint32_t flags) {
     /* sock_fprog contains a second guest pointer.  Static ET_EXEC guests may
      * embed its low link address even after the outer syscall argument was
      * rebased, so translate the nested pointer by the same image model. */
-    if (g_nonpie_lo && insn_ptr >= g_nonpie_lo && insn_ptr < g_nonpie_hi) insn_ptr += g_nonpie_bias;
+    insn_ptr = nonpie_fold(insn_ptr);
     if (len == 0 || len > HL_LINUX_BPF_MAXINSNS) return -EINVAL;
     if (!insn_ptr) return -EFAULT;
     size_t bytes = (size_t)len * sizeof(struct hl_linux_sock_filter);

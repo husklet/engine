@@ -416,7 +416,7 @@ static void overlay_mkparents(const char *guest) {
                 char lo[4300];
                 layer_follow(g_lower[i].canon, g_lower[i].clen, acc, lo, sizeof lo, 0);
                 if (lstat(lo, &st) == 0 && S_ISDIR(st.st_mode)) {
-                    if (mkdir(up, st.st_mode & 0777) == 0) made = 1;
+                    if (hl_compat_mkdir(up, st.st_mode & 0777) == 0) made = 1;
                     break;
                 }
             }
@@ -453,7 +453,8 @@ static void ovl_copy_xattrs(const char *src, const char *dst) {
 // Apply the lower's mode (incl S_ISUID/S_ISGID/S_ISVTX), atime/mtime and xattrs to a copied-up inode.
 static void ovl_copy_meta(const char *src, const char *dst, const struct stat *st) {
     chmod(dst, st->st_mode & 07777);
-    struct timespec ts[2] = {st->st_atimespec, st->st_mtimespec};
+    struct timespec ts[2] = {{(time_t)HL_HOST_STAT_ATIME_SEC(st), (long)HL_HOST_STAT_ATIME_NSEC(st)},
+                             {(time_t)HL_HOST_STAT_MTIME_SEC(st), (long)HL_HOST_STAT_MTIME_NSEC(st)}};
     utimensat(AT_FDCWD, dst, ts, AT_SYMLINK_NOFOLLOW);
     ovl_copy_xattrs(src, dst);
 }
@@ -555,7 +556,7 @@ static void overlay_copyup(const char *guest, char *host, size_t hn) {
             if (lstat(lp, &ds) == 0) {
                 if (S_ISDIR(ds.st_mode)) {
                     overlay_mkparents(guest);
-                    if (mkdir(up, ds.st_mode & 0777) == 0) hl_fdcache_resolution_bump(); // upper dir materialized
+                    if (hl_compat_mkdir(up, ds.st_mode & 0777) == 0) hl_fdcache_resolution_bump(); // upper dir materialized
                     return;
                 }
                 break; // lower provides it as a non-dir (symlink/special): leave to the caller's fallback
@@ -576,10 +577,10 @@ static void overlay_copyup(const char *guest, char *host, size_t hn) {
         for (char *q = dir + g_rootfs_canon_len + 1; *q; q++)
             if (*q == '/') {
                 *q = 0;
-                mkdir(dir, 0755);
+                hl_compat_mkdir(dir, 0755);
                 *q = '/';
             }
-        mkdir(dir, 0755);
+        hl_compat_mkdir(dir, 0755);
     }
     int in = open(src, O_RDONLY),
         // copy lower -> upper (full mode incl setuid/setgid/sticky; fchmod below is authoritative past umask)
@@ -630,7 +631,7 @@ static void overlay_copyup_tree(const char *guest) {
     overlay_mkparents(guest);
     xresolve_exec(guest, up, sizeof up);
     struct stat ust;
-    if (lstat(up, &ust) != 0 && mkdir(up, lst.st_mode & 0777) == 0)
+    if (lstat(up, &ust) != 0 && hl_compat_mkdir(up, lst.st_mode & 0777) == 0)
         hl_fdcache_resolution_bump(); // directory appeared in the upper
     ovl_copy_meta(lo, up, &lst);
     DIR *d = opendir(lo);
@@ -967,10 +968,10 @@ static void overlay_whiteout(const char *guest) {
         for (char *q = dir + g_rootfs_canon_len + 1; *q; q++)
             if (*q == '/') {
                 *q = 0;
-                mkdir(dir, 0755);
+                hl_compat_mkdir(dir, 0755);
                 *q = '/';
             }
-        mkdir(dir, 0755);
+        hl_compat_mkdir(dir, 0755);
     }
     (void)hl_host_file_create(&g_jit_services, wh, 0644);
     // Invalidate the directory verdict and negative caches so no pre-removal

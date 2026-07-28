@@ -1,9 +1,14 @@
-#![cfg(target_os = "linux")]
 //! Capture and restore an INTERACTIVE shell that owns a PTY.
 //!
 //! Linux hosts only: the guest is the host's own `/bin/bash`, a real aarch64 Linux ELF there and a Mach-O on
 //! darwin. None of the committed rootfs assets carries a bash, so the darwin half of this case waits for one;
-//! the fix it covers is host-independent and its Linux and macOS halves share one code path.
+//! the fix it covers is host-independent and its Linux and macOS halves share one code path. Windows has no
+//! `/bin/bash` at all, and no engine to run one with.
+//!
+//! This used to be a crate-level `#![cfg(target_os = "linux")]`, which compiled the file away to an empty
+//! test binary on every other host: three tests that simply were not there, reported as a clean run. The gate
+//! is now a runtime one in [`round_trip`], so those hosts say out loud which three tests they are not running
+//! and why.
 //!
 //! This is the shape a terminal embedder actually runs -- `bash -il` on a pty, job control on, parked in
 //! `read(2)` on its terminal at the prompt -- and it is exactly the shape that used to be uncapturable.
@@ -251,6 +256,14 @@ fn probe_terminal_state(session: &Session, tag: &str) -> Observed {
 /// `foreground` runs one command in the shell's foreground before the capture, so the restored tree has a
 /// real job to come back to; `interrupt` is sent after the restore to end it.
 fn round_trip(foreground: Option<&str>, interrupt: bool) -> bool {
+    if !cfg!(target_os = "linux") {
+        eprintln!(
+            "SKIP an_interactive_shell_on_a_pty_round_trips: the guest is the HOST's own {SHELL}, \
+             which is an aarch64 Linux ELF on Linux and something the engine cannot load anywhere \
+             else; no committed rootfs fixture carries a bash to use instead"
+        );
+        return true;
+    }
     if checkpoint_env::skip_if_unavailable("an_interactive_shell_on_a_pty_round_trips") {
         return true;
     }
