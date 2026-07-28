@@ -250,7 +250,7 @@ static int decode_bytes(const uint8_t bytes[15], hl_x86_insn *I) {
             I->rm_reg = I->rm | (I->rexB << 3);
         } else {
             I->is_mem = 1;
-            int base = I->rm, idx = -1, scale = 0;
+            int base, idx = -1, scale = 0;
             if (I->rm == 4) { // SIB
                 uint8_t s = p[n++];
                 scale = s >> 6;

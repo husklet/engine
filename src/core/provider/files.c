@@ -173,9 +173,14 @@ static hl_host_result provider_read_at(void *context, hl_host_handle file, uint6
     put64(payload + 9, offset);
     put32(payload + 17, (uint32_t)output.size);
     result = request(payload, sizeof(payload), &reply);
-    if (result.status == HL_STATUS_OK && (reply.size < 5 || reply.bytes[0] != OP_READ ||
-                                          (size = get32(reply.bytes + 1)) > output.size || reply.size != 5 + size))
-        result = failure(EPROTO);
+    if (result.status == HL_STATUS_OK) {
+        if (reply.size < 5 || reply.bytes[0] != OP_READ) {
+            result = failure(EPROTO);
+        } else {
+            size = get32(reply.bytes + 1);
+            if (size > output.size || reply.size != 5u + size) result = failure(EPROTO);
+        }
+    }
     if (result.status == HL_STATUS_OK) {
         memcpy(output.data, reply.bytes + 5, size);
         result.value = size;

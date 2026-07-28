@@ -434,7 +434,6 @@ int hl_provider_demux_create(hl_provider_demux **out, int fd, uint32_t max_paylo
         d->subscriptions[i].storage =
             (unsigned char *)d + event_storage_offset + (size_t)i * event_capacity * max_event_payload;
     }
-    i = 0;
     d->descriptor = fd;
     d->maximum_payload = max_payload;
     d->maximum_event_payload = max_event_payload;
@@ -744,7 +743,7 @@ int hl_provider_demux_subscribe_remote(hl_provider_demux *d, uint64_t id, const 
                                        hl_provider_wake_fn wake, void *context) {
     int status, first = 1;
     uint32_t i;
-    if (bytes == NULL || size == 0 || (d != NULL && size > d->maximum_payload)) return -EINVAL;
+    if (d == NULL || bytes == NULL || size == 0 || size > d->maximum_payload) return -EINVAL;
     status = ensure_reader(d);
     if (status != 0) return status;
     status = hl_provider_demux_subscribe(d, id, wake, context);

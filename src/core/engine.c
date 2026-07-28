@@ -146,7 +146,10 @@ static int hl_engine_environment_valid(const char *environment) {
         while (offset < HL_ENGINE_STRING_LIMIT && environment[offset] != 0 && environment[offset] != '\n')
             ++offset;
         if (offset == HL_ENGINE_STRING_LIMIT) return 0;
-        if (environment[offset] == '\n' && environment[++offset] == 0) return 0;
+        if (environment[offset] == '\n') {
+            ++offset;
+            if (environment[offset] == 0) return 0;
+        }
     }
     return offset < HL_ENGINE_STRING_LIMIT;
 }
