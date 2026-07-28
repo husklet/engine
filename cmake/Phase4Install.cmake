@@ -50,13 +50,12 @@ endif()
 # --- the runner: a `make all` product and an installed binary ---------------
 add_executable(hl-engine-runner src/runner/main.c)
 target_link_libraries(hl-engine-runner PRIVATE hl_engine_cflags)
-# These three archives are mutually recursive, so GNU ld needs an explicit
-# --start-group/--end-group (LINK_GROUP RESCAN). Apple's linker does not support
-# that feature -- and does not need it, since it rescans archives to a fixed
-# point on its own -- so a Darwin link takes the plain list instead. Using
-# LINK_GROUP unconditionally made a macOS configure fail outright with
-# "Feature 'RESCAN' ... is not supported for the 'C' link language".
-if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+# These three archives are mutually recursive, so a linker that makes a single
+# pass needs an explicit --start-group/--end-group (LINK_GROUP RESCAN); one that
+# rescans to a fixed point on its own rejects the feature outright and takes the
+# plain list instead. HL_LINK_GROUP_RESCAN in CMakeLists.txt is that decision,
+# made once for the three sites that need it.
+if(NOT HL_LINK_GROUP_RESCAN)
   target_link_libraries(hl-engine-runner PRIVATE hl-engine hl-translator hl-linux-abi)
 else()
   target_link_libraries(hl-engine-runner PRIVATE

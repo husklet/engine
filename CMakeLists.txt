@@ -251,6 +251,7 @@ set(WINDOWS_HOST_SOURCES
   src/host/windows/range.c src/host/windows/system.c src/host/windows/directory.c
   src/host/windows/child.c src/host/windows/fork_wire.c
   src/host/windows/counter.c src/host/windows/event.c src/host/windows/stream.c
+  src/host/windows/socket.c
   src/host/windows/private.c src/host/windows/resolve.c src/host/windows/math.c
   src/host/range.c src/host/file.c src/host/clock.c src/host/sync.c)
 
