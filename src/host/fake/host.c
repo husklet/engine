@@ -1587,7 +1587,7 @@ void hl_fake_host_block_process_wait(hl_fake_host *fake, uint32_t block) {
  * the real host/private.c), so these cannot shadow the real implementations. Registering a private
  * descriptor is a no-op for a fake host, which is the correct fake behaviour.
  *
- * ../system.h declares all three; include it so these are definitions of the declared contract rather
+ * ../system.h declares the hooks; include it so these are definitions of the declared contract rather
  * than fresh external symbols (-Wmissing-prototypes, which this tree builds with). */
 #include "../system.h"
 
@@ -1597,6 +1597,10 @@ void hl_host_private_init(void) {
 int hl_host_process_fd_private_add(int descriptor) {
     (void)descriptor;
     return 0;
+}
+
+int hl_host_process_fd_private_floor(void) {
+    return -1;
 }
 
 void hl_host_process_fd_private_remove(int descriptor) {
