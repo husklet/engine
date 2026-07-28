@@ -21,7 +21,8 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/linter/src/hl_lint.c")
 endif()
 
 add_executable(hl_lint
-  linter/src/hl_lint.c)
+  linter/src/hl_lint.c
+  linter/src/process_posix.c)
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(hl_lint PRIVATE
@@ -92,6 +93,25 @@ if(HL_BUILD_TESTS)
   set_target_properties(hl_lint_fake_analyzer PROPERTIES
     OUTPUT_NAME "hl lint fake analyzer"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+
+  add_executable(hl_lint_process_helper
+    linter/tests/process_helper.c)
+  set_target_properties(hl_lint_process_helper PROPERTIES
+    OUTPUT_NAME "hl lint process helper"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+
+  add_executable(hl_lint_process_test
+    linter/tests/test_process.c
+    linter/src/process_posix.c)
+  target_include_directories(hl_lint_process_test PRIVATE
+    "${CMAKE_SOURCE_DIR}/linter/src")
+  set_target_properties(hl_lint_process_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
+
+  add_test(NAME lint.process
+    COMMAND $<TARGET_FILE:hl_lint_process_test>
+      $<TARGET_FILE:hl_lint_process_helper>)
+  set_tests_properties(lint.process PROPERTIES LABELS "lint")
 
   add_test(NAME lint.clang-tidy-argv
     COMMAND $<TARGET_FILE:hl_lint>

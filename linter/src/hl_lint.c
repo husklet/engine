@@ -14,7 +14,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
+
+#include "process.h"
 
 typedef struct {
     char **items;
@@ -106,28 +107,6 @@ static char *xdup_format(const char *fmt, ...) {
     return buf;
 }
 
-static char *shell_quote(const char *value) {
-    size_t len = 0;
-    for (const char *p = value; *p; p++) {
-        len += (*p == '\'') ? 4 : 1;
-    }
-    char *out = malloc(len + 3);
-    if (!out) return NULL;
-    size_t i = 0;
-    out[i++] = '\'';
-    for (const char *p = value; *p; p++) {
-        if (*p == '\'') {
-            memcpy(&out[i], "'\\''", 4);
-            i += 4;
-        } else {
-            out[i++] = *p;
-        }
-    }
-    out[i++] = '\'';
-    out[i] = '\0';
-    return out;
-}
-
 static const char *skip_space(const char *s) {
     while (*s && isspace((unsigned char)*s)) s++;
     return s;
@@ -211,41 +190,30 @@ static void emit_diag(const char *severity, const char *path, int line, int col,
     }
 }
 
-static void update_stats_from_line(LintStats *stats, const char *line, const char *fallback_tag) {
-    if (strstr(line, "error:") || strstr(line, "fatal error:") || strstr(line, "critical:")) {
-        stats->errors++;
-    } else if (strstr(line, "warning:") || strstr(line, "warning [") || strstr(line, "warning ]")) {
-        stats->warnings++;
-    } else if (strstr(line, "note:") || strstr(line, "info:")) {
-        stats->warnings++;
-    } else {
-        (void)fallback_tag;
-        // keep passthrough-only lines non-counted unless they fail the process.
-    }
-}
-
-static int run_command_lines(const char *label, const char *command, LintStats *stats, bool accumulate_stats) {
-    FILE *pipe = popen(command, "r");
-    if (!pipe) {
-        fprintf(stdout, "%s: failed to execute `%s`\n", label, command);
+static int run_command_argv(const char *label, const char *const argv[],
+                            LintStats *stats) {
+    HlLintProcessResult result;
+    if (hl_lint_process_run(argv, 0, &result) != 0) {
+        fprintf(stdout, "error: %s failed to execute: %s\n", label,
+                strerror(result.platform_error));
         stats->errors++;
         return 1;
     }
-
-    char line[8192];
-    while (fgets(line, sizeof(line), pipe)) {
-        fputs(line, stdout);
-        if (accumulate_stats) update_stats_from_line(stats, line, label);
+    if (result.output_size > 0) {
+        fwrite(result.output, 1, result.output_size, stdout);
     }
-
-    int rc = pclose(pipe);
-    if (rc == -1) {
+    if (result.output_truncated) {
+        fprintf(stdout, "warn: %s output truncated\n", label);
+    }
+    int rc = result.exit_code;
+    if (result.term_signal != 0) {
+        fprintf(stdout, "error: %s terminated by signal %d\n", label,
+                result.term_signal);
         stats->errors++;
-        return 1;
+        rc = 1;
     }
-    if (WIFEXITED(rc)) return WEXITSTATUS(rc);
-    stats->errors++;
-    return 1;
+    hl_lint_process_result_destroy(&result);
+    return rc;
 }
 
 static int run_clang_format(const LintConfig *cfg, const StringList *files, LintStats *stats) {
@@ -263,23 +231,16 @@ static int run_clang_format(const LintConfig *cfg, const StringList *files, Lint
 
     for (size_t i = 0; i < files->count; i++) {
         const char *file = files->items[i];
-        char *qbin = shell_quote(cfg->clang_format_bin);
-        char *qfile = shell_quote(file);
-        if (!qbin || !qfile) {
-            free(qbin);
-            free(qfile);
-            return 1;
-        }
-        char *cmd = xdup_format("%s --dry-run --Werror --style=file --ferror-limit=1 %s 2>&1",
-                                qbin, qfile);
-        free(qbin);
-        free(qfile);
-        if (!cmd) {
-            fprintf(stdout, "error: out of memory building clang-format command\n");
-            free(cmd);
-            return 1;
-        }
-        int c = run_command_lines("clang-format", cmd, stats, false);
+        const char *const argv[] = {
+            cfg->clang_format_bin,
+            "--dry-run",
+            "--Werror",
+            "--style=file",
+            "--ferror-limit=1",
+            file,
+            NULL
+        };
+        int c = run_command_argv("clang-format", argv, stats);
         if (c != 0) {
             if (cfg->strict) {
                 emit_diag("error", file, 0, 0, "clang-format", "formatting violation");
@@ -290,7 +251,6 @@ static int run_clang_format(const LintConfig *cfg, const StringList *files, Lint
                 stats->warnings++;
             }
         }
-        free(cmd);
         if (cfg->strict && rc != 0) return 1;
         if (cfg->strict) rc = (rc != 0) ? rc : c;
         else rc = 0;
@@ -330,32 +290,28 @@ static int run_clang_tidy(const LintConfig *cfg, const StringList *files, LintSt
     for (size_t i = 0; i < files->count; i++) {
         const char *file = files->items[i];
         if (!has_ext(file, ".c")) continue;
-        char *qbin = shell_quote(cfg->clang_tidy_bin);
-        char *qfile = shell_quote(file);
-        if (!qbin || !qfile) {
-            free(qbin);
-            free(qfile);
-            return 1;
-        }
-        char *qdb = shell_quote(cfg->compile_db_dir);
-        if (!qdb) {
-            free(qbin);
-            free(qfile);
-            return 1;
-        }
-        char *checks = shell_quote(cfg->clang_tidy_checks ? cfg->clang_tidy_checks : "bugprone-*,clang-analyzer-*,performance-*");
-        char *cmd = xdup_format(
-            "%s --quiet -p %s --checks=%s --extra-arg=-std=c11 --warnings-as-errors='*' %s 2>&1",
-            qbin, qdb, checks, qfile);
-        free(qbin);
-        free(qfile);
-        free(qdb);
-        free(checks);
-        if (!cmd) {
+        char *checks = xdup_format(
+            "--checks=%s",
+            cfg->clang_tidy_checks
+                ? cfg->clang_tidy_checks
+                : "bugprone-*,clang-analyzer-*,performance-*");
+        if (!checks) {
             fprintf(stdout, "error: out of memory building clang-tidy command\n");
             return 1;
         }
-        int c = run_command_lines("clang-tidy", cmd, stats, false);
+        const char *const argv[] = {
+            cfg->clang_tidy_bin,
+            "--quiet",
+            "-p",
+            cfg->compile_db_dir,
+            checks,
+            "--extra-arg=-std=c11",
+            "--warnings-as-errors=*",
+            file,
+            NULL
+        };
+        int c = run_command_argv("clang-tidy", argv, stats);
+        free(checks);
         if (c != 0) {
             emit_diag("warn", file, 0, 0, "clang-tidy", "diagnostic(s) reported");
             if (cfg->strict) {
@@ -365,7 +321,6 @@ static int run_clang_tidy(const LintConfig *cfg, const StringList *files, LintSt
             stats->warnings++;
             c = 0;
         }
-        free(cmd);
         rc = (rc != 0) ? rc : c;
     }
     return rc;
@@ -388,57 +343,29 @@ static int run_cppcheck(const LintConfig *cfg, const StringList *files, LintStat
         const char *file = files->items[i];
         if (!has_ext(file, ".c") && !has_ext(file, ".h")) continue;
 
-        size_t base_len = 0;
-        char *qbin = shell_quote(cfg->cppcheck_bin);
-        if (!qbin) {
-            return 1;
-        }
-        char *cmd = xdup_format("%s --quiet --std=c11 --enable=warning,performance,style,portability,information "
-                                "--inconclusive --suppress=missingIncludeSystem --error-exitcode=1", qbin);
-        free(qbin);
-        if (!cmd) {
+        size_t argument_count = 9 + (cfg->include_dirs.count * 2);
+        const char **argv = calloc(argument_count, sizeof *argv);
+        if (!argv) {
             fprintf(stdout, "error: out of memory building cppcheck command\n");
             return 1;
         }
-
+        size_t a = 0;
+        argv[a++] = cfg->cppcheck_bin;
+        argv[a++] = "--quiet";
+        argv[a++] = "--std=c11";
+        argv[a++] = "--enable=warning,performance,style,portability,information";
+        argv[a++] = "--inconclusive";
+        argv[a++] = "--suppress=missingIncludeSystem";
+        argv[a++] = "--error-exitcode=1";
         for (size_t d = 0; d < cfg->include_dirs.count; d++) {
-            char *qi = shell_quote(cfg->include_dirs.items[d]);
-            if (!qi) {
-                free(cmd);
-                return 1;
-            }
-            base_len = strlen(cmd);
-            size_t add_len = strlen(" -I ") + strlen(qi);
-            char *next = realloc(cmd, base_len + add_len + 1);
-            if (!next) {
-                fprintf(stdout, "error: out of memory expanding cppcheck command\n");
-                free(qi);
-                free(cmd);
-                return 1;
-            }
-            cmd = next;
-            snprintf(cmd + base_len, add_len + 1, " -I %s", qi);
-            free(qi);
+            argv[a++] = "-I";
+            argv[a++] = cfg->include_dirs.items[d];
         }
-        char *qfile = shell_quote(file);
-        if (!qfile) {
-            free(cmd);
-            return 1;
-        }
-        base_len = strlen(cmd);
-        size_t add_len = 1 + strlen(qfile) + strlen(" 2>&1");
-        char *next = realloc(cmd, base_len + add_len + 1);
-        if (!next) {
-            fprintf(stdout, "error: out of memory expanding cppcheck command\n");
-            free(qfile);
-            free(cmd);
-            return 1;
-        }
-        cmd = next;
-        snprintf(cmd + base_len, add_len + 1, " %s 2>&1", qfile);
-        free(qfile);
+        argv[a++] = file;
+        argv[a] = NULL;
 
-        int c = run_command_lines("cppcheck", cmd, stats, false);
+        int c = run_command_argv("cppcheck", argv, stats);
+        free(argv);
         if (c != 0) {
             emit_diag("warn", file, 0, 0, "cppcheck", "diagnostic(s) reported");
             if (cfg->strict) {
@@ -448,7 +375,6 @@ static int run_cppcheck(const LintConfig *cfg, const StringList *files, LintStat
             stats->warnings++;
             c = 0;
         }
-        free(cmd);
         rc = (rc != 0) ? rc : c;
     }
     return rc;
