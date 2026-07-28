@@ -49,6 +49,20 @@ elseif(HL_LINT_CASE STREQUAL "stdio-allowed")
     --strict
     --allow-stdio-file "linter/tests/stdio_fixture.c"
     --source-file "${HL_LINT_SOURCE_DIR}/linter/tests/stdio_fixture.c")
+elseif(HL_LINT_CASE STREQUAL "shell-error")
+  set(_expected 1)
+  set(_pattern "shell execution is forbidden")
+  set(_args
+    ${_common}
+    --source-file "${HL_LINT_SOURCE_DIR}/linter/tests/shell_fixture.c")
+elseif(HL_LINT_CASE STREQUAL "shell-allowed")
+  set(_expected 0)
+  set(_pattern "warnings=0 errors=0")
+  set(_args
+    ${_common}
+    --strict
+    --allow-shell-file "linter/tests/shell_fixture.c"
+    --source-file "${HL_LINT_SOURCE_DIR}/linter/tests/shell_fixture.c")
 elseif(HL_LINT_CASE STREQUAL "usage")
   set(_expected 2)
   set(_pattern "unknown option")

@@ -123,6 +123,7 @@ endforeach()
 foreach(_cli_file IN LISTS _hl_lint_cli_stdio_files)
   list(APPEND _hl_lint_args --allow-stdio-file "${_cli_file}")
 endforeach()
+list(APPEND _hl_lint_args --allow-shell-file "tools/bench_runner.c")
 
 add_custom_target(hl-lint
   COMMAND $<TARGET_FILE:hl_lint> ${_hl_lint_args}
@@ -185,7 +186,7 @@ if(HL_BUILD_TESTS)
     PASS_REGULAR_EXPRESSION "fake-analyzer: cppcheck argv ok")
 
   foreach(_case IN ITEMS clean warning-nonstrict warning-strict error
-      stdio-error stdio-allowed usage)
+      stdio-error stdio-allowed shell-error shell-allowed usage)
     add_test(NAME lint.exit-${_case}
       COMMAND "${CMAKE_COMMAND}"
         -DHL_LINT=$<TARGET_FILE:hl_lint>
