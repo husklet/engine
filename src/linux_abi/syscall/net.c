@@ -42,7 +42,7 @@ static size_t udp_dgram_maxlen(int fd) {
 // fails EADDRINUSE (breaks dual-stack servers like MariaDB that bind :: v6-only + 0.0.0.0 separately).
 // Map the known ones; ignore (-1) unknown rather than pass a Linux number straight to macOS IPPROTO_IPV6.
 static int ip6_opt_l2m(int o) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     return o;
 #else
     switch (o) {
@@ -66,7 +66,7 @@ static int ip6_opt_l2m(int o) {
 // (int TOS/TTL/HDRINCL/loop/mcast-ttl, in_addr mcast-if, ip_mreq membership); ignore (-1) unknown / no-mac-
 // equivalent ones (IP_PKTINFO/IP_MTU_DISCOVER/IP_RECVERR/IP_FREEBIND: no macOS analogue or a divergent struct).
 static int ip_opt_l2m(int o) {
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     return o;
 #else
     switch (o) {
@@ -545,8 +545,9 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // of raising SIGPIPE. Benign on healthy sockets; only sockets get it, so real pipes/FIFOs
             // keep Linux's default SIGPIPE-on-write semantics.
             (void)hl_native_set_no_sigpipe(r);
-            if (ty & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC);
-            if (ty & 0x800) fcntl(r, F_SETFL, O_NONBLOCK);
+            // One spelling on every host: on a host whose descriptor status cannot be queried the two
+            // bits live in a side record rather than in fcntl, and the caller must not have to know which.
+            hl_linux_socket_apply_type_flags(r, ty);
             if (r < HL_NFD) {
                 // AF_INET6 STREAM also gets loopback isolation (::/::1 -> private lo). a0 is the guest's
                 // Linux domain value, so test the Linux AF_INET6 (10), not the macOS one (30).
@@ -623,10 +624,8 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 fcntl(sv[1], F_SETFD, FD_CLOEXEC);
             }
             if ((int)a1 & 0x800) { // SOCK_NONBLOCK
-                int f0 = fcntl(sv[0], F_GETFL);
-                int f1 = fcntl(sv[1], F_GETFL);
-                if (f0 >= 0) fcntl(sv[0], F_SETFL, f0 | O_NONBLOCK);
-                if (f1 >= 0) fcntl(sv[1], F_SETFL, f1 | O_NONBLOCK);
+                hl_linux_socket_apply_type_flags(sv[0], SOCK_NONBLOCK);
+                hl_linux_socket_apply_type_flags(sv[1], SOCK_NONBLOCK);
             }
             // The fd pair is written straight into the guest array; a bad/unmapped destination must EFAULT
             // (and leak no fds) like Linux, not fault the engine writing the pair.
@@ -1093,8 +1092,7 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
             if (nr == 242) {
-                if ((int)a3 & 0x800) fcntl(r, F_SETFL, fcntl(r, F_GETFL) | O_NONBLOCK);
-                if ((int)a3 & 0x80000) fcntl(r, F_SETFD, FD_CLOEXEC);
+                hl_linux_socket_apply_type_flags(r, (int)a3);
             }
             if (want_peer) {
                 socklen_t gcap = a2 ? *(socklen_t *)a2 : 0;

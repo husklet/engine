@@ -2,13 +2,31 @@
  * The Windows host backend: handle table, error mapping, log, sync and the
  * constructor that assembles hl_host_services.
  *
- * Advertised: MEMORY | CLOCK | LOG | SYNC | CODE_MAPPING | FILE | PROCESS.
+ * Advertised: MEMORY | CLOCK | LOG | SYNC | CODE_MAPPING | FILE | PROCESS |
+ * COUNTER | EVENT | EVENT_TIMER | STREAM | NETWORK.
  * Omitting a bit is safe by construction -- hl_host_services_validate inspects a
  * group's pointers only when its bit is set -- and the contract's rule is that a
- * capability is advertised only when the whole group is real. stream, event,
- * counter, transfer, network, shared_memory, directory, watch and
- * posix_attachment are therefore absent rather than stubbed: a half-populated
- * table would pass validation and fail at run time.
+ * capability is advertised only when the whole group is real. transfer, network,
+ * shared_memory, directory, watch, terminal and posix_attachment are therefore
+ * absent rather than stubbed: a half-populated table would pass validation and
+ * fail at run time.
+ *
+ * NETWORK is advertised at ABI 2, all twenty callbacks over Winsock, with three
+ * typed refusals among them and each argued at its site in socket.c: a named
+ * local datagram socket (no Windows AF_UNIX datagram exists, and framing a
+ * socket a third party may connect to is not ours to do), ancillary data (no
+ * carrier at all, and a send that dropped it would report a success the peer
+ * never sees), and wait_handle (the sockets ARE waitable, but the event group
+ * does not accept them yet, so a yes would send a caller into a pollset that
+ * never wakes). ws2_32 is resolved by name on first use rather than imported --
+ * see socket.c's header for why the import table is the constraint.
+ *
+ * COUNTER, EVENT and STREAM are advertised because all ten, seven and eight of
+ * their callbacks respectively are implemented over real Windows objects, with
+ * no typed refusal among them. EVENT_TIMER is a separate bit over the same
+ * group and is advertised on its own footing: arm_timer and disarm_timer are
+ * real waitable timers, and the group's records carry the caller's token and
+ * HL_HOST_READY_TIMER exactly, which is what a POSIX guest timer is drained by.
  *
  * FILE is advertised because all 41 of its callbacks are implemented, including
  * the two -- make_fifo and set_owner -- that report a typed NOT_SUPPORTED. That
@@ -364,7 +382,9 @@ hl_status hl_host_windows_create(hl_host_windows **out_host, hl_host_services *o
     out_services->abi = HL_HOST_SERVICES_ABI;
     out_services->size = sizeof(*out_services);
     out_services->capabilities = HL_HOST_CAP_MEMORY | HL_HOST_CAP_CLOCK | HL_HOST_CAP_LOG | HL_HOST_CAP_SYNC |
-                                 HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_FILE | HL_HOST_CAP_PROCESS;
+                                 HL_HOST_CAP_CODE_MAPPING | HL_HOST_CAP_FILE | HL_HOST_CAP_PROCESS |
+                                 HL_HOST_CAP_COUNTER | HL_HOST_CAP_EVENT | HL_HOST_CAP_EVENT_TIMER |
+                                 HL_HOST_CAP_STREAM | HL_HOST_CAP_NETWORK;
     out_services->context = host;
     out_services->memory = &hl_windows_memory_services;
     out_services->clock = &hl_windows_clock_services;
@@ -372,6 +392,10 @@ hl_status hl_host_windows_create(hl_host_windows **out_host, hl_host_services *o
     out_services->sync = &sync;
     out_services->file = &hl_windows_file_services;
     out_services->process = &hl_windows_process_services;
+    out_services->counter = &hl_windows_counter_services;
+    out_services->event = &hl_windows_event_services;
+    out_services->stream = &hl_windows_stream_services;
+    out_services->network = &hl_windows_network_services;
     *out_host = host;
     return HL_STATUS_OK;
 }
@@ -379,12 +403,25 @@ hl_status hl_host_windows_create(hl_host_windows **out_host, hl_host_services *o
 void hl_host_windows_destroy(hl_host_windows *host) {
     uint32_t index;
     if (host == NULL) return;
+    /* Subscriptions first, and outside the host lock, because retiring one
+     * blocks until its thread-pool callback has finished and takes the host
+     * lock to find the next -- neither of which can happen with the table
+     * pinned. Nothing new can be subscribed: the caller is destroying. */
+    hl_windows_counter_retire_all_subscriptions(host);
     hl_windows_lock(host);
     host->destroying = 1;
     for (index = 0; index < host->handle_capacity; ++index) {
         hl_windows_handle_entry *entry = &host->handles[index];
         if (entry->kind == HL_WINDOWS_HANDLE_MAPPING)
             hl_windows_memory_destroy_entry(host, entry);
+        else if (entry->kind == HL_WINDOWS_HANDLE_COUNTER)
+            hl_windows_counter_destroy_entry(entry);
+        else if (entry->kind == HL_WINDOWS_HANDLE_STREAM)
+            hl_windows_stream_destroy_entry(entry);
+        else if (entry->kind == HL_WINDOWS_HANDLE_POLLSET)
+            hl_windows_event_destroy_entry(entry);
+        else if (entry->kind == HL_WINDOWS_HANDLE_SOCKET)
+            hl_windows_socket_destroy_entry(entry);
         else if (entry->kind != HL_WINDOWS_HANDLE_NONE && entry->object != NULL)
             CloseHandle(entry->object);
     }

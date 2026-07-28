@@ -37,7 +37,12 @@ typedef enum hl_windows_handle_kind {
     HL_WINDOWS_HANDLE_TRANSFER = 8,
     HL_WINDOWS_HANDLE_DIRECTORY = 9,
     HL_WINDOWS_HANDLE_WATCH = 10,
-    HL_WINDOWS_HANDLE_STREAM = 11
+    HL_WINDOWS_HANDLE_STREAM = 11,
+    /* A counter subscription. It is a handle kind rather than a private table
+     * because counter.unsubscribe is handed an opaque hl_host_handle and has to
+     * resolve it with the same generation and kind checks every other handle
+     * gets; a second numbering would be a second way to get that wrong. */
+    HL_WINDOWS_HANDLE_SUBSCRIPTION = 12
 } hl_windows_handle_kind;
 
 /*
@@ -106,6 +111,14 @@ typedef struct hl_windows_handle_entry {
     uint32_t process_waiters;
     uint32_t process_exit_kind; /* hl_host_process_exit_kind */
     uint64_t process_exit_value;
+    /* Group-private record for the kinds whose state does not fit a HANDLE: a
+     * counter object, a stream object, a pollset or a subscription. Those four
+     * groups share an object between several handles (duplicate aliases rather
+     * than copies), so the slot points at the object instead of owning it, and
+     * the object carries its own reference count. */
+    void *payload;
+    /* HL_HOST_TRANSFER_* rights, on HL_WINDOWS_HANDLE_COUNTER slots only. */
+    uint32_t rights;
 } hl_windows_handle_entry;
 
 /*
@@ -230,8 +243,41 @@ extern const hl_host_memory_services hl_windows_memory_services;
 extern const hl_host_clock_services hl_windows_clock_services;
 extern const hl_host_file_services hl_windows_file_services;
 extern const hl_host_process_services hl_windows_process_services;
+extern const hl_host_counter_services hl_windows_counter_services;
+extern const hl_host_event_services hl_windows_event_services;
+extern const hl_host_stream_services hl_windows_stream_services;
+extern const hl_host_network_services hl_windows_network_services;
 
 /* Tear down every mapping a destroyed host still owns. */
 void hl_windows_memory_destroy_entry(hl_host_windows *host, hl_windows_handle_entry *entry);
+/* Same, for the three groups whose slots own a reference-counted payload. Each
+ * is called under the host lock with the host already marked destroying. */
+void hl_windows_counter_destroy_entry(hl_windows_handle_entry *entry);
+void hl_windows_stream_destroy_entry(hl_windows_handle_entry *entry);
+void hl_windows_event_destroy_entry(hl_windows_handle_entry *entry);
+/* Same again for a socket slot. A socket is closed through closesocket and not
+ * CloseHandle -- the two are not interchangeable even though a SOCKET is a real
+ * kernel handle, because only the former runs the protocol's own teardown. */
+void hl_windows_socket_destroy_entry(hl_windows_handle_entry *entry);
+
+/*
+ * The borrowed handle a pollset waits on for this object, or NULL when the
+ * object has no waitable form. Called with the host lock held; the handle stays
+ * owned by the object and must not be closed by the pollset.
+ *
+ * This is what keeps event.control typed. The alternative -- handing the pollset
+ * whatever HANDLE the slot happens to hold -- would register a pipe or a file
+ * handle whose signalled state means "the last synchronous I/O on this handle
+ * finished", which is not readiness and would wake the pollset at the wrong
+ * times forever.
+ */
+HANDLE hl_windows_counter_wait_handle_locked(const hl_windows_handle_entry *entry);
+HANDLE hl_windows_stream_wait_handle_locked(const hl_windows_handle_entry *entry);
+HANDLE hl_windows_socket_wait_handle_locked(const hl_windows_handle_entry *entry);
+/* Retire every live subscription attached to a counter handle, or -- for the
+ * teardown form -- every live subscription this host owns. Both quiesce each
+ * callback before returning and must be called without the host lock held. */
+void hl_windows_counter_retire_subscriptions(hl_host_windows *host, hl_host_handle counter);
+void hl_windows_counter_retire_all_subscriptions(hl_host_windows *host);
 
 #endif

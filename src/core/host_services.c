@@ -22,6 +22,11 @@ static size_t hl_memory_abi7_size(void) {
     return offsetof(hl_host_memory_services, protect_address);
 }
 
+/* Bytes an ABI 1 network group is required to carry: everything through close. */
+static size_t hl_network_prefix_size(void) {
+    return offsetof(hl_host_network_services, listen);
+}
+
 /* Bytes an ABI 2 sync group is required to carry: everything through fork_child. */
 static size_t hl_sync_prefix_size(void) {
     return offsetof(hl_host_sync_services, park);
@@ -111,11 +116,22 @@ hl_status hl_host_services_validate(const hl_host_services *services, uint64_t r
          services->event->create == NULL || services->event->wait == NULL || services->event->wake == NULL ||
          services->event->close == NULL || services->event->arm_timer == NULL || services->event->disarm_timer == NULL))
         return HL_STATUS_ABI_MISMATCH;
-    if ((services->capabilities & HL_HOST_CAP_NETWORK) != 0 &&
-        (!hl_valid_group(services->network, HL_HOST_NETWORK_ABI, sizeof(*services->network)) ||
-         services->network->socket == NULL || services->network->bind == NULL || services->network->connect == NULL ||
-         services->network->send == NULL || services->network->receive == NULL || services->network->close == NULL))
-        return HL_STATUS_ABI_MISMATCH;
+    if ((services->capabilities & HL_HOST_CAP_NETWORK) != 0) {
+        const hl_host_network_services *network = services->network;
+        if (network == NULL || network->abi < HL_HOST_NETWORK_ABI_MIN || network->abi > HL_HOST_NETWORK_ABI ||
+            network->size < hl_network_prefix_size() || network->socket == NULL || network->bind == NULL ||
+            network->connect == NULL || network->send == NULL || network->receive == NULL || network->close == NULL)
+            return HL_STATUS_ABI_MISMATCH;
+        /* The fourteen connection, naming, option, message and readiness operations exist only from
+         * ABI 2; an ABI 1 group stops before them. */
+        if (network->abi >= HL_HOST_NETWORK_ABI &&
+            (network->size < sizeof(*network) || network->listen == NULL || network->accept == NULL ||
+             network->pair == NULL || network->shutdown == NULL || network->local_address == NULL ||
+             network->peer_address == NULL || network->get_option == NULL || network->set_option == NULL ||
+             network->send_message == NULL || network->receive_message == NULL || network->readiness == NULL ||
+             network->wait_handle == NULL || network->set_status_flags == NULL || network->duplicate == NULL))
+            return HL_STATUS_ABI_MISMATCH;
+    }
     if ((services->capabilities & HL_HOST_CAP_SHARED_MEMORY) != 0 &&
         (!hl_valid_group(services->shared_memory, HL_HOST_SHARED_MEMORY_ABI, sizeof(*services->shared_memory)) ||
          services->shared_memory->create == NULL || services->shared_memory->open == NULL ||
