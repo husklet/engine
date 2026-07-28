@@ -29,7 +29,7 @@ typedef struct {
     const char *clang_format_bin;
     const char *clang_tidy_bin;
     const char *cppcheck_bin;
-    const char *compile_db;
+    const char *compile_db_dir;
     const char *clang_tidy_checks;
     StringList allow_getenv_files;
     int max_function_lines;
@@ -304,29 +304,36 @@ static int run_clang_tidy(const LintConfig *cfg, const StringList *files, LintSt
         fprintf(stdout, "warn: skipping clang-tidy (binary not configured)\n");
         return 0;
     }
-    if (!cfg->compile_db || access(cfg->compile_db, F_OK) != 0) {
+    char *compile_db = cfg->compile_db_dir
+        ? xdup_format("%s/compile_commands.json", cfg->compile_db_dir)
+        : NULL;
+    if (!compile_db || access(compile_db, F_OK) != 0) {
         if (cfg->strict) {
-            fprintf(stdout, "error: compile database missing for clang-tidy: %s\n", cfg->compile_db ? cfg->compile_db : "<unset>");
+            fprintf(stdout, "error: compile database missing for clang-tidy: %s\n",
+                    compile_db ? compile_db : "<unset>");
             stats->errors++;
+            free(compile_db);
             return 1;
         }
         fprintf(stdout, "warn: skipping clang-tidy (missing compile db)\n");
+        free(compile_db);
         return 0;
     }
+    free(compile_db);
 
     for (size_t i = 0; i < files->count; i++) {
         const char *file = files->items[i];
         if (!has_ext(file, ".c")) continue;
         char *qfile = shell_quote(file);
         if (!qfile) return 1;
-        char *qdb = shell_quote(cfg->compile_db);
+        char *qdb = shell_quote(cfg->compile_db_dir);
         if (!qdb) {
             free(qfile);
             return 1;
         }
         char *checks = shell_quote(cfg->clang_tidy_checks ? cfg->clang_tidy_checks : "bugprone-*,clang-analyzer-*,performance-*");
         char *cmd = xdup_format(
-            "%s --quiet -p %s --checks=%s --std=c11 --warnings-as-errors='*' %s 2>&1",
+            "%s --quiet -p %s --checks=%s --extra-arg=-std=c11 --warnings-as-errors='*' %s 2>&1",
             cfg->clang_tidy_bin, qdb, checks, qfile);
         free(qfile);
         free(qdb);
@@ -383,7 +390,8 @@ static int run_cppcheck(const LintConfig *cfg, const StringList *files, LintStat
                 return 1;
             }
             base_len = strlen(cmd);
-            char *next = realloc(cmd, base_len + strlen(" -I") + strlen(qi) + 1);
+            size_t add_len = strlen(" -I ") + strlen(qi);
+            char *next = realloc(cmd, base_len + add_len + 1);
             if (!next) {
                 fprintf(stdout, "error: out of memory expanding cppcheck command\n");
                 free(qi);
@@ -391,7 +399,7 @@ static int run_cppcheck(const LintConfig *cfg, const StringList *files, LintStat
                 return 1;
             }
             cmd = next;
-            snprintf(cmd + base_len, strlen(cmd) + 1 + strlen(" -I") + strlen(qi) + 1, " -I %s", qi);
+            snprintf(cmd + base_len, add_len + 1, " -I %s", qi);
             free(qi);
         }
         char *qfile = shell_quote(file);
@@ -400,7 +408,8 @@ static int run_cppcheck(const LintConfig *cfg, const StringList *files, LintStat
             return 1;
         }
         base_len = strlen(cmd);
-        char *next = realloc(cmd, base_len + 1 + 1 + strlen(qfile) + 1 + 4);
+        size_t add_len = 1 + strlen(qfile) + strlen(" 2>&1");
+        char *next = realloc(cmd, base_len + add_len + 1);
         if (!next) {
             fprintf(stdout, "error: out of memory expanding cppcheck command\n");
             free(qfile);
@@ -408,7 +417,7 @@ static int run_cppcheck(const LintConfig *cfg, const StringList *files, LintStat
             return 1;
         }
         cmd = next;
-        snprintf(cmd + base_len, 5 + strlen(qfile) + 1, " %s 2>&1", qfile);
+        snprintf(cmd + base_len, add_len + 1, " %s 2>&1", qfile);
         free(qfile);
 
         int c = run_command_lines("cppcheck", cmd, stats, false);
@@ -714,7 +723,7 @@ static void print_usage(const char *prog) {
     fprintf(stdout, "  --source-dir PATH         add recursive source directory (default: src)\n");
     fprintf(stdout, "  --source-file PATH        add explicit source file\n");
     fprintf(stdout, "  --include-dir PATH        add include directory for cppcheck\n");
-    fprintf(stdout, "  --compile-commands PATH   path to compile_commands.json for clang-tidy\n");
+    fprintf(stdout, "  --compile-commands-dir DIR directory containing compile_commands.json for clang-tidy\n");
     fprintf(stdout, "  --clang-format-bin PATH   clang-format path\n");
     fprintf(stdout, "  --clang-tidy-bin PATH     clang-tidy path\n");
     fprintf(stdout, "  --cppcheck-bin PATH       cppcheck path\n");
@@ -789,12 +798,12 @@ int main(int argc, char **argv) {
                 return 2;
             }
             list_append(&cfg.include_dirs, argv[++i]);
-        } else if (strcmp(arg, "--compile-commands") == 0) {
+        } else if (strcmp(arg, "--compile-commands-dir") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stdout, "error: %s expects <path>\n", arg);
                 return 2;
             }
-            cfg.compile_db = argv[++i];
+            cfg.compile_db_dir = argv[++i];
         } else if (strcmp(arg, "--clang-format-bin") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stdout, "error: %s expects <path>\n", arg);
