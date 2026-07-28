@@ -606,7 +606,10 @@ static void guest_abspath_at(int dirfd, const char *raw, char *out, size_t n) {
             if (hl_native_fd_path(dirfd, db, sizeof db) == 0) {
                 if (g_rootfs) {
                     char gd[4200];
-                    guest_from_host_raw(db, gd, sizeof gd);
+                    if (guest_from_host_raw(db, gd, sizeof gd) <= 0) {
+                        if (n != 0) out[0] = 0;
+                        return;
+                    }
                     snprintf(j, sizeof j, "%s/%s", gd, raw);
                 } else
                     snprintf(j, sizeof j, "%s/%s", db, raw);

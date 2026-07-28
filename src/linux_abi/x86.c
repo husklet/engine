@@ -62,7 +62,11 @@ static int x86_image_read(const char *path, hl_linux_image *image) {
             }
         }
         if (backing == 1) {
-            guest_from_host_raw(path, guest, sizeof guest);
+            int mapped = guest_from_host_raw(path, guest, sizeof guest);
+            if (mapped <= 0) {
+                errno = mapped < 0 ? -mapped : EACCES;
+                return -1;
+            }
             request = guest;
         }
     }

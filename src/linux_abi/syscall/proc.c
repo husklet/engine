@@ -1924,7 +1924,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             }
             if (g_rootfs) {
                 char gb[4200];
-                guest_from_host_raw(hb, gb, sizeof gb);
+                int mapped = guest_from_host_raw(hb, gb, sizeof gb);
+                if (mapped <= 0) {
+                    G_RET(c) = (uint64_t)(int64_t)(mapped < 0 ? mapped : -EACCES);
+                    break;
+                }
                 snprintf(eat_pb, sizeof eat_pb, "%s", gb);
             } else
                 snprintf(eat_pb, sizeof eat_pb, "%s", hb);
@@ -1997,7 +2001,11 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
                     if (hl_native_fd_path(pfn, hb, sizeof hb) == 0 && hb[0]) {
                         if (g_rootfs) {
                             char gb[4200];
-                            guest_from_host_raw(hb, gb, sizeof gb);
+                            int mapped = guest_from_host_raw(hb, gb, sizeof gb);
+                            if (mapped <= 0) {
+                                G_RET(c) = (uint64_t)(int64_t)(mapped < 0 ? mapped : -EACCES);
+                                break;
+                            }
                             snprintf(pse_pb, sizeof pse_pb, "%s", gb);
                         } else
                             snprintf(pse_pb, sizeof pse_pb, "%s", hb);

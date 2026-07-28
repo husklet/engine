@@ -1027,7 +1027,7 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // FITS does the copy run -> -EFAULT on a NULL/bad BUF. The old code passed the guest BUF straight to
         // the host getcwd(BUF,size): a NULL/huge-size probe (LTP getcwd01 case 2: buf=NULL,size=(size_t)-1)
         // made libc getcwd write through NULL -> SIGSEGV in the engine instead of returning EFAULT.
-        char cwbuf[4200], cwguest[4200];
+        char cwbuf[4200], cwguest[sizeof cwbuf + sizeof g_vols[0].guest];
         const char *cw;
         if (g_rootfs) {
             cw = g_cwd[0] ? g_cwd : "/"; // the GUEST cwd (not the host path)
@@ -1039,7 +1039,12 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 G_RET(c) = (uint64_t)(-errno);
                 break;
             }
-            cw = guest_from_host_volume(cwbuf, cwguest, sizeof cwguest) ? cwguest : cwbuf;
+            int mapped = guest_from_host_volume(cwbuf, cwguest, sizeof cwguest);
+            if (mapped < 0) {
+                G_RET(c) = (uint64_t)(int64_t)mapped;
+                break;
+            }
+            cw = mapped > 0 ? cwguest : cwbuf;
         }
         size_t len = strlen(cw) + 1; // path length INCLUDING the terminating NUL, exactly like the kernel
         if (len > (size_t)a1) {
@@ -2231,8 +2236,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             }
         } else {
             r = fstatfs((int)a0, &hs);
-            if (g_rootfs && (int)a0 >= 0 && (int)a0 < 1024 && g_fdpath[(int)a0][0])
-                guest_from_host(g_fdpath[(int)a0], gpath, sizeof gpath);
+            if (g_rootfs && (int)a0 >= 0 && (int)a0 < 1024 && g_fdpath[(int)a0][0] &&
+                guest_from_host(g_fdpath[(int)a0], gpath, sizeof gpath) <= 0)
+                gpath[0] = 0;
         }
         if (r < 0) {
             G_RET(c) = (uint64_t)(-errno);
@@ -2619,8 +2625,18 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     case 49: {
         char pb[4200];
+        char guest_cwd[sizeof g_cwd];
         // chdir (confined; tracks guest cwd)
         const char *p = atpath(-100, (const char *)a0, pb, sizeof pb, 0);
+        if (g_rootfs) {
+            char canonical[4200];
+            const char *host_cwd = realpath(p, canonical) ? canonical : p;
+            int mapped = guest_from_host(host_cwd, guest_cwd, sizeof guest_cwd);
+            if (mapped <= 0) {
+                G_RET(c) = (uint64_t)(int64_t)(mapped < 0 ? mapped : -EACCES);
+                break;
+            }
+        }
         if (chdir(p) < 0) {
             G_RET(c) = (uint64_t)(-errno);
             break;
@@ -2631,26 +2647,36 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // as "/var/lib/mysql/./"; InnoDB then classified the final "." component as hidden and skipped every
         // existing tablespace during recovery.  getcwd() also resolves the actual upper/lower/volume backing,
         // which guest_from_host maps back into the guest namespace.
-        if (g_rootfs) {
-            char canonical[4200];
-            if (getcwd(canonical, sizeof canonical))
-                guest_from_host(canonical, g_cwd, sizeof g_cwd);
-            else
-                guest_from_host(p, g_cwd, sizeof g_cwd);
-        }
+        if (g_rootfs) (void)path_copy(g_cwd, sizeof g_cwd, guest_cwd);
         G_RET(c) = 0;
         break;
     }
     case 50: {
         int changed;
-        if (!bound_handle_chdir((int)a0, &changed)) changed = fchdir((int)a0) == 0 ? 0 : -errno;
+        int handled = bound_handle_chdir((int)a0, &changed);
+        char guest_cwd[sizeof g_cwd];
+        if (!handled) {
+            if (g_rootfs) {
+                char host_cwd[4200];
+                const char *path = NULL;
+                if ((int)a0 >= 0 && (int)a0 < HL_NFD && g_fdpath[(int)a0][0])
+                    path = g_fdpath[(int)a0];
+                else if (hl_native_fd_path((int)a0, host_cwd, sizeof host_cwd) == 0)
+                    path = host_cwd;
+                int mapped = path ? guest_from_host(path, guest_cwd, sizeof guest_cwd) : 0;
+                if (mapped <= 0) {
+                    G_RET(c) = (uint64_t)(int64_t)(mapped < 0 ? mapped : -EACCES);
+                    break;
+                }
+            }
+            changed = fchdir((int)a0) == 0 ? 0 : -errno;
+        }
         if (changed < 0) {
             G_RET(c) = (uint64_t)(int64_t)changed;
             break;
             // fchdir (tracks guest cwd)
         }
-        if (g_rootfs && (int)a0 >= 0 && (int)a0 < 1024 && g_fdpath[(int)a0][0])
-            guest_from_host(g_fdpath[(int)a0], g_cwd, sizeof g_cwd);
+        if (g_rootfs && !handled) (void)path_copy(g_cwd, sizeof g_cwd, guest_cwd);
         G_RET(c) = 0;
         break;
     }
@@ -3406,17 +3432,17 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 // therefore made lseek(fd, off, SEEK_SET) a silent no-op on it (read then served from offset
                 // 0): gpg's keyring_get_keyblock seeks to the matched keyblock's found.offset, so the wrong
                 // keyblock (the first key) was re-read -> BADSIG on apt-get update over a layered image.
-                char gdir[4200];
-                if (have_canon)
-                    guest_from_host(gpa, gdir, sizeof gdir);
-                else
+                char gdir[4200] = {0};
+                if (have_canon) {
+                    if (guest_from_host(gpa, gdir, sizeof gdir) <= 0) gdir[0] = 0;
+                } else
                     snprintf(gdir, sizeof gdir, "%s", gp);
                 struct stat dst;
                 uint32_t provider_cursor = 0;
                 int has_provider_children =
                     hl_provider_namespace_launch_child(gp, strlen(gp), &provider_cursor) != NULL;
                 if (has_provider_children) snprintf(gdir, sizeof gdir, "%s", gp);
-                if (r < HL_NFD && (!jail_is_vol(gdir) || has_provider_children) && fstat(r, &dst) == 0 &&
+                if (r < HL_NFD && gdir[0] && (!jail_is_vol(gdir) || has_provider_children) && fstat(r, &dst) == 0 &&
                     S_ISDIR(dst.st_mode))
                     if (path_copy(g_ovldir[r], sizeof g_ovldir[r], gdir) != 0) g_ovldir[r][0] = 0;
             }
@@ -3610,8 +3636,9 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         if (fd >= 0 && fd < HL_NFD && !g_ovldir[fd][0] && g_fdpath[fd][0]) {
             char guest_directory[4200];
             uint32_t provider_cursor = 0;
-            guest_from_host(g_fdpath[fd], guest_directory, sizeof guest_directory);
-            if (hl_provider_namespace_launch_child(guest_directory, strlen(guest_directory), &provider_cursor) !=
+            int mapped = guest_from_host(g_fdpath[fd], guest_directory, sizeof guest_directory);
+            if (mapped > 0 &&
+                hl_provider_namespace_launch_child(guest_directory, strlen(guest_directory), &provider_cursor) !=
                     NULL &&
                 path_copy(g_ovldir[fd], sizeof g_ovldir[fd], guest_directory) != 0)
                 g_ovldir[fd][0] = 0;
@@ -3936,7 +3963,11 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 // bound volume (e.g. /tmp -> a host scratch dir) through the volume table, so the guest never
                 // sees the raw host path -- the old rootfs-only strip leaked the macOS /private/tmp path for a
                 // fd on a mapped volume. proc_fd_rebase is a no-op for a host path under no known mount.
-                proc_fd_rebase(gp, sizeof gp);
+                int mapped = proc_fd_rebase(gp, sizeof gp);
+                if (mapped < 0 || (g_rootfs && mapped == 0)) {
+                    G_RET(c) = (uint64_t)(int64_t)(mapped < 0 ? mapped : -EACCES);
+                    break;
+                }
                 const char *gpath = gp;
                 if (!gpath[0]) gpath = "/";
                 size_t l = strlen(gpath);
@@ -3950,15 +3981,21 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
             if (p) {
                 const char *leaf = proc_self_leaf(gp);
                 if (leaf && (!strcmp(leaf, "root") || !strcmp(leaf, "cwd"))) {
-                    char cwb[4200], cwg[4200];
+                    char cwb[4200], cwg[sizeof cwb + sizeof g_vols[0].guest];
                     const char *tgt = "/";
                     // Bare mode (no rootfs): the live host cwd IS the guest cwd, except inside a mapped volume
                     // -- readlink() must never hand the guest a host path (see guest_from_host_volume).
                     if (!strcmp(leaf, "cwd")) {
-                        if (!g_rootfs && getcwd(cwb, sizeof cwb))
-                            tgt = guest_from_host_volume(cwb, cwg, sizeof cwg) ? cwg : cwb;
-                        else
+                        if (!g_rootfs && getcwd(cwb, sizeof cwb)) {
+                            int mapped = guest_from_host_volume(cwb, cwg, sizeof cwg);
+                            if (mapped < 0) {
+                                G_RET(c) = (uint64_t)(int64_t)mapped;
+                                break;
+                            }
+                            tgt = mapped > 0 ? cwg : cwb;
+                        } else {
                             tgt = g_cwd[0] ? g_cwd : "/";
+                        }
                     }
                     size_t l = strlen(tgt);
                     if (l > bs) l = bs;
@@ -4208,15 +4245,21 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                         G_RET(c) = (uint64_t)(int64_t)(-EFAULT);
                         break;
                     }
-                    char cwb[4200], cwg[4200];
+                    char cwb[4200], cwg[sizeof cwb + sizeof g_vols[0].guest];
                     const char *tgt = "/";
                     // Bare mode: the live host cwd IS the guest cwd, except inside a mapped volume. tgt is a
                     // GUEST path here -- it is handed to xresolve_overlay below, which maps guest -> host.
                     if (!strcmp(sleaf, "cwd")) {
-                        if (!g_rootfs && getcwd(cwb, sizeof cwb))
-                            tgt = guest_from_host_volume(cwb, cwg, sizeof cwg) ? cwg : cwb;
-                        else
+                        if (!g_rootfs && getcwd(cwb, sizeof cwb)) {
+                            int mapped = guest_from_host_volume(cwb, cwg, sizeof cwg);
+                            if (mapped < 0) {
+                                G_RET(c) = (uint64_t)(int64_t)mapped;
+                                break;
+                            }
+                            tgt = mapped > 0 ? cwg : cwb;
+                        } else {
                             tgt = g_cwd[0] ? g_cwd : "/";
+                        }
                     }
                     struct stat es;
                     if (a3 & 0x100) { // lstat: the symlink itself (Linux: st_size == 0)

@@ -3580,12 +3580,14 @@ static int sa_un_m2l(const struct sockaddr *m, socklen_t mlen, uint8_t *g, sockl
             guest_backing = 1;
             matched_volume = volume;
         }
-    if (matched_volume >= 0)
-        snprintf(gpath, sizeof gpath, "%s%s", g_vols[matched_volume].guest, backing + g_vols[matched_volume].hlen);
-    else if (guest_backing)
-        guest_from_host(backing, gpath, sizeof gpath); // overlay host path -> guest-visible path
-    else
+    if (matched_volume >= 0) {
+        if (path_concat(gpath, sizeof gpath, g_vols[matched_volume].guest, backing + g_vols[matched_volume].hlen) != 0)
+            gpath[0] = 0;
+    } else if (guest_backing) {
+        if (guest_from_host(backing, gpath, sizeof gpath) <= 0) gpath[0] = 0;
+    } else {
         snprintf(gpath, sizeof gpath, "%s", hpath); // unnamed/autobind (empty) or non-jail: pass through
+    }
     uint8_t t[2 + sizeof gpath];
     *(uint16_t *)t = AF_UNIX;
     size_t pl = strlen(gpath);

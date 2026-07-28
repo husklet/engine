@@ -1269,13 +1269,23 @@ static int bound_handle_host_path(hl_host_handle file, char *path, size_t size) 
 static int bound_handle_chdir(int fd, int *result) {
     hl_linux_fd_snapshot snapshot;
     char path[HL_LINUX_PATH_MAX + 1];
+    char guest[sizeof g_cwd];
     if (result == NULL || !bound_snapshot((uint64_t)(uint32_t)fd, &snapshot)) return 0;
     if (bound_handle_host_path(snapshot.host_handle, path, sizeof path) != 0) {
         *result = -EBADF;
         return 1;
     }
+    int mapped = g_rootfs ? guest_from_host(path, guest, sizeof guest) : 0;
+    if (mapped < 0) {
+        *result = mapped;
+        return 1;
+    }
+    if (g_rootfs && mapped == 0) {
+        *result = -EACCES;
+        return 1;
+    }
     *result = chdir(path) == 0 ? 0 : -errno;
-    if (*result == 0 && g_rootfs) guest_from_host(path, g_cwd, sizeof g_cwd);
+    if (*result == 0 && g_rootfs) (void)path_copy(g_cwd, sizeof g_cwd, guest);
     return 1;
 }
 

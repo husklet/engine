@@ -2314,10 +2314,10 @@ static void exe_canon(const char *guest, char *out, size_t n) {
         return;
     }
     char gb[4200];
-    guest_from_host_raw(hp, gb, sizeof gb);
+    int mapped = guest_from_host_raw(hp, gb, sizeof gb);
     // guest_from_host_raw answers "/" for a host path outside every layer (fail-safe); keep the lexical
     // guest path then rather than claiming the exe is "/".
-    snprintf(out, n, "%s", (gb[0] == '/' && gb[1] == 0 && !(lex[0] == '/' && lex[1] == 0)) ? lex : gb);
+    snprintf(out, n, "%s", (mapped <= 0 || (gb[0] == '/' && gb[1] == 0 && !(lex[0] == '/' && lex[1] == 0))) ? lex : gb);
 }
 
 // The guest task name (Linux comm, max 15 chars): the recorded exec-name (set_guest_comm), falling back
@@ -2601,7 +2601,7 @@ static int maprow_cmp(const void *a, const void *b) {
     return p->hi < q->hi ? -1 : p->hi > q->hi ? 1 : 0;
 }
 
-static void proc_fd_rebase(char *tgt, size_t capacity); // defined below; maps naming reuses /proc/self/fd's
+static int proc_fd_rebase(char *tgt, size_t capacity); // defined below; maps naming reuses /proc/self/fd's
 static int synth_names_dir_open(const char *guestpath, const char *const *names, int kind);
 
 // The maps rows for one read, plus the arena the file-backed rows' pathnames live in (`name` points into
@@ -2621,13 +2621,12 @@ struct maptable {
 // host path is REFUSED (0), because an unnamed anon row is a loss of detail while a host path is a
 // containment failure. Returns 1 on success.
 static int filemap_guest_path(int fd, char *out, size_t n) {
-    char hp[4200], raw[4200];
+    char hp[4200];
     if (fd < 0 || hl_native_fd_path(fd, hp, sizeof hp) != 0 || hp[0] != '/') return 0;
-    snprintf(raw, sizeof raw, "%s", hp);
-    proc_fd_rebase(hp, sizeof hp);
+    int mapped = proc_fd_rebase(hp, sizeof hp);
     // Jailed and unrebased means the path lies outside every layer: refuse it. In bare mode the guest
     // namespace IS the host's, so the path is already the guest's own (same rule /proc/self/exe follows).
-    if (g_rootfs && !strcmp(hp, raw)) return 0;
+    if (mapped < 0 || (g_rootfs && mapped == 0)) return 0;
     if (strlen(hp) >= n) return 0;
     snprintf(out, n, "%s", hp);
     return 1;
@@ -3738,7 +3737,7 @@ static int hl_get_procinfo(int pid, struct hl_procinfo *pi) {
 }
 
 // Rebase a host vnode path into the container's guest namespace (strip the rootfs prefix), in place.
-static void proc_fd_rebase(char *tgt, size_t capacity) {
+static int proc_fd_rebase(char *tgt, size_t capacity) {
     int mapped = g_rootfs_canon_len != 0 && !strncmp(tgt, g_rootfs_canon, g_rootfs_canon_len) &&
                  (tgt[g_rootfs_canon_len] == '/' || tgt[g_rootfs_canon_len] == 0);
     for (int index = 0; !mapped && index < g_nvols; ++index)
@@ -3747,9 +3746,14 @@ static void proc_fd_rebase(char *tgt, size_t capacity) {
             mapped = 1;
     if (mapped) {
         char guest[4200];
-        guest_from_host(tgt, guest, sizeof guest);
-        snprintf(tgt, capacity, "%s", guest);
+        int status = guest_from_host(tgt, guest, sizeof guest);
+        if (status <= 0 || path_copy(tgt, capacity, guest) != 0) {
+            if (capacity != 0) tgt[0] = 0;
+            return status < 0 ? status : -ENAMETOOLONG;
+        }
+        return 1;
     }
+    return 0;
 }
 
 static int proc_fdvis_resolve_host(int host, int guest_fd) {
@@ -3815,7 +3819,8 @@ static int proc_fd_link_pid(int host, int fd, char *out, size_t n) {
         g_fdpath[fd][0]) {
         char tracked[4200];
         snprintf(tracked, sizeof tracked, "%s", g_fdpath[fd]);
-        proc_fd_rebase(tracked, sizeof tracked);
+        int mapped = proc_fd_rebase(tracked, sizeof tracked);
+        if (mapped < 0 || (g_rootfs && mapped == 0)) return -1;
         size_t l = strlen(tracked);
         if (l > n) l = n;
         memcpy(out, tracked, l);
@@ -3830,10 +3835,11 @@ static int proc_fd_link_pid(int host, int fd, char *out, size_t n) {
          * guest devpts namespace regardless of the host's global pty number.
          * Only typed launch stdio receives this projection; ordinary host
          * binds and guest-created ptys retain their own namespace identity. */
-        if (logical_found && fd >= 0 && fd <= STDERR_FILENO &&
-            (strncmp(tgt, "/dev/pts/", 9) == 0 || strncmp(tgt, "/dev/ttys", 9) == 0))
-            snprintf(tgt, sizeof tgt, "/dev/pts/0");
-        proc_fd_rebase(tgt, sizeof tgt);
+        int projected_tty = logical_found && fd >= 0 && fd <= STDERR_FILENO &&
+                            (strncmp(tgt, "/dev/pts/", 9) == 0 || strncmp(tgt, "/dev/ttys", 9) == 0);
+        if (projected_tty) snprintf(tgt, sizeof tgt, "/dev/pts/0");
+        int mapped = projected_tty ? 1 : proc_fd_rebase(tgt, sizeof tgt);
+        if (mapped < 0 || (g_rootfs && mapped == 0)) return -1;
         size_t l = strlen(tgt);
         if (l > n) l = n;
         memcpy(out, tgt, l);
@@ -3920,8 +3926,8 @@ static int proc_fd_dir_pid_open(int guest, int host) {
         if (entry.descriptor == fd) fds[i].kind = entry.kind;
         if (have) {
             tgt[target_size] = 0;
-            proc_fd_rebase(tgt, sizeof tgt);
-            have = tgt[0] != 0;
+            int mapped = proc_fd_rebase(tgt, sizeof tgt);
+            have = mapped >= 0 && (!g_rootfs || mapped > 0) && tgt[0] != 0;
         }
         if (!have) {
             const char *k = fds[i].kind == HL_HOST_FD_SOCKET ? "socket"

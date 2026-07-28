@@ -677,7 +677,7 @@ static void abs_guest(int dirfd, const char *raw, char *out, size_t n) {
 // whichever jail prefix backs it so the guest cwd is tracked correctly regardless of layer (the bare
 // "strip g_rootfs_canon" form silently left g_cwd stale for a dir that lives only in a lower). Boundary
 // check ('/' or end) avoids a prefix collision between sibling layer roots. Unknown -> "/" (fail safe).
-static void guest_from_host_raw(const char *host, char *out, size_t n) {
+static int guest_from_host_raw(const char *host, char *out, size_t n) {
     // Mounts nest: a bound volume can back a directory that lives INSIDE another mapped layer (the matrix
     // harness backs guest /tmp with a scratch dir under the binary_root volume; Docker likewise permits a
     // bind mount under an existing mount). The kernel resolves such a host path to its MOST-SPECIFIC mount,
@@ -712,21 +712,25 @@ static void guest_from_host_raw(const char *host, char *out, size_t n) {
             have = 1;
         }
     if (!have) {
-        snprintf(out, n, "/");
-        return;
+        if (path_copy(out, n, "/") == 0) return 0;
+        if (n != 0) out[0] = 0;
+        return -ENAMETOOLONG;
     }
-    if (best_guest[0])
-        snprintf(out, n, "%s%s", best_guest, best_suffix);
-    else
-        snprintf(out, n, "%s", best_suffix[0] ? best_suffix : "/");
+    int status = best_guest[0] ? path_concat(out, n, best_guest, best_suffix)
+                               : path_copy(out, n, best_suffix[0] ? best_suffix : "/");
+    if (status == 0) return 1;
+    if (n != 0) out[0] = 0;
+    return -ENAMETOOLONG;
 }
 
 // Map a canonical HOST dir to the GUEST path, then fold it into the active chroot frame: under a chroot,
 // chdir/fchdir resolve to a host dir whose rootfs-relative guest path includes the chroot prefix, but the
 // guest must see g_cwd in its OWN root, so strip the prefix. No-op (byte-identical) with no chroot.
-static void guest_from_host(const char *host, char *out, size_t n) {
-    guest_from_host_raw(host, out, n);
+static int guest_from_host(const char *host, char *out, size_t n) {
+    int status = guest_from_host_raw(host, out, n);
+    if (status < 0) return status;
     if (g_chroot[0]) chroot_strip(out, n);
+    return status;
 }
 
 // Map a canonical HOST path back to the guest namespace using the VOLUME table only, reporting whether any
@@ -751,7 +755,10 @@ static int guest_from_host_volume(const char *host, char *out, size_t n) {
             best_guest = g_vols[i].guest;
         }
     if (best_guest == NULL) return 0;
-    snprintf(out, n, "%s%s", best_guest, best_suffix);
+    if (path_concat(out, n, best_guest, best_suffix) != 0) {
+        if (n != 0) out[0] = 0;
+        return -ENAMETOOLONG;
+    }
     return 1;
 }
 
