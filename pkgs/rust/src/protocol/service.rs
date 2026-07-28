@@ -3,7 +3,7 @@ mod input;
 mod model;
 mod namespace;
 
-pub use codec::{decode_reply, decode_request, encode_reply, encode_request};
+pub(crate) use codec::ServiceCodec;
 pub use model::{Reply, Request, SeekWhence, ServiceFailure, ServiceStat};
 pub use namespace::{
     decode_namespace_install, encode_namespace_install, ProjectionKind, ServiceProjection,
@@ -12,9 +12,8 @@ pub use namespace::{
 #[cfg(test)]
 mod tests {
     use super::{
-        codec::WRITE, decode_namespace_install, decode_reply, decode_request,
-        encode_namespace_install, encode_reply, encode_request, input::protocol, ProjectionKind,
-        Reply, Request, ServiceFailure, ServiceProjection,
+        codec::WRITE, decode_namespace_install, encode_namespace_install, input::protocol,
+        ProjectionKind, Reply, Request, ServiceCodec, ServiceFailure, ServiceProjection,
     };
     use crate::api::extension::ServiceId;
     use crate::provider::{LinuxError, Readiness, ReadyState};
@@ -26,7 +25,7 @@ mod tests {
             offset: 11,
             bytes: b"owned".to_vec(),
         };
-        let encoded = encode_request(&request, 16).unwrap();
+        let encoded = ServiceCodec::encode_request(&request, 16).unwrap();
         assert_eq!(
             encoded,
             [
@@ -38,32 +37,41 @@ mod tests {
             ]
             .concat()
         );
-        assert_eq!(decode_request(&encoded, 16).unwrap(), request);
+        assert_eq!(ServiceCodec::decode_request(&encoded, 16).unwrap(), request);
 
         let ready = Reply::Ready(Readiness {
             states: [ReadyState::Readable, ReadyState::Hangup]
                 .into_iter()
                 .collect(),
         });
-        let encoded = encode_reply(&Ok(ready.clone()), 16).unwrap();
-        assert_eq!(decode_reply(&encoded, 16).unwrap(), ready);
+        let encoded = ServiceCodec::encode_reply(&Ok(ready.clone()), 16).unwrap();
+        assert_eq!(ServiceCodec::decode_reply(&encoded, 16).unwrap(), ready);
 
         let failure = ServiceFailure::Linux(LinuxError {
             errno: 19,
             context: "provider unavailable".into(),
         });
-        let encoded = encode_reply(&Err(failure.clone()), 64).unwrap();
-        assert_eq!(decode_reply(&encoded, 64).unwrap_err(), failure);
+        let encoded = ServiceCodec::encode_reply(&Err(failure.clone()), 64).unwrap();
+        assert_eq!(
+            ServiceCodec::decode_reply(&encoded, 64).unwrap_err(),
+            failure
+        );
     }
 
     #[test]
     fn codecs_reject_trailing_invalid_and_oversized_payloads() {
-        let mut request = encode_request(&Request::Close { handle: 1 }, 8).unwrap();
+        let mut request = ServiceCodec::encode_request(&Request::Close { handle: 1 }, 8).unwrap();
         request.push(0);
-        assert_eq!(decode_request(&request, 8).unwrap_err(), protocol());
-        assert_eq!(decode_request(&[WRITE], 8).unwrap_err(), protocol());
+        assert_eq!(
+            ServiceCodec::decode_request(&request, 8).unwrap_err(),
+            protocol()
+        );
+        assert_eq!(
+            ServiceCodec::decode_request(&[WRITE], 8).unwrap_err(),
+            protocol()
+        );
         assert!(matches!(
-            encode_request(
+            ServiceCodec::encode_request(
                 &Request::Write {
                     handle: 1,
                     offset: 0,

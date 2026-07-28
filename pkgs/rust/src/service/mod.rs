@@ -19,11 +19,9 @@ mod descriptor;
 mod provider;
 mod server;
 
-#[cfg(test)]
-use crate::protocol::{decode_reply, encode_request};
 pub(crate) use crate::protocol::{
-    decode_request, encode_namespace_install, encode_reply, ProjectionKind, Reply, Request,
-    SeekWhence, ServiceFailure, ServiceProjection, ServiceStat,
+    encode_namespace_install, ProjectionKind, Reply, Request, SeekWhence, ServiceCodec,
+    ServiceFailure, ServiceProjection, ServiceStat,
 };
 #[cfg(test)]
 use descriptor::Descriptors;
@@ -299,7 +297,7 @@ mod tests {
             16,
         );
         let deadline = deadline();
-        let open = encode_request(
+        let open = ServiceCodec::encode_request(
             &Request::Open {
                 service: ServiceId(77),
                 read: true,
@@ -309,16 +307,16 @@ mod tests {
         )
         .unwrap();
         let Reply::Opened { handle } =
-            decode_reply(&dispatcher.dispatch(&open, deadline).unwrap(), 16).unwrap()
+            ServiceCodec::decode_reply(&dispatcher.dispatch(&open, deadline).unwrap(), 16).unwrap()
         else {
             panic!("open reply")
         };
         let second = dispatcher.dispatch(&open, deadline).unwrap();
         assert!(matches!(
-            decode_reply(&second, 16),
+            ServiceCodec::decode_reply(&second, 16),
             Err(ServiceFailure::Linux(LinuxError { errno: 24, .. }))
         ));
-        let write = encode_request(
+        let write = ServiceCodec::encode_request(
             &Request::Write {
                 handle,
                 offset: 1,
@@ -328,12 +326,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            decode_reply(&dispatcher.dispatch(&write, deadline).unwrap(), 16).unwrap(),
+            ServiceCodec::decode_reply(&dispatcher.dispatch(&write, deadline).unwrap(), 16)
+                .unwrap(),
             Reply::Written(2)
         );
-        let stat = encode_request(&Request::Stat { handle }, 16).unwrap();
+        let stat = ServiceCodec::encode_request(&Request::Stat { handle }, 16).unwrap();
         assert_eq!(
-            decode_reply(&dispatcher.dispatch(&stat, deadline).unwrap(), 16).unwrap(),
+            ServiceCodec::decode_reply(&dispatcher.dispatch(&stat, deadline).unwrap(), 16).unwrap(),
             Reply::Stat(ServiceStat {
                 mode: 0o660,
                 uid: 10,
@@ -356,7 +355,7 @@ mod tests {
                     kind: MessageType::Subscribe,
                     request_id: 42,
                     features: 0,
-                    payload: encode_request(
+                    payload: ServiceCodec::encode_request(
                         &Request::Poll {
                             handle,
                             interest: Interest {
@@ -376,7 +375,7 @@ mod tests {
         assert_eq!(event.kind, MessageType::ReadinessEvent);
         assert_eq!(event.request_id, 42);
         assert!(matches!(
-            decode_reply(&event.payload, 16).unwrap(),
+            ServiceCodec::decode_reply(&event.payload, 16).unwrap(),
             Reply::Ready(_)
         ));
         client
@@ -427,7 +426,7 @@ mod tests {
                     kind: MessageType::Request,
                     request_id: 41,
                     features: 0,
-                    payload: encode_request(
+                    payload: ServiceCodec::encode_request(
                         &Request::Open {
                             service: ServiceId(77),
                             read: true,
@@ -442,7 +441,8 @@ mod tests {
             .unwrap();
         let opened = client.receive(deadline()).unwrap();
         assert_eq!(opened.request_id, 41);
-        let Reply::Opened { handle } = decode_reply(&opened.payload, 16).unwrap() else {
+        let Reply::Opened { handle } = ServiceCodec::decode_reply(&opened.payload, 16).unwrap()
+        else {
             panic!("open reply was not an owned provider handle")
         };
         assert_readiness_subscription(&client, handle);
@@ -495,7 +495,7 @@ mod tests {
                     kind: MessageType::Request,
                     request_id: 1,
                     features: 0,
-                    payload: encode_request(
+                    payload: ServiceCodec::encode_request(
                         &Request::Open {
                             service: ServiceId(77),
                             read: true,
@@ -509,7 +509,7 @@ mod tests {
             )
             .unwrap();
         let Reply::Opened { handle } =
-            decode_reply(&client.receive(deadline()).unwrap().payload, 16).unwrap()
+            ServiceCodec::decode_reply(&client.receive(deadline()).unwrap().payload, 16).unwrap()
         else {
             panic!("open reply")
         };
@@ -519,7 +519,7 @@ mod tests {
                     kind: MessageType::Request,
                     request_id: 2,
                     features: 0,
-                    payload: encode_request(
+                    payload: ServiceCodec::encode_request(
                         &Request::Read {
                             handle,
                             offset: 0,

@@ -1,8 +1,8 @@
 use super::{
-    decode_request, encode_reply, linux, protocol, require, system_deadline, Arc, AtomicU64,
-    BTreeMap, Credentials, HandleOperation, Handles, Instant, LinuxError, Mutex, OpenAccess,
-    OpenRequest, Ordering, ReadRequest, Reply, Request, SeekOrigin, SeekRequest, SeekWhence,
-    ServiceFailure, ServiceId, ServiceRegistration, ServiceStat, TransportError, WriteRequest,
+    linux, protocol, require, system_deadline, Arc, AtomicU64, BTreeMap, Credentials,
+    HandleOperation, Handles, Instant, LinuxError, Mutex, OpenAccess, OpenRequest, Ordering,
+    ReadRequest, Reply, Request, SeekOrigin, SeekRequest, SeekWhence, ServiceCodec, ServiceFailure,
+    ServiceId, ServiceRegistration, ServiceStat, TransportError, WriteRequest,
 };
 pub(crate) struct ProviderDispatcher {
     provider: Arc<dyn Handles>,
@@ -49,15 +49,15 @@ impl ProviderDispatcher {
         if Instant::now() >= deadline {
             return Err(ServiceFailure::Transport(TransportError::Timeout));
         }
-        let request = match decode_request(payload, self.maximum_request) {
+        let request = match ServiceCodec::decode_request(payload, self.maximum_request) {
             Ok(request) => request,
             Err(error @ ServiceFailure::Linux(_)) => {
-                return encode_reply(&Err(error), self.maximum_request)
+                return ServiceCodec::encode_reply(&Err(error), self.maximum_request)
             }
             Err(error) => return Err(error),
         };
         let reply = self.execute(request, deadline);
-        encode_reply(&reply, self.maximum_request)
+        ServiceCodec::encode_reply(&reply, self.maximum_request)
     }
 
     #[allow(clippy::too_many_lines)]

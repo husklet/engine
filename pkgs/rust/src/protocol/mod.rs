@@ -12,8 +12,8 @@ mod service;
 
 pub(crate) use frame::HeaderCodec;
 pub use frame::{Frame, MessageType, TransportError, HEADER_BYTES};
+pub(crate) use service::ServiceCodec;
 pub use service::{
-    decode_namespace_install, decode_reply, decode_request, encode_namespace_install, encode_reply,
-    encode_request, ProjectionKind, Reply, Request, SeekWhence, ServiceFailure, ServiceProjection,
-    ServiceStat,
+    decode_namespace_install, encode_namespace_install, ProjectionKind, Reply, Request, SeekWhence,
+    ServiceFailure, ServiceProjection, ServiceStat,
 };
