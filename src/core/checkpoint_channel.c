@@ -46,20 +46,15 @@ int hl_ckpt_channel_adopt(const char *broker, const char *trigger) {
     int broker_descriptor = checkpoint_parse_descriptor(broker);
     int trigger_descriptor = checkpoint_parse_descriptor(trigger);
     if (broker_descriptor < 0 || trigger_descriptor < 0) return -1;
-    if (fcntl(broker_descriptor, F_GETFD) < 0 || fcntl(trigger_descriptor, F_GETFD) < 0) {
-        fprintf(stderr, "hl-engine: checkpoint store descriptors %d/%d are not open\n", broker_descriptor,
-                trigger_descriptor);
+    if (fcntl(broker_descriptor, F_GETFD) < 0 || fcntl(trigger_descriptor, F_GETFD) < 0)
         return -1;
-    }
     hl_host_private_init();
     /* Move both into the engine-private range, exactly as activation does with the descriptors it is
      * handed: the guest descriptor scan must never see them. */
     broker_descriptor = hl_host_process_fd_private_adopt(broker_descriptor);
     trigger_descriptor = hl_host_process_fd_private_adopt(trigger_descriptor);
-    if (broker_descriptor < 0 || trigger_descriptor < 0) {
-        fprintf(stderr, "hl-engine: cannot adopt the checkpoint store descriptors as engine-private\n");
+    if (broker_descriptor < 0 || trigger_descriptor < 0)
         return -1;
-    }
     checkpoint_broker = broker_descriptor;
     checkpoint_trigger = trigger_descriptor;
     return 0;
