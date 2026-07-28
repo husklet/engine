@@ -248,6 +248,13 @@ static uint64_t mc_hash(const char *s) {
     return h ? h : 1;
 }
 
+static int fdcache_copy_string(char *destination, size_t capacity, const char *source) {
+    size_t length = strlen(source);
+    if (length >= capacity) return -1;
+    memcpy(destination, source, length + 1u);
+    return 0;
+}
+
 int hl_fdcache_metadata_lookup(const char *p, int *rc, struct stat *out) {
     if (!p || strlen(p) >= 192) return 0;
     CLK;
@@ -276,7 +283,7 @@ void hl_fdcache_metadata_store(const char *p, int rc, const struct stat *s) {
     e->hash = h;
     e->epoch = g_res_epoch;
     e->fgen = g_fs_fgen;
-    strcpy(e->path, p);
+    (void)fdcache_copy_string(e->path, sizeof(e->path), p);
     e->rc = rc;
     e->st = *s;
     CUL;
@@ -332,7 +339,7 @@ void hl_fdcache_readlink_store(const char *p, int rc, const char *link, int len)
     e->hash = h;
     e->epoch = g_res_epoch;
     e->fgen = g_fs_fgen;
-    strcpy(e->path, p);
+    (void)fdcache_copy_string(e->path, sizeof(e->path), p);
     e->rc = rc;
     e->linklen = len;
     if (rc >= 0) memcpy(e->link, link, (size_t)len);
@@ -371,7 +378,7 @@ void hl_fdcache_access_store(const char *p, int rc) {
     e->hash = h;
     e->epoch = g_res_epoch;
     e->fgen = g_fs_fgen;
-    strcpy(e->path, p);
+    (void)fdcache_copy_string(e->path, sizeof(e->path), p);
     e->rc = rc;
     CUL;
 }
@@ -445,7 +452,7 @@ void hl_fdcache_upper_negative_store(const char *d) {
     e->hash = h;
     e->epoch = g_res_epoch;
     e->fgen = g_fs_fgen;
-    strcpy(e->dir, d);
+    (void)fdcache_copy_string(e->dir, sizeof(e->dir), d);
     CUL;
 }
 
@@ -487,7 +494,7 @@ void hl_fdcache_upper_verdict_store(const char *d, int verdict) {
     e->epoch = g_res_epoch;
     e->fgen = g_fs_fgen;
     e->verdict = (uint8_t)verdict;
-    strcpy(e->dir, d);
+    (void)fdcache_copy_string(e->dir, sizeof(e->dir), d);
     CUL;
 }
 
@@ -561,7 +568,7 @@ void hl_fdcache_dentry_store(const char *key, const char *canon, int nmiss) {
     e->fgen = g_fs_fgen;    // fork/chroot generation; a fork child's hl_fdcache_reset bump drops this entry
     e->nmiss = (uint16_t)nmiss;
     e->clen = (uint16_t)cl;
-    strcpy(e->key, key);
+    (void)fdcache_copy_string(e->key, sizeof(e->key), key);
     memcpy(e->canon, canon, cl + 1);
     CUL;
 }
@@ -632,7 +639,7 @@ void hl_fdcache_resolution_store(const char *g, const char *host) {
     e->epoch = g_res_epoch; // stamp with the CURRENT epoch; a later mutation invalidates it
     e->fgen = g_fs_fgen;
     e->hlen = (uint16_t)hl;
-    strcpy(e->guest, g);
+    (void)fdcache_copy_string(e->guest, sizeof(e->guest), g);
     memcpy(e->host, host, hl + 1);
     CUL;
 }
@@ -694,7 +701,7 @@ void hl_fdcache_open_store(const char *g, const char *host) {
     e->epoch = g_res_epoch; // stamp the CURRENT epoch; a later mutation invalidates it
     e->fgen = g_fs_fgen;
     e->hlen = (uint16_t)hl;
-    strcpy(e->guest, g);
+    (void)fdcache_copy_string(e->guest, sizeof(e->guest), g);
     memcpy(e->host, host, hl + 1);
     CUL;
 }
@@ -792,7 +799,7 @@ void hl_fdcache_generation_poll(void) {
 
 void hl_fdcache_fd_setpath(int fd, const char *p) {
     if (fd >= 0 && (size_t)fd < g_fdcache.binding.fd_capacity && p && strlen(p) < HL_FDCACHE_PATH_CAPACITY)
-        strcpy(g_fdcache.binding.fd_paths[fd], p);
+        (void)fdcache_copy_string(g_fdcache.binding.fd_paths[fd], HL_FDCACHE_PATH_CAPACITY, p);
 }
 
 void hl_fdcache_fd_evict(int fd) {

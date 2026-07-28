@@ -199,6 +199,18 @@ int main(void) {
 
     hl_fdcache_fd_setpath(2, "/root/file");
     HL_CHECK(strcmp(fd_paths[2], "/root/file") == 0);
+    {
+        char maximum[HL_FDCACHE_PATH_CAPACITY];
+        char oversized[HL_FDCACHE_PATH_CAPACITY + 1u];
+        memset(maximum, 'm', sizeof(maximum) - 1u);
+        maximum[sizeof(maximum) - 1u] = 0;
+        memset(oversized, 'x', sizeof(oversized) - 1u);
+        oversized[sizeof(oversized) - 1u] = 0;
+        hl_fdcache_fd_setpath(2, maximum);
+        HL_CHECK(memcmp(fd_paths[2], maximum, sizeof(maximum)) == 0);
+        hl_fdcache_fd_setpath(2, oversized);
+        HL_CHECK(memcmp(fd_paths[2], maximum, sizeof(maximum)) == 0);
+    }
     hl_fdcache_fd_clear(2);
     HL_CHECK(fd_paths[2][0] == 0);
 
