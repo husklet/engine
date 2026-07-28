@@ -894,7 +894,7 @@ static int container_init(const char *rootfs) {
         for (int i = 0; i < g_nlower; ++i)
             owner_lowers[i] = g_lower[i].canon;
         g_rootfs = (char *)rootfs;
-        if (root_handle_bind(g_rootfs) != 0 || root_native_require(g_rootfs) != 0) return -1;
+        if (root_handle_bind(g_rootfs) != 0 || root_native_require() != 0) return -1;
         if (hl_owner_seed(g_rootfs, hl_option_get("HL_FILE_OWNERS"), owner_lowers, (size_t)g_nlower) != 0) return -1;
         container_populate_dev();        // /dev/{fd,stdin,stdout,stderr,ptmx,pts,shm,console,...} the unpacker stripped
         container_populate_machine_id(); // /etc/machine-id agreeing with boot_id (if image ships none)

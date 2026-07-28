@@ -999,29 +999,13 @@ static inline int hl_linux_socket_condition_errno(uint32_t condition) {
     }
 }
 
-/*
- * Compiling with -DHL_SOCKET_TRACE turns every refusal into one stderr line
- * naming the call site, the status, the domain and the condition. It is here
- * rather than in a scratch build because the four numbers together are what
- * makes a socket failure diagnosable at all: the status alone cannot tell an
- * "option not supported" apart from a "family not supported", and by the time
- * an errno reaches a guest the domain is gone.
- */
-static inline int hl_linux_socket_fail_at(hl_host_result result, int line) {
+static inline int hl_linux_socket_fail(hl_host_result result) {
     int code = 0;
     if (result.detail_domain == HL_HOST_DETAIL_NETWORK) code = hl_linux_socket_condition_errno((uint32_t)result.detail);
     if (code == 0) code = hl_fdhandle_errno(result.status);
-#if defined(HL_SOCKET_TRACE)
-    fprintf(stderr, "[sock] line=%d status=%d domain=%u detail=%llu errno=%d\n", line, (int)result.status,
-            (unsigned)result.detail_domain, (unsigned long long)result.detail, code);
-#else
-    (void)line;
-#endif
     errno = code;
     return -1;
 }
-
-#define hl_linux_socket_fail(result) hl_linux_socket_fail_at((result), __LINE__)
 
 /* ---- the descriptor reservation ---------------------------------------- */
 

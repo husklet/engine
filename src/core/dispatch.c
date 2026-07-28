@@ -172,10 +172,13 @@ __attribute__((naked)) static void block_return(void) {
 static void run_block(struct cpu *cpu, void *code) {
     (void)cpu;
     (void)code;
+    (void)jit_fail(HL_STATUS_NOT_SUPPORTED, "host execution backend unavailable",
+                   sizeof("host execution backend unavailable") - 1u);
     abort();
 }
 
 static void block_return(void) {
+    (void)jit_fail(HL_STATUS_CORRUPT, "invalid generated-code return", sizeof("invalid generated-code return") - 1u);
     abort();
 }
 #endif

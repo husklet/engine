@@ -1498,7 +1498,7 @@ static int root_handle_bind(const char *path) {
     // -1-safe: jail_pick()/jail_pick_idx() hand it back for equality tests (dispatch.c, overlay.c) or into
     // resolve_at's explicit `root_fd < 0 && !g_rootfs` fallback, engine_fd_reloc() ignores a slot that does
     // not equal the target fd, and engine_fd_vacate_range()/exec_fd_is_engine() filter on >= 0. A rootfs DOES
-    // need the walk; root_native_require() below refuses it there, naming what is missing.
+    // need the walk; root_native_require() below refuses it there.
     attachment = g_host_services->posix_attachment;
     root = file->open_relative(g_host_services->context, HL_HOST_HANDLE_CWD, path, strlen(path),
                                HL_HOST_FILE_READ | HL_HOST_FILE_DIRECTORY | HL_HOST_FILE_PATH_ONLY, 0, 0);
@@ -1534,19 +1534,8 @@ fail_root:
     return -1;
 }
 
-// A rootfs is the one shape that genuinely requires the native root: every container path syscall runs the
-// confined per-component walk (resolve_at -> jail_pick_idx), which starts from g_root_fd and has no typed
-// arm yet. Refuse the container HERE, naming the missing capability, instead of letting root_handle_bind
-// fail for every guest (which is what blocked a bare launch) or letting resolve_at return a bare -EPERM from
-// its `root_fd < 0` arm once per path syscall. Unreachable on Linux/macOS: both advertise
-// HL_HOST_CAP_POSIX_ATTACHMENT (linux/host.c, macos/host.c), so root_handle_bind always binds g_root_fd.
-static int root_native_require(const char *path) {
-    if (g_root_fd >= 0) return 0;
-    fprintf(stderr,
-            "hl-engine: rootfs %s needs a native root descriptor; this host does not implement the "
-            "optional POSIX attachment services\n",
-            path);
-    return -1;
+static int root_native_require(void) {
+    return g_root_fd >= 0 ? 0 : -1;
 }
 
 // Engine-private host fds (the rootfs dir-fd + each bind-mount volume dir-fd) share the guest's descriptor
