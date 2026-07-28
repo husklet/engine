@@ -31,6 +31,7 @@ find_program(HL_BASH_EXECUTABLE NAMES bash REQUIRED)
 # ---------------------------------------------------------------------------
 option(HL_LINT "Run the C lint pipeline (clang-format, clang-tidy, cppcheck, custom C heuristics)" OFF)
 option(HL_LINT_STRICT "Treat lint findings as hard errors" OFF)
+option(HL_BUILD_NESTED_ENGINES "Build self-contained Linux engines for recursive execution tests" OFF)
 
 # clang-tidy and check-based tooling need a compile DB for reliable parsing.
 if(HL_LINT)

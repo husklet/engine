@@ -93,6 +93,27 @@ function(hl_linux_production arch guest_isa link_extra)
     hl-engine hl-translator hl-linux-abi hl-host-linux ${link_extra})
   set_target_properties(hl-engine-linux-${arch} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/linux-production)
+
+  if(HL_BUILD_NESTED_ENGINES)
+    set(_nested_target hl-engine-linux-${CMAKE_SYSTEM_PROCESSOR}-exec-${arch}-guest)
+    string(TOUPPER "${CMAKE_SYSTEM_PROCESSOR}" _nested_host)
+    set(_nested_static_command "$ENV{${_nested_host}_LINUX_STATIC_CC}")
+    if(_nested_static_command STREQUAL "")
+      message(FATAL_ERROR
+        "HL_BUILD_NESTED_ENGINES requires ${_nested_host}_LINUX_STATIC_CC from the Nix devShell")
+    endif()
+    separate_arguments(_nested_static_flags UNIX_COMMAND "${_nested_static_command}")
+    list(POP_FRONT _nested_static_flags)
+    add_executable(${_nested_target}
+      $<TARGET_OBJECTS:prod_target_${arch}>
+      $<TARGET_OBJECTS:prod_life_${arch}>
+      ${_prov_objs})
+    target_link_libraries(${_nested_target} PRIVATE
+      hl-engine hl-translator hl-linux-abi hl-host-linux ${link_extra})
+    target_link_options(${_nested_target} PRIVATE -static ${_nested_static_flags})
+    set_target_properties(${_nested_target} PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/linux-production/nested)
+  endif()
 endfunction()
 
 # aarch64 links -pthread -lm -ldl -latomic; x86_64 lane links -pthread -lm
