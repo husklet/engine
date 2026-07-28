@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::api::{extension::ProviderId, Sandbox};
+use crate::model::{extension::ProviderId, Sandbox};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecuritySpec {

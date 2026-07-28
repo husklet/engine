@@ -4,7 +4,7 @@ use std::sync::MutexGuard;
 
 use crate::{Machine, Terminal};
 
-pub use crate::api::control::{
+pub use crate::model::control::{
     AttachRequest, AttachmentKind, ProcessInfo, ResourceUpdate, SignalTarget,
 };
 

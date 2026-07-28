@@ -8,7 +8,7 @@
 )))]
 compile_error!("hl-engine supports only aarch64-apple-darwin and aarch64-unknown-linux-gnu hosts");
 
-pub(crate) mod api;
+pub(crate) mod model;
 pub(crate) mod protocol;
 pub(crate) mod provider;
 pub(crate) mod runtime;
@@ -40,9 +40,9 @@ mod wire;
 
 pub use crate::wire::launch_abi;
 
-pub use crate::api::observability;
-pub use crate::api::{Access, Guest, Mount, Sandbox, Stdio, Version};
 pub use checkpoint_stream::{CheckpointStore, MemoryStore, StoreError};
+pub use model::observability;
+pub use model::{Access, Guest, Mount, Sandbox, Stdio, Version};
 
 pub use child::{Child, Output};
 pub use command::Command;

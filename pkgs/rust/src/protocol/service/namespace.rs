@@ -1,4 +1,4 @@
-use crate::api::extension::ServiceId;
+use crate::model::extension::ServiceId;
 
 use super::{
     input::{protocol, Input, Output as _},

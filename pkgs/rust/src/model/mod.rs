@@ -1,4 +1,4 @@
-//! Backend-independent contracts for HL engine implementations and callers.
+//! Backend-independent values shared by engine boundaries.
 
 pub mod control;
 pub mod extension;

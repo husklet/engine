@@ -1,4 +1,4 @@
-//! Backend-independent discovery, launch-policy, and validation models.
+//! Discovery, launch-policy, and validation values.
 
 mod capability;
 mod filesystem;
@@ -10,7 +10,7 @@ mod security;
 mod time;
 mod validation;
 
-pub use crate::api::Version;
+pub use crate::model::Version;
 pub use capability::*;
 pub use filesystem::*;
 pub use namespace::*;

@@ -1,8 +1,8 @@
-//! Filesystem tree, coherence, and initial ownership models.
+//! Filesystem tree, coherence, and initial ownership values.
 
 use std::path::PathBuf;
 
-use crate::api::extension::{HostBindEntry, ProviderId};
+use crate::model::extension::{HostBindEntry, ProviderId};
 
 use super::{SpecError, SpecErrorCategory, SpecResource};
 

@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeSet, ffi::OsString};
 
-use crate::api::Stdio;
+use crate::model::Stdio;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CpuSpec {

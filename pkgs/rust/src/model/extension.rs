@@ -1,8 +1,8 @@
-//! Declarative, backend-independent engine extension specifications.
+//! Declarative engine extension values.
 
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
-use crate::api::Version;
+use crate::model::Version;
 
 /// Stable provider identity. Names are compared byte-for-byte and are not interpreted by the engine.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

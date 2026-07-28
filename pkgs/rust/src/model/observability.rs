@@ -1,4 +1,4 @@
-//! Stable observability schemas. Native emission/control is not implemented.
+//! Stable observability schemas.
 
 const MAGIC: u32 = 0x484c_4f42;
 const VERSION: u16 = 1;

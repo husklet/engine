@@ -1,4 +1,4 @@
-use crate::api::{
+use crate::model::{
     extension::{Inheritance, Protections, ProviderId, Sharing},
     Version,
 };

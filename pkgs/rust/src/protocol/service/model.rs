@@ -1,4 +1,4 @@
-use crate::api::extension::ServiceId;
+use crate::model::extension::ServiceId;
 use crate::protocol::TransportError;
 use crate::provider::{Interest, LinuxError, Readiness};
 #[derive(Clone, Debug, Eq, PartialEq)]

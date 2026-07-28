@@ -1,4 +1,4 @@
-//! Backend-independent live-control requests and result models.
+//! Backend-independent live-control values.
 
 use std::collections::BTreeSet;
 

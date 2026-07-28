@@ -1,8 +1,8 @@
-//! Engine discovery models and hard limits.
+//! Engine discovery values and hard limits.
 
 use std::collections::BTreeSet;
 
-use crate::api::{extension::ExtensionCapability, Guest, Version};
+use crate::model::{extension::ExtensionCapability, Guest, Version};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineCapabilities {

@@ -1,4 +1,4 @@
-use crate::api::extension::{Metadata, ServiceId};
+use crate::model::extension::{Metadata, ServiceId};
 use crate::provider::LinuxError;
 use std::{collections::BTreeSet, time::SystemTime};
 

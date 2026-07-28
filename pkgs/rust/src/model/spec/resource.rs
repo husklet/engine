@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::api::extension::ProviderId;
+use crate::model::extension::ProviderId;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ResourceSpec {

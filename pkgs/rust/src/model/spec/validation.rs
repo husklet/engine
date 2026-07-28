@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeSet, path::PathBuf};
 
-use crate::api::{
+use crate::model::{
     extension::{Feature, ProviderId, ServiceId},
     Version,
 };

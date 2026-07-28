@@ -1,4 +1,4 @@
-use crate::api::extension::{ContractError, ProviderId};
+use crate::model::extension::{ContractError, ProviderId};
 use crate::provider::{Handles, Memory};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 

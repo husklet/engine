@@ -2,7 +2,7 @@ use super::{
     input::{protocol, Input, Output as _},
     Reply, Request, SeekWhence, ServiceFailure, ServiceStat,
 };
-use crate::api::extension::ServiceId;
+use crate::model::extension::ServiceId;
 use crate::provider::{Interest, LinuxError, Readiness, ReadyState};
 
 const OPEN: u8 = 1;

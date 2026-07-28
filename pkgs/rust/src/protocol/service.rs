@@ -15,7 +15,7 @@ mod tests {
         codec::WRITE, decode_namespace_install, encode_namespace_install, input::protocol,
         ProjectionKind, Reply, Request, ServiceCodec, ServiceFailure, ServiceProjection,
     };
-    use crate::api::extension::ServiceId;
+    use crate::model::extension::ServiceId;
     use crate::provider::{LinuxError, Readiness, ReadyState};
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::api::{
+use crate::model::{
     extension::{
         ExtensionConfig, ExtensionLimits, Feature, MemoryRequirement, NamespaceEntry, ProviderId,
         ServiceRegistration,
