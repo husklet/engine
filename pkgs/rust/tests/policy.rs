@@ -100,7 +100,16 @@ fn cache_policy_is_explicit_and_read_write_host_store_is_supported() {
         "cache.directory"
     );
 
-    value.cache.directory = Some("/tmp/hl-cache".into());
+    // An absolute path as THIS host spells one. The rule under test is
+    // "absolute or rejected", and `Path::is_absolute` answers that question per
+    // platform: `/tmp/hl-cache` is absolute on Unix and relative on Windows,
+    // where a rooted path needs a drive or UNC prefix. Hardcoding the Unix form
+    // tested the assertion above a second time instead of this one.
+    value.cache.directory = Some(if cfg!(windows) {
+        "C:\\hl-cache".into()
+    } else {
+        "/tmp/hl-cache".into()
+    });
     Engine::new().validate(&value).unwrap();
 
     value.cache.policy = CachePolicy::ReadOnly;

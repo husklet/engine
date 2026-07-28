@@ -116,12 +116,20 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     $<TARGET_OBJECTS:win_target_x86_64>
     $<TARGET_OBJECTS:win_life_x86_64>
     ${_win_prov_objs})
-  # The three engine archives are mutually recursive; lld-link's PE driver is
-  # not used here (this is the GNU-style clang driver over ld.lld), so the
-  # explicit group is required exactly as it is for the Linux runner link.
-  target_link_libraries(hl-engine-windows-x86_64 PRIVATE
-    "$<LINK_GROUP:RESCAN,hl-engine,hl-translator,hl-linux-abi,hl-host-windows>"
-    pthread)
+  # The engine archives are mutually recursive. Under the mingw-w64 toolchain
+  # this is the GNU-style clang driver over ld.lld, which makes a single pass
+  # and needs the explicit group, exactly as the Linux runner link does. Under
+  # the MSVC-ABI toolchain the linker rescans on its own and REJECTS the feature
+  # at configure time, and there is no winpthreads to link either.
+  # HL_LINK_GROUP_RESCAN in CMakeLists.txt is that decision.
+  if(HL_LINK_GROUP_RESCAN)
+    target_link_libraries(hl-engine-windows-x86_64 PRIVATE
+      "$<LINK_GROUP:RESCAN,hl-engine,hl-translator,hl-linux-abi,hl-host-windows>"
+      pthread)
+  else()
+    target_link_libraries(hl-engine-windows-x86_64 PRIVATE
+      hl-engine hl-translator hl-linux-abi hl-host-windows)
+  endif()
   set_target_properties(hl-engine-windows-x86_64 PROPERTIES
     EXCLUDE_FROM_ALL TRUE
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/windows-production)
@@ -144,12 +152,82 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     $<TARGET_OBJECTS:win_target_x86_64_nomain>
     $<TARGET_OBJECTS:win_life_x86_64>
     ${_win_prov_objs})
-  target_link_libraries(hl-tier0-probe-x86_64 PRIVATE hl_cpp_flags
-    "$<LINK_GROUP:RESCAN,hl-engine,hl-translator,hl-linux-abi,hl-host-windows>"
-    pthread)
+  if(HL_LINK_GROUP_RESCAN)
+    target_link_libraries(hl-tier0-probe-x86_64 PRIVATE hl_cpp_flags
+      "$<LINK_GROUP:RESCAN,hl-engine,hl-translator,hl-linux-abi,hl-host-windows>"
+      pthread)
+  else()
+    target_link_libraries(hl-tier0-probe-x86_64 PRIVATE hl_cpp_flags
+      hl-engine hl-translator hl-linux-abi hl-host-windows)
+  endif()
   set_target_properties(hl-tier0-probe-x86_64 PROPERTIES
     EXCLUDE_FROM_ALL TRUE
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/windows-production)
+
+  # ---- the Rust crate's embedded archive ----------------------------------
+  # ${HL_PACKAGE_ARCH_DIR}/hl-engine.lib -- the Windows counterpart of the Linux
+  # dual archive below and of the Darwin one in Phase4Mac.cmake. It is what
+  # pkgs/rust/build.rs links, and it is the reason the MSVC-ABI toolchain exists:
+  # rustup's default host triple here is x86_64-pc-windows-msvc, and a
+  # mingw-w64 archive cannot be linked into that ABI.
+  #
+  # MSVC-ABI ONLY. Under the mingw-w64 toolchain this target is not defined at
+  # all, because an archive built there would satisfy no rustc on a stock
+  # Windows machine, and offering one would invite it to be published.
+  #
+  # SINGLE guest ISA, unlike the Linux and Darwin archives, which carry both and
+  # dispatch through src/core/target/dual.c. The x86-64 guest is the one this
+  # host has been measured on; the aarch64 unity TU has not been compiled here
+  # at all, and dual.c's dispatch would pull in an hl_aarch64_run_linux_guest
+  # that nothing defines. Adding the second ISA is additive and needs no change
+  # to this shape.
+  #
+  # COMPLETE. src/core/activation.c is listed explicitly below rather than
+  # through CORE_SOURCES because it is not a core source on any host: the Linux
+  # and Darwin lanes each compile it into their own OBJECT library (dual_activation,
+  # macdual_activation) so it lands in the production archive and nowhere else,
+  # and this is the Windows counterpart of that. It carries the nine
+  # hl_activation_* entry points pkgs/rust/src/ffi.rs declares and the activation
+  # constructor with them; the remaining six (hl_ckpt_*, hl_engine_guest_fd_limit)
+  # come from CORE_SOURCES and the Windows host archive.
+  if(NOT HL_LINK_GROUP_RESCAN)
+    # Full embedded rebuild of the engine, exactly as the Linux arm does below:
+    # the archive is self-contained and shares no object with the Phase-1
+    # libraries, which are built without HL_EMBEDDED_BUILD.
+    add_library(hl-windows-embedded-objs OBJECT
+      ${CORE_SOURCES} src/core/activation.c ${IR_SOURCES} ${LINUX_ABI_SOURCES} ${WINDOWS_HOST_SOURCES})
+    target_link_libraries(hl-windows-embedded-objs PRIVATE hl_engine_cflags)
+    target_compile_options(hl-windows-embedded-objs PRIVATE -D_GNU_SOURCE -DHL_EMBEDDED_BUILD=1)
+
+    # The guest-target unity TU and its lifecycle core, both with
+    # HL_EMBEDDED_BUILD and NO main(): the target root defines one, and an
+    # archive that carries main() would collide with the Rust test harness's.
+    hl_object(win_embed_target_x86_64 src/core/target/x86_64.c
+      FLAGS -D_GNU_SOURCE -DHL_EMBEDDED_BUILD=1 -DHL_ENGINE_NO_MAIN=1 -O2 UNITY)
+    # lifecycle-core: no -D_GNU_SOURCE, matching every other host's lane.
+    hl_object(win_embed_life_x86_64 src/core/lifecycle.c
+      FLAGS -DHL_EMBEDDED_BUILD=1 -DHL_PRODUCTION_GUEST_ISA=HL_GUEST_ISA_X86_64 -O2)
+
+    foreach(_stamped hl-windows-embedded-objs win_embed_target_x86_64 win_embed_life_x86_64)
+      hl_stamp_archive_object(${_stamped})
+    endforeach()
+
+    add_library(hl-engine-crate-archive STATIC
+      $<TARGET_OBJECTS:win_embed_target_x86_64>
+      $<TARGET_OBJECTS:win_embed_life_x86_64>
+      $<TARGET_OBJECTS:hl-windows-embedded-objs>
+      # The POSIX seam. It belongs IN the archive rather than beside it: it
+      # resolves references made by the objects above, and a consumer that had
+      # to link a second library to satisfy them would be a consumer that can
+      # get it wrong.
+      ${CMAKE_SOURCE_DIR}/cmake/toolchains/msvc-posix/posix.c)
+    set_target_properties(hl-engine-crate-archive PROPERTIES
+      EXCLUDE_FROM_ALL TRUE
+      ARCHIVE_OUTPUT_DIRECTORY ${HL_PACKAGE_ARCH_DIR}
+      # rustc's native-library search wants `hl-engine.lib` on a *-windows-msvc
+      # target; the toolchain file already set the empty prefix and .lib suffix.
+      OUTPUT_NAME hl-engine)
+  endif()
   return()
 endif()
 

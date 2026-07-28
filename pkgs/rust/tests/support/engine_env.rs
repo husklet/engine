@@ -26,11 +26,49 @@
 use hl_engine::{Engine, Exit, Guest};
 use std::{path::PathBuf, process::Command, sync::OnceLock};
 
-/// The smallest guest there is: a static Linux binary whose whole job is to exit 42.
-const PROBE_GUEST: &str = "testdata/exit42-aarch64";
-
 fn manifest(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+/// Whether the linked engine archive can execute a guest of one specific ISA.
+///
+/// Per-ISA rather than one boolean because "can this engine run a guest" is two questions on a host
+/// whose archive does not carry every translator. A production POSIX archive carries both and
+/// dispatches between them, so the distinction is invisible there. The Windows archive is built from
+/// a single guest-target unity translation unit (x86-64), which makes an aarch64 launch fail with a
+/// typed "no backend for that ISA" -- a different fact from "activation is broken", and one the skip
+/// reason has to be able to say, because the two have completely different fixes.
+///
+/// The probe is a real launch of the smallest guest there is: a static Linux binary whose whole job
+/// is to exit 42. An archive that links and then cannot run anything is exactly the state a
+/// half-finished port is in, and it is the state this has to distinguish from a working one.
+fn guest_isa_runs(guest: Guest) -> bool {
+    static AARCH64: OnceLock<bool> = OnceLock::new();
+    static X86_64: OnceLock<bool> = OnceLock::new();
+    let (cell, fixture) = match guest {
+        Guest::Aarch64 => (&AARCH64, "testdata/exit42-aarch64"),
+        Guest::X86_64 => (&X86_64, "testdata/exit42-x86_64"),
+    };
+    *cell.get_or_init(|| {
+        Engine::new()
+            .command(guest, manifest(fixture))
+            .status()
+            .is_ok_and(|exit| exit == Exit::Code(42))
+    })
+}
+
+/// Names the ISAs this archive can and cannot run, for a skip reason that is actionable.
+fn isa_summary() -> String {
+    let carried: Vec<&str> = [(Guest::Aarch64, "aarch64"), (Guest::X86_64, "x86-64")]
+        .into_iter()
+        .filter(|&(guest, _)| guest_isa_runs(guest))
+        .map(|(_, name)| name)
+        .collect();
+    if carried.is_empty() {
+        "no guest ISA".to_owned()
+    } else {
+        format!("only the {} guest target", carried.join(" and "))
+    }
 }
 
 /// A scratch directory this binary owns, removed and recreated on first use.
@@ -38,19 +76,14 @@ fn scratch() -> PathBuf {
     manifest("target").join(format!("hl-engine-env-{}", std::process::id()))
 }
 
-/// Whether the linked engine archive can actually execute a guest on this host.
+/// Whether the linked engine archive can execute the guests this suite's `testdata/` fixtures use.
 ///
-/// A real launch, not an env-var guess or a "does the archive exist" check: an archive that links
-/// and then cannot run anything is precisely the state a half-finished port is in, and it is the
-/// state this has to distinguish from a working one.
+/// Both ISAs, not either: every fixture in `testdata/` is committed in an aarch64 and an x86-64
+/// build, and the tests behind this gate either loop over both or name aarch64 outright. So the
+/// question a caller is really asking is "can this engine run MY fixtures", and an archive carrying
+/// one translator answers no to that even though it runs guests perfectly well.
 fn guest_runs() -> bool {
-    static RUNS: OnceLock<bool> = OnceLock::new();
-    *RUNS.get_or_init(|| {
-        Engine::new()
-            .command(Guest::Aarch64, manifest(PROBE_GUEST))
-            .status()
-            .is_ok_and(|exit| exit == Exit::Code(42))
-    })
+    guest_isa_runs(Guest::Aarch64) && guest_isa_runs(Guest::X86_64)
 }
 
 /// Whether the pinned Alpine fixture can be unpacked into a usable guest root here.
@@ -61,7 +94,10 @@ fn guest_runs() -> bool {
 fn rootfs_extracts() -> bool {
     static EXTRACTS: OnceLock<bool> = OnceLock::new();
     *EXTRACTS.get_or_init(|| {
-        if !guest_runs() {
+        // The pinned fixture is `alpine-minirootfs-...-aarch64.tar.gz`, so this needs the aarch64
+        // translator specifically -- an engine that runs x86-64 guests cannot execute a single
+        // binary in this root filesystem.
+        if !guest_isa_runs(Guest::Aarch64) {
             return false;
         }
         let path = scratch().join("rootfs-probe");
@@ -136,8 +172,11 @@ pub fn skip_without_guest(test: &str) -> bool {
     }
     announce(
         test,
-        "the engine archive linked into this binary cannot execute a guest on this host \
-         (there is no Windows engine yet); delete this guard once it can",
+        &format!(
+            "the engine archive linked into this binary carries {} and this test's `testdata/` \
+             fixtures need both aarch64 and x86-64; delete this guard once it carries both",
+            isa_summary()
+        ),
     )
 }
 
@@ -147,8 +186,15 @@ pub fn skip_without_rootfs(test: &str) -> bool {
     if !cfg!(windows) || rootfs_extracts() {
         return false;
     }
-    if !guest_runs() {
-        return skip_without_guest(test);
+    if !guest_isa_runs(Guest::Aarch64) {
+        return announce(
+            test,
+            &format!(
+                "the pinned Alpine fixture is an aarch64 root filesystem and this engine archive \
+                 carries {}",
+                isa_summary()
+            ),
+        );
     }
     announce(
         test,
