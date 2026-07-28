@@ -17,6 +17,8 @@ typedef struct provider_root {
     _Atomic uint32_t clones;
     _Atomic uint32_t closes;
     _Atomic uint32_t last_mask;
+    _Atomic uint64_t last_removed_token;
+    uint32_t fail_add_at;
     hl_status clone_status;
 } provider_root;
 
@@ -36,13 +38,30 @@ typedef struct fork_stress {
     _Atomic uint32_t failed;
 } fork_stress;
 
+typedef struct test_image_header {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t watch_count;
+    int32_t next_wd;
+    uint32_t nonblocking;
+    uint64_t queue_size;
+} test_image_header;
+
+typedef struct test_image_watch {
+    int32_t wd;
+    uint32_t mask;
+    uint64_t token;
+    uint64_t path_size;
+} test_image_watch;
+
 static hl_status provider_add(void *opaque, const char *path, size_t size, uint64_t token, uint32_t mask) {
     provider *state = opaque;
     (void)path;
     (void)size;
     (void)token;
-    state->root->adds++;
+    uint32_t adds = ++state->root->adds;
     state->root->last_mask = mask;
+    if (state->root->fail_add_at != 0 && adds == state->root->fail_add_at) return HL_STATUS_OUT_OF_MEMORY;
     return HL_STATUS_OK;
 }
 
@@ -56,8 +75,8 @@ static hl_status provider_modify(void *opaque, uint64_t token, uint32_t mask) {
 
 static hl_status provider_remove(void *opaque, uint64_t token) {
     provider *state = opaque;
-    (void)token;
     state->root->removes++;
+    state->root->last_removed_token = token;
     return HL_STATUS_OK;
 }
 
@@ -279,6 +298,36 @@ int main(void) {
                  root.clones == clones_before + 1u);
         root.clone_status = HL_STATUS_OK;
         HL_CHECK(hl_linux_close(&abi, (hl_linux_fd)alias) == 0 && root.closes == closes_before + 1u);
+    }
+    {
+        static const char first_path[] = "/tmp/first";
+        static const char second_path[] = "/tmp/second";
+        unsigned char image[sizeof(test_image_header) + 2u * sizeof(test_image_watch) + sizeof(first_path) - 1u +
+                            sizeof(second_path) - 1u];
+        unsigned char *cursor = image;
+        test_image_header header = {
+            UINT64_C(0x484c494e4f544659), 1, 2, 3, 0, 0,
+        };
+        test_image_watch first = {1, HL_LINUX_IN_CREATE, 101, sizeof(first_path) - 1u};
+        test_image_watch second = {2, HL_LINUX_IN_DELETE, 202, sizeof(second_path) - 1u};
+        provider_root import_root = {.fail_add_at = 2};
+        provider *import_state = calloc(1, sizeof(*import_state));
+        HL_CHECK(import_state != NULL);
+        import_state->root = &import_root;
+        memcpy(cursor, &header, sizeof(header));
+        cursor += sizeof(header);
+        memcpy(cursor, &first, sizeof(first));
+        cursor += sizeof(first);
+        memcpy(cursor, first_path, sizeof(first_path) - 1u);
+        cursor += sizeof(first_path) - 1u;
+        memcpy(cursor, &second, sizeof(second));
+        cursor += sizeof(second);
+        memcpy(cursor, second_path, sizeof(second_path) - 1u);
+        HL_CHECK(hl_linux_inotify_import_at(&abi, 5, &provider_ops, import_state, 0, 0, image, sizeof(image)) ==
+                 -HL_LINUX_ENOMEM);
+        HL_CHECK(import_root.adds == 2 && import_root.removes == 1 && import_root.last_removed_token == 101 &&
+                 import_root.closes == 1);
+        HL_CHECK(hl_linux_read(&abi, 5, bytes, sizeof(bytes)) == -HL_LINUX_EBADF);
     }
     HL_CHECK(hl_linux_abi_destroy(&abi) == HL_STATUS_OK);
     return EXIT_SUCCESS;

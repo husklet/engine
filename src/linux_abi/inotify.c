@@ -260,12 +260,12 @@ static hl_status inotify_clone(void *opaque, void **out_context) {
         copy->watches = calloc(source->watch_capacity, sizeof(*copy->watches));
         if (copy->watches == NULL) goto no_memory_locked;
         copy->watch_capacity = source->watch_capacity;
-        copy->watch_count = source->watch_count;
         for (index = 0; index < source->watch_count; ++index) {
             copy->watches[index] = source->watches[index];
             copy->watches[index].path = malloc(source->watches[index].path_size + 1u);
             if (copy->watches[index].path == NULL) goto no_memory_locked;
             memcpy(copy->watches[index].path, source->watches[index].path, source->watches[index].path_size + 1u);
+            copy->watch_count++;
         }
     }
     if (source->queue_size != 0) {
@@ -610,27 +610,31 @@ int64_t hl_linux_inotify_import_at(hl_linux_abi *linux_abi, hl_linux_fd requeste
     }
     for (index = 0; index < header.watch_count; ++index) {
         inotify_image_watch saved;
-        inotify_watch *watch = &object->watches[index];
+        inotify_watch watch = {0};
         if ((size_t)(end - cursor) < sizeof(saved)) goto fail_object;
         memcpy(&saved, cursor, sizeof(saved));
         cursor += sizeof(saved);
         if (saved.wd <= 0 || saved.path_size == 0 || saved.path_size > (uint64_t)(end - cursor) ||
             saved.path_size > SIZE_MAX - 1u)
             goto fail_object;
-        watch->path = malloc((size_t)saved.path_size + 1u);
-        if (watch->path == NULL) {
+        watch.path = malloc((size_t)saved.path_size + 1u);
+        if (watch.path == NULL) {
             status = HL_STATUS_OUT_OF_MEMORY;
             goto fail_object;
         }
-        memcpy(watch->path, cursor, (size_t)saved.path_size);
-        watch->path[saved.path_size] = 0;
+        memcpy(watch.path, cursor, (size_t)saved.path_size);
+        watch.path[saved.path_size] = 0;
         cursor += saved.path_size;
-        watch->wd = saved.wd;
-        watch->mask = saved.mask;
-        watch->token = saved.token;
-        watch->path_size = (size_t)saved.path_size;
-        status = provider->add(provider_context, watch->path, watch->path_size, watch->token, watch->mask);
-        if (status != HL_STATUS_OK) goto fail_object;
+        watch.wd = saved.wd;
+        watch.mask = saved.mask;
+        watch.token = saved.token;
+        watch.path_size = (size_t)saved.path_size;
+        status = provider->add(provider_context, watch.path, watch.path_size, watch.token, watch.mask);
+        if (status != HL_STATUS_OK) {
+            free(watch.path);
+            goto fail_object;
+        }
+        object->watches[object->watch_count] = watch;
         object->watch_count++;
     }
     if (header.queue_size != (uint64_t)(end - cursor)) goto fail_object;
@@ -671,7 +675,6 @@ fail_object:
             (void)provider->remove(provider_context, object->watches[index].token);
             free(object->watches[index].path);
         }
-        if (object->watch_count < object->watch_capacity) free(object->watches[object->watch_count].path);
         free(object->watches);
         free(object->queue);
         pthread_mutex_destroy(&object->snapshot_lock);

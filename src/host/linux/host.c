@@ -163,6 +163,20 @@ static void hl_linux_counter_unsubscribe_all(hl_host_linux *host, hl_host_handle
 static int hl_linux_descriptor(hl_host_linux *host, hl_host_handle handle, hl_linux_handle_kind first,
                                hl_linux_handle_kind second);
 
+static int hl_linux_grow_capacity(uint32_t current, uint32_t initial, size_t element_size, uint32_t *next) {
+    uint32_t capacity;
+    if (initial == 0 || element_size == 0 || next == NULL) return -1;
+    if (current == 0) {
+        capacity = initial;
+    } else {
+        if (current > UINT32_MAX / 2u) return -1;
+        capacity = current * 2u;
+    }
+    if ((size_t)capacity > SIZE_MAX / element_size) return -1;
+    *next = capacity;
+    return 0;
+}
+
 static uint64_t hl_linux_monotonic_value(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -2411,8 +2425,11 @@ static hl_host_result hl_linux_directory_add(void *context, hl_host_handle insta
                 break;
             }
         if (slot == NULL) {
-            uint32_t capacity = object->watch_capacity * 2u;
-            hl_linux_directory_watch *grown = realloc(object->watches, (size_t)capacity * sizeof(*grown));
+            uint32_t capacity;
+            hl_linux_directory_watch *grown = hl_linux_grow_capacity(object->watch_capacity, HL_LINUX_DIRECTORY_WATCHES,
+                                                                     sizeof(*object->watches), &capacity) == 0
+                                                  ? realloc(object->watches, (size_t)capacity * sizeof(*grown))
+                                                  : NULL;
             if (grown != NULL) {
                 for (index = object->watch_capacity; index < capacity; ++index) {
                     grown[index] = (hl_linux_directory_watch){0};
@@ -2494,8 +2511,11 @@ static uint32_t hl_linux_directory_changes(uint32_t mask) {
 
 static int hl_linux_directory_append(hl_linux_directory_object *object, hl_host_directory_record record) {
     if (object->pending_count == object->pending_capacity) {
-        uint32_t capacity = object->pending_capacity == 0 ? 32u : object->pending_capacity * 2u;
-        hl_host_directory_record *pending = realloc(object->pending, capacity * sizeof(*pending));
+        uint32_t capacity;
+        hl_host_directory_record *pending =
+            hl_linux_grow_capacity(object->pending_capacity, 32u, sizeof(*object->pending), &capacity) == 0
+                ? realloc(object->pending, (size_t)capacity * sizeof(*pending))
+                : NULL;
         if (pending == NULL) return -1;
         object->pending = pending;
         object->pending_capacity = capacity;
@@ -2946,8 +2966,11 @@ static hl_host_result hl_linux_event_arm_timer(void *context, hl_host_handle pol
                 break;
             }
         if (timer == NULL) {
-            uint32_t capacity = host->timer_capacity * 2u;
-            hl_linux_timer_entry *grown = realloc(host->timers, (size_t)capacity * sizeof(*grown));
+            uint32_t capacity;
+            hl_linux_timer_entry *grown = hl_linux_grow_capacity(host->timer_capacity, HL_LINUX_TIMER_CAPACITY,
+                                                                 sizeof(*host->timers), &capacity) == 0
+                                              ? realloc(host->timers, (size_t)capacity * sizeof(*grown))
+                                              : NULL;
             if (grown != NULL) {
                 for (index = host->timer_capacity; index < capacity; ++index) {
                     grown[index] = (hl_linux_timer_entry){0};
@@ -3225,9 +3248,12 @@ static hl_host_result hl_linux_counter_subscribe(void *context, hl_host_handle c
             break;
         }
     if (descriptor >= 0 && index == host->counter_subscription_capacity) {
-        uint32_t capacity = host->counter_subscription_capacity ? host->counter_subscription_capacity * 2u
-                                                                : HL_LINUX_COUNTER_SUBSCRIPTIONS_INITIAL;
-        void *grown = realloc(host->counter_subscriptions, (size_t)capacity * sizeof(*host->counter_subscriptions));
+        uint32_t capacity;
+        void *grown =
+            hl_linux_grow_capacity(host->counter_subscription_capacity, HL_LINUX_COUNTER_SUBSCRIPTIONS_INITIAL,
+                                   sizeof(*host->counter_subscriptions), &capacity) == 0
+                ? realloc(host->counter_subscriptions, (size_t)capacity * sizeof(*host->counter_subscriptions))
+                : NULL;
         if (grown != NULL) {
             host->counter_subscriptions = grown;
             memset(host->counter_subscriptions + host->counter_subscription_capacity, 0,

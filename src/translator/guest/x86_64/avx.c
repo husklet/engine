@@ -2719,7 +2719,7 @@ static void do_avx(const hl_x86_avx_state *state, struct cpu *c) {
                 memcpy(t, b + lane, 16);
                 memcpy(t + 16, a + lane, 16);
                 for (int i = 0; i < 16; i++)
-                    d[lane + i] = (sh + i < 32) ? t[sh + i] : 0;
+                    d[lane + i] = sh < 32 - i ? t[sh + i] : 0;
             }
             avx_put(c, rd, d, W);
             goto done;
@@ -3287,7 +3287,7 @@ static void do_sse3b(const hl_x86_avx_state *state, struct cpu *c) {
 
     // ---- PEXTR* / EXTRACTPS (0F3A 14/15/16/17): xmm -> GPR/memory -----------------------------------
     if (map == 3 && (op == 0x14 || op == 0x15 || op == 0x16 || op == 0x17)) {
-        int imm = (int)I.imm;
+        uint8_t imm = (uint8_t)I.imm;
         uint64_t val;
         int nb;
         if (op == 0x14) {
@@ -3851,7 +3851,7 @@ static void do_sse3b(const hl_x86_avx_state *state, struct cpu *c) {
 
     // ---- map == 3 (0F3A), the xmm-destructive imm8 forms ------------------------------------------
     {
-        int imm = (int)I.imm;
+        uint8_t imm = (uint8_t)I.imm;
         switch (op) {
         case 0x08:
         case 0x09:
@@ -3902,7 +3902,7 @@ static void do_sse3b(const hl_x86_avx_state *state, struct cpu *c) {
             memcpy(comb, s, 16);
             memcpy(comb + 16, D, 16);
             for (int i = 0; i < 16; i++)
-                r[i] = (imm + i < 32) ? comb[imm + i] : 0;
+                r[i] = imm < (unsigned)(32 - i) ? comb[imm + (unsigned)i] : 0;
             break;
         }
         case 0x40: { // dpps: packed-single dot product
