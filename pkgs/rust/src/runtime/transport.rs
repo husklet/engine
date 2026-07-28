@@ -107,11 +107,11 @@ impl Channel {
         }
         let mut stream = self.writer.lock().map_err(|_| TransportError::Io)?;
         stream
-            .set_write_timeout(Some(remaining(deadline)?))
-            .map_err(io_error)?;
+            .set_write_timeout(Some(Self::remaining(deadline)?))
+            .map_err(Self::io_error)?;
         let header = HeaderCodec::encode(frame)?;
-        write_all(&mut stream, &header)?;
-        write_all(&mut stream, &frame.payload)
+        Self::write_all(&mut stream, &header)?;
+        Self::write_all(&mut stream, &frame.payload)
     }
 
     /// Receives and validates one complete frame before exposing its payload.
@@ -121,16 +121,16 @@ impl Channel {
     pub fn receive(&self, deadline: Instant) -> Result<Frame, TransportError> {
         let mut stream = self.reader.lock().map_err(|_| TransportError::Io)?;
         stream
-            .set_read_timeout(Some(remaining(deadline)?))
-            .map_err(io_error)?;
+            .set_read_timeout(Some(Self::remaining(deadline)?))
+            .map_err(Self::io_error)?;
         let mut header = [0_u8; HEADER_BYTES];
-        read_exact(&mut stream, &mut header)?;
+        Self::read_exact(&mut stream, &mut header)?;
         let (kind, request_id, features, length) = HeaderCodec::decode(&header)?;
         if length > self.limits.payload_bytes {
             return Err(TransportError::Oversized);
         }
         let mut payload = vec![0; length as usize];
-        read_exact(&mut stream, &mut payload)?;
+        Self::read_exact(&mut stream, &mut payload)?;
         Ok(Frame {
             kind,
             request_id,
@@ -230,38 +230,40 @@ impl Channel {
         }
         Ok(())
     }
-}
 
-fn remaining(deadline: Instant) -> Result<Duration, TransportError> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|value| !value.is_zero())
-        .ok_or(TransportError::Timeout)
-}
-
-fn write_all(stream: &mut UnixStream, bytes: &[u8]) -> Result<(), TransportError> {
-    stream.write_all(bytes).map_err(io_error)
-}
-
-fn read_exact(stream: &mut UnixStream, bytes: &mut [u8]) -> Result<(), TransportError> {
-    stream.read_exact(bytes).map_err(io_error)
-}
-
-fn io_error(error: std::io::Error) -> TransportError {
-    #[cfg(target_os = "macos")]
-    if matches!(error.raw_os_error(), Some(22 | 32 | 54 | 57)) {
-        return TransportError::PeerClosed;
+    fn remaining(deadline: Instant) -> Result<Duration, TransportError> {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|value| !value.is_zero())
+            .ok_or(TransportError::Timeout)
     }
-    let kind = error.kind();
-    drop(error);
-    match kind {
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => TransportError::Timeout,
-        std::io::ErrorKind::UnexpectedEof
-        | std::io::ErrorKind::BrokenPipe
-        | std::io::ErrorKind::ConnectionReset
-        | std::io::ErrorKind::ConnectionAborted
-        | std::io::ErrorKind::NotConnected => TransportError::PeerClosed,
-        _ => TransportError::Io,
+
+    fn write_all(stream: &mut UnixStream, bytes: &[u8]) -> Result<(), TransportError> {
+        stream.write_all(bytes).map_err(Self::io_error)
+    }
+
+    fn read_exact(stream: &mut UnixStream, bytes: &mut [u8]) -> Result<(), TransportError> {
+        stream.read_exact(bytes).map_err(Self::io_error)
+    }
+
+    fn io_error(error: std::io::Error) -> TransportError {
+        #[cfg(target_os = "macos")]
+        if matches!(error.raw_os_error(), Some(22 | 32 | 54 | 57)) {
+            return TransportError::PeerClosed;
+        }
+        let kind = error.kind();
+        drop(error);
+        match kind {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                TransportError::Timeout
+            }
+            std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected => TransportError::PeerClosed,
+            _ => TransportError::Io,
+        }
     }
 }
 
