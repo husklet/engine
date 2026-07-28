@@ -212,9 +212,8 @@ static int check_copy_semantics(void) {
     committed_count = 0;
     hl_x86_rep_set_store_commit(store_committed, store_observation_active);
     HL_CHECK(hl_x86_rep_movs(observed + 4, observed, 4, 2, 0, NULL, 0) == 2);
-    HL_CHECK(committed_count == 2);
-    HL_CHECK(committed_address[0] == (uint64_t)(uintptr_t)(observed + 4) && committed_size[0] == 2);
-    HL_CHECK(committed_address[1] == (uint64_t)(uintptr_t)(observed + 6) && committed_size[1] == 2);
+    HL_CHECK(committed_count == 1);
+    HL_CHECK(committed_address[0] == (uint64_t)(uintptr_t)(observed + 4) && committed_size[0] == 4);
     observe_stores = 0;
     return 0;
 }
@@ -257,10 +256,8 @@ static int check_fill_semantics(void) {
     committed_count = 0;
     hl_x86_rep_set_store_commit(store_committed, store_observation_active);
     HL_CHECK(hl_x86_rep_stos(bytes + 6, UINT64_C(0x1234), 3, 2, 1, NULL, 0) == 3);
-    HL_CHECK(committed_count == 3);
-    HL_CHECK(committed_address[0] == (uint64_t)(uintptr_t)(bytes + 6) && committed_size[0] == 2);
-    HL_CHECK(committed_address[1] == (uint64_t)(uintptr_t)(bytes + 4) && committed_size[1] == 2);
-    HL_CHECK(committed_address[2] == (uint64_t)(uintptr_t)(bytes + 2) && committed_size[2] == 2);
+    HL_CHECK(committed_count == 1);
+    HL_CHECK(committed_address[0] == (uint64_t)(uintptr_t)(bytes + 2) && committed_size[0] == 6);
     observe_stores = 0;
     return 0;
 }

@@ -38,6 +38,12 @@ static uint64_t rep_fault(struct cpu *cpu, uint64_t address, uint64_t width, uin
     return completed;
 }
 
+static void rep_observe_store(uint64_t address, uint64_t size) {
+    if (size != 0 && g_rep_store_commit != NULL && g_rep_store_observation_active != NULL &&
+        g_rep_store_observation_active())
+        g_rep_store_commit(address, size);
+}
+
 // translator/guest/x86_64 -- rep movs/stos idiom upgrade.
 // Generalizes the LSE idiom-upgrade lever to the x86 string ops: a `rep movs`/`rep stos`
 // (the idiomatic memcpy/memset of every musl/glibc x86 guest) is lowered to ONE optimized
@@ -97,17 +103,6 @@ uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes,
         }
         return n;
     }
-    if (g_rep_store_commit != NULL && g_rep_store_observation_active != NULL && g_rep_store_observation_active()) {
-        uint64_t n = nbytes / (unsigned)w;
-        for (uint64_t i = 0; i < n; ++i) {
-            uint64_t step = i * (uint64_t)w;
-            uint8_t *element_dst = df ? dst - step : dst + step;
-            const uint8_t *element_src = df ? src - step : src + step;
-            memcpy(element_dst, element_src, (size_t)w);
-            g_rep_store_commit((uint64_t)(uintptr_t)element_dst, (uint64_t)w);
-        }
-        return n;
-    }
     if (df) { // DF=1 backward: dst/src point at the HIGHEST element; copy high->low, element-granular (the
         // x86 `std; rep movs` used by memmove for dst>src overlap). Element-by-element replays the scalar
         // loop's exact bytes for every overlap/width; byte-identical to the -w element loop below.
@@ -116,6 +111,7 @@ uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes,
             uint64_t o = i * (uint64_t)w;
             memcpy(dst - o, src - o, (size_t)w); // one whole w-wide element per step
         }
+        rep_observe_store(dlo, nbytes);
         return n;
     }
     uintptr_t dst_address = (uintptr_t)dst;
@@ -123,6 +119,7 @@ uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes,
     if (dst_address <= src_address ||
         dst_address - src_address >= nbytes) { // disjoint, or forward-safe (dst before src)
         memcpy(dst, src, nbytes);
+        rep_observe_store(dlo, nbytes);
         return nbytes / (unsigned)w;
     }
     switch (w) { // forward-overlap smear, element-granular (matches per-element rep movs)
@@ -131,6 +128,7 @@ uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes,
         const uint16_t *s = (const uint16_t *)src;
         for (uint64_t i = 0, n = nbytes >> 1; i < n; i++)
             d[i] = s[i];
+        rep_observe_store(dlo, nbytes);
         return nbytes / (unsigned)w;
     }
     case 4: {
@@ -138,6 +136,7 @@ uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes,
         const uint32_t *s = (const uint32_t *)src;
         for (uint64_t i = 0, n = nbytes >> 2; i < n; i++)
             d[i] = s[i];
+        rep_observe_store(dlo, nbytes);
         return nbytes / (unsigned)w;
     }
     case 8: {
@@ -145,11 +144,13 @@ uint64_t hl_x86_rep_movs(void *destination, const void *source, uint64_t nbytes,
         const uint64_t *s = (const uint64_t *)src;
         for (uint64_t i = 0, n = nbytes >> 3; i < n; i++)
             d[i] = s[i];
+        rep_observe_store(dlo, nbytes);
         return nbytes / (unsigned)w;
     }
     default:
         for (uint64_t i = 0; i < nbytes; i++)
             dst[i] = src[i];
+        rep_observe_store(dlo, nbytes);
         return nbytes;
     }
 }
@@ -181,19 +182,11 @@ uint64_t hl_x86_rep_stos(void *destination, uint64_t val, uint64_t n, int w, int
         }
         return n;
     }
-    if (g_rep_store_commit != NULL && g_rep_store_observation_active != NULL && g_rep_store_observation_active()) {
-        for (uint64_t i = 0; i < n; ++i) {
-            uint64_t step = i * (uint64_t)w;
-            uint8_t *element_dst = df ? dst - step : dst + step;
-            memcpy(element_dst, &val, (size_t)w);
-            g_rep_store_commit((uint64_t)(uintptr_t)element_dst, (uint64_t)w);
-        }
-        return n;
-    }
     if (df) { // DF=1 backward: dst points at the highest element; write val at dst, dst-w, dst-2w, ...
         uint8_t *p = dst;
         for (uint64_t i = 0; i < n; i++, p -= (unsigned)w)
             memcpy(p, &val, (size_t)w); // low w bytes of RAX, little-endian (== AL/AX/EAX/RAX)
+        rep_observe_store(dlo, bytes);
         return n;
     }
     switch (w) {
@@ -201,21 +194,27 @@ uint64_t hl_x86_rep_stos(void *destination, uint64_t val, uint64_t n, int w, int
         uint16_t *p = (uint16_t *)dst, v = (uint16_t)val;
         for (uint64_t i = 0; i < n; i++)
             p[i] = v;
+        rep_observe_store(dlo, bytes);
         return n;
     }
     case 4: {
         uint32_t *p = (uint32_t *)dst, v = (uint32_t)val;
         for (uint64_t i = 0; i < n; i++)
             p[i] = v;
+        rep_observe_store(dlo, bytes);
         return n;
     }
     case 8: {
         uint64_t *p = (uint64_t *)dst, v = val;
         for (uint64_t i = 0; i < n; i++)
             p[i] = v;
+        rep_observe_store(dlo, bytes);
         return n;
     }
-    default: memset(dst, (int)(val & 0xff), n); return n;
+    default:
+        memset(dst, (int)(val & 0xff), n);
+        rep_observe_store(dlo, bytes);
+        return n;
     }
 }
 
