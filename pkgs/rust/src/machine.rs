@@ -6,8 +6,8 @@ use std::{
 
 use crate::{
     control::{
-        decrement, AttachRequest, Attachment, AttachmentKind, ControlError, PauseGuard,
-        ProcessInfo, ResourceUpdate, ShutdownPolicy, Signal, SignalTarget,
+        AttachRequest, Attachment, AttachmentKind, ControlError, PauseGuard, ProcessInfo,
+        ResourceUpdate, ShutdownPolicy, Signal, SignalTarget,
     },
     Child, Domain, Error, Exit, Terminal,
 };
@@ -237,7 +237,7 @@ impl Machine {
             operation: "resume",
             context: "pause state lock is poisoned".into(),
         })?;
-        if !decrement(pauses) {
+        if !PauseGuard::decrement(pauses) {
             return Ok(());
         }
         self.child.signal(continue_signal()).map_err(|error| {

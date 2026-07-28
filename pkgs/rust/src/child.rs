@@ -1,4 +1,4 @@
-use crate::{configfile::ConfigFile, ffi, result, Domain, Error, Exit, Terminal};
+use crate::{configfile::ConfigFile, ffi, Domain, Error, Exit, Terminal};
 use std::{fs::File, io::Read};
 
 /// Owned running engine process.
@@ -59,7 +59,7 @@ impl Child {
             .ok_or(Error::InvalidState)?
             .try_wait()
             .map_err(Self::native_error)?
-            .map(result::native)
+            .map(Exit::from_native)
             .transpose()?;
         self.completed |= exit.is_some();
         Ok(exit)
@@ -90,7 +90,7 @@ impl Child {
     /// # Errors
     /// Returns native lifecycle or result-protocol failures.
     pub fn wait(mut self) -> Result<Exit, Error> {
-        let exit = result::native(
+        let exit = Exit::from_native(
             self.process
                 .as_ref()
                 .ok_or(Error::InvalidState)?

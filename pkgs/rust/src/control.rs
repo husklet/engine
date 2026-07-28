@@ -119,6 +119,12 @@ impl PauseGuard<'_> {
         self.active = false;
         self.machine.release_pause(true)
     }
+
+    pub(crate) fn decrement(mut count: MutexGuard<'_, usize>) -> bool {
+        debug_assert!(*count > 0);
+        *count -= 1;
+        *count == 0
+    }
 }
 
 impl Drop for PauseGuard<'_> {
@@ -127,10 +133,4 @@ impl Drop for PauseGuard<'_> {
             let _ = self.machine.release_pause(false);
         }
     }
-}
-
-pub(crate) fn decrement(mut count: MutexGuard<'_, usize>) -> bool {
-    debug_assert!(*count > 0);
-    *count -= 1;
-    *count == 0
 }

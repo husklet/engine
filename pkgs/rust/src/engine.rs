@@ -73,7 +73,7 @@ impl Engine {
     /// # Errors
     /// Returns a field-addressed error for invalid, conflicting, unsupported, or oversized input.
     pub fn validate(&self, spec: &MachineSpec) -> Result<Validation, SpecError> {
-        validate_spec(&self.capabilities(), spec)
+        validation::validate(&self.capabilities(), spec)
     }
 
     /// Starts a machine from the versioned typed launch model.
@@ -121,7 +121,7 @@ impl Engine {
         }
         validation::validate_authorities(&spec, &authorities).map_err(SpawnError::Spec)?;
         let resources = lowering::allocate_memory(&spec, &authorities).map_err(SpawnError::Spec)?;
-        let launch = lower(spec).map_err(SpawnError::Spec)?;
+        let launch = lowering::Launch::from_spec(spec).map_err(SpawnError::Spec)?;
         launch::start(launch, io, authorities, resources)
             .map(Machine::new)
             .map_err(SpawnError::Engine)
@@ -162,7 +162,7 @@ impl Engine {
         self.validate(&spec).map_err(SpawnError::Spec)?;
         validation::validate_authorities(&spec, &authorities).map_err(SpawnError::Spec)?;
         let resources = lowering::allocate_memory(&spec, &authorities).map_err(SpawnError::Spec)?;
-        let launch = lower(spec).map_err(SpawnError::Spec)?;
+        let launch = lowering::Launch::from_spec(spec).map_err(SpawnError::Spec)?;
         let (broker, child) =
             ffi::broker_pair().map_err(|error| SpawnError::Engine(Error::Io(error)))?;
         let trigger =
@@ -258,17 +258,6 @@ fn namespace_features() -> BTreeSet<crate::extension::Feature> {
     .collect()
 }
 
-fn validate_spec(
-    capabilities: &EngineCapabilities,
-    spec: &MachineSpec,
-) -> Result<Validation, SpecError> {
-    validation::validate(capabilities, spec)
-}
-
-fn lower(spec: MachineSpec) -> Result<lowering::Launch, SpecError> {
-    lowering::Launch::from_spec(spec)
-}
-
 fn spec_error(
     category: SpecErrorCategory,
     field: impl Into<String>,
@@ -354,7 +343,7 @@ mod typed_tests {
         });
         let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/true");
         spec.extensions.push(requested(required, optional.clone()));
-        let validation = super::validate_spec(&capabilities, &spec).unwrap();
+        let validation = super::validation::validate(&capabilities, &spec).unwrap();
         assert_eq!(validation.selected_extensions.len(), 1);
         assert_eq!(validation.degraded_features[0].feature, optional);
         assert_eq!(validation.resources.extension_memory_bytes, 8192);
@@ -382,7 +371,7 @@ mod typed_tests {
         let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/true");
         spec.extensions.push(requested(required, optional));
         assert_eq!(
-            super::validate_spec(&capabilities, &spec)
+            super::validation::validate(&capabilities, &spec)
                 .unwrap_err()
                 .field,
             "extensions.required_features"
