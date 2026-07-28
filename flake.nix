@@ -42,10 +42,23 @@
       ];
 
       # Host backends implementing the hl_host_services contract, one per
-      # src/host/<name>/. `supported` gates whether outputs are produced at all:
-      # src/host/windows/ is currently a reserved boundary (README only, no code
-      # and no Makefile/CMake wiring), so a windows host evaluates but builds
-      # nothing. When that backend lands, flip the flag.
+      # src/host/<name>/. `supported` gates whether outputs are produced at all.
+      #
+      # windows = false no longer means "no backend". src/host/windows/ is a real
+      # backend now -- it builds, links a production engine and runs Linux guests --
+      # and it is reached through cmake/toolchains/x86_64-windows.cmake with
+      # mingw-w64 clang, or x86_64-windows-msvc.cmake for the crate archive.
+      #
+      # What the flag says is that NIX is not the route to it. Nix does not run
+      # natively on Windows, so nothing here can produce a Windows output for a
+      # Windows user; a nix build could only ever cross-compile one from Linux,
+      # which is not a supported configuration and which nothing tests. Flipping
+      # this to true would advertise outputs that do not exist.
+      #
+      # The consequence to know: canBuildGuests is false for a windows host, so the
+      # guest fixture corpus is not built here. It is cross-built from a WSL2 Linux
+      # by tools/windows/build_guest_fixtures.sh and consumed from a digest-checked
+      # cache -- see cmake/GuestFixtures.cmake's Windows arm.
       hostBackends = {
         linux = { supported = true; };
         macos = { supported = true; };

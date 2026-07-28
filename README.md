@@ -7,6 +7,7 @@ HL Engine runs AArch64 and x86-64 Linux programs on AArch64 macOS and Linux host
 | macOS AArch64 | Supported | AArch64, x86-64 |
 | Linux AArch64 | Supported | AArch64, x86-64 |
 | Linux x86-64 | In progress — see below | AArch64, x86-64 (interpreted) |
+| Windows x86-64 | Early — see [`docs/windows/README.md`](docs/windows/README.md) | x86-64 (interpreted) |
 
 "Supported" means the exact-golden compatibility, lifecycle and production matrices pass on that host for **both**
 guest ISAs. Linux x86-64 is not there yet, and the table says only what is proven on it:
@@ -46,7 +47,16 @@ guest ISAs. Linux x86-64 is not there yet, and the table says only what is prove
 
 [`docs/amd64-host.md`](docs/amd64-host.md) is the single record for this work: the seam, the
 (host CPU × guest ISA) matrix, measured performance, what emulation proves, every defect found, what is
-still missing, and merge guidance. Windows is a reserved boundary with no code.
+still missing, and merge guidance.
+
+Windows x86-64 is no longer a reserved boundary. A native Win32/NT host backend exists, the
+production engine builds and links, and a Linux guest runs: `hello_x86` prints byte-exact golden
+output and exits on the guest's own `exit_group(42)`, and a dynamically linked glibc guest runs too.
+**862 of 1,471 active x86-64 compatibility cases pass (58.6%)**, golden-compared, with no
+`excluded-windows` disposition used to reach that number — every remaining failure is a named
+defect. It is early, not supported: guest `fork()`, SysV IPC, termios and the aarch64 guest are all
+absent, and `docs/windows/README.md` is the record of what is proven, what is measured and what is
+still missing.
 
 ```sh
 cargo add hl-engine
