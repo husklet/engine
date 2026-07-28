@@ -12,7 +12,7 @@ endif()
 find_program(HL_CLANG_FORMAT_EXECUTABLE NAMES clang-format)
 find_program(HL_CLANG_TIDY_EXECUTABLE NAMES clang-tidy)
 find_program(HL_CPPCHECK_EXECUTABLE NAMES cppcheck)
-set(HL_LINT_ALLOW_GETENV_FILES "src/core/environment.c"
+set(HL_LINT_ALLOW_GETENV_FILES "src/core/environment.c;tools/config.c"
   CACHE STRING "Semicolon-separated source files allowed to use getenv()")
 # Ratchet, not approval: these files predate the tagged logging boundary and
 # must be removed from this list as their direct diagnostics are migrated.
@@ -43,6 +43,9 @@ set(HL_LINT_ALLOW_STDIO_FILES
   src/translator/guest/x86_64/signal.c
   src/translator/guest/x86_64/translate.c
   CACHE STRING "Legacy files temporarily allowed direct console output")
+set(_hl_lint_cli_stdio_files
+  tools/bench_runner.c
+  tools/matrix_runner.c)
 
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/linter/src/hl_lint.c")
   message(STATUS "linter source missing: ${CMAKE_CURRENT_SOURCE_DIR}/linter/src/hl_lint.c")
@@ -82,6 +85,9 @@ set(_hl_lint_args
   ${_hl_lint_strict}
   --source-dir "${CMAKE_SOURCE_DIR}/src"
   --source-dir "${CMAKE_SOURCE_DIR}/include"
+  --source-file "${CMAKE_SOURCE_DIR}/tools/config.c"
+  --source-file "${CMAKE_SOURCE_DIR}/tools/bench_runner.c"
+  --source-file "${CMAKE_SOURCE_DIR}/tools/matrix_runner.c"
   --include-dir "${CMAKE_SOURCE_DIR}/include"
   --include-dir "${CMAKE_SOURCE_DIR}/src"
   --clang-format-check
@@ -114,6 +120,9 @@ foreach(_allowed_file IN LISTS HL_LINT_ALLOW_GETENV_FILES)
 endforeach()
 foreach(_allowed_file IN LISTS HL_LINT_ALLOW_STDIO_FILES)
   list(APPEND _hl_lint_args --allow-stdio-file "${_allowed_file}")
+endforeach()
+foreach(_cli_file IN LISTS _hl_lint_cli_stdio_files)
+  list(APPEND _hl_lint_args --allow-stdio-file "${_cli_file}")
 endforeach()
 
 add_custom_target(hl-lint

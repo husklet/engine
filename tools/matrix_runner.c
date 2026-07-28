@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "launch.h"
+#include "config.h"
 
 #include "hl/config.h"
 
@@ -32,14 +33,7 @@ enum { CASE_MAX = 256, FIELD_MAX = 512, OUTPUT_MAX = 1024 * 1024, ERROR_MAX = 64
  * budget is an explicit opt-in the caller sets for the suites that need it.
  * Values outside [1s, 1h] are ignored rather than trusted. */
 static uint64_t case_timeout_ms(void) {
-    const char *value = getenv("HL_MATRIX_CASE_TIMEOUT_MS");
-    char *end = NULL;
-    unsigned long parsed;
-    if (value == NULL || *value == 0) return TIMEOUT_MS;
-    errno = 0;
-    parsed = strtoul(value, &end, 10);
-    if (errno != 0 || end == value || *end != 0 || parsed < 1000 || parsed > 3600000) return TIMEOUT_MS;
-    return (uint64_t)parsed;
+    return hl_tool_config_matrix_timeout_ms(TIMEOUT_MS);
 }
 
 #ifndef AARCH64_DYNAMIC_LOADER
@@ -123,7 +117,7 @@ static int resources_restored(resource_baseline baseline, const suite_case *item
     int descriptor_clean = baseline.descriptors < 0 || current.descriptors == baseline.descriptors;
     int thread_clean = baseline.threads < 0 || current.threads == baseline.threads;
     if (child_clean && descriptor_clean && thread_clean) return 1;
-    if (getenv("GITHUB_ACTIONS") != NULL)
+    if (hl_tool_config_github_actions())
         fprintf(stderr,
                 "::error title=Compatibility resource leak (%s)::children=%s descriptors=%ld/%ld "
                 "threads=%ld/%ld\n",
@@ -507,7 +501,7 @@ static int make_config(const char *binary_root, const char *guest, const char *a
     wire.config.gid = -1;
     if (process_domain(wire.config.process_domain) != 0) return 1;
     {
-        const char *debug_log = getenv("HL_LOG");
+        const char *debug_log = hl_tool_config_log_selector();
         if (debug_log != NULL && *debug_log != 0 && pool_string(&wire, debug_log, &wire.config.debug_log_offset) != 0)
             return 1;
     }
@@ -613,7 +607,7 @@ static int run_guest(const char *bridge, const char *engine, const char *guest, 
          * mounted tmpfs. The override is a HOST path; the engine's guest-side
          * special-casing of /tmp and /dev/shm does not apply to it.
          */
-        const char *scratch_base = getenv("HL_MATRIX_SCRATCH_DIR");
+        const char *scratch_base = hl_tool_config_matrix_scratch();
         struct stat base_stat;
         if (scratch_base == NULL || scratch_base[0] == 0 || stat(scratch_base, &base_stat) != 0 ||
             !S_ISDIR(base_stat.st_mode) || access(scratch_base, W_OK) != 0)
@@ -836,7 +830,7 @@ static int exit_matches(const capture *result, int expected) {
 }
 
 static void diagnostic(const suite_case *item, const char *isa, const char *reason, const capture *result) {
-    if (getenv("GITHUB_ACTIONS") != NULL)
+    if (hl_tool_config_github_actions())
         fprintf(stderr, "::error title=Compatibility failure (%s %s)::%s\n", item->name, isa, reason);
     fprintf(stderr, "matrix-runner: %s [%s] %s", item->name, isa, reason);
     if (result != NULL) {

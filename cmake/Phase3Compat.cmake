@@ -347,7 +347,7 @@ endif()
 hl_tool(linux-production-smoke tools/linux_production_smoke.c)
 hl_tool(linux-matrix           tools/linux_matrix.c)
 # bench-runner does many benign width conversions; -Wconversion is dropped.
-add_executable(bench-runner tools/bench_runner.c)
+add_executable(bench-runner tools/bench_runner.c tools/config.c)
 target_compile_options(bench-runner PRIVATE -O2 -g -std=gnu11 -Wall -Wextra)
 set_target_properties(bench-runner PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tools)
@@ -359,6 +359,7 @@ hl_tool(matrix-runner tools/matrix_runner.c LINK -lc
         -DAARCH64_DYNAMIC_LIBC="${HL_AARCH64_DYNAMIC_LIBC}"
         -DX86_64_DYNAMIC_LOADER="${HL_X86_64_DYNAMIC_LOADER}"
         -DX86_64_DYNAMIC_LIBC="${HL_X86_64_DYNAMIC_LIBC}")
+target_sources(matrix-runner PRIVATE tools/config.c)
 
 # Native (host-arch) smoke fixtures. Linux-only: they are the Linux syscall
 # surface (epoll/eventfd/timerfd/seccomp/statx) compiled for the HOST, so a

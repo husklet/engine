@@ -114,6 +114,8 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include "config.h"
+
 #define MAX_PHASES 32
 #define MAX_REPEATS 128
 #define MAX_COLS 32
@@ -187,14 +189,12 @@ static void ctx_defaults(ctx_t *c) {
 
 /* Environment override for the docker command (default "docker"). */
 static const char *docker_cmd(void) {
-    const char *d = getenv("DOCKER");
-    return (d && *d) ? d : "docker";
+    return hl_tool_config_docker_command();
 }
 
 static const char *docker_image(const ctx_t *c) {
     if (c->image) return c->image;
-    const char *e = getenv("DOCKER_IMAGE");
-    return (e && *e) ? e : "debian:stable-slim";
+    return hl_tool_config_docker_image();
 }
 
 /* ------------------------------------------------------------ provider model */
@@ -406,15 +406,26 @@ static int run_once(const char *cmd, phase_acc_t *acc, int *nph) {
     return seen > 0 ? 0 : -3;
 }
 
-static void ensure_parent_dir(const char *path) {
+static int ensure_parent_dir(const char *path) {
     char tmp[LINE];
-    snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t length = strlen(path);
+    struct stat status;
+    if (length >= sizeof(tmp)) return -1;
+    memcpy(tmp, path, length + 1);
     char *slash = strrchr(tmp, '/');
-    if (!slash) return;
+    if (!slash) return 0;
     *slash = '\0';
-    char cmd[LINE];
-    snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", tmp);
-    (void)system(cmd);
+    for (char *cursor = tmp + (tmp[0] == '/');; ++cursor) {
+        if (*cursor != '/' && *cursor != '\0') continue;
+        char saved = *cursor;
+        *cursor = '\0';
+        if (tmp[0] != '\0' && mkdir(tmp, 0777) != 0 &&
+            (errno != EEXIST || stat(tmp, &status) != 0 || !S_ISDIR(status.st_mode)))
+            return -1;
+        *cursor = saved;
+        if (saved == '\0') break;
+    }
+    return 0;
 }
 
 static int cmd_run(int argc, char **argv) {
@@ -504,7 +515,10 @@ static int cmd_run(int argc, char **argv) {
     /* emit CSV */
     FILE *o = stdout;
     if (out) {
-        ensure_parent_dir(out);
+        if (ensure_parent_dir(out) != 0) {
+            fprintf(stderr, "cannot create output directory for %s: %s\n", out, strerror(errno));
+            return 1;
+        }
         o = fopen(out, "w");
         if (!o) {
             perror("fopen");
