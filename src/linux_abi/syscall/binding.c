@@ -34,13 +34,19 @@ static int bound_sentinel_vacate(int target) {
     int relocated = fcntl(g_bound_sentinel, F_DUPFD_CLOEXEC, target < 64 ? 64 : target + 1);
     if (relocated < 0) return -errno;
     int adopted = hl_host_process_fd_private_adopt(relocated);
-    if (adopted < 0) {
+    /* No private band on this host means nothing to hoist into, and the guest
+     * asked only that this NUMBER be free -- which the relocation above already
+     * made it. Failing here instead would answer an ordinary F_DUPFD with EMFILE
+     * purely because its floor happened to be the sentinel's number. Same test
+     * bound_shadow_activate makes of the same refusal. */
+    if (adopted < 0 && hl_host_process_fd_private_floor() >= 0) {
         close(relocated);
         return -ENOSPC;
     }
     hl_host_process_fd_private_remove(g_bound_sentinel);
+    (void)hl_fdhandle_forget(g_bound_sentinel);
     close(g_bound_sentinel);
-    g_bound_sentinel = adopted;
+    g_bound_sentinel = adopted >= 0 ? adopted : relocated;
     return 0;
 }
 
@@ -1062,25 +1068,41 @@ static int bound_shadow_activate(void) {
         }
         return 0;
     }
-    opened = open(HL_LINUX_HOST_NULL_DEVICE, O_RDWR | O_CLOEXEC);
+    /* openat(AT_FDCWD, ...) IS open() on every host, and on a host whose
+       descriptors carry no metadata of their own it is also the call that files
+       the descriptor's access mode and close-on-exec in the handle table. The
+       bare open() left the sentinel unrecorded there, and the very next line
+       asks fcntl to duplicate it -- which on such a host can only answer for a
+       descriptor the table knows. */
+    opened = openat(AT_FDCWD, HL_LINUX_HOST_NULL_DEVICE, O_RDWR | O_CLOEXEC);
     if (opened < 0) return -1;
     g_bound_sentinel = bound_private_dup(opened, 64);
     if (g_bound_sentinel < 0) {
         int error = errno;
+        (void)hl_fdhandle_forget(opened);
         close(opened);
         errno = error;
         return -1;
     }
+    /* The record is only ever as good as the number it is filed under, and this
+       number is about to be free for reuse by a path that publishes nothing. */
+    (void)hl_fdhandle_forget(opened);
     close(opened);
     int adopted = hl_host_process_fd_private_adopt(g_bound_sentinel);
-    if (adopted < 0) {
+    /* A host that publishes no private descriptor band cannot hoist anything,
+       and refusing to activate on that account would refuse the typed box
+       outright. The sentinel then simply stays at the number bound_private_dup
+       chose, which is what an unhoisted engine descriptor is everywhere: a
+       collision hazard if a guest names it, not an incorrect answer. Same test
+       activation.c already makes of the same refusal. */
+    if (adopted < 0 && hl_host_process_fd_private_floor() >= 0) {
         int error = ENOSPC;
         close(g_bound_sentinel);
         g_bound_sentinel = -1;
         errno = error;
         return -1;
     }
-    g_bound_sentinel = adopted;
+    if (adopted >= 0) g_bound_sentinel = adopted;
     for (fd = 0; fd < g_linux_box->fd_capacity; ++fd) {
         int shadow;
         if (hl_linux_fd_snapshot_get(g_linux_box, fd, &snapshot) != HL_STATUS_OK) continue;

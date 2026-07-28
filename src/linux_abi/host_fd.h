@@ -395,11 +395,41 @@ static inline char *realpath(const char *path, char *resolved) {
  * open.  A probe therefore under-reports here, exactly as it did when the whole
  * call refused, and no caller may read a refusal as proof of a closed fd.
  *
- * F_DUPFD stays refused.  It is the one command with a synthesizable body (dup
- * in a loop until the result clears the floor, closing the rejects), and
- * syscall/io.c's engine_fd_reloc asks for a floor of 1 << 20, which a dup loop
- * would chase until it exhausted the 8192-entry table.  The record-lock and
- * SIGIO-owner commands stay refused because nothing records them yet.
+ * F_DUPFD AND F_DUPFD_CLOEXEC are REAL for an AMBIENT binding and refused
+ * otherwise, and the split is the whole of what makes them safe.
+ *
+ * The body was always the obvious one -- dup in a loop until the result clears
+ * the floor, closing the rejects -- and it was refused for a reason that is
+ * still true of one caller and only one: syscall/io.c's engine_fd_reloc asks for
+ * a floor of 1 << 20 and a dup loop would chase that until it exhausted the
+ * 8192-entry table.  So the FLOOR is what is tested.  A floor the table cannot
+ * reach is refused exactly as before -- and engine_fd_reloc already retries at
+ * 64 when the high floor fails, which is the arm it now takes here -- while a
+ * floor inside the table is answered.  The loop is self-limiting: each rejected
+ * duplicate holds a slot until the loop ends, so a floor the table can reach is
+ * reached in at most one pass over it, and a full table ends the loop with the
+ * CRT's own EMFILE instead of spinning.
+ *
+ * AMBIENT ONLY, because dup(2) duplicates the DESCRIPTOR and only an ambient
+ * binding is a descriptor: the int is the object, _dup is exactly dup(2) on it,
+ * and the duplicate names the same open file description with its own number.
+ * A handle-bound descriptor's object is the handle, which _dup does not
+ * duplicate, so the result would be a number pointing at the CRT's idea of the
+ * fd and not at the description the caller asked to duplicate.  That refuses.
+ *
+ * ONE NAMED RESIDUAL.  F_DUPFD_CLOEXEC records close-on-exec, and the record is
+ * what this layer reads -- F_GETFD above and syscall/proc.c's emulated execve
+ * sweep both answer from it.  It does NOT mark the underlying HANDLE
+ * non-inheritable: that is SetHandleInformation, which means <windows.h>, which
+ * a header pulled into the guest-target unity TU must not include (see (2)
+ * above).  So a descriptor duplicated with this flag is still inheritable by a
+ * CreateProcess that inherits handles.  Every caller of these two commands in
+ * this layer duplicates an engine-private descriptor that no spawn hands on, so
+ * nothing rests on the handle bit today; it is named because the flag's name
+ * promises it.
+ *
+ * The record-lock and SIGIO-owner commands stay refused because nothing records
+ * them yet.
  */
 static inline int fcntl(int descriptor, int command, ...) {
     hl_host_handle handle;
@@ -455,6 +485,64 @@ static inline int fcntl(int descriptor, int command, ...) {
         if (requested == state) return 0;
         errno = ENOSYS;
         return -1;
+    }
+    case F_DUPFD:
+    case F_DUPFD_CLOEXEC: {
+        va_list arguments;
+        int *held = NULL;
+        size_t count = 0;
+        size_t capacity = 0;
+        int floor;
+        int duplicate;
+        int error = 0;
+        va_start(arguments, command);
+        floor = va_arg(arguments, int);
+        va_end(arguments);
+        /* Not a descriptor this can duplicate: see the AMBIENT-ONLY paragraph. */
+        if (handle != HL_HOST_HANDLE_INVALID || (state & HL_FDHANDLE_AMBIENT) == 0) {
+            errno = ENOSYS;
+            return -1;
+        }
+        if (floor < 0 || floor >= getdtablesize()) {
+            errno = floor < 0 ? EINVAL : ENOSYS;
+            return -1;
+        }
+        for (;;) {
+            duplicate = _dup(descriptor);
+            if (duplicate < 0) {
+                error = errno;
+                break;
+            }
+            if (duplicate >= floor) break;
+            if (count == capacity) {
+                size_t grown = capacity == 0 ? 64u : capacity * 2u;
+                int *resized = (int *)realloc(held, grown * sizeof(*held));
+                if (resized == NULL) {
+                    _close(duplicate);
+                    error = ENOMEM;
+                    duplicate = -1;
+                    break;
+                }
+                held = resized;
+                capacity = grown;
+            }
+            held[count++] = duplicate;
+        }
+        /* The rejects are released only after the winner is in hand, so that the
+           loop cannot be handed the same number twice. */
+        while (count != 0)
+            _close(held[--count]);
+        free(held);
+        if (duplicate < 0) {
+            errno = error;
+            return -1;
+        }
+        /* POSIX: the duplicate does not inherit FD_CLOEXEC, and F_DUPFD_CLOEXEC
+           is the spelling that asks for it. */
+        (void)hl_fdhandle_publish_ambient(duplicate, command == F_DUPFD_CLOEXEC
+                                                         ? (state | HL_FDHANDLE_CLOEXEC)
+                                                         : (state & ~(uint32_t)HL_FDHANDLE_CLOEXEC));
+        return duplicate;
     }
     default: errno = ENOSYS; return -1;
     }

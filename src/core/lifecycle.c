@@ -257,6 +257,34 @@ static hl_status hl_production_launch_options(hl_options *options, const unsigne
 }
 
 /*
+ * The box the cold child runs with, and the two tables it indexes.
+ *
+ * The tables are heap rather than static for the reason engine.c allocates the
+ * same pair that way: together they are several megabytes, almost all of which
+ * a typical guest never touches, and a calloc leaves the untouched pages
+ * demand-zero. hl_linux_abi_init requires them zeroed and deliberately does not
+ * zero them itself, which is exactly what calloc promises.
+ *
+ * The hl_linux_abi itself is static because it must outlive this function and
+ * every guest thread that will reach it through g_linux_box; a failure to build
+ * it returns NULL, which is the state this host was in before and which
+ * hl_run_linux_guest already accepts.
+ */
+static hl_linux_abi cold_box;
+
+static hl_linux_abi *hl_production_cold_box(const hl_host_services *services) {
+    hl_linux_fd_entry *fds = calloc(HL_LINUX_FD_LIMIT, sizeof(*fds));
+    hl_linux_ofd_entry *ofds = calloc(HL_LINUX_OFD_LIMIT, sizeof(*ofds));
+    if (fds == NULL || ofds == NULL ||
+        hl_linux_abi_init(&cold_box, services, fds, HL_LINUX_FD_LIMIT, ofds, HL_LINUX_OFD_LIMIT) != HL_STATUS_OK) {
+        free(fds);
+        free(ofds);
+        return NULL;
+    }
+    return &cold_box;
+}
+
+/*
  * The child side. Reached with a NULL context, because on this host a context is
  * a pointer and a pointer is the one thing that cannot cross; everything it
  * would have pointed at arrives through the launch channel instead.
@@ -269,16 +297,42 @@ static hl_status hl_production_launch_options(hl_options *options, const unsigne
  * the spawn already inherited, so this host is the same host, addressing the
  * same console or pipes.
  *
- * The box is NULL, and that is a statement about what a cold child is. A box
- * carries the guest's open-file descriptions across a FORK; a child that shares
- * no address space has nothing to carry them into and builds its fd table from
- * the descriptors it was launched with. The bindings the parent installed in its
- * own box are the three standard streams, and those arrive as inherited handles.
+ * The box is BUILT HERE, and the reason it is built rather than carried is the
+ * reason everything else on this path is: it is a graph of pointers -- host
+ * services, two descriptor tables, a host mutex per open file description --
+ * and not one of those pointers means anything in a second address space. What
+ * makes it constructible anyway is that a box has no INPUTS a cold child does
+ * not already have. hl_linux_abi_init takes host services and two zeroed arrays,
+ * and this arm has just created the first and can allocate the second, so the
+ * object the parent would have handed over is exactly the object this produces.
+ *
+ * It starts EMPTY, and that is the statement about what a cold child is. The
+ * entries a box carries are open file descriptions, and those cross a FORK by
+ * being duplicated into a child that already shares the address space they live
+ * in. A CreateProcess child shares none of it; what it holds instead are the
+ * three standard streams the spawn inherited, which are already reachable as
+ * this process's own descriptors and are the descriptors the guest's fd 0, 1
+ * and 2 resolve to. So the table starts with nothing in it and fills as the
+ * guest asks for things.
+ *
+ * Which is the whole point of building it. The box is not only a descriptor
+ * table -- it is the object the typed providers (eventfd, pipe, epoll, timerfd,
+ * pidfd, inotify) install into, and the guest paths that reach them are all
+ * guarded on its existence. With no box those paths are unreachable on this
+ * host no matter what is wired behind them; with an empty one they behave
+ * exactly as they do on a freshly forked guest that has not opened anything.
+ *
+ * Nothing is destroyed on the way out. hl_linux_abi_destroy refuses a box with
+ * live descriptions in it, which is the normal state of a guest that ran, and
+ * this frame is the last one before process exit -- so the tables are released
+ * by exit, with the host handles in them, exactly as the guest's other
+ * per-process state is.
  */
 static int32_t hl_production_cold_entry(void *opaque) {
     hl_production_launch_header header;
     hl_host_windows *native = NULL;
     hl_host_services services = {0};
+    hl_linux_abi *box;
     hl_options options;
     const unsigned char *bytes;
     size_t payload_size = 0;
@@ -353,7 +407,11 @@ static int32_t hl_production_cold_entry(void *opaque) {
      * idempotent, and calling them explicitly removes this launch's dependence
      * on where in the constructor list this image's spawn hook happens to sit. */
     hl_target_runtime_init();
-    result = hl_run_linux_guest(&services, NULL, rootfs, HL_HOST_HANDLE_INVALID, image, (size_t)header.image_size,
+    /* `services` outlives the guest run: this frame is the entry point and does
+     * not return until the run is over, which is the same lifetime the call
+     * below already relies on for the services pointer itself. */
+    box = hl_production_cold_box(&services);
+    result = hl_run_linux_guest(&services, box, rootfs, HL_HOST_HANDLE_INVALID, image, (size_t)header.image_size,
                                 header.argc, argv);
     (void)hl_options_bind_process(previous);
     hl_engine_child_result_publish(result, hl_run_linux_guest_status(), 0);
