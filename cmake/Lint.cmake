@@ -14,6 +14,40 @@ find_program(HL_CLANG_TIDY_EXECUTABLE NAMES clang-tidy)
 find_program(HL_CPPCHECK_EXECUTABLE NAMES cppcheck)
 set(HL_LINT_ALLOW_GETENV_FILES "src/core/environment.c"
   CACHE STRING "Semicolon-separated source files allowed to use getenv()")
+# Ratchet, not approval: these files predate the tagged logging boundary and
+# must be removed from this list as their direct diagnostics are migrated.
+set(HL_LINT_ALLOW_STDIO_FILES
+  src/core/checkpoint_channel.c
+  src/core/dispatch.c
+  src/core/launch.c
+  src/core/lifecycle.c
+  src/core/target/aarch64.c
+  src/core/target/run.c
+  src/core/target/x86_64.c
+  src/linux_abi/checkpoint.c
+  src/linux_abi/container/netns.c
+  src/linux_abi/container/state.c
+  src/linux_abi/elf.c
+  src/linux_abi/fork.c
+  src/linux_abi/parse.c
+  src/linux_abi/sentry.c
+  src/linux_abi/syscall/dispatch.c
+  src/linux_abi/syscall/event.c
+  src/linux_abi/syscall/inotify.c
+  src/linux_abi/syscall/io.c
+  src/linux_abi/syscall/proc.c
+  src/linux_abi/x86.c
+  src/runner/main.c
+  src/translator/cache.c
+  src/translator/guest/aarch64/cache.c
+  src/translator/guest/aarch64/signal.c
+  src/translator/guest/aarch64/translate.c
+  src/translator/guest/x86_64/avx.c
+  src/translator/guest/x86_64/cache.c
+  src/translator/guest/x86_64/dispatch.h
+  src/translator/guest/x86_64/signal.c
+  src/translator/guest/x86_64/translate.c
+  CACHE STRING "Legacy files temporarily allowed direct console output")
 
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/linter/src/hl_lint.c")
   message(STATUS "linter source missing: ${CMAKE_CURRENT_SOURCE_DIR}/linter/src/hl_lint.c")
@@ -77,6 +111,9 @@ list(APPEND _hl_lint_args --clang-tidy-checks "bugprone-*,clang-analyzer-*,perfo
 foreach(_allowed_file IN LISTS HL_LINT_ALLOW_GETENV_FILES)
   list(APPEND _hl_lint_args --allow-getenv-file "${_allowed_file}")
 endforeach()
+foreach(_allowed_file IN LISTS HL_LINT_ALLOW_STDIO_FILES)
+  list(APPEND _hl_lint_args --allow-stdio-file "${_allowed_file}")
+endforeach()
 
 add_custom_target(hl-lint
   COMMAND $<TARGET_FILE:hl_lint> ${_hl_lint_args}
@@ -138,7 +175,8 @@ if(HL_BUILD_TESTS)
     LABELS "lint"
     PASS_REGULAR_EXPRESSION "fake-analyzer: cppcheck argv ok")
 
-  foreach(_case IN ITEMS clean warning-nonstrict warning-strict error usage)
+  foreach(_case IN ITEMS clean warning-nonstrict warning-strict error
+      stdio-error stdio-allowed usage)
     add_test(NAME lint.exit-${_case}
       COMMAND "${CMAKE_COMMAND}"
         -DHL_LINT=$<TARGET_FILE:hl_lint>

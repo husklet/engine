@@ -19,7 +19,7 @@ With `-DHL_LINT=ON` (default `HL_LINT_STRICT=OFF`), it runs:
 - `clang-tidy` with a conservative check set (`bugprone-*`, `clang-analyzer-*`, `performance-*`)
 - `cppcheck`
 - deterministic policy checks implemented in C (currently the centralized
-  `getenv()` rule)
+  `getenv()` and tagged-logging boundaries)
 
 The C driver executes analyzers directly with argv vectors; it does not invoke
 a shell. Analyzer output is captured with a fixed upper bound and stdout/stderr
@@ -35,6 +35,17 @@ deliberately not lint rules.
 
 `getenv()` is tracked by default and only permitted in files passed via
 `--allow-getenv-file` (or through CMake cache variable `HL_LINT_ALLOW_GETENV_FILES`).
+
+Engine/library code must not write diagnostics directly with `printf`,
+`fprintf(stderr/stdout, ...)`, `puts`, `fputs(stderr/stdout, ...)`, or
+`perror`; it must use the tagged logging service in `include/hl/log.h`.
+Formatting into a buffer with `snprintf`, and structured serialization to an
+ordinary file stream, remain valid.
+
+`HL_LINT_ALLOW_STDIO_FILES` is an explicit migration-debt ratchet for files
+that predate this boundary. New files are forbidden by default. Each migration
+from direct output to tagged logging removes one entry; additions require the
+same scrutiny as a new policy exception.
 
 Exit status `0` means the enabled stages completed without fatal policy or
 infrastructure errors. In non-strict mode, analyzer findings are reported as

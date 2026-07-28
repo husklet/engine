@@ -33,6 +33,7 @@ typedef struct {
     const char *compile_db_dir;
     const char *clang_tidy_checks;
     StringList allow_getenv_files;
+    StringList allow_stdio_files;
     int max_function_lines;
     int max_nesting_depth;
     int max_line_length;
@@ -130,6 +131,13 @@ static bool is_getenv_allowed_in_file(const LintConfig *cfg, const char *path) {
     if (cfg->allow_getenv_files.count == 0) return false;
     for (size_t i = 0; i < cfg->allow_getenv_files.count; i++) {
         if (path_matches(path, cfg->allow_getenv_files.items[i])) return true;
+    }
+    return false;
+}
+
+static bool is_stdio_allowed_in_file(const LintConfig *cfg, const char *path) {
+    for (size_t i = 0; i < cfg->allow_stdio_files.count; i++) {
+        if (path_matches(path, cfg->allow_stdio_files.items[i])) return true;
     }
     return false;
 }
@@ -398,6 +406,21 @@ static bool line_has_word(const char *line, const char *word) {
     }
 }
 
+static bool line_has_direct_console_output(const char *line) {
+    if (line_has_word(line, "printf")
+        || line_has_word(line, "vprintf")
+        || line_has_word(line, "puts")
+        || line_has_word(line, "perror")) {
+        return true;
+    }
+    if ((line_has_word(line, "fprintf") || line_has_word(line, "vfprintf")
+         || line_has_word(line, "fputs"))
+        && (line_has_word(line, "stderr") || line_has_word(line, "stdout"))) {
+        return true;
+    }
+    return false;
+}
+
 static bool line_has_control_prefix(const char *line) {
     const char *s = skip_space(line);
     static const char *const k_controls[] = {
@@ -528,6 +551,12 @@ static void check_file_custom(const LintConfig *cfg, const char *path, LintStats
                 stats->errors++;
             }
         }
+        if (line_has_direct_console_output(clean)
+            && !is_stdio_allowed_in_file(cfg, path)) {
+            emit_diag("error", path, lineno, 1, "logging",
+                      "direct console output is forbidden; use tagged logging");
+            stats->errors++;
+        }
 
         if (!in_function && brace_depth == 0) {
             if (sig_collecting) {
@@ -634,6 +663,7 @@ static void print_usage(const char *prog) {
     fprintf(stdout, "  --skip-cppcheck           disable cppcheck stage\n");
     fprintf(stdout, "  --skip-custom             disable custom heuristics stage\n");
     fprintf(stdout, "  --allow-getenv-file PATH  allow getenv() usage in this source file\n");
+    fprintf(stdout, "  --allow-stdio-file PATH   temporarily allow direct console output in this file\n");
     fprintf(stdout, "  --clang-format-check/--clang-format-no-check\n");
     fprintf(stdout, "  --clang-tidy-check/--clang-tidy-no-check\n");
     fprintf(stdout, "  --cppcheck-check/--cppcheck-no-check\n");
@@ -667,6 +697,7 @@ int main(int argc, char **argv) {
     list_init(&cfg.source_dirs);
     list_init(&cfg.include_dirs);
     list_init(&cfg.allow_getenv_files);
+    list_init(&cfg.allow_stdio_files);
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -676,6 +707,7 @@ int main(int argc, char **argv) {
             list_free(&cfg.source_dirs);
             list_free(&cfg.include_dirs);
             list_free(&cfg.allow_getenv_files);
+            list_free(&cfg.allow_stdio_files);
             return 0;
         } else if (strcmp(arg, "--source-dir") == 0 || strcmp(arg, "--src") == 0) {
             if (i + 1 >= argc) {
@@ -759,6 +791,12 @@ int main(int argc, char **argv) {
                 return 2;
             }
             list_append(&cfg.allow_getenv_files, argv[++i]);
+        } else if (strcmp(arg, "--allow-stdio-file") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stdout, "error: %s expects <path>\n", arg);
+                return 2;
+            }
+            list_append(&cfg.allow_stdio_files, argv[++i]);
         } else if (strcmp(arg, "--clang-format-check") == 0) {
             cfg.run_clang_format = true;
         } else if (strcmp(arg, "--clang-format-no-check") == 0) {
@@ -777,6 +815,8 @@ int main(int argc, char **argv) {
             list_free(&cfg.source_files);
             list_free(&cfg.source_dirs);
             list_free(&cfg.include_dirs);
+            list_free(&cfg.allow_getenv_files);
+            list_free(&cfg.allow_stdio_files);
             return 2;
         }
     }
@@ -829,5 +869,6 @@ int main(int argc, char **argv) {
     list_free(&cfg.source_dirs);
     list_free(&cfg.include_dirs);
     list_free(&cfg.allow_getenv_files);
+    list_free(&cfg.allow_stdio_files);
     return rc;
 }

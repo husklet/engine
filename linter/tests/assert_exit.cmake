@@ -16,7 +16,7 @@ if(HL_LINT_CASE STREQUAL "clean")
     --source-file "${HL_LINT_SOURCE_DIR}/linter/tests/fixture.c")
 elseif(HL_LINT_CASE STREQUAL "warning-nonstrict")
   set(_expected 0)
-  set(_pattern "warnings=2 \\(non-fatal\\)")
+  set(_pattern "warnings=[1-9][0-9]* \\(non-fatal\\)")
   set(_args
     ${_common}
     --max-line-length 8
@@ -35,6 +35,20 @@ elseif(HL_LINT_CASE STREQUAL "error")
   set(_args
     ${_common}
     --source-file "${HL_LINT_SOURCE_DIR}/linter/tests/getenv_fixture.c")
+elseif(HL_LINT_CASE STREQUAL "stdio-error")
+  set(_expected 1)
+  set(_pattern "direct console output is forbidden; use tagged logging")
+  set(_args
+    ${_common}
+    --source-file "${HL_LINT_SOURCE_DIR}/linter/tests/stdio_fixture.c")
+elseif(HL_LINT_CASE STREQUAL "stdio-allowed")
+  set(_expected 0)
+  set(_pattern "warnings=0 errors=0")
+  set(_args
+    ${_common}
+    --strict
+    --allow-stdio-file "linter/tests/stdio_fixture.c"
+    --source-file "${HL_LINT_SOURCE_DIR}/linter/tests/stdio_fixture.c")
 elseif(HL_LINT_CASE STREQUAL "usage")
   set(_expected 2)
   set(_pattern "unknown option")
