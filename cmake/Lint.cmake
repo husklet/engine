@@ -38,7 +38,6 @@ set(HL_LINT_ALLOW_STDIO_FILES
   src/linux_abi/syscall/proc.c
   src/linux_abi/x86.c
   src/runner/main.c
-  src/translator/cache.c
   src/translator/guest/aarch64/cache.c
   src/translator/guest/aarch64/signal.c
   src/translator/guest/aarch64/translate.c

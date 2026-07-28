@@ -1408,12 +1408,12 @@ static int stw_checkpoint_wait(uint64_t request) {
         uint64_t ack = atomic_load_explicit(&g_stw_threads[i].dispatch_ack, memory_order_acquire);
         if (ack >= request) continue;
         struct cpu *c = g_stw_threads[i].cpu;
-        fprintf(stderr, "[ckpt] thread barrier timeout tid=%d translated=%d service=%llu ack=%llu request=%llu\n",
+        HL_LOGF(&g_jit_log, HL_LOG_TAG_PROCESS,
+                "checkpoint thread barrier timeout tid=%d translated=%d service=%llu ack=%llu request=%llu",
                 c ? c->tid : -1,
                 atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_acquire),
                 (unsigned long long)(c ? __atomic_load_n(&c->in_service, __ATOMIC_SEQ_CST) : 0),
-                (unsigned long long)ack,
-                (unsigned long long)request);
+                (unsigned long long)ack, (unsigned long long)request);
     }
     return -1;
 }
