@@ -37,21 +37,33 @@ assert!(output.exit.success());
 
 Applied container closures contribute only mounts and environment edits; the engine remains device-neutral.
 
-## Documentation
+## Build and test
 
-- [`DOCS.md`](DOCS.md) — normative design: layering, public contracts, build and test model, roadmap. Start here.
-  It indexes the rest of `docs/`.
-- [`docs/arch.md`](docs/arch.md) — where each layer lives in the source, at symbol level.
-- [`pkgs/rust/README.md`](pkgs/rust/README.md) — the Rust crate's own API surface.
-
-Build and test, from a `nix develop` shell:
+Nix is the contributor interface. Build the engine, run all checks, or enter a
+development shell:
 
 ```sh
-cmake -G Ninja -B build-cmake
-ninja -C build-cmake
-ctest --test-dir build-cmake -L unit --no-tests=error
+nix build
+nix flake check
+nix develop
 ```
 
-CMake is the only build system. `ctest --print-labels` lists every lane; always pass
-`--no-tests=error`, because `ctest -L` on an unknown label exits 0. `cmake/CiLanes.cmake` declares
-which lanes CI runs and `gate.ci-lane-parity` fails the build if one of them selects no tests.
+The flake owns supported toolchains and contributor entry points; CMake owns the
+internal build graph. Inside `nix develop`, `ctest --print-labels` lists test
+lanes. Always use `--no-tests=error` when selecting a label.
+
+## Repository map
+
+| Path | Owner |
+| --- | --- |
+| `include/hl/` | Public C interfaces |
+| `src/` | Engine, translators, Linux ABI, and host backends |
+| `pkgs/rust/` | Process-isolated Rust API |
+| `linter/` | Static-analysis driver and policy |
+| `tests/` | Unit, integration, compatibility, and compliance tests |
+| `tools/` | Maintainer utilities and benchmarks |
+| `cmake/`, `flake.nix` | Build graph and reproducible contributor environment |
+
+Component-specific contracts live beside their code, for example in
+[`linter/README.md`](linter/README.md) and
+[`pkgs/rust/README.md`](pkgs/rust/README.md).

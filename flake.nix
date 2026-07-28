@@ -16,8 +16,8 @@
         }));
 
       # =====================================================================
-      # The project has three independent axes (DOCS.md section 1): guest OS
-      # (Linux), guest ISA, and host platform. Modelling the last two as DATA
+      # The project has three independent axes: guest OS (Linux), guest ISA,
+      # and host platform. Modelling the last two as data
       # keeps the flake from growing a new `system == "..."` branch every time
       # one of them gains a member -- which is how it previously ended up with
       # the whole compiler/loader environment written out once per host.
