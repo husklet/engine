@@ -4496,7 +4496,8 @@ static int dns_local_lookup(const char *qname, uint32_t *ip_be) {
     br_init();
     for (uint8_t interface = 0; interface < g_netif_count; interface++) {
         char path[256];
-        snprintf(path, sizeof path, "%s/.names", g_netif[interface].path);
+        int path_size = snprintf(path, sizeof path, "%s/.names", g_netif[interface].path);
+        if (path_size < 0 || (size_t)path_size >= sizeof path) continue;
         FILE *f = fopen(path, "re");
         if (!f) continue;
         char line[512];
