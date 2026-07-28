@@ -54,7 +54,7 @@ impl Child {
     /// Returns native lifecycle or result-protocol failures.
     pub fn try_wait(&mut self) -> Result<Option<Exit>, Error> {
         let exit = ffi::try_wait(self.process.as_ref().ok_or(Error::InvalidState)?)
-            .map_err(native_error)?
+            .map_err(Self::native_error)?
             .map(result::native)
             .transpose()?;
         self.completed |= exit.is_some();
@@ -65,7 +65,7 @@ impl Child {
     /// # Errors
     /// Returns native process-control failures.
     pub fn force_stop(&mut self) -> Result<(), Error> {
-        ffi::kill(self.process.as_ref().ok_or(Error::InvalidState)?).map_err(native_error)
+        ffi::kill(self.process.as_ref().ok_or(Error::InvalidState)?).map_err(Self::native_error)
     }
     pub(crate) fn signal(&self, signal: i32) -> Result<(), Error> {
         if self.completed {
@@ -83,7 +83,8 @@ impl Child {
     /// Returns native lifecycle or result-protocol failures.
     pub fn wait(mut self) -> Result<Exit, Error> {
         let exit = result::native(
-            ffi::wait(self.process.as_ref().ok_or(Error::InvalidState)?).map_err(native_error)?,
+            ffi::wait(self.process.as_ref().ok_or(Error::InvalidState)?)
+                .map_err(Self::native_error)?,
         )?;
         ffi::destroy(self.process.take().ok_or(Error::InvalidState)?);
         Ok(exit)
@@ -107,33 +108,36 @@ impl Child {
             })
         });
         let status = self.wait()?;
-        let stdout = join(stdout)?;
-        let stderr = join(stderr)?;
+        let stdout = Self::join(stdout)?;
+        let stderr = Self::join(stderr)?;
         Ok(Output {
             exit: status,
             stdout,
             stderr,
         })
     }
+
+    fn native_error(status: i32) -> Error {
+        Error::Engine { status, detail: 0 }
+    }
+
+    fn join(
+        thread: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+    ) -> Result<Vec<u8>, Error> {
+        match thread {
+            None => Ok(Vec::new()),
+            Some(thread) => thread
+                .join()
+                .map_err(|_| Error::InvalidState)?
+                .map_err(Error::Io),
+        }
+    }
 }
+
 impl Drop for Child {
     fn drop(&mut self) {
         if let Some(process) = self.process.take() {
             ffi::destroy(process);
         }
-    }
-}
-fn native_error(status: i32) -> Error {
-    Error::Engine { status, detail: 0 }
-}
-fn join(
-    thread: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
-) -> Result<Vec<u8>, Error> {
-    match thread {
-        None => Ok(Vec::new()),
-        Some(thread) => thread
-            .join()
-            .map_err(|_| Error::InvalidState)?
-            .map_err(Error::Io),
     }
 }
