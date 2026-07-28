@@ -426,51 +426,7 @@ static void jit86_store_writeback_record(struct cpu *cpu, uint64_t lo, uint64_t 
     cpu->store_range_count++;
 }
 
-static void jit86_store_alias_changed(uint64_t guest, uint64_t size) {
-    if (size == 0 || guest > UINT64_MAX - size) return;
-    if (!filemap_shared_filter_maybe(guest, size)) return;
-    struct cpu *cpu = pthread_getspecific(g_cpu_key);
-    if (cpu == NULL) return;
-    uint64_t ranges[GNA_MAX + 1][2];
-    uint32_t range_count = 0;
-    int emulated_store = 0;
-
-    pthread_mutex_lock(&g_filemap_lock);
-    uint64_t device = 0, inode = 0, offset = 0, length = 0;
-    for (int index = 0; index < g_nfilemap; ++index) {
-        const struct guest_file_mapping *mapping = &g_filemap[index];
-        if (guest < mapping->lo || guest >= mapping->hi) continue;
-        if (!mapping->shared) break;
-        uint64_t span = mapping->hi - guest;
-        length = size < span ? size : span;
-        offset = mapping->offset + (guest - mapping->lo);
-        device = mapping->device;
-        inode = mapping->inode;
-        emulated_store = mapping->emulated != 0;
-        ranges[range_count][0] = guest;
-        ranges[range_count][1] = guest + length;
-        range_count++;
-        break;
-    }
-    if (range_count != 0 && length != 0) {
-        uint64_t file_last = offset + length;
-        for (int index = 0; index < g_nfilemap && range_count < GNA_MAX + 1; ++index) {
-            const struct guest_file_mapping *mapping = &g_filemap[index];
-            if (!mapping->shared || mapping->device != device || mapping->inode != inode) continue;
-            uint64_t mapping_length = mapping->hi - mapping->lo;
-            if (mapping->offset > UINT64_MAX - mapping_length) continue;
-            uint64_t mapping_last = mapping->offset + mapping_length;
-            uint64_t first = offset > mapping->offset ? offset : mapping->offset;
-            uint64_t last = file_last < mapping_last ? file_last : mapping_last;
-            if (last <= first) continue;
-            uint64_t alias_first = mapping->lo + (first - mapping->offset);
-            ranges[range_count][0] = alias_first;
-            ranges[range_count][1] = alias_first + (last - first);
-            range_count++;
-        }
-    }
-    pthread_mutex_unlock(&g_filemap_lock);
-    if (range_count == 0) return;
+static void jit86_store_alias_ranges(struct cpu *cpu, uint64_t ranges[][2], uint32_t range_count, int emulated_store) {
     /* ranges[0] is the store itself; ranges[1..] are its aliases, which hold
        the bytes this store replaced and must never be written back. */
     if (emulated_store) jit86_store_writeback_record(cpu, ranges[0][0], ranges[0][1]);
@@ -492,6 +448,71 @@ static void jit86_store_alias_changed(uint64_t guest, uint64_t size) {
         cpu->smc_ranges[cpu->smc_range_count][0] = lo;
         cpu->smc_ranges[cpu->smc_range_count][1] = hi;
         cpu->smc_range_count++;
+    }
+}
+
+static uint64_t jit86_store_alias_segment(struct cpu *cpu, uint64_t cursor, uint64_t last) {
+    uint64_t ranges[GNA_MAX + 1][2];
+    uint32_t range_count = 0;
+    uint64_t segment_first = last;
+    uint64_t segment_last = last;
+    uint64_t device = 0, inode = 0, offset = 0;
+    int emulated_store = 0;
+
+    pthread_mutex_lock(&g_filemap_lock);
+    const struct guest_file_mapping *source = NULL;
+    for (int index = 0; index < g_nfilemap; ++index) {
+        const struct guest_file_mapping *mapping = &g_filemap[index];
+        if (mapping->hi <= cursor || mapping->lo >= last) continue;
+        uint64_t first = mapping->lo > cursor ? mapping->lo : cursor;
+        if (source == NULL || first < segment_first) {
+            source = mapping;
+            segment_first = first;
+        }
+    }
+    if (source != NULL) {
+        segment_last = source->hi < last ? source->hi : last;
+        if (source->shared) {
+            uint64_t length = segment_last - segment_first;
+            offset = source->offset + (segment_first - source->lo);
+            device = source->device;
+            inode = source->inode;
+            emulated_store = source->emulated != 0;
+            ranges[0][0] = segment_first;
+            ranges[0][1] = segment_last;
+            range_count = 1;
+            uint64_t file_last = offset + length;
+            for (int index = 0; index < g_nfilemap && range_count < GNA_MAX + 1; ++index) {
+                const struct guest_file_mapping *mapping = &g_filemap[index];
+                if (!mapping->shared || mapping->device != device || mapping->inode != inode) continue;
+                uint64_t mapping_length = mapping->hi - mapping->lo;
+                if (mapping->offset > UINT64_MAX - mapping_length) continue;
+                uint64_t mapping_last = mapping->offset + mapping_length;
+                uint64_t first = offset > mapping->offset ? offset : mapping->offset;
+                uint64_t alias_last = file_last < mapping_last ? file_last : mapping_last;
+                if (alias_last <= first) continue;
+                uint64_t alias_first = mapping->lo + (first - mapping->offset);
+                ranges[range_count][0] = alias_first;
+                ranges[range_count][1] = alias_first + (alias_last - first);
+                range_count++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_filemap_lock);
+    if (range_count != 0) jit86_store_alias_ranges(cpu, ranges, range_count, emulated_store);
+    return segment_last;
+}
+
+static void jit86_store_alias_changed(uint64_t guest, uint64_t size) {
+    if (size == 0 || guest > UINT64_MAX - size) return;
+    if (!filemap_shared_filter_maybe(guest, size)) return;
+    struct cpu *cpu = pthread_getspecific(g_cpu_key);
+    if (cpu == NULL) return;
+    uint64_t last = guest + size;
+    for (uint64_t cursor = guest; cursor < last;) {
+        uint64_t next = jit86_store_alias_segment(cpu, cursor, last);
+        if (next <= cursor) break;
+        cursor = next;
     }
 }
 
