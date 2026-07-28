@@ -17,7 +17,6 @@ set(HL_LINT_ALLOW_GETENV_FILES "src/core/environment.c;tools/config.c"
 # Ratchet, not approval: these files predate the tagged logging boundary and
 # must be removed from this list as their direct diagnostics are migrated.
 set(HL_LINT_ALLOW_STDIO_FILES
-  src/core/dispatch.c
   src/core/target/aarch64.c
   src/core/target/x86_64.c
   src/linux_abi/checkpoint.c

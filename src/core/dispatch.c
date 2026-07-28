@@ -184,21 +184,8 @@ __attribute__((naked)) static void block_return(void) {
 #ifndef G_AFTER_TRANSLATE
 #define G_AFTER_TRANSLATE(c) ((void)0)
 #endif
-// Per-block JT trace dump (the 5th divergence). aarch64 dumps pc + x19/x20/sp + the first 6 block words.
 #ifndef G_TRACE_DUMP
-#define G_TRACE_DUMP(c)                                                                                                \
-    if (g_trace) {                                                                                                     \
-        uint32_t *ci = (uint32_t *)G_PC(c);                                                                            \
-        fprintf(stderr, "[blk] pc=%llx x19=%llx x20=%llx sp=%llx | %08x %08x %08x %08x %08x %08x\n",                   \
-                (unsigned long long)G_PC(c), (unsigned long long)(c)->x[19], (unsigned long long)(c)->x[20],           \
-                (unsigned long long)(c)->sp, ci[0], ci[1], ci[2], ci[3], ci[4], ci[5]);                                \
-        if (g_dbg_gprdump) {                                                                                           \
-            fprintf(stderr, "[gpr] pc=%llx", (unsigned long long)G_PC(c));                                             \
-            for (int _i = 0; _i < 31; _i++)                                                                            \
-                fprintf(stderr, " x%d=%llx", _i, (unsigned long long)(c)->x[_i]);                                      \
-            fprintf(stderr, " sp=%llx\n", (unsigned long long)(c)->sp);                                                \
-        }                                                                                                              \
-    }
+#define G_TRACE_DUMP(c) ((void)(c))
 #endif
 
 // ---------------- dispatcher ----------------
