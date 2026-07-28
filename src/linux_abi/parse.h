@@ -1,4 +1,4 @@
-// hl/linux_abi -- container config parsing: the strict numeric trust boundary (see docs/LAUNCH.md).
+// hl/linux_abi -- container config parsing: the strict numeric trust boundary.
 //
 // HL is the actual runtime that executes untrusted guest images AND is reachable directly via the
 // main()/`docker` CLI (bypassing the typed Rust binding), so it must NOT trust its config input.

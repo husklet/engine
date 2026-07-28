@@ -5,7 +5,7 @@
 // NOTE: the EPOLLONESHOT-disarm and EPOLLET-transition readiness of an *emulated object* (eventfd)
 // are deliberately NOT asserted here. On the macOS backend epoll is emulated over kqueue and those
 // flags are honoured for real kqueue-able fds but not yet for emulated objects such as eventfd, so
-// their readiness is host-delegated (see docs/ci-green.md, "epoll eventfd oneshot/edge"). Asserting
+// their readiness is host-delegated. Asserting
 // an exact oneshot/edge readiness sequence would encode a host-specific outcome, which is an invalid
 // differential golden; this case asserts only the Linux-invariant errno/ordering contract.
 #define _GNU_SOURCE

@@ -3,7 +3,7 @@
 # Lines beginning with '#' are comments. One test per line.
 # Curated to the surface dd emulates; multi-binary/helper-dependent, device-,
 # hugepage-, cgroup-, module-, and privilege-heavy tests are intentionally
-# excluded (see docs/compliance-ltp.md "Skipped / out-of-scope").
+# excluded when they require external helpers, devices, privileges, or kernel configuration.
 
 # ---- file I/O ----
 fileio  openat      openat/openat01.c

@@ -72,7 +72,7 @@ typedef struct ckpt_sink_vtable {
     int (*group_present)(struct ckpt_sink *sink, const char *group); // 1 present, 0 absent, -1 error
     int (*group_count)(struct ckpt_sink *sink, const char *prefix);  // >=0 count, -1 error
 
-    // The image digest that authenticates the checkpoint (see docs/checkpoint-sink.md). Called once, by the
+    // The image digest that authenticates the checkpoint. Called once, by the
     // coordinator, immediately before commit.
     int (*digest)(struct ckpt_sink *sink, uint64_t *hash, uint64_t *files, uint64_t *bytes);
 

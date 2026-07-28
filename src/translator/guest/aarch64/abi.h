@@ -8,8 +8,8 @@
 //   G_A0(c)..G_A5(c)   the syscall argument registers [rvalue]
 //   G_RET(c)           the syscall return register    [lvalue]
 //
-// Remaining per-arch seams (documented in docs/STRUCTURE.md), provided by the frontend when it wires
-// into the shared service: struct layouts (stat/sigaction differ on aarch64 vs x86_64), the §B shadow
+// Remaining per-arch seams are provided by the frontend when it wires into the
+// shared service: struct layouts (stat/sigaction differ on aarch64 vs x86_64), the §B shadow
 // stack (`ssp`, aarch64-only), TLS, and sigaltstack.
 //
 // aarch64 is the reference: syscall regs are x8 / x0..x5 / x0, and its ABI numbers ARE canonical.

@@ -6,7 +6,7 @@
  * executable and every guest process is a further fork() of it. None of them shares an address space with the
  * embedder. So the sink vtable is implemented, in each engine process, by a client that marshals every
  * operation onto a descriptor inherited from activation, and the embedder runs a server that replays them
- * onto its own storage. See docs/checkpoint-sink.md.
+ * onto its own storage.
  *
  * TOPOLOGY
  *   broker    : ONE SOCK_SEQPACKET descriptor, handed to the first engine process by activation (SCM_RIGHTS)
@@ -56,7 +56,7 @@ typedef enum hl_ckpt_stream_op {
     HL_CKPT_OP_CLAIM = 10,          /* name -> status 0 acquired / 1 already held */
     HL_CKPT_OP_UNCLAIM = 11,        /* name -> ok */
     HL_CKPT_OP_COMMIT = 12,         /* payload = manifest -> ok     : the image is complete */
-    /* --- rendezvous (the coordinator's "has that peer finished?"; see docs/checkpoint-sink.md) --- */
+    /* --- rendezvous: a peer is finished only once its group is committed --- */
     HL_CKPT_OP_GROUP_PRESENT = 13, /* name -> value = 1 when that group has been committed */
     HL_CKPT_OP_GROUP_COUNT = 14,   /* name = prefix -> value = committed groups with that prefix */
     /* --- digest (accumulated as bytes are emitted; never re-reads the store) --- */

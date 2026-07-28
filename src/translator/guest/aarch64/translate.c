@@ -599,7 +599,7 @@ static void emit_casp_mangled(uint32_t in, int override_base) {
     for (int i = 0; i < nsp; i++) e_ldr(spill[i], CPUREG, (int)OFF_MSCRATCH + 8 * i);
 }
 
-// ---- guest_base bias-fold (non-PIE ET_EXEC; see docs/design/nonpie-pagezero.md) ----
+// ---- guest_base bias-fold for non-PIE ET_EXEC images ----
 // A non-PIE image maps HIGH (+g_nonpie_bias) but its baked absolute pointers stay LOW (link vaddr); a
 // guest load/store through such a pointer would hit the unmapped low address and trap (one SIGSEGV per
 // access -> cc1 ~400s). Instead, fold the bias into the effective address at translate time: if the access

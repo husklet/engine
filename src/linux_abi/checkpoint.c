@@ -53,7 +53,7 @@
 
 #include "../host/file.h"
 #include "../host/system.h"
-#include "ckpt_sink_stream.h" // the writer emits every byte through the sink (docs/checkpoint-sink.md)
+#include "ckpt_sink_stream.h" // the writer emits every image byte through the sink
 #include "ckpt_source.h"      // restore reads the image back through the symmetric source interface
 #include "logical_vma.h"
 

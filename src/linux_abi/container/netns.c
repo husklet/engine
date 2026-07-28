@@ -3181,7 +3181,7 @@ static int sa_m2l(const struct sockaddr *m, uint8_t *g, socklen_t gcap) {
     return -1;
 }
 
-// ---- Per-workspace VPN egress redirect (docs/VPN.md option b) ---------------------------------------
+// ---- Per-workspace VPN egress redirect ---------------------------------------------------------------
 // When HL_EGRESS_SOCKS="host:port" is armed, the guest's genuine external TCP connect()s are funneled
 // through that SOCKS5 proxy (the front-end of a per-workspace userspace tunnel) instead of dialing the
 // destination directly from the host's default routing domain. When the env var is ABSENT the whole

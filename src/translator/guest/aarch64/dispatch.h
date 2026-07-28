@@ -1,6 +1,6 @@
 // translator/guest/aarch64/dispatch.h -- the aarch64 guest's definitions of the shared run_guest()
-// dispatch seam (engine-dedup PR2). The shared jit/dispatch.c calls these hooks at the four spots where
-// the dispatcher historically diverged per guest arch (see docs/design/engine-dedup.md §A.3/§B.3):
+// dispatch seam. The shared jit/dispatch.c calls these hooks at the four
+// spots where the dispatcher differs per guest architecture:
 //
 //   G_DISPATCH_DEBUG(c)   top-of-loop debug instrumentation       (x86-only; EMPTY on aarch64)
 //   G_SHADOW_CLEAR(c)     §B shadow-stack reset on wholesale flush (aarch64-only)

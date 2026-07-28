@@ -9,8 +9,7 @@
 
 // translator/guest/x86_64/dispatch.h -- the x86-64 guest's definitions of the shared run_guest()
 // dispatch seam (engine-dedup PR3/PR4). Mirror of guest/aarch64/dispatch.h: the shared
-// jit/dispatch.c calls these hooks at every spot where the dispatcher historically diverged per guest
-// arch (see docs/design/engine-dedup.md §A.3/§B.3). Each macro reproduces EXACTLY what the standalone
+// jit/dispatch.c calls these hooks at every guest-architecture seam. Each macro reproduces what the standalone
 // frontend/x86_64/dispatch.c did, so swapping the x86 target onto jit/dispatch.c is behavior-preserving.
 //
 // The macros are EXPANDED at their call sites inside jit/dispatch.c's run_guest() loop (not here), so
