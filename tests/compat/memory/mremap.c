@@ -1,6 +1,7 @@
 // mremap(2) (Linux): grow an anonymous mapping in place / with MREMAP_MAYMOVE, preserving contents.
 // No portable POSIX form (macOS lacks mremap) -> Linux-only, native oracle.
 #define _GNU_SOURCE
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -23,7 +24,23 @@ int main(void) {
     char *m3 = grown ? mremap(m2, big, old, 0) : MAP_FAILED;
     int shrunk = m3 != MAP_FAILED;
     if (shrunk) munmap(m3, old); else if (grown) munmap(m2, big);
-    printf("mremap grown=%d preserved=%d tail_zero=%d tail_wr=%d shrunk=%d\n",
-           grown, preserved, tail_zero, tail_wr, shrunk);
+
+    // A grow that fits inside an implementation's reserved tail still changes
+    // the guest VMA length. Unmapping the grown length must release the whole
+    // mapping rather than leave hidden pages behind.
+    char *u = mmap(NULL, old, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    char *u2 = u == MAP_FAILED ? MAP_FAILED : mremap(u, old, old * 2, MREMAP_MAYMOVE);
+    int released = 0;
+    if (u2 != MAP_FAILED) {
+        void *address = u2;
+        unsigned char residency = 0;
+        munmap(u2, old * 2);
+        errno = 0;
+        released = mincore(address, (size_t)ps, &residency) == -1 && errno == ENOMEM;
+    } else if (u != MAP_FAILED) {
+        munmap(u, old);
+    }
+    printf("mremap grown=%d preserved=%d tail_zero=%d tail_wr=%d shrunk=%d released=%d\n",
+           grown, preserved, tail_zero, tail_wr, shrunk, released);
     return 0;
 }

@@ -164,6 +164,17 @@ int main(void) {
     hl_gmap_remove(0x20000);
     hl_gmap_remove(0x24000);
 
+    /* Publishing a replacement directly also preserves the non-overlap
+     * invariant; callers cannot accidentally create duplicate base entries. */
+    hl_gmap_add(0x30000, 0x14000);
+    hl_gmap_set_guest_length(0x30000, 0x4000);
+    hl_gmap_add(0x30000, 0x4000);
+    HL_CHECK(hl_gmap_count() == 2);
+    HL_CHECK(hl_gmap_find_length(0x30000) == 0x4000);
+    HL_CHECK(hl_gmap_find_length(0x34000) == 0x10000);
+    hl_gmap_remove(0x30000);
+    hl_gmap_remove(0x34000);
+
     {
         void *mapping = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         HL_CHECK(mapping != MAP_FAILED);

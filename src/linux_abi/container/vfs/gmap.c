@@ -39,6 +39,7 @@ static hl_exec_mapping g_exec_mappings[HL_EXEC_MAPPING_CAPACITY];
 static size_t g_exec_mapping_count;
 
 static struct hl_gmap_context g_gmap;
+static void hl_gmap_remove_overlap(uint64_t start, uint64_t end);
 
 void hl_gmap_bind_limits(const hl_limit_table *limits) {
     g_gmap.limits = limits;
@@ -101,6 +102,13 @@ void hl_gmap_add_physical(uint64_t address, uint64_t length, uint64_t physical_a
         physical_address > UINT64_MAX - physical_length || physical_address > address ||
         address + length > physical_address + physical_length)
         return;
+    /*
+     * Guest VMAs cannot overlap: a newly published mapping replaces the
+     * covered portion of every older mapping, regardless of which mmap path
+     * created it. Enforce that invariant at the registry boundary so an
+     * omitted caller-side cleanup cannot leave duplicate exact-base entries.
+     */
+    hl_gmap_remove_overlap(address, address + length);
     hl_gmap_reserve_one();
     entry = &g_gmap.mappings[g_gmap.mapping_count++];
     entry->address = address;
@@ -166,6 +174,10 @@ int hl_gmap_contains(uint64_t address, uint64_t length) {
 
 void hl_gmap_unmap_range(uint64_t start, uint64_t end) {
     if (end > start) hl_exec_mapping_discard_range(start, end - start);
+    hl_gmap_remove_overlap(start, end);
+}
+
+static void hl_gmap_remove_overlap(uint64_t start, uint64_t end) {
     for (size_t index = 0; index < g_gmap.mapping_count;) {
         hl_gmap_entry *entry = &g_gmap.mappings[index];
         uint64_t base = entry->address;

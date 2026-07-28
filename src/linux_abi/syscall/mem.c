@@ -193,6 +193,22 @@ static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int f
     return 0;
 }
 
+static void mremap_publish_accessible(uint64_t first, uint64_t last) {
+    uint64_t low = first & ~(uint64_t)0xfff;
+    uint64_t high = (last + 0xfff) & ~(uint64_t)0xfff;
+    gna_clear(low, high);
+    gro_clear(low, high);
+    gbus_clear(low, high);
+}
+
+static void mremap_publish_unmapped(uint64_t first, uint64_t last) {
+    uint64_t low = first & ~(uint64_t)0xfff;
+    uint64_t high = (last + 0xfff) & ~(uint64_t)0xfff;
+    gna_add(low, high);
+    gro_clear(low, high);
+    gbus_clear(low, high);
+}
+
 // The guest's page size (as it sees via AT_PAGESZ / sysconf(_SC_PAGESIZE)).  Read it from auxv after
 // stack construction; before that exists, fall back to the Linux ABI constant, never the host mapping
 // granularity.  Host mmap alignment paths use getpagesize() explicitly.
@@ -283,6 +299,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // full == a1) and untracked mappings (full == 0) keep the plain a1 unmap unchanged.
         size_t len = (size_t)a1;
         uint64_t full = hl_gmap_find_length(a0);
+        uint64_t guest_length = hl_gmap_find_guest_length(a0);
         // Page-size mismatch: guest pages are 4 KB (AT_PAGESZ) but the macOS host uses 16 KB pages, and
         // macOS munmap rounds the LENGTH up to a whole host page. macOS also gives every distinct mmap
         // its own host-page-aligned base + host-page-rounded extent, so two SEPARATE guest mappings never
@@ -302,7 +319,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         size_t hp = (size_t)getpagesize();
         uint64_t physical_address = 0, physical_length = 0;
         int has_physical = hl_gmap_find_physical(a0, &physical_address, &physical_length);
-        int complete = (full == (uint64_t)a1 || full == (uint64_t)a1 + 0x10000) &&
+        int complete = full != 0 && guest_length == (uint64_t)a1 &&
                        (((a0 & (hp - 1)) == 0) || (has_physical && physical_address != a0));
         int r;
         uint64_t u_lo, u_hi; // the range host munmap actually cleared (empty when u_lo==u_hi)
@@ -428,10 +445,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a2);
             anon_track((uint64_t)r, (uint64_t)a2 + guard, PROT_READ | PROT_WRITE);
             anon_update_prot(a0, (uint64_t)a1, PROT_READ | PROT_WRITE); // source is writable zero anon again
-            gna_clear(a0 & ~(uint64_t)0xfff, (a0 + a1 + 0xfff) & ~(uint64_t)0xfff);
-            gro_clear(a0 & ~(uint64_t)0xfff, (a0 + a1 + 0xfff) & ~(uint64_t)0xfff);
-            gna_clear((uint64_t)r & ~(uint64_t)0xfff, ((uint64_t)r + a2 + 0xfff) & ~(uint64_t)0xfff);
-            gro_clear((uint64_t)r & ~(uint64_t)0xfff, ((uint64_t)r + a2 + 0xfff) & ~(uint64_t)0xfff);
+            mremap_publish_accessible(a0, a0 + a1);
+            mremap_publish_accessible((uint64_t)r, (uint64_t)r + a2 + guard);
             G_SMC_UNMAP(a0, a0 + (uint64_t)a1);
             G_SMC_UNMAP((uint64_t)r, (uint64_t)r + (uint64_t)a2);
             G_RET(c) = (uint64_t)r;
@@ -478,7 +493,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                         munmap((void *)a0, (size_t)phys); // free the full old extent (incl. its guard tail)
                         hl_gmap_remove(a0);
                         anon_untrack(a0, (size_t)phys);
-                        gna_clear(a0 & ~(uint64_t)0xfff, (ohi + 0xfff) & ~(uint64_t)0xfff);
+                        mremap_publish_unmapped(a0, a0 + phys);
                         hl_gmap_lock_remove(a0, (uint64_t)a1);
                         wipefork_del(a0, (uint64_t)a1);
                         dontfork_del(a0, (uint64_t)a1);
@@ -486,7 +501,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     hl_gmap_add(a4, (uint64_t)a2 + guard);
                     hl_gmap_set_guest_length(a4, (uint64_t)a2);
                     anon_track(a4, (uint64_t)a2 + guard, PROT_READ | PROT_WRITE);
-                    gna_clear(a4 & ~(uint64_t)0xfff, (nhi + 0xfff) & ~(uint64_t)0xfff);
+                    mremap_publish_accessible(a4, a4 + a2 + guard);
                     // stale-translation: the mapping (and any executable code in it) relocated. Drop cached
                     // translations for BOTH the freed source VA and the replaced destination VA.
                     G_SMC_UNMAP(a0, a0 + (uint64_t)a1);
@@ -529,8 +544,18 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
         }
-        // A grow that still fits within the already-mapped extent: stay in place, touch nothing.
+        /*
+         * A grow that fits in the hidden compatibility tail stays in place,
+         * but it is not a no-op: the guest-visible VMA length expands and the
+         * newly exposed pages cease to be guard/tombstone state. Keeping the
+         * old guest length made a later munmap look partial, leaking or
+         * repeatedly reclassifying the same mapping.
+         */
         if ((uint64_t)a2 <= phys) {
+            hl_gmap_set_guest_length(a0, (uint64_t)a2);
+            uint64_t exposed_first = (a0 + a1 + 0xfff) & ~(uint64_t)0xfff;
+            uint64_t exposed_last = (a0 + a2 + 0xfff) & ~(uint64_t)0xfff;
+            mremap_publish_accessible(exposed_first, exposed_last);
             G_RET(c) = a0;
             break;
         }
@@ -546,6 +571,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 hl_gmap_add(a0, want); // track the grown extent (incl. fresh guard) for execve() teardown
                 hl_gmap_set_guest_length(a0, (uint64_t)a2); // /proc maps report the guest length (sans guard)
                 anon_track(a0, want, PROT_READ | PROT_WRITE);
+                mremap_publish_accessible(end, a0 + want);
                 G_RET(c) = a0;
                 break;
             }
@@ -570,10 +596,12 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             munmap((void *)a0, (size_t)phys); // free the FULL tracked extent (incl. old guard tail)
             hl_gmap_remove(a0);
             anon_untrack(a0, (size_t)phys);
+            mremap_publish_unmapped(a0, a0 + phys);
         }
         hl_gmap_add((uint64_t)r, (uint64_t)a2 + guard);                        // track for execve() teardown
         hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a2);                   // /proc maps: guest length (sans guard)
         anon_track((uint64_t)r, (uint64_t)a2 + guard, PROT_READ | PROT_WRITE); // fresh private-anon copy
+        mremap_publish_accessible((uint64_t)r, (uint64_t)r + a2 + guard);
         G_RET(c) = (uint64_t)r;
         break;
     }
