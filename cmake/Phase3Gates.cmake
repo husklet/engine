@@ -717,6 +717,13 @@ if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND
                  ${HL_PERF}/syscall-${_native} 0)
   hl_perf_native(fork-stress 1 ${HL_PERF_HEAVY_SAMPLES}
                  ${HL_COMPAT}/process/${_native}/forkstorm 0)
+  add_test(NAME perf.native-combined-options-${_native}
+    COMMAND ${HL_PERF}/combined-bench-${_native}
+            --divisor 100000 --phase syscall)
+  set_tests_properties(perf.native-combined-options-${_native} PROPERTIES
+    LABELS "perf;perf-native" RUN_SERIAL TRUE
+    PASS_REGULAR_EXPRESSION "PHASE syscall us=[0-9]+ ok=[0-9]+"
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   foreach(_op mmap file pipe event ipc-latency ipc-throughput)
     hl_perf_native(${_op} ${HL_PERF_WARMUPS} ${HL_PERF_OP_SAMPLES} ${HL_PERF}/${_op}-${_native} 0)
   endforeach()

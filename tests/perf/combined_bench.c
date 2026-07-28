@@ -13,9 +13,10 @@
  * automatically excluded.
  *
  * Output: one line per phase, e.g.  "PHASE compute us=1234 ok=1"
- * Deterministic, fixed iteration counts, each phase warmed before timing. The
- * "ok" checksum for every phase is deterministic and must be identical across
- * native/qemu/hl for the same arch, so the comparison is valid.
+ * Default iteration counts are fixed and each phase is warmed before timing.
+ * `--divisor N` bounds expensive nested-engine probes, and `--phase NAME`
+ * isolates one bottleneck. Checksums remain comparable when invocations use
+ * the same arch and divisor.
  *
  * The sqlite phase is compiled only when HL_BENCH_SQLITE is defined (it links a
  * static libsqlite3 for the target arch, supplied by nix for both arches); the
@@ -25,6 +26,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -89,12 +91,11 @@ static volatile uint64_t g_sink;
 
 /* ---------------- phase: compute (integer + float busyloop) ---------------- */
 
-static uint64_t phase_compute(void) {
+static uint64_t phase_compute(unsigned iters) {
     /* Ported shape of a busyloop: long dependency chain, int + float mix. */
-    enum { N = 40000000 };
     uint64_t acc = 1469598103934665603ULL;
     double f = 1.0;
-    for (int i = 0; i < N; ++i) {
+    for (unsigned i = 0; i < iters; ++i) {
         acc ^= (uint64_t)i;
         acc *= 1099511628211ULL;
         acc = (acc << 13) | (acc >> 51);
@@ -588,49 +589,92 @@ static uint64_t run_phase(const char *name, uint64_t (*fn)(unsigned), unsigned i
     return us;
 }
 
-/* compute takes no iters arg; wrap it for the uniform signature. */
-static uint64_t compute_wrap(unsigned iters) {
-    (void)iters;
-    return phase_compute();
+static unsigned divided(unsigned count, unsigned divisor) {
+    unsigned value = count / divisor;
+    return value == 0 ? 1 : value;
 }
 
-int main(void) {
+static int parse_options(int argc, char **argv, unsigned *divisor, const char **phase) {
+    for (int index = 1; index < argc; index += 2) {
+        if (index + 1 >= argc) return -1;
+        if (strcmp(argv[index], "--phase") == 0) {
+            if (*phase != NULL || argv[index + 1][0] == '\0') return -1;
+            *phase = argv[index + 1];
+            continue;
+        }
+        if (strcmp(argv[index], "--divisor") != 0 || *divisor != 1) return -1;
+
+        char *end = NULL;
+        errno = 0;
+        unsigned long value = strtoul(argv[index + 1], &end, 10);
+        if (errno != 0 || end == argv[index + 1] || *end != '\0' || value == 0 ||
+            value > UINT_MAX)
+            return -1;
+        *divisor = (unsigned)value;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    unsigned divisor = 1;
+    const char *selected_phase = NULL;
+    if (parse_options(argc, argv, &divisor, &selected_phase) != 0) {
+        fprintf(stderr,
+                "usage: %s [--divisor positive-integer] [--phase phase-name]\n",
+                argv[0]);
+        return 2;
+    }
+
     g_freq = timer_freq();
     if (g_freq == 0) {
         fprintf(stderr, "timer freq is zero\n");
         return 1;
     }
-    printf("cntfrq=%llu\n", (unsigned long long)g_freq);
+    printf("cntfrq=%llu divisor=%u\n", (unsigned long long)g_freq, divisor);
     fflush(stdout);
 
+    int phase_matched = 0;
+#define RUN_PHASE(name, function, count, warm)                                     \
+    do {                                                                            \
+        if (selected_phase == NULL || strcmp(selected_phase, (name)) == 0) {        \
+            run_phase((name), (function), divided((count), divisor), (warm));       \
+            phase_matched = 1;                                                       \
+        }                                                                            \
+    } while (0)
+
     /* compute appears twice to expose cold-translation vs warm delta. */
-    run_phase("compute_cold", compute_wrap, 0, 0);
-    run_phase("compute", compute_wrap, 0, 1);
+    RUN_PHASE("compute_cold", phase_compute, 40000000, 0);
+    RUN_PHASE("compute", phase_compute, 40000000, 1);
     /* Iteration counts are sized so every phase runs long enough (~150-500ms
      * on native arm64) to give stable medians and swamp per-call timer/OS
      * noise -- the sub-10ms phases in the first cut were dominated by jitter.
      * Checksums change with the counts but stay consistent across envs (same
      * binary, same iters), so cross-env divergence detection is unaffected. */
     /* CPU / ALU surface */
-    run_phase("intdiv", phase_intdiv, 60000000, 1);
-    run_phase("float_simd", phase_float_simd, 500000, 3);
-    run_phase("crypto", phase_crypto, 120000, 2);
-    run_phase("atomics", phase_atomics, 50000000, 3);
-    run_phase("branch", phase_branch, 60000000, 1);
-    run_phase("calls", phase_calls, 60000, 2);
+    RUN_PHASE("intdiv", phase_intdiv, 60000000, 1);
+    RUN_PHASE("float_simd", phase_float_simd, 500000, 3);
+    RUN_PHASE("crypto", phase_crypto, 120000, 2);
+    RUN_PHASE("atomics", phase_atomics, 50000000, 3);
+    RUN_PHASE("branch", phase_branch, 60000000, 1);
+    RUN_PHASE("calls", phase_calls, 60000, 2);
     /* memory / allocator surface */
-    run_phase("malloc", phase_malloc, 12000000, 2);
-    run_phase("string", phase_string, 5000000, 2);
-    run_phase("memory", phase_memory, 8000, 2);
-    run_phase("tlb", phase_tlb, 3000, 2);
+    RUN_PHASE("malloc", phase_malloc, 12000000, 2);
+    RUN_PHASE("string", phase_string, 5000000, 2);
+    RUN_PHASE("memory", phase_memory, 8000, 2);
+    RUN_PHASE("tlb", phase_tlb, 3000, 2);
     /* OS / kernel surface */
-    run_phase("syscall", phase_syscall, 10000000, 2);
-    run_phase("signal", phase_signal, 1000000, 2);
-    run_phase("mmap", phase_mmap, 150000, 2);
-    run_phase("file", phase_file, 400000, 2);
-    run_phase("pipe", phase_pipe, 1500000, 2);
+    RUN_PHASE("syscall", phase_syscall, 10000000, 2);
+    RUN_PHASE("signal", phase_signal, 1000000, 2);
+    RUN_PHASE("mmap", phase_mmap, 150000, 2);
+    RUN_PHASE("file", phase_file, 400000, 2);
+    RUN_PHASE("pipe", phase_pipe, 1500000, 2);
 #ifdef HL_BENCH_SQLITE
-    run_phase("sqlite", phase_sqlite, 300000, 1);
+    RUN_PHASE("sqlite", phase_sqlite, 300000, 1);
 #endif
+    if (selected_phase != NULL && !phase_matched) {
+        fprintf(stderr, "unknown phase: %s\n", selected_phase);
+        return 2;
+    }
+#undef RUN_PHASE
     return 0;
 }

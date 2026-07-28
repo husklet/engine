@@ -133,6 +133,16 @@ $R report --baseline hl-engine results/*.csv
 The `bench` target runs the locally-reachable cells automatically. On a real amd64
 host add `--env native --arch amd64` for the true native-amd baseline.
 
+For engine-in-engine profiling, the guest accepts `--divisor N` and
+`--phase NAME`. Keep the default workload for normal comparisons; use a large
+divisor and one phase when several translated engines would make the full
+workload impractical:
+
+```sh
+outer-engine inner-engine inner-engine perf/combined-bench-aarch64 \
+  --divisor 100000 --phase syscall
+```
+
 ## How to read
 
 Rows = phase, columns = env/arch. Timing is **inside the guest**, so startup /
