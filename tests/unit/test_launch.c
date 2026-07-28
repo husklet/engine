@@ -5,30 +5,11 @@
 #include "../../src/core/launch.h"
 #include "../../src/core/options.h"
 #include "hl/config.h"
-#include "hl/host_services.h"
-#include "hl/linux_abi.h"
-
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable,
-                       const void *executable_image, size_t executable_size, uint32_t argc, char *const argv[]);
-
-int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable,
-                       const void *executable_image, size_t executable_size, uint32_t argc, char *const argv[]) {
-    (void)host;
-    (void)box;
-    (void)rootfs;
-    (void)executable;
-    (void)executable_image;
-    (void)executable_size;
-    (void)argc;
-    (void)argv;
-    return 99;
-}
 
 static uint32_t add_string(char *pool, size_t *cursor, const char *value) {
     uint32_t offset = (uint32_t)*cursor;
@@ -95,14 +76,15 @@ int main(void) {
     static const char malformed[] = "not a launch configuration";
     int fd;
 
-    HL_CHECK(hl_run_config_file(NULL) == 78);
-    HL_CHECK(hl_run_config_file("") == 78);
+    HL_CHECK(hl_run_config_file_with(NULL, inspect_launch) == 78);
+    HL_CHECK(hl_run_config_file_with("", inspect_launch) == 78);
+    HL_CHECK(hl_run_config_file_with(path, NULL) == 78);
     HL_CHECK(hl_option_set("HL_HOSTNAME", "caller-host", 1) == 0);
     fd = mkstemp(path);
     HL_CHECK(fd >= 0);
     HL_CHECK(write(fd, malformed, sizeof(malformed)) == (ssize_t)sizeof(malformed));
     HL_CHECK(close(fd) == 0);
-    HL_CHECK(hl_run_config_file(path) == 78);
+    HL_CHECK(hl_run_config_file_with(path, inspect_launch) == 78);
     HL_CHECK(strcmp(hl_option_get("HL_HOSTNAME"), "caller-host") == 0);
     errno = 0;
     HL_CHECK(access(path, F_OK) == -1 && errno == ENOENT);

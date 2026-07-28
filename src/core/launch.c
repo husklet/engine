@@ -15,9 +15,6 @@
 #include <unistd.h>
 
 #include "../../include/hl/config.h"
-#include "../../include/hl/host_services.h"
-#include "../../include/hl/linux_abi.h"
-#include "../host/system.h"
 #include "launch.h"
 #include "options.h"
 
@@ -27,10 +24,6 @@
 extern void hl_host_private_init(void) __attribute__((weak));
 extern int hl_host_process_fd_private_add(int descriptor) __attribute__((weak));
 extern void hl_host_process_fd_private_remove(int descriptor) __attribute__((weak));
-
-// hl_run_linux_guest() is the internal Linux guest entry defined by each target translation unit.
-int hl_run_linux_guest(const hl_host_services *host, hl_linux_abi *box, const char *rootfs, hl_host_handle executable,
-                       const void *executable_image, size_t executable_size, uint32_t argc, char *const argv[]);
 
 // Read exactly `n` bytes from `fd` into `buf`, looping over short reads. Returns 0 on success, -1 on
 // EOF/error -- a truncated buffer is a hard failure (a partial config must never launch a container).
@@ -129,8 +122,7 @@ static int launch_lowers(const hl_launch_config *config, const char *pool, char 
     return 0;
 }
 
-// Read an hl launch config from an already-open file, populate launch state, rebuild the guest argv, and
-// enter the Linux guest. Private: hl_run_config_file() is the sole launch protocol.
+// Decode an open launch config and invoke the selected runtime.
 static int hl_read_config_file(int fd, hl_launch_runner runner) {
     enum { HL_LAUNCH_HEADER_LIMIT = 4096, HL_LAUNCH_POOL_LIMIT = 64 * 1024 * 1024 };
 
@@ -325,14 +317,6 @@ option_failure:
     return 78;
 }
 
-static int hl_legacy_launch(const char *rootfs, const char *executable_host, uint32_t argc, char *const argv[],
-                            const hl_options *options, const char *result_path) {
-    (void)options;
-    (void)result_path;
-    (void)executable_host;
-    return hl_run_linux_guest(NULL, NULL, rootfs, HL_HOST_HANDLE_INVALID, NULL, 0, argc, argv);
-}
-
 int hl_run_config_file_with(const char *path, hl_launch_runner runner) {
     if (runner == NULL) return 78;
     if (!path || !path[0]) return 78;
@@ -354,8 +338,4 @@ int hl_run_config_file_with(const char *path, hl_launch_runner runner) {
     if (hl_host_process_fd_private_remove != NULL) hl_host_process_fd_private_remove(fd);
     close(fd);
     return rc;
-}
-
-int hl_run_config_file(const char *path) {
-    return hl_run_config_file_with(path, hl_legacy_launch);
 }
