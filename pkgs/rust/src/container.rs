@@ -50,55 +50,58 @@ impl Container {
         }
         config.mounts.extend(mounts.into_values());
         for (name, value) in self.environment {
-            validate_name(&name)?;
+            Self::validate_name(&name)?;
             config.set_environment(name, value);
         }
         let mut edits: BTreeMap<OsString, (Vec<PathBuf>, Vec<PathBuf>)> = BTreeMap::new();
         for (name, path) in self.prepend {
-            validate_path(&name, &path)?;
+            Self::validate_path(&name, &path)?;
             edits.entry(name).or_default().0.push(path);
         }
         for (name, path) in self.append {
-            validate_path(&name, &path)?;
+            Self::validate_path(&name, &path)?;
             edits.entry(name).or_default().1.push(path);
         }
         for (name, (before, after)) in edits {
             let mut value = OsString::new();
             for path in before {
-                push_path(&mut value, path.as_os_str());
+                Self::push_path(&mut value, path.as_os_str());
             }
             if let Some(current) = config.environment_value(&name) {
-                push_path(&mut value, current);
+                Self::push_path(&mut value, current);
             }
             for path in after {
-                push_path(&mut value, path.as_os_str());
+                Self::push_path(&mut value, path.as_os_str());
             }
             config.set_environment(name, value);
         }
         Ok(())
     }
-}
-fn validate_name(name: &OsStr) -> Result<(), Error> {
-    if name.is_empty()
-        || name.as_encoded_bytes().contains(&b'=')
-        || name.as_encoded_bytes().contains(&b'\n')
-    {
-        Err(Error::InvalidConfig("invalid environment name"))
-    } else {
-        Ok(())
+
+    fn validate_name(name: &OsStr) -> Result<(), Error> {
+        if name.is_empty()
+            || name.as_encoded_bytes().contains(&b'=')
+            || name.as_encoded_bytes().contains(&b'\n')
+        {
+            Err(Error::InvalidConfig("invalid environment name"))
+        } else {
+            Ok(())
+        }
     }
-}
-fn validate_path(name: &OsStr, path: &std::path::Path) -> Result<(), Error> {
-    validate_name(name)?;
-    if path.as_os_str().as_encoded_bytes().contains(&b':') {
-        Err(Error::InvalidConfig("path component contains ':'"))
-    } else {
-        Ok(())
+
+    fn validate_path(name: &OsStr, path: &std::path::Path) -> Result<(), Error> {
+        Self::validate_name(name)?;
+        if path.as_os_str().as_encoded_bytes().contains(&b':') {
+            Err(Error::InvalidConfig("path component contains ':'"))
+        } else {
+            Ok(())
+        }
     }
-}
-fn push_path(value: &mut OsString, part: &OsStr) {
-    if !value.is_empty() {
-        value.push(":");
+
+    fn push_path(value: &mut OsString, part: &OsStr) {
+        if !value.is_empty() {
+            value.push(":");
+        }
+        value.push(part);
     }
-    value.push(part);
 }
