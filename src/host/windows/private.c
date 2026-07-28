@@ -37,6 +37,9 @@
  */
 
 #include "../system.h"
+/* The public declaration of hl_engine_guest_fd_limit, which is defined below.
+ * Included so the definition is checked against the prototype callers see. */
+#include "hl/engine.h"
 
 #include <errno.h>
 #include <stdint.h>
