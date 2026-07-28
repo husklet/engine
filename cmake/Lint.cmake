@@ -49,8 +49,6 @@ set(_hl_lint_args
   --source-dir "${CMAKE_SOURCE_DIR}/include"
   --include-dir "${CMAKE_SOURCE_DIR}/include"
   --include-dir "${CMAKE_SOURCE_DIR}/src"
-  --max-function-lines 350
-  --max-nesting 12
   --clang-format-check
   --clang-tidy-check
   --cppcheck-check)

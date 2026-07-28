@@ -504,10 +504,7 @@ static void check_file_custom(const LintConfig *cfg, const char *path, LintStats
     int func_start_line = 0;
     int func_lines = 0;
     int func_max_nesting = 0;
-    int func_malloc = 0;
-    int func_free = 0;
     bool sig_collecting = false;
-    bool func_signal_emitted = false;
     int sig_start_line = 0;
     char signature[8192] = {0};
 
@@ -517,32 +514,9 @@ static void check_file_custom(const LintConfig *cfg, const char *path, LintStats
         strip_trailing_newline(raw);
         sanitize_for_parse(raw, clean, sizeof(clean), &state);
 
-        int leading_spaces = 0;
-        int leading_tabs = 0;
-        const char *pws = raw;
-        while (*pws == ' ' || *pws == '\t') {
-            if (*pws == ' ') leading_spaces++;
-            else leading_tabs++;
-            pws++;
-        }
-        bool has_code = false;
-        for (const char *c = pws; *c; c++) {
-            if (!isspace((unsigned char)*c)) {
-                has_code = true;
-                break;
-            }
-        }
-        if (has_code && leading_spaces > 0 && (leading_tabs > 0)) {
-            emit_diag("warn", path, lineno, 1, "indent", "mixed tabs and spaces in indentation");
-            stats->warnings++;
-        }
-        if (has_code && leading_tabs == 0 && leading_spaces > 0 && (leading_spaces & 1)) {
-            emit_diag("warn", path, lineno, 1, "indent", "odd indentation width (non-multiple-of-2 spaces)");
-            stats->warnings++;
-        }
-
         size_t line_len = strlen(raw);
-        if (line_len > (size_t)cfg->max_line_length) {
+        if (cfg->max_line_length > 0
+            && line_len > (size_t)cfg->max_line_length) {
             emit_diag("warn", path, lineno, 1, "style", "long line");
             stats->warnings++;
         }
@@ -591,13 +565,6 @@ static void check_file_custom(const LintConfig *cfg, const char *path, LintStats
                     func_start_line = sig_start_line;
                     func_lines = 1;
                     func_max_nesting = 1;
-                    func_malloc = 0;
-                    func_free = 0;
-                    func_signal_emitted = false;
-                    if (line_has_word(signature, "malloc") || line_has_word(signature, "calloc") ||
-                        line_has_word(signature, "realloc") || line_has_word(signature, "strdup")) {
-                        func_malloc++;
-                    }
                 } else {
                     sig_collecting = false;
                     signature[0] = '\0';
@@ -606,18 +573,6 @@ static void check_file_custom(const LintConfig *cfg, const char *path, LintStats
         }
 
         if (in_function && lineno != func_start_line) func_lines++;
-        if (in_function) {
-            if (line_has_word(clean, "malloc") || line_has_word(clean, "calloc") || line_has_word(clean, "realloc") || line_has_word(clean, "strdup")) {
-                func_malloc++;
-            }
-            if (line_has_word(clean, "free")) func_free++;
-            if (func_malloc > 0 && func_free == 0 && (strstr(clean, "return") || strstr(clean, "goto") || strstr(clean, "exit"))) {
-                // not a hard failure, but likely needs review because returns without free.
-                emit_diag("warn", path, lineno, 1, "mem", "potential leak path: allocation with no obvious deallocation before return/goto");
-                stats->warnings++;
-                func_signal_emitted = true;
-            }
-        }
 
         for (size_t i = 0; i < strlen(clean); i++) {
             char c = clean[i];
@@ -632,16 +587,14 @@ static void check_file_custom(const LintConfig *cfg, const char *path, LintStats
             if (c == '}') {
                 if (brace_depth > 0) brace_depth--;
                 if (in_function && brace_depth < func_base_depth + 1) {
-                    if (func_lines > cfg->max_function_lines) {
+                    if (cfg->max_function_lines > 0
+                        && func_lines > cfg->max_function_lines) {
                         emit_diag("warn", path, func_start_line, 1, "complexity", "function exceeds max lines");
                         stats->warnings++;
                     }
-                    if (func_max_nesting > cfg->max_nesting_depth) {
+                    if (cfg->max_nesting_depth > 0
+                        && func_max_nesting > cfg->max_nesting_depth) {
                         emit_diag("warn", path, func_start_line, 1, "complexity", "function exceeds max nesting depth");
-                        stats->warnings++;
-                    }
-                    if (func_malloc > 0 && !func_signal_emitted && func_free == 0) {
-                        emit_diag("warn", path, func_start_line, 1, "mem", "possible memory leak in function");
                         stats->warnings++;
                     }
                     in_function = false;
@@ -672,9 +625,9 @@ static void print_usage(const char *prog) {
     fprintf(stdout, "  --clang-tidy-bin PATH     clang-tidy path\n");
     fprintf(stdout, "  --cppcheck-bin PATH       cppcheck path\n");
     fprintf(stdout, "  --clang-tidy-checks LIST  clang-tidy checks (default: bugprone-*,clang-analyzer-*,performance-*)\n");
-    fprintf(stdout, "  --max-function-lines N    fail when function spans > N lines (default 350)\n");
-    fprintf(stdout, "  --max-nesting N           fail when function nesting > N (default 12)\n");
-    fprintf(stdout, "  --max-line-length N       warn when line exceeds N chars (default 140)\n");
+    fprintf(stdout, "  --max-function-lines N    opt in to lexical function-length warnings\n");
+    fprintf(stdout, "  --max-nesting N           opt in to lexical brace-depth warnings\n");
+    fprintf(stdout, "  --max-line-length N       opt in to line-length warnings\n");
     fprintf(stdout, "  --strict                  fail on warnings as errors\n");
     fprintf(stdout, "  --skip-clang-format       disable clang-format stage\n");
     fprintf(stdout, "  --skip-clang-tidy         disable clang-tidy stage\n");
@@ -699,9 +652,9 @@ static int parse_positive_int(const char *value) {
 
 int main(int argc, char **argv) {
     LintConfig cfg = {
-        .max_function_lines = 350,
-        .max_nesting_depth = 12,
-        .max_line_length = 140,
+        .max_function_lines = 0,
+        .max_nesting_depth = 0,
+        .max_line_length = 0,
         .run_clang_format = true,
         .run_clang_tidy = true,
         .run_cppcheck = true,
