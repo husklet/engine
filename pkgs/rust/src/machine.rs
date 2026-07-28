@@ -127,7 +127,9 @@ impl Machine {
         for process in self.processes().unwrap_or_default() {
             // Never the launch process itself: it runs no guest and therefore never installs the engine's
             // handler for this signal, so delivering it there would KILL the launch instead of nudging it.
-            if process.host_id != self.id() && crate::ffi::signal(process.host_id, signal).is_ok() {
+            if process.host_id != self.id()
+                && crate::ffi::Process::signal(process.host_id, signal).is_ok()
+            {
                 kicked.push(process.host_id);
             }
         }

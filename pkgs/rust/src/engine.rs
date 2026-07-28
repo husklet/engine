@@ -164,11 +164,11 @@ impl Engine {
         let resources = lowering::allocate_memory(&spec, &authorities).map_err(SpawnError::Spec)?;
         let launch = lowering::Launch::from_spec(spec).map_err(SpawnError::Spec)?;
         let (broker, child) =
-            ffi::broker_pair().map_err(|error| SpawnError::Engine(Error::Io(error)))?;
+            ffi::Broker::pair().map_err(|error| SpawnError::Engine(Error::Io(error)))?;
         let trigger =
             ffi::Trigger::create().map_err(|error| SpawnError::Engine(Error::Io(error)))?;
         let server = Arc::new(crate::checkpoint_stream::SinkServer::new(store));
-        let acceptor = crate::checkpoint_stream::serve(&server, broker);
+        let acceptor = crate::checkpoint_stream::SinkServer::start(&server, broker);
         let started = launch::start_channels(
             launch,
             io,

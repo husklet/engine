@@ -9,6 +9,18 @@ use std::{
 pub(crate) struct Process {
     _private: [u8; 0],
 }
+
+impl Process {
+    pub(crate) fn signal(process: u64, signal: i32) -> std::io::Result<()> {
+        let process =
+            c_int::try_from(process).map_err(|_| std::io::Error::from_raw_os_error(22))?;
+        if unsafe { process_signal(process, signal) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
 #[derive(Debug)]
 pub(crate) struct Handle(*mut Process);
 // SAFETY: activation processes have no thread affinity. The safe wrapper never
@@ -252,14 +264,6 @@ pub(crate) fn domain_processes(
     }
     Err(5)
 }
-pub(crate) fn signal(process: u64, signal: i32) -> std::io::Result<()> {
-    let process = c_int::try_from(process).map_err(|_| std::io::Error::from_raw_os_error(22))?;
-    if unsafe { process_signal(process, signal) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
 pub(crate) fn pipe_pair() -> std::io::Result<(File, File)> {
     const F_SETFD: c_int = 2;
     const FD_CLOEXEC: c_int = 1;
@@ -286,36 +290,36 @@ const _: () = assert!(std::mem::size_of::<*mut c_void>() == std::mem::size_of::<
 // wrappers turn the raw descriptors into owned Rust types at the single unsafe boundary; everything above
 // them -- the protocol codec, the demultiplexing server, the embedder's trait -- is safe code.
 
-/// The broker socketpair. The parent end is kept by the server; the child end is handed to activation.
-pub(crate) fn broker_pair() -> std::io::Result<(std::os::unix::net::UnixDatagram, OwnedDescriptor)>
-{
-    let mut parent = -1;
-    let mut child = -1;
-    if unsafe { hl_ckpt_broker_pair(&mut parent, &mut child) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: both descriptors were just created by socketpair(2) and are owned by this process.
-    let parent = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(parent) };
-    Ok((parent, OwnedDescriptor(child)))
-}
+#[derive(Debug)]
+pub(crate) struct Broker(std::os::unix::net::UnixDatagram);
 
-/// Waits for one engine process to announce itself and returns its private channel.
-pub(crate) fn broker_accept(
-    broker: &std::os::unix::net::UnixDatagram,
-    timeout: std::time::Duration,
-) -> Option<(std::os::unix::net::UnixStream, u64)> {
-    let milliseconds = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
-    let mut host_pid = 0_u64;
-    let descriptor =
-        unsafe { hl_ckpt_broker_accept(broker.as_raw_fd(), milliseconds, &mut host_pid) };
-    if descriptor < 0 {
-        return None;
+impl Broker {
+    pub(crate) fn pair() -> std::io::Result<(Self, OwnedDescriptor)> {
+        let mut parent = -1;
+        let mut child = -1;
+        if unsafe { hl_ckpt_broker_pair(&mut parent, &mut child) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let parent = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(parent) };
+        Ok((Self(parent), OwnedDescriptor(child)))
     }
-    // SAFETY: the descriptor was installed into this process by recvmsg and is owned by it.
-    Some((
-        unsafe { std::os::unix::net::UnixStream::from_raw_fd(descriptor) },
-        host_pid,
-    ))
+
+    pub(crate) fn accept(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Option<(std::os::unix::net::UnixStream, u64)> {
+        let milliseconds = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
+        let mut host_pid = 0_u64;
+        let descriptor =
+            unsafe { hl_ckpt_broker_accept(self.0.as_raw_fd(), milliseconds, &mut host_pid) };
+        if descriptor < 0 {
+            return None;
+        }
+        Some((
+            unsafe { std::os::unix::net::UnixStream::from_raw_fd(descriptor) },
+            host_pid,
+        ))
+    }
 }
 
 /// A raw descriptor this process owns and closes on drop.

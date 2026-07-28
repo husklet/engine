@@ -738,31 +738,32 @@ impl SinkServer {
     }
 }
 
-/// Runs the acceptor: every engine process that announces itself gets a thread.
-pub(crate) fn serve(
-    server: &Arc<SinkServer>,
-    broker: std::os::unix::net::UnixDatagram,
-) -> std::thread::JoinHandle<()> {
-    let server = Arc::clone(server);
-    std::thread::spawn(move || {
-        let mut workers = Vec::new();
-        while server.running.load(Ordering::SeqCst) {
-            let Some((mut channel, host_pid)) =
-                crate::ffi::broker_accept(&broker, std::time::Duration::from_millis(50))
-            else {
-                continue;
-            };
-            let worker = Arc::clone(&server);
-            let id = workers.len() as u64 + 1;
-            worker.attach(id, host_pid);
-            workers.push(std::thread::spawn(move || {
-                worker.serve(&mut channel, id);
-            }));
-        }
-        for worker in workers {
-            let _ = worker.join();
-        }
-    })
+impl SinkServer {
+    pub(crate) fn start(
+        server: &Arc<Self>,
+        broker: crate::ffi::Broker,
+    ) -> std::thread::JoinHandle<()> {
+        let server = Arc::clone(server);
+        std::thread::spawn(move || {
+            let mut workers = Vec::new();
+            while server.running.load(Ordering::SeqCst) {
+                let Some((mut channel, host_pid)) =
+                    broker.accept(std::time::Duration::from_millis(50))
+                else {
+                    continue;
+                };
+                let worker = Arc::clone(&server);
+                let id = workers.len() as u64 + 1;
+                worker.attach(id, host_pid);
+                workers.push(std::thread::spawn(move || {
+                    worker.serve(&mut channel, id);
+                }));
+            }
+            for worker in workers {
+                let _ = worker.join();
+            }
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------------------- codec
