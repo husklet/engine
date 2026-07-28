@@ -4,6 +4,28 @@ Chrome is a demanding Linux compatibility workload. It combines a sandboxed mult
 shared memory, descriptor passing, asynchronous I/O, threads, signals, Wayland, and accelerated graphics.
 Fix the underlying Linux or engine contract; do not add Chrome-specific execution behavior.
 
+## Regression-sensitive contracts
+
+These contracts have caused or can plausibly cause Chrome startup failures, stalls, extreme latency, or
+host-wide freezes. Preserve them during engine refactors:
+
+- [ ] Errno values remain guest Linux values. `EAGAIN`/`EWOULDBLOCK` (11) from nonblocking I/O is returned
+      to the guest and never promoted to an engine fatal error.
+- [ ] A forked child inherits every epoll interest, including one descriptor registered in multiple epoll
+      instances with different masks and user data.
+- [ ] Fork resets child thread identity and synchronization ownership; no child retains a vanished host
+      worker, lock owner, stop-the-world owner, or parent-only thread ID.
+- [ ] Guest buffers crossing translated pages or imported mappings are copied and validated as ranges, not
+      assumed to be one contiguous host pointer.
+- [ ] Writes performed by translated bulk operations and syscalls invalidate translated code with the same
+      precision and ordering as ordinary guest stores.
+- [ ] Mapping ownership survives split, protect, unmap, fork, and rollback without double release, stale
+      aliases, or lost backing storage.
+- [ ] Signal delivery and return preserve the guest ABI frame, register state, mask, alternate stack, and
+      restart semantics for both ARM64 and AMD64 guests.
+- [ ] Diagnostics never log per translated block, syscall retry, frame, or polling iteration unless a
+      bounded diagnostic session explicitly enables them.
+
 ## Launch
 
 - [ ] An unmodified supported installation starts with `google-chrome`, without compatibility flags.
