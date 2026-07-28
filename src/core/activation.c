@@ -1404,7 +1404,9 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
     child_argv[1] = NULL;
     if (terminal != NULL) {
         struct winsize size = {.ws_row = terminal->rows, .ws_col = terminal->columns};
+#if !defined(__linux__)
         int close_limit = getdtablesize();
+#endif
         int opened = openpty(&master, &slave, NULL, NULL, &size);
         if (opened == 0) master = reserve_master_descriptor(master);
         if (opened != 0 || master < 0 || fcntl(master, F_SETFD, FD_CLOEXEC) != 0 ||

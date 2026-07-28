@@ -19,8 +19,7 @@ typedef struct {
  * disposition is in exit_code/term_signal. A negative return is an
  * infrastructure failure and platform_error contains errno/GetLastError.
  */
-int hl_lint_process_run(const char *const argv[], size_t output_limit,
-                        HlLintProcessResult *result);
+int hl_lint_process_run(const char *const argv[], size_t output_limit, HlLintProcessResult *result);
 void hl_lint_process_result_destroy(HlLintProcessResult *result);
 
 #endif

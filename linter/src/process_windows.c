@@ -16,11 +16,8 @@ static void result_init(HlLintProcessResult *result) {
     result->exit_code = -1;
 }
 
-static int append_output(HlLintProcessResult *result, const char *data,
-                         size_t length, size_t limit, size_t *capacity) {
-    size_t available = result->output_size < limit
-        ? limit - result->output_size
-        : 0;
+static int append_output(HlLintProcessResult *result, const char *data, size_t length, size_t limit, size_t *capacity) {
+    size_t available = result->output_size < limit ? limit - result->output_size : 0;
     size_t keep = length < available ? length : available;
     size_t required;
     char *grown;
@@ -46,14 +43,12 @@ static int append_output(HlLintProcessResult *result, const char *data,
 }
 
 static wchar_t *utf8_to_wide(const char *text) {
-    int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1,
-                                    NULL, 0);
+    int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, NULL, 0);
     wchar_t *wide;
     if (count == 0) return NULL;
     wide = malloc((size_t)count * sizeof(*wide));
     if (wide == NULL) return NULL;
-    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, wide,
-                            count) == 0) {
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, wide, count) == 0) {
         free(wide);
         return NULL;
     }
@@ -113,7 +108,8 @@ static wchar_t *command_line(const char *const argv[]) {
     wchar_t **wide;
     wchar_t *line;
     wchar_t *cursor;
-    while (argv[count] != NULL) ++count;
+    while (argv[count] != NULL)
+        ++count;
     wide = calloc(count, sizeof(*wide));
     if (wide == NULL) return NULL;
     for (size_t i = 0; i < count; ++i) {
@@ -133,13 +129,13 @@ static wchar_t *command_line(const char *const argv[]) {
     free(wide);
     return line;
 fail:
-    for (size_t i = 0; i < count; ++i) free(wide[i]);
+    for (size_t i = 0; i < count; ++i)
+        free(wide[i]);
     free(wide);
     return NULL;
 }
 
-int hl_lint_process_run(const char *const argv[], size_t output_limit,
-                        HlLintProcessResult *result) {
+int hl_lint_process_run(const char *const argv[], size_t output_limit, HlLintProcessResult *result) {
     SECURITY_ATTRIBUTES security = {sizeof(security), NULL, TRUE};
     STARTUPINFOW startup;
     PROCESS_INFORMATION process;
@@ -175,8 +171,7 @@ int hl_lint_process_run(const char *const argv[], size_t output_limit,
     startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     startup.hStdOutput = write_pipe;
     startup.hStdError = write_pipe;
-    if (!CreateProcessW(NULL, line, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL,
-                        NULL, &startup, &process)) {
+    if (!CreateProcessW(NULL, line, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &startup, &process)) {
         error = GetLastError();
         goto done;
     }
@@ -200,8 +195,7 @@ int hl_lint_process_run(const char *const argv[], size_t output_limit,
     WaitForSingleObject(process.hProcess, INFINITE);
     {
         DWORD exit_code;
-        if (!GetExitCodeProcess(process.hProcess, &exit_code) ||
-            exit_code > INT_MAX) {
+        if (!GetExitCodeProcess(process.hProcess, &exit_code) || exit_code > INT_MAX) {
             if (error == ERROR_SUCCESS) error = GetLastError();
         } else {
             result->exit_code = (int)exit_code;

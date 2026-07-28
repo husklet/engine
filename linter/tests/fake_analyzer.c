@@ -5,18 +5,14 @@
 
 static bool has_arg(int argc, char **argv, const char *expected) {
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], expected) == 0) {
-            return true;
-        }
+        if (strcmp(argv[i], expected) == 0) { return true; }
     }
     return false;
 }
 
 static const char *value_after(int argc, char **argv, const char *option) {
     for (int i = 1; i + 1 < argc; ++i) {
-        if (strcmp(argv[i], option) == 0) {
-            return argv[i + 1];
-        }
+        if (strcmp(argv[i], option) == 0) { return argv[i + 1]; }
     }
     return NULL;
 }
@@ -44,9 +40,8 @@ static int check_clang_tidy(int argc, char **argv) {
         fputs("fake-analyzer: clang-tidy compile database missing\n", stderr);
         return 2;
     }
-    if (!has_arg(argc, argv, "--extra-arg=-std=c11")
-        || !has_arg(argc, argv, "--checks=bugprone-*,performance-*")
-        || !has_arg(argc, argv, "--warnings-as-errors=*")) {
+    if (!has_arg(argc, argv, "--extra-arg=-std=c11") || !has_arg(argc, argv, "--checks=bugprone-*,performance-*") ||
+        !has_arg(argc, argv, "--warnings-as-errors=*")) {
         fputs("fake-analyzer: clang-tidy required argument missing\n", stderr);
         return 2;
     }
@@ -61,9 +56,8 @@ static int check_cppcheck(int argc, char **argv) {
         fputs("fake-analyzer: cppcheck include directory missing\n", stderr);
         return 2;
     }
-    if (!has_arg(argc, argv, "--std=c11")
-        || !has_arg(argc, argv, "--error-exitcode=1")
-        || has_arg(argc, argv, "2>&1")) {
+    if (!has_arg(argc, argv, "--std=c11") || !has_arg(argc, argv, "--error-exitcode=1") ||
+        has_arg(argc, argv, "2>&1")) {
         fputs("fake-analyzer: cppcheck argument corruption\n", stderr);
         return 2;
     }
@@ -77,9 +71,7 @@ static int check_cppcheck(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
-    if (has_arg(argc, argv, "--quiet") && has_arg(argc, argv, "-p")) {
-        return check_clang_tidy(argc, argv);
-    }
+    if (has_arg(argc, argv, "--quiet") && has_arg(argc, argv, "-p")) { return check_clang_tidy(argc, argv); }
     if (has_arg(argc, argv, "--enable=warning,performance,style,portability,information")) {
         return check_cppcheck(argc, argv);
     }

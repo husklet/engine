@@ -130,7 +130,8 @@ static char *xdup_format(const char *fmt, ...) {
 }
 
 static const char *skip_space(const char *s) {
-    while (*s && isspace((unsigned char)*s)) s++;
+    while (*s && isspace((unsigned char)*s))
+        s++;
     return s;
 }
 
@@ -175,22 +176,19 @@ static bool is_source_file(const char *path) {
 }
 
 static bool dir_should_skip(const char *name) {
-    return strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || name[0] == '.'
-           || strcmp(name, "build") == 0 || strncmp(name, "build-", 6) == 0
-           || strcmp(name, "result") == 0 || strncmp(name, "result-", 7) == 0
-           || strcmp(name, "hl_errmat_") == 0;
+    return strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || name[0] == '.' || strcmp(name, "build") == 0 ||
+           strncmp(name, "build-", 6) == 0 || strcmp(name, "result") == 0 || strncmp(name, "result-", 7) == 0 ||
+           strcmp(name, "hl_errmat_") == 0;
 }
 
 #ifdef _WIN32
 static wchar_t *path_to_wide(const char *path) {
-    int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1,
-                                    NULL, 0);
+    int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
     wchar_t *wide;
     if (count == 0) return NULL;
     wide = malloc((size_t)count * sizeof(*wide));
     if (wide == NULL) return NULL;
-    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide,
-                            count) == 0) {
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, count) == 0) {
         free(wide);
         return NULL;
     }
@@ -198,14 +196,12 @@ static wchar_t *path_to_wide(const char *path) {
 }
 
 static char *path_from_wide(const wchar_t *path) {
-    int count = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path, -1,
-                                   NULL, 0, NULL, NULL);
+    int count = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path, -1, NULL, 0, NULL, NULL);
     char *utf8;
     if (count == 0) return NULL;
     utf8 = malloc((size_t)count);
     if (utf8 == NULL) return NULL;
-    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path, -1, utf8,
-                            count, NULL, NULL) == 0) {
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path, -1, utf8, count, NULL, NULL) == 0) {
         free(utf8);
         return NULL;
     }
@@ -221,8 +217,7 @@ static void collect_recursive(const char *root, StringList *files) {
     }
     attributes = GetFileAttributesW(wide);
     if (attributes == INVALID_FILE_ATTRIBUTES) {
-        fprintf(stdout, "warn: cannot inspect path `%s` (Windows error %lu)\n",
-                root, (unsigned long)GetLastError());
+        fprintf(stdout, "warn: cannot inspect path `%s` (Windows error %lu)\n", root, (unsigned long)GetLastError());
         free(wide);
         return;
     }
@@ -242,8 +237,8 @@ static void collect_recursive(const char *root, StringList *files) {
         search = FindFirstFileW(pattern, &entry);
         free(pattern);
         if (search == INVALID_HANDLE_VALUE) {
-            fprintf(stdout, "warn: cannot open directory `%s` (Windows error %lu)\n",
-                    root, (unsigned long)GetLastError());
+            fprintf(stdout, "warn: cannot open directory `%s` (Windows error %lu)\n", root,
+                    (unsigned long)GetLastError());
             free(wide);
             return;
         }
@@ -303,13 +298,12 @@ static void collect_recursive(const char *root, StringList *files) {
         return;
     }
 
-    if (S_ISREG(st.st_mode) && is_source_file(root)) {
-        list_append(files, root);
-    }
+    if (S_ISREG(st.st_mode) && is_source_file(root)) { list_append(files, root); }
 }
 #endif
 
-static void emit_diag(const char *severity, const char *path, int line, int col, const char *rule, const char *message) {
+static void emit_diag(const char *severity, const char *path, int line, int col, const char *rule,
+                      const char *message) {
     if (line > 0) {
         fprintf(stdout, "%s:%d:%d: [%s] %s: %s\n", path, line, col, severity, rule, message);
     } else {
@@ -317,30 +311,22 @@ static void emit_diag(const char *severity, const char *path, int line, int col,
     }
 }
 
-static int run_command_argv(const char *label, const char *const argv[],
-                            LintStats *stats) {
+static int run_command_argv(const char *label, const char *const argv[], LintStats *stats) {
     HlLintProcessResult result;
     if (hl_lint_process_run(argv, 0, &result) != 0) {
 #ifdef _WIN32
-        fprintf(stdout, "error: %s failed to execute (Windows error %d)\n",
-                label, result.platform_error);
+        fprintf(stdout, "error: %s failed to execute (Windows error %d)\n", label, result.platform_error);
 #else
-        fprintf(stdout, "error: %s failed to execute: %s\n", label,
-                strerror(result.platform_error));
+        fprintf(stdout, "error: %s failed to execute: %s\n", label, strerror(result.platform_error));
 #endif
         stats->errors++;
         return 1;
     }
-    if (result.output_size > 0) {
-        fwrite(result.output, 1, result.output_size, stdout);
-    }
-    if (result.output_truncated) {
-        fprintf(stdout, "warn: %s output truncated\n", label);
-    }
+    if (result.output_size > 0) { fwrite(result.output, 1, result.output_size, stdout); }
+    if (result.output_truncated) { fprintf(stdout, "warn: %s output truncated\n", label); }
     int rc = result.exit_code;
     if (result.term_signal != 0) {
-        fprintf(stdout, "error: %s terminated by signal %d\n", label,
-                result.term_signal);
+        fprintf(stdout, "error: %s terminated by signal %d\n", label, result.term_signal);
         stats->errors++;
         rc = 1;
     }
@@ -363,15 +349,8 @@ static int run_clang_format(const LintConfig *cfg, const StringList *files, Lint
 
     for (size_t i = 0; i < files->count; i++) {
         const char *file = files->items[i];
-        const char *const argv[] = {
-            cfg->clang_format_bin,
-            "--dry-run",
-            "--Werror",
-            "--style=file",
-            "--ferror-limit=1",
-            file,
-            NULL
-        };
+        const char *const argv[] = {cfg->clang_format_bin, "--dry-run", "--Werror", "--style=file",
+                                    "--ferror-limit=1",    file,        NULL};
         int c = run_command_argv("clang-format", argv, stats);
         if (c != 0) {
             if (cfg->strict) {
@@ -384,8 +363,10 @@ static int run_clang_format(const LintConfig *cfg, const StringList *files, Lint
             }
         }
         if (cfg->strict && rc != 0) return 1;
-        if (cfg->strict) rc = (rc != 0) ? rc : c;
-        else rc = 0;
+        if (cfg->strict)
+            rc = (rc != 0) ? rc : c;
+        else
+            rc = 0;
     }
     return rc;
 }
@@ -402,9 +383,7 @@ static int run_clang_tidy(const LintConfig *cfg, const StringList *files, LintSt
         fprintf(stdout, "warn: skipping clang-tidy (binary not configured)\n");
         return 0;
     }
-    char *compile_db = cfg->compile_db_dir
-        ? xdup_format("%s/compile_commands.json", cfg->compile_db_dir)
-        : NULL;
+    char *compile_db = cfg->compile_db_dir ? xdup_format("%s/compile_commands.json", cfg->compile_db_dir) : NULL;
     if (!compile_db ||
 #ifdef _WIN32
         _access(compile_db, 0) != 0) {
@@ -427,26 +406,15 @@ static int run_clang_tidy(const LintConfig *cfg, const StringList *files, LintSt
     for (size_t i = 0; i < files->count; i++) {
         const char *file = files->items[i];
         if (!has_ext(file, ".c")) continue;
-        char *checks = xdup_format(
-            "--checks=%s",
-            cfg->clang_tidy_checks
-                ? cfg->clang_tidy_checks
-                : "bugprone-*,clang-analyzer-*,performance-*");
+        char *checks = xdup_format("--checks=%s", cfg->clang_tidy_checks ? cfg->clang_tidy_checks
+                                                                         : "bugprone-*,clang-analyzer-*,performance-*");
         if (!checks) {
             fprintf(stdout, "error: out of memory building clang-tidy command\n");
             return 1;
         }
-        const char *const argv[] = {
-            cfg->clang_tidy_bin,
-            "--quiet",
-            "-p",
-            cfg->compile_db_dir,
-            checks,
-            "--extra-arg=-std=c11",
-            "--warnings-as-errors=*",
-            file,
-            NULL
-        };
+        const char *const argv[] = {cfg->clang_tidy_bin,      "--quiet", "-p",
+                                    cfg->compile_db_dir,      checks,    "--extra-arg=-std=c11",
+                                    "--warnings-as-errors=*", file,      NULL};
         int c = run_command_argv("clang-tidy", argv, stats);
         free(checks);
         if (c != 0) {
@@ -536,15 +504,12 @@ static bool line_has_word(const char *line, const char *word) {
 }
 
 static bool line_has_direct_console_output(const char *line) {
-    if (line_has_word(line, "printf")
-        || line_has_word(line, "vprintf")
-        || line_has_word(line, "puts")
-        || line_has_word(line, "perror")) {
+    if (line_has_word(line, "printf") || line_has_word(line, "vprintf") || line_has_word(line, "puts") ||
+        line_has_word(line, "perror")) {
         return true;
     }
-    if ((line_has_word(line, "fprintf") || line_has_word(line, "vfprintf")
-         || line_has_word(line, "fputs"))
-        && (line_has_word(line, "stderr") || line_has_word(line, "stdout"))) {
+    if ((line_has_word(line, "fprintf") || line_has_word(line, "vfprintf") || line_has_word(line, "fputs")) &&
+        (line_has_word(line, "stderr") || line_has_word(line, "stdout"))) {
         return true;
     }
     return false;
@@ -552,10 +517,9 @@ static bool line_has_direct_console_output(const char *line) {
 
 static bool line_has_control_prefix(const char *line) {
     const char *s = skip_space(line);
-    static const char *const k_controls[] = {
-        "if", "else", "for", "while", "switch", "case", "default", "do", "goto",
-        "sizeof", "struct", "union", "enum", "typedef", "return", "asm", "asm volatile",
-        NULL};
+    static const char *const k_controls[] = {"if",      "else",    "for",    "while",  "switch",       "case",
+                                             "default", "do",      "goto",   "sizeof", "struct",       "union",
+                                             "enum",    "typedef", "return", "asm",    "asm volatile", NULL};
     for (size_t i = 0; k_controls[i]; i++) {
         const char *kw = k_controls[i];
         size_t klen = strlen(kw);
@@ -667,8 +631,7 @@ static void check_file_custom(const LintConfig *cfg, const char *path, LintStats
         sanitize_for_parse(raw, clean, sizeof(clean), &state);
 
         size_t line_len = strlen(raw);
-        if (cfg->max_line_length > 0
-            && line_len > (size_t)cfg->max_line_length) {
+        if (cfg->max_line_length > 0 && line_len > (size_t)cfg->max_line_length) {
             emit_diag("warn", path, lineno, 1, "style", "long line");
             stats->warnings++;
         }
@@ -680,14 +643,11 @@ static void check_file_custom(const LintConfig *cfg, const char *path, LintStats
                 stats->errors++;
             }
         }
-        if (line_has_direct_console_output(clean)
-            && !is_stdio_allowed_in_file(cfg, path)) {
-            emit_diag("error", path, lineno, 1, "logging",
-                      "direct console output is forbidden; use tagged logging");
+        if (line_has_direct_console_output(clean) && !is_stdio_allowed_in_file(cfg, path)) {
+            emit_diag("error", path, lineno, 1, "logging", "direct console output is forbidden; use tagged logging");
             stats->errors++;
         }
-        if ((line_has_word(clean, "system") || line_has_word(clean, "popen"))
-            && !is_shell_allowed_in_file(cfg, path)) {
+        if ((line_has_word(clean, "system") || line_has_word(clean, "popen")) && !is_shell_allowed_in_file(cfg, path)) {
             emit_diag("error", path, lineno, 1, "process",
                       "shell execution is forbidden; launch an argv vector directly");
             stats->errors++;
@@ -751,13 +711,11 @@ static void check_file_custom(const LintConfig *cfg, const char *path, LintStats
             if (c == '}') {
                 if (brace_depth > 0) brace_depth--;
                 if (in_function && brace_depth < func_base_depth + 1) {
-                    if (cfg->max_function_lines > 0
-                        && func_lines > cfg->max_function_lines) {
+                    if (cfg->max_function_lines > 0 && func_lines > cfg->max_function_lines) {
                         emit_diag("warn", path, func_start_line, 1, "complexity", "function exceeds max lines");
                         stats->warnings++;
                     }
-                    if (cfg->max_nesting_depth > 0
-                        && func_max_nesting > cfg->max_nesting_depth) {
+                    if (cfg->max_nesting_depth > 0 && func_max_nesting > cfg->max_nesting_depth) {
                         emit_diag("warn", path, func_start_line, 1, "complexity", "function exceeds max nesting depth");
                         stats->warnings++;
                     }
@@ -788,7 +746,8 @@ static void print_usage(const char *prog) {
     fprintf(stdout, "  --clang-format-bin PATH   clang-format path\n");
     fprintf(stdout, "  --clang-tidy-bin PATH     clang-tidy path\n");
     fprintf(stdout, "  --cppcheck-bin PATH       cppcheck path\n");
-    fprintf(stdout, "  --clang-tidy-checks LIST  clang-tidy checks (default: bugprone-*,clang-analyzer-*,performance-*)\n");
+    fprintf(stdout,
+            "  --clang-tidy-checks LIST  clang-tidy checks (default: bugprone-*,clang-analyzer-*,performance-*)\n");
     fprintf(stdout, "  --max-function-lines N    opt in to lexical function-length warnings\n");
     fprintf(stdout, "  --max-nesting N           opt in to lexical brace-depth warnings\n");
     fprintf(stdout, "  --max-line-length N       opt in to line-length warnings\n");
@@ -980,9 +939,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (all_files.count == 0) {
-        fprintf(stdout, "warn: no source files matched\n");
-    }
+    if (all_files.count == 0) { fprintf(stdout, "warn: no source files matched\n"); }
 
     if (cfg.allow_getenv_files.count == 0) {
         // Engine currently centralizes env-var reads in environment.c.
@@ -1001,13 +958,13 @@ int main(int argc, char **argv) {
         rc = 0;
     } else {
         fprintf(stdout, "hl-lint: warnings=%ld errors=%ld\n", stats.warnings, stats.errors);
-        if (stats.errors > 0) rc = 1;
-        else if (cfg.strict && stats.warnings > 0) rc = 1;
+        if (stats.errors > 0)
+            rc = 1;
+        else if (cfg.strict && stats.warnings > 0)
+            rc = 1;
     }
 
-    if (cfg.strict) {
-        fprintf(stdout, "hl-lint: strict mode enabled\n");
-    }
+    if (cfg.strict) { fprintf(stdout, "hl-lint: strict mode enabled\n"); }
 
     list_free(&all_files);
     list_free(&cfg.source_files);
