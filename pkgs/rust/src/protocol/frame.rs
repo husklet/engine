@@ -59,69 +59,65 @@ pub enum TransportError {
     Quota,
 }
 
-/// Encodes the frozen envelope header.
-///
-/// # Errors
-/// Returns [`TransportError::Oversized`] when the payload length cannot be represented.
-pub fn encode_header(frame: &Frame) -> Result<[u8; HEADER_BYTES], TransportError> {
-    let length = u32::try_from(frame.payload.len()).map_err(|_| TransportError::Oversized)?;
-    let mut bytes = [0_u8; HEADER_BYTES];
-    bytes[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-    bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
-    bytes[6..8].copy_from_slice(&(frame.kind as u16).to_le_bytes());
-    bytes[8..12].copy_from_slice(&length.to_le_bytes());
-    bytes[12..20].copy_from_slice(&frame.request_id.to_le_bytes());
-    bytes[20..28].copy_from_slice(&frame.features.to_le_bytes());
-    Ok(bytes)
-}
+pub(crate) struct HeaderCodec;
 
-/// Decodes and validates the frozen envelope header.
-///
-/// # Errors
-/// Returns a malformed or version error when the header violates the wire contract.
-pub fn decode_header(
-    bytes: &[u8; HEADER_BYTES],
-) -> Result<(MessageType, u64, u64, u32), TransportError> {
-    if u32::from_le_bytes(
-        bytes[0..4]
-            .try_into()
-            .map_err(|_| TransportError::Malformed)?,
-    ) != MAGIC
-    {
-        return Err(TransportError::Malformed);
+impl HeaderCodec {
+    pub(crate) fn encode(frame: &Frame) -> Result<[u8; HEADER_BYTES], TransportError> {
+        let length = u32::try_from(frame.payload.len()).map_err(|_| TransportError::Oversized)?;
+        let mut bytes = [0_u8; HEADER_BYTES];
+        bytes[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
+        bytes[6..8].copy_from_slice(&(frame.kind as u16).to_le_bytes());
+        bytes[8..12].copy_from_slice(&length.to_le_bytes());
+        bytes[12..20].copy_from_slice(&frame.request_id.to_le_bytes());
+        bytes[20..28].copy_from_slice(&frame.features.to_le_bytes());
+        Ok(bytes)
     }
-    if u16::from_le_bytes(
-        bytes[4..6]
-            .try_into()
-            .map_err(|_| TransportError::Malformed)?,
-    ) != VERSION
-    {
-        return Err(TransportError::Version);
+
+    pub(crate) fn decode(
+        bytes: &[u8; HEADER_BYTES],
+    ) -> Result<(MessageType, u64, u64, u32), TransportError> {
+        if u32::from_le_bytes(
+            bytes[0..4]
+                .try_into()
+                .map_err(|_| TransportError::Malformed)?,
+        ) != MAGIC
+        {
+            return Err(TransportError::Malformed);
+        }
+        if u16::from_le_bytes(
+            bytes[4..6]
+                .try_into()
+                .map_err(|_| TransportError::Malformed)?,
+        ) != VERSION
+        {
+            return Err(TransportError::Version);
+        }
+        let kind = MessageType::try_from(u16::from_le_bytes(
+            bytes[6..8]
+                .try_into()
+                .map_err(|_| TransportError::Malformed)?,
+        ))?;
+        let length = u32::from_le_bytes(
+            bytes[8..12]
+                .try_into()
+                .map_err(|_| TransportError::Malformed)?,
+        );
+        let request_id = u64::from_le_bytes(
+            bytes[12..20]
+                .try_into()
+                .map_err(|_| TransportError::Malformed)?,
+        );
+        let features = u64::from_le_bytes(
+            bytes[20..28]
+                .try_into()
+                .map_err(|_| TransportError::Malformed)?,
+        );
+        if bytes[28..32] != [0; 4] {
+            return Err(TransportError::Malformed);
+        }
+        Ok((kind, request_id, features, length))
     }
-    let kind = MessageType::try_from(u16::from_le_bytes(
-        bytes[6..8]
-            .try_into()
-            .map_err(|_| TransportError::Malformed)?,
-    ))?;
-    let length = u32::from_le_bytes(
-        bytes[8..12]
-            .try_into()
-            .map_err(|_| TransportError::Malformed)?,
-    );
-    let request_id = u64::from_le_bytes(
-        bytes[12..20]
-            .try_into()
-            .map_err(|_| TransportError::Malformed)?,
-    );
-    let features = u64::from_le_bytes(
-        bytes[20..28]
-            .try_into()
-            .map_err(|_| TransportError::Malformed)?,
-    );
-    if bytes[28..32] != [0; 4] {
-        return Err(TransportError::Malformed);
-    }
-    Ok((kind, request_id, features, length))
 }
 
 #[cfg(test)]
@@ -136,15 +132,21 @@ mod tests {
             features: 7,
             payload: b"copied".to_vec(),
         };
-        let header = encode_header(&frame).unwrap();
+        let header = HeaderCodec::encode(&frame).unwrap();
         assert_eq!(
-            decode_header(&header).unwrap(),
+            HeaderCodec::decode(&header).unwrap(),
             (MessageType::Request, 42, 7, 6)
         );
         let mut malformed = [0; HEADER_BYTES];
-        assert_eq!(decode_header(&malformed), Err(TransportError::Malformed));
+        assert_eq!(
+            HeaderCodec::decode(&malformed),
+            Err(TransportError::Malformed)
+        );
         malformed[0..4].copy_from_slice(&MAGIC.to_le_bytes());
         malformed[4..6].copy_from_slice(&(VERSION + 1).to_le_bytes());
-        assert_eq!(decode_header(&malformed), Err(TransportError::Version));
+        assert_eq!(
+            HeaderCodec::decode(&malformed),
+            Err(TransportError::Version)
+        );
     }
 }

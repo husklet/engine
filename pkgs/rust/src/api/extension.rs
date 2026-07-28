@@ -15,7 +15,7 @@ impl ProviderId {
     /// Returns [`ContractError::InvalidIdentifier`] for an empty, oversized, or non-portable name.
     pub fn new(value: impl Into<String>) -> Result<Self, ContractError> {
         let value = value.into();
-        if value.is_empty() || value.len() > 128 || !value.bytes().all(valid_identifier_byte) {
+        if value.is_empty() || value.len() > 128 || !value.bytes().all(Identifier::allows) {
             return Err(ContractError::InvalidIdentifier);
         }
         Ok(Self(value))
@@ -27,8 +27,12 @@ impl ProviderId {
     }
 }
 
-const fn valid_identifier_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+struct Identifier;
+
+impl Identifier {
+    const fn allows(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+    }
 }
 
 /// One feature selected during extension negotiation.
@@ -42,7 +46,7 @@ impl Feature {
     /// Returns [`ContractError::InvalidFeature`] for an empty, oversized, or non-portable name.
     pub fn new(value: impl Into<String>) -> Result<Self, ContractError> {
         let value = value.into();
-        if value.is_empty() || value.len() > 64 || !value.bytes().all(valid_identifier_byte) {
+        if value.is_empty() || value.len() > 64 || !value.bytes().all(Identifier::allows) {
             return Err(ContractError::InvalidFeature);
         }
         Ok(Self(value))

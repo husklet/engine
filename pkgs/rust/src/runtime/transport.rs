@@ -10,8 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::protocol::{decode_header, encode_header, HEADER_BYTES};
 pub use crate::protocol::{Frame, MessageType, TransportError};
+use crate::protocol::{HeaderCodec, HEADER_BYTES};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransportLimits {
@@ -109,7 +109,7 @@ impl Channel {
         stream
             .set_write_timeout(Some(remaining(deadline)?))
             .map_err(io_error)?;
-        let header = encode_header(frame)?;
+        let header = HeaderCodec::encode(frame)?;
         write_all(&mut stream, &header)?;
         write_all(&mut stream, &frame.payload)
     }
@@ -125,7 +125,7 @@ impl Channel {
             .map_err(io_error)?;
         let mut header = [0_u8; HEADER_BYTES];
         read_exact(&mut stream, &mut header)?;
-        let (kind, request_id, features, length) = decode_header(&header)?;
+        let (kind, request_id, features, length) = HeaderCodec::decode(&header)?;
         if length > self.limits.payload_bytes {
             return Err(TransportError::Oversized);
         }
