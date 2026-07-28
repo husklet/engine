@@ -1656,7 +1656,8 @@ static int ckpt_dump_inotify(struct ckpt_sink *sink, const char *group) {
             .snapshot_size = (uint32_t)snapshot_size,
             .is_directory = g_inotify_isdir[wd],
         };
-        snprintf(watch.path, sizeof watch.path, "%s", g_inotify_wpath[wd]);
+        memcpy(watch.path, g_inotify_wpath[wd], sizeof watch.path);
+        watch.path[sizeof watch.path - 1] = 0;
         if (ckpt_sink_write(sink, file, &watch, sizeof watch) != 0 ||
             (snapshot_size && ckpt_sink_write(sink, file, g_inotify_snap[wd], snapshot_size) != 0))
             goto fail;
