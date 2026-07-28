@@ -619,13 +619,13 @@ static int svc_net(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // fatal SIGPIPE (matches Linux EPIPE-to-guest behaviour). See case 198 for the rationale.
             (void)hl_native_set_no_sigpipe(sv[0]);
             (void)hl_native_set_no_sigpipe(sv[1]);
-            if ((int)a1 & 0x80000) { // SOCK_CLOEXEC
+            if ((int)a1 & HL_LINUX_SOCK_CLOEXEC) {
                 fcntl(sv[0], F_SETFD, FD_CLOEXEC);
                 fcntl(sv[1], F_SETFD, FD_CLOEXEC);
             }
-            if ((int)a1 & 0x800) { // SOCK_NONBLOCK
-                hl_linux_socket_apply_type_flags(sv[0], SOCK_NONBLOCK);
-                hl_linux_socket_apply_type_flags(sv[1], SOCK_NONBLOCK);
+            if ((int)a1 & HL_LINUX_SOCK_NONBLOCK) {
+                hl_linux_socket_apply_type_flags(sv[0], HL_LINUX_SOCK_NONBLOCK);
+                hl_linux_socket_apply_type_flags(sv[1], HL_LINUX_SOCK_NONBLOCK);
             }
             // The fd pair is written straight into the guest array; a bad/unmapped destination must EFAULT
             // (and leak no fds) like Linux, not fault the engine writing the pair.

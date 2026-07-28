@@ -1,6 +1,8 @@
 #ifndef HL_LINUX_ABI_HOST_SOCKET_H
 #define HL_LINUX_ABI_HOST_SOCKET_H
 
+enum { HL_LINUX_SOCK_NONBLOCK = 0x800, HL_LINUX_SOCK_CLOEXEC = 0x80000 };
+
 /*
  * The BSD sockets vocabulary for this layer: <sys/socket.h>, <netinet/in.h>,
  * <netinet/tcp.h>, <sys/un.h>, <arpa/inet.h> and <netdb.h> behind one door.
@@ -103,8 +105,8 @@ static inline int hl_linux_socket_is(int descriptor) {
 /* Apply the SOCK_CLOEXEC/SOCK_NONBLOCK bits a creation call carried. Two fcntls
    here; on a host with no queryable descriptor status it is a record update. */
 static inline int hl_linux_socket_apply_type_flags(int descriptor, int type) {
-    if ((type & SOCK_CLOEXEC) != 0) (void)fcntl(descriptor, F_SETFD, FD_CLOEXEC);
-    if ((type & SOCK_NONBLOCK) != 0) (void)fcntl(descriptor, F_SETFL, O_NONBLOCK);
+    if ((type & HL_LINUX_SOCK_CLOEXEC) != 0) (void)fcntl(descriptor, F_SETFD, FD_CLOEXEC);
+    if ((type & HL_LINUX_SOCK_NONBLOCK) != 0) (void)fcntl(descriptor, F_SETFL, O_NONBLOCK);
     return 0;
 }
 
@@ -174,8 +176,8 @@ typedef uint32_t in_addr_t;
 #define SOCK_SEQPACKET 5
 #define SOCK_DCCP 6
 #define SOCK_PACKET 10
-#define SOCK_CLOEXEC 0x80000
-#define SOCK_NONBLOCK 0x800
+#define SOCK_CLOEXEC HL_LINUX_SOCK_CLOEXEC
+#define SOCK_NONBLOCK HL_LINUX_SOCK_NONBLOCK
 #define SOCK_TYPE_MASK 0xf
 
 /* ---- SHAPE: option levels.  SOL_SOCKET is 1, not Winsock's 0xffff. ------ */
