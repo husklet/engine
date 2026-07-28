@@ -1,6 +1,5 @@
 //! Backend-independent contracts for HL engine implementations and callers.
 
-pub mod checkpoint;
 pub mod control;
 pub mod extension;
 pub mod observability;

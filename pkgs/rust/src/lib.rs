@@ -40,7 +40,7 @@ mod wire;
 
 pub use crate::wire::launch_abi;
 
-pub use crate::api::{checkpoint, observability};
+pub use crate::api::observability;
 pub use crate::api::{Access, Guest, Mount, Sandbox, Stdio, Version};
 pub use checkpoint_stream::{CheckpointStore, MemoryStore, StoreError};
 

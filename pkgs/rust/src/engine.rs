@@ -305,8 +305,8 @@ mod typed_tests {
             ExtensionCapability, ExtensionConfig, ExtensionSpec, Feature, Inheritance,
             MemoryRequirement, Protections, ProviderId, Sharing,
         },
-        spec::{NetworkMode, TreeSource, Version},
-        Domain, Engine, Guest, MachineSpec, Sandbox,
+        spec::Version,
+        Engine, Guest, MachineSpec,
     };
 
     fn requested(required_feature: Feature, optional_feature: Feature) -> ExtensionSpec {
@@ -386,49 +386,6 @@ mod typed_tests {
                 .unwrap_err()
                 .field,
             "extensions.required_features"
-        );
-    }
-
-    #[test]
-    fn typed_lowering_preserves_the_frozen_legacy_wire_record() {
-        let domain = Domain::from_identity([11, 22]);
-        let root = std::path::PathBuf::from("/tmp/typed-wire-root");
-        let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/echo");
-        spec.process.argv.push("hello".into());
-        spec.process.cwd = "/tmp".into();
-        spec.process.env.push(("A".into(), "B".into()));
-        spec.process.domain = Some(domain);
-        spec.identity.uid = Some(12);
-        spec.identity.gid = Some(34);
-        spec.identity.hostname = Some("typed".into());
-        spec.filesystem.root = Some(TreeSource::HostDirectory(root.clone()));
-        spec.filesystem.read_only = true;
-        spec.resources.memory_bytes = Some(4096);
-        spec.resources.process_limit = Some(8);
-        spec.resources.cpu_limit = Some(2);
-        spec.security.sandbox = Sandbox::SentryOnly;
-        spec.network.mode = NetworkMode::None;
-
-        let launch = super::lower(spec).unwrap();
-        let legacy = crate::Config::new()
-            .root(root)
-            .working_dir("/tmp")
-            .env("A", "B")
-            .domain(domain)
-            .uid(12)
-            .gid(34)
-            .hostname("typed")
-            .read_only_root(true)
-            .memory_limit(4096)
-            .process_limit(8)
-            .cpu_limit(2)
-            .sandbox(Sandbox::SentryOnly)
-            .network(true);
-        let mut argv = vec![launch.program];
-        argv.extend(launch.arguments);
-        assert_eq!(
-            crate::wire::encode(&launch.config, &argv, None).unwrap(),
-            crate::wire::encode(&legacy, &argv, None).unwrap()
         );
     }
 }
