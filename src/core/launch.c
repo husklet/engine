@@ -136,33 +136,26 @@ static int hl_read_config_file(int fd, hl_launch_runner runner) {
     uint32_t abi;
     size_t wire_size;
 
-    if (cfd_read_full(fd, prefix, sizeof prefix) != 0) {
-        fprintf(stderr, "hl-engine: launch config has a short prefix\n");
-        return 78;
-    }
+    if (cfd_read_full(fd, prefix, sizeof prefix) != 0) return 78;
     memcpy(&magic, prefix + 0, 4);
     memcpy(&pool_size, prefix + 4, 4);
     memcpy(&header_size, prefix + 8, 4);
     memcpy(&abi, prefix + 12, 4);
     if (magic != HL_CONFIG_MAGIC || abi != HL_CONFIG_ABI || header_size < sizeof(hl_launch_config) ||
-        header_size > HL_LAUNCH_HEADER_LIMIT || pool_size == 0 || pool_size > HL_LAUNCH_POOL_LIMIT) {
-        fprintf(stderr, "hl-engine: launch config has an invalid prefix\n");
+        header_size > HL_LAUNCH_HEADER_LIMIT || pool_size == 0 || pool_size > HL_LAUNCH_POOL_LIMIT)
         return 78;
-    }
     wire_size = (size_t)header_size + (size_t)pool_size;
     if (wire_size < header_size) return 78;
     wire = (uint8_t *)malloc(wire_size);
     if (wire == NULL) return 78;
     memcpy(wire, prefix, sizeof prefix);
     if (cfd_read_full(fd, wire + sizeof prefix, wire_size - sizeof prefix) != 0) {
-        fprintf(stderr, "hl-engine: launch config is truncated\n");
         free(wire);
         return 78;
     }
     if (hl_launch_config_validate(wire, wire_size, &cfg, &pool) != HL_STATUS_OK || !launch_strings_valid(&cfg, pool) ||
         (cfg.publish_count != 0 && hl_launch_config_publish(&cfg, pool, NULL) != HL_STATUS_OK) ||
         hl_launch_config_arguments_validate(&cfg, pool, NULL) != HL_STATUS_OK) {
-        fprintf(stderr, "hl-engine: launch config is malformed\n");
         free(wire);
         return 78;
     }
@@ -321,16 +314,12 @@ int hl_run_config_file_with(const char *path, hl_launch_runner runner) {
     if (runner == NULL) return 78;
     if (!path || !path[0]) return 78;
     int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "hl-engine: --configfile: open failed: %s\n", path);
-        return 78;
-    }
+    if (fd < 0) return 78;
     /* The unlinked launch wire remains open while the runner owns pointers
      * decoded from it.  It is engine control state, never a guest descriptor. */
     if (hl_host_private_init != NULL) hl_host_private_init();
     if (hl_host_process_fd_private_add != NULL && hl_host_process_fd_private_add(fd) != 0) {
         close(fd);
-        fprintf(stderr, "hl-engine: --configfile: cannot reserve private descriptor\n");
         return 78;
     }
     unlink(path);
