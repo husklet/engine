@@ -278,14 +278,10 @@ static int decode_bytes(const uint8_t bytes[15], hl_x86_insn *I) {
                 I->m_scale = scale;
             }
             // displacement
-            if (I->rip_rel) {
-                I->disp = (int32_t)((uint32_t)p[n] | ((uint32_t)p[n + 1] << 8) | ((uint32_t)p[n + 2] << 16) |
-                                    ((uint32_t)p[n + 3] << 24));
-                n += 4;
-            } else if (I->mod == 1) {
+            if (I->mod == 1) {
                 I->disp = (int8_t)p[n];
                 n += 1;
-            } else if (I->mod == 2 || (!I->m_hasbase && I->rm == 4)) {
+            } else if (I->rip_rel || I->mod == 2 || (!I->m_hasbase && I->rm == 4)) {
                 I->disp = (int32_t)((uint32_t)p[n] | ((uint32_t)p[n + 1] << 8) | ((uint32_t)p[n + 2] << 16) |
                                     ((uint32_t)p[n + 3] << 24));
                 n += 4;

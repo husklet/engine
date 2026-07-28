@@ -31,6 +31,11 @@ int main(void) {
     HL_CHECK(decode(rip_relative, &insn) == 7);
     HL_CHECK(insn.rip_rel && insn.is_mem && !insn.m_hasbase && insn.disp == -4);
 
+    const uint8_t sib_without_base[] = {0x8b, 0x04, 0x25, 0x78, 0x56, 0x34, 0x12};
+    HL_CHECK(decode(sib_without_base, &insn) == 7);
+    HL_CHECK(insn.is_mem && !insn.rip_rel && !insn.m_hasbase && !insn.m_hasindex);
+    HL_CHECK(insn.disp == 0x12345678);
+
     const uint8_t movabs[] = {0x48, 0xb8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11};
     HL_CHECK(decode(movabs, &insn) == 10);
     HL_CHECK(insn.imm_bytes == 8 && (uint64_t)insn.imm == UINT64_C(0x1122334455667788));
