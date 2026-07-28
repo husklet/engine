@@ -1,7 +1,32 @@
 use crate::{network, Domain, Mount, Sandbox};
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FileOwners {
+    entries: HashMap<Box<[OsString]>, (PathBuf, u32, u32)>,
+}
+
+impl FileOwners {
+    fn insert(&mut self, path: PathBuf, uid: u32, gid: u32) {
+        let key = path
+            .components()
+            .map(|component| component.as_os_str().to_os_string())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        self.entries.insert(key, (path, uid, gid));
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &(PathBuf, u32, u32)> {
+        self.entries.values()
+    }
+}
 
 /// Configuration for one Linux launch and its initial process.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -41,7 +66,7 @@ pub struct Config {
     pub(crate) checkpoint_policy: crate::spec::IncompatibleResourcePolicy,
     pub(crate) mounts: Vec<Mount>,
     pub(crate) namespace_links: Vec<(PathBuf, PathBuf)>,
-    pub(crate) file_owners: Vec<(PathBuf, u32, u32)>,
+    pub(crate) file_owners: FileOwners,
     pub(crate) process_domain: Option<Domain>,
     pub(crate) executable_host: Option<PathBuf>,
 }
@@ -224,9 +249,40 @@ impl Config {
     /// Set the initial Linux-visible owner for one rootfs-relative path.
     #[must_use]
     pub fn owner(mut self, path: impl Into<PathBuf>, uid: u32, gid: u32) -> Self {
-        let path = path.into();
-        self.file_owners.retain(|(current, _, _)| current != &path);
-        self.file_owners.push((path, uid, gid));
+        self.file_owners.insert(path.into(), uid, gid);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owners_replace_component_equivalent_paths() {
+        let owners = Config::new()
+            .owner("var//lib/./data", 1, 2)
+            .owner(std::path::Path::new("var/lib/data"), 3, 4)
+            .file_owners;
+
+        assert_eq!(owners.entries.len(), 1);
+        assert_eq!(
+            owners.values().next(),
+            Some(&(PathBuf::from("var/lib/data"), 3, 4))
+        );
+    }
+
+    #[test]
+    fn owner_index_scales_without_scanning_existing_paths() {
+        let mut owners = FileOwners::default();
+        for index in 0..16_384 {
+            owners.insert(PathBuf::from(format!("usr/lib/item-{index}")), 1, 2);
+        }
+        for index in 0..16_384 {
+            owners.insert(PathBuf::from(format!("usr/lib/./item-{index}")), 3, 4);
+        }
+
+        assert_eq!(owners.entries.len(), 16_384);
+        assert!(owners.values().all(|(_, uid, gid)| (*uid, *gid) == (3, 4)));
     }
 }

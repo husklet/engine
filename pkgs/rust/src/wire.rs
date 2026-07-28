@@ -207,7 +207,7 @@ fn file_owners(config: &Config) -> Result<Option<OsString>, Error> {
     if config.file_owners.is_empty() {
         return Ok(None);
     }
-    let mut entries = config.file_owners.iter().collect::<Vec<_>>();
+    let mut entries = config.file_owners.values().collect::<Vec<_>>();
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     let mut output = Vec::new();
     for (index, (path, uid, gid)) in entries.into_iter().enumerate() {
