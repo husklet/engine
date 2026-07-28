@@ -37,8 +37,12 @@ host-wide freezes. Preserve them during engine refactors:
       Linux-compatible.
 - [ ] `fork`, `clone`, `exec`, descriptor inheritance, `CLOEXEC`, signals, and child cleanup remain correct
       under concurrent process creation.
+- [ ] Chromium's browser-renderer Mojo broker socket survives clone/exec descriptor remapping and remains
+      usable for shared-memory requests; a renderer must not observe `broker_posix` `EPIPE`.
 - [ ] Terminating an exec updates its observable state and reaps its descendants; a killed Chrome process
       never remains `Running` or leaves an unowned translated process tree.
+- [ ] Signal submission and process completion remain distinct: termination is complete only after wait
+      status is observable and descendants are reaped, not when the signal request returns.
 
 ## Scheduling and I/O
 
@@ -68,6 +72,8 @@ host-wide freezes. Preserve them during engine refactors:
 
 - [ ] Unix socket ancillary data preserves `SCM_RIGHTS` descriptors until the receiver owns or rejects them.
 - [ ] Socket readiness, peer shutdown, cancellation, and backpressure follow Linux semantics.
+- [ ] TCP bind/listen/accept and loopback routing let Chrome expose DevTools while Wayland and GPU processes
+      are active; a visible window alone is not launch-readiness evidence.
 - [ ] Projected sockets name existing host endpoints and remain valid for the launch lifetime.
 - [ ] Wayland requests, callbacks, object destruction, and descriptor transfers preserve protocol order.
 - [ ] Input focus, keyboard state, pointer coordinates, popups, output scale, and presentation feedback are
@@ -116,6 +122,10 @@ host-wide freezes. Preserve them during engine refactors:
 ## Acceptance evidence
 
 - [ ] Launch plain `google-chrome` in a clean workspace on every supported host and guest architecture.
+- [ ] Wait for and query the DevTools version endpoint, then complete a bounded `SystemInfo.getInfo` request;
+      neither request may hang after the browser window appears.
+- [ ] Inspect browser, renderer, GPU, and engine logs for the first causal event. Treat later provider
+      `EPIPE`, display disconnects, and teardown errors as downstream unless their timestamps prove otherwise.
 - [ ] Load several real sites, navigate, type, scroll, open popups and additional windows, download a file,
       and run sustained animation.
 - [ ] Confirm Chrome reports GPU compositing, rasterization, Canvas, WebGL, and supported WebGPU paths as
