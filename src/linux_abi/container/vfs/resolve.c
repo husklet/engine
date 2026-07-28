@@ -112,7 +112,8 @@ restart:;
     }
     if (root_fd < 0) return -1;
     if (volidx >= 0 && g_vols[volidx].isfile) {
-        if (g_vols[volidx].issymlink && !nofollow) {
+        int exact_volume = strcmp(gbuf, g_vols[volidx].guest) == 0;
+        if (g_vols[volidx].issymlink && (!nofollow || !exact_volume)) {
             char target[4096], next[8192], parent[8192];
             ssize_t length = readlinkat(root_fd, vol_fbase(volidx), target, sizeof target - 1);
             if (length < 0) return -errno;
@@ -127,11 +128,11 @@ restart:;
             } else {
                 vol_parent_guest(volidx, parent, sizeof parent);
                 char joined[8192];
-                if (path_concat(joined, sizeof joined, parent, target) != 0 ||
+                if (path_join(joined, sizeof joined, parent, target) != 0 ||
                     path_concat(next, sizeof next, joined, suffix) != 0)
                     return -ENAMETOOLONG;
             }
-            if (path_copy(gbuf, sizeof gbuf, next) != 0) return -ENAMETOOLONG;
+            confine(next, gbuf, sizeof gbuf);
             goto restart;
         }
         // File bind-mount (jail_match matched only the exact mount point): `root_fd` is the host file's

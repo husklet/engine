@@ -13,6 +13,19 @@ fn checked_bytes(value: &OsStr) -> Result<&[u8], Error> {
     }
 }
 
+fn volume_field(output: &mut Vec<u8>, value: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &byte in value {
+        if matches!(byte, b'%' | b':' | b',') {
+            output.push(b'%');
+            output.push(HEX[usize::from(byte >> 4)]);
+            output.push(HEX[usize::from(byte & 0x0f)]);
+        } else {
+            output.push(byte);
+        }
+    }
+}
+
 const MAGIC: u32 = 0x484c_4346;
 const ABI: u32 = 1;
 
@@ -234,47 +247,29 @@ fn volumes(config: &Config) -> Result<Option<OsString>, Error> {
     for mount in &config.mounts {
         let host = checked_bytes(mount.host.as_os_str())?;
         let guest = checked_bytes(mount.guest.as_os_str())?;
-        if host.contains(&b',')
-            || host.contains(&b':')
-            || guest.contains(&b',')
-            || guest.contains(&b':')
-        {
-            return Err(Error::InvalidConfig(
-                "mount paths must not contain ':' or ','",
-            ));
-        }
         if index != 0 {
             output.push(b',');
         }
         output.extend_from_slice(if mount.access == Access::ReadOnly {
-            b"ro:"
+            b"v2:ro:"
         } else {
-            b"rw:"
+            b"v2:rw:"
         });
-        output.extend_from_slice(guest);
+        volume_field(&mut output, guest);
         output.push(b':');
-        output.extend_from_slice(host);
+        volume_field(&mut output, host);
         index += 1;
     }
     for (host, guest) in &config.namespace_links {
         let host = checked_bytes(host.as_os_str())?;
         let guest = checked_bytes(guest.as_os_str())?;
-        if host.contains(&b',')
-            || host.contains(&b':')
-            || guest.contains(&b',')
-            || guest.contains(&b':')
-        {
-            return Err(Error::InvalidConfig(
-                "namespace link paths must not contain ':' or ','",
-            ));
-        }
         if index != 0 {
             output.push(b',');
         }
-        output.extend_from_slice(b"link:");
-        output.extend_from_slice(guest);
+        output.extend_from_slice(b"v2:link:");
+        volume_field(&mut output, guest);
         output.push(b':');
-        output.extend_from_slice(host);
+        volume_field(&mut output, host);
         index += 1;
     }
     Ok(Some(OsString::from_vec(output)))
@@ -638,6 +633,29 @@ mod tests {
             b"/lower/high\0/lower/low\0"
         );
         assert_eq!(word(&wire, RESERVED_OFFSET), 0);
+    }
+
+    #[test]
+    fn volume_records_escape_valid_unix_path_delimiters() {
+        let mut config = Config::new();
+        config.mounts.push(crate::Mount::read_only(
+            "/host/with,comma",
+            "/guest/with:colon",
+        ));
+        config.namespace_links.push((
+            "/projection/sys/dev/char/226:128".into(),
+            "/sys/dev/char/226:128".into(),
+        ));
+
+        let wire = encode(&config, &[OsString::from("/bin/true")], None).unwrap();
+
+        assert_eq!(
+            string(&wire, VOLUMES_OFFSET),
+            Some(
+                "v2:ro:/guest/with%3Acolon:/host/with%2Ccomma,\
+v2:link:/sys/dev/char/226%3A128:/projection/sys/dev/char/226%3A128"
+            )
+        );
     }
 
     #[test]

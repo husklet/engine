@@ -23,6 +23,7 @@
 // | __AUDIT_ARCH_64BIT | _LE = 0xC000003E.
 #define G_SECCOMP_ARCH 0xC000003Eu
 #define G_SECCOMP_NR(c) ((int)(uint32_t)(c)->r[0])
+#define G_SECCOMP_IP(c) ((c)->rip)
 
 // Engine seam: the shared jit/cache.c hashes the guest PC as (gpc >> G_GPC_HASH_SHIFT). x86 PCs are
 // byte-granular, so do not shift (>>0) -- matches the original frontend/x86_64/cache.c hash.

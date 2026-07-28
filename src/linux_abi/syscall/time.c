@@ -239,7 +239,7 @@ static void *gtimer_loop(void *arg) {
             // repeat expirations of the SAME timer folded into timer_getoverrun (which is derived from the
             // first_ns anchor above, independent of this queue).
             if (sigq_tag_queued(signo, id + 1)) continue;
-            if (sigq_push(signo, id + 1, HL_SI_TIMER, sv, 0, 0, 0))
+            if (sigq_push(signo, id + 1, 0, HL_SI_TIMER, sv, 0, 0, 0))
                 sfd_deliver(signo); // wake signalfd/epoll (per-OFD mask)
         }
     }

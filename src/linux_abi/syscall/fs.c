@@ -2590,9 +2590,32 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
     }
     case 49: {
         char pb[4200];
+        // Synthetic proc directories are materialized by their directory
+        // provider, not by the image overlay. Navigate through that provider's
+        // descriptor so stat/open/chdir observe one synthetic namespace.
+        if (g_rootfs) {
+            char raw[4200], guest[4200];
+            snprintf(raw, sizeof raw, "%s", (const char *)a0);
+            abs_guest(-100, raw, guest, sizeof guest);
+            if (synth_proc_fd_dir_is(guest)) {
+                int directory = synth_misc_dir_open(guest);
+                if (directory < 0 || fchdir(directory) != 0) {
+                    int error = directory < 0 ? ENOENT : errno;
+                    if (directory >= 0) close(directory);
+                    G_RET(c) = (uint64_t)(int64_t)(-error);
+                    break;
+                }
+                close(directory);
+                snprintf(g_cwd, sizeof g_cwd, "%s", guest);
+                G_RET(c) = 0;
+                break;
+            }
+        }
         // chdir (confined; tracks guest cwd)
         const char *p = atpath(-100, (const char *)a0, pb, sizeof pb, 0);
         if (chdir(p) < 0) {
+            fprintf(stderr, "[hl-engine] chdir guest=%s host=%s failed: %s\n",
+                    (const char *)a0, p ? p : "(null)", strerror(errno));
             G_RET(c) = (uint64_t)(-errno);
             break;
         }
@@ -2915,7 +2938,14 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
         // O_TMPFILE which carries O_RDWR) under an `-v …:ro` volume fails EROFS -- exactly as the kernel
         // rejects a write-open on a read-only mount. A pure O_RDONLY open still succeeds. Checked up front
         // so neither O_TMPFILE nor the memoized open-cache walk below can slip a write through.
-        if (((lf & 3) || (lf & 0x40) || (lf & 0x200) || (lf & 0x400)) && jail_ro_at((int)a0, (const char *)a1)) {
+        int write_intent = (lf & 3) || (lf & 0x40) || (lf & 0x200) || (lf & 0x400);
+        char projected_path[4200];
+        const hl_provider_node *projected_open_node = NULL;
+        if (write_intent) {
+            guest_abspath_at((int)a0, (const char *)a1, projected_path, sizeof projected_path);
+            projected_open_node = hl_provider_namespace_launch_resolve(projected_path, strlen(projected_path));
+        }
+        if (write_intent && projected_open_node == NULL && jail_ro_at((int)a0, (const char *)a1)) {
             G_RET(c) = (uint64_t)(int64_t)(-EROFS);
             break;
         }

@@ -1,6 +1,6 @@
 use crate::api::extension::ServiceId;
 use crate::protocol::TransportError;
-use crate::provider::{Interest, LinuxError, Readiness};
+use crate::provider::{Interest, IoctlWrite, LinuxError, Readiness};
 #[derive(Clone, Debug, Eq, PartialEq)]
 
 pub enum Request {
@@ -31,6 +31,11 @@ pub enum Request {
         handle: u64,
         interest: Interest,
     },
+    Ioctl {
+        handle: u64,
+        command: u64,
+        argument: Vec<u8>,
+    },
     Close {
         handle: u64,
     },
@@ -45,12 +50,19 @@ pub enum SeekWhence {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Reply {
-    Opened { handle: u64 },
+    Opened {
+        handle: u64,
+    },
     Bytes(Vec<u8>),
     Written(u32),
     Offset(u64),
     Stat(ServiceStat),
     Ready(Readiness),
+    Ioctl {
+        value: i64,
+        argument: Vec<u8>,
+        writes: Vec<IoctlWrite>,
+    },
     Closed,
 }
 
@@ -78,6 +90,7 @@ impl Request {
             | Self::Seek { handle, .. }
             | Self::Stat { handle }
             | Self::Poll { handle, .. }
+            | Self::Ioctl { handle, .. }
             | Self::Close { handle } => *handle,
             Self::Open { .. } => 0,
         }

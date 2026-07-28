@@ -1,8 +1,8 @@
 use crate::{
     extension::{
-        Credentials, HandleOperation, Handles, Interest, LinuxError, OpenAccess, OpenRequest,
-        ReadRequest, Readiness, SeekOrigin, SeekRequest, ServiceId, ServiceRegistration,
-        WriteRequest,
+        Credentials, HandleOperation, Handles, Interest, IoctlRequest, LinuxError, OpenAccess,
+        OpenRequest, ReadRequest, Readiness, SeekOrigin, SeekRequest, ServiceId,
+        ServiceRegistration, WriteRequest,
     },
     transport::{Channel, Frame, MessageType, TransportError},
 };
@@ -262,6 +262,11 @@ mod tests {
                         .into_iter()
                         .collect(),
                 }),
+                Request::Ioctl { argument, .. } => Reply::Ioctl {
+                    value: 0,
+                    argument,
+                    writes: Vec::new(),
+                },
                 Request::Close { .. } => {
                     self.closes.fetch_add(1, Ordering::Relaxed);
                     Reply::Closed

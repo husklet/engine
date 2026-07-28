@@ -874,9 +874,9 @@ const _Atomic(hl_logical_vma_snapshot *) *hl_logical_vma_global_snapshot_source(
     return &g_logical_vmas.current;
 }
 
-void hl_logical_vma_visit_exec_aliases(uint64_t guest_first, uint64_t guest_last, hl_logical_vma_alias_visitor visitor,
-                                       void *opaque) {
-    if (visitor == NULL || guest_last <= guest_first) return;
+int hl_logical_vma_visit_exec_aliases(uint64_t guest_first, uint64_t guest_last, hl_logical_vma_alias_visitor visitor,
+                                      void *opaque) {
+    if (visitor == NULL || guest_last <= guest_first) return 0;
 
     struct alias_range {
         uint64_t first, last;
@@ -884,6 +884,7 @@ void hl_logical_vma_visit_exec_aliases(uint64_t guest_first, uint64_t guest_last
     struct alias_range *ranges = NULL;
     size_t count = 0, capacity = 0;
     int overflow = 0;
+    int matched = 0;
     (void)pthread_once(&g_logical_vmas_once, global_init);
     pthread_mutex_lock(&g_logical_vmas.lock);
     for (size_t source = 0; source < g_logical_vmas.count; ++source) {
@@ -891,6 +892,7 @@ void hl_logical_vma_visit_exec_aliases(uint64_t guest_first, uint64_t guest_last
         uint64_t first = guest_first > sv->guest_first ? guest_first : sv->guest_first;
         uint64_t last = guest_last < sv->guest_last ? guest_last : sv->guest_last;
         if (last <= first) continue;
+        matched = 1;
         uint64_t source_offset = sv->backing_offset + (first - sv->guest_first);
         uint64_t source_last = source_offset + (last - first);
         for (size_t alias = 0; alias < g_logical_vmas.count; ++alias) {
@@ -927,6 +929,7 @@ void hl_logical_vma_visit_exec_aliases(uint64_t guest_first, uint64_t guest_last
         for (size_t index = 0; index < count; ++index)
             visitor(ranges[index].first, ranges[index].last, opaque);
     free(ranges);
+    return matched;
 }
 
 int hl_logical_vma_has_exec_alias_file(uint64_t device, uint64_t inode, uint64_t file_offset, size_t length) {

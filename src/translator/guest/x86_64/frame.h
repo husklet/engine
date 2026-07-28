@@ -12,6 +12,7 @@ typedef struct hl_x86_signal_state {
     uint64_t handler;
     uint64_t flags;
     uint64_t mask;
+    int *error;
     int *code;
     uint64_t *value;
     uint64_t *address;

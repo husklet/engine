@@ -11,14 +11,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 static int fd_count(void) {
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return -1;
     DIR *d = opendir("/proc/self/fd");
     if (!d) return -1;
     int c = 0;
-    for (struct dirent *e; (e = readdir(d));)
-        if (e->d_name[0] != '.') c++;
+    for (struct dirent *e; (e = readdir(d));) {
+        if (e->d_name[0] == '.') continue;
+        char *end = NULL;
+        unsigned long descriptor = strtoul(e->d_name, &end, 10);
+        if (!end || *end || descriptor >= limit.rlim_cur) {
+            closedir(d);
+            return -1;
+        }
+        c++;
+    }
     closedir(d);
     return c;
 }

@@ -679,6 +679,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         int bus_prepared = 0;
         int mapping_prepared = 0;
         hl_logical_vma_plan *logical_plan = NULL;
+        int logical_committed = 0;
         int logical_prepare_failed = 0;
         int logical_prepare_errno = 0;
         int soft_activated_here = 0;
@@ -878,9 +879,10 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (r != MAP_FAILED) gbus_clear((uint64_t)(uintptr_t)r, (uint64_t)(uintptr_t)r + a1 + guard);
         }
         if (logical_plan != NULL) {
-            if (r != MAP_FAILED && off_emul == 2)
+            if (r != MAP_FAILED && off_emul == 2) {
                 hl_logical_vma_commit_shared(logical_plan);
-            else
+                logical_committed = 1;
+            } else
                 hl_logical_vma_abort_shared(logical_plan);
         }
         // refund
@@ -898,7 +900,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 hl_gmap_add((uint64_t)r, (uint64_t)a1 + guard);  // track for execve() teardown
             hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a1); // /proc maps report the guest length (sans guard)
             if (!(a3 & 0x20) && (int)a4 >= 0)
-                filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0, off_emul == 2);
+                filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0,
+                                 off_emul == 2 && !logical_committed);
             // Shared-futex key (thread.c): a file-backed MAP_SHARED region (memfd/shm, mapped independently
             // by each peer at its own VA) must key its futex words by the shared object identity, not the VA,
             // so a cross-process/cross-mapping FUTEX_WAKE reaches a FUTEX_WAIT (Wall 7). Record its VA range
@@ -906,7 +909,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // fd/inode and, when shared, is only ever fork-inherited at a COMMON VA (the VA key already works
             // there), so it is excluded. off_emul (a private-anon offset-fixup copy) is not the real shared
             // object -- skip it. Inert for every private mapping (the fast-path gate stays 0).
-            if ((a3 & 0x01) && !(a3 & 0x20) && !off_emul && (int)a4 >= 0)
+            if ((a3 & 0x01) && !(a3 & 0x20) && (!off_emul || logical_committed) && (int)a4 >= 0)
                 futex_shared_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5);
             // x86-TSO ordering must hold for ANY observer, and a MAP_SHARED region (file-backed OR anon --
             // shared anon is fork-inherited) can be read by a peer PROCESS. The translator elides guest

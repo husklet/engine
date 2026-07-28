@@ -52,6 +52,7 @@ void hl_aarch64_signal_build(struct cpu *c, int sig, const hl_aarch64_signal_sta
     memset(f, 0, 4688);
     // siginfo.si_signo
     *(int *)(f + 0) = sig;
+    *(int *)(f + 4) = *state->error;         // si_errno (seccomp trap data; otherwise zero)
     *(int *)(f + 8) = *state->code;          // si_code (SI_QUEUE for sigqueue, else 0)
     *(uint64_t *)(f + 16) = *state->address; // si_addr (synchronous fault address; 0 for async)
     *(uint64_t *)(f + 24) = *state->value;   // si_value (sigqueue's sival_int/ptr)
@@ -61,6 +62,7 @@ void hl_aarch64_signal_build(struct cpu *c, int sig, const hl_aarch64_signal_sta
         *(int *)(f + 16) = *state->pid;
         *(int *)(f + 20) = *state->uid;
     }
+    *state->error = 0;
     *state->code = 0;
     *state->value = 0;
     *state->address = 0;

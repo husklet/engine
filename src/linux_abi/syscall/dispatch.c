@@ -541,6 +541,11 @@ static void cpu_range_str(char *buf, size_t n) {
 static char g_exe_path_store[4200];
 
 static int proc_self_exe(const char *p, char *tgt, size_t cap) {
+    // A chroot changes which mount points are reachable. The engine's synthetic /proc belongs to the
+    // launch root and must not leak into a new root merely because the guest spells an absolute /proc
+    // path. In particular, Chromium's setuid sandbox chroots into an empty directory and verifies that
+    // /proc/self/exe can no longer be opened before treating the filesystem sandbox as sealed.
+    if (g_chroot[0]) return 0;
     if (!p || strncmp(p, "/proc/", 6)) return 0;
     const char *rest = p + 6;
     if (!strncmp(rest, "self/", 5)) {
