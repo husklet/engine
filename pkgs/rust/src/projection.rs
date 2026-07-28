@@ -145,10 +145,7 @@ impl Projection {
     fn host_path(&self, guest: &Path) -> Result<PathBuf, SpecError> {
         let bytes = guest_path::bytes(guest);
         if !guest_path::is_absolute(bytes) {
-            return Err(Self::unsupported(
-                guest,
-                "projected paths must be absolute",
-            ));
+            return Err(Self::unsupported(guest, "projected paths must be absolute"));
         }
         let mut host = self.root.clone();
         for segment in guest_path::host_segments(bytes) {

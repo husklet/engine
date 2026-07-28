@@ -11,7 +11,6 @@ HL_EXTERN_C_BEGIN
  * provider ends at unwire_range; callbacks appended after a provider's own version are absent
  * rather than NULL, so validation checks the prefix that version is required to carry and only
  * demands an appended callback from a provider that declares the version which added it. */
-#define HL_HOST_MEMORY_ABI_MIN 6u
 #define HL_HOST_FILE_MAPPING_ABI 1u
 #define HL_HOST_MEMORY_MAPPING_ABI 1u
 #define HL_HOST_CLOCK_ABI 4u
@@ -23,14 +22,12 @@ HL_EXTERN_C_BEGIN
 /* Oldest network group still accepted. An ABI 1 provider ends at close; the fourteen operations
  * appended in ABI 2 are absent rather than NULL, so validation checks the ABI 1 prefix and only
  * demands the appended callbacks from an ABI 2 provider. */
-#define HL_HOST_NETWORK_ABI_MIN 1u
 #define HL_HOST_SHARED_MEMORY_ABI 1u
 #define HL_HOST_COUNTER_ABI 2u
 #define HL_HOST_SYNC_ABI 3u
 /* Oldest sync group still accepted. An ABI 2 provider ends at fork_child; the parking operations
  * appended in ABI 3 are absent rather than NULL, so validation checks the ABI 2 prefix and only
  * demands the appended callbacks from an ABI 3 provider. */
-#define HL_HOST_SYNC_ABI_MIN 2u
 #define HL_HOST_TERMINAL_ABI 1u
 #define HL_HOST_TRANSFER_ABI 2u
 #define HL_HOST_DIRECTORY_ABI 1u

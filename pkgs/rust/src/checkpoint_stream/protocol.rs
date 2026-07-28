@@ -113,10 +113,7 @@ impl Reply {
         }
     }
 
-    pub(super) fn write(
-        &self,
-        channel: &mut std::os::unix::net::UnixStream,
-    ) -> std::io::Result<()> {
+    pub(super) fn write(&self, channel: &mut crate::sys::Stream) -> std::io::Result<()> {
         let mut header = [0_u8; REPLY_BYTES];
         header[0..4].copy_from_slice(&MAGIC_REPLY.to_ne_bytes());
         header[4..8].copy_from_slice(&ABI.to_ne_bytes());

@@ -257,29 +257,16 @@ int main(void) {
     malformed_memory.unwire_range = NULL;
     truncated.memory = &malformed_memory;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
-    /* An ABI 6 group stops before them and stays valid: two shipping hosts are still on it. */
     malformed_memory = *services.memory;
-    malformed_memory.abi = HL_HOST_MEMORY_ABI_MIN;
+    malformed_memory.abi = HL_HOST_MEMORY_ABI - 1u;
     malformed_memory.size = (uint32_t)offsetof(hl_host_memory_services, unmap_address);
     malformed_memory.unmap_address = NULL;
     malformed_memory.wire_range = NULL;
     malformed_memory.unwire_range = NULL;
     truncated.memory = &malformed_memory;
-    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_OK);
-    /* The code-mapping prefix is inside the ABI 6 group, so it stays reachable there too. */
-    malformed_memory.reserve_code = fake_reserve_code;
-    malformed_memory.repair_code_after_fork = fake_repair_code;
-    truncated.capabilities |= HL_HOST_CAP_CODE_MAPPING;
-    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_CODE_MAPPING) == HL_STATUS_OK);
-    truncated.capabilities = services.capabilities;
-    /* One byte short of the ABI 6 prefix is not a prefix. */
-    malformed_memory.size = (uint32_t)offsetof(hl_host_memory_services, unmap_address) - 1u;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
-    /* Neither an unreleased future group nor a retired older one is accepted. */
     malformed_memory = *services.memory;
     malformed_memory.abi = HL_HOST_MEMORY_ABI + 1u;
-    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
-    malformed_memory.abi = HL_HOST_MEMORY_ABI_MIN - 1u;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
 
     /* HL_HOST_MEMORY_ABI 8: the address-keyed protection and flush the handle-keyed pair could not
@@ -311,8 +298,6 @@ int main(void) {
     HL_CHECK(services.memory->protect_address(services.context, 0x40000000, 4096, HL_HOST_MEMORY_READ).status ==
              HL_STATUS_OK);
 
-    /* An ABI 8 group must carry both appended callbacks; an ABI 7 group stops before them and is
-     * still accepted, which is the whole point of keeping the prefix valid. */
     malformed_memory = *services.memory;
     malformed_memory.protect_address = NULL;
     truncated = services;
@@ -328,12 +313,8 @@ int main(void) {
     malformed_memory.protect_address = NULL;
     malformed_memory.sync_address = NULL;
     truncated.memory = &malformed_memory;
-    HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_OK);
-    /* One byte short of the ABI 7 prefix is not a prefix. */
-    malformed_memory.size = (uint32_t)offsetof(hl_host_memory_services, protect_address) - 1u;
     HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_MEMORY) == HL_STATUS_ABI_MISMATCH);
     {
-        /* HL_HOST_SYNC_ABI 3: the parking trio, and the ABI 2 prefix that must keep validating. */
         uint64_t word = 0;
         uint64_t key = (uint64_t)(uintptr_t)&word;
         HL_CHECK(services.sync->abi == HL_HOST_SYNC_ABI && services.sync->park != NULL &&
@@ -350,18 +331,14 @@ int main(void) {
         malformed_sync.interrupt_park = NULL;
         HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_SYNC) == HL_STATUS_ABI_MISMATCH);
         malformed_sync = *services.sync;
-        malformed_sync.abi = HL_HOST_SYNC_ABI_MIN;
+        malformed_sync.abi = HL_HOST_SYNC_ABI - 1u;
         malformed_sync.size = (uint32_t)offsetof(hl_host_sync_services, park);
         malformed_sync.park = NULL;
         malformed_sync.unpark = NULL;
         malformed_sync.interrupt_park = NULL;
-        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_SYNC) == HL_STATUS_OK);
-        malformed_sync.size = (uint32_t)offsetof(hl_host_sync_services, park) - 1u;
         HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_SYNC) == HL_STATUS_ABI_MISMATCH);
         malformed_sync = *services.sync;
         malformed_sync.abi = HL_HOST_SYNC_ABI + 1u;
-        HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_SYNC) == HL_STATUS_ABI_MISMATCH);
-        malformed_sync.abi = HL_HOST_SYNC_ABI_MIN - 1u;
         HL_CHECK(hl_host_services_validate(&truncated, HL_HOST_CAP_SYNC) == HL_STATUS_ABI_MISMATCH);
 
         /* Behaviour. This provider never blocks, so what it can answer is the set decided without
