@@ -81,7 +81,7 @@ impl Machine {
         channel.trigger.bump();
         let mut kicked = self.kick_participants();
         if kicked.is_empty() {
-            return Err(checkpoint_context(
+            return Err(Self::checkpoint_context(
                 "no engine process could be interrupted to start a checkpoint",
             ));
         }
@@ -92,16 +92,18 @@ impl Machine {
                 return Ok(());
             }
             if let Some(failure) = channel.server.failure() {
-                return Err(checkpoint_context(failure));
+                return Err(Self::checkpoint_context(failure));
             }
             let progress = channel.server.progress();
             if self.child.completed() {
-                return Err(checkpoint_context(format!(
+                return Err(Self::checkpoint_context(format!(
                     "engine exited without committing a complete checkpoint image ({progress})"
                 )));
             }
             if Instant::now() >= deadline {
-                return Err(checkpoint_context(capture_stall(&progress, &kicked)));
+                return Err(Self::checkpoint_context(Self::capture_stall(
+                    &progress, &kicked,
+                )));
             }
             if Instant::now() >= next_kick {
                 // Re-kick: a process that entered a blocking host syscall after the first interrupt (or
@@ -344,43 +346,41 @@ impl Machine {
     pub fn wait(self) -> Result<Exit, Error> {
         self.child.wait()
     }
+
+    fn capture_stall(progress: &crate::checkpoint_stream::Progress, kicked: &[u64]) -> String {
+        if !progress.aborted.is_empty() {
+            return format!(
+                "checkpoint abandoned: {} was aborted by the engine -- {progress}",
+                progress.aborted.join(", ")
+            );
+        }
+        if !progress.incomplete.is_empty() {
+            return format!(
+                "checkpoint deadline expired: {} entered capture but never committed -- {progress}",
+                progress.incomplete.join(", ")
+            );
+        }
+        if progress.any_image_started() {
+            return format!(
+                "checkpoint deadline expired before the image was committed -- {progress}"
+            );
+        }
+        format!(
+            "checkpoint deadline expired before any process entered capture after {} interrupt(s) to host pid(s) {kicked:?} -- {progress}",
+            kicked.len()
+        )
+    }
+
+    fn checkpoint_context(context: impl Into<String>) -> ControlError {
+        ControlError {
+            category: crate::ControlErrorCategory::Host,
+            operation: "checkpoint",
+            context: context.into(),
+        }
+    }
 }
 
-/// How often a capture in flight re-interrupts its participants.
 const KICK_INTERVAL: Duration = Duration::from_millis(250);
-
-/// Explains a capture that ran out of time, naming what was outstanding rather than only the deadline.
-fn capture_stall(progress: &crate::checkpoint_stream::Progress, kicked: &[u64]) -> String {
-    if !progress.aborted.is_empty() {
-        return format!(
-            "checkpoint abandoned: {} was aborted by the engine (an unsupported resource is refused during \
-             capture; the engine's [ckpt] log names it) -- {progress}",
-            progress.aborted.join(", ")
-        );
-    }
-    if !progress.incomplete.is_empty() {
-        return format!(
-            "checkpoint deadline expired: {} entered capture but never committed -- {progress}",
-            progress.incomplete.join(", ")
-        );
-    }
-    if progress.any_image_started() {
-        return format!("checkpoint deadline expired before the image was committed -- {progress}");
-    }
-    format!(
-        "checkpoint deadline expired before any process entered capture: no engine process opened a process \
-         image after {} interrupt(s) to host pid(s) {kicked:?} -- {progress}",
-        kicked.len()
-    )
-}
-
-fn checkpoint_context(context: impl Into<String>) -> ControlError {
-    ControlError {
-        category: crate::ControlErrorCategory::Host,
-        operation: "checkpoint",
-        context: context.into(),
-    }
-}
 
 #[cfg(target_os = "linux")]
 const fn stop_signal() -> i32 {

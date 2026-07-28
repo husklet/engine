@@ -94,7 +94,7 @@ impl Projection {
     fn create(&self, entry: &NamespaceEntry) -> Result<(), SpecError> {
         let host = self.host_path(entry.path())?;
         if let Some(parent) = host.parent() {
-            fs::create_dir_all(parent).map_err(projection_io)?;
+            fs::create_dir_all(parent).map_err(Self::io_error)?;
         }
         match entry {
             NamespaceEntry::Directory(value) => {
@@ -106,29 +106,29 @@ impl Projection {
                             Err(error)
                         }
                     })
-                    .map_err(projection_io)?;
+                    .map_err(Self::io_error)?;
                 fs::set_permissions(&host, fs::Permissions::from_mode(value.metadata.mode))
-                    .map_err(projection_io)?;
+                    .map_err(Self::io_error)?;
             }
             NamespaceEntry::File(value) => {
                 let (FileSource::Immutable(bytes) | FileSource::Mutable(bytes)) = &value.source
                 else {
-                    return Err(unsupported(
+                    return Err(Self::unsupported(
                         entry.path(),
                         "only immutable projected files are implemented",
                     ));
                 };
-                let mut file = fs::File::create(&host).map_err(projection_io)?;
-                file.write_all(bytes).map_err(projection_io)?;
-                file.sync_all().map_err(projection_io)?;
+                let mut file = fs::File::create(&host).map_err(Self::io_error)?;
+                file.write_all(bytes).map_err(Self::io_error)?;
+                file.sync_all().map_err(Self::io_error)?;
                 fs::set_permissions(&host, fs::Permissions::from_mode(value.metadata.mode))
-                    .map_err(projection_io)?;
+                    .map_err(Self::io_error)?;
             }
             NamespaceEntry::Symlink(value) => {
-                symlink(&value.target, &host).map_err(projection_io)?;
+                symlink(&value.target, &host).map_err(Self::io_error)?;
             }
             _ => {
-                return Err(unsupported(
+                return Err(Self::unsupported(
                     entry.path(),
                     "projected node kind has no runtime implementation",
                 ))
@@ -141,7 +141,27 @@ impl Projection {
         guest
             .strip_prefix("/")
             .map(|path| self.root.join(path))
-            .map_err(|_| unsupported(guest, "projected paths must be absolute"))
+            .map_err(|_| Self::unsupported(guest, "projected paths must be absolute"))
+    }
+
+    fn io_error(error: std::io::Error) -> SpecError {
+        let message = error.to_string();
+        drop(error);
+        SpecError {
+            category: SpecErrorCategory::Invalid,
+            field: "extensions.namespace".into(),
+            resource: None,
+            context: format!("cannot materialize namespace projection: {message}"),
+        }
+    }
+
+    fn unsupported(path: &Path, context: &str) -> SpecError {
+        SpecError {
+            category: SpecErrorCategory::Unsupported,
+            field: "extensions.namespace".into(),
+            resource: Some(crate::spec::SpecResource::Path(path.to_owned())),
+            context: context.into(),
+        }
     }
 }
 
@@ -161,33 +181,13 @@ fn create_root() -> Result<PathBuf, SpecError> {
         match fs::create_dir(&path) {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(projection_io(error)),
+            Err(error) => return Err(Projection::io_error(error)),
         }
     }
-    Err(unsupported(
+    Err(Projection::unsupported(
         Path::new("/"),
         "could not allocate projection backing storage",
     ))
-}
-
-fn projection_io(error: std::io::Error) -> SpecError {
-    let message = error.to_string();
-    drop(error);
-    SpecError {
-        category: SpecErrorCategory::Invalid,
-        field: "extensions.namespace".into(),
-        resource: None,
-        context: format!("cannot materialize namespace projection: {message}"),
-    }
-}
-
-fn unsupported(path: &Path, context: &str) -> SpecError {
-    SpecError {
-        category: SpecErrorCategory::Unsupported,
-        field: "extensions.namespace".into(),
-        resource: Some(crate::spec::SpecResource::Path(path.to_owned())),
-        context: context.into(),
-    }
 }
 
 #[cfg(test)]
