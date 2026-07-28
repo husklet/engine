@@ -40,6 +40,10 @@ use std::{
     },
 };
 
+mod digest;
+
+use digest::CheckpointDigest;
+
 const ABI: u32 = 1;
 const MAGIC_REQUEST: u32 = 0x484b_4351;
 const MAGIC_REPLY: u32 = 0x484b_4353;
@@ -71,33 +75,33 @@ const OP_SOURCE_LIST: u32 = 16;
 const OP_SOURCE_SIZE: u32 = 17;
 const OP_SOURCE_READ: u32 = 18;
 
-/// Protocol operation names, for the capture-progress diagnostics.
-const fn op_name(op: u32) -> &'static str {
-    match op {
-        OP_OBJECT_BEGIN => "OBJECT_BEGIN",
-        OP_OBJECT_WRITE => "OBJECT_WRITE",
-        OP_OBJECT_WRITE_AT => "OBJECT_WRITE_AT",
-        OP_OBJECT_TELL => "OBJECT_TELL",
-        OP_OBJECT_FINISH => "OBJECT_FINISH",
-        OP_OBJECT_ABORT => "OBJECT_ABORT",
-        OP_GROUP_BEGIN => "GROUP_BEGIN",
-        OP_GROUP_COMMIT => "GROUP_COMMIT",
-        OP_GROUP_ABORT => "GROUP_ABORT",
-        OP_CLAIM => "CLAIM",
-        OP_UNCLAIM => "UNCLAIM",
-        OP_COMMIT => "COMMIT",
-        OP_GROUP_PRESENT => "GROUP_PRESENT",
-        OP_GROUP_COUNT => "GROUP_COUNT",
-        OP_DIGEST => "DIGEST",
-        OP_SOURCE_LIST => "SOURCE_LIST",
-        OP_SOURCE_SIZE => "SOURCE_SIZE",
-        OP_SOURCE_READ => "SOURCE_READ",
-        _ => "UNKNOWN",
+struct Operation;
+
+impl Operation {
+    const fn name(op: u32) -> &'static str {
+        match op {
+            OP_OBJECT_BEGIN => "OBJECT_BEGIN",
+            OP_OBJECT_WRITE => "OBJECT_WRITE",
+            OP_OBJECT_WRITE_AT => "OBJECT_WRITE_AT",
+            OP_OBJECT_TELL => "OBJECT_TELL",
+            OP_OBJECT_FINISH => "OBJECT_FINISH",
+            OP_OBJECT_ABORT => "OBJECT_ABORT",
+            OP_GROUP_BEGIN => "GROUP_BEGIN",
+            OP_GROUP_COMMIT => "GROUP_COMMIT",
+            OP_GROUP_ABORT => "GROUP_ABORT",
+            OP_CLAIM => "CLAIM",
+            OP_UNCLAIM => "UNCLAIM",
+            OP_COMMIT => "COMMIT",
+            OP_GROUP_PRESENT => "GROUP_PRESENT",
+            OP_GROUP_COUNT => "GROUP_COUNT",
+            OP_DIGEST => "DIGEST",
+            OP_SOURCE_LIST => "SOURCE_LIST",
+            OP_SOURCE_SIZE => "SOURCE_SIZE",
+            OP_SOURCE_READ => "SOURCE_READ",
+            _ => "UNKNOWN",
+        }
     }
 }
-
-const HASH_BASIS: u64 = 14_695_981_039_346_656_037;
-const HASH_PRIME: u64 = 1_099_511_628_211;
 
 /// Why a store operation failed. The engine only distinguishes "worked" from "did not".
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -238,46 +242,6 @@ impl CheckpointStore for MemoryStore {
             .collect())
     }
 }
-
-// ---------------------------------------------------------------------------------------- digest
-
-fn hash_bytes(mut hash: u64, data: &[u8]) -> u64 {
-    for byte in data {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(HASH_PRIME);
-    }
-    hash
-}
-
-/// The per-object hash: name, then length, then contents. Identical to `ckpt_hash_object` in the engine.
-fn object_hash(name: &str, data: &[u8]) -> u64 {
-    let mut hash = hash_bytes(HASH_BASIS, name.as_bytes());
-    hash = hash_bytes(hash, &[0]);
-    hash = hash_bytes(hash, &(data.len() as u64).to_ne_bytes());
-    hash_bytes(hash, data)
-}
-
-/// The image hash: the per-object hashes folded in ascending name order. Identical to the engine's
-/// `ckpt_hash_combine` loop, and computable without ever re-reading a stored object.
-fn image_digest(objects: &BTreeMap<String, (u64, u64)>) -> (u64, u64, u64) {
-    let mut hash = HASH_BASIS;
-    let mut bytes = 0_u64;
-    for (name, (object, size)) in objects {
-        hash = hash_bytes(hash, name.as_bytes());
-        hash = hash_bytes(hash, &[0]);
-        hash = hash_bytes(hash, &object.to_ne_bytes());
-        bytes += *size;
-    }
-    (hash, objects.len() as u64, bytes)
-}
-
-/// Objects the digest never covers: the manifest authenticates the rest and cannot cover itself, and the
-/// restore-side recovery journal is written after the image is already complete.
-fn digested(name: &str) -> bool {
-    name != "MANIFEST" && name != "RECOVERY.jsonl" && !name.starts_with(".RECOVERY.jsonl.tmp.")
-}
-
-// ---------------------------------------------------------------------------------------- server
 
 #[derive(Debug)]
 struct Object {
@@ -467,12 +431,12 @@ impl SinkServer {
     /// Hands one finished object to the embedder and folds it into the digest.
     fn publish(&self, object: &Object) -> Result<(), StoreError> {
         self.store.put(&object.name, &object.bytes)?;
-        if digested(&object.name) {
+        if CheckpointDigest::includes(&object.name) {
             if let Ok(mut state) = self.state.lock() {
                 state.digest.insert(
                     object.name.clone(),
                     (
-                        object_hash(&object.name, &object.bytes),
+                        CheckpointDigest::object(&object.name, &object.bytes),
                         object.bytes.len() as u64,
                     ),
                 );
@@ -487,16 +451,16 @@ impl SinkServer {
     fn stored_digest(&self) -> Result<(u64, u64, u64), StoreError> {
         let mut objects = BTreeMap::new();
         for name in self.store.list()? {
-            if !digested(&name) {
+            if !CheckpointDigest::includes(&name) {
                 continue;
             }
             let bytes = self.store.get(&name)?;
             objects.insert(
                 name.clone(),
-                (object_hash(&name, &bytes), bytes.len() as u64),
+                (CheckpointDigest::object(&name, &bytes), bytes.len() as u64),
             );
         }
-        Ok(image_digest(&objects))
+        Ok(CheckpointDigest::image(&objects))
     }
 
     /// Serves one engine process until it closes its channel.
@@ -541,7 +505,7 @@ impl SinkServer {
                 OP_GROUP_BEGIN | OP_GROUP_COMMIT | OP_GROUP_ABORT
             )
             .then_some(name);
-            Self::observe(&mut state, id, op_name(request.op), group);
+            Self::observe(&mut state, id, Operation::name(request.op), group);
         }
         match request.op {
             OP_OBJECT_BEGIN => {
@@ -699,7 +663,7 @@ impl SinkServer {
                     if state.digest.is_empty() {
                         None
                     } else {
-                        Some(image_digest(&state.digest))
+                        Some(CheckpointDigest::image(&state.digest))
                     }
                 };
                 let digest = match digest {
@@ -895,20 +859,23 @@ impl Reply {
 
 #[cfg(test)]
 mod tests {
-    use super::{image_digest, object_hash, CheckpointStore, MemoryStore};
+    use super::{CheckpointDigest, CheckpointStore, MemoryStore};
     use std::collections::BTreeMap;
 
     #[test]
     fn the_image_digest_is_order_independent_in_its_input() {
         let mut forward = BTreeMap::new();
-        forward.insert("a".to_owned(), (object_hash("a", b"one"), 3));
-        forward.insert("b".to_owned(), (object_hash("b", b"two"), 3));
+        forward.insert("a".to_owned(), (CheckpointDigest::object("a", b"one"), 3));
+        forward.insert("b".to_owned(), (CheckpointDigest::object("b", b"two"), 3));
         let mut backward = BTreeMap::new();
-        backward.insert("b".to_owned(), (object_hash("b", b"two"), 3));
-        backward.insert("a".to_owned(), (object_hash("a", b"one"), 3));
-        assert_eq!(image_digest(&forward), image_digest(&backward));
-        assert_eq!(image_digest(&forward).1, 2);
-        assert_eq!(image_digest(&forward).2, 6);
+        backward.insert("b".to_owned(), (CheckpointDigest::object("b", b"two"), 3));
+        backward.insert("a".to_owned(), (CheckpointDigest::object("a", b"one"), 3));
+        assert_eq!(
+            CheckpointDigest::image(&forward),
+            CheckpointDigest::image(&backward)
+        );
+        assert_eq!(CheckpointDigest::image(&forward).1, 2);
+        assert_eq!(CheckpointDigest::image(&forward).2, 6);
     }
 
     #[test]
