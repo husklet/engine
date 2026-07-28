@@ -16,8 +16,7 @@ hl_status hl_fatal_report(hl_fatal_context *context, hl_status status, uint32_t 
         return (hl_status)expected;
     host = context->host;
 #if defined(HL_ENABLE_LOGGING) && HL_ENABLE_LOGGING
-    if (host != NULL &&
-        host->size >= offsetof(hl_host_services, log) + sizeof(const hl_host_log_services *) &&
+    if (host != NULL && host->size >= offsetof(hl_host_services, log) + sizeof(const hl_host_log_services *) &&
         (host->capabilities & HL_HOST_CAP_LOG) != 0 && host->log != NULL && host->log->abi == HL_HOST_LOG_ABI &&
         host->log->size >= sizeof(*host->log) && host->log->emit != NULL && message != NULL)
         host->log->emit(host->context, tag, message, message_size);
