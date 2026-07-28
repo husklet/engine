@@ -59,7 +59,7 @@ static hl_host_result failure(int error) {
                        : error == EMFILE                   ? HL_STATUS_RESOURCE_LIMIT
                        : error == ECONNRESET               ? HL_STATUS_DISCONNECTED
                                                            : HL_STATUS_IO;
-    return (hl_host_result){.status = status, .detail = (uint64_t)(unsigned)error};
+    return (hl_host_result){.status = (int32_t)status, .detail = (uint64_t)(unsigned)error};
 }
 
 static hl_host_result request(const unsigned char *payload, uint32_t size, hl_provider_reply *reply) {
@@ -165,7 +165,7 @@ static hl_host_result provider_read_at(void *context, hl_host_handle file, uint6
     hl_provider_reply reply;
     hl_host_result result;
     uint64_t id;
-    uint32_t size;
+    uint32_t size = 0;
     if (!hl_provider_handle_is(file)) return underlying->read_at(underlying_context, file, offset, output);
     (void)context;
     if (output.size > UINT32_MAX || remote(file, &id) != 0) return failure(EINVAL);

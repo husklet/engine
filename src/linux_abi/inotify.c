@@ -257,8 +257,9 @@ static hl_status inotify_clone(void *opaque, void **out_context) {
     copy->nonblocking = source->nonblocking;
     copy->mutation_epoch = 0;
     if (source->watch_capacity != 0) {
-        copy->watches = calloc(source->watch_capacity, sizeof(*copy->watches));
-        if (copy->watches == NULL) goto no_memory_locked;
+        inotify_watch *watches = calloc(source->watch_capacity, sizeof(*watches));
+        if (watches == NULL) goto no_memory_locked;
+        copy->watches = watches;
         copy->watch_capacity = source->watch_capacity;
         for (index = 0; index < source->watch_count; ++index) {
             copy->watches[index] = source->watches[index];
@@ -279,8 +280,10 @@ static hl_status inotify_clone(void *opaque, void **out_context) {
     return HL_STATUS_OK;
 no_memory_locked:
     pthread_mutex_unlock(&source->snapshot_lock);
-    for (index = 0; index < copy->watch_count; ++index)
-        free(copy->watches[index].path);
+    if (copy->watches != NULL) {
+        for (index = 0; index < copy->watch_count && index < copy->watch_capacity; ++index)
+            free(copy->watches[index].path);
+    }
     free(copy->watches);
     (void)copy->provider->close(copy->provider_context);
     pthread_mutex_destroy(&copy->snapshot_lock);
@@ -601,11 +604,12 @@ int64_t hl_linux_inotify_import_at(hl_linux_abi *linux_abi, hl_linux_fd requeste
     object->next_wd = header.next_wd;
     object->nonblocking = (status_flags & HL_LINUX_O_NONBLOCK) != 0;
     if (header.watch_count != 0) {
-        object->watches = calloc(header.watch_count, sizeof(*object->watches));
-        if (object->watches == NULL) {
+        inotify_watch *watches = calloc(header.watch_count, sizeof(*watches));
+        if (watches == NULL) {
             status = HL_STATUS_OUT_OF_MEMORY;
             goto fail_object;
         }
+        object->watches = watches;
         object->watch_capacity = header.watch_count;
     }
     for (index = 0; index < header.watch_count; ++index) {
@@ -671,9 +675,11 @@ int64_t hl_linux_inotify_import_at(hl_linux_abi *linux_abi, hl_linux_fd requeste
     return (int64_t)requested;
 fail_object:
     if (object != NULL) {
-        for (index = 0; index < object->watch_count; ++index) {
-            (void)provider->remove(provider_context, object->watches[index].token);
-            free(object->watches[index].path);
+        if (object->watches != NULL) {
+            for (index = 0; index < object->watch_count && index < object->watch_capacity; ++index) {
+                (void)provider->remove(provider_context, object->watches[index].token);
+                free(object->watches[index].path);
+            }
         }
         free(object->watches);
         free(object->queue);

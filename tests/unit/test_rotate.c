@@ -37,5 +37,14 @@ int main(void) {
     hl_x86_rotate_carry(&cpu);
     HL_CHECK(cpu.r[RBX] == UINT64_C(0xa5));
     HL_CHECK(cpu.nzcv == UINT64_C(0xf0000000));
+
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.divop = 3 | ((uint64_t)RAX << 16);
+    cpu.r[RAX] = UINT64_C(0x1234);
+    cpu.r[RCX] = 1;
+    cpu.nzcv = UINT64_C(0xa0000000);
+    hl_x86_rotate_carry(&cpu);
+    HL_CHECK(cpu.r[RAX] == UINT64_C(0x1234));
+    HL_CHECK(cpu.nzcv == UINT64_C(0xa0000000));
     return 0;
 }

@@ -20,6 +20,9 @@ void hl_x86_rotate_carry(struct cpu *cpu) {
     int is_memory = (int)((descriptor >> 9) & 1);
     int high_byte = (int)((descriptor >> 10) & 1);
     int reg = (int)((descriptor >> 16) & UINT64_C(0x1f));
+    if ((width != 1 && width != 2 && width != 4 && width != 8) || (!is_memory && reg >= 16) ||
+        (high_byte && (is_memory || width != 1)))
+        return;
     int bits = 8 * width;
     uint64_t mask = (width == 8) ? UINT64_MAX : ((UINT64_C(1) << bits) - 1);
     uint64_t address = cpu->x87_ea;
