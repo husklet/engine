@@ -23,16 +23,28 @@ impl Description {
         }
         result
     }
+
+    fn close(&self) {
+        let id = self.requests.fetch_add(1, Ordering::Relaxed);
+        if self
+            .transport
+            .request(
+                id,
+                Request::Close {
+                    handle: self.handle,
+                },
+                Instant::now() + Duration::from_secs(1),
+            )
+            .is_err()
+        {
+            self.transport.cancel(id);
+        }
+    }
 }
 
 impl Drop for Description {
     fn drop(&mut self) {
-        let _ = self.call(
-            Request::Close {
-                handle: self.handle,
-            },
-            Instant::now() + Duration::from_secs(1),
-        );
+        self.close();
     }
 }
 

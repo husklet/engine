@@ -13,7 +13,7 @@ pub(crate) struct ConfigFile {
 impl ConfigFile {
     pub(crate) fn create(bytes: &[u8]) -> std::io::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::host::HostPaths::temporary(&format!(
             "hl-engine-config-{}-{}",
             std::process::id(),
             UNIQUE.fetch_add(1, Ordering::Relaxed)

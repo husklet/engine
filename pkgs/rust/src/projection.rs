@@ -19,7 +19,7 @@ pub(crate) struct Projection {
     root: PathBuf,
 }
 
-pub(crate) struct Materialized {
+pub(crate) struct ProjectionPlan {
     pub(crate) mounts: Vec<Mount>,
     pub(crate) links: Vec<(PathBuf, PathBuf)>,
 }
@@ -27,7 +27,7 @@ pub(crate) struct Materialized {
 impl Projection {
     pub(crate) fn materialize(
         entries: &[&NamespaceEntry],
-    ) -> Result<(Self, Materialized), SpecError> {
+    ) -> Result<(Self, ProjectionPlan), SpecError> {
         let root = create_root()?;
         let projection = Self { root };
         let result = projection.populate(entries);
@@ -37,7 +37,7 @@ impl Projection {
         }
     }
 
-    fn populate(&self, entries: &[&NamespaceEntry]) -> Result<Materialized, SpecError> {
+    fn populate(&self, entries: &[&NamespaceEntry]) -> Result<ProjectionPlan, SpecError> {
         let mut ordered = entries.to_vec();
         ordered.sort_by(|left, right| {
             left.path()
@@ -88,7 +88,7 @@ impl Projection {
                 ));
             }
         }
-        Ok(Materialized { mounts, links })
+        Ok(ProjectionPlan { mounts, links })
     }
 
     fn create(&self, entry: &NamespaceEntry) -> Result<(), SpecError> {
@@ -154,8 +154,10 @@ impl Drop for Projection {
 fn create_root() -> Result<PathBuf, SpecError> {
     for _ in 0..32 {
         let sequence = NEXT_PROJECTION.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("hl-projection-{}-{sequence}", std::process::id()));
+        let path = crate::host::HostPaths::temporary(&format!(
+            "hl-projection-{}-{sequence}",
+            std::process::id()
+        ));
         match fs::create_dir(&path) {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
