@@ -14,6 +14,56 @@ pub(crate) struct Handle(*mut Process);
 // SAFETY: activation processes have no thread affinity. The safe wrapper never
 // exposes the pointer, provides no concurrent access, and destroys it exactly once.
 unsafe impl Send for Handle {}
+
+impl Handle {
+    pub(crate) fn wait(&self) -> Result<EngineExit, i32> {
+        let mut exit = EngineExit::default();
+        let status = unsafe { hl_activation_wait(self.0, &mut exit) };
+        if status == 0 {
+            Ok(exit)
+        } else {
+            Err(status)
+        }
+    }
+
+    pub(crate) fn try_wait(&self) -> Result<Option<EngineExit>, i32> {
+        let mut ready = 0;
+        let mut exit = EngineExit::default();
+        let status = unsafe { hl_activation_try_wait(self.0, &mut ready, &mut exit) };
+        if status != 0 {
+            Err(status)
+        } else if ready == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(exit))
+        }
+    }
+
+    pub(crate) fn kill(&self) -> Result<(), i32> {
+        let status = unsafe { hl_activation_kill(self.0) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(status)
+        }
+    }
+
+    pub(crate) fn id(&self) -> Result<u64, i32> {
+        let mut id = 0;
+        let status = unsafe { hl_activation_process_id(self.0, &mut id) };
+        if status == 0 {
+            Ok(id)
+        } else {
+            Err(status)
+        }
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        unsafe { hl_activation_process_destroy(self.0) }
+    }
+}
 #[repr(C)]
 pub(crate) struct Streams {
     pub input: i32,
@@ -145,35 +195,6 @@ pub(crate) fn resize(file: &File, size: TerminalSize) -> Result<(), i32> {
     }
 }
 
-pub(crate) fn wait(process: &Handle) -> Result<EngineExit, i32> {
-    let mut exit = EngineExit::default();
-    let status = unsafe { hl_activation_wait(process.0, &mut exit) };
-    if status == 0 {
-        Ok(exit)
-    } else {
-        Err(status)
-    }
-}
-pub(crate) fn try_wait(process: &Handle) -> Result<Option<EngineExit>, i32> {
-    let mut ready = 0;
-    let mut exit = EngineExit::default();
-    let status = unsafe { hl_activation_try_wait(process.0, &mut ready, &mut exit) };
-    if status != 0 {
-        Err(status)
-    } else if ready == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(exit))
-    }
-}
-pub(crate) fn kill(process: &Handle) -> Result<(), i32> {
-    let status = unsafe { hl_activation_kill(process.0) };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(status)
-    }
-}
 pub(crate) fn terminate_domain(identity: [u64; 2]) -> Result<(), i32> {
     let status = unsafe { hl_activation_domain_terminate(ProcessDomain { identity }) };
     if status == 0 {
@@ -224,19 +245,6 @@ pub(crate) fn domain_processes(
         }
     }
     Err(5)
-}
-#[allow(clippy::needless_pass_by_value)] // Consumption enforces exactly-once destruction.
-pub(crate) fn destroy(process: Handle) {
-    unsafe { hl_activation_process_destroy(process.0) }
-}
-pub(crate) fn process_id(process: &Handle) -> Result<u64, i32> {
-    let mut id = 0;
-    let status = unsafe { hl_activation_process_id(process.0, &mut id) };
-    if status == 0 {
-        Ok(id)
-    } else {
-        Err(status)
-    }
 }
 pub(crate) fn signal(process: u64, signal: i32) -> std::io::Result<()> {
     let process = c_int::try_from(process).map_err(|_| std::io::Error::from_raw_os_error(22))?;

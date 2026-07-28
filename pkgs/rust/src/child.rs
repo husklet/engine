@@ -32,7 +32,7 @@ impl Child {
     pub fn id(&self) -> u64 {
         self.process
             .as_ref()
-            .and_then(|process| ffi::process_id(process).ok())
+            .and_then(|process| process.id().ok())
             .unwrap_or(0)
     }
     pub fn take_stdin(&mut self) -> Option<File> {
@@ -53,7 +53,11 @@ impl Child {
     /// # Errors
     /// Returns native lifecycle or result-protocol failures.
     pub fn try_wait(&mut self) -> Result<Option<Exit>, Error> {
-        let exit = ffi::try_wait(self.process.as_ref().ok_or(Error::InvalidState)?)
+        let exit = self
+            .process
+            .as_ref()
+            .ok_or(Error::InvalidState)?
+            .try_wait()
             .map_err(Self::native_error)?
             .map(result::native)
             .transpose()?;
@@ -65,7 +69,11 @@ impl Child {
     /// # Errors
     /// Returns native process-control failures.
     pub fn force_stop(&mut self) -> Result<(), Error> {
-        ffi::kill(self.process.as_ref().ok_or(Error::InvalidState)?).map_err(Self::native_error)
+        self.process
+            .as_ref()
+            .ok_or(Error::InvalidState)?
+            .kill()
+            .map_err(Self::native_error)
     }
     pub(crate) fn signal(&self, signal: i32) -> Result<(), Error> {
         if self.completed {
@@ -83,10 +91,13 @@ impl Child {
     /// Returns native lifecycle or result-protocol failures.
     pub fn wait(mut self) -> Result<Exit, Error> {
         let exit = result::native(
-            ffi::wait(self.process.as_ref().ok_or(Error::InvalidState)?)
+            self.process
+                .as_ref()
+                .ok_or(Error::InvalidState)?
+                .wait()
                 .map_err(Self::native_error)?,
         )?;
-        ffi::destroy(self.process.take().ok_or(Error::InvalidState)?);
+        drop(self.process.take().ok_or(Error::InvalidState)?);
         Ok(exit)
     }
     /// Waits while concurrently capturing standard output and error.
@@ -137,7 +148,7 @@ impl Child {
 impl Drop for Child {
     fn drop(&mut self) {
         if let Some(process) = self.process.take() {
-            ffi::destroy(process);
+            drop(process);
         }
     }
 }
