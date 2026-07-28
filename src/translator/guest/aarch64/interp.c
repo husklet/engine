@@ -463,11 +463,7 @@ static void interp_raise_sync_signal(struct cpu *cpu, int signo, int signal_code
     cpu->reason = R_BRANCH;
 }
 
-// The one diagnostic exit. Reaching it means THIS BACKEND HAS A GAP, never "the guest executed something
-// illegal" -- opposite responses; where the architecture is unambiguous the split is made at the decode site
-// (op0 == 0000, the RESERVED group, raises SIGILL; the exception-generation box SIGTRAP for BRK). stderr is
-// the only route guaranteed visible (HL_ENABLE_LOGGING is 0 in production); jit_fail's g_jit_fatal stops the
-// guest with exit code 70.
+// Backend gaps are fatal; architecturally undefined guest instructions use the signal path instead.
 static int interp_undefined(struct cpu *cpu, uint32_t insn, const char *class_name) {
     char message[320];
     int written = snprintf(message, sizeof message,
@@ -478,7 +474,6 @@ static int interp_undefined(struct cpu *cpu, uint32_t insn, const char *class_na
                            (unsigned)((insn >> 16) & 31), (unsigned)((insn >> 10) & 31));
     if (written < 0) written = 0;
     if ((size_t)written >= sizeof message) written = (int)sizeof message - 1;
-    fprintf(stderr, "%s\n", message);
     (void)jit_fail(HL_STATUS_NOT_SUPPORTED, message, (size_t)written);
     // Leave cpu->pc ON the offending instruction so message and state agree; the dispatcher's fatal check
     // ends the run next iteration, and R_BRANCH is the only exit that does not misread it.
@@ -5408,10 +5403,8 @@ static void run_block(struct cpu *cpu, void *code) {
 // sigframe_resume_dispatch bakes it. Abort, not return -- a silent return spins the dispatcher on a stale
 // cpu->reason.
 static void block_return(void) {
-    fprintf(stderr, "hl: block_return() entered under the aarch64 interpreter backend on a " HL_HOST_CPU_NAME " host.\n"
-                    "    Nothing in the code arena is executable here, so no translated block can have branched\n"
-                    "    to this address -- it was baked into something that then ran, which means a stale\n"
-                    "    persistent-cache image or a checkpoint written by the JIT was accepted.\n");
+    static const char message[] = "interpreter received an invalid generated-code return";
+    (void)jit_fail(HL_STATUS_CORRUPT, message, sizeof message - 1u);
     abort();
 }
 
@@ -5563,8 +5556,8 @@ static int shadowgate(void) {
 #define PC_IMG_BASE 0x0000040000000000ull    // fixed guest image base
 #define PC_INTERP_BASE 0x0000048000000000ull // fixed interpreter (ld.so) base
 
-static int g_pcache;            // HL_PCACHE=1 requested (never hits)
-static int g_coldprof;          // cache timing diagnostics
+static int g_pcache; // HL_PCACHE=1 requested (never hits)
+static int g_coldprof;
 static uint64_t g_force_base;   // one-shot fixed-VA request consumed by load_elf
 static int g_force_base_failed; // a fixed-VA map fell back to a kernel base
 static uint64_t g_pc_binid;     // binary + interp + argv0 + build + host ISA
@@ -5595,7 +5588,6 @@ static uint64_t pcache_make_id(const char *prog_host, const char *interp_host, c
 // Always a clean MISS.
 static int pcache_load(uint64_t entry_jump) {
     (void)entry_jump;
-    if (g_pcache && g_coldprof) fprintf(stderr, "[pcache] MISS (interpreter backend stores no host code)\n");
     return 0;
 }
 

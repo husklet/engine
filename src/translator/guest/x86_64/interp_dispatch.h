@@ -42,25 +42,12 @@ static inline int smc_seen(void) {
 // Publish the absence of an IBTC base (header note).
 #define G_DISPATCH_ENTER(c) ((c)->ibtc_base = 0)
 
-// A PLAIN brace block (NOT do/while(0)) so the trace-cap `break` reaches the shared dispatcher while-loop.
 #define G_DISPATCH_DEBUG(c)                                                                                            \
     {                                                                                                                  \
         if (g_pending) maybe_deliver_signal(c); /* redirect to the guest handler */                                    \
         g_prevpc = g_curpc;                                                                                            \
         g_curpc = (c)->rip;                                                                                            \
         g_disp_n++;                                                                                                    \
-        if (g_trace && g_tracecap && g_disp_n > g_tracecap) { /* bound runaway trace output */                         \
-            fprintf(stderr, "[hl] trace cap %llu blocks reached -> stop\n", (unsigned long long)g_tracecap);           \
-            (c)->exited = 1;                                                                                           \
-            (c)->exit_code = 99;                                                                                       \
-            break;                                                                                                     \
-        }                                                                                                              \
-        if (g_w8 && *g_w8 != g_w8v) { /* byte watchpoint */                                                            \
-            fprintf(stderr, "[w8] @%p %02x -> %02x  by block +%llx  malloc#=%llu  rsi=%llx\n", (void *)g_w8, g_w8v,    \
-                    *g_w8, (unsigned long long)(g_prevpc - g_loadbase), (unsigned long long)g_malloc_n,                \
-                    (unsigned long long)(c)->r[6]);                                                                    \
-            g_w8v = *g_w8;                                                                                             \
-        }                                                                                                              \
     }
 
 // On-flush reset; g_xibtc holds HOST code pointers (header note).
@@ -77,20 +64,7 @@ static inline int smc_seen(void) {
 
 // MUST be overridden on either backend: the shared default reads cpu->x[]/cpu->sp, which an x86 guest
 // lacks. Identical to dispatch.h's; stored C is NOT x86 CF.
-#define G_TRACE_DUMP(c)                                                                                                \
-    if (g_trace) {                                                                                                     \
-        unsigned nz = (unsigned)(c)->nzcv;                                                                             \
-        int CF = !((nz >> 29) & 1), ZF = (nz >> 30) & 1, SF = (nz >> 31) & 1, OF = (nz >> 28) & 1;                     \
-        fprintf(stderr,                                                                                                \
-                "[blk] rip=%llx rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx rbp=%llx r8=%llx r9=%llx "       \
-                "r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx fl=C%dZ%dS%dO%d\n",                             \
-                (unsigned long long)(c)->rip, (unsigned long long)(c)->r[RAX], (unsigned long long)(c)->r[3],          \
-                (unsigned long long)(c)->r[RCX], (unsigned long long)(c)->r[RDX], (unsigned long long)(c)->r[RSI],     \
-                (unsigned long long)(c)->r[RDI], (unsigned long long)(c)->r[RBP], (unsigned long long)(c)->r[8],       \
-                (unsigned long long)(c)->r[9], (unsigned long long)(c)->r[10], (unsigned long long)(c)->r[11],         \
-                (unsigned long long)(c)->r[12], (unsigned long long)(c)->r[13], (unsigned long long)(c)->r[14],        \
-                (unsigned long long)(c)->r[15], CF, ZF, SF, OF);                                                       \
-    }
+#define G_TRACE_DUMP(c) ((void)0)
 
 // No inline branch-target cache: cpu->ic_miss is never set here.
 #define G_IBTC_FILL(c) ((void)0)
@@ -119,12 +93,6 @@ static inline int smc_seen(void) {
     if ((c)->reason == R_SOFTSPAN) { /* retry the restartable string op */                                             \
         (c)->reason = R_BRANCH;                                                                                        \
         continue;                                                                                                      \
-    }                                                                                                                  \
-    if ((c)->reason == 99) {                                                                                           \
-        fprintf(stderr, "[hl] aborting at rip marker %llx (unimplemented opcode)\n", (unsigned long long)(c)->rip);    \
-        (c)->exited = 1;                                                                                               \
-        (c)->exit_code = 70;                                                                                           \
-        break;                                                                                                         \
     }                                                                                                                  \
     if ((c)->reason == R_TIER2) { /* see the header note */                                                            \
         (c)->reason = R_BRANCH;                                                                                        \

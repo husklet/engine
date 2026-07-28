@@ -74,10 +74,9 @@ static int hl_x86_force_barriers_for_shared(void) {
 // Never called (G_BLOCK_ALIGN is a compile-time 0) but must exist for that dead branch to type-check, and
 // aborts rather than appending an ARM64 nop into the descriptor arena. Non-static: lower/primitives.h.
 void emit32(uint32_t instruction) {
+    static const char message[] = "interpreter cannot emit host instructions";
     (void)instruction;
-    fprintf(stderr, "[hl] emit32() called on a " HL_HOST_CPU_NAME " host: the interpreter backend emits no\n"
-                    "     instructions, so a caller believes the code arena holds machine code. G_BLOCK_ALIGN\n"
-                    "     is 0 precisely so the shared dispatcher's alignment pad never reaches here.\n");
+    (void)jit_fail(HL_STATUS_CORRUPT, message, sizeof message - 1u);
     abort();
 }
 
@@ -774,7 +773,8 @@ static void tier2_promote(uint64_t gpc) {
 // fetch path, so reporting next to an unmapped page cannot itself fault.
 static int interp_undefined(struct cpu *cpu, const struct insn *insn, uint64_t pc, const char *class_name) {
     uint8_t bytes[16] = {0};
-    char text[96];
+    char text[96] = {0};
+    char message[384];
     int length = (insn->len > 0 && insn->len <= 15) ? insn->len : 8;
     int used = 0;
     const char *map = insn->vex         ? (insn->evex ? "EVEX" : "VEX")
@@ -786,20 +786,15 @@ static int interp_undefined(struct cpu *cpu, const struct insn *insn, uint64_t p
     for (int index = 0; index < length && used < (int)sizeof text - 4; index++)
         used += snprintf(text + used, sizeof text - (size_t)used, "%02x ", bytes[index]);
     if (used > 0) text[used - 1] = 0;
-    fprintf(stderr,
-            "[hl] interp: unimplemented %s at rip=%llx (image+%llx)\n"
-            "     bytes: %s | map=%s op=0x%02x modrm=0x%02x reg=%d rm=%d opsize=%d len=%d prefixes:%s%s%s%s%s%s\n",
-            class_name, (unsigned long long)pc, (unsigned long long)(pc - g_loadbase), text, map, insn->op,
-            insn->has_modrm ? insn->modrm : 0, insn->reg, insn->rm_reg, insn->opsize, insn->len,
-            insn->has_rex ? " REX" : "", insn->p66 ? " 66" : "", insn->rep ? " F3" : "", insn->repne ? " F2" : "",
-            insn->lock ? " LOCK" : "",
-            insn->seg == 1   ? " FS"
-            : insn->seg == 2 ? " GS"
-                             : "");
-    HL_LOGF(&g_jit_log, HL_LOG_TAG_TRANSLATE, "isa=x86_64 interp unimplemented=%s guest_pc=%#llx op=%#x", class_name,
-            (unsigned long long)pc, (unsigned)insn->op);
+    int written =
+        snprintf(message, sizeof message,
+                 "x86 interpreter unsupported class=%s pc=%#llx bytes=%s map=%s op=%#x modrm=%#x", class_name,
+                 (unsigned long long)pc, text, map, (unsigned)insn->op, (unsigned)(insn->has_modrm ? insn->modrm : 0));
+    if (written < 0) written = 0;
+    if ((size_t)written >= sizeof message) written = (int)sizeof message - 1;
+    (void)jit_fail(HL_STATUS_NOT_SUPPORTED, message, (size_t)written);
     cpu->rip = pc;
-    cpu->reason = 99;
+    cpu->reason = R_BRANCH;
     return 1; // STEP_END
 }
 
@@ -1104,13 +1099,10 @@ static void block_return(void);
 static void run_block(struct cpu *cpu, void *code) {
     struct interp_block *block = (struct interp_block *)code;
     if (block == NULL || block->magic != INTERP_BLOCK_MAGIC) {
-        fprintf(stderr,
-                "[hl] interp: block descriptor at %p is not one of ours (magic=%llx, expected %llx) for rip=%llx.\n"
-                "     A persistent cache written by the ARM64 backend, or a reclaimed arena generation, is the\n"
-                "     only way to reach this.\n",
-                code, (unsigned long long)(block ? block->magic : 0), (unsigned long long)INTERP_BLOCK_MAGIC,
-                (unsigned long long)cpu->rip);
-        abort();
+        static const char message[] = "interpreter received an invalid block descriptor";
+        (void)jit_fail(HL_STATUS_CORRUPT, message, sizeof message - 1u);
+        cpu->reason = R_BRANCH;
+        return;
     }
     // Guest-fault landing pad. savemask=0 -- this is the hottest line in the engine (once per guest block)
     // and savemask=1 makes glibc issue a real rt_sigprocmask here. interp_restore_handler_mask does the
@@ -1148,9 +1140,8 @@ static void run_block(struct cpu *cpu, void *code) {
 }
 
 static void block_return(void) {
-    fprintf(stderr, "[hl] interp: block_return() entered on a " HL_HOST_CPU_NAME " host. Only translated ARM64\n"
-                    "     blocks branch here and this backend emits none -- so its address was baked into\n"
-                    "     something that then ran (a stale persistent-cache image or a mis-relocated exit).\n");
+    static const char message[] = "interpreter received an invalid generated-code return";
+    (void)jit_fail(HL_STATUS_CORRUPT, message, sizeof message - 1u);
     abort();
 }
 
@@ -5066,7 +5057,6 @@ static uint64_t pcache_make_id(const char *program_host, const char *interpreter
 
 static int pcache_load(uint64_t entry_jump) {
     (void)entry_jump;
-    if (g_coldprof) fprintf(stderr, "[pcache] MISS (interpreter backend: the cache stores host code)\n");
     g_pcache_loaded = 0;
     return 0; // MISS: the dispatcher translates fresh
 }
