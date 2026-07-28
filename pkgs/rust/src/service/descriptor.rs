@@ -1,7 +1,7 @@
 use super::{
-    linux, protocol, Arc, AtomicU64, BTreeMap, Duration, Instant, Interest, Mutex, Ordering,
-    Readiness, Reply, Request, SeekWhence, ServiceFailure, ServiceId, ServiceStat,
-    ServiceTransport, TransportError,
+    protocol, Arc, AtomicU64, BTreeMap, Duration, Instant, Interest, Mutex, Ordering, Readiness,
+    Reply, Request, SeekWhence, ServiceFailure, ServiceId, ServiceStat, ServiceTransport,
+    TransportError,
 };
 struct Description {
     handle: u64,
@@ -84,7 +84,10 @@ impl Descriptors {
         deadline: Instant,
     ) -> Result<i32, ServiceFailure> {
         if self.values.len() >= self.maximum_open as usize {
-            return Err(linux(24, "service descriptor quota exhausted"));
+            return Err(ServiceFailure::linux(
+                24,
+                "service descriptor quota exhausted",
+            ));
         }
         let id = self.requests.fetch_add(1, Ordering::Relaxed);
         let reply = transport.request(
@@ -153,7 +156,7 @@ impl Descriptors {
         self.values
             .remove(&fd)
             .map(|_| ())
-            .ok_or_else(|| linux(9, "bad service descriptor"))
+            .ok_or_else(|| ServiceFailure::linux(9, "bad service descriptor"))
     }
 
     pub(crate) fn read(
@@ -165,7 +168,10 @@ impl Descriptors {
     ) -> Result<Vec<u8>, ServiceFailure> {
         let description = &self.get(fd)?.description;
         if length > description.maximum {
-            return Err(linux(22, "service read exceeds request bound"));
+            return Err(ServiceFailure::linux(
+                22,
+                "service read exceeds request bound",
+            ));
         }
         let at = offset.unwrap_or(*description.offset.lock().map_err(|_| protocol())?);
         let Reply::Bytes(bytes) = description.call(
@@ -198,7 +204,10 @@ impl Descriptors {
     ) -> Result<u32, ServiceFailure> {
         let description = &self.get(fd)?.description;
         if bytes.len() > description.maximum as usize {
-            return Err(linux(22, "service write exceeds request bound"));
+            return Err(ServiceFailure::linux(
+                22,
+                "service write exceeds request bound",
+            ));
         }
         let at = offset.unwrap_or(*description.offset.lock().map_err(|_| protocol())?);
         let Reply::Written(written) = description.call(
@@ -282,20 +291,20 @@ impl Descriptors {
     fn get(&self, fd: i32) -> Result<&Descriptor, ServiceFailure> {
         self.values
             .get(&fd)
-            .ok_or_else(|| linux(9, "bad service descriptor"))
+            .ok_or_else(|| ServiceFailure::linux(9, "bad service descriptor"))
     }
     fn allocate(&mut self) -> Result<i32, ServiceFailure> {
         while self.values.contains_key(&self.next) {
             self.next = self
                 .next
                 .checked_add(1)
-                .ok_or_else(|| linux(24, "descriptor range exhausted"))?;
+                .ok_or_else(|| ServiceFailure::linux(24, "descriptor range exhausted"))?;
         }
         let fd = self.next;
         self.next = self
             .next
             .checked_add(1)
-            .ok_or_else(|| linux(24, "descriptor range exhausted"))?;
+            .ok_or_else(|| ServiceFailure::linux(24, "descriptor range exhausted"))?;
         Ok(fd)
     }
 }

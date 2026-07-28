@@ -1,8 +1,8 @@
 use super::{
-    linux, protocol, require, system_deadline, Arc, AtomicU64, BTreeMap, Credentials,
-    HandleOperation, Handles, Instant, LinuxError, Mutex, OpenAccess, OpenRequest, Ordering,
-    ReadRequest, Reply, Request, SeekOrigin, SeekRequest, SeekWhence, ServiceCodec, ServiceFailure,
-    ServiceId, ServiceRegistration, ServiceStat, TransportError, WriteRequest,
+    protocol, Arc, AtomicU64, BTreeMap, Credentials, HandleOperation, Handles, Instant, LinuxError,
+    Mutex, OpenAccess, OpenRequest, Ordering, ReadRequest, Reply, Request, SeekOrigin, SeekRequest,
+    SeekWhence, ServiceCodec, ServiceFailure, ServiceId, ServiceRegistration, ServiceStat,
+    SystemTime, TransportError, WriteRequest,
 };
 pub(crate) struct ProviderDispatcher {
     provider: Arc<dyn Handles>,
@@ -20,6 +20,10 @@ struct ActiveHandle {
 }
 
 impl ProviderDispatcher {
+    fn system_deadline(deadline: Instant) -> SystemTime {
+        SystemTime::now() + deadline.saturating_duration_since(Instant::now())
+    }
+
     pub(crate) fn new(
         provider: Arc<dyn Handles>,
         services: &[ServiceRegistration],
@@ -74,16 +78,21 @@ impl ProviderDispatcher {
                 let operations = self
                     .services
                     .get(&service)
-                    .ok_or_else(|| linux(19, "service is outside this launch authority"))?
+                    .ok_or_else(|| {
+                        ServiceFailure::linux(19, "service is outside this launch authority")
+                    })?
                     .clone();
                 if (read && !operations.contains(&HandleOperation::Read))
                     || (write && !operations.contains(&HandleOperation::Write))
                 {
-                    return Err(linux(13, "service access exceeds declared operations"));
+                    return Err(ServiceFailure::linux(
+                        13,
+                        "service access exceeds declared operations",
+                    ));
                 }
                 let mut handles = self.handles.lock().map_err(|_| protocol())?;
                 if handles.len() >= self.maximum_handles as usize {
-                    return Err(linux(24, "provider handle quota exhausted"));
+                    return Err(ServiceFailure::linux(24, "provider handle quota exhausted"));
                 }
                 let handle = self
                     .provider
@@ -95,7 +104,7 @@ impl ProviderDispatcher {
                             nonblocking: false,
                         },
                         credentials: self.credentials.clone(),
-                        deadline: system_deadline(deadline),
+                        deadline: Self::system_deadline(deadline),
                     })
                     .map_err(ServiceFailure::Linux)?;
                 let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -120,7 +129,7 @@ impl ProviderDispatcher {
                     .lock()
                     .map_err(|_| protocol())?
                     .remove(&handle)
-                    .ok_or_else(|| linux(9, "unknown provider handle"))?;
+                    .ok_or_else(|| ServiceFailure::linux(9, "unknown provider handle"))?;
                 value.value.close();
                 Ok(Reply::Closed)
             }
@@ -128,34 +137,34 @@ impl ProviderDispatcher {
                 let handles = self.handles.lock().map_err(|_| protocol())?;
                 let handle = handles
                     .get(&request.handle())
-                    .ok_or_else(|| linux(9, "unknown provider handle"))?;
+                    .ok_or_else(|| ServiceFailure::linux(9, "unknown provider handle"))?;
                 match request {
                     Request::Read { offset, length, .. } => {
-                        require(&handle.operations, HandleOperation::Read)?;
+                        HandleOperation::Read.require(&handle.operations)?;
                         if offset != u64::MAX {
-                            require(&handle.operations, HandleOperation::PositionedIo)?;
+                            HandleOperation::PositionedIo.require(&handle.operations)?;
                         }
                         handle
                             .value
                             .read(ReadRequest {
                                 offset: (offset != u64::MAX).then_some(offset),
                                 length,
-                                deadline: system_deadline(deadline),
+                                deadline: Self::system_deadline(deadline),
                             })
                             .map(Reply::Bytes)
                             .map_err(ServiceFailure::Linux)
                     }
                     Request::Write { offset, bytes, .. } => {
-                        require(&handle.operations, HandleOperation::Write)?;
+                        HandleOperation::Write.require(&handle.operations)?;
                         if offset != u64::MAX {
-                            require(&handle.operations, HandleOperation::PositionedIo)?;
+                            HandleOperation::PositionedIo.require(&handle.operations)?;
                         }
                         handle
                             .value
                             .write(WriteRequest {
                                 offset: (offset != u64::MAX).then_some(offset),
                                 bytes,
-                                deadline: system_deadline(deadline),
+                                deadline: Self::system_deadline(deadline),
                             })
                             .and_then(|written| {
                                 u32::try_from(written).map_err(|_| LinuxError {
@@ -167,7 +176,7 @@ impl ProviderDispatcher {
                             .map_err(ServiceFailure::Linux)
                     }
                     Request::Seek { offset, whence, .. } => {
-                        require(&handle.operations, HandleOperation::Seek)?;
+                        HandleOperation::Seek.require(&handle.operations)?;
                         handle
                             .value
                             .seek(SeekRequest {
@@ -182,7 +191,7 @@ impl ProviderDispatcher {
                             .map_err(ServiceFailure::Linux)
                     }
                     Request::Stat { .. } => {
-                        require(&handle.operations, HandleOperation::Metadata)?;
+                        HandleOperation::Metadata.require(&handle.operations)?;
                         handle
                             .value
                             .metadata()
@@ -197,7 +206,7 @@ impl ProviderDispatcher {
                             .map_err(ServiceFailure::Linux)
                     }
                     Request::Poll { interest, .. } => {
-                        require(&handle.operations, HandleOperation::Poll)?;
+                        HandleOperation::Poll.require(&handle.operations)?;
                         handle
                             .value
                             .readiness(interest)

@@ -81,7 +81,7 @@ impl<'a> Input<'a> {
 }
 
 impl ServiceFailure {
-    pub(super) fn linux(errno: i32, context: &str) -> Self {
+    pub(crate) fn linux(errno: i32, context: &str) -> Self {
         Self::Linux(crate::provider::LinuxError {
             errno,
             context: context.into(),

@@ -38,28 +38,16 @@ pub(crate) trait ServiceTransport: Send + Sync {
     fn cancel(&self, id: u64);
 }
 
-fn system_deadline(deadline: Instant) -> SystemTime {
-    SystemTime::now() + deadline.saturating_duration_since(Instant::now())
-}
-
-fn linux(errno: i32, context: &str) -> ServiceFailure {
-    ServiceFailure::Linux(LinuxError {
-        errno,
-        context: context.into(),
-    })
-}
-
-fn require(
-    operations: &std::collections::BTreeSet<HandleOperation>,
-    operation: HandleOperation,
-) -> Result<(), ServiceFailure> {
-    if operations.contains(&operation) {
-        Ok(())
-    } else {
-        Err(linux(
-            95,
-            "service operation was not granted for this launch",
-        ))
+impl HandleOperation {
+    fn require(self, operations: &std::collections::BTreeSet<Self>) -> Result<(), ServiceFailure> {
+        if operations.contains(&self) {
+            Ok(())
+        } else {
+            Err(ServiceFailure::linux(
+                95,
+                "service operation was not granted for this launch",
+            ))
+        }
     }
 }
 
@@ -217,7 +205,7 @@ mod tests {
                 Request::Open { .. } => Reply::Opened { handle: 9 },
                 Request::Read { offset, length, .. } => {
                     let start = usize::try_from(offset)
-                        .map_err(|_| linux(22, "offset exceeds host range"))?;
+                        .map_err(|_| ServiceFailure::linux(22, "offset exceeds host range"))?;
                     Reply::Bytes(
                         bytes
                             .get(start..start.saturating_add(length as usize).min(bytes.len()))
@@ -231,24 +219,26 @@ mod tests {
                     ..
                 } => {
                     let start = usize::try_from(offset)
-                        .map_err(|_| linux(22, "offset exceeds host range"))?;
+                        .map_err(|_| ServiceFailure::linux(22, "offset exceeds host range"))?;
                     if bytes.len() < start + input.len() {
                         bytes.resize(start + input.len(), 0);
                     }
                     bytes[start..start + input.len()].copy_from_slice(&input);
                     Reply::Written(
-                        u32::try_from(input.len())
-                            .map_err(|_| linux(22, "write exceeds protocol range"))?,
+                        u32::try_from(input.len()).map_err(|_| {
+                            ServiceFailure::linux(22, "write exceeds protocol range")
+                        })?,
                     )
                 }
                 Request::Seek { offset, whence, .. } => {
                     let base = match whence {
                         SeekWhence::Start | SeekWhence::Current => 0,
                         SeekWhence::End => i64::try_from(bytes.len())
-                            .map_err(|_| linux(75, "size exceeds seek range"))?,
+                            .map_err(|_| ServiceFailure::linux(75, "size exceeds seek range"))?,
                     };
                     Reply::Offset(
-                        u64::try_from(base + offset).map_err(|_| linux(22, "negative seek"))?,
+                        u64::try_from(base + offset)
+                            .map_err(|_| ServiceFailure::linux(22, "negative seek"))?,
                     )
                 }
                 Request::Stat { .. } => Reply::Stat(ServiceStat {
