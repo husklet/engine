@@ -1,26 +1,30 @@
-use crate::protocol::TransportError;
-use crate::provider::LinuxError;
-
 use super::ServiceFailure;
+use crate::protocol::TransportError;
 
-pub(super) fn put_u16(out: &mut Vec<u8>, value: u16) {
-    out.extend(value.to_le_bytes());
+pub(super) trait Output {
+    fn u16(&mut self, value: u16);
+    fn u32(&mut self, value: u32);
+    fn i32(&mut self, value: i32);
+    fn u64(&mut self, value: u64);
+    fn i64(&mut self, value: i64);
 }
 
-pub(super) fn put_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend(value.to_le_bytes());
-}
-
-pub(super) fn put_i32(out: &mut Vec<u8>, value: i32) {
-    out.extend(value.to_le_bytes());
-}
-
-pub(super) fn put_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend(value.to_le_bytes());
-}
-
-pub(super) fn put_i64(out: &mut Vec<u8>, value: i64) {
-    out.extend(value.to_le_bytes());
+impl Output for Vec<u8> {
+    fn u16(&mut self, value: u16) {
+        self.extend(value.to_le_bytes());
+    }
+    fn u32(&mut self, value: u32) {
+        self.extend(value.to_le_bytes());
+    }
+    fn i32(&mut self, value: i32) {
+        self.extend(value.to_le_bytes());
+    }
+    fn u64(&mut self, value: u64) {
+        self.extend(value.to_le_bytes());
+    }
+    fn i64(&mut self, value: i64) {
+        self.extend(value.to_le_bytes());
+    }
 }
 
 pub(super) struct Input<'a> {
@@ -76,11 +80,13 @@ impl<'a> Input<'a> {
     }
 }
 
-pub(super) fn linux(errno: i32, context: &str) -> ServiceFailure {
-    ServiceFailure::Linux(LinuxError {
-        errno,
-        context: context.into(),
-    })
+impl ServiceFailure {
+    pub(super) fn linux(errno: i32, context: &str) -> Self {
+        Self::Linux(crate::provider::LinuxError {
+            errno,
+            context: context.into(),
+        })
+    }
 }
 pub(super) fn protocol() -> ServiceFailure {
     ServiceFailure::Transport(TransportError::Malformed)

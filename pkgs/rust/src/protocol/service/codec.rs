@@ -1,5 +1,5 @@
 use super::{
-    input::{linux, protocol, put_i32, put_i64, put_u16, put_u32, put_u64, Input},
+    input::{protocol, Input, Output as _},
     Reply, Request, SeekWhence, ServiceFailure, ServiceStat,
 };
 use crate::api::extension::ServiceId;
@@ -27,7 +27,7 @@ pub fn encode_request(request: &Request, maximum: u32) -> Result<Vec<u8>, Servic
             write,
         } => {
             out.push(OPEN);
-            put_u64(&mut out, service.0);
+            out.u64(service.0);
             out.push(u8::from(*read) | (u8::from(*write) << 1));
         }
         Request::Read {
@@ -36,12 +36,15 @@ pub fn encode_request(request: &Request, maximum: u32) -> Result<Vec<u8>, Servic
             length,
         } => {
             if *length > maximum {
-                return Err(linux(22, "service read exceeds request bound"));
+                return Err(ServiceFailure::linux(
+                    22,
+                    "service read exceeds request bound",
+                ));
             }
             out.push(READ);
-            put_u64(&mut out, *handle);
-            put_u64(&mut out, *offset);
-            put_u32(&mut out, *length);
+            out.u64(*handle);
+            out.u64(*offset);
+            out.u32(*length);
         }
         Request::Write {
             handle,
@@ -49,14 +52,17 @@ pub fn encode_request(request: &Request, maximum: u32) -> Result<Vec<u8>, Servic
             bytes,
         } => {
             let length = u32::try_from(bytes.len())
-                .map_err(|_| linux(22, "service write exceeds protocol range"))?;
+                .map_err(|_| ServiceFailure::linux(22, "service write exceeds protocol range"))?;
             if length > maximum {
-                return Err(linux(22, "service write exceeds request bound"));
+                return Err(ServiceFailure::linux(
+                    22,
+                    "service write exceeds request bound",
+                ));
             }
             out.push(WRITE);
-            put_u64(&mut out, *handle);
-            put_u64(&mut out, *offset);
-            put_u32(&mut out, length);
+            out.u64(*handle);
+            out.u64(*offset);
+            out.u32(length);
             out.extend(bytes);
         }
         Request::Seek {
@@ -65,8 +71,8 @@ pub fn encode_request(request: &Request, maximum: u32) -> Result<Vec<u8>, Servic
             whence,
         } => {
             out.push(SEEK);
-            put_u64(&mut out, *handle);
-            put_i64(&mut out, *offset);
+            out.u64(*handle);
+            out.i64(*offset);
             out.push(match whence {
                 SeekWhence::Start => 0,
                 SeekWhence::Current => 1,
@@ -75,11 +81,11 @@ pub fn encode_request(request: &Request, maximum: u32) -> Result<Vec<u8>, Servic
         }
         Request::Stat { handle } => {
             out.push(STAT);
-            put_u64(&mut out, *handle);
+            out.u64(*handle);
         }
         Request::Poll { handle, interest } => {
             out.push(POLL);
-            put_u64(&mut out, *handle);
+            out.u64(*handle);
             out.push(
                 u8::from(interest.readable)
                     | (u8::from(interest.writable) << 1)
@@ -88,7 +94,7 @@ pub fn encode_request(request: &Request, maximum: u32) -> Result<Vec<u8>, Servic
         }
         Request::Close { handle } => {
             out.push(CLOSE);
-            put_u64(&mut out, *handle);
+            out.u64(*handle);
         }
     }
     Ok(out)
@@ -120,7 +126,10 @@ pub fn decode_request(bytes: &[u8], maximum: u32) -> Result<Request, ServiceFail
             let offset = input.u64()?;
             let length = input.u32()?;
             if length > maximum {
-                return Err(linux(22, "service read exceeds request bound"));
+                return Err(ServiceFailure::linux(
+                    22,
+                    "service read exceeds request bound",
+                ));
             }
             Request::Read {
                 handle,
@@ -133,7 +142,10 @@ pub fn decode_request(bytes: &[u8], maximum: u32) -> Result<Request, ServiceFail
             let offset = input.u64()?;
             let length = input.u32()?;
             if length > maximum {
-                return Err(linux(22, "service write exceeds request bound"));
+                return Err(ServiceFailure::linux(
+                    22,
+                    "service write exceeds request bound",
+                ));
             }
             let payload = input.bytes(length as usize)?.to_vec();
             Request::Write {
@@ -196,10 +208,10 @@ pub fn encode_reply(
     match reply {
         Err(ServiceFailure::Linux(error)) => {
             out.push(ERROR);
-            put_i32(&mut out, error.errno);
+            out.i32(error.errno);
             let context = error.context.as_bytes();
             let length = u16::try_from(context.len()).map_err(|_| protocol())?;
-            put_u16(&mut out, length);
+            out.u16(length);
             out.extend(context);
         }
 
@@ -207,7 +219,7 @@ pub fn encode_reply(
         Ok(value) => match value {
             Reply::Opened { handle } => {
                 out.push(OPEN);
-                put_u64(&mut out, *handle);
+                out.u64(*handle);
             }
 
             Reply::Bytes(bytes) => {
@@ -216,26 +228,26 @@ pub fn encode_reply(
                     return Err(protocol());
                 }
                 out.push(READ);
-                put_u32(&mut out, length);
+                out.u32(length);
                 out.extend(bytes);
             }
 
             Reply::Written(value) => {
                 out.push(WRITE);
-                put_u32(&mut out, *value);
+                out.u32(*value);
             }
 
             Reply::Offset(value) => {
                 out.push(SEEK);
-                put_u64(&mut out, *value);
+                out.u64(*value);
             }
 
             Reply::Stat(value) => {
                 out.push(STAT);
-                put_u32(&mut out, value.mode);
-                put_u32(&mut out, value.uid);
-                put_u32(&mut out, value.gid);
-                put_u64(&mut out, value.size);
+                out.u32(value.mode);
+                out.u32(value.uid);
+                out.u32(value.gid);
+                out.u64(value.size);
             }
 
             Reply::Ready(value) => {

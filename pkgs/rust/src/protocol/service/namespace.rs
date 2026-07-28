@@ -1,7 +1,7 @@
 use crate::api::extension::ServiceId;
 
 use super::{
-    input::{linux, protocol, put_u16, put_u32, put_u64, Input},
+    input::{protocol, Input, Output as _},
     ServiceFailure,
 };
 
@@ -34,7 +34,7 @@ pub fn encode_namespace_install(
     validate_projections(entries, maximum_entries, maximum_path)?;
     let mut out = Vec::new();
     let count = u32::try_from(entries.len()).map_err(|_| protocol())?;
-    put_u32(&mut out, count | 0xc000_0000);
+    out.u32(count | 0xc000_0000);
     for entry in entries {
         use std::os::unix::ffi::OsStrExt;
         let path = entry.path.as_os_str().as_bytes();
@@ -44,15 +44,15 @@ pub fn encode_namespace_install(
             ProjectionKind::BlockDevice { major, minor } => (5, major, minor),
         };
         out.push(kind);
-        put_u64(&mut out, entry.service.0);
-        put_u32(&mut out, entry.mode);
-        put_u32(&mut out, entry.uid);
-        put_u32(&mut out, entry.gid);
-        put_u16(&mut out, u16::try_from(path.len()).map_err(|_| protocol())?);
+        out.u64(entry.service.0);
+        out.u32(entry.mode);
+        out.u32(entry.uid);
+        out.u32(entry.gid);
+        out.u16(u16::try_from(path.len()).map_err(|_| protocol())?);
         out.extend(path);
-        put_u16(&mut out, 0);
-        put_u32(&mut out, major);
-        put_u32(&mut out, minor);
+        out.u16(0);
+        out.u32(major);
+        out.u32(minor);
     }
     Ok(out)
 }
@@ -74,7 +74,10 @@ pub fn decode_namespace_install(
     }
     let count = encoded_count & 0x3fff_ffff;
     if count > maximum_entries {
-        return Err(linux(7, "service projection count exceeds launch bound"));
+        return Err(ServiceFailure::linux(
+            7,
+            "service projection count exceeds launch bound",
+        ));
     }
     let mut entries = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -85,11 +88,17 @@ pub fn decode_namespace_install(
         let gid = input.u32()?;
         let length = u32::from(input.u16()?);
         if length == 0 || length > maximum_path {
-            return Err(linux(36, "service projection path exceeds launch bound"));
+            return Err(ServiceFailure::linux(
+                36,
+                "service projection path exceeds launch bound",
+            ));
         }
         let path = std::ffi::OsString::from_vec(input.bytes(length as usize)?.to_vec()).into();
         if input.u16()? != 0 {
-            return Err(linux(22, "service projection symlink target is invalid"));
+            return Err(ServiceFailure::linux(
+                22,
+                "service projection symlink target is invalid",
+            ));
         }
         let major = input.u32()?;
         let minor = input.u32()?;
@@ -97,7 +106,12 @@ pub fn decode_namespace_install(
             1 => ProjectionKind::Service,
             4 => ProjectionKind::CharacterDevice { major, minor },
             5 => ProjectionKind::BlockDevice { major, minor },
-            _ => return Err(linux(22, "service projection kind is invalid")),
+            _ => {
+                return Err(ServiceFailure::linux(
+                    22,
+                    "service projection kind is invalid",
+                ))
+            }
         };
         entries.push(ServiceProjection {
             path,
@@ -120,7 +134,10 @@ fn validate_projections(
 ) -> Result<(), ServiceFailure> {
     use std::os::unix::ffi::OsStrExt;
     if entries.len() > maximum_entries as usize {
-        return Err(linux(7, "service projection count exceeds launch bound"));
+        return Err(ServiceFailure::linux(
+            7,
+            "service projection count exceeds launch bound",
+        ));
     }
     let mut paths = std::collections::BTreeSet::new();
     for entry in entries {
@@ -142,7 +159,10 @@ fn validate_projections(
             || !paths.insert(entry.path.clone())
             || matches!(entry.kind, ProjectionKind::CharacterDevice { major, minor } | ProjectionKind::BlockDevice { major, minor } if major >= 4096 || minor >= (1 << 20))
         {
-            return Err(linux(22, "invalid or conflicting service projection"));
+            return Err(ServiceFailure::linux(
+                22,
+                "invalid or conflicting service projection",
+            ));
         }
     }
     for path in &paths {
@@ -151,7 +171,10 @@ fn validate_projections(
             .skip(1)
             .any(|ancestor| ancestor != std::path::Path::new("/") && paths.contains(ancestor))
         {
-            return Err(linux(20, "service projection cannot contain descendants"));
+            return Err(ServiceFailure::linux(
+                20,
+                "service projection cannot contain descendants",
+            ));
         }
     }
     Ok(())
