@@ -47,8 +47,9 @@
 //     would persist the PARENT's reloc offsets against the child's re-translated arena, and the next
 //     load's relocation pass would then stomp 16-byte movz/movk sequences over live code at those stale
 //     offsets -> SIGSEGV/hang on the next hit. PCACHE_FORK_HOOK resets the recording state in the child
-//     and bars it from saving; an in-process execve (pcache_exec_reload) fully re-keys + resets state,
-//     which makes saving safe again -- that is exactly the go-build fork+execve case we want cached.
+//     and bars that process lifetime from saving. An in-process execve re-keys + resets state and may
+//     consume an independently-published cache, but it cannot turn inherited process state into a safe
+//     cache-production epoch.
 //   * NEVER SAVE ACROSS A WHOLESALE FLUSH without resetting the records: the dispatcher's cache-full
 //     flush (in-place or stop-the-world) drops/renews the arena, so PCACHE_FLUSH_HOOK zeroes g_nreloc;
 //     everything re-emitted afterwards re-records, keeping "every baked pointer recorded" by construction.
@@ -103,8 +104,7 @@ static uint64_t g_pc_binid;     // identity of the guest binary+interp+argv0+eng
 static uint64_t g_pc_entry;     // initial guest pc (sanity key)
 static int g_pcache_poison;     // an unrecorded baked host pointer may exist -> save() refuses (correctness)
 static int g_pcache_loaded;     // this run restored from cache -> never re-save (arena would snowball)
-static int g_pcache_forked;     // this process is a fork child -> never save (stale-bookkeeping guard);
-                                // cleared by pcache_exec_reload (execve fully re-keys + resets the records)
+static int g_pcache_forked;     // this process is a fork child -> never save (stale-bookkeeping guard)
 static hl_reloc g_reloc_storage[PC_RELOC_CAP];
 static hl_reloc_table g_reloc_table = {g_reloc_storage, 0, (int)PC_RELOC_CAP};
 #define g_reloc (g_reloc_table.records)
@@ -652,8 +652,10 @@ static void pcache_poison_check(void) {
 // The child either KEPT the parent's warm arena (preserved-arena fork: single-threaded parent /
 // MAP_JIT fallback) or got a fresh empty one (threaded rebuild); either way its arena from here on is a
 // fork-private slice whose inherited g_pc_binid/g_pc_entry identity belongs to the PARENT's complete
-// image -- so drop the inherited reloc records and bar this process from saving. An in-process execve
-// re-keys everything and lifts the bar (pcache_exec_reload).
+// image -- so drop the inherited reloc records and bar this process from saving. Execve may safely LOAD
+// an independently-published cache after re-keying, but it must not publish the child epoch: the translated
+// arena still descends from the fork snapshot, and dynamic-loader translations recorded in that epoch have
+// produced invalid warm-cache host branches on AArch64.
 static void pcache_after_fork(void) {
     hl_reloc_reset(&g_reloc_table);
     g_pc_nprov = 0;
@@ -691,16 +693,16 @@ static void pcache_exec_force_interp(void) {
 
 static void pcache_exec_reload(const char *prog_host, const char *interp_host, const char *argv0, uint64_t jump) {
     if (!g_pcache) return;
-    // execve is a full identity + arena reset (thread_exit_others ran; gmap/arena/map/ibtc flushed by
-    // case 221), so the recording state resets with it and saving becomes safe again -- including for a
-    // fork child (this is exactly the fork+execve toolchain case the cache exists for).
+    // Execve re-keys the binary and resets its recording tables. A non-forked process may publish a cold
+    // miss. A fork child remains barred from publishing: resetting g_cp/map/ibtc does not make every
+    // inherited translator datum a pristine cache-production epoch on AArch64. It may still consume a
+    // cache independently published by a non-forked launch.
     hl_reloc_reset(&g_reloc_table);
     g_pc_nprov = 0;
     g_t2n = 0;    // fresh tier-2 slot set for the new image (no cross-image alias)
     txpg_clear(); // nothing is translated now; the set re-fills (or is restored by the load below)
     txln_clear();
     g_pcache_loaded = 0; // allow a cold-miss save of the NEW binary
-    g_pcache_forked = 0;
     g_pc_binid = pcache_make_id(prog_host, interp_host, argv0);
     g_pc_entry = jump;
     int hit = pcache_load(jump);

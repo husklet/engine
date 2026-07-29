@@ -288,7 +288,7 @@ static void fork_child_hooks(struct cpu *c) {
     } // dual map: re-alias RX from the child's COW RW pages at the same VA (~1us; keeps
       // every inherited translation valid) -- or, threaded parent, rebuild a fresh cache
 #ifdef PCACHE_FORK_HOOK
-    PCACHE_FORK_HOOK; // drop inherited reloc records + bar child saves (an execve re-keys + unbars)
+    PCACHE_FORK_HOOK; // drop inherited reloc records + apply the frontend's fork-epoch save policy
 #endif
     G_SHADOW_RESET(c); // §B: child's pre-fork host_rets crossed run_block -> drop, use IBTC
     // Only when jit_after_fork REBUILT the cache at a fresh VA (threaded parent) is every cached body
