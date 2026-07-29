@@ -411,8 +411,7 @@ static inline uint64_t nonpie_unfold(uint64_t storage) {
 // PHYSICALLY readable, so host_range_mapped's page probe wrongly reports it mapped -- and a syscall
 // whose user buffer lands there returns success instead of -EFAULT (LTP sched_getaffinity01's EFAULT
 // case). Track the guest-requested PROT_NONE ranges so host_range_mapped can fault them exactly as the
-// kernel's copy_to_user would. Lock-free like g_gmap/g_anonmap (mem.c): a race can at worst mis-window a
-// concurrently-changing mapping, never corrupt memory. Updated by mmap/mprotect/munmap in mem.c.
+// kernel's copy_to_user would. Readers use the generation as a seqlock while mmap/mprotect/munmap update it.
 #define GNA_MAX 512
 
 static struct {
@@ -1320,10 +1319,11 @@ static void gna_add(uint64_t lo, uint64_t hi) {
     gna_writer_lock();
     atomic_fetch_add_explicit(&g_gna_generation, 1, memory_order_acq_rel);
     gna_clear_raw(lo, hi); // coalesce inside the same odd-generation transaction
-    if (g_ngna < GNA_MAX) {
-        g_gna[g_ngna].lo = lo;
-        g_gna[g_ngna].hi = hi;
-        __atomic_store_n(&g_ngna, g_ngna + 1, __ATOMIC_RELEASE);
+    int count = __atomic_load_n(&g_ngna, __ATOMIC_RELAXED);
+    if (count < GNA_MAX) {
+        __atomic_store_n(&g_gna[count].lo, lo, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_gna[count].hi, hi, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_ngna, count + 1, __ATOMIC_RELEASE);
     }
     atomic_fetch_add_explicit(&g_gna_generation, 1, memory_order_release);
     gna_writer_unlock();
@@ -1342,25 +1342,30 @@ static void gna_clear(uint64_t lo, uint64_t hi) {
 }
 
 static void gna_clear_raw(uint64_t lo, uint64_t hi) {
-    for (int i = 0; i < g_ngna;) {
-        uint64_t b = g_gna[i].lo, e = g_gna[i].hi;
+    int count = __atomic_load_n(&g_ngna, __ATOMIC_RELAXED);
+    for (int i = 0; i < count;) {
+        uint64_t b = __atomic_load_n(&g_gna[i].lo, __ATOMIC_RELAXED);
+        uint64_t e = __atomic_load_n(&g_gna[i].hi, __ATOMIC_RELAXED);
         if (lo >= e || hi <= b) {
             i++;
             continue;
         }
         int keep_head = b < lo, keep_tail = hi < e;
         if (!keep_head && !keep_tail) {
-            g_gna[i] = g_gna[--g_ngna];
+            --count;
+            __atomic_store_n(&g_gna[i].lo, __atomic_load_n(&g_gna[count].lo, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
+            __atomic_store_n(&g_gna[i].hi, __atomic_load_n(&g_gna[count].hi, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
+            __atomic_store_n(&g_ngna, count, __ATOMIC_RELEASE);
             continue;
         }
         if (keep_head)
-            g_gna[i].hi = lo; // trim to the surviving head [b,lo)
+            __atomic_store_n(&g_gna[i].hi, lo, __ATOMIC_RELAXED); // trim to the surviving head [b,lo)
         else
-            g_gna[i].lo = hi;                             // keep_tail only: [hi,e)
-        if (keep_head && keep_tail && g_ngna < GNA_MAX) { // middle grant -> tail becomes a 2nd entry
-            g_gna[g_ngna].lo = hi;
-            g_gna[g_ngna].hi = e;
-            __atomic_store_n(&g_ngna, g_ngna + 1, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_gna[i].lo, hi, __ATOMIC_RELAXED); // keep_tail only: [hi,e)
+        if (keep_head && keep_tail && count < GNA_MAX) {          // middle grant -> tail becomes a 2nd entry
+            __atomic_store_n(&g_gna[count].lo, hi, __ATOMIC_RELAXED);
+            __atomic_store_n(&g_gna[count].hi, e, __ATOMIC_RELAXED);
+            __atomic_store_n(&g_ngna, ++count, __ATOMIC_RELEASE);
         }
         i++;
     }
@@ -1371,21 +1376,36 @@ static int gna_hit(uint64_t a, uint64_t len) {
     if (!len || __atomic_load_n(&g_ngna, __ATOMIC_ACQUIRE) == 0) return 0;
     a = nonpie_unfold(a); // registry keys are guest coordinates; callers may hold either (see the rule above)
     uint64_t end = a + len;
-    uint64_t generation = atomic_load_explicit(&g_gna_generation, memory_order_acquire);
     uint64_t first_page = a >> 12, last_page = (end - 1) >> 12;
     uint32_t slot = (uint32_t)(first_page * 2654435761u) & (GNA_NEGATIVE_N - 1);
-    if (!(generation & 1) && first_page == last_page && g_gna_negative_generation[slot] == generation &&
-        g_gna_negative_page[slot] == first_page)
-        return 0;
-    for (int i = 0; i < g_ngna; i++) {
-        if (a < g_gna[i].hi && end > g_gna[i].lo) return 1;
+    for (int attempt = 0; attempt < 4096; ++attempt) {
+        uint64_t generation = atomic_load_explicit(&g_gna_generation, memory_order_acquire);
+        if (generation & 1) {
+            sched_yield();
+            continue;
+        }
+        if (first_page == last_page && g_gna_negative_generation[slot] == generation &&
+            g_gna_negative_page[slot] == first_page &&
+            atomic_load_explicit(&g_gna_generation, memory_order_acquire) == generation)
+            return 0;
+        int count = __atomic_load_n(&g_ngna, __ATOMIC_ACQUIRE);
+        int hit = 0;
+        for (int i = 0; i < count; ++i) {
+            uint64_t lo = __atomic_load_n(&g_gna[i].lo, __ATOMIC_RELAXED);
+            uint64_t hi = __atomic_load_n(&g_gna[i].hi, __ATOMIC_RELAXED);
+            if (a < hi && end > lo) {
+                hit = 1;
+                break;
+            }
+        }
+        if (atomic_load_explicit(&g_gna_generation, memory_order_acquire) != generation) continue;
+        if (!hit && first_page == last_page) {
+            g_gna_negative_page[slot] = first_page;
+            g_gna_negative_generation[slot] = generation;
+        }
+        return hit;
     }
-    if (!(generation & 1) && first_page == last_page &&
-        atomic_load_explicit(&g_gna_generation, memory_order_acquire) == generation) {
-        g_gna_negative_page[slot] = first_page;
-        g_gna_negative_generation[slot] = generation;
-    }
-    return 0;
+    return 1;
 }
 
 // True iff EVERY guest page of [a,a+len) is in a tracked guest PROT_NONE region -- the whole-MAPPING
@@ -1406,13 +1426,25 @@ static int gna_all(uint64_t a, uint64_t len) {
 static uint64_t gna_prefix(uint64_t a, uint64_t len) {
     if (!len || __atomic_load_n(&g_ngna, __ATOMIC_ACQUIRE) == 0) return len;
     a = nonpie_unfold(a); // guest-keyed registry; the return is a LENGTH, so the coordinate cancels
-    uint64_t end = a + len;
-    for (int i = 0; i < g_ngna; i++)
-        if (a < g_gna[i].hi && end > g_gna[i].lo) {
-            uint64_t first = g_gna[i].lo > a ? g_gna[i].lo : a;
-            if (first - a < end - a) end = first;
+    for (int attempt = 0; attempt < 4096; ++attempt) {
+        uint64_t generation = atomic_load_explicit(&g_gna_generation, memory_order_acquire);
+        if (generation & 1) {
+            sched_yield();
+            continue;
         }
-    return end - a;
+        uint64_t end = a + len;
+        int count = __atomic_load_n(&g_ngna, __ATOMIC_ACQUIRE);
+        for (int i = 0; i < count; ++i) {
+            uint64_t lo = __atomic_load_n(&g_gna[i].lo, __ATOMIC_RELAXED);
+            uint64_t hi = __atomic_load_n(&g_gna[i].hi, __ATOMIC_RELAXED);
+            if (a < hi && end > lo) {
+                uint64_t first = lo > a ? lo : a;
+                if (first - a < end - a) end = first;
+            }
+        }
+        if (atomic_load_explicit(&g_gna_generation, memory_order_acquire) == generation) return end - a;
+    }
+    return 0;
 }
 
 static void gro_add(uint64_t lo, uint64_t hi) {
