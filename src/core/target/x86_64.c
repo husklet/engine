@@ -147,6 +147,28 @@ static const hl_host_services *effective_host_services(void) {
 static void jit86_store_alias_changed(uint64_t guest, uint64_t size);
 static int jit86_store_alias_observation_active(void);
 
+static void jit86_smc_queue_range(uint64_t lo, uint64_t hi, void *opaque) {
+    struct cpu *cpu = opaque;
+    if (hi <= lo) return;
+    if (lo == 0 && hi == UINT64_MAX) {
+        cpu->smc_range_overflow = 1;
+        return;
+    }
+    for (uint64_t index = 0; index < cpu->smc_range_count; ++index) {
+        if (hi < cpu->smc_ranges[index][0] || lo > cpu->smc_ranges[index][1]) continue;
+        if (lo < cpu->smc_ranges[index][0]) cpu->smc_ranges[index][0] = lo;
+        if (hi > cpu->smc_ranges[index][1]) cpu->smc_ranges[index][1] = hi;
+        return;
+    }
+    if (cpu->smc_range_count == X86_SMC_RANGE_CAP) {
+        cpu->smc_range_overflow = 1;
+        return;
+    }
+    cpu->smc_ranges[cpu->smc_range_count][0] = lo;
+    cpu->smc_ranges[cpu->smc_range_count][1] = hi;
+    cpu->smc_range_count++;
+}
+
 static int jit86_avx_memory_read(uint64_t guest, void *destination, size_t length) {
     hl_logical_vma_pin pin = {0};
     int logical = hl_logical_vma_pin_data(guest, length, HL_LOGICAL_VMA_READ, &pin);
@@ -503,9 +525,10 @@ static uint64_t jit86_store_alias_segment(struct cpu *cpu, uint64_t cursor, uint
 
 static void jit86_store_alias_changed(uint64_t guest, uint64_t size) {
     if (size == 0 || guest > UINT64_MAX - size) return;
-    if (!filemap_shared_filter_maybe(guest, size)) return;
     struct cpu *cpu = pthread_getspecific(g_cpu_key);
     if (cpu == NULL) return;
+    if (hl_logical_vma_visit_exec_aliases(guest, guest + size, jit86_smc_queue_range, cpu)) return;
+    if (!filemap_shared_filter_maybe(guest, size)) return;
     uint64_t last = guest + size;
     for (uint64_t cursor = guest; cursor < last;) {
         uint64_t next = jit86_store_alias_segment(cpu, cursor, last);
@@ -646,6 +669,7 @@ static void build_signal_frame(struct cpu *c, int sig, int synchronous) {
         .handler = g_sigact[sig].handler,
         .flags = g_sigact[sig].flags,
         .mask = g_sigact[sig].mask,
+        .error = &g_sigerror[sig],
         .code = synchronous ? &c->sync_code : &g_sigcode[sig],
         .value = &g_sigval[sig],
         .address = synchronous ? &c->sync_address : &g_sigaddr[sig],
@@ -850,11 +874,12 @@ static int container_init(const char *rootfs) {
         container_populate_machine_id(); // /etc/machine-id agreeing with boot_id (if image ships none)
         // Container identity = root (0) by default; HL_UID/HL_GID or typed launch fields override it.
         const char *eu = hl_option_get("HL_UID");
-        if (eu && g_uid < 0) g_uid = hl_parse_id("HL_UID", eu);
+        if (eu) g_uid = hl_parse_id("HL_UID", eu);
         const char *eg = hl_option_get("HL_GID");
-        if (eg && g_gid < 0) g_gid = hl_parse_id("HL_GID", eg);
+        if (eg) g_gid = hl_parse_id("HL_GID", eg);
         if (g_uid < 0) g_uid = 0;
         if (g_gid < 0) g_gid = 0;
+        cred_reset_initial();
     }
     if (!rootfs && (root_handle_bind("/") != 0 || hl_owner_seed("/", NULL, NULL, 0) != 0)) return -1;
     {
@@ -876,11 +901,12 @@ static int container_init(const char *rootfs) {
         const char *vs =
             hl_option_get("HL_VOLUMES"); // bind-mount volumes (env path; bridge usually can't pass env, so --vol too)
         if (vs && vs[0]) {
-            char tmp[2048];
-            snprintf(tmp, sizeof tmp, "%s", vs);
+            char *tmp = strdup(vs);
+            if (tmp == NULL) return -1;
             char *sv;
             for (char *t = strtok_r(tmp, ",", &sv); t; t = strtok_r(NULL, ",", &sv))
                 add_vol(t);
+            free(tmp);
         }
     }
     {

@@ -557,6 +557,26 @@ static void bound_status_from_metadata(hl_linux_file_status *status, const hl_ho
     status->group = metadata->group;
 }
 
+static void bound_virtualize_namespace(int fd, hl_linux_file_status *status) {
+    if (fd < 0 || fd >= HL_NFD || !g_fdpath[fd][0]) return;
+    const hl_provider_node *node =
+        hl_provider_namespace_launch_resolve(g_fdpath[fd], strlen(g_fdpath[fd]));
+    if (node == NULL || node->kind == HL_PROVIDER_NODE_DIRECTORY ||
+        node->kind == HL_PROVIDER_NODE_SYMLINK)
+        return;
+
+    uint32_t type = node->kind == HL_PROVIDER_NODE_CHARACTER ? 0020000 :
+                    node->kind == HL_PROVIDER_NODE_BLOCK ? 0060000 : 0100000;
+    status->mode = type | (node->mode & 07777u);
+    status->user = node->uid;
+    status->group = node->gid;
+    status->special_device =
+        node->kind == HL_PROVIDER_NODE_CHARACTER || node->kind == HL_PROVIDER_NODE_BLOCK
+            ? hl_linux_device_make(node->major, node->minor)
+            : 0;
+    status->link_count = 1;
+}
+
 static bound_mapping *bound_mapping_find(uint64_t address, uint64_t size) {
     bound_mapping **head = bound_mapping_head();
     bound_mapping *entry;
@@ -3512,6 +3532,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         if (result == 0 &&
             guest_accessible_prefix(a1, GUEST_LINUX_STAT_BYTES, HL_LOGICAL_VMA_WRITE) != GUEST_LINUX_STAT_BYTES)
             result = -EFAULT;
+        if (result == 0) bound_virtualize_namespace(source.fd, &status);
         if (result == 0) bound_virtualize_owner(&source, &status);
         if (result == 0) {
             uint8_t encoded[GUEST_LINUX_STAT_BYTES];
@@ -3542,6 +3563,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
         hl_linux_file_status status;
         result = hl_linux_fstat(g_linux_box, source.fd, &status);
         if (result == 0) {
+            bound_virtualize_namespace(source.fd, &status);
             bound_virtualize_owner(&source, &status);
             uint8_t encoded[256];
             bound_fill_statx(encoded, &status);
@@ -3745,6 +3767,56 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
     case 29: {
         uint32_t request = (uint32_t)a1;
         uint64_t guest_argument = a2;
+        if (hl_provider_files_is_handle(source.host_handle)) {
+            uint32_t direction = request >> 30;
+            uint32_t argument_size = (request >> 16) & 0x3fffu;
+            if (argument_size > 16384) {
+                result = -E2BIG;
+                break;
+            }
+            unsigned char *provider_argument =
+                argument_size == 0 ? NULL : calloc(argument_size, 1);
+            if (argument_size != 0 && provider_argument == NULL) {
+                result = -ENOMEM;
+                break;
+            }
+            if (argument_size != 0 && guest_argument == 0) {
+                free(provider_argument);
+                result = -EFAULT;
+                break;
+            }
+            if ((direction & 1u) != 0 &&
+                guest_copy_from(provider_argument, guest_argument, argument_size) != argument_size) {
+                free(provider_argument);
+                result = -EFAULT;
+                break;
+            }
+            hl_provider_ioctl_result ioctl_result = {0};
+            hl_host_result called = hl_provider_files_ioctl(
+                source.host_handle, request, provider_argument, argument_size,
+                &ioctl_result);
+            if (called.status != HL_STATUS_OK)
+                result = called.detail != 0 ? -(int64_t)called.detail
+                                            : bound_host_error(called.status);
+            else
+                result = (int64_t)called.value;
+            if (result >= 0 && (direction & 2u) != 0 &&
+                guest_copy_to(guest_argument, provider_argument, argument_size) != argument_size)
+                result = -EFAULT;
+            if (result >= 0) {
+                for (uint32_t i = 0; i < ioctl_result.write_count; ++i) {
+                    hl_provider_ioctl_write *write = &ioctl_result.writes[i];
+                    if (write->address == 0 ||
+                        guest_copy_to(write->address, write->bytes, write->size) != write->size) {
+                        result = -EFAULT;
+                        break;
+                    }
+                }
+            }
+            hl_provider_files_ioctl_result_destroy(&ioctl_result);
+            free(provider_argument);
+            break;
+        }
         uint8_t argument[44] = {0};
         size_t argument_size = 0;
         int argument_input = 0, argument_output = 0;

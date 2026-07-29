@@ -1355,9 +1355,17 @@ void jit86_faulth(int sig, siginfo_t *si, void *uc) {
     // form it can't decode, falling through to the real diagnostics below. Inert for PIE (g_nonpie_lo == 0).
     if (nonpie_fixup(si, uc)) return;
     struct cpu *c = (struct cpu *)pthread_getspecific(g_cpu_key);
+    extern uint64_t g_prevpc, g_curpc;
+    int diagnostic = open("/tmp/hl-engine-fault.log", O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (diagnostic >= 0) {
+        dprintf(diagnostic, "pid=%d sig=%d addr=%p rip=%#llx curpc=%#llx prevpc=%#llx\n",
+                (int)getpid(), sig, si ? si->si_addr : 0,
+                (unsigned long long)(c ? c->rip : 0),
+                (unsigned long long)g_curpc, (unsigned long long)g_prevpc);
+        close(diagnostic);
+    }
     static const char *nm[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
                                  "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
-    extern uint64_t g_prevpc, g_curpc;
     fprintf(stderr, "[FAULT] sig=%d addr=%p  guest rip(last blk)=%llx  curpc=%llx prevblk=%llx ibranch_src=%llx\n", sig,
             si ? si->si_addr : 0, c ? (unsigned long long)c->rip : 0, (unsigned long long)g_curpc,
             (unsigned long long)g_prevpc, c ? (unsigned long long)c->dbg_ibsrc : 0);

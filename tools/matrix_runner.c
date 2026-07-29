@@ -398,6 +398,7 @@ typedef struct suite_case {
     int needs_rootfs;
     int dynamic_rootfs;
     int mapping_data_rootfs;
+    int translation_reuse;
 } suite_case;
 
 typedef struct capture {
@@ -685,6 +686,7 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
                 goto invalid;
             cases[*case_count].isa = ISA_BOTH;
             cases[*case_count].needs_rootfs = 0;
+            cases[*case_count].translation_reuse = 0;
             cases[*case_count].environment[0] = 0;
             cases[*case_count].argument[0] = 0;
             if (snprintf(cases[*case_count].name, sizeof(cases[*case_count].name), "%s", fields[0]) >=
@@ -747,6 +749,7 @@ static int load_manifest(const char *root, suite_case cases[CASE_MAX], size_t *c
         cases[*case_count].needs_rootfs = strstr(fields[10], "-rootfs") != NULL;
         cases[*case_count].dynamic_rootfs = strstr(fields[10], "dynamic-rootfs") != NULL;
         cases[*case_count].mapping_data_rootfs = strstr(fields[10], "mapping-data-rootfs") != NULL;
+        cases[*case_count].translation_reuse = strstr(fields[10], "translation-reuse") != NULL;
         cases[*case_count].argument[0] = 0;
         if (strncmp(fields[6], "argv:", 5) == 0 &&
             snprintf(cases[*case_count].argument, sizeof(cases[*case_count].argument), "%s", fields[6] + 5) >=
@@ -1667,6 +1670,67 @@ static int exit_matches(const capture *result, int expected) {
     return WIFEXITED(result->wait_status) && WEXITSTATUS(result->wait_status) == expected;
 }
 
+/*
+ * The guest emits a marker immediately before each exit_group. With launches
+ * serialized by waitpid, the next translate log belongs to that marked
+ * process. A no-exec child has already inherited and executed the warmed
+ * corpus, so its total translation count bounds the work rebuilt after fork.
+ * Exec children remain correctness/control samples and are not budgeted.
+ */
+static int translation_reuse_matches(const suite_case *item, const char *isa, const capture *result) {
+    enum { REUSE_BLOCK_BUDGET = 128 };
+    const char marker[] = "[cache-reuse] kind=";
+    const char blocks[] = "[hl:translate] blocks=";
+    char *text, *line, *save = NULL;
+    uint64_t parent = 0, noexec_max = 0, exec_max = 0;
+    unsigned fork_count = 0, clone_count = 0, exec_count = 0;
+    int kind = 0;
+    if (!item->translation_reuse || getenv("HL_MATRIX_TRANSLATION_REUSE") == NULL) return 1;
+    text = malloc(result->error_size + 1u);
+    if (text == NULL) return 0;
+    memcpy(text, result->error, result->error_size);
+    text[result->error_size] = 0;
+    for (line = strtok_r(text, "\n", &save); line != NULL; line = strtok_r(NULL, "\n", &save)) {
+        const char *found = strstr(line, marker);
+        if (found != NULL) {
+            const char *name = found + sizeof marker - 1u;
+            kind = strcmp(name, "fork") == 0 ? 1
+                   : strcmp(name, "clone3") == 0 ? 2
+                   : strcmp(name, "exec") == 0   ? 3
+                   : strcmp(name, "parent") == 0 ? 4
+                                                  : 0;
+            continue;
+        }
+        found = strstr(line, blocks);
+        if (found != NULL && kind != 0) {
+            char *end = NULL;
+            uint64_t count = strtoull(found + sizeof blocks - 1u, &end, 10);
+            if (end == found + sizeof blocks - 1u) continue;
+            if (kind == 1) {
+                fork_count++;
+                if (count > noexec_max) noexec_max = count;
+            } else if (kind == 2) {
+                clone_count++;
+                if (count > noexec_max) noexec_max = count;
+            } else if (kind == 3) {
+                exec_count++;
+                if (count > exec_max) exec_max = count;
+            } else {
+                parent = count;
+            }
+            kind = 0;
+        }
+    }
+    free(text);
+    fprintf(stderr,
+            "matrix-runner: %s [%s] translation reuse parent=%llu noexec_max=%llu budget=%u "
+            "exec_max=%llu samples=%u/%u/%u\n",
+            item->name, isa, (unsigned long long)parent, (unsigned long long)noexec_max,
+            REUSE_BLOCK_BUDGET, (unsigned long long)exec_max, fork_count, clone_count, exec_count);
+    return parent != 0 && fork_count == 4 && clone_count == 4 && exec_count == 4 &&
+           noexec_max <= REUSE_BLOCK_BUDGET;
+}
+
 static void diagnostic(const suite_case *item, const char *isa, const char *reason, const capture *result) {
     if (hl_tool_config_github_actions())
         fprintf(stderr, "::error title=Compatibility failure (%s %s)::%s\n", item->name, isa, reason);
@@ -1765,11 +1829,30 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
         return 1;
     }
     /* A bare name is resolved through the guest rootfs PATH without bridge-side path translation. */
+    char *saved_log = NULL;
+    int measure_reuse = item->translation_reuse && getenv("HL_MATRIX_TRANSLATION_REUSE") != NULL;
+    if (measure_reuse) {
+        const char *current = getenv("HL_LOG");
+        if (current != NULL) saved_log = strdup(current);
+        if (setenv("HL_LOG", "translate", 1) != 0) {
+            free(expected);
+            free(saved_log);
+            return 1;
+        }
+    }
     status = run_guest(bridge, engine, item->needs_rootfs ? "/bin/guest" : guest, item->argument,
                        item->needs_rootfs ? rootfs : NULL, item->environment, binary_root, result);
+    if (measure_reuse) {
+        if (saved_log != NULL)
+            (void)setenv("HL_LOG", saved_log, 1);
+        else
+            (void)unsetenv("HL_LOG");
+        free(saved_log);
+    }
     if (item->needs_rootfs) remove_rootfs(rootfs);
+    int reuse_ok = translation_reuse_matches(item, isa, result);
     if (status != 0 || !exit_matches(result, item->expected_exit) || result->output_size != expected_size ||
-        memcmp(result->output, expected, expected_size) != 0) {
+        memcmp(result->output, expected, expected_size) != 0 || !reuse_ok) {
         size_t common = result->output_size < expected_size ? result->output_size : expected_size;
         size_t mismatch = 0;
         while (mismatch < common && result->output[mismatch] == expected[mismatch])
@@ -1786,7 +1869,8 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
 #if defined(_WIN32)
                    : status == 4 ? stall_unanswerable_reason()
 #endif
-                                 : "exit/stdout mismatch",
+                   : measure_reuse && !reuse_ok ? "translation reuse threshold exceeded"
+                                                : "exit/stdout mismatch",
                    result);
         free(expected);
         return 1;

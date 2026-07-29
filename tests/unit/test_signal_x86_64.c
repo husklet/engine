@@ -21,11 +21,12 @@ int main(void) {
     _Alignas(16) uint8_t stack[16384];
     struct cpu cpu;
     struct cpu saved;
-    int code = -6, pid = 123, uid = 456;
+    int error = 77, code = -6, pid = 123, uid = 456;
     uint64_t value = UINT64_C(0xabcdef0123456789), address = UINT64_C(0x99887766);
     hl_x86_signal_state state = {
         .handler = UINT64_C(0x70001000),
         .mask = UINT64_C(0x200),
+        .error = &error,
         .code = &code,
         .value = &value,
         .address = &address,
@@ -60,9 +61,10 @@ int main(void) {
     HL_CHECK(uc == ((saved.r[4] - 2048) & ~UINT64_C(15)));
     HL_CHECK(cpu.r[4] == uc - 8 && load_u64(cpu.r[4]) == state.sigreturn_pc);
     HL_CHECK(cpu.r[7] == 12 && cpu.r[6] == uc + 512 && cpu.rip == state.handler);
+    HL_CHECK(*(const int *)(uintptr_t)(uc + 516) == 77);
     HL_CHECK(load_u64(mc + 16 * 8) == saved.rip);
     HL_CHECK(load_u64(uc + 296) == saved.sigmask);
-    HL_CHECK(code == 0 && value == 0 && address == 0 && pid == 0 && uid == 0);
+    HL_CHECK(error == 0 && code == 0 && value == 0 && address == 0 && pid == 0 && uid == 0);
     HL_CHECK(cpu.sigmask == (saved.sigmask | state.mask | (UINT64_C(1) << 11)));
 
     /* Sigreturn restores the frame, including edits made by the handler. */

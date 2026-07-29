@@ -12,11 +12,11 @@ use hl_engine::{
     extension::{
         AllocationRequest, Authorities, BindAccess, Coherency, DeviceEntry, DeviceKind,
         DirectoryEntry, ExtensionConfig, ExtensionSpec, Feature, FileEntry, FileSource,
-        HandleOperation, Handles, HostBindEntry, HostResource, Inheritance, Interest, LinuxError,
-        Memory, MemoryRequirement, Metadata, NamespaceEntry, OpenHandle, OpenRequest, Protections,
-        ProviderAuthority, ProviderId, ReadRequest, Readiness, ReadyState, Region,
-        ResourceDescriptor, ResourceError, ResourceId, ServiceEntry, ServiceId,
-        ServiceRegistration, Sharing, SymlinkEntry, WriteRequest,
+        HandleOperation, Handles, HostBindEntry, HostResource, Inheritance, Interest, IoctlRequest,
+        IoctlResult, IoctlWrite, LinuxError, Memory, MemoryRequirement, Metadata, NamespaceEntry,
+        OpenHandle, OpenRequest, Protections, ProviderAuthority, ProviderId, ReadRequest,
+        Readiness, ReadyState, Region, ResourceDescriptor, ResourceError, ResourceId, ServiceEntry,
+        ServiceId, ServiceRegistration, Sharing, SymlinkEntry, WriteRequest,
     },
     network::Namespace,
     spec::{NetworkMode, SpecErrorCategory, TreeSource, Version},
@@ -184,6 +184,26 @@ fn bound_xattr_errno_probe(guest: Guest) -> &'static str {
         Guest::Aarch64 => "/tmp/fgetxattr-bound-errno-aarch64",
         Guest::X86_64 => "/tmp/fgetxattr-bound-errno-x86_64",
     }
+}
+
+#[test]
+fn seccomp_trap_delivers_linux_sigsys_metadata() {
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/seccomp-trap-probe-aarch64"),
+        rootfs().join("tmp/seccomp-trap-probe"),
+    )
+    .unwrap();
+    let mut spec = MachineSpec::new(Guest::Aarch64, "/tmp/seccomp-trap-probe");
+    spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
+
+    assert_eq!(
+        Engine::new()
+            .spawn(spec, ProcessIo::default())
+            .unwrap()
+            .wait()
+            .unwrap(),
+        Exit::Code(0)
+    );
 }
 
 #[test]
@@ -715,7 +735,171 @@ run'"
     spec.extensions.push(namespace_extension(b"projected\n"));
     let validation = Engine::new().validate(&spec).unwrap();
     assert_eq!(validation.selected_extensions.len(), 1);
+    let mut machine = Engine::new()
+        .spawn(
+            spec,
+            ProcessIo {
+                stdout: hl_engine::Stdio::piped(),
+                ..ProcessIo::default()
+            },
+        )
+        .unwrap();
+    let mut output = String::new();
+    machine
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(machine.wait().unwrap(), Exit::Code(0), "{output}");
+}
+
+#[test]
+fn projected_symlink_accepts_delimiters_in_a_valid_unix_path() {
+    let mut extension = namespace_extension(b"unused");
+    extension.namespace = vec![NamespaceEntry::Symlink(SymlinkEntry {
+        path: "/sys/dev/char/226:128".into(),
+        target: "/sys/devices/platform/hl-gpu/drm/renderD128".into(),
+        uid: 0,
+        gid: 0,
+    })];
+    let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/sh");
+    spec.process
+        .argv
+        .extend(["-c".into(), "readlink /sys/dev/char/226:128".into()]);
+    spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
+    spec.extensions.push(extension);
+
+    let mut machine = Engine::new()
+        .spawn(
+            spec,
+            ProcessIo {
+                stdout: hl_engine::Stdio::piped(),
+                ..ProcessIo::default()
+            },
+        )
+        .unwrap();
+    let mut output = String::new();
+    machine
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+
+    assert_eq!(machine.wait().unwrap(), Exit::Code(0));
+    assert_eq!(output.trim(), "/sys/devices/platform/hl-gpu/drm/renderD128");
+}
+
+#[test]
+fn readlink_follows_intermediate_projected_symlinks() {
+    let base = std::env::temp_dir().join(format!(
+        "hl-projected-symlink-overlay-{}",
+        std::process::id()
+    ));
+    let upper = base.join("upper");
+    let work = base.join("work");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&upper).unwrap();
+    fs::create_dir_all(&work).unwrap();
+
+    let mut extension = namespace_extension(b"unused");
+    extension.namespace = vec![
+        NamespaceEntry::Symlink(SymlinkEntry {
+            path: "/sys/dev/char/226:128".into(),
+            target: "/sys/devices/platform/hl-gpu/drm/renderD128".into(),
+            uid: 0,
+            gid: 0,
+        }),
+        NamespaceEntry::Symlink(SymlinkEntry {
+            path: "/sys/devices/platform/hl-gpu/drm/renderD128/device".into(),
+            target: "../..".into(),
+            uid: 0,
+            gid: 0,
+        }),
+        NamespaceEntry::Symlink(SymlinkEntry {
+            path: "/sys/devices/platform/hl-gpu/subsystem".into(),
+            target: "/sys/bus/platform".into(),
+            uid: 0,
+            gid: 0,
+        }),
+    ];
+    let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/sh");
+    spec.process.argv.extend([
+        "-c".into(),
+        "readlink /sys/dev/char/226:128/device/subsystem".into(),
+    ]);
+    spec.filesystem.root = Some(TreeSource::Overlay {
+        lower: vec![TreeSource::HostDirectory(rootfs().clone())],
+        upper,
+        work,
+    });
+    spec.extensions.push(extension);
+
+    let validation = Engine::new().validate(&spec).unwrap();
+    assert_eq!(validation.selected_extensions.len(), 1);
+    let mut machine = Engine::new()
+        .spawn(
+            spec,
+            ProcessIo {
+                stdout: hl_engine::Stdio::piped(),
+                ..ProcessIo::default()
+            },
+        )
+        .unwrap();
+    let mut output = String::new();
+    machine
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(machine.wait().unwrap(), Exit::Code(0), "{output}");
+    assert_eq!(output.lines().next(), Some("/sys/bus/platform"), "{output}");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn setuid_exec_uses_guest_mode_and_ownership() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source =
+        std::env::temp_dir().join(format!("hl-setuid-exec-probe-{}.c", std::process::id()));
+    fs::write(
+        &source,
+        r"
+#include <unistd.h>
+int main(void) {
+    return getuid() == 1000 && geteuid() == 0 ? 0 : 20;
+}
+",
+    )
+    .unwrap();
+    let executable = rootfs().join("tmp/setuid-exec-probe");
+    assert!(Command::new("cc")
+        .args(["-static", "-O2", "-o"])
+        .arg(&executable)
+        .arg(&source)
+        .status()
+        .unwrap()
+        .success());
+    let _ = fs::remove_file(source);
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o4755)).unwrap();
+
+    let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/sh");
+    spec.process
+        .argv
+        .extend(["-c".into(), "exec /tmp/setuid-exec-probe".into()]);
+    spec.identity.uid = Some(1000);
+    spec.identity.gid = Some(1000);
+    spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
+    spec.filesystem
+        .ownership
+        .push(hl_engine::spec::InitialOwnership {
+            path: "/tmp/setuid-exec-probe".into(),
+            uid: 0,
+            gid: 0,
+        });
+
     let machine = Engine::new().spawn(spec, ProcessIo::default()).unwrap();
+
     assert_eq!(machine.wait().unwrap(), Exit::Code(0));
 }
 
@@ -1714,6 +1898,28 @@ impl OpenHandle for BasicHandle {
         })
     }
 
+    fn ioctl(&self, request: IoctlRequest) -> Result<IoctlResult, LinuxError> {
+        match request.command {
+            0xc004_6801 if request.argument == 7_u32.to_ne_bytes() => Ok(IoctlResult {
+                value: 0,
+                argument: 0x1234_5678_u32.to_ne_bytes().to_vec(),
+                writes: Vec::new(),
+            }),
+            0xc010_6802 if request.argument.len() == 16 => Ok(IoctlResult {
+                value: 0,
+                argument: request.argument.clone(),
+                writes: vec![IoctlWrite {
+                    address: u64::from_ne_bytes(request.argument[0..8].try_into().unwrap()),
+                    bytes: b"provider".to_vec(),
+                }],
+            }),
+            _ => Err(LinuxError {
+                errno: 22,
+                context: "unexpected test ioctl".into(),
+            }),
+        }
+    }
+
     fn readiness(&self, _interest: Interest) -> Result<Readiness, LinuxError> {
         Ok(Readiness {
             states: BTreeSet::from([ReadyState::Readable, ReadyState::Writable]),
@@ -1767,6 +1973,58 @@ fn handles_extension() -> ExtensionSpec {
         memory: Vec::new(),
         environment: Vec::new(),
     }
+}
+
+#[test]
+fn provider_launch_returns_before_a_piped_stdin_read_completes() {
+    let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/sh");
+    spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
+    spec.process.argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "read line; printf 'read:%s\\n' \"$line\"".into(),
+    ];
+    spec.extensions.push(handles_extension());
+
+    let mut authority = HandlesAuthority::new();
+    authority
+        .grant(
+            ProviderId::new("engine.handles").unwrap(),
+            Arc::new(BasicHandles {
+                closes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        )
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut machine = Engine::new()
+        .spawn_with_authority(
+            spec,
+            ProcessIo {
+                stdin: hl_engine::Stdio::Piped,
+                stdout: hl_engine::Stdio::Piped,
+                stderr: hl_engine::Stdio::Null,
+            },
+            authority,
+        )
+        .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "launch waited for guest stdin"
+    );
+
+    machine
+        .take_stdin()
+        .unwrap()
+        .write_all(b"provider-input\n")
+        .unwrap();
+    let mut output = String::new();
+    machine
+        .take_stdout()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(machine.wait().unwrap(), Exit::Code(0));
+    assert_eq!(output, "read:provider-input\n");
 }
 
 fn memory_extension() -> ExtensionSpec {
@@ -1973,7 +2231,7 @@ fn handle_services_require_launch_scoped_authority_and_reject_unadvertised_opera
 
     spec.extensions[0].services[0]
         .operations
-        .insert(HandleOperation::Ioctl);
+        .insert(HandleOperation::Seek);
     assert_eq!(
         Engine::new().validate(&spec).unwrap_err().category,
         SpecErrorCategory::Unsupported
@@ -2065,6 +2323,56 @@ int main(int argc, char **argv) {
     assert_eq!(closes.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
+fn compile_projected_device_probe() -> PathBuf {
+    let source =
+        std::env::temp_dir().join(format!("hl-provider-device-open-{}.c", std::process::id()));
+    fs::write(
+        &source,
+        r#"
+#include <dirent.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+int main(void) {
+  DIR *directory = opendir("/dev/dri");
+  if (!directory) return 10;
+  int found = 0;
+  struct dirent *entry;
+  while ((entry = readdir(directory)))
+    if (!strcmp(entry->d_name, "renderD128")) found = 1;
+  closedir(directory);
+  if (!found) return 11;
+  int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+  if (fd < 0) return 12;
+  struct stat status;
+  if (fstat(fd, &status)) return 13;
+  if (!S_ISCHR(status.st_mode)) return 14;
+  if (major(status.st_rdev) != 226 || minor(status.st_rdev) != 128) return 15;
+  unsigned value = 7;
+  if (ioctl(fd, 0xc0046801u, &value) || value != 0x12345678u) return 16;
+  char output[8] = {0};
+  struct { char *address; unsigned long size; } indirect = {output, sizeof output};
+  if (ioctl(fd, 0xc0106802u, &indirect) || memcmp(output, "provider", 8)) return 17;
+  return 0;
+}
+"#,
+    )
+    .unwrap();
+    let guest = rootfs().join(format!("tmp/provider-device-open-{}", std::process::id()));
+    assert!(Command::new("cc")
+        .args(["-static", "-O2", "-o"])
+        .arg(&guest)
+        .arg(&source)
+        .status()
+        .unwrap()
+        .success());
+    let _ = fs::remove_file(source);
+    guest
+}
+
 #[test]
 fn projected_directory_exposes_a_service_backed_device_to_a_real_guest() {
     if engine_env::skip_without_rootfs(
@@ -2072,6 +2380,7 @@ fn projected_directory_exposes_a_service_backed_device_to_a_real_guest() {
     ) {
         return;
     }
+    let guest = compile_projected_device_probe();
     let base =
         std::env::temp_dir().join(format!("hl-provider-device-overlay-{}", std::process::id()));
     let upper = base.join("upper");
@@ -2099,6 +2408,12 @@ fn projected_directory_exposes_a_service_backed_device_to_a_real_guest() {
     extension.services[0]
         .operations
         .insert(HandleOperation::Metadata);
+    extension.services[0]
+        .operations
+        .insert(HandleOperation::Ioctl);
+    extension
+        .required_features
+        .insert(Feature::new("ioctl").unwrap());
     let directory = ExtensionSpec {
         provider: ProviderId::new("engine.namespace").unwrap(),
         version: Version::new(1, 0),
@@ -2120,16 +2435,15 @@ fn projected_directory_exposes_a_service_backed_device_to_a_real_guest() {
         memory: Vec::new(),
         environment: Vec::new(),
     };
-    let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/sh");
+    let mut spec = MachineSpec::new(
+        Guest::Aarch64,
+        PathBuf::from("/").join(guest.strip_prefix(rootfs()).unwrap()),
+    );
     spec.filesystem.root = Some(TreeSource::Overlay {
         lower: vec![TreeSource::HostDirectory(rootfs().clone())],
         upper,
         work,
     });
-    spec.process.argv.extend([
-        "-c".into(),
-        "test \"$(ls /dev/dri)\" = renderD128 || exit 10; test -c /dev/dri/renderD128 || exit 11; exec 3</dev/dri/renderD128 || exit 13".into(),
-    ]);
     spec.extensions.extend([directory, extension]);
 
     let mut authority = HandlesAuthority::new();
@@ -2147,6 +2461,7 @@ fn projected_directory_exposes_a_service_backed_device_to_a_real_guest() {
         .unwrap()
         .wait()
         .unwrap();
+    let _ = fs::remove_file(guest);
     let _ = fs::remove_dir_all(&base);
     assert_eq!(exit, Exit::Code(0));
 }

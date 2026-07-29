@@ -182,16 +182,13 @@ static void fd_carry_virt(int newfd, int oldfd, struct fdvis_reservation *reserv
 #define G_O_DIRECT 0x10000 // aarch64 / asm-generic
 #endif
 
-// Guest O_LARGEFILE, likewise per-arch (x86-64 = 0100000 = 0x8000, aarch64/asm-generic = 0400000 =
-// 0x20000). A 64-bit Linux kernel FORCES this bit on in every open(): do_dentry_open() sets
-// FMODE_LARGEFILE unconditionally on 64-bit and force_o_largefile() makes O_LARGEFILE part of f_flags,
-// so F_GETFL on ANY fd reports it. The engine rebuilt the flag word from scratch and never set it, so
-// fcntl(fd, F_GETFL) returned 2 where Linux returns 0x20002 -- a mismatch for anything that round-trips
-// F_GETFL/F_SETFL or compares the word against O_ACCMODE|O_LARGEFILE.
+// x86-64 exposes its historical kernel O_LARGEFILE bit through F_GETFL. Native AArch64 does not: its
+// 64-bit ABI defines libc O_LARGEFILE as zero and F_GETFL on files and sockets omits the asm-generic
+// 0x20000 value. Inventing that bit makes a valid F_GETFL/F_SETFL round trip fail Chromium's seccomp mask.
 #if G_O_DIRECTORY == 0x10000
 #define G_O_LARGEFILE 0x8000 // x86-64
 #else
-#define G_O_LARGEFILE 0x20000 // aarch64 / asm-generic
+#define G_O_LARGEFILE 0 // aarch64
 #endif
 
 /* FUSE/shared host mounts may expose regular I/O but reject sparse seeking. Keep Linux guest semantics
@@ -822,8 +819,10 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 uint8_t info[128] = {0};
                 uint32_t signo = (uint32_t)sig, pid = (uint32_t)(popped ? ent.pid : g_sigpid[sig]);
                 uint32_t uid = (uint32_t)(popped ? ent.uid : g_siguid[sig]);
+                int32_t error = popped ? ent.error : g_sigerror[sig];
                 int32_t code = popped ? ent.code : g_sigcode[sig];
                 memcpy(info, &signo, sizeof(signo));
+                memcpy(info + 4, &error, sizeof(error));
                 memcpy(info + 8, &code, sizeof(code));
                 memcpy(info + 12, &pid, sizeof(pid));
                 memcpy(info + 16, &uid, sizeof(uid));
@@ -836,6 +835,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                     break;
                 }
                 if (!popped) {
+                    g_sigerror[sig] = 0;
                     g_sigcode[sig] = 0;
                     g_sigval[sig] = 0;
                     g_sigpid[sig] = 0;
@@ -2035,7 +2035,7 @@ static int svc_io(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 have_fgetpath = 1;
                 if (proc_text_host_path(fgetpath_buf)) lf &= ~0x3;
             }
-            // 64-bit Linux always reports O_LARGEFILE (see G_O_LARGEFILE above).
+            // Preserve the architecture's native F_GETFL representation (see G_O_LARGEFILE above).
             lf |= G_O_LARGEFILE;
             if (r & O_APPEND) lf |= 0x400;
             if (r & O_NONBLOCK) lf |= 0x800;

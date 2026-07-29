@@ -502,6 +502,21 @@ static void ep_rearm_from_interest(int ep, int ident, int slot) {
     }
 }
 
+static void ep_rearm_native_watch(const ep_native_watch *watch) {
+    uint16_t flags =
+        (uint16_t)((watch->events & UINT32_C(0x80000000) ? EV_CLEAR : 0) |
+                   (watch->events & UINT32_C(0x40000000) ? EV_ONESHOT : 0));
+    struct kevent changes[2];
+    int count = 0;
+    if (watch->armed & 1u)
+        EV_SET(&changes[count++], watch->descriptor, EVFILT_READ, EV_ADD | flags, 0, 0,
+               (void *)(uintptr_t)watch->data);
+    if (watch->armed & 2u)
+        EV_SET(&changes[count++], watch->descriptor, EVFILT_WRITE, EV_ADD | flags, 0, 0,
+               (void *)(uintptr_t)watch->data);
+    if (count) (void)kevent(watch->epoll, changes, count, NULL, 0, NULL);
+}
+
 // A watched fd is being closed. If a dup keeps its OPEN FILE DESCRIPTION alive, Linux keeps the epoll
 // registration (readiness must persist), but the macOS kqueue knote dies with the fd NUMBER. Re-home the
 // registration onto a surviving alias of the same OFD so readiness continues to be reported with the same
@@ -526,15 +541,10 @@ static void ep_close_rehome(int fd) {
         }
         (void)hl_native_kevent_rehome(owner, fd, y);
 #else
-        struct kevent changes[2];
-        int count = 0;
-        uint16_t flags = (uint16_t)((watch->events & UINT32_C(0x80000000) ? EV_CLEAR : 0) |
-                                    (watch->events & UINT32_C(0x40000000) ? EV_ONESHOT : 0));
-        if (watch->armed & 1u)
-            EV_SET(&changes[count++], y, EVFILT_READ, EV_ADD | flags, 0, 0, (void *)(uintptr_t)watch->data);
-        if (watch->armed & 2u)
-            EV_SET(&changes[count++], y, EVFILT_WRITE, EV_ADD | flags, 0, 0, (void *)(uintptr_t)watch->data);
-        if (count) (void)kevent(owner, changes, count, NULL, 0, NULL);
+        int descriptor = watch->descriptor;
+        watch->descriptor = y;
+        ep_rearm_native_watch(watch);
+        watch->descriptor = descriptor;
 #endif
         watch->descriptor = y;
         watch->logical_descriptor = y;
@@ -690,27 +700,28 @@ static void kqueue_rebuild_after_fork(void) {
     memset(g_ep_os, 0, sizeof g_ep_os);
     // the rebuilt kqueues carry no EVFILT_USER wake knote either -> re-arm lazily on next epoll op
     memset(g_ep_wake_armed, 0, sizeof g_ep_wake_armed);
-    // Linux children INHERIT the parent's epoll interest list. The interest table (fd -> owner+events+udata)
-    // survived the fork via COW, and the watched fds are ordinary inherited descriptors, so re-arm every
-    // recorded registration on its owning (rebuilt, empty) epoll kqueue and restore the armed maps + the
-    // membership we just cleared. A child that epoll_waits WITHOUT re-registering now sees inherited events
-    // (the timerfd/inotify halves are re-armed in the rebuild loop above).
-    for (int fd = 0; fd < HL_NFD; fd++) {
-        if (!g_ep_owner[fd]) continue;
-        int ep = g_ep_owner[fd] - 1;
-        int drop = (ep < 0 || ep >= HL_NFD || !g_epoll[ep] || fcntl(ep, F_GETFD) == -1 || fcntl(fd, F_GETFD) == -1);
-        if (drop) { // owner epoll or watched fd did not survive into the child -> drop the stale entry
-            g_ep_owner[fd] = 0;
-            g_ep_events[fd] = 0;
-            g_ep_udata[fd] = 0;
+    // Linux children inherit every registration in every epoll instance. A descriptor can be watched by
+    // more than one instance with different events and user data, so the old descriptor-indexed
+    // g_ep_owner table was insufficient here: the last EPOLL_CTL_ADD silently replaced every earlier owner
+    // during the child rebuild. The pair-indexed native watch table is the authoritative interest list.
+    for (uint32_t index = 0; index < EP_NATIVE_WATCH_LIMIT; ++index) {
+        ep_native_watch *watch = &g_ep_native_watches[index];
+        if (__atomic_load_n(&watch->active, __ATOMIC_ACQUIRE) != 1) continue;
+        int ep = watch->epoll;
+        int fd = watch->descriptor;
+        int drop = ep < 0 || ep >= HL_NFD || !g_epoll[ep] || fcntl(ep, F_GETFD) == -1 ||
+                   fcntl(fd, F_GETFD) == -1;
+        if (drop) {
+            __atomic_store_n(&watch->active, 0, __ATOMIC_RELEASE);
             continue;
         }
-        ep_rearm_from_interest(ep, fd, fd);
-        uint32_t ev = g_ep_events[fd];
-        g_ep_rd[fd] = (ev & 0x1) ? 1 : 0;
-        g_ep_wr[fd] = (ev & 0x4) ? 1 : 0;
-        g_ep_os[fd] = (ev & 0x40000000u) ? 1 : 0;
-        ep_mem_set(ep, fd, 1);
+        ep_rearm_native_watch(watch);
+        if (fd < HL_NFD) {
+            g_ep_rd[fd] |= (watch->armed & 1u) != 0;
+            g_ep_wr[fd] |= (watch->armed & 2u) != 0;
+            g_ep_os[fd] |= (watch->events & UINT32_C(0x40000000)) != 0;
+            ep_mem_set(ep, fd, 1);
+        }
     }
     // fork() only clones the calling thread: if a peer M held g_ep_mtx (mid epoll_ctl/epoll_wait) at fork
     // time the child inherits it LOCKED with no owner, so its next svc_event ep_lock() deadlocks forever

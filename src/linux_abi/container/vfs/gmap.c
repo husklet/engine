@@ -140,6 +140,8 @@ static void hl_gmap_reserve_one(void) {
     g_gmap.mapping_capacity = capacity;
 }
 
+static void hl_gmap_split_range(uint64_t start, uint64_t end);
+
 void hl_gmap_add(uint64_t address, uint64_t length) {
     hl_gmap_add_physical(address, length, address, length);
 }
@@ -150,6 +152,7 @@ void hl_gmap_add_physical(uint64_t address, uint64_t length, uint64_t physical_a
         physical_address > UINT64_MAX - physical_length || physical_address > address ||
         address + length > physical_address + physical_length)
         return;
+    hl_gmap_split_range(address, address + length);
     hl_gmap_reserve_one();
     entry = &g_gmap.mappings[g_gmap.mapping_count++];
     entry->address = address;
@@ -224,8 +227,6 @@ int hl_gmap_contains(uint64_t address, uint64_t length) {
     }
     return at >= end;
 }
-
-static void hl_gmap_split_range(uint64_t start, uint64_t end);
 
 /* MAP_FIXED replaces whatever the range held, so the registry entries it overlapped must be split the way
    the kernel splits the VMAs -- otherwise the superseded reservation stays whole and /proc/[pid]/maps emits

@@ -241,6 +241,7 @@ struct ckpt_socket_queue_frame {
 struct ckpt_signal_state {
     uint64_t magic;
     uint64_t pending;
+    int32_t error[65];
     int32_t code[65];
     int32_t pid[65];
     int32_t uid[65];
@@ -316,6 +317,7 @@ static int ckpt_dump_signal_state(struct ckpt_sink *sink, const char *group) {
     if (state == NULL) return -1;
     state->magic = CKPT_SIGNAL_MAGIC;
     state->pending = __atomic_load_n(&g_pending, __ATOMIC_SEQ_CST);
+    memcpy(state->error, g_sigerror, sizeof state->error);
     memcpy(state->code, g_sigcode, sizeof state->code);
     memcpy(state->pid, g_sigpid, sizeof state->pid);
     memcpy(state->uid, g_siguid, sizeof state->uid);
@@ -352,6 +354,7 @@ static int ckpt_restore_signal_state(const char *procdir) {
             free(state);
             return -1;
         }
+    memcpy(g_sigerror, state->error, sizeof state->error);
     memcpy(g_sigcode, state->code, sizeof state->code);
     memcpy(g_sigpid, state->pid, sizeof state->pid);
     memcpy(g_siguid, state->uid, sizeof state->uid);

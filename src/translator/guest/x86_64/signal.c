@@ -81,6 +81,7 @@ void hl_x86_signal_build(struct cpu *c, int sig, const hl_x86_signal_state *stat
     *(uint64_t *)(xe + 392) = c->fpsw;
     *(uint64_t *)(xe + 400) = c->fpcw;
     *(int *)(info + 0) = sig;                   // siginfo.si_signo
+    *(int *)(info + 4) = *state->error;         // si_errno (seccomp trap data; otherwise zero)
     *(int *)(info + 8) = *state->code;          // si_code (SI_QUEUE for sigqueue, else 0)
     *(uint64_t *)(info + 16) = *state->address; // si_addr (synchronous fault address; 0 for async)
     *(uint64_t *)(info + 24) = *state->value;   // si_value
@@ -90,6 +91,7 @@ void hl_x86_signal_build(struct cpu *c, int sig, const hl_x86_signal_state *stat
         *(int *)(info + 16) = *state->pid;
         *(int *)(info + 20) = *state->uid;
     }
+    *state->error = 0;
     *state->code = 0;
     *state->value = 0;
     *state->address = 0;

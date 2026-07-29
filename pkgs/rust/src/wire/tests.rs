@@ -146,6 +146,28 @@ fn overlay_paths_are_ordered_nul_records() {
 }
 
 #[test]
+fn volume_records_escape_valid_unix_path_delimiters() {
+    let mut config = Config::new();
+    config.mounts.push(crate::Mount::read_only(
+        "/host/with,comma",
+        "/guest/with:colon",
+    ));
+    config.namespace_links.push((
+        "/projection/sys/dev/char/226:128".into(),
+        "/sys/dev/char/226:128".into(),
+    ));
+
+    let wire = LaunchWire::encode(&config, &[OsString::from("/bin/true")], None).unwrap();
+    assert_eq!(
+        string(&wire, VOLUMES_OFFSET),
+        Some(
+            "v2:ro:/guest/with%3Acolon:/host/with%2Ccomma,\
+v2:link:/sys/dev/char/226%3A128:/projection/sys/dev/char/226%3A128"
+        )
+    );
+}
+
+#[test]
 fn filesystem_generation_uses_the_c_abi_offset_and_rejects_nul() {
     use std::os::unix::ffi::OsStringExt;
 

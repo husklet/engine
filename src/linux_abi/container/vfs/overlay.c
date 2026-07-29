@@ -294,6 +294,12 @@ static int overlay_lookup(const char *guest, char *host, size_t hn) {
 // a fresh path, so the chain crosses layers. nofollow keeps the final component (lstat/readlink/unlink).
 // Bounded to 40 hops; a symlink loop terminates as absent (ENOENT), never hangs.
 static int overlay_resolve(const char *guest, char *host, size_t hn, int nofollow) {
+    // Bind mounts and projected namespace entries are separate mount routes,
+    // not members of the rootfs overlay. Resolve their complete path through
+    // the confined volume walker so intermediate projected symlinks are
+    // followed while only the request's final component honors `nofollow`.
+    if (jail_match(guest) >= 0) return secure_resolve(guest, host, hn, nofollow);
+
     char cur[4200];
     if (path_copy(cur, sizeof cur, guest) != 0) {
         if (hn) host[0] = 0;

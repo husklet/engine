@@ -95,6 +95,21 @@ static void fake_memory_finish(void) {
     observe_stores = 0;
 }
 
+static uintptr_t readable_until = UINTPTR_MAX;
+static uintptr_t writable_until = UINTPTR_MAX;
+
+static int range_ends_before(uint64_t address, size_t length, uintptr_t limit) {
+    return address <= UINTPTR_MAX && length <= UINTPTR_MAX - (uintptr_t)address && (uintptr_t)address + length <= limit;
+}
+
+static int range_readable(uint64_t address, size_t length) {
+    return range_ends_before(address, length, readable_until);
+}
+
+static int range_writable(uint64_t address, size_t length) {
+    return range_ends_before(address, length, writable_until);
+}
+
 static int store_observation_active(void) {
     return observe_stores;
 }
@@ -256,6 +271,29 @@ static int check_copy_semantics(void) {
     HL_CHECK(committed_count == 1);
     HL_CHECK(committed_address[0] == (uint64_t)(uintptr_t)(observed + 4) && committed_size[0] == 4);
     observe_stores = 0;
+
+    return 0;
+}
+
+static int check_copy_stops_before_inaccessible_range(void) {
+    uint8_t source[] = {0, 1, 2, 3, 4, 5, 6, 7};
+    uint8_t destination[sizeof(source)] = {0};
+    struct cpu cpu = {0};
+
+    readable_until = (uintptr_t)(source + 4);
+    writable_until = UINTPTR_MAX;
+    hl_x86_rep_set_access_validators(range_readable, range_writable, NULL);
+
+    HL_CHECK(hl_x86_rep_movs(destination, source, sizeof(source), 1, 0, &cpu, UINT64_C(0x1234)) == 4);
+    HL_CHECK(memcmp(destination, source, 4) == 0);
+    HL_CHECK(memcmp(destination + 4, (uint8_t[4]){0}, 4) == 0);
+    HL_CHECK(cpu.reason == R_SOFTMISS);
+    HL_CHECK(cpu.bus_ea == (uintptr_t)(source + 4));
+    HL_CHECK(cpu.soft_required == X86_SOFT_READ);
+    HL_CHECK(cpu.rip == UINT64_C(0x1234));
+
+    readable_until = UINTPTR_MAX;
+    hl_x86_rep_set_access_validators(NULL, NULL, NULL);
     return 0;
 }
 
@@ -377,6 +415,7 @@ static int check_compare_exit(void) {
 
 int main(void) {
     HL_CHECK(check_copy_semantics() == 0);
+    HL_CHECK(check_copy_stops_before_inaccessible_range() == 0);
     HL_CHECK(check_fill_semantics() == 0);
     HL_CHECK(check_indirect_bulk() == 0);
     HL_CHECK(check_indirect_boundaries_and_fault() == 0);

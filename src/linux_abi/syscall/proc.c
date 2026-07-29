@@ -545,6 +545,12 @@ static void rusage_to_linux(uint8_t *d, const struct rusage *ru) {
     *(int64_t *)(d + 136) = ru->ru_nivcsw;
 }
 
+static void translation_log_summary(void *context, uint64_t translations, uint64_t translation_ns) {
+    (void)translation_ns;
+    HL_LOGF((hl_log_context *)context, HL_LOG_TAG_TRANSLATE, "blocks=%llu",
+            (unsigned long long)translations);
+}
+
 static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                     uint64_t a5) {
     switch (nr) {
@@ -677,6 +683,20 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         abs_guest(-100, guest_path, gabs, sizeof gabs); // (AT_FDCWD, path) -> guest-view abs
+        if (g_rootfs && synth_proc_fd_dir_is(gabs)) {
+            char isolated[128], backing[4200];
+            snprintf(isolated, sizeof isolated, "/.hl-proc-chroot-%d", (int)getpid());
+            confine_in(g_rootfs_canon, g_rootfs_canon_len, isolated, backing, sizeof backing, 1);
+            if (mkdir(backing, 0700) != 0 && errno != EEXIST) {
+                G_RET(c) = (uint64_t)(int64_t)(-errno);
+                break;
+            }
+            snprintf(g_chroot, sizeof g_chroot, "%s", isolated);
+            snprintf(g_cwd, sizeof g_cwd, "/");
+            hl_fdcache_reset();
+            G_RET(c) = 0;
+            break;
+        }
         char hp[4200];
         const char *h = xresolve_overlay(gabs, hp, sizeof hp); // host backing (honors any chroot already set)
         struct stat st;
@@ -703,6 +723,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     // exit_group: end the whole process
     case 94:
         HL_LOGF(&g_jit_log, HL_LOG_TAG_NETWORK, "exit_group pid=%d code=%d", (int)getpid(), (int)a0);
+        hl_dispatch_profile_report(&g_dispatch_profile, &g_jit_log, translation_log_summary);
         if (0)
             fprintf(stderr,
                     "[prof] crossings=%llu syscalls=%llu ibtc_miss=%llu branch_cross=%llu translations=%llu lse=%llu "
@@ -1784,6 +1805,24 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
     case 178: G_RET(c) = (uint64_t)(c->tid ? c->tid : container_pid()); break;
     // clone(flags,stack,ptid,tls,ctid)
     case 220: {
+        // Dynamic Linux namespaces are not yet modeled by the embedded ABI.
+        // Silently accepting these bits is observably wrong: callers publish
+        // namespace-specific state after a successful clone even though the
+        // child remains in the original namespace. Return EINVAL, the kernel
+        // contract for unsupported clone flags, so capability probes can use
+        // their documented fallback.
+        const uint64_t namespace_flags =
+            0x00020000ull | // CLONE_NEWNS
+            0x02000000ull | // CLONE_NEWCGROUP
+            0x04000000ull | // CLONE_NEWUTS
+            0x08000000ull | // CLONE_NEWIPC
+            0x10000000ull | // CLONE_NEWUSER
+            0x20000000ull | // CLONE_NEWPID
+            0x40000000ull;  // CLONE_NEWNET
+        if (a0 & namespace_flags) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         // CLONE_THREAD: stack arg IS the top
         if (a0 & 0x10000) {
             G_RET(c) = (uint64_t)spawn_thread(c, a0, a1, a3, a2, a4);
@@ -1794,6 +1833,12 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // one shared budget across the process tree). Previously only in-process threads were gated.
         if (g_pids_max && acct_pids_total() >= g_pids_max) {
             G_RET(c) = (uint64_t)(int64_t)(-EAGAIN);
+            break;
+        }
+        int share_fs = (a0 & 0x00000200ull) != 0; // CLONE_FS
+        int fs_status = share_fs ? guest_fs_share() : 0;
+        if (fs_status != 0) {
+            G_RET(c) = (uint64_t)(int64_t)fs_status;
             break;
         }
         // fork/vfork: COW copy; child continues. Flush RAM-backed scratch into the real (shared) fds so
@@ -1843,11 +1888,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         errno = fork_error;
         if (pid == 0) {
-            // clone(CLONE_VM, child_stack): glibc posix_spawn/popen/vfork pass a separate child stack in a1
-            // and seed the clone trampoline (fn ptr + args) at its top. We fork() (COW) instead of sharing
-            // the VM, but the child MUST run on a1 or glibc reads the trampoline off the parent's SP ->
-            // garbage branch (SIGILL — broke initdb). a1==0 for a plain fork (bash), keeping the inherited SP.
-            if ((a0 & 0x100) && a1) G_SP(c) = a1;
+            guest_fs_after_fork(share_fs);
+            // clone(child_stack): Linux resumes the child on the supplied stack regardless of CLONE_VM.
+            // glibc seeds its clone trampoline (fn ptr + arg) there before the syscall. Restricting this to
+            // CLONE_VM made an ordinary process clone resume on the parent's stack: the child then popped a
+            // return address as its callback and returned into the caller with cleared callee-saved state.
+            // a1==0 is the fork-compatible form and keeps the inherited stack.
+            if (a1) G_SP(c) = a1;
             fork_child_hooks(c); // shared child-side engine reset (cache re-alias, caches, kqueues, locks)
             // CLONE_CHILD_SETTID(0x01000000): store the child's own tid (== its pid for a process clone) into
             // the child's *ctid (a4). CLONE_CHILD_CLEARTID(0x00200000): remember ctid so thread/process exit
@@ -2140,7 +2187,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // when exec commits, before the new image begins executing.
         vfork_release_parent();
         set_guest_comm(comm_src); // comm := basename of the exec'd NAME (captured pre-rewrite above)
-        cred_after_exec();        // exec recomputes caps (non-root loses them) + clears KEEPCAPS; ids persist
+        cred_after_exec(p); // apply set-id ownership, recompute caps, and clear KEEPCAPS
 #ifdef PCACHE_SAVE_HOOK
         // the exec below flushes this image's translated arena and RE-KEYS the cache identity for
         // the new image (pcache_exec_reload), so the exit-time save can never again cover this epoch.
@@ -2515,6 +2562,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         uint64_t flags = ca[0];
+        const uint64_t namespace_flags =
+            0x00020000ull | 0x02000000ull | 0x04000000ull | 0x08000000ull |
+            0x10000000ull | 0x20000000ull | 0x40000000ull;
+        if (flags & namespace_flags) {
+            G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
+            break;
+        }
         // CLONE_THREAD: sp = stack + stack_size
         if (flags & 0x10000) {
             G_RET(c) = (uint64_t)spawn_thread(c, flags, ca[5] + ca[6], ca[7], ca[3], ca[2]);
@@ -2523,6 +2577,12 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // cgroup pids.max gates a clone3 forked PROCESS too (see case 220): fork past the limit -> EAGAIN.
         if (g_pids_max && acct_pids_total() >= g_pids_max) {
             G_RET(c) = (uint64_t)(int64_t)(-EAGAIN);
+            break;
+        }
+        int share_fs = (flags & 0x00000200ull) != 0; // CLONE_FS
+        int fs_status = share_fs ? guest_fs_share() : 0;
+        if (fs_status != 0) {
+            G_RET(c) = (uint64_t)(int64_t)fs_status;
             break;
         }
         sigexit_init(); // shared signal-death relay must exist in the parent before fork (see case 220)
@@ -2550,6 +2610,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // path caches / kqueues / fork-unsafe locks). clone3 historically lacked the W^X re-assert and the
         // DIR*-cache drop the clone site had; the shared helper closes that drift.
         if (pid == 0) {
+            guest_fs_after_fork(share_fs);
             if ((flags & 0x100) && ca[5]) G_SP(c) = ca[5] + ca[6];
             fork_child_hooks(c);
             // clone_args: child_tid = ca[2]. CLONE_CHILD_SETTID stores the child's tid there; CLONE_CHILD_

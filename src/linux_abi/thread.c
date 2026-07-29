@@ -2287,6 +2287,13 @@ static pthread_mutex_t g_threg_m = PTHREAD_MUTEX_INITIALIZER;
 // semaphores). Called from the fork child path in proc.c.
 static void thread_after_fork(void) {
     pthread_mutex_init(&g_threg_m, NULL); // thread registry (tkill/tgkill lookup, thread_register)
+    struct cpu *self = (g_my_threg >= 0) ? g_threg[g_my_threg].c : NULL;
+    // The sole thread surviving fork becomes the child process leader. Linux
+    // requires its tid to equal the new pid even when a non-leader parent
+    // thread called fork. Keeping the caller's old tid gives unrelated child
+    // processes duplicate thread identities and breaks process-shared users
+    // that key ownership by tid.
+    if (self) self->tid = 0;
     /*
      * Only the calling host thread survives a guest fork. A vanished peer may
      * have held either process-private file-map lock while publishing or
@@ -2317,7 +2324,6 @@ static void thread_after_fork(void) {
     // that can never leave (the go build fork+exec stall: ~14s PER compile child, measured). Rebuild the
     // registry to hold ONLY the surviving (calling) thread, exactly as stw_after_fork() does for the STW
     // registry -- reinitialised this module's LOCKS but left the registry CONTENTS inherited.
-    struct cpu *self = (g_my_threg >= 0) ? g_threg[g_my_threg].c : NULL;
     memset(g_threg, 0, sizeof g_threg);
     if (self) {
         g_threg[0].c = self;

@@ -508,8 +508,10 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
                 if (!popped) __atomic_and_fetch(&g_pending, ~(1ull << got), __ATOMIC_SEQ_CST);
                 if (a1) { // fill siginfo_t whenever info != NULL (a3 is the sigsetsize, not a size threshold)
                     unsigned char result_info[128] = {0};
+                    int error = popped ? ent.error : g_sigerror[got];
                     int code = popped ? ent.code : g_sigcode[got];
                     memcpy(result_info, &got, sizeof got);
+                    memcpy(result_info + 4, &error, sizeof error);
                     memcpy(result_info + 8, &code, sizeof code);
                     int spid = popped ? ent.pid : g_sigpid[got];
                     if (spid) {
@@ -524,6 +526,7 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
                         break;
                     }
                     if (!popped) {
+                        g_sigerror[got] = 0;
                         g_sigcode[got] = 0;
                         g_sigval[got] = 0;
                         g_sigpid[got] = 0;

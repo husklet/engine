@@ -320,7 +320,11 @@
         {
           default = pkgs.mkShell ({
             packages = [
+              # clang carries clang-format AND clang-tidy; cppcheck is separate.
+              # Both are required by `ninja hl-lint`, which fails rather than
+              # silently skipping a stage whose tool is absent.
               pkgs.clang
+              pkgs.cppcheck
               pkgs.gnumake
               pkgs.cmake
               pkgs.ninja

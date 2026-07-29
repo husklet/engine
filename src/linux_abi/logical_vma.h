@@ -20,6 +20,8 @@ typedef struct hl_logical_vma_view {
     uint64_t guest_first;
     uint64_t guest_last;
     uint64_t host_delta;
+    uint64_t backing;
+    uint64_t backing_offset;
     uint32_t protection;
     uint32_t flags;
 } hl_logical_vma_view;
@@ -182,8 +184,8 @@ int hl_logical_vma_global_describe(uint64_t guest, hl_logical_vma_descriptor *);
 int hl_logical_vma_global_copy_out(uint64_t guest, void *destination, size_t length);
 int hl_logical_vma_global_copy_in(uint64_t guest, const void *source, size_t length);
 const _Atomic(hl_logical_vma_snapshot *) *hl_logical_vma_global_snapshot_source(void);
-void hl_logical_vma_visit_exec_aliases(uint64_t guest_first, uint64_t guest_last, hl_logical_vma_alias_visitor visitor,
-                                       void *opaque);
+int hl_logical_vma_visit_exec_aliases(uint64_t guest_first, uint64_t guest_last, hl_logical_vma_alias_visitor visitor,
+                                      void *opaque);
 int hl_logical_vma_has_exec_alias_file(uint64_t device, uint64_t inode, uint64_t file_offset, size_t length);
 
 /* Deterministic allocation-failure seam for the transaction regression. */

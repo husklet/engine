@@ -79,6 +79,7 @@ static __thread int g_in_service;
 static __thread int g_syscall_restart;
 // rt_sigqueueinfo extras carried to the handler's siginfo: si_code + si_value (consumed on delivery)
 static int g_sigcode[65];
+static int g_sigerror[65];
 static uint64_t g_sigval[65];
 // SA_SIGINFO sender identity (si_pid/si_uid) captured from the host siginfo for a kill(2)/tgkill-delivered
 // signal (consumed on delivery). g_sigpid==0 means "no sender identity" (async fault/internal), so a kill
@@ -87,6 +88,9 @@ static int g_sigpid[65];
 static int g_siguid[65];
 // synchronous-fault address carried to the handler's siginfo (si_addr; consumed on delivery, 0 for async)
 static uint64_t g_sigaddr[65];
+// Temporary Chrome child-fault diagnostics. Populated when the guest stack is built so fatal-default
+// reports identify forked Chromium service roles whose executable path is otherwise identical.
+static char g_fault_cmdline[512];
 
 // ---------------- per-signal pending FIFO (siginfo carrier) ----------------
 // g_pending/c->tpending stay the 1-bit-per-signal "is pending" indicators every fast-path scan reads.
@@ -101,6 +105,7 @@ static uint64_t g_sigaddr[65];
 #define SIGQ_DEPTH 64
 
 struct sigq_ent {
+    int error;      // si_errno (seccomp trap data)
     int code;       // si_code
     uint64_t value; // si_value (sigqueue) / si_status (SIGCHLD; aliases offset 24)
     int pid;        // si_pid
@@ -126,14 +131,22 @@ static int sig_is_rt(int s) {
 // Returns 1 iff a new instance was actually enqueued -- the signalfd wake byte must be written ONLY then,
 // or a coalesced-away duplicate leaves a spare byte in the self-pipe and signalfd reports one siginfo
 // record too many (a second read that Linux answers with EAGAIN).
-static int sigq_push(int sig, int tag, int code, uint64_t value, int pid, int uid, uint64_t addr) {
+static int sigq_push(int sig, int tag, int error, int code, uint64_t value, int pid, int uid, uint64_t addr) {
     if (sig < 1 || sig > 64) return 0;
     int queued = 0;
     pthread_mutex_lock(&g_sigq_lk);
     int cap = sig_is_rt(sig) ? SIGQ_DEPTH : 1;
     if (g_sigq[sig].count < cap) {
         int t = (g_sigq[sig].head + g_sigq[sig].count) % SIGQ_DEPTH;
-        g_sigq[sig].e[t] = (struct sigq_ent){code, value, pid, uid, addr, tag};
+        g_sigq[sig].e[t] = (struct sigq_ent){
+            .error = error,
+            .code = code,
+            .value = value,
+            .pid = pid,
+            .uid = uid,
+            .addr = addr,
+            .tag = tag,
+        };
         g_sigq[sig].count++;
         queued = 1;
     }
@@ -663,6 +676,7 @@ static void maybe_deliver_signal(struct cpu *c) {
         if (popped || had_t || had_p) {
             g_force_deliver &= ~bit; // consumed: the sigframe (built below) saves the true post-suspend mask
             if (popped) {
+                g_sigerror[sig] = ent.error;
                 g_sigcode[sig] = ent.code;
                 g_sigval[sig] = ent.value;
                 g_sigpid[sig] = ent.pid;
@@ -728,7 +742,8 @@ static void maybe_deliver_signal(struct cpu *c) {
 // handler / blocked -> queue the per-instance siginfo + pending bit; otherwise apply the default action.
 // `code`/`value`/`pid`/`uid` are the siginfo to carry (SI_USER + sender pid for a plain kill/raise, or
 // SI_QUEUE + value + sender pid for sigqueue); realtime signals queue every instance FIFO.
-static void raise_guest_signal_si(struct cpu *c, int sig, int code, uint64_t value, int pid, int uid) {
+static void raise_guest_signal_info(struct cpu *c, int sig, int error, int code, uint64_t value, int pid,
+                                    int uid, uint64_t address) {
     if (sig < 1 || sig > 64) return;
     // if this process is traced, a signal it raises on itself (raise/abort/kill-self, incl. the
     // raise(SIGSTOP) tracers' children use) becomes a ptrace signal/group-stop reported to the tracer.
@@ -747,19 +762,19 @@ static void raise_guest_signal_si(struct cpu *c, int sig, int code, uint64_t val
     // handler disposition (Linux delivers a blocked signal to signalfd, not to a handler). Feed the
     // self-pipe (readability) AND queue the siginfo (ssi_int/pid/code); the read path drains it in order.
     if (blocked && sfd_routed(sig)) {
-        if (sigq_push(sig, 0, code, value, pid, uid, 0)) sfd_deliver(sig);
+        if (sigq_push(sig, 0, error, code, value, pid, uid, address)) sfd_deliver(sig);
         return;
     }
     // custom handler -> queue for the dispatcher's maybe_deliver_signal (carries per-instance siginfo)
     if (h > 1) {
-        sigq_push(sig, 0, code, value, pid, uid, 0);
+        sigq_push(sig, 0, error, code, value, pid, uid, address);
         return;
     }
     // SIG_IGN
     if (h == 1) return;
     // blocked, no handler: queue pending for delivery on unblock (also feeds any signalfd via sfd_deliver)
     if (blocked) {
-        if (sigq_push(sig, 0, code, value, pid, uid, 0)) sfd_deliver(sig);
+        if (sigq_push(sig, 0, error, code, value, pid, uid, address)) sfd_deliver(sig);
         return;
     }
     // SIGCHLD/CONT/URG/WINCH: ignore
@@ -787,6 +802,10 @@ static void raise_guest_signal_si(struct cpu *c, int sig, int code, uint64_t val
     if (raise(host_stop) == 0) return; // stopped, then continued by SIGCONT -> resume guest execution
     c->exited = 1;
     c->exit_code = 128 + sig; // fallback: raise failed (signo invalid on host)
+}
+
+static void raise_guest_signal_si(struct cpu *c, int sig, int code, uint64_t value, int pid, int uid) {
+    raise_guest_signal_info(c, sig, 0, code, value, pid, uid, 0);
 }
 
 // Convenience: a self-directed signal with no explicit sender info (raise/abort/kill-self/pthread_kill).

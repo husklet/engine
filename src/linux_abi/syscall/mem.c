@@ -195,6 +195,22 @@ static int host_fixed_map286(uint64_t a0, uint64_t a1, int prot, int anon, int f
     return 0;
 }
 
+static void mremap_publish_accessible(uint64_t first, uint64_t last) {
+    uint64_t low = first & ~(uint64_t)0xfff;
+    uint64_t high = (last + 0xfff) & ~(uint64_t)0xfff;
+    gna_clear(low, high);
+    gro_clear(low, high);
+    gbus_clear(low, high);
+}
+
+static void mremap_publish_unmapped(uint64_t first, uint64_t last) {
+    uint64_t low = first & ~(uint64_t)0xfff;
+    uint64_t high = (last + 0xfff) & ~(uint64_t)0xfff;
+    gna_add(low, high);
+    gro_clear(low, high);
+    gbus_clear(low, high);
+}
+
 // The guest's page size (as it sees via AT_PAGESZ / sysconf(_SC_PAGESIZE)).  Read it from auxv after
 // stack construction; before that exists, fall back to the Linux ABI constant, never the host mapping
 // granularity.  Host mmap alignment paths use hl_linux_host_map_granularity() explicitly.
@@ -285,6 +301,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // full == a1) and untracked mappings (full == 0) keep the plain a1 unmap unchanged.
         size_t len = (size_t)a1;
         uint64_t full = hl_gmap_find_length(a0);
+        uint64_t guest_length = hl_gmap_find_guest_length(a0);
         // Page-size mismatch: guest pages are 4 KB (AT_PAGESZ) but the host granule may be coarser, and
         // munmap rounds the LENGTH up to a whole host page. The host also gives every distinct mmap
         // its own host-page-aligned base + host-page-rounded extent, so two SEPARATE guest mappings never
@@ -304,7 +321,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         size_t hp = hl_linux_host_map_granularity();
         uint64_t physical_address = 0, physical_length = 0;
         int has_physical = hl_gmap_find_physical(a0, &physical_address, &physical_length);
-        int complete = (full == (uint64_t)a1 || full == (uint64_t)a1 + 0x10000) &&
+        int complete = full != 0 && guest_length == (uint64_t)a1 &&
                        (((a0 & (hp - 1)) == 0) || (has_physical && physical_address != a0));
         int r;
         uint64_t u_lo, u_hi; // the range host munmap actually cleared (empty when u_lo==u_hi)
@@ -430,10 +447,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a2);
             anon_track((uint64_t)r, (uint64_t)a2 + guard, PROT_READ | PROT_WRITE);
             anon_update_prot(a0, (uint64_t)a1, PROT_READ | PROT_WRITE); // source is writable zero anon again
-            gna_clear(a0 & ~(uint64_t)0xfff, (a0 + a1 + 0xfff) & ~(uint64_t)0xfff);
-            gro_clear(a0 & ~(uint64_t)0xfff, (a0 + a1 + 0xfff) & ~(uint64_t)0xfff);
-            gna_clear((uint64_t)r & ~(uint64_t)0xfff, ((uint64_t)r + a2 + 0xfff) & ~(uint64_t)0xfff);
-            gro_clear((uint64_t)r & ~(uint64_t)0xfff, ((uint64_t)r + a2 + 0xfff) & ~(uint64_t)0xfff);
+            mremap_publish_accessible(a0, a0 + a1);
+            mremap_publish_accessible((uint64_t)r, (uint64_t)r + a2 + guard);
             G_SMC_UNMAP(a0, a0 + (uint64_t)a1);
             G_SMC_UNMAP((uint64_t)r, (uint64_t)r + (uint64_t)a2);
             G_RET(c) = (uint64_t)r;
@@ -480,7 +495,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                         munmap((void *)a0, (size_t)phys); // free the full old extent (incl. its guard tail)
                         hl_gmap_remove(a0);
                         anon_untrack(a0, (size_t)phys);
-                        gna_clear(a0 & ~(uint64_t)0xfff, (ohi + 0xfff) & ~(uint64_t)0xfff);
+                        mremap_publish_unmapped(a0, a0 + phys);
                         hl_gmap_lock_remove(a0, (uint64_t)a1);
                         wipefork_del(a0, (uint64_t)a1);
                         dontfork_del(a0, (uint64_t)a1);
@@ -488,7 +503,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     hl_gmap_add(a4, (uint64_t)a2 + guard);
                     hl_gmap_set_guest_length(a4, (uint64_t)a2);
                     anon_track(a4, (uint64_t)a2 + guard, PROT_READ | PROT_WRITE);
-                    gna_clear(a4 & ~(uint64_t)0xfff, (nhi + 0xfff) & ~(uint64_t)0xfff);
+                    mremap_publish_accessible(a4, a4 + a2 + guard);
                     // stale-translation: the mapping (and any executable code in it) relocated. Drop cached
                     // translations for BOTH the freed source VA and the replaced destination VA.
                     G_SMC_UNMAP(a0, a0 + (uint64_t)a1);
@@ -531,8 +546,18 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 break;
             }
         }
-        // A grow that still fits within the already-mapped extent: stay in place, touch nothing.
+        /*
+         * A grow that fits in the hidden compatibility tail stays in place,
+         * but it is not a no-op: the guest-visible VMA length expands and the
+         * newly exposed pages cease to be guard/tombstone state. Keeping the
+         * old guest length made a later munmap look partial, leaking or
+         * repeatedly reclassifying the same mapping.
+         */
         if ((uint64_t)a2 <= phys) {
+            hl_gmap_set_guest_length(a0, (uint64_t)a2);
+            uint64_t exposed_first = (a0 + a1 + 0xfff) & ~(uint64_t)0xfff;
+            uint64_t exposed_last = (a0 + a2 + 0xfff) & ~(uint64_t)0xfff;
+            mremap_publish_accessible(exposed_first, exposed_last);
             G_RET(c) = a0;
             break;
         }
@@ -548,6 +573,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 hl_gmap_add(a0, want); // track the grown extent (incl. fresh guard) for execve() teardown
                 hl_gmap_set_guest_length(a0, (uint64_t)a2); // /proc maps report the guest length (sans guard)
                 anon_track(a0, want, PROT_READ | PROT_WRITE);
+                mremap_publish_accessible(end, a0 + want);
                 G_RET(c) = a0;
                 break;
             }
@@ -572,10 +598,12 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             munmap((void *)a0, (size_t)phys); // free the FULL tracked extent (incl. old guard tail)
             hl_gmap_remove(a0);
             anon_untrack(a0, (size_t)phys);
+            mremap_publish_unmapped(a0, a0 + phys);
         }
         hl_gmap_add((uint64_t)r, (uint64_t)a2 + guard);                        // track for execve() teardown
         hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a2);                   // /proc maps: guest length (sans guard)
         anon_track((uint64_t)r, (uint64_t)a2 + guard, PROT_READ | PROT_WRITE); // fresh private-anon copy
+        mremap_publish_accessible((uint64_t)r, (uint64_t)r + a2 + guard);
         G_RET(c) = (uint64_t)r;
         break;
     }
@@ -687,6 +715,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         int bus_prepared = 0;
         int mapping_prepared = 0;
         hl_logical_vma_plan *logical_plan = NULL;
+        int logical_committed = 0;
         int logical_prepare_failed = 0;
         int logical_prepare_errno = 0;
         int soft_activated_here = 0;
@@ -884,9 +913,10 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             if (r != MAP_FAILED) gbus_clear((uint64_t)(uintptr_t)r, (uint64_t)(uintptr_t)r + a1 + guard);
         }
         if (logical_plan != NULL) {
-            if (r != MAP_FAILED && off_emul == 2)
+            if (r != MAP_FAILED && off_emul == 2) {
                 hl_logical_vma_commit_shared(logical_plan);
-            else
+                logical_committed = 1;
+            } else
                 hl_logical_vma_abort_shared(logical_plan);
         }
         // refund
@@ -896,11 +926,15 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         }
         if (r != MAP_FAILED) {
             if (a3 & 0x10) {
-                filemap_unmap((uint64_t)r, (uint64_t)r + (uint64_t)a1);
-                // The guest-map registry must split around the replaced range too, or a whole-span
-                // reservation MAP_FIXED'd into (every ld.so does this) stays whole and /proc/[pid]/maps
-                // emits rows that overlap the segments mapped inside it.
-                hl_gmap_supersede_range((uint64_t)r, (uint64_t)r + mapped_length);
+                uint64_t replaced_first = (uint64_t)r;
+                uint64_t replaced_last = replaced_first + mapped_length;
+                hl_gmap_supersede_range(replaced_first, replaced_last);
+                anon_split_unmap(replaced_first, replaced_last);
+                filemap_unmap(replaced_first, replaced_last);
+                futex_shared_unmap(replaced_first, replaced_last);
+                wipefork_del(replaced_first, replaced_last - replaced_first);
+                dontfork_del(replaced_first, replaced_last - replaced_first);
+                hl_gmap_lock_remove(replaced_first, replaced_last - replaced_first);
             }
             if (!bus_prepared && !mapping_prepared) gbus_clear((uint64_t)r, (uint64_t)r + (uint64_t)a1 + guard);
             if (physical_mapping != NULL)
@@ -910,7 +944,8 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 hl_gmap_add((uint64_t)r, mapped_length);         // track for execve() teardown
             hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a1); // /proc maps report the guest length (sans guard)
             if (!(a3 & 0x20) && (int)a4 >= 0)
-                filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0, off_emul == 2);
+                filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0,
+                                 off_emul == 2 && !logical_committed);
             // Shared-futex key (thread.c): a file-backed MAP_SHARED region (memfd/shm, mapped independently
             // by each peer at its own VA) must key its futex words by the shared object identity, not the VA,
             // so a cross-process/cross-mapping FUTEX_WAKE reaches a FUTEX_WAIT (Wall 7). Record its VA range
@@ -918,7 +953,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             // fd/inode and, when shared, is only ever fork-inherited at a COMMON VA (the VA key already works
             // there), so it is excluded. off_emul (a private-anon offset-fixup copy) is not the real shared
             // object -- skip it. Inert for every private mapping (the fast-path gate stays 0).
-            if ((a3 & 0x01) && !(a3 & 0x20) && !off_emul && (int)a4 >= 0)
+            if ((a3 & 0x01) && !(a3 & 0x20) && (!off_emul || logical_committed) && (int)a4 >= 0)
                 futex_shared_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5);
             // x86-TSO ordering must hold for ANY observer, and a MAP_SHARED region (file-backed OR anon --
             // shared anon is fork-inherited) can be read by a peer PROCESS. The translator elides guest

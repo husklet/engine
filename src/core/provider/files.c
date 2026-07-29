@@ -3,10 +3,20 @@
 
 #include <errno.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
 
-enum { OP_OPEN = 1, OP_READ = 2, OP_WRITE = 3, OP_SEEK = 4, OP_STAT = 5, OP_POLL = 6, OP_CLOSE = 7 };
+enum {
+    OP_OPEN = 1,
+    OP_READ = 2,
+    OP_WRITE = 3,
+    OP_SEEK = 4,
+    OP_STAT = 5,
+    OP_POLL = 6,
+    OP_CLOSE = 7,
+    OP_IOCTL = 8
+};
 
 static const hl_host_file_services *underlying;
 static hl_host_file_services composite;
@@ -158,6 +168,88 @@ hl_host_result hl_provider_files_open_service(uint64_t service, uint32_t access)
     }
     hl_provider_reply_destroy(&reply);
     return result;
+}
+
+void hl_provider_files_ioctl_result_destroy(hl_provider_ioctl_result *result) {
+    if (result == NULL) return;
+    for (uint32_t i = 0; i < result->write_count; ++i) {
+        free(result->writes[i].bytes);
+        result->writes[i].bytes = NULL;
+    }
+    result->write_count = 0;
+}
+
+hl_host_result hl_provider_files_ioctl(hl_host_handle handle, uint64_t command,
+                                       unsigned char *argument, uint32_t size,
+                                       hl_provider_ioctl_result *output) {
+    unsigned char *payload;
+    hl_provider_reply reply;
+    hl_host_result result;
+    uint64_t id;
+    uint32_t reply_size, write_count, offset, transferred;
+    if (output == NULL || size > 16384 || (size != 0 && argument == NULL))
+        return failure(EINVAL);
+    memset(output, 0, sizeof(*output));
+    if (remote(handle, &id) != 0) return failure(EBADF);
+    payload = malloc(21u + size);
+    if (payload == NULL) return failure(ENOMEM);
+    payload[0] = OP_IOCTL;
+    put64(payload + 1, id);
+    put64(payload + 9, command);
+    put32(payload + 17, size);
+    if (size != 0) memcpy(payload + 21, argument, size);
+    result = request(payload, 21u + size, &reply);
+    free(payload);
+    if (result.status != HL_STATUS_OK) return result;
+    if (reply.size < 13 || reply.bytes[0] != OP_IOCTL) {
+        hl_provider_reply_destroy(&reply);
+        return failure(EPROTO);
+    }
+    reply_size = get32(reply.bytes + 9);
+    offset = 13u + reply_size;
+    if (reply_size != size || reply.size < offset + 4u) {
+        hl_provider_reply_destroy(&reply);
+        return failure(EPROTO);
+    }
+    if (size != 0) memcpy(argument, reply.bytes + 13, size);
+    write_count = get32(reply.bytes + offset);
+    offset += 4;
+    transferred = size;
+    if (write_count > HL_PROVIDER_IOCTL_WRITE_MAX) {
+        hl_provider_reply_destroy(&reply);
+        return failure(EPROTO);
+    }
+    for (uint32_t i = 0; i < write_count; ++i) {
+        uint32_t write_size;
+        if (reply.size - offset < 12u) goto malformed;
+        output->writes[i].address = get64(reply.bytes + offset);
+        write_size = get32(reply.bytes + offset + 8);
+        offset += 12;
+        if (write_size > 16384u - transferred || reply.size - offset < write_size)
+            goto malformed;
+        output->writes[i].bytes = write_size == 0 ? NULL : malloc(write_size);
+        if (write_size != 0 && output->writes[i].bytes == NULL) {
+            output->write_count = i;
+            hl_provider_files_ioctl_result_destroy(output);
+            hl_provider_reply_destroy(&reply);
+            return failure(ENOMEM);
+        }
+        if (write_size != 0)
+            memcpy(output->writes[i].bytes, reply.bytes + offset, write_size);
+        output->writes[i].size = write_size;
+        output->write_count = i + 1;
+        transferred += write_size;
+        offset += write_size;
+    }
+    if (offset != reply.size) goto malformed;
+    result.value = get64(reply.bytes + 1);
+    hl_provider_reply_destroy(&reply);
+    return result;
+
+malformed:
+    hl_provider_files_ioctl_result_destroy(output);
+    hl_provider_reply_destroy(&reply);
+    return failure(EPROTO);
 }
 
 static hl_host_result provider_read_at(void *context, hl_host_handle file, uint64_t offset, hl_host_bytes output) {

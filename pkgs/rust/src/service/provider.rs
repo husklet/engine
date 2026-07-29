@@ -1,8 +1,8 @@
 use super::{
-    protocol, Arc, AtomicU64, BTreeMap, Credentials, HandleOperation, Handles, Instant, LinuxError,
-    Mutex, OpenAccess, OpenRequest, Ordering, ReadRequest, Reply, Request, SeekOrigin, SeekRequest,
-    SeekWhence, ServiceCodec, ServiceFailure, ServiceId, ServiceRegistration, ServiceStat,
-    SystemTime, TransportError, WriteRequest,
+    protocol, Arc, AtomicU64, BTreeMap, Credentials, HandleOperation, Handles, Instant,
+    IoctlRequest, LinuxError, Mutex, OpenAccess, OpenRequest, Ordering, ReadRequest, Reply,
+    Request, SeekOrigin, SeekRequest, SeekWhence, ServiceCodec, ServiceFailure, ServiceId,
+    ServiceRegistration, ServiceStat, SystemTime, TransportError, WriteRequest,
 };
 pub(crate) struct ProviderDispatcher {
     provider: Arc<dyn Handles>,
@@ -211,6 +211,33 @@ impl ProviderDispatcher {
                             .value
                             .readiness(interest)
                             .map(Reply::Ready)
+                            .map_err(ServiceFailure::Linux)
+                    }
+                    Request::Ioctl {
+                        command, argument, ..
+                    } => {
+                        HandleOperation::Ioctl.require(&handle.operations)?;
+                        handle
+                            .value
+                            .ioctl(IoctlRequest {
+                                command,
+                                argument,
+                                deadline: Self::system_deadline(deadline),
+                            })
+                            .and_then(|result| {
+                                if result.argument.len() > self.maximum_request as usize {
+                                    return Err(LinuxError {
+                                        errno: 75,
+                                        context: "provider ioctl result exceeds request bound"
+                                            .into(),
+                                    });
+                                }
+                                Ok(Reply::Ioctl {
+                                    value: result.value,
+                                    argument: result.argument,
+                                    writes: result.writes,
+                                })
+                            })
                             .map_err(ServiceFailure::Linux)
                     }
                     Request::Open { .. } | Request::Close { .. } => unreachable!(),

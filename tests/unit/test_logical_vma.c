@@ -68,6 +68,19 @@ static void await_first_iteration(_Atomic unsigned long *counter, _Atomic int *f
     }
 }
 
+typedef struct alias_visit {
+    uint64_t first;
+    uint64_t last;
+    unsigned count;
+} alias_visit;
+
+static void record_alias(uint64_t first, uint64_t last, void *opaque) {
+    alias_visit *visit = opaque;
+    visit->first = first;
+    visit->last = last;
+    visit->count++;
+}
+
 int main(void) {
     hl_logical_vma_ledger ledger;
     HL_CHECK(hl_logical_vma_init(&ledger) == 0);
@@ -206,6 +219,15 @@ int main(void) {
        hidden mapping alive independently of snapshot lifetime. */
     const uint64_t pinned = UINT64_C(0x600000004000);
     HL_CHECK(hl_logical_vma_global_map_shared(pinned, 4096, HL_LOGICAL_VMA_READ, fd, 0, 16384) == 0);
+    alias_visit visit = {0};
+    HL_CHECK(hl_logical_vma_visit_exec_aliases(pinned, pinned + 1, record_alias, &visit) == 1);
+    HL_CHECK(visit.count == 0);
+    const uint64_t pinned_exec = UINT64_C(0x600000014000);
+    HL_CHECK(hl_logical_vma_global_map_shared(pinned_exec, 4096, HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_EXEC, fd, 0,
+                                              16384) == 0);
+    HL_CHECK(hl_logical_vma_visit_exec_aliases(pinned, pinned + 1, record_alias, &visit) == 1);
+    HL_CHECK(visit.count == 1);
+    HL_CHECK(visit.first == pinned_exec && visit.last == pinned_exec + 1);
     pin_stress pstress = {.address = pinned};
     pthread_t pinner;
     HL_CHECK(pthread_create(&pinner, NULL, pin_thread, &pstress) == 0);

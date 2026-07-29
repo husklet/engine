@@ -5,9 +5,8 @@
 // pointer was NULL -- getrusage(RUSAGE_SELF, NULL) returned 0 and sched_getaffinity(0, size, NULL)
 // returned the mask width, both without writing anything.
 //
-// Also pins fcntl(F_GETFL): a 64-bit Linux kernel forces O_LARGEFILE into f_flags for every open, so
-// F_GETFL reports it on every fd. The engine rebuilt the flag word from scratch and dropped the bit.
-// Arch-neutral: errnos and booleans only (O_LARGEFILE's VALUE differs per ISA, so test the bit).
+// Also pins fcntl(F_GETFL): x86-64 exposes its historical O_LARGEFILE bit, while native AArch64 omits
+// the asm-generic bit because its ABI is already 64-bit. Test the architecture's native answer.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -21,8 +20,10 @@
 // _FILE_OFFSET_BITS=64, so spell it out.
 #if defined(__x86_64__)
 #define K_O_LARGEFILE 0100000
+#define EXPECT_O_LARGEFILE 1
 #else
 #define K_O_LARGEFILE 0400000
+#define EXPECT_O_LARGEFILE 0
 #endif
 
 static int ec(long r) {
@@ -48,17 +49,18 @@ int main(void) {
     printf("getrusage_ok=%d\n", syscall(SYS_getrusage, 0, &ru) == 0);
     printf("sched_getaffinity_ok=%d\n", syscall(SYS_sched_getaffinity, 0, sizeof mask, &mask) > 0);
 
-    // F_GETFL always carries O_LARGEFILE on 64-bit Linux, across the access modes and across a
-    // F_SETFL(O_APPEND) round-trip.
+    // Preserve the native O_LARGEFILE representation across access modes and F_SETFL(O_APPEND).
     int fd = open("/dev/null", O_RDWR);
     int fl = fcntl(fd, F_GETFL);
-    printf("getfl_largefile=%d getfl_accmode=%d\n", (fl & K_O_LARGEFILE) != 0, fl & O_ACCMODE);
+    printf("getfl_largefile=%d getfl_accmode=%d\n", ((fl & K_O_LARGEFILE) != 0) == EXPECT_O_LARGEFILE,
+           fl & O_ACCMODE);
     printf("setfl_append=%d\n", ec(fcntl(fd, F_SETFL, O_APPEND)));
     fl = fcntl(fd, F_GETFL);
-    printf("getfl2_largefile=%d getfl2_append=%d getfl2_accmode=%d\n", (fl & K_O_LARGEFILE) != 0,
-           (fl & O_APPEND) != 0, fl & O_ACCMODE);
+    printf("getfl2_largefile=%d getfl2_append=%d getfl2_accmode=%d\n",
+           ((fl & K_O_LARGEFILE) != 0) == EXPECT_O_LARGEFILE, (fl & O_APPEND) != 0, fl & O_ACCMODE);
     int rfd = open("/dev/null", O_RDONLY);
-    printf("getfl_rdonly_largefile=%d\n", (fcntl(rfd, F_GETFL) & K_O_LARGEFILE) != 0);
+    printf("getfl_rdonly_largefile=%d\n",
+           ((fcntl(rfd, F_GETFL) & K_O_LARGEFILE) != 0) == EXPECT_O_LARGEFILE);
     close(rfd);
     close(fd);
     return 0;

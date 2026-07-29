@@ -519,6 +519,8 @@ static int g_rgid, g_egid, g_sgid; // real / effective / saved-set gid
 // apt/gosu drop WITHOUT keepcaps, so permitted->0 and they correctly can never regain root.
 static int g_keepcaps = 0;                    // PR_SET_KEEPCAPS armed (caps survive the all-nonzero uid drop)
 static int g_cap_setid_perm, g_cap_setid_eff; // permitted / effective CAP_SETUID+CAP_SETGID (move together)
+static int g_nnp;                             // sticky PR_SET/GET_NO_NEW_PRIVS state
+static int g_fsuid_ovr = -1, g_fsgid_ovr = -1; // -1 = follow effective identity
 
 static void cred_init(void) {
     if (g_cred_init) return;
@@ -541,12 +543,21 @@ static void cred_uid_changed(void) {
     if (g_ruid != 0 && g_suid != 0 && !g_keepcaps) g_cap_setid_perm = 0; // all-nonzero, no keepcaps -> gone
 }
 
-// execve of an ordinary (non-setuid, no-file-cap) binary recomputes the capability state: a non-root
-// task loses all caps, root keeps them, and PR_SET_KEEPCAPS is cleared -- so a program that dropped uid and
-// then exec'd cannot silently retain CAP_SETUID/SETGID. The uid/gid values THEMSELVES persist across exec
-// (the engine reloads the image in-process), exactly as the kernel carries credentials over an execve.
-static void cred_after_exec(void) {
+// Apply Linux exec credential transitions using guest-visible mode and ownership. Host ownership is not
+// authoritative for image files: extracted roots use virtual ownership metadata. no_new_privs suppresses
+// set-id transitions exactly as Linux does.
+static void cred_after_exec(const char *hostpath) {
     cred_init();
+    struct stat status;
+    if (!g_nnp && hostpath != NULL && stat(hostpath, &status) == 0) {
+        mode_t mode = stat_virt_mode(&status, hostpath, -1);
+        uint32_t uid, gid;
+        stat_virt_ids(&status, hostpath, -1, &uid, &gid);
+        if (mode & S_ISUID) g_euid = g_suid = (int)uid;
+        if (mode & S_ISGID) g_egid = g_sgid = (int)gid;
+    }
+    g_fsuid_ovr = -1;
+    g_fsgid_ovr = -1;
     g_keepcaps = 0;
     g_cap_setid_perm = g_cap_setid_eff = (g_euid == 0);
 }
@@ -586,8 +597,7 @@ static int gid_permitted(int id) {
                                             // net_bind_service,net_raw,sys_chroot,mknod,audit_write,setfcap
 static uint64_t g_cap_eff = HL_CAP_DEFAULT; // process EFFECTIVE cap set (capset(2) may narrow it)
 static uint64_t g_cap_bnd = HL_CAP_DEFAULT; // process BOUNDING cap set (PR_CAPBSET_DROP clears bits)
-static int g_nnp;                           // PR_SET/GET_NO_NEW_PRIVS: sticky; /proc/self/status NoNewPrivs
-static int g_securebits;                    // PR_SET/GET_SECUREBITS: the per-process securebits flags (0 default)
+static int g_securebits; // PR_SET/GET_SECUREBITS
 // The file-mode creation mask. Forwarded to the host on umask(2) so real inode creation honours it, but ALSO
 // tracked here so /proc/self/status `Umask:` reflects the guest's current value (it was hardcoded 0022, so a
 // guest umask(2) changed real file modes yet the status line stayed 0022 -- a syscall-vs-/proc disagreement).
@@ -609,6 +619,21 @@ static int g_umask = 022;
 static gid_t g_groups[HL_NGROUPS_MAX];
 static int g_ngroups = 0;       // count in g_groups (may be 0 after a guest setgroups(0))
 static int g_groups_parsed = 0; // 1 once container_parse_groups ran (rootfs mode); gates getgroups/setgroups
+
+static void cred_reset_initial(void) {
+    g_cred_init = 0;
+    g_keepcaps = 0;
+    g_cap_setid_perm = 0;
+    g_cap_setid_eff = 0;
+    g_nnp = 0;
+    g_fsuid_ovr = -1;
+    g_fsgid_ovr = -1;
+    g_cap_eff = HL_CAP_DEFAULT;
+    g_cap_bnd = HL_CAP_DEFAULT;
+    g_securebits = 0;
+    g_ngroups = 0;
+    g_groups_parsed = 0;
+}
 
 static void groups_reset(void) {
     g_ngroups = 0;
@@ -638,8 +663,6 @@ static int groups_status_str(char *b, size_t n) {
 // euid/egid unless setfsuid/setfsgid override them (g_fs*_ovr >= 0); any subsequent set*id resets the
 // override (POSIX: fsuid tracks euid). We persist the intended owner as the SAME hl.uid/gid xattr the
 // chown path uses, so a later stat reports it. The create sites in fs.c call the helpers below.
-static int g_fsuid_ovr = -1, g_fsgid_ovr = -1; // -1 = follow euid/egid
-
 static int newfile_uid(void) {
     return g_fsuid_ovr >= 0 ? g_fsuid_ovr : cred_euid();
 }

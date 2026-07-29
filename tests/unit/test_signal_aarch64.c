@@ -37,6 +37,7 @@ int main(void) {
     const size_t alternate_size = 8192;
     struct cpu cpu;
     uint64_t bias = UINT64_C(0x100000000);
+    int error = 77;
     int code = -6;
     uint64_t value = UINT64_C(0xabcdef0123456789);
     uint64_t address = UINT64_C(0x99887766);
@@ -46,6 +47,7 @@ int main(void) {
         .handler = UINT64_C(0x70001000),
         .flags = 0,
         .mask = UINT64_C(0x200),
+        .error = &error,
         .code = &code,
         .value = &value,
         .address = &address,
@@ -84,10 +86,10 @@ int main(void) {
     uint64_t uc = frame + 128;
     uint64_t mc = uc + 176;
     HL_CHECK(frame == ((saved_sp - 4688) & ~UINT64_C(15)));
-    HL_CHECK(load_u32(frame) == 12 && (int32_t)load_u32(frame + 8) == -6);
+    HL_CHECK(load_u32(frame) == 12 && load_u32(frame + 4) == 77 && (int32_t)load_u32(frame + 8) == -6);
     HL_CHECK(load_u32(frame + 16) == 123 && load_u32(frame + 20) == 456);
     HL_CHECK(load_u64(frame + 24) == UINT64_C(0xabcdef0123456789));
-    HL_CHECK(code == 0 && value == 0 && address == 0 && pid == 0 && uid == 0);
+    HL_CHECK(error == 0 && code == 0 && value == 0 && address == 0 && pid == 0 && uid == 0);
     HL_CHECK(load_u64(uc + 40) == saved_mask);
     HL_CHECK(load_u64(mc + 256) == saved_sp && load_u64(mc + 264) == saved_pc);
     HL_CHECK(load_u64(mc + 272) == saved_nzcv);
@@ -107,6 +109,7 @@ int main(void) {
     HL_CHECK(memcmp(cpu.v, saved_v, sizeof(saved_v)) == 0);
 
     /* SA_ONSTACK selects the alternate top and publishes SS_ONSTACK in uc_stack. */
+    error = 0;
     code = 1;
     value = address = 2;
     pid = uid = 0;

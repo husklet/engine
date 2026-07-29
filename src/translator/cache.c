@@ -1622,35 +1622,35 @@ static int jit_flush_to_fresh(int retain_map_generations) {
 // guest thread is live: quiesce every peer at the park safepoint, switch to a fresh cache, then release.
 static int stw_flush(void) {
     g_stw_flushes++;
-    atomic_store_explicit(&g_stw_active, 1, memory_order_seq_cst);
     pthread_t me = pthread_self();
-    int target = 0;
-    // Hold g_stw_reg_lock for the WHOLE flush (not just the enumeration). stw_unregister() -- the only
-    // place a guest thread clears its `used` slot and then terminates -- also takes this lock, so while we
-    // hold it an exiting peer is pinned in stw_unregister and cannot terminate. That closes a lost-signal
-    // hang: if the lock were dropped right after enumeration, a peer we just pthread_kill'd could unregister
-    // and exit before its STW_SIG was ever delivered (the kernel discards a directed signal posted to a
-    // thread that has already terminated). Its park would then never happen, g_stw_parked would never reach
-    // `target`, and this flusher -- holding g_jit_lock -- would spin forever, stalling every guest thread
-    // (the rustc/Go "blocks at exit, 0% CPU" hang). Pinned in stw_unregister, the peer instead takes the
-    // pending STW_SIG (the park handler runs on top of the blocked pthread_mutex_lock), parks, and is
-    // counted. Lock order is always g_jit_lock -> g_stw_reg_lock (matches stw_peers_live), so no deadlock;
-    // the park handler itself takes no lock, so parking peers never need this lock to make progress.
+    uint64_t request = atomic_fetch_add_explicit(&g_dispatch_request, 1, memory_order_acq_rel) + 1;
+    /*
+     * Quiesce at dispatcher boundaries instead of asynchronously parking a
+     * peer at an arbitrary host PC. A signaled peer may hold a host-service
+     * mutex; parking it there while jit_flush_to_fresh releases an arena
+     * through the same service deadlocks permanently. Only translated peers
+     * can retain code-cache PCs, so request their emitted IRQ poll and wait
+     * for its dispatcher acknowledgement. Service/host threads remain free
+     * to release their locks.
+     *
+     * The caller already holds g_jit_lock. Preserve the global lock order and
+     * pin registry slots through the arena switch so a peer cannot unregister
+     * between enumeration and acknowledgement.
+     */
+    atomic_store_explicit(&g_dispatch_gate, 1, memory_order_seq_cst);
     pthread_mutex_lock(&g_stw_reg_lock);
-    for (int i = 0; i < STW_MAXTHREAD; i++)
-        if (atomic_load_explicit(&g_stw_threads[i].used, memory_order_relaxed) &&
-            !pthread_equal(g_stw_threads[i].th, me))
-            if (pthread_kill(g_stw_threads[i].th, STW_SIG) == 0) target++;
-    // Wait until every signaled peer has reached the safepoint (so none is executing in the cache).
-    while (atomic_load_explicit(&g_stw_parked, memory_order_seq_cst) < target) {
-        jit_backoff_ns(UINT64_C(50000));
+    for (int i = 0; i < STW_MAXTHREAD; ++i) {
+        if (!atomic_load_explicit(&g_stw_threads[i].used, memory_order_acquire)) continue;
+        if (pthread_equal(g_stw_threads[i].th, me)) {
+            atomic_store_explicit(&g_stw_threads[i].dispatch_ack, request, memory_order_release);
+        } else if (atomic_load_explicit(&g_stw_threads[i].in_translated, memory_order_seq_cst) &&
+                   g_stw_threads[i].cpu != NULL) {
+            __atomic_store_n(&g_stw_threads[i].cpu->irq, 1, __ATOMIC_SEQ_CST);
+        }
     }
+    stw_wait_translated_acks(request);
     int ok = jit_flush_to_fresh(1);
-    atomic_store_explicit(&g_stw_active, 0, memory_order_seq_cst); // release the world
-    // Wait for all peers to leave the handler so the counters are clean for the next flush.
-    while (atomic_load_explicit(&g_stw_parked, memory_order_seq_cst) > 0) {
-        jit_backoff_ns(UINT64_C(50000));
-    }
+    atomic_store_explicit(&g_dispatch_gate, 0, memory_order_release);
     pthread_mutex_unlock(&g_stw_reg_lock);
     return ok;
 }

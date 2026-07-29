@@ -148,6 +148,33 @@ int main(void) {
     hl_gmap_remove(0x9000);
     hl_gmap_remove(0xb000);
 
+    /*
+     * A MAP_FIXED replacement at the base of a mapping with a synthetic
+     * compatibility tail must retire the replaced prefix before the new VMA
+     * is appended. A later exact-base lookup must see the replacement, not
+     * the stale original extent.
+     */
+    hl_gmap_add(0x20000, 0x14000);
+    hl_gmap_set_guest_length(0x20000, 0x4000);
+    hl_gmap_unmap_range(0x20000, 0x24000);
+    hl_gmap_add(0x20000, 0x4000);
+    hl_gmap_set_guest_length(0x20000, 0x4000);
+    HL_CHECK(hl_gmap_find_length(0x20000) == 0x4000);
+    HL_CHECK(hl_gmap_find_length(0x24000) == 0x10000);
+    hl_gmap_remove(0x20000);
+    hl_gmap_remove(0x24000);
+
+    /* Publishing a replacement directly also preserves the non-overlap
+     * invariant; callers cannot accidentally create duplicate base entries. */
+    hl_gmap_add(0x30000, 0x14000);
+    hl_gmap_set_guest_length(0x30000, 0x4000);
+    hl_gmap_add(0x30000, 0x4000);
+    HL_CHECK(hl_gmap_count() == 2);
+    HL_CHECK(hl_gmap_find_length(0x30000) == 0x4000);
+    HL_CHECK(hl_gmap_find_length(0x34000) == 0x10000);
+    hl_gmap_remove(0x30000);
+    hl_gmap_remove(0x34000);
+
     {
         void *mapping = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         HL_CHECK(mapping != MAP_FAILED);

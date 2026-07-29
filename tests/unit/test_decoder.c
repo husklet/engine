@@ -40,6 +40,10 @@ int main(void) {
     HL_CHECK(decode(movabs, &insn) == 10);
     HL_CHECK(insn.imm_bytes == 8 && (uint64_t)insn.imm == UINT64_C(0x1122334455667788));
 
+    const uint8_t rex_mov_r9d[] = {0x41, 0xb9, 0x01, 0x00, 0x00, 0x00};
+    HL_CHECK(decode(rex_mov_r9d, &insn) == 6);
+    HL_CHECK(insn.rexB && insn.op == 0xb9 && insn.opsize == 4 && insn.imm_bytes == 4 && insn.imm == 1);
+
     const uint8_t signed_imm8[] = {0x83, 0xc0, 0x80};
     HL_CHECK(decode(signed_imm8, &insn) == 3);
     HL_CHECK(insn.mod == 3 && insn.rm_reg == 0 && insn.imm_bytes == 1 && insn.imm == -128);

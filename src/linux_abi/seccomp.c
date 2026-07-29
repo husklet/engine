@@ -95,7 +95,8 @@ static int hl_linux_seccomp_apply(struct cpu *c) {
     struct hl_linux_seccomp_data sd;
     sd.nr = (int32_t)G_SECCOMP_NR(c); // RAW native syscall number the guest issued (pre-normalization)
     sd.arch = G_SECCOMP_ARCH;
-    sd.instruction_pointer = G_PC(c);
+    // Guest ABI state: SIGSYS handlers compare this address with the interrupted PC in ucontext.
+    sd.instruction_pointer = G_SECCOMP_IP(c);
     sd.args[0] = G_A0(c);
     sd.args[1] = G_A1(c);
     sd.args[2] = G_A2(c);
@@ -129,8 +130,10 @@ static int hl_linux_seccomp_apply(struct cpu *c) {
         // SIGSYS handler it runs; otherwise SIGSYS default-terminates the process (raise_guest_signal). The
         // kernel's TRAP path skips the syscall WITHOUT writing the return register (unlike ERRNO/TRACE), so
         // we leave G_RET untouched -- matching Linux, where a returning handler observes the unmodified reg.
-        g_sigcode[31] = 1 /*SYS_SECCOMP*/;
-        raise_guest_signal(c, 31);
+        // Linux _sigsys: call_addr@16, syscall@24, arch@28; RET_DATA is carried in si_errno.
+        raise_guest_signal_info(c, 31, (int)(action & HL_LINUX_SECCOMP_RET_DATA), 1 /*SYS_SECCOMP*/,
+                                (uint64_t)(uint32_t)sd.nr | ((uint64_t)sd.arch << 32), 0, 0,
+                                sd.instruction_pointer);
         return 1;
     case HL_LINUX_SECCOMP_RET_KILL_PROCESS:
     case HL_LINUX_SECCOMP_RET_KILL_THREAD: // modeled as process death (faithful for a single-threaded guest)

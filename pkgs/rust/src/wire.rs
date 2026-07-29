@@ -23,6 +23,19 @@ impl LaunchWire {
     }
 }
 
+fn volume_field(output: &mut Vec<u8>, value: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &byte in value {
+        if matches!(byte, b'%' | b':' | b',') {
+            output.push(b'%');
+            output.push(HEX[usize::from(byte >> 4)]);
+            output.push(HEX[usize::from(byte & 0x0f)]);
+        } else {
+            output.push(byte);
+        }
+    }
+}
+
 const MAGIC: u32 = 0x484c_4346;
 const ABI: u32 = 1;
 
@@ -210,7 +223,7 @@ impl LaunchWire {
         if config.file_owners.is_empty() {
             return Ok(None);
         }
-        let mut entries = config.file_owners.iter().collect::<Vec<_>>();
+        let mut entries = config.file_owners.values().collect::<Vec<_>>();
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         let mut output = Vec::new();
         for (index, (path, uid, gid)) in entries.into_iter().enumerate() {
@@ -234,7 +247,6 @@ impl LaunchWire {
         }
         Ok(Some(output))
     }
-
     fn volumes(config: &Config) -> Result<Option<Vec<u8>>, Error> {
         if config.mounts.is_empty() && config.namespace_links.is_empty() {
             return Ok(None);
@@ -244,47 +256,29 @@ impl LaunchWire {
         for mount in &config.mounts {
             let host = Self::checked_bytes(mount.host.as_os_str())?;
             let guest = Self::checked_bytes(mount.guest.as_os_str())?;
-            if host.contains(&b',')
-                || host.contains(&b':')
-                || guest.contains(&b',')
-                || guest.contains(&b':')
-            {
-                return Err(Error::InvalidConfig(
-                    "mount paths must not contain ':' or ','",
-                ));
-            }
             if index != 0 {
                 output.push(b',');
             }
             output.extend_from_slice(if mount.access == Access::ReadOnly {
-                b"ro:"
+                b"v2:ro:"
             } else {
-                b"rw:"
+                b"v2:rw:"
             });
-            output.extend_from_slice(guest);
+            volume_field(&mut output, guest);
             output.push(b':');
-            output.extend_from_slice(host);
+            volume_field(&mut output, host);
             index += 1;
         }
         for (host, guest) in &config.namespace_links {
             let host = Self::checked_bytes(host.as_os_str())?;
             let guest = Self::checked_bytes(guest.as_os_str())?;
-            if host.contains(&b',')
-                || host.contains(&b':')
-                || guest.contains(&b',')
-                || guest.contains(&b':')
-            {
-                return Err(Error::InvalidConfig(
-                    "namespace link paths must not contain ':' or ','",
-                ));
-            }
             if index != 0 {
                 output.push(b',');
             }
-            output.extend_from_slice(b"link:");
-            output.extend_from_slice(guest);
+            output.extend_from_slice(b"v2:link:");
+            volume_field(&mut output, guest);
             output.push(b':');
-            output.extend_from_slice(host);
+            volume_field(&mut output, host);
             index += 1;
         }
         Ok(Some(output))

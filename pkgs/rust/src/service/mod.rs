@@ -1,8 +1,8 @@
 use crate::{
     extension::{
-        Credentials, HandleOperation, Handles, Interest, LinuxError, OpenAccess, OpenRequest,
-        ReadRequest, Readiness, SeekOrigin, SeekRequest, ServiceId, ServiceRegistration,
-        WriteRequest,
+        Credentials, HandleOperation, Handles, Interest, IoctlRequest, LinuxError, OpenAccess,
+        OpenRequest, ReadRequest, Readiness, SeekOrigin, SeekRequest, ServiceId,
+        ServiceRegistration, WriteRequest,
     },
     transport::{Channel, Frame, MessageType, TransportError},
 };

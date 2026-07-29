@@ -91,6 +91,11 @@ impl ServiceTransport for Mock {
                     .into_iter()
                     .collect(),
             }),
+            Request::Ioctl { argument, .. } => Reply::Ioctl {
+                value: 0,
+                argument,
+                writes: Vec::new(),
+            },
             Request::Close { .. } => {
                 self.closes.fetch_add(1, Ordering::Relaxed);
                 Reply::Closed

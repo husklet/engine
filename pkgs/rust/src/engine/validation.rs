@@ -476,6 +476,7 @@ fn validate_selected_runtime(
                 crate::extension::HandleOperation::Write,
                 crate::extension::HandleOperation::Metadata,
                 crate::extension::HandleOperation::Poll,
+                crate::extension::HandleOperation::Ioctl,
             ]);
             if extension
                 .services
@@ -486,7 +487,7 @@ fn validate_selected_runtime(
                     SpecErrorCategory::Unsupported,
                     "extensions.services.operations",
                     crate::spec::SpecResource::Provider(extension.provider.clone()),
-                    "handles contract v1 advertises only read, write, metadata, poll, and engine-owned OFD lifecycle",
+                    "handles contract v1 advertises only read, write, metadata, poll, ioctl, and engine-owned OFD lifecycle",
                 ));
             }
             for entry in &extension.namespace {

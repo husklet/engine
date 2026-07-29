@@ -28,6 +28,9 @@
 // ones, so G_SECCOMP_NR is just x8. AUDIT_ARCH_AARCH64 = EM_AARCH64(183) | __AUDIT_ARCH_64BIT | _LE.
 #define G_SECCOMP_ARCH 0xC00000B7u
 #define G_SECCOMP_NR(c) ((int)(uint32_t)(c)->x[8])
+// seccomp_data and the SIGSYS ucontext expose the architectural guest PC, never the engine's private
+// high-map address used to execute non-PIE images. Linux enters seccomp after advancing ELR past SVC.
+#define G_SECCOMP_IP(c) pcrel_base((c)->pc + 4)
 
 // Engine seam: the shared jit/cache.c hashes the guest PC as (gpc >> G_GPC_HASH_SHIFT). aarch64 PCs are
 // 4-byte aligned, so shifting out the low 2 bits spreads the map. (Pure tuning constant; value 2 is the

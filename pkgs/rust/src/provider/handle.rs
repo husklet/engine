@@ -65,6 +65,17 @@ pub trait OpenHandle: Send + Sync {
             context: "provider handle metadata is unsupported".into(),
         })
     }
+    /// Executes one provider-defined ioctl over the command's bounded root argument.
+    ///
+    /// # Errors
+    /// Returns a Linux error when the command is unknown or its argument is invalid.
+    fn ioctl(&self, request: IoctlRequest) -> Result<IoctlResult, LinuxError> {
+        let _ = request;
+        Err(LinuxError {
+            errno: 25,
+            context: "provider handle ioctl is unsupported".into(),
+        })
+    }
     /// Samples readiness for an interest set.
     ///
     /// # Errors
@@ -105,6 +116,23 @@ pub enum SeekOrigin {
 pub struct HandleMetadata {
     pub metadata: Metadata,
     pub size: u64,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IoctlRequest {
+    pub command: u64,
+    pub argument: Vec<u8>,
+    pub deadline: SystemTime,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IoctlResult {
+    pub value: i64,
+    pub argument: Vec<u8>,
+    pub writes: Vec<IoctlWrite>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IoctlWrite {
+    pub address: u64,
+    pub bytes: Vec<u8>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Interest {

@@ -248,6 +248,7 @@ static void build_signal_frame(struct cpu *c, int sig, int synchronous) {
         .handler = g_sigact[sig].handler,
         .flags = g_sigact[sig].flags,
         .mask = g_sigact[sig].mask,
+        .error = &g_sigerror[sig],
         .code = synchronous ? &c->sync_code : &g_sigcode[sig],
         .value = &g_sigval[sig],
         .address = synchronous ? &c->sync_address : &g_sigaddr[sig],
@@ -884,9 +885,9 @@ static int container_init(const char *rootfs) {
         } else if (g_netns[0] && hl_target_services_make_directory(&g_target_services, g_netns, 0700) != 0)
             return -1;
         const char *eu = hl_option_get("HL_UID");
-        if (eu && g_uid < 0) g_uid = hl_parse_id("HL_UID", eu);
+        if (eu) g_uid = hl_parse_id("HL_UID", eu);
         const char *eg = hl_option_get("HL_GID");
-        if (eg && g_gid < 0) g_gid = hl_parse_id("HL_GID", eg);
+        if (eg) g_gid = hl_parse_id("HL_GID", eg);
         // USER ns (process.user)
     }
     if (rootfs && rootfs[0]) {
@@ -901,6 +902,7 @@ static int container_init(const char *rootfs) {
         if (g_uid < 0) g_uid = 0;
         // Container default: run as root (0), unless HL_UID or the typed uid field is set.
         if (g_gid < 0) g_gid = 0;
+        cred_reset_initial();
         // Docker -w / initial working directory: start the guest in HL_CWD (must be reachable inside the
         // container -- typically a bind-mounted volume). confine() normalizes + clamps it to the rootfs.
         const char *icwd = hl_option_get("HL_CWD");
@@ -913,11 +915,12 @@ static int container_init(const char *rootfs) {
     // registration is what surfaces the bind in /proc/self/mountinfo + /proc/mounts.
     const char *vspec = hl_option_get("HL_VOLUMES");
     if (vspec && vspec[0]) {
-        char tmp[4096];
-        snprintf(tmp, sizeof tmp, "%s", vspec);
+        char *tmp = strdup(vspec);
+        if (tmp == NULL) return -1;
         char *sv = NULL;
         for (char *t = strtok_r(tmp, ",", &sv); t; t = strtok_r(NULL, ",", &sv))
             add_vol(t);
+        free(tmp);
     }
     // derive the run user's supplementary group set from the image rootfs (runc additionalGids), after
     // g_uid/g_gid + the overlay lowers are resolved, so getgroups(2) and /proc/self/status Groups: report it.

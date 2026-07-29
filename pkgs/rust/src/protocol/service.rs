@@ -16,7 +16,7 @@ mod tests {
         ProjectionKind, Reply, Request, ServiceCodec, ServiceFailure, ServiceProjection,
     };
     use crate::model::extension::ServiceId;
-    use crate::provider::{LinuxError, Readiness, ReadyState};
+    use crate::provider::{IoctlWrite, LinuxError, Readiness, ReadyState};
 
     #[test]
     fn frozen_codec_round_trips_requests_replies_and_errno() {
@@ -38,6 +38,24 @@ mod tests {
             .concat()
         );
         assert_eq!(ServiceCodec::decode_request(&encoded, 16).unwrap(), request);
+
+        let ioctl = Request::Ioctl {
+            handle: 9,
+            command: 0xc004_6801,
+            argument: 7_u32.to_le_bytes().to_vec(),
+        };
+        let encoded = ServiceCodec::encode_request(&ioctl, 16).unwrap();
+        assert_eq!(ServiceCodec::decode_request(&encoded, 16).unwrap(), ioctl);
+        let reply = Reply::Ioctl {
+            value: 0,
+            argument: 0x1234_5678_u32.to_le_bytes().to_vec(),
+            writes: vec![IoctlWrite {
+                address: 0x1000,
+                bytes: b"driver".to_vec(),
+            }],
+        };
+        let encoded = ServiceCodec::encode_reply(&Ok(reply.clone()), 16).unwrap();
+        assert_eq!(ServiceCodec::decode_reply(&encoded, 16).unwrap(), reply);
 
         let ready = Reply::Ready(Readiness {
             states: [ReadyState::Readable, ReadyState::Hangup]

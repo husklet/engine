@@ -12,9 +12,28 @@ const SEEK: u8 = 4;
 const STAT: u8 = 5;
 const POLL: u8 = 6;
 const CLOSE: u8 = 7;
+const IOCTL: u8 = 8;
 const ERROR: u8 = 0xff;
+const MAX_IOCTL_WRITES: usize = 16;
 
 pub(crate) struct ServiceCodec;
+
+fn decode_ioctl_request(input: &mut Input<'_>, maximum: u32) -> Result<Request, ServiceFailure> {
+    let handle = input.u64()?;
+    let command = input.u64()?;
+    let length = input.u32()?;
+    if length > maximum {
+        return Err(ServiceFailure::linux(
+            22,
+            "service ioctl exceeds request bound",
+        ));
+    }
+    Ok(Request::Ioctl {
+        handle,
+        command,
+        argument: input.bytes(length as usize)?.to_vec(),
+    })
+}
 
 impl ServiceCodec {
     /// Encodes one bounded service request.
@@ -95,6 +114,26 @@ impl ServiceCodec {
                         | (u8::from(interest.writable) << 1)
                         | (u8::from(interest.priority) << 2),
                 );
+            }
+            Request::Ioctl {
+                handle,
+                command,
+                argument,
+            } => {
+                let length = u32::try_from(argument.len()).map_err(|_| {
+                    ServiceFailure::linux(22, "service ioctl exceeds protocol range")
+                })?;
+                if length > maximum {
+                    return Err(ServiceFailure::linux(
+                        22,
+                        "service ioctl exceeds request bound",
+                    ));
+                }
+                out.push(IOCTL);
+                out.u64(*handle);
+                out.u64(*command);
+                out.u32(length);
+                out.extend(argument);
             }
             Request::Close { handle } => {
                 out.push(CLOSE);
@@ -191,6 +230,7 @@ impl ServiceCodec {
                     },
                 }
             }
+            IOCTL => decode_ioctl_request(&mut input, maximum)?,
             CLOSE => Request::Close {
                 handle: input.u64()?,
             },
@@ -267,6 +307,35 @@ impl ServiceCodec {
                     }
                     out.push(states);
                 }
+                Reply::Ioctl {
+                    value,
+                    argument,
+                    writes,
+                } => {
+                    let length = u32::try_from(argument.len()).map_err(|_| protocol())?;
+                    if length > maximum || writes.len() > MAX_IOCTL_WRITES {
+                        return Err(protocol());
+                    }
+                    let mut transferred = length;
+                    for write in writes {
+                        let write_length =
+                            u32::try_from(write.bytes.len()).map_err(|_| protocol())?;
+                        transferred = transferred.checked_add(write_length).ok_or_else(protocol)?;
+                        if transferred > maximum {
+                            return Err(protocol());
+                        }
+                    }
+                    out.push(IOCTL);
+                    out.i64(*value);
+                    out.u32(length);
+                    out.extend(argument);
+                    out.u32(u32::try_from(writes.len()).map_err(|_| protocol())?);
+                    for write in writes {
+                        out.u64(write.address);
+                        out.u32(u32::try_from(write.bytes.len()).map_err(|_| protocol())?);
+                        out.extend(&write.bytes);
+                    }
+                }
                 Reply::Closed => out.push(CLOSE),
             },
         }
@@ -324,6 +393,37 @@ impl ServiceCodec {
                 .filter_map(|(bit, state)| (value & bit != 0).then_some(state))
                 .collect();
                 Reply::Ready(Readiness { states })
+            }
+            IOCTL => {
+                let value = input.i64()?;
+                let length = input.u32()?;
+                if length > maximum {
+                    return Err(protocol());
+                }
+                let argument = input.bytes(length as usize)?.to_vec();
+                let count = input.u32()? as usize;
+                if count > MAX_IOCTL_WRITES {
+                    return Err(protocol());
+                }
+                let mut transferred = length;
+                let mut writes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let address = input.u64()?;
+                    let write_length = input.u32()?;
+                    transferred = transferred.checked_add(write_length).ok_or_else(protocol)?;
+                    if transferred > maximum {
+                        return Err(protocol());
+                    }
+                    writes.push(crate::provider::IoctlWrite {
+                        address,
+                        bytes: input.bytes(write_length as usize)?.to_vec(),
+                    });
+                }
+                Reply::Ioctl {
+                    value,
+                    argument,
+                    writes,
+                }
             }
             CLOSE => Reply::Closed,
             _ => return Err(protocol()),
