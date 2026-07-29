@@ -94,7 +94,7 @@ jobs:
       # --no-tests=error because `ctest -L <missing>` exits 0 (I15).
       #
       # `nested-engine` is the branch's acceptance criterion, engine in engine. All
-      # five cells run here, because this is the only host where BOTH engine ELF
+      # six cells run here, because this is the only host where BOTH engine ELF
       # arches exist: build-arm-check above supplies the aarch64 ones. ~130s.
       # -V, not --output-on-failure: CTest prints nothing for a SKIPPED test, and a
       # skip here means build-arm-check went missing -- whose whole point is to say

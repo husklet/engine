@@ -870,6 +870,18 @@ hl_nested_case(${_nest_foreign}-${_nest_foreign}-${HL_HOST_ARCH}
   CHAIN ${_nest_native}-${_nest_foreign} ${_nest_cross}-${_nest_foreign}
         ${_nest_cross}-${HL_HOST_ARCH} ${_nest_hello}/${HL_HOST_ARCH}/hello)
 
+if(HL_HOST_ARCH STREQUAL "x86_64")
+  hl_nested_case(aarch64-x86_64-aarch64
+    CROSS ${_nest_cross_dir} BUDGET ${_nest_budget3}
+    CHAIN ${_nest_native}-aarch64 ${_nest_cross}-x86_64
+          ${_nest_native}-aarch64 ${_nest_hello}/aarch64/hello)
+else()
+  hl_nested_case(aarch64-x86_64-aarch64
+    CROSS ${_nest_cross_dir} BUDGET ${_nest_budget3}
+    CHAIN ${_nest_native}-aarch64 ${_nest_native}-x86_64
+          ${_nest_cross}-aarch64 ${_nest_hello}/aarch64/hello)
+endif()
+
 # ===========================================================================
 # 9b. the compat corpus against an EMULATED aarch64 host (qemu-user)
 # ===========================================================================
