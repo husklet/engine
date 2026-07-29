@@ -70,12 +70,14 @@
 // interpreter). Opt in via HL_PCACHE=1.
 
 #define PC_MAGIC 0x34414350544a4c48ull // "HLJTPCA4" (LE tag)
-#define PC_VERSION 9 // v9 persists each block's exact guest-source interval for targeted SMC invalidation.
+#define PC_VERSION 10 // v10 records the translated-code ABI independently from the file layout.
 #define PC_VERSION_EFF PC_VERSION
+#define PC_TRANSLATOR_ABI HL_PCACHE_ABI_AARCH64
 #define PC_IMG_BASE 0x0000040000000000ull    // 4 TB -- fixed guest image base (probed free on Apple silicon)
 #define PC_INTERP_BASE 0x0000048000000000ull // 4.5 TB -- fixed interp (ld.so) base
 #define PC_RELOC_CAP (1u << 20)              // recorded baked-host-pointer slots (poison if exceeded)
 
+#include "../../cache_abi.h"
 #include "../../reloc.h"
 #include "../../digest.h"
 #include "../../identity.h"
@@ -213,6 +215,7 @@ static void pc_record_icsite(uint8_t *lt) {
 // [pc_hdr][reloc][map][pend][t2][txpg][provenance][arena bytes]
 struct pc_hdr {
     uint64_t magic, version;
+    uint64_t translator_abi;
     uint64_t cpu_sz, jit_map_n, ibtc_n;
     uint64_t img_base, interp_base;
     uint64_t bin_id, entry_jump;
@@ -243,18 +246,14 @@ static uint64_t pcache_id_of(const char *path) {
 // Per-engine-build tag so the cache self-invalidates across engine rebuilds: host bytes emitted by another
 // build must never be loaded, because they are instructions the current translator would not have emitted.
 //
-// The ENGINE BINARY's own identity is what makes this sound. __DATE__/__TIME__ alone did NOT: they freeze
-// when THIS translation unit is compiled, so changing any other translator source yielded an engine that
-// emitted different host code under an UNCHANGED tag. That defect was demonstrated on the x86_64 side,
-// where it crashed the pc-* persistent-cache cases with SIGSEGV after a codegen-only change; aarch64 shares
-// the scheme and so shared the latent hole. Any relink moves the binary's size/mtime/inode.
-//
-// The compile-time tag stays as a mix-in: it still discriminates when the engine's own path cannot be
-// resolved (hl_identity_source returns 0), e.g. an embedded/activated engine.
+// The explicit translator ABI is authoritative for embedded engines, where g_self_path identifies the
+// outer application rather than the translator archive. The executable identity and compile-time tag remain
+// useful mix-ins, but neither replaces bumping PC_TRANSLATOR_ABI after an incompatible codegen change.
 static uint64_t pcache_engine_id(void) {
     static const char tag[] = __DATE__ " " __TIME__;
     uint64_t build = hl_digest_bytes(HL_DIGEST_SEED, tag, sizeof tag - 1);
     build = hl_digest_bytes(build, &(uint64_t){pcache_id_of(g_self_path)}, sizeof(uint64_t));
+    build = hl_digest_bytes(build, &(uint64_t){PC_TRANSLATOR_ABI}, sizeof(uint64_t));
     uint64_t modes = (uint64_t)(g_guestfold != 0) | ((uint64_t)(g_steal1617 != 0) << 1) |
                      ((uint64_t)(g_noibslim != 0) << 2) | ((uint64_t)(g_mtibtc != 0) << 3) |
                      ((uint64_t)(g_no_stw_reclaim != 0) << 4) | ((uint64_t)(g_prof != 0) << 5) |
@@ -392,7 +391,9 @@ static int pcache_load(uint64_t entry_jump) {
     hl_persist_cursor cursor = {image, image_size, 0};
     struct pc_hdr h;
     if (!hl_persist_take(&cursor, &h, sizeof h)) { free(image); return 0; }
-    if (h.magic != PC_MAGIC || h.version != PC_VERSION_EFF || h.cpu_sz != sizeof(struct cpu) ||
+    if (h.magic != PC_MAGIC ||
+        !hl_pcache_compatible(h.version, h.translator_abi, PC_VERSION_EFF, PC_TRANSLATOR_ABI) ||
+        h.cpu_sz != sizeof(struct cpu) ||
         h.jit_map_n != JIT_MAP_N || h.ibtc_n != IBTC_N || h.img_base != PC_IMG_BASE ||
         h.interp_base != PC_INTERP_BASE || h.bin_id != g_pc_binid || h.entry_jump != entry_jump ||
         h.arena_used > CACHE_SZ || (h.arena_used & 3) || h.n_reloc > PC_RELOC_CAP || h.n_mapent > JIT_MAP_N ||
@@ -568,6 +569,7 @@ static void pcache_save(void) {
     memset(&h, 0, sizeof h);
     h.magic = PC_MAGIC;
     h.version = PC_VERSION_EFF;
+    h.translator_abi = PC_TRANSLATOR_ABI;
     h.cpu_sz = sizeof(struct cpu);
     h.jit_map_n = JIT_MAP_N;
     h.ibtc_n = IBTC_N;
