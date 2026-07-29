@@ -633,6 +633,12 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
         // guest's requested range -- a guard tail would let a collision in the extra pages spuriously fail
         // (or a free-space map succeed where the tail overlaps), so keep NOREPLACE maps exact-length.
         size_t guard = (!(a3 & 0x10) && (a3 & 0x20) && !(a3 & 0x100000)) ? 0x10000 : 0;
+        uint64_t page_mask = (uint64_t)guest_pagesz() - 1;
+        if (a1 > UINT64_MAX - page_mask - guard) {
+            G_RET(c) = (uint64_t)(int64_t)(-ENOMEM);
+            break;
+        }
+        uint64_t mapped_length = ((a1 + page_mask) & ~page_mask) + guard;
         // mprotect (case 226) is a no-op (the JIT never executes guest pages), so a later PROT_READ ->
         // PROT_READ|WRITE upgrade would be silently dropped. Map ANON memory writable up front so the
         // upgrade is already in effect (redis' checkLinuxMadvFreeForkBug mmaps R then mprotects RW then stores).
@@ -804,7 +810,7 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             void *base = mmap(NULL, mapped_size, prot, mmap_flags((int)a3), (int)a4, aligned_offset);
             if (base != MAP_FAILED) {
                 physical_mapping = base;
-                physical_mapping_size = mapped_size;
+                physical_mapping_size = (mapped_size + hp - 1) & ~(hp - 1);
                 r = (char *)base + head;
                 off_emul = 0;
             }
@@ -894,14 +900,14 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 // The guest-map registry must split around the replaced range too, or a whole-span
                 // reservation MAP_FIXED'd into (every ld.so does this) stays whole and /proc/[pid]/maps
                 // emits rows that overlap the segments mapped inside it.
-                hl_gmap_supersede_range((uint64_t)r, (uint64_t)r + (uint64_t)a1);
+                hl_gmap_supersede_range((uint64_t)r, (uint64_t)r + mapped_length);
             }
             if (!bus_prepared && !mapping_prepared) gbus_clear((uint64_t)r, (uint64_t)r + (uint64_t)a1 + guard);
             if (physical_mapping != NULL)
-                hl_gmap_add_physical((uint64_t)r, (uint64_t)a1 + guard, (uint64_t)physical_mapping,
+                hl_gmap_add_physical((uint64_t)r, mapped_length, (uint64_t)physical_mapping,
                                      (uint64_t)physical_mapping_size);
             else
-                hl_gmap_add((uint64_t)r, (uint64_t)a1 + guard);  // track for execve() teardown
+                hl_gmap_add((uint64_t)r, mapped_length);         // track for execve() teardown
             hl_gmap_set_guest_length((uint64_t)r, (uint64_t)a1); // /proc maps report the guest length (sans guard)
             if (!(a3 & 0x20) && (int)a4 >= 0)
                 filemap_register((uint64_t)r, (uint64_t)a1, (int)a4, (uint64_t)a5, (a3 & 0x01) != 0, off_emul == 2);
