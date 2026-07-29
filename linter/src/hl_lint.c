@@ -173,7 +173,7 @@ static bool is_shell_allowed_in_file(const LintConfig *cfg, const char *path) {
 }
 
 static bool is_source_file(const char *path) {
-    return has_ext(path, ".c") || has_ext(path, ".h");
+    return has_ext(path, ".c") || has_ext(path, ".h") || has_ext(path, ".m") || has_ext(path, ".mm");
 }
 
 static bool dir_should_skip(const char *name) {
@@ -546,6 +546,13 @@ static bool line_has_direct_environment_access(const char *line) {
     return false;
 }
 
+static bool line_has_platform_debug_output(const char *line) {
+    static const char *const calls[] = {"OutputDebugStringA", "OutputDebugStringW", "NSLog", "os_log", "syslog", NULL};
+    for (size_t index = 0; calls[index] != NULL; ++index)
+        if (line_has_call(line, calls[index])) return true;
+    return false;
+}
+
 static bool line_has_control_prefix(const char *line) {
     const char *s = skip_space(line);
     static const char *const k_controls[] = {"if",      "else",    "for",    "while",  "switch",       "case",
@@ -676,6 +683,10 @@ static void check_file_custom(const LintConfig *cfg, const char *path, LintStats
         }
         if (line_has_direct_console_output(clean) && !is_stdio_allowed_in_file(cfg, path)) {
             emit_diag("error", path, lineno, 1, "logging", "direct console output is forbidden; use tagged logging");
+            stats->errors++;
+        }
+        if (line_has_platform_debug_output(clean) && !is_stdio_allowed_in_file(cfg, path)) {
+            emit_diag("error", path, lineno, 1, "logging", "platform debug output is forbidden; use tagged logging");
             stats->errors++;
         }
         if ((line_has_call(clean, "system") || line_has_call(clean, "popen")) && !is_shell_allowed_in_file(cfg, path)) {

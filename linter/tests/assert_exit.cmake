@@ -61,6 +61,12 @@ elseif(HL_LINT_CASE STREQUAL "stdio-extended-error")
   set(_args
     ${_common}
     --source-file "${HL_LINT_SOURCE_DIR}/linter/tests/stdio_extended_fixture.c")
+elseif(HL_LINT_CASE STREQUAL "platform-debug-error")
+  set(_expected 1)
+  set(_pattern "warnings=0 errors=5")
+  set(_args
+    ${_common}
+    --source-dir "${HL_LINT_SOURCE_DIR}/linter/tests/platform_debug")
 elseif(HL_LINT_CASE STREQUAL "shell-error")
   set(_expected 1)
   set(_pattern "shell execution is forbidden")
