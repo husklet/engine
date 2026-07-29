@@ -3236,7 +3236,6 @@ static uint64_t scan_tail_x30_carry(uint64_t pc) {
 }
 
 static void *translate_block(uint64_t gpc) {
-    HL_LOGF(&g_jit_log, HL_LOG_TAG_TRANSLATE, "isa=aarch64 guest_pc=%#llx", (unsigned long long)gpc);
     /* Observe writes made through another MAP_SHARED alias before decoding
        an executable view backed by an emulated host-page snapshot. */
     uint64_t source_page = gpc & ~UINT64_C(0xfff);

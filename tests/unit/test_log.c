@@ -1,6 +1,7 @@
 #include "test.h"
 
 #include "hl/log.h"
+#include "../../src/core/profile.h"
 
 #include <string.h>
 
@@ -19,6 +20,14 @@ static void capture_emit(void *context, uint32_t event, const char *message, siz
     capture->message[copy] = '\0';
 }
 
+#if defined(HL_ENABLE_LOGGING) && HL_ENABLE_LOGGING
+static void report_translations(void *context, uint64_t translations, uint64_t translation_ns) {
+    (void)translation_ns;
+    HL_LOGF((hl_log_context *)context, HL_LOG_TAG_TRANSLATE, "blocks=%llu",
+            (unsigned long long)translations);
+}
+#endif
+
 int main(void) {
     static const hl_host_log_services log_services = {HL_HOST_LOG_ABI, sizeof(log_services), capture_emit};
     log_capture capture = {0};
@@ -29,7 +38,7 @@ int main(void) {
     host.capabilities = HL_HOST_CAP_LOG;
     host.context = &capture;
     host.log = &log_services;
-    HL_CHECK(hl_log_context_init(&log, &host, "log:fs,log:jit") == HL_STATUS_OK);
+    HL_CHECK(hl_log_context_init(&log, &host, "log:fs,log:jit,log:translate") == HL_STATUS_OK);
 #if defined(HL_ENABLE_LOGGING) && HL_ENABLE_LOGGING
     HL_CHECK(hl_log_enabled(&log, HL_LOG_TAG_FS));
     HL_CHECK(!hl_log_enabled(&log, HL_LOG_TAG_NETWORK));
@@ -37,6 +46,14 @@ int main(void) {
     HL_LOGF(&log, HL_LOG_TAG_JIT, "block=%d", 7);
     HL_CHECK(capture.events == 2 && capture.last_tag == HL_LOG_TAG_JIT);
     HL_CHECK(strcmp(capture.message, "[hl:jit] block=7\n") == 0);
+
+    hl_dispatch_profile profile = {0};
+    for (uint64_t block = 0; block < 100000; block++)
+        hl_dispatch_profile_translation(&profile);
+    HL_CHECK(capture.events == 2);
+    hl_dispatch_profile_report(&profile, &log, report_translations);
+    HL_CHECK(capture.events == 3 && capture.last_tag == HL_LOG_TAG_TRANSLATE);
+    HL_CHECK(strcmp(capture.message, "[hl:translate] blocks=100000\n") == 0);
 #else
     int side_effect = 0;
     HL_LOGF(&log, HL_LOG_TAG_FS, "side=%d", ++side_effect);

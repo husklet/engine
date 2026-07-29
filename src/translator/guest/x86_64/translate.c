@@ -3001,7 +3001,6 @@ static void *translate_block(uint64_t gpc) {
     };
     const int stitch = 1;
     uint64_t start = gpc;
-    HL_LOGF(&g_jit_log, HL_LOG_TAG_TRANSLATE, "isa=x86_64 guest_pc=%#llx", (unsigned long long)gpc);
     void *host = g_cp;
     emit_prologue();
     void *body = g_cp;
@@ -3013,7 +3012,6 @@ static void *translate_block(uint64_t gpc) {
     g_df = HL_X86_DIRECTION_DYNAMIC; // a prior block's std/popfq may have left it set
     hl_x86_x87_reset();              // x87: top unknown at block entry until a finit anchors it
     g_vmark_done = 0;                // fresh region -> first xmm write must re-mark cpu->vdirty
-    g_prof_xlate++;                  // PROF (measurement-only): translate_block calls
     // W3-A superblock state: guest block-starts already laid in this region + region budget.
     uint64_t seen[HL_X86_TRACE_MAX_BLOCKS];
     int nseen = 0, trace_blk = 0;

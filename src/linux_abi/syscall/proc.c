@@ -544,6 +544,12 @@ static void rusage_to_linux(uint8_t *d, const struct rusage *ru) {
     *(int64_t *)(d + 136) = ru->ru_nivcsw;
 }
 
+static void translation_log_summary(void *context, uint64_t translations, uint64_t translation_ns) {
+    (void)translation_ns;
+    HL_LOGF((hl_log_context *)context, HL_LOG_TAG_TRANSLATE, "blocks=%llu",
+            (unsigned long long)translations);
+}
+
 static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
                     uint64_t a5) {
     switch (nr) {
@@ -718,6 +724,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         fprintf(stderr, "[HLDBG] exit-group pid=%d code=%d pc=%#llx\n", (int)getpid(), (int)a0,
                 (unsigned long long)G_PC(c));
         HL_LOGF(&g_jit_log, HL_LOG_TAG_NETWORK, "exit_group pid=%d code=%d", (int)getpid(), (int)a0);
+        hl_dispatch_profile_report(&g_dispatch_profile, &g_jit_log, translation_log_summary);
         if (0)
             fprintf(stderr,
                     "[prof] crossings=%llu syscalls=%llu ibtc_miss=%llu branch_cross=%llu translations=%llu lse=%llu "
