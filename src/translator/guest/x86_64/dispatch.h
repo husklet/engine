@@ -125,7 +125,10 @@ static int smc_on_write(uint64_t a) {
 // shared dispatcher while-loop -- the original broke the loop immediately, not just the macro.
 #define G_DISPATCH_DEBUG(c)                                                                                            \
     {                                                                                                                  \
-        if (g_pending) maybe_deliver_signal(c); /* async signal pending -> redirect to guest handler */                \
+        if (g_pending) {                                                                                               \
+            maybe_deliver_signal(c); /* async signal pending -> redirect to guest handler */                           \
+            (c)->rip = nonpie_fold((c)->rip);                                                                          \
+        }                                                                                                              \
         g_prevpc = g_curpc;                                                                                            \
         g_curpc = (c)->rip;                                                                                            \
         g_disp_n++;                                                                                                    \
