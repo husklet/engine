@@ -259,6 +259,7 @@ endif()
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Format.cmake)
 
 # --- lint target -------------------------------------------------------------
+add_subdirectory(linter)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Lint.cmake)
 
 # --- rustfmt / clippy as tests ------------------------------------------------
