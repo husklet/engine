@@ -171,6 +171,7 @@ hl_unit(options_environment NO_LIBS
                             FLAGS -UHL_ENABLE_LOGGING -DHL_ENABLE_LOGGING=1)
 hl_unit(tool_process NO_LIBS SOURCES tools/process.c
         FLAGS -D_POSIX_C_SOURCE=200809L -DHL_TEST_COMMAND=\"${CMAKE_COMMAND}\")
+hl_unit(cache_abi NO_LIBS)
 
 # Cases compiled straight against a handful of .c files (no archive at all).
 hl_unit(resolve      SOURCES src/host/resolve.c)
@@ -209,7 +210,7 @@ hl_unit(system       SOURCES src/host/linux/system.c src/host/private.c)
 # --- the generic sweep (UNIT_NAMES) ----------------------------------------
 set(HL_UNIT_NAMES
   a64_asm address affinity arena avx bus child ckptinoq cli clock config cpuid
-  cmpxchg decoder device digest directory directory_services emit epoll eventfd
+  cache_abi cmpxchg decoder device digest directory directory_services emit epoll eventfd
   environment eventfd_fork fatal fdcache file flags fork_wire glue gmap guest_fetch host_services
   guest_naked identity image inotify key launch legacy lifecycle_identity linux_abi
   linux_fork logical_vma lower_alu lower_crypto lower_mov lower_repstr lower_shift
