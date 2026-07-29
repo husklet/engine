@@ -29,8 +29,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   # -lhl-host-windows names an archive that does not exist yet (M4). Emitting
   # `windows` anyway is still right: the alternative is emitting `linux`, i.e. a
-  # .pc file that names the WRONG archive rather than a missing one, which is
-  # exactly the class of path-literal bug docs/amd64-host.md 8.1 records.
+  # .pc file that names the WRONG archive rather than a missing one.
   set(HL_PACKAGE_HOST windows)
 else()
   set(HL_PACKAGE_HOST linux)

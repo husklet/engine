@@ -7,9 +7,8 @@
 # restored by the other, in both directions, for both guest ISAs.
 #
 # On an x86_64 host the two backends are the native INTERPRETER and the cross-built AArch64-host JIT run
-# under qemu-aarch64, so this shares the emulated lane's boundary: read docs/amd64-host.md before
-# trusting or distrusting a result. What it does vouch for is the part that has nothing to do with emulation
-# -- that the image one backend writes is the image the other reads.
+# under qemu-aarch64. This verifies the emulation-independent contract: the image one backend writes is the
+# image the other reads.
 #
 #   checkpoint_cross_gate.sh <cross-tree> <shim-dir> <runner> <fixture-dir> <isa> <direction> <fixture> [scenario]
 #

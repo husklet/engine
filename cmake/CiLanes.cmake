@@ -82,8 +82,8 @@ set(HL_CI_HOSTS
 # both guest ISAs, so only suites green on BOTH are gateable.
 #
 # The gateable set is much larger than this comment used to claim (compat-ipc,
-# compat-syscall-edges, compat-time). The second corpus sweep -- pinned binaries,
-# 3013 (case, guest-ISA) runs, docs/amd64-host.md 3.10 -- scores 99.34%
+# compat-syscall-edges, compat-time). The second pinned-binary corpus sweep,
+# covering 3013 (case, guest-ISA) runs, scores 99.34%
 # with 20 of the 24 suites fully green on BOTH guest ISAs; the residue is
 # compat-completeness, compat-core-regress, compat-process and compat-procfs, and
 # two of those four fail partly on the nice-level precondition that CI does not
@@ -225,8 +225,7 @@ set(HL_CI_SHARDED_HOST_ONLY
 #
 # emulated-aarch64-gated is the same shape: linux-x86_64.yml alone, because it is
 # the only host that HAS a cross-built aarch64 host arm to emulate. It is EMULATION
-# and CI says so -- docs/amd64-host.md is the category list, and weak memory
-# ordering is not on the vouched-for side of it.
+# and CI says so; weak memory ordering is not covered.
 set(HL_CI_DIRECT_LINUX
   unit
   nested-engine

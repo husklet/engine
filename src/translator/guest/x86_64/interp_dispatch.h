@@ -8,7 +8,7 @@
 #include "flags.h"
 
 // The x86-64 guest's dispatch seam for the INTERPRETER backend (every host CPU that is not AArch64);
-// dispatch.h beside it is the same seam for the ARM64 JIT. Background: docs/amd64-host.md sections 2-3.
+// dispatch.h beside it is the same seam for the ARM64 JIT.
 //
 // Nothing in the shared run_guest() contract requires `code` to be host machine code: interp.c makes it a
 // decoded-block DESCRIPTOR and run_block a C decode-and-execute loop, leaving struct cpu, the block cache,

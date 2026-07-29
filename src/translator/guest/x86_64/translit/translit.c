@@ -21,11 +21,10 @@
 // LOW, so the JIT emits a runtime fold on EVERY memory access (guest/x86_64/address.c emit_bias: if the
 // address has no bits above 32, add the bias) and un-biases address MATERIALISATION (lower/mov.c,
 // interp_lea_value) in the opposite direction. Verbatim copying can express NEITHER: a copied instruction
-// carries its own addressing mode, and there is no place to put the fold. Six separate bugs on this branch
-// came from getting one direction of that rule wrong (docs/amd64-host.md 3.11, 3.12, 3.16), so the
+// carries its own addressing mode, and there is no place to put the fold. Getting either direction wrong
+// corrupts addresses, so the
 // transliterator does not attempt it: g_nonpie_lo != 0 declines the image outright and every block runs on
-// the interpreter, which already implements both directions. This is a refusal, not an implementation --
-// see docs/amd64-host.md for what it costs and what would lift it.
+// the interpreter, which already implements both directions. This is a refusal, not an implementation.
 
 #include "../../../host/x86_64/asm.h"
 

@@ -22,8 +22,8 @@
 static volatile sig_atomic_t interrupted_signal;
 static volatile sig_atomic_t active_group;
 
-/* Per-launch guest budget and its host-backend scale; tools/matrix_runner.c is the reference, docs/ci-green.md
-   the reasoning, and the knob is identical in all six runners. 30s assumes a JIT host; without one a correct
+/* Per-launch guest budget and its host-backend scale; tools/matrix_runner.c is the reference and the knob is
+   identical in all six runners. 30s assumes a JIT host; without one a correct
    launch is terminated and reported as a hang. This runner is also the perf.linux-warm-cache-* payload, and
    the budget is PER LAUNCH: every one of that case's REPETITIONS samples must fit inside it. */
 enum { CASE_TIMEOUT_MS = 30000, TIMEOUT_SCALE_MAX = 100 };

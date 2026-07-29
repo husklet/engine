@@ -81,8 +81,8 @@ static ssize_t hl_getline(char **line, size_t *capacity, FILE *file) {
 #define HL_IO_COUNT(bytes) (bytes)
 #endif
 
-/* Per-case hang detector and its host-backend scale; tools/matrix_runner.c is the reference, docs/ci-green.md
-   the reasoning, and the knob is identical in all six runners. 20s assumes a JIT host; without one the SIGKILL
+/* Per-case hang detector and its host-backend scale; tools/matrix_runner.c is the reference and the knob is
+   identical in all six runners. 20s assumes a JIT host; without one the SIGKILL
    below reports slow-but-correct as a hang. Scale 1 is bit-for-bit the unscaled runner, failure text
    included. */
 enum { CASE_TIMEOUT_MS = 20000, TIMEOUT_SCALE_MAX = 100 };

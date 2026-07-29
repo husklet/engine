@@ -49,7 +49,7 @@ static inline void hl_x64_copy(hl_x64_asm *a, const uint8_t *bytes, int length) 
 
 // ---- %gs-relative absolute addressing: `<op> %gs:disp32`, ModRM mod=00 rm=100 + SIB base=101.
 // This is the transliterator's whole cpu-access vocabulary: it names no general register, which is the
-// point of the segment-base register model (docs/amd64-host.md 3.1).
+// point of the segment-base register model.
 static inline void hl_x64_gs_op(hl_x64_asm *a, int rex_w, uint8_t op, int reg_field, int32_t disp) {
     hl_x64_u8(a, 0x65);
     if (rex_w || reg_field >= 8) hl_x64_u8(a, (uint8_t)(0x40 | (rex_w ? 8 : 0) | ((reg_field >= 8) ? 4 : 0)));

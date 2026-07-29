@@ -18,8 +18,8 @@
 
 enum { TIMEOUT_SECONDS = 15, TIMEOUT_SCALE_MAX = 100 };
 
-/* Per-wait guest budget and its host-backend scale; tools/matrix_runner.c is the reference, docs/ci-green.md
-   the reasoning, and the knob is identical in all six runners. 15s assumes a JIT host, and without one an
+/* Per-wait guest budget and its host-backend scale; tools/matrix_runner.c is the reference and the knob is
+   identical in all six runners. 15s assumes a JIT host, and without one an
    expired deadline here reads as WRONG rather than slow: wait_child() returns 124, which several scenarios
    read as "the engine refused", and wait_for_ready() names markers the guest had not reached yet. */
 static unsigned long timeout_scale = 1;

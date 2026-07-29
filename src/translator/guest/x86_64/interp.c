@@ -1,7 +1,7 @@
 // translator/guest/x86_64/interp.c -- the x86-64 guest backend for hosts that are NOT AArch64: decode and
 // execute x86-64 rather than emit ARM64. core/target/x86_64.c forks on HL_HOST_CPU_AARCH64 and textually
 // includes this file into that unity TU in place of emit.c + translate.c + cache.c, so it must define
-// exactly the names those three defined and no more. Background: docs/amd64-host.md.
+// exactly the names those three defined and no more.
 //
 // Legal because core/dispatch.c run_guest's whole contract is `code = translate_block(G_PC(c));
 // run_block(c, code);`, with c->reason, c->rip and all guest state final in *c on return -- `code` need not
@@ -193,7 +193,7 @@ int interp_signal_capture(struct cpu *cpu, void *native_context) {
 // ordering (mask first, __longjmp second).
 //
 // The savemask=1 this replaces cost an rt_sigprocmask syscall on EVERY guest basic block -- 271.7 ns, 44% of
-// compute CPU and 99.96% of the process's host syscalls (docs/amd64-host.md 3, 4 and 7.1) -- to
+// compute CPU and 99.96% of the process's host syscalls -- to
 // save a mask that only this rare path ever reads.
 static void interp_restore_handler_mask(void *native_context) {
 #if defined(_WIN32)
@@ -342,7 +342,7 @@ static uint64_t interp_ea(const struct cpu *cpu, const struct insn *insn, uint64
 // A non-PIE rip-relative LEA must yield the LOW link address: it MATERIALISES a pointer compared against
 // the image's baked LOW pointers, and a HIGH value silently disagrees -- glibc's __malloc_fork_lock_parent
 // then self-deadlocks on main_arena.mutex. Un-biases materialisation only; ACCESSES stay rebiased by
-// hl_x86_guest_pointer. Guards as in lower/mov.c (docs/amd64-host.md 3.11): 64-bit opsize (32-bit
+// hl_x86_guest_pointer. Guards match lower/mov.c: 64-bit opsize (32-bit
 // truncates to the low value anyway); rip-relative; target inside the link range; Go images narrowed to the
 // type section, since code LEAs (`LEAQ asyncPreempt(SB)`) need HIGH for findfunc.
 static uint64_t interp_lea_value(const struct cpu *cpu, const struct insn *insn, uint64_t next) {

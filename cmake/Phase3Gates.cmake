@@ -522,10 +522,9 @@ set(HL_PERF_OP_SAMPLES 7  CACHE STRING "perf samples for OS-op cases")
 # the measurement without a verdict. Record-only cases are RENAMED so a green line cannot read
 # as a threshold met; --label is not.
 #
-# The reason is NOT that the thresholds are all unreachable here. Measured
-# (docs/amd64-host.md section 2): five of the thirteen x86_64 cases PASS the JIT
-# thresholds unchanged and four more are within 3x, so docs/ci-green.md's "all thirteen cases
-# fail" is false and must be corrected there too. What rules the five out is MARGIN against
+# The reason is NOT that the thresholds are all unreachable here. Five of the
+# thirteen x86_64 cases pass the JIT thresholds unchanged and four more are within
+# 3x. What rules the five out is MARGIN against
 # this host's measured load spread of ~1.9x (compute: 348s/run loaded vs 184s median):
 # translation clears p99 by 5.6%, fork-stress by 9.5%, startup by 39%, ipc-throughput by 38% --
 # enforcing them buys flaky red, not signal. warm-cache is the only one with real margin and it
@@ -549,8 +548,7 @@ option(HL_PERF_ENFORCE
 # runs x measured median x 1.9 (this host's measured load spread) x 1.25 headroom:
 #   x86_64  11 x 184.0s x 1.9 x 1.25 = 4807 -> 4800
 #   aarch64 11 x 135.6s x 1.9 x 1.25 = 3542 -> 3600   (1492s unloaded: 17% margin, i.e. flaky)
-# Numbers from docs/amd64-host.md section 2. Interpreting host only: on a JIT host
-# the case is ~1s and 1800s stays the tighter hang bound.
+# On a JIT host the case is ~1s and 1800s stays the tighter hang bound.
 if(HL_HOST_ARCH STREQUAL "x86_64")
   set(PERF_TIMEOUT_compute_x86_64  4800)
   set(PERF_TIMEOUT_compute_aarch64 3600)
@@ -570,7 +568,7 @@ function(hl_perf_linux case arch warmups samples payload expect)
     set(_name ${_name}.record-only)
     set(_limits "")
     # LAST, so the enforced path's command list is unchanged.
-    set(_record "-DCMD2=${CMAKE_COMMAND} -E echo RECORD-ONLY ${_name}: measured but NOT gated. Its tracked thresholds (cold ${_cold}us p99 ${_p99}us) describe a JIT host and were not applied here. See docs/ci-green.md.")
+    set(_record "-DCMD2=${CMAKE_COMMAND} -E echo RECORD-ONLY ${_name}: measured but NOT gated. Its tracked thresholds (cold ${_cold}us p99 ${_p99}us) describe a JIT host and were not applied here.")
   endif()
   add_test(NAME ${_name}
     COMMAND ${CMAKE_COMMAND}
@@ -617,7 +615,7 @@ foreach(_arch aarch64 x86_64)
   if(NOT HL_PERF_ENFORCE)
     set(_wc_name ${_wc_name}.record-only)
     set(_wc_limits "")
-    set(_wc_record "-DCMD3=${CMAKE_COMMAND} -E echo RECORD-ONLY ${_wc_name}: measured but NOT gated. Its tracked thresholds (cold ${_wc_cold}us p99 ${_wc_p99}us) describe a JIT host and were not applied here. See docs/ci-green.md.")
+    set(_wc_record "-DCMD3=${CMAKE_COMMAND} -E echo RECORD-ONLY ${_wc_name}: measured but NOT gated. Its tracked thresholds (cold ${_wc_cold}us p99 ${_wc_p99}us) describe a JIT host and were not applied here.")
   endif()
   add_test(NAME ${_wc_name}
     COMMAND ${CMAKE_COMMAND}
@@ -881,8 +879,8 @@ hl_nested_case(${_nest_foreign}-${_nest_foreign}-${HL_HOST_ARCH}
 # cells run the SAME compat suites against the cross tree's engines under
 # qemu-aarch64, on the host that builds them.
 #
-# EMULATION, NOT HARDWARE, and the name says so. docs/amd64-host.md records
-# what the fidelity probes established: instruction semantics, the dual-alias W^X
+# EMULATION, NOT HARDWARE, and the name says so. The fidelity probes cover
+# instruction semantics, the dual-alias W^X
 # arena, signal delivery and uc_mcontext are vouched for; weak memory ordering and
 # timing are NOT, because qemu-user inherits the x86 host's stronger model. A green
 # cell here is evidence, not proof, and never a substitute for an aarch64 runner.
@@ -927,7 +925,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND HL_HOST_ARCH STREQUAL "x86_64")
   # lowered), x87-fprem-loop and x87-precision-rounding diverge on FPREM and
   # precision-control results. All three fixtures arrived with 5d28c1ca, which fixed
   # only the x86-host arm. Add GATED when they pass, and not before.
-  # (completeness/priority also fails, on nice level alone -- docs/ci-green.md.)
+  # completeness/priority also fails on nice level alone.
   hl_emulated_case(completeness ${HL_COMPAT}/completeness tests/compat/completeness)
 
   # ---- 9c. CROSS-BACKEND checkpoint restore (label: ckpt-cross) -------------
@@ -943,10 +941,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND HL_HOST_ARCH STREQUAL "x86_64")
   # cpu-state interchange -- the image pins the guest VAs the CAPTURING host's allocator
   # chose, and under qemu one of them (a MAP_SHARED guest region) names a range qemu-user
   # reserves and does not expose, so restore's MAP_FIXED takes it and the next access is
-  # SEGV_ACCERR. Whether a real aarch64 host collides there is unknown, so per
-  # docs/amd64-host.md's own rule the cell is unproven in both directions rather than
-  # a defect to gate on. The underlying engine gap -- restore MAP_FIXEDs saved guest VAs
-  # unconditionally -- is real on every host and recorded in docs/checkpoint-restore-io.md.
+  # SEGV_ACCERR. Whether a real aarch64 host collides there is unknown, so the cell is
+  # unproven in both directions rather than a defect to gate on. The underlying engine
+  # gap is that restore MAP_FIXEDs saved guest VAs unconditionally.
   function(hl_checkpoint_cross isa direction fixture scenario)
     add_test(NAME checkpoint-cross.${isa}.${direction}-${fixture}
       COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/checkpoint_cross_gate.sh

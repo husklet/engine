@@ -15,8 +15,8 @@
 
 enum { HL_E2E_OUTPUT_LIMIT = 1024 * 1024 };
 
-/* Per-case guest budget and its host-backend scale; tools/matrix_runner.c is the reference, docs/ci-green.md
-   the reasoning, and the knob is identical in all six runners. 30s assumes a JIT host; without one a correct
+/* Per-case guest budget and its host-backend scale; tools/matrix_runner.c is the reference and the knob is
+   identical in all six runners. 30s assumes a JIT host; without one a correct
    case is killed and reported as a hang. Scale 1 is bit-for-bit the unscaled runner; a bad value is refused,
    not rounded to 1. */
 enum { CASE_TIMEOUT_MS = 30000, TIMEOUT_SCALE_MAX = 100 };

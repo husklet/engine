@@ -12,8 +12,8 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Per-case guest budget and its host-backend scale; tools/matrix_runner.c is the reference, docs/ci-green.md
-   the reasoning, and the knob is identical in all six runners. 30s assumes a JIT host; without one the SIGKILL
+/* Per-case guest budget and its host-backend scale; tools/matrix_runner.c is the reference and the knob is
+   identical in all six runners. 30s assumes a JIT host; without one the SIGKILL
    below reports slow-but-correct as a hang -- worst here, because this is a DYNAMIC guest whose loader and
    libc startup are interpreted before its own first instruction. */
 enum { CASE_TIMEOUT_MS = 30000, TIMEOUT_SCALE_MAX = 100 };
