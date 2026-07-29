@@ -23,9 +23,9 @@
 #endif
 #include <sys/stat.h>
 
+#include "analyzers.h"
 #include "lint.h"
 #include "policy.h"
-#include "process.h"
 
 static void list_init(StringList *list) {
     list->items = NULL;
@@ -78,6 +78,7 @@ static void list_free(StringList *list) {
     list->cap = 0;
 }
 
+#ifdef _WIN32
 static char *xdup_format(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -91,6 +92,7 @@ static char *xdup_format(const char *fmt, ...) {
     va_end(ap);
     return buf;
 }
+#endif
 
 static bool has_ext(const char *path, const char *ext) {
     size_t path_length = strlen(path);
@@ -228,192 +230,6 @@ static void collect_recursive(const char *root, StringList *files) {
     if (S_ISREG(st.st_mode) && is_source_file(root)) { list_append(files, root); }
 }
 #endif
-
-static void emit_diag(const char *severity, const char *path, int line, int col, const char *rule,
-                      const char *message) {
-    if (line > 0) {
-        fprintf(stdout, "%s:%d:%d: [%s] %s: %s\n", path, line, col, severity, rule, message);
-    } else {
-        fprintf(stdout, "%s: [%s] %s: %s\n", path, severity, rule, message);
-    }
-}
-
-static int run_command_argv(const char *label, const char *const argv[], bool strict, LintStats *stats) {
-    HlLintProcessResult result;
-    if (hl_lint_process_run(argv, 0, &result) != 0) {
-#ifdef _WIN32
-        fprintf(stdout, "error: %s failed to execute (Windows error %d)\n", label, result.platform_error);
-#else
-        fprintf(stdout, "error: %s failed to execute: %s\n", label, strerror(result.platform_error));
-#endif
-        stats->errors++;
-        return 1;
-    }
-    int rc = result.exit_code;
-    if (result.output_size > 0) { fwrite(result.output, 1, result.output_size, stdout); }
-    if (result.output_truncated) {
-        fprintf(stdout, "%s: %s output truncated\n", strict ? "error" : "warn", label);
-        if (strict) {
-            stats->errors++;
-            rc = 1;
-        } else {
-            stats->warnings++;
-        }
-    }
-    if (result.term_signal != 0) {
-        fprintf(stdout, "error: %s terminated by signal %d\n", label, result.term_signal);
-        stats->errors++;
-        rc = 1;
-    }
-    hl_lint_process_result_destroy(&result);
-    return rc;
-}
-
-static int run_clang_format(const LintConfig *cfg, const StringList *files, LintStats *stats) {
-    int rc = 0;
-    if (!cfg->run_clang_format) return 0;
-    if (!cfg->clang_format_bin) {
-        if (cfg->strict) {
-            fprintf(stdout, "error: clang-format not configured\n");
-            stats->errors++;
-            return 1;
-        }
-        fprintf(stdout, "warn: skipping clang-format (binary not configured)\n");
-        return 0;
-    }
-
-    for (size_t i = 0; i < files->count; i++) {
-        const char *file = files->items[i];
-        const char *const argv[] = {cfg->clang_format_bin, "--dry-run", "--Werror", "--style=file",
-                                    "--ferror-limit=1",    file,        NULL};
-        int c = run_command_argv("clang-format", argv, cfg->strict, stats);
-        if (c != 0) {
-            if (cfg->strict) {
-                emit_diag("error", file, 0, 0, "clang-format", "formatting violation");
-                stats->errors++;
-                rc = 1;
-            } else {
-                emit_diag("warn", file, 0, 0, "clang-format", "formatting violation");
-                stats->warnings++;
-            }
-        }
-        if (cfg->strict && rc != 0) return 1;
-        if (cfg->strict)
-            rc = (rc != 0) ? rc : c;
-        else
-            rc = 0;
-    }
-    return rc;
-}
-
-static int run_clang_tidy(const LintConfig *cfg, const StringList *files, LintStats *stats) {
-    int rc = 0;
-    if (!cfg->run_clang_tidy) return 0;
-    if (!cfg->clang_tidy_bin) {
-        if (cfg->strict) {
-            fprintf(stdout, "error: clang-tidy not configured\n");
-            stats->errors++;
-            return 1;
-        }
-        fprintf(stdout, "warn: skipping clang-tidy (binary not configured)\n");
-        return 0;
-    }
-    char *compile_db = cfg->compile_db_dir ? xdup_format("%s/compile_commands.json", cfg->compile_db_dir) : NULL;
-    if (!compile_db ||
-#ifdef _WIN32
-        _access(compile_db, 0) != 0) {
-#else
-        access(compile_db, F_OK) != 0) {
-#endif
-        if (cfg->strict) {
-            fprintf(stdout, "error: compile database missing for clang-tidy: %s\n",
-                    compile_db ? compile_db : "<unset>");
-            stats->errors++;
-            free(compile_db);
-            return 1;
-        }
-        fprintf(stdout, "warn: skipping clang-tidy (missing compile db)\n");
-        free(compile_db);
-        return 0;
-    }
-    free(compile_db);
-
-    for (size_t i = 0; i < files->count; i++) {
-        const char *file = files->items[i];
-        if (!has_ext(file, ".c")) continue;
-        char *checks = xdup_format("--checks=%s", cfg->clang_tidy_checks ? cfg->clang_tidy_checks
-                                                                         : "bugprone-*,clang-analyzer-*,performance-*");
-        if (!checks) {
-            fprintf(stdout, "error: out of memory building clang-tidy command\n");
-            return 1;
-        }
-        const char *const argv[] = {cfg->clang_tidy_bin,      "--quiet", "-p",
-                                    cfg->compile_db_dir,      checks,    "--extra-arg=-std=c11",
-                                    "--warnings-as-errors=*", file,      NULL};
-        int c = run_command_argv("clang-tidy", argv, cfg->strict, stats);
-        free(checks);
-        if (c != 0) {
-            emit_diag("warn", file, 0, 0, "clang-tidy", "diagnostic(s) reported");
-            if (cfg->strict) {
-                stats->errors++;
-                rc = 1;
-                continue;
-            }
-            stats->warnings++;
-            c = 0;
-        }
-        rc = (rc != 0) ? rc : c;
-    }
-    return rc;
-}
-
-static int run_cppcheck(const LintConfig *cfg, const StringList *files, LintStats *stats) {
-    (void)files;
-    if (!cfg->run_cppcheck) return 0;
-    if (!cfg->cppcheck_bin) {
-        if (cfg->strict) {
-            fprintf(stdout, "error: cppcheck not configured\n");
-            stats->errors++;
-            return 1;
-        }
-        fprintf(stdout, "warn: skipping cppcheck (binary not configured)\n");
-        return 0;
-    }
-
-    char *project = cfg->compile_db_dir ? xdup_format("--project=%s/compile_commands.json", cfg->compile_db_dir) : NULL;
-    if (!project) {
-        fprintf(stdout, "error: cppcheck requires a compile commands directory\n");
-        stats->errors++;
-        return 1;
-    }
-    const char *argv[] = {
-        cfg->cppcheck_bin,
-        "--quiet",
-        "--std=c11",
-        "--enable=warning,performance,portability",
-        "--inconclusive",
-        "--suppress=missingIncludeSystem",
-        "--suppress=unmatchedSuppression",
-        "--suppress=unusedStructMember",
-        "--suppress=constParameter",
-        "--suppress=normalCheckLevelMaxBranches",
-        "--suppress=toomanyconfigs",
-        "--suppress=preprocessorErrorDirective",
-        "--error-exitcode=1",
-        project,
-        NULL,
-    };
-    int rc = run_command_argv("cppcheck", argv, cfg->strict, stats);
-    free(project);
-    if (rc == 0) return 0;
-    emit_diag("warn", cfg->compile_db_dir, 0, 0, "cppcheck", "diagnostic(s) reported");
-    if (cfg->strict) {
-        stats->errors++;
-        return 1;
-    }
-    stats->warnings++;
-    return 0;
-}
 
 static void print_usage(const char *prog) {
     fprintf(stdout, "usage: %s [options] [--source-dir <path>]... [--source-file <path>]...\n", prog);
@@ -646,11 +462,8 @@ int main(int argc, char **argv) {
         list_append(&cfg.allow_getenv_files, "src/core/environment.c");
     }
 
-    int rc = 0;
-    if (cfg.run_clang_format) rc = run_clang_format(&cfg, &all_files, &stats);
     const StringList *clang_tidy_files = cfg.clang_tidy_files.count > 0 ? &cfg.clang_tidy_files : &all_files;
-    if (rc == 0 && cfg.run_clang_tidy) rc = run_clang_tidy(&cfg, clang_tidy_files, &stats);
-    if (rc == 0 && cfg.run_cppcheck) rc = run_cppcheck(&cfg, &all_files, &stats);
+    int rc = hl_lint_analyzers_run(&cfg, &all_files, clang_tidy_files, &stats);
     if (cfg.run_custom) hl_lint_policy_run(&cfg, &all_files, &stats);
 
     if (stats.errors == 0 && !cfg.strict && stats.warnings > 0) {

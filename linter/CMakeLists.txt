@@ -9,6 +9,7 @@ else()
 endif()
 
 add_executable(hl_lint
+  src/analyzers.c
   src/hl_lint.c
   src/policy.c
   ${_hl_lint_process_source})
