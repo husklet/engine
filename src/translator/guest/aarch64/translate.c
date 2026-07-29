@@ -2539,7 +2539,9 @@ static int aarch64_soft_tlb_miss(struct cpu *c) {
         last = view->guest_last;
         protection = view->protection;
     } else {
+#if !defined(__APPLE__)
         if (!hl_host_range_mapped((uintptr_t)c->soft_ea, 1)) return 0;
+#endif
         first = c->soft_ea & ~UINT64_C(4095);
         last = first + UINT64_C(4096);
     }

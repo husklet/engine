@@ -274,6 +274,41 @@ int main(void) {
     HL_CHECK(errno == EACCES);
     hl_logical_vma_global_reset_quiescent();
 
+    /*
+     * A direct view borrows engine-owned image storage. It enforces logical
+     * protection without taking ownership or entering checkpoint metadata.
+     */
+    unsigned char direct_first[8192] = {0x31};
+    unsigned char direct_second[4096] = {0x72};
+    const uint64_t direct = UINT64_C(0x600000304000);
+    HL_CHECK(hl_logical_vma_global_map_direct(direct, sizeof direct_first, HL_LOGICAL_VMA_READ,
+                                              (uint64_t)(uintptr_t)direct_first) == 0);
+    hl_logical_vma_pin direct_pin;
+    HL_CHECK(hl_logical_vma_pin_data(direct, 1, HL_LOGICAL_VMA_READ, &direct_pin) == 1);
+    HL_CHECK(direct_pin.host == direct_first && *(unsigned char *)direct_pin.host == 0x31);
+    HL_CHECK((direct_pin.flags & HL_LOGICAL_VMA_DIRECT) != 0);
+    hl_logical_vma_unpin(&direct_pin);
+    HL_CHECK(hl_logical_vma_pin_data(direct, 1, HL_LOGICAL_VMA_WRITE, &direct_pin) == -1);
+    HL_CHECK(errno == EACCES);
+    HL_CHECK(hl_logical_vma_global_map_direct(direct + 4096, sizeof direct_second,
+                                              HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_WRITE,
+                                              (uint64_t)(uintptr_t)direct_second) == 0);
+    HL_CHECK(hl_logical_vma_pin_data(direct + 4096, 1, HL_LOGICAL_VMA_WRITE, &direct_pin) == 1);
+    HL_CHECK(direct_pin.host == direct_second);
+    hl_logical_vma_unpin(&direct_pin);
+    HL_CHECK(hl_logical_vma_pin_data(direct, 1, HL_LOGICAL_VMA_READ, &direct_pin) == 1);
+    HL_CHECK(direct_pin.host == direct_first);
+    hl_logical_vma_unpin(&direct_pin);
+    HL_CHECK(hl_logical_vma_global_export(NULL, 0) == 0);
+    HL_CHECK(hl_logical_vma_global_describe(direct, &checkpoint_descriptor) == 0);
+    hl_logical_vma_snapshot *direct_snapshot =
+        atomic_load_explicit(hl_logical_vma_global_snapshot_source(), memory_order_acquire);
+    HL_CHECK(direct_snapshot != NULL && direct_snapshot->count == 2);
+    hl_logical_vma_global_reset_quiescent();
+    direct_first[0] = 0x44;
+    direct_second[0] = 0x55;
+    HL_CHECK(direct_first[0] == 0x44 && direct_second[0] == 0x55);
+
     hl_logical_vma_destroy(&ledger);
     close(fd);
     return 0;

@@ -30,6 +30,7 @@ struct hl_logical_vma_backing {
     uint64_t file_offset;
     logical_backing_ref retained;
     int writable;
+    int borrowed;
 };
 
 struct hl_logical_vma_plan {
@@ -191,7 +192,7 @@ static int grow(hl_logical_vma_ledger *ledger, size_t need) {
 
 static void backing_put(hl_logical_vma_backing *backing) {
     if (atomic_fetch_sub_explicit(&backing->references, 1, memory_order_acq_rel) != 1) return;
-    logical_backing_unmap(backing->mapping, backing->length);
+    if (!backing->borrowed) logical_backing_unmap(backing->mapping, backing->length);
     logical_backing_release(&backing->retained);
     free(backing);
 }
@@ -437,8 +438,8 @@ int hl_logical_vma_map_shared(hl_logical_vma_ledger *ledger, uint64_t guest_firs
         return -1;
     }
     *backing = (hl_logical_vma_backing){
-        mapping,  mapped_length,     1, (uint64_t)status.st_dev, (uint64_t)status.st_ino, canonical_first,
-        retained, canonical_writable};
+        mapping,  mapped_length,      1, (uint64_t)status.st_dev, (uint64_t)status.st_ino, canonical_first,
+        retained, canonical_writable, 0};
     for (size_t index = 0; index < ledger->count; ++index) {
         hl_logical_vma_entry *entry = &ledger->entries[index];
         hl_logical_vma_backing *old = entry->backing;
@@ -722,6 +723,48 @@ int hl_logical_vma_global_map_shared(uint64_t guest_first, uint64_t length, uint
     return hl_logical_vma_map_shared(&g_logical_vmas, guest_first, length, protection, fd, file_offset, host_page);
 }
 
+static int logical_vma_map_direct(hl_logical_vma_ledger *ledger, uint64_t guest_first, uint64_t length,
+                                  uint32_t protection, uint64_t host_first) {
+    if (length == 0 || guest_first > UINT64_MAX - length || host_first > UINTPTR_MAX ||
+        length > UINTPTR_MAX - host_first) {
+        errno = EINVAL;
+        return -1;
+    }
+    pthread_mutex_lock(&ledger->lock);
+    if (grow(ledger, ledger->count + 1) != 0) {
+        pthread_mutex_unlock(&ledger->lock);
+        return -1;
+    }
+    hl_logical_vma_snapshot *next = snapshot_allocate(ledger->count + 1);
+    hl_logical_vma_backing *backing = calloc(1, sizeof(*backing));
+    if (next == NULL || backing == NULL) {
+        free(next);
+        free(backing);
+        pthread_mutex_unlock(&ledger->lock);
+        return -1;
+    }
+    backing->mapping = (void *)(uintptr_t)host_first;
+    backing->length = (size_t)length;
+    atomic_init(&backing->references, 1);
+    backing->retained.fd = -1;
+    backing->retained.handle = HL_HOST_HANDLE_INVALID;
+    backing->borrowed = 1;
+    uint64_t last = guest_first + length;
+    (void)unmap_locked(ledger, guest_first, last);
+    backing_get(backing);
+    ledger->entries[ledger->count++] =
+        (hl_logical_vma_entry){guest_first, last, 0, protection, HL_LOGICAL_VMA_DIRECT, backing};
+    publish_locked(ledger, next);
+    backing_put(backing);
+    pthread_mutex_unlock(&ledger->lock);
+    return 0;
+}
+
+int hl_logical_vma_global_map_direct(uint64_t guest_first, uint64_t length, uint32_t protection, uint64_t host_first) {
+    (void)pthread_once(&g_logical_vmas_once, global_init);
+    return logical_vma_map_direct(&g_logical_vmas, guest_first, length, protection, host_first);
+}
+
 int hl_logical_vma_global_restore_shared(uint64_t guest_first, uint64_t length, uint32_t protection, int fd,
                                          uint64_t file_offset, size_t host_page) {
     (void)pthread_once(&g_logical_vmas_once, global_init);
@@ -753,6 +796,42 @@ int hl_logical_vma_global_prepare_protect(uint64_t guest_first, uint64_t length,
                                           hl_logical_vma_plan **plan) {
     (void)pthread_once(&g_logical_vmas_once, global_init);
     return hl_logical_vma_prepare_protect(&g_logical_vmas, guest_first, length, protection, plan);
+}
+
+int hl_logical_vma_global_prepare_direct(uint64_t guest_first, uint64_t length, uint32_t protection,
+                                         uint64_t host_first, hl_logical_vma_plan **result) {
+    if (result == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    (void)pthread_once(&g_logical_vmas_once, global_init);
+    hl_logical_vma_plan *plan = *result;
+    if (plan == NULL) {
+        plan = calloc(1, sizeof(*plan));
+        if (plan == NULL) return -1;
+        if (hl_logical_vma_init(&plan->staged) != 0) {
+            free(plan);
+            return -1;
+        }
+        plan->live = &g_logical_vmas;
+        pthread_mutex_lock(&g_logical_vmas.lock);
+        if (grow(&plan->staged, g_logical_vmas.count) != 0) goto fail;
+        for (size_t index = 0; index < g_logical_vmas.count; ++index) {
+            plan->staged.entries[index] = g_logical_vmas.entries[index];
+            backing_get(plan->staged.entries[index].backing);
+        }
+        plan->staged.count = g_logical_vmas.count;
+        *result = plan;
+    } else if (plan->live != &g_logical_vmas) {
+        errno = EINVAL;
+        return -1;
+    }
+    return logical_vma_map_direct(&plan->staged, guest_first, length, protection, host_first);
+fail:
+    pthread_mutex_unlock(&g_logical_vmas.lock);
+    hl_logical_vma_destroy(&plan->staged);
+    free(plan);
+    return -1;
 }
 
 int hl_logical_vma_global_overlap(uint64_t guest_first, uint64_t length) {
@@ -974,11 +1053,14 @@ size_t hl_logical_vma_global_export(hl_logical_vma_descriptor *descriptors, size
     (void)pthread_once(&g_logical_vmas_once, global_init);
     if (descriptors == NULL) capacity = 0;
     pthread_mutex_lock(&g_logical_vmas.lock);
-    size_t count = g_logical_vmas.count;
-    size_t copied = count < capacity ? count : capacity;
-    for (size_t index = 0; index < copied; ++index) {
+    size_t count = 0;
+    for (size_t index = 0; index < g_logical_vmas.count; ++index)
+        if ((g_logical_vmas.entries[index].flags & HL_LOGICAL_VMA_DIRECT) == 0) ++count;
+    size_t copied = 0;
+    for (size_t index = 0; index < g_logical_vmas.count && copied < capacity; ++index) {
         const hl_logical_vma_entry *entry = &g_logical_vmas.entries[index];
-        descriptors[index] = (hl_logical_vma_descriptor){
+        if (entry->flags & HL_LOGICAL_VMA_DIRECT) continue;
+        descriptors[copied++] = (hl_logical_vma_descriptor){
             entry->guest_first,
             entry->guest_last - entry->guest_first,
             entry->backing->device,
@@ -1002,6 +1084,10 @@ int hl_logical_vma_global_describe(uint64_t guest, hl_logical_vma_descriptor *de
     for (size_t index = 0; index < g_logical_vmas.count; ++index) {
         const hl_logical_vma_entry *entry = &g_logical_vmas.entries[index];
         if (guest < entry->guest_first || guest >= entry->guest_last) continue;
+        if (entry->flags & HL_LOGICAL_VMA_DIRECT) {
+            pthread_mutex_unlock(&g_logical_vmas.lock);
+            return 0;
+        }
         *descriptor = (hl_logical_vma_descriptor){
             entry->guest_first,
             entry->guest_last - entry->guest_first,

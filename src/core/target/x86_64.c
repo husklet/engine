@@ -606,8 +606,26 @@ static int soft_tlb_miss(struct cpu *c) {
             last = snapshot->views[index++].guest_last;
         }
         if (width > last - address) {
+#if defined(__APPLE__)
+            uint64_t end = address + width;
+            if (end < address) {
+                c->fault_addr = address;
+                return raise_guest_data_map_fault(c);
+            }
+            if (index < snapshot->count && snapshot->views[index].guest_first < end &&
+                (snapshot->views[index].protection & required) != required) {
+                c->fault_addr = snapshot->views[index].guest_first;
+                return raise_guest_fetch_fault(c);
+            }
+            if (view->host_delta != 0 || (index < snapshot->count && snapshot->views[index].guest_first < end)) {
+                c->reason = R_SOFTSPAN;
+                return 0;
+            }
+            last = end;
+#else
             c->reason = R_SOFTSPAN;
             return 0;
+#endif
         }
         c->soft_delta = view->host_delta;
         c->soft_protection = view->protection;
@@ -617,7 +635,11 @@ static int soft_tlb_miss(struct cpu *c) {
            handling remains authoritative after the identity rewrite. */
         c->soft_delta = 0;
         c->soft_protection = HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_WRITE | HL_LOGICAL_VMA_EXEC;
-        if (width > UINT64_MAX - address || !host_range_mapped((uintptr_t)address, (size_t)width)) {
+        if (width > UINT64_MAX - address
+#if !defined(__APPLE__)
+            || !host_range_mapped((uintptr_t)address, (size_t)width)
+#endif
+        ) {
             c->fault_addr = address;
             return raise_guest_data_map_fault(c);
         }
@@ -635,8 +657,21 @@ static int soft_tlb_miss(struct cpu *c) {
         if (snapshot != NULL) {
             for (size_t index = 0; index < snapshot->count; ++index) {
                 if (snapshot->views[index].guest_first < end && snapshot->views[index].guest_last > address) {
+#if defined(__APPLE__)
+                    const hl_logical_vma_view *overlap = &snapshot->views[index];
+                    if ((overlap->protection & required) != required) {
+                        c->fault_addr = overlap->guest_first > address ? overlap->guest_first : address;
+                        return raise_guest_fetch_fault(c);
+                    }
+                    if (overlap->host_delta != 0) {
+                        c->reason = R_SOFTSPAN;
+                        return 0;
+                    }
+                    continue;
+#else
                     c->reason = R_SOFTSPAN;
                     return 0;
+#endif
                 }
                 if (snapshot->views[index].guest_first >= end && snapshot->views[index].guest_first < last)
                     last = snapshot->views[index].guest_first;

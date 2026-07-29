@@ -64,6 +64,7 @@ enum {
     HL_LOGICAL_VMA_WRITE = 2u,
     HL_LOGICAL_VMA_EXEC = 4u,
     HL_LOGICAL_VMA_SHARED = 1u,
+    HL_LOGICAL_VMA_DIRECT = 2u,
 };
 
 typedef struct hl_logical_vma_resolution {
@@ -144,12 +145,16 @@ size_t hl_logical_vma_count(hl_logical_vma_ledger *);
 /* Process-global ledger used by the production Linux personality. */
 int hl_logical_vma_global_map_shared(uint64_t guest_first, uint64_t length, uint32_t protection, int fd,
                                      uint64_t file_offset, size_t host_page);
+/* Publish guest-page protection over existing engine-owned storage. */
+int hl_logical_vma_global_map_direct(uint64_t guest_first, uint64_t length, uint32_t protection, uint64_t host_first);
 /* Restore-only construction keeps canonical storage writable while publishing
  * the exact guest protection recorded in the image. */
 int hl_logical_vma_global_restore_shared(uint64_t guest_first, uint64_t length, uint32_t protection, int fd,
                                          uint64_t file_offset, size_t host_page);
 int hl_logical_vma_global_prepare_shared(uint64_t guest_first, uint64_t length, uint32_t protection, int fd,
                                          uint64_t file_offset, size_t host_page, hl_logical_vma_plan **);
+int hl_logical_vma_global_prepare_direct(uint64_t guest_first, uint64_t length, uint32_t protection,
+                                         uint64_t host_first, hl_logical_vma_plan **);
 int hl_logical_vma_global_prepare_protect(uint64_t guest_first, uint64_t length, uint32_t protection,
                                           hl_logical_vma_plan **);
 int hl_logical_vma_global_unmap(uint64_t guest_first, uint64_t length);

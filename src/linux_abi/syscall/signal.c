@@ -303,9 +303,31 @@ static int svc_signal(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint
             }
         }
         if (a0) {
-            memcpy(&c->alt_sp, new_stack, sizeof c->alt_sp);
+            uint64_t nsp, nsize;
+            memcpy(&nsp, new_stack, sizeof nsp);
+            memcpy(&nsize, new_stack + 16, sizeof nsize);
+            if (g_nonpie_lo && nsp >= g_nonpie_lo && nsize <= g_nonpie_hi - nsp &&
+                !hl_host_range_mapped((uintptr_t)nsp, (size_t)nsize)) {
+                gbus_mapping_transition_lock();
+                if (!jit_guest_soft_activate()) {
+                    gbus_mapping_transition_unlock();
+                    G_RET(c) = (uint64_t)(int64_t)-ENOMEM;
+                    break;
+                }
+                gbus_mapping_stw_begin();
+                int mapped = hl_logical_vma_global_map_direct(nsp, nsize, HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_WRITE,
+                                                              nonpie_fold(nsp));
+                hl_logical_vma_global_reclaim_quiescent();
+                gbus_mapping_stw_end();
+                gbus_mapping_transition_unlock();
+                if (mapped != 0) {
+                    G_RET(c) = (uint64_t)(int64_t)-ENOMEM;
+                    break;
+                }
+            }
+            c->alt_sp = nsp;
             memcpy(&c->alt_flags, new_stack + 8, sizeof c->alt_flags);
-            memcpy(&c->alt_size, new_stack + 16, sizeof c->alt_size);
+            c->alt_size = nsize;
         }
         G_RET(c) = 0;
         break;

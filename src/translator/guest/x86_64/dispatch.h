@@ -235,6 +235,18 @@ static int smc_on_write(uint64_t a) {
 // service pc-advance -- the per-arch syscall tail convention lives here; aarch64 does pc += 4 instead).
 // Each non-syscall case `continue`s the shared while-loop (so the shared `if (reason==R_TIER2) ...`
 // tail line never re-fires for x86). Verbatim from frontend/x86_64/dispatch.c. `break` exits the loop.
+#if defined(__APPLE__)
+#define G_DISPATCH_SOFTSPAN(c)                                                                                         \
+    if ((c)->reason == R_SOFTSPAN) {                                                                                   \
+        (c)->soft_snapshot = 0;                                                                                        \
+        (c)->rip = nonpie_unfold((c)->rip);                                                                            \
+        (c)->reason = R_BRANCH;                                                                                        \
+        continue;                                                                                                      \
+    }
+#else
+#define G_DISPATCH_SOFTSPAN(c)
+#endif
+
 #define G_DISPATCH_REASON(c)                                                                                           \
     /* The C instruction emulators come FIRST and do not `continue` unconditionally: they run outside                  \
        run_block, so a guest access they reject leaves a NEW reason (R_SOFTMISS, or R_TRAP for an                      \
@@ -251,6 +263,7 @@ static int smc_on_write(uint64_t a) {
         if (soft_tlb_miss(c)) maybe_deliver_signal(c);                                                                 \
         continue;                                                                                                      \
     }                                                                                                                  \
+    G_DISPATCH_SOFTSPAN(c)                                                                                             \
     if ((c)->reason == 99) {                                                                                           \
         fprintf(stderr, "[hl] aborting at rip marker %llx (unimplemented opcode)\n", (unsigned long long)(c)->rip);    \
         if (g_trace) {                                                                                                 \
