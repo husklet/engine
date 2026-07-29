@@ -464,18 +464,6 @@ if(NOT HL_WINDOWS_HOST)
 hl_tool(linux-production-smoke tools/linux_production_smoke.c)
 endif()
 hl_tool(linux-matrix           tools/linux_matrix.c)
-# bench-runner does many benign width conversions; -Wconversion is dropped.
-if(NOT HL_WINDOWS_HOST)
-add_executable(bench-runner
-  tools/bench_runner.c
-  tools/config.c
-  tools/process.c)
-target_compile_options(bench-runner PRIVATE
-  -O2 -g -std=gnu11 -Wall -Wextra
-  -D_POSIX_C_SOURCE=200809L)
-set_target_properties(bench-runner PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tools)
-endif()
 
 # matrix-runner needs the host loader/libc paths baked in (Makefile 2166).
 # -lc is the Linux/Darwin spelling and there is no libc.a to name on mingw-w64:

@@ -170,6 +170,7 @@ if(HL_BUILD_TESTS)
   # absent (e.g. a plain `nix build`, whose sandbox exports no *_LINUX_CC).
   include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/GuestFixtures.cmake)
   if(HL_HAVE_GUEST_CC)
+    add_subdirectory(tools)
     # These build and run guest programs, so they depend on the fixtures above.
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Compat.cmake)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Gates.cmake)
