@@ -828,7 +828,7 @@ set(_nest_hello_out ${CMAKE_SOURCE_DIR}/tests/compat/core/abi/expected/hello.out
 function(hl_nested_case name)
   cmake_parse_arguments(N "" "CROSS;BUDGET" "CHAIN" ${ARGN})
   add_test(NAME nested.${name}
-    COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/nested_engine_gate.sh
+    COMMAND $<TARGET_FILE:nested-engine-gate>
             ${N_CROSS} "${_nest_fix}" ${_nest_hello_out} 42 -- ${N_CHAIN})
   set_tests_properties(nested.${name} PROPERTIES
     LABELS "nested-engine" SKIP_RETURN_CODE 77 RESOURCE_LOCK hl-guest
@@ -869,6 +869,18 @@ hl_nested_case(${_nest_foreign}-${_nest_foreign}-${HL_HOST_ARCH}
   CROSS ${_nest_cross_dir} BUDGET ${_nest_budget3}
   CHAIN ${_nest_native}-${_nest_foreign} ${_nest_cross}-${_nest_foreign}
         ${_nest_cross}-${HL_HOST_ARCH} ${_nest_hello}/${HL_HOST_ARCH}/hello)
+
+if(HL_HOST_ARCH STREQUAL "x86_64")
+  hl_nested_case(aarch64-x86_64-aarch64
+    CROSS ${_nest_cross_dir} BUDGET ${_nest_budget3}
+    CHAIN ${_nest_native}-aarch64 ${_nest_cross}-x86_64
+          ${_nest_native}-aarch64 ${_nest_hello}/aarch64/hello)
+else()
+  hl_nested_case(aarch64-x86_64-aarch64
+    CROSS ${_nest_cross_dir} BUDGET ${_nest_budget3}
+    CHAIN ${_nest_native}-aarch64 ${_nest_native}-x86_64
+          ${_nest_cross}-aarch64 ${_nest_hello}/aarch64/hello)
+endif()
 
 # ===========================================================================
 # 9b. the compat corpus against an EMULATED aarch64 host (qemu-user)
