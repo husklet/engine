@@ -80,6 +80,8 @@ done
 # Print the emulator version: it is the lane's oracle, pinned by flake.lock.
 printf 'emulated-aarch64: %s under %s (%s)\n' "$(basename -- "$suitedir")" "$qemu" \
 	"$("$qemu" --version 2>/dev/null | head -1)"
+export HL_MATRIX_AARCH64_FORMAT_SOURCE="$cross/hl-engine-linux-aarch64"
+export HL_MATRIX_X86_64_FORMAT_SOURCE="$cross/hl-engine-linux-x86_64"
 exec "$runner" env \
 	"$shim/hl-engine-linux-aarch64" "$bindir/aarch64" \
 	"$shim/hl-engine-linux-x86_64" "$bindir/x86_64" \

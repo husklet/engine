@@ -584,6 +584,16 @@ static int engine_absent(const char *engine_path) {
     return strcmp(engine_path, "-") == 0;
 }
 
+/* A bridge may require an executable adapter in place of the engine image. The
+ * qemu-user lane is one such bridge: its adapter runs `qemu-aarch64 ENGINE`,
+ * while the native supervisor still launches the adapter as the engine. Keep
+ * format policy tied to a real image by letting that lane name the image to
+ * inspect; this is a path override, never a claimed format. */
+static const char *engine_format_source(const char *engine_path, const char *environment_name) {
+    const char *source = getenv(environment_name);
+    return source != NULL && *source != '\0' ? source : engine_path;
+}
+
 static int engine_format_of(const char *engine_path, engine_format *out) {
     unsigned char magic[4] = {0};
     int fd = open(engine_path, O_RDONLY | HL_O_BINARY);
@@ -1940,8 +1950,10 @@ int main(int argc, char **argv) {
     {
         engine_format aarch64_format = ENGINE_ELF;
         engine_format x86_64_format = ENGINE_ELF;
-        if (have_aarch64 && engine_format_of(argv[2], &aarch64_format) != 0) return 2;
-        if (have_x86_64 && engine_format_of(argv[4], &x86_64_format) != 0) return 2;
+        const char *aarch64_format_source = engine_format_source(argv[2], "HL_MATRIX_AARCH64_FORMAT_SOURCE");
+        const char *x86_64_format_source = engine_format_source(argv[4], "HL_MATRIX_X86_64_FORMAT_SOURCE");
+        if (have_aarch64 && engine_format_of(aarch64_format_source, &aarch64_format) != 0) return 2;
+        if (have_x86_64 && engine_format_of(x86_64_format_source, &x86_64_format) != 0) return 2;
         if (!have_aarch64) aarch64_format = x86_64_format;
         if (!have_x86_64) x86_64_format = aarch64_format;
         if (aarch64_format != x86_64_format) {
@@ -1949,7 +1961,8 @@ int main(int argc, char **argv) {
                     "matrix-runner: the two engines are different object formats (%s: %s, %s: %s). The "
                     "manifest's per-engine exclusions are one set for both, so this pairing would apply one "
                     "host's skips to the other host's engine.\n",
-                    argv[2], engine_format_name(aarch64_format), argv[4], engine_format_name(x86_64_format));
+                    aarch64_format_source, engine_format_name(aarch64_format), x86_64_format_source,
+                    engine_format_name(x86_64_format));
             return 2;
         }
         host_format = aarch64_format;
