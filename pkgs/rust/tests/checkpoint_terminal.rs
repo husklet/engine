@@ -56,6 +56,7 @@ const JOB_MARKER: &str = "JOB-ALIVE";
 /// assumption -- readiness is asserted by the prompt coming back -- but a terminal signal that lands while
 /// the engine process is still starting has no guest to reach and kills the launch instead.
 const INTERRUPT_HEAD_START: Duration = Duration::from_secs(3);
+static TERMINAL_CHECKPOINT: Mutex<()> = Mutex::new(());
 
 fn io() -> ProcessIo {
     ProcessIo {
@@ -267,6 +268,9 @@ fn round_trip(foreground: Option<&str>, interrupt: bool) -> bool {
     if checkpoint_env::skip_if_unavailable("an_interactive_shell_on_a_pty_round_trips") {
         return true;
     }
+    let _serial = TERMINAL_CHECKPOINT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let store = Arc::new(MemoryStore::new());
 
     let mut machine = Engine::new()
