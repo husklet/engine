@@ -5602,3 +5602,8 @@ static void pcache_poison_check(void) {
 // No cache directory is opened.
 static void pcache_directory_close(void) {
 }
+
+static void pcache_note_fixed_img(uint64_t base, uint64_t span) {
+    (void)base;
+    (void)span;
+}
