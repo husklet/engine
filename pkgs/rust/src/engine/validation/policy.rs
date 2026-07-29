@@ -457,9 +457,8 @@ pub(super) fn validate_network(
 /// `Path::new("/etc/passwd").is_absolute()` is `false` there, and `Path` splits `a\b` into two
 /// components rather than reading it as one filename.
 ///
-/// Passing this check is also the precondition that lets the *structural* `std::path` operations
-/// above it (`parent`, `ancestors`, `starts_with`, `components().count()`) stay as they are: once a
-/// path is `/`-rooted with no `\` in any segment, those agree on every host.
+/// On Windows, paths containing `\` are rejected because the current public model still stores
+/// guest paths in the host's `Path` type. Unix hosts preserve valid Linux filenames containing it.
 pub(super) fn validate_guest_path(
     path: &std::path::Path,
     maximum: u32,
@@ -488,12 +487,11 @@ pub(super) fn validate_guest_path(
             "guest paths must not escape through '..'",
         ));
     }
-    if guest_path::segments(bytes).any(|segment| segment.contains(&b'\\')) {
+    if cfg!(windows) && guest_path::segments(bytes).any(|segment| segment.contains(&b'\\')) {
         return Err(spec_error(
             SpecErrorCategory::Invalid,
             field,
-            "guest path segments must not contain '\\', which names one file on a Linux guest and \
-             separates two components on a Windows host",
+            "guest path segments containing '\\' are not supported on Windows hosts",
         ));
     }
     Ok(())

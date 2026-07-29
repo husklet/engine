@@ -17,13 +17,10 @@
 //! where the engine expects a normalized relative one. Nothing warns, nothing fails to compile, and
 //! no existing test can see it. Asking the byte string directly gives one answer on every host.
 //!
-//! **Backslash.** A segment containing `\` is rejected. On Linux `a\b` is one filename; on Windows
-//! `Path` reads it as two components. Both hosts accept it today and mean different things by it, so
-//! the bytes handed to the guest stop matching what the caller wrote. Rejecting is a narrowing of an
-//! already-documented contract ("normalized"), it is loud, and it buys something concrete: once
-//! every segment is `/`-separated and free of `\`, `std::path`'s *structural* operations
-//! (`parent`, `ancestors`, `starts_with`, `components().count()`) agree across hosts, so the
-//! containment and depth logic above this module needs no change.
+//! **Backslash.** A Linux guest may legitimately name one entry `a\b`; systemd unit files do this
+//! in ordinary distribution images. Unix hosts give that byte the same meaning, while Windows
+//! `Path` reads it as a separator. Windows therefore rejects such paths until the public spec uses
+//! a host-independent guest-path type. Unix hosts must not narrow Linux filename semantics.
 //!
 //! Bytes come from `OsStr::as_encoded_bytes`, which is the platform-native encoding: bytes on Unix
 //! and WTF-8 on Windows. Both encode ASCII as ASCII, so `/`, `\`, `.` and NUL compare byte-for-byte
@@ -63,17 +60,19 @@ pub(crate) fn segments(path: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// A segment that names exactly one guest directory entry.
 ///
 /// This is the byte-level form of `matches!(component, Component::Normal(_))`, with the two
-/// differences that matter: an empty segment is rejected rather than discarded, and `\` is rejected
-/// rather than meaning one thing per host.
+/// difference that matters on every host: empty and special segments are rejected rather than
+/// discarded. Windows also rejects `\`, whose host-path meaning differs from Linux.
 pub(crate) fn is_normal(segment: &[u8]) -> bool {
     !segment.is_empty()
         && segment != b"."
         && segment != b".."
-        && !segment.contains(&b'\\')
+        && (!cfg!(windows) || !segment.contains(&b'\\'))
         && !segment.contains(&0)
 }
 
-/// Every segment names exactly one entry: no empty, `.`, `..`, `\` or NUL segment anywhere.
+/// Every segment names exactly one entry: no empty, `.`, `..`, or NUL segment anywhere.
+///
+/// Windows additionally rejects `\` until guest paths stop using the host `Path` type.
 pub(crate) fn all_normal(path: &[u8]) -> bool {
     segments(path).all(is_normal)
 }
@@ -152,16 +151,17 @@ mod tests {
     }
 
     /// `wire.rs::file_owners` and the namespace validators require every component to name one
-    /// entry. `Path` calls `a\b` one component on Linux and two on Windows, and accepts it on both.
+    /// entry. `a\b` is one valid Linux filename and must stay valid on Unix hosts. Windows rejects
+    /// it because its host `Path` type would reinterpret it.
     #[test]
-    fn a_backslash_segment_is_rejected_rather_than_meaning_two_things() {
+    fn a_backslash_segment_preserves_linux_semantics_on_unix() {
         assert_eq!(
             Path::new(r"a\b").components().count(),
             1 + usize::from(cfg!(windows))
         );
-        assert!(!all_normal(br"a\b"));
-        assert!(!is_normalized_relative(br"a\b"));
-        assert!(!is_normalized_absolute(br"/a\b"));
+        assert_eq!(all_normal(br"a\b"), !cfg!(windows));
+        assert_eq!(is_normalized_relative(br"a\b"), !cfg!(windows));
+        assert_eq!(is_normalized_absolute(br"/a\b"), !cfg!(windows));
         assert!(is_normalized_relative(b"a/b"));
     }
 
