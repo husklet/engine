@@ -13,6 +13,7 @@ add_executable(hl_lint
   src/cli.c
   src/hl_lint.c
   src/policy.c
+  src/sources.c
   ${_hl_lint_process_source})
 
 target_compile_features(hl_lint PRIVATE c_std_11)

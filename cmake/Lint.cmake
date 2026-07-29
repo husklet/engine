@@ -53,6 +53,7 @@ set(_hl_lint_cli_stdio_files
   linter/src/cli.c
   linter/src/hl_lint.c
   linter/src/policy.c
+  linter/src/sources.c
   tests/unit/test.h
   tests/unit/test_ckptinoq.c
   tests/unit/test_epoll.c
