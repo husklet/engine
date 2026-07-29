@@ -35,6 +35,14 @@ const char *hl_tool_config_matrix_scratch(void) {
     return environment_value("HL_MATRIX_SCRATCH_DIR");
 }
 
+const char *hl_tool_config_matrix_aarch64_format_source(void) {
+    return environment_value("HL_MATRIX_AARCH64_FORMAT_SOURCE");
+}
+
+const char *hl_tool_config_matrix_x86_64_format_source(void) {
+    return environment_value("HL_MATRIX_X86_64_FORMAT_SOURCE");
+}
+
 const char *hl_tool_config_docker_command(void) {
     const char *value = environment_value("DOCKER");
     return value != NULL ? value : "docker";

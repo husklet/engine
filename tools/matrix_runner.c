@@ -589,8 +589,7 @@ static int engine_absent(const char *engine_path) {
  * while the native supervisor still launches the adapter as the engine. Keep
  * format policy tied to a real image by letting that lane name the image to
  * inspect; this is a path override, never a claimed format. */
-static const char *engine_format_source(const char *engine_path, const char *environment_name) {
-    const char *source = getenv(environment_name);
+static const char *engine_format_source(const char *engine_path, const char *source) {
     return source != NULL && *source != '\0' ? source : engine_path;
 }
 
@@ -1950,8 +1949,9 @@ int main(int argc, char **argv) {
     {
         engine_format aarch64_format = ENGINE_ELF;
         engine_format x86_64_format = ENGINE_ELF;
-        const char *aarch64_format_source = engine_format_source(argv[2], "HL_MATRIX_AARCH64_FORMAT_SOURCE");
-        const char *x86_64_format_source = engine_format_source(argv[4], "HL_MATRIX_X86_64_FORMAT_SOURCE");
+        const char *aarch64_format_source =
+            engine_format_source(argv[2], hl_tool_config_matrix_aarch64_format_source());
+        const char *x86_64_format_source = engine_format_source(argv[4], hl_tool_config_matrix_x86_64_format_source());
         if (have_aarch64 && engine_format_of(aarch64_format_source, &aarch64_format) != 0) return 2;
         if (have_x86_64 && engine_format_of(x86_64_format_source, &x86_64_format) != 0) return 2;
         if (!have_aarch64) aarch64_format = x86_64_format;
