@@ -69,6 +69,7 @@ set(_hl_lint_cli_stdio_files
   tools/lifecycle_e2e_runner.c
   tools/linux_matrix.c
   tools/linux_production_smoke.c
+  tools/lane_parity_gate.c
   tools/matrix_runner.c
   tools/nested_engine_gate.c
   tools/perf_runner.c
@@ -76,6 +77,7 @@ set(_hl_lint_cli_stdio_files
   tools/rootfs_e2e_runner.c
   tools/stdio_e2e_runner.c
   tests/integration/direct_launch_gate.c
+  tests/integration/lane_parity_gate.c
   tools/windows/tier0_probe.c
   tools/windows/toolchain_probe.c)
 

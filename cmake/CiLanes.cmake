@@ -1,9 +1,9 @@
 # Single source of truth for the CI test lanes.
 #
-# Consumed by two guards, both of which parse this file TEXTUALLY, so keep the
-# format literal: `set(<NAME>` on its own line, one lane per line, `)` alone.
+# Included directly by the lane-parity gate and parsed textually by the workflow
+# guard, so keep `set(<NAME>` and one lane per line.
 #
-#   tools/check_lane_parity.sh   -> gate.ci-lane-parity. Every lane below must
+#   cmake/LaneParity.cmake       -> gate.ci-lane-parity. Every lane below must
 #       select at least one test on the host it applies to. `ctest -L <miss>`
 #       exits 0, so nothing else catches a renamed or deleted label.
 #   tools/check_ci_workflows.sh  -> I13/I14. Every SHARDED lane must be named by
@@ -31,7 +31,7 @@ set(HL_CI_HOSTS
 # Windows-x86_64 IS now declared, and this records what made it declarable,
 # because the previous state of this comment was a list of reasons not to.
 #
-# The blocker was never the wiring -- tools/check_lane_parity.sh already had a
+# The blocker was never the wiring -- the lane-parity gate already had a
 # Windows arm selecting HL_CI_{SHARDED,DIRECT,REGISTRY}_WINDOWS,
 # cmake/LaneParity.cmake already keyed gate.ci-lane-parity on this list rather
 # than on guest cross compilers a Windows host can never have,
@@ -95,7 +95,7 @@ set(HL_CI_HOSTS
 #   2. Rework the guards that key off OS. check_ci_workflows.sh's I19 compares one
 #      Linux list against one Darwin list; with three compat hosts parity is an
 #      all-pairs relation, and HL_CI_SHARDED_HOST_ONLY grows an entry per lane a
-#      host cannot run. check_lane_parity.sh's `case "$os"` needs the same keying.
+#      host cannot run. The lane-parity host selection needs the same keying.
 #   3. Only then declare the token, and in the SAME change give linux-x86_64.yml a
 #      sharded matrix job: declaring it turns I20 off, and a workflow that shards
 #      nothing while exempt from I20 has no structural guard at all.
@@ -189,7 +189,7 @@ set(HL_CI_SHARDED_DARWIN
 # HL_CI_COMPAT_HOSTS: I20 requires a non-compat host's workflow to name no lane,
 # so an entry here with no matching shard in windows-x86_64.yml fails I20, and a
 # shard added without the HL_CI_COMPAT_HOSTS entry fails it the other way. The
-# block exists rather than being omitted because tools/check_lane_parity.sh's
+# block exists rather than being omitted because the lane-parity gate's
 # Windows arm reads it by name, and a missing block and an empty one are the
 # same thing to that parser -- but not to a reader deciding whether the omission
 # was a decision.

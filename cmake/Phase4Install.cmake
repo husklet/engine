@@ -297,24 +297,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND HL_BUILD_TESTS)
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
-# --- gate.ci-lane-parity, for a host with no guest corpus --------------------
-# CMakeLists.txt includes cmake/LaneParity.cmake only under HL_HAVE_GUEST_CC.
-# That condition is a proxy: it is right for Linux and Darwin, whose declared
-# lane lists are mostly guest-backed suites, and wrong for a host whose declared
-# list contains none of them -- there the corpus is irrelevant and the effect is
-# that the ONE guard against a declared-but-empty lane is missing on exactly the
-# newest, least-proven host. A token in HL_CI_HOSTS with nothing counting its
-# lanes is a declaration, not a check.
-#
-# LaneParity.cmake now decides for itself (it reads HL_CI_HOSTS and returns
-# early when this host's token is undeclared, or when the guest-backed lanes it
-# would have to count are absent), so this only has to reach it. The condition
-# is the exact complement of CMakeLists.txt's, so the file is included once and
-# never twice; when that include site is relaxed, delete this block.
-if(HL_BUILD_TESTS AND NOT HL_HAVE_GUEST_CC)
-  include(${CMAKE_CURRENT_LIST_DIR}/LaneParity.cmake)
-endif()
-
 # --- package-test: install into a staging root, link a consumer, run it -----
 # The Makefile does this by re-invoking itself with DESTDIR; the CMake form
 # runs `cmake --install` into a staging prefix from a driver script so the

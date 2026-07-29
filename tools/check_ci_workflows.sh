@@ -385,7 +385,7 @@ invariants)
 		# a new host has no runner, or has one whose configure drops the gate.
 		# This runs on Linux and macOS on every push, so the wiring of a host
 		# token is guarded from the moment it is written, by machines that
-		# already exist. Empty here means check_lane_parity.sh would exit 1 with
+		# already exist. Empty here means lane-parity-gate would exit 1 with
 		# "parsed no lanes" the first time the new runner ran it.
 		os=${host%%-*}
 		upper=$(printf '%s\n' "$os" | tr 'a-z' 'A-Z')

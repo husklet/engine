@@ -145,7 +145,7 @@ jobs:
         run: |
           set -e
           for t in hl-translator hl-host-fake hl-engine hl-linux-abi \
-                   hl-host-windows hl-engine-runner; do
+                   hl-host-windows hl-engine-runner lane-parity-gate; do
             cmake --build build-ci --target "$t"
           done
           for a in libhl-translator.a libhl-host-fake.a libhl-engine.a \
@@ -153,6 +153,7 @@ jobs:
             test -f "build-ci/$a"
           done
           test -f build-ci/bin/hl-engine-runner.exe
+          test -f build-ci/tools/lane-parity-gate.exe
           llvm-nm --print-armap build-ci/libhl-translator.a > /dev/null
 
       # THE declared lane, replacing the by-name list this step used to carry.

@@ -21,7 +21,7 @@
 # variables the flake devShell exports (AARCH64_LINUX_CC / X86_64_LINUX_CC).
 # Do not hardcode compiler paths here.
 # ---------------------------------------------------------------------------
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.28)
 project(hl_engine LANGUAGES C)
 
 # The shell. OPTIONAL, and found exactly once: cmake/Phase3CiConfig.cmake and
@@ -38,7 +38,7 @@ find_program(HL_BASH_EXECUTABLE NAMES bash)
 if(NOT HL_BASH_EXECUTABLE)
   message(STATUS
     "bash not found -- the shell-backed CTest cases (unit.ci-workflow-invariants, "
-    "unit.publish-gating, gate.ci-lane-parity, gate.archive-closure) and the "
+    "unit.publish-gating, gate.archive-closure) and the "
     "crate-archive targets (check-crate-archives, refresh-crate-archives*) are NOT "
     "registered. The libraries, engines and runner still build. Install MSYS2 or "
     "Git for Windows to get them.")
@@ -169,8 +169,8 @@ if(HL_BUILD_TESTS)
   # Sets HL_HAVE_GUEST_CC and returns early when the Linux cross compilers are
   # absent (e.g. a plain `nix build`, whose sandbox exports no *_LINUX_CC).
   include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/GuestFixtures.cmake)
+  add_subdirectory(tools)
   if(HL_HAVE_GUEST_CC)
-    add_subdirectory(tools)
     # These build and run guest programs, so they depend on the fixtures above.
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Compat.cmake)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase3Gates.cmake)
@@ -203,13 +203,6 @@ endif()
 
 # --- Phase 4: install rules, pkg-config, packaging smoke tests -------------
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Phase4Install.cmake)
-
-# Lane parity covers the complete registry, including Phase4Install's package
-# labels.  A host-unit-only configure intentionally has no guest cross
-# compilers and therefore no compat/production lanes to audit.
-if(HL_BUILD_TESTS AND HL_HAVE_GUEST_CC)
-  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/LaneParity.cmake)
-endif()
 
 # Preserve the Linux-to-macOS transport entry point.  The real Darwin build
 # and CTest registry remain authoritative; this target only drives them over
@@ -265,3 +258,10 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Lint.cmake)
 
 # --- rustfmt / clippy as tests ------------------------------------------------
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/RustLint.cmake)
+
+# This must be the final test registration. It serializes the complete
+# recursive registry before adding its own guard, so the guard cannot satisfy
+# a lane by counting itself.
+if(HL_BUILD_TESTS)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/LaneParity.cmake)
+endif()
