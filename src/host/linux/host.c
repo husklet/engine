@@ -2169,20 +2169,51 @@ static hl_host_result hl_linux_file_open_beneath(void *context, hl_host_handle r
     return result;
 }
 
+static int hl_linux_write_zeros(int descriptor, off_t begin, off_t end) {
+    static const unsigned char zeros[65536];
+    while (begin < end) {
+        size_t request = (uint64_t)(end - begin) < sizeof(zeros) ? (size_t)(end - begin) : sizeof(zeros);
+        ssize_t count = pwrite(descriptor, zeros, request, begin);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            if (count == 0) errno = EIO;
+            return -1;
+        }
+        begin += count;
+    }
+    return 0;
+}
+
 static hl_host_result hl_linux_file_allocate_range(void *context, hl_host_handle file, uint32_t mode, uint64_t offset,
                                                    uint64_t size) {
+    const uint32_t keep = HL_HOST_FILE_ALLOC_KEEP_SIZE;
+    const uint32_t punch = HL_HOST_FILE_ALLOC_PUNCH_HOLE;
+    const uint32_t collapse = HL_HOST_FILE_ALLOC_COLLAPSE_RANGE;
+    const uint32_t zero = HL_HOST_FILE_ALLOC_ZERO_RANGE;
+    const uint32_t insert = HL_HOST_FILE_ALLOC_INSERT_RANGE;
+    const uint32_t unshare = HL_HOST_FILE_ALLOC_UNSHARE_RANGE;
     const uint32_t allowed = HL_HOST_FILE_ALLOC_KEEP_SIZE | HL_HOST_FILE_ALLOC_PUNCH_HOLE |
                              HL_HOST_FILE_ALLOC_COLLAPSE_RANGE | HL_HOST_FILE_ALLOC_ZERO_RANGE |
                              HL_HOST_FILE_ALLOC_INSERT_RANGE | HL_HOST_FILE_ALLOC_UNSHARE_RANGE;
     hl_host_linux *host = context;
+    struct stat metadata;
     int descriptor;
-    if (size == 0 || offset > INT64_MAX || size > INT64_MAX || offset > INT64_MAX - size || (mode & ~allowed) != 0)
+    if (size == 0 || offset > INT64_MAX || size > INT64_MAX || offset > INT64_MAX - size || (mode & ~allowed) != 0 ||
+        ((mode & punch) != 0 && (mode & keep) == 0) || ((mode & collapse) != 0 && mode != collapse) ||
+        ((mode & insert) != 0 && mode != insert) || ((mode & unshare) != 0 && (mode & ~(unshare | keep)) != 0))
         return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
     pthread_mutex_lock(&host->lock);
     descriptor = hl_linux_descriptor(host, file, HL_LINUX_HANDLE_FILE, HL_LINUX_HANDLE_SHARED_MEMORY);
     pthread_mutex_unlock(&host->lock);
     if (descriptor < 0) return hl_linux_result(HL_STATUS_INVALID_ARGUMENT, 0, 0);
-    if (fallocate(descriptor, (int)mode, (off_t)offset, (off_t)size) != 0) return hl_linux_errno_result();
+    if (fallocate(descriptor, (int)mode, (off_t)offset, (off_t)size) == 0) return hl_linux_result(HL_STATUS_OK, 0, 0);
+    if ((mode & zero) == 0 || (errno != EOPNOTSUPP && errno != ENOSYS)) return hl_linux_errno_result();
+    if (fstat(descriptor, &metadata) != 0) return hl_linux_errno_result();
+    off_t begin = (off_t)offset;
+    off_t end = begin + (off_t)size;
+    off_t zero_end = (mode & keep) != 0 && end > metadata.st_size ? metadata.st_size : end;
+    if ((mode & keep) == 0 && end > metadata.st_size && ftruncate(descriptor, end) != 0) return hl_linux_errno_result();
+    if (begin < zero_end && hl_linux_write_zeros(descriptor, begin, zero_end) != 0) return hl_linux_errno_result();
     return hl_linux_result(HL_STATUS_OK, 0, 0);
 }
 

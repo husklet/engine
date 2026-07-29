@@ -904,6 +904,8 @@ int main(void) {
         hl_host_filesystem_metadata filesystem;
         hl_host_file_metadata range_metadata;
         hl_host_result range_file;
+        unsigned char range_bytes[8192];
+        unsigned char range_readback[8192];
         snprintf(range_path, sizeof(range_path), "/tmp/hl_file_abi14_linux_%ld", (long)getpid());
         range_file = services.file->open_relative(services.context, HL_HOST_HANDLE_CWD, range_path, strlen(range_path),
                                                   HL_HOST_FILE_READ | HL_HOST_FILE_WRITE,
@@ -913,6 +915,21 @@ int main(void) {
                  HL_STATUS_OK);
         HL_CHECK(services.file->metadata(services.context, range_file.value, &range_metadata).status == HL_STATUS_OK &&
                  range_metadata.size == 8192);
+        memset(range_bytes, 0x5a, sizeof(range_bytes));
+        HL_CHECK(services.file
+                     ->write_at(services.context, range_file.value, 0,
+                                (hl_host_const_bytes){range_bytes, sizeof(range_bytes)})
+                     .value == sizeof(range_bytes));
+        HL_CHECK(services.file
+                     ->allocate_range(services.context, range_file.value,
+                                      HL_HOST_FILE_ALLOC_ZERO_RANGE | HL_HOST_FILE_ALLOC_KEEP_SIZE, 2048, 4096)
+                     .status == HL_STATUS_OK);
+        HL_CHECK(services.file
+                     ->read_at(services.context, range_file.value, 0,
+                               (hl_host_bytes){range_readback, sizeof(range_readback)})
+                     .value == sizeof(range_readback));
+        for (size_t index = 0; index < sizeof(range_readback); ++index)
+            HL_CHECK(range_readback[index] == (index >= 2048 && index < 6144 ? 0 : 0x5a));
         HL_CHECK(services.file->filesystem_metadata(services.context, range_file.value, &filesystem).status ==
                      HL_STATUS_OK &&
                  filesystem.block_size > 0 && filesystem.blocks > 0 && filesystem.blocks_free <= filesystem.blocks);
