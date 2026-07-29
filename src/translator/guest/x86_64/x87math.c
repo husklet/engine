@@ -49,6 +49,7 @@ static unsigned quotient_low3(double st0, double st1, int ieee) {
 static void x87_remainder(struct cpu *cpu, int ieee) {
     double st0 = cpu->st[cpu->fptop & 7];
     double st1 = cpu->st[(cpu->fptop + 1) & 7];
+    unsigned invalid;
     unsigned held;
     if (hl_x87_phys_empty(cpu->fptop, (int)(cpu->fptop & 7)) ||
         hl_x87_phys_empty(cpu->fptop, (int)((cpu->fptop + 1) & 7))) {
@@ -68,11 +69,11 @@ static void x87_remainder(struct cpu *cpu, int ieee) {
             return;
         }
     }
+    invalid = !isnan(st0) && !isnan(st1) && (isinf(st0) || st1 == 0.0);
     cpu->st[cpu->fptop & 7] = ieee ? remainder(st0, st1) : fmod(st0, st1);
     {
         unsigned magnitude = quotient_low3(st0, st1, ieee);
-        // The remainder itself may legitimately have raised #IA (ST1 zero, ST0 infinite); keep that.
-        hl_x87_exceptions_set(held | (hl_x87_exceptions_get() & 1u));
+        hl_x87_exceptions_set(held | invalid);
         // BOTH flavours publish |Q|'s low three bits as C1/C3/C0; the old lowering cleared them for FPREM1.
         cpu->fpsw |= (uint64_t)((magnitude >> 2) & 1u) << 8 | (uint64_t)(magnitude & 1u) << 9 |
                      (uint64_t)((magnitude >> 1) & 1u) << 14;
