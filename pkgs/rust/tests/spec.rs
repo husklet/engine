@@ -2329,13 +2329,27 @@ fn compile_projected_device_probe() -> PathBuf {
     fs::write(
         &source,
         r#"
+#define _GNU_SOURCE
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <linux/stat.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+static int device_status(int fd) {
+  struct stat status;
+  if (fstat(fd, &status)) return 1;
+  if (!S_ISCHR(status.st_mode)) return 2;
+  if (major(status.st_rdev) != 226 || minor(status.st_rdev) != 128) return 3;
+  return 0;
+}
+
 int main(void) {
   DIR *directory = opendir("/dev/dri");
   if (!directory) return 10;
@@ -2347,15 +2361,52 @@ int main(void) {
   if (!found) return 11;
   int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
   if (fd < 0) return 12;
-  struct stat status;
-  if (fstat(fd, &status)) return 13;
-  if (!S_ISCHR(status.st_mode)) return 14;
-  if (major(status.st_rdev) != 226 || minor(status.st_rdev) != 128) return 15;
+  int status = device_status(fd);
+  if (status) return 12 + status;
   unsigned value = 7;
   if (ioctl(fd, 0xc0046801u, &value) || value != 0x12345678u) return 16;
   char output[8] = {0};
   struct { char *address; unsigned long size; } indirect = {output, sizeof output};
   if (ioctl(fd, 0xc0106802u, &indirect) || memcmp(output, "provider", 8)) return 17;
+
+  int duplicate = dup(fd);
+  if (duplicate < 0) return 18;
+  status = device_status(duplicate);
+  if (status) return 18 + status;
+
+  pid_t child = fork();
+  if (child < 0) return 22;
+  if (child == 0) _exit(device_status(duplicate));
+  int child_status;
+  if (waitpid(child, &child_status, 0) != child ||
+      !WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) return 23;
+
+  struct statx extended;
+  int statx_supported = 0;
+  memset(&extended, 0, sizeof extended);
+  if (syscall(SYS_statx, AT_FDCWD, "/dev/dri/renderD128", 0, STATX_BASIC_STATS, &extended)) {
+    if (errno != ENOSYS) return 24;
+  } else if ((extended.stx_mode & S_IFMT) != S_IFCHR ||
+             extended.stx_rdev_major != 226 || extended.stx_rdev_minor != 128) {
+    return 25;
+  } else {
+    statx_supported = 1;
+  }
+  memset(&extended, 0, sizeof extended);
+  if (syscall(SYS_statx, fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &extended)) {
+    if (errno != ENOSYS || statx_supported) return 26;
+  } else if ((extended.stx_mode & S_IFMT) != S_IFCHR ||
+             extended.stx_rdev_major != 226 || extended.stx_rdev_minor != 128) {
+    return 27;
+  }
+
+  close(fd);
+  int reopened = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+  if (reopened != fd) return 28;
+  status = device_status(reopened);
+  if (status) return 28 + status;
+  close(reopened);
+  close(duplicate);
   return 0;
 }
 "#,

@@ -3554,7 +3554,10 @@ static int svc_fs(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t
                 opened = bound_adopt_handle(&typed_slot, plan.target, typed_open_flags(a2));
                 if (opened < 0) (void)g_host_services->file->close(g_host_services->context, plan.target);
                 opened = bound_relocate_lowest(opened);
-                if (opened >= 0 && have_typed_host_path) {
+                if (opened >= 0 && projected != NULL && opened < HL_NFD) {
+                    if (path_copy(g_fdpath[(int)opened], sizeof g_fdpath[(int)opened], overlay_guest) != 0)
+                        g_fdpath[(int)opened][0] = 0;
+                } else if (opened >= 0 && have_typed_host_path) {
                     hl_fdcache_fd_setpath((int)opened, typed_host_path);
                     if ((lf & 3) || (lf & 0x40) || (lf & 0x200)) {
                         HL_LOGF(&g_jit_log, HL_LOG_TAG_FS, "open-cache-evict path=%s typed=1 created=%d",

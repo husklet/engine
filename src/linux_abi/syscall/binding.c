@@ -1156,6 +1156,11 @@ activation_failed: {
 }
 }
 
+static void bound_path_duplicate(hl_linux_fd source, int64_t target) {
+    if (source >= HL_NFD || target < 0 || target >= HL_NFD) return;
+    snprintf(g_fdpath[(int)target], sizeof g_fdpath[(int)target], "%s", g_fdpath[(int)source]);
+}
+
 static int64_t bound_dup_at_least(hl_linux_fd source, int minimum, uint32_t descriptor_flags) {
     struct fdvis_reservation fdvis;
     int shadow = bound_shadow_reserve(minimum);
@@ -1190,6 +1195,7 @@ static int64_t bound_dup_at_least(hl_linux_fd source, int minimum, uint32_t desc
                 kind = HL_HOST_FD_SOCKET;
         }
         proc_fdvis_reservation_publish(&fdvis, (int)result, kind, metadata.stable_device, metadata.stable_object);
+        bound_path_duplicate(source, result);
     }
     return result;
 }
@@ -4077,6 +4083,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                         kind = HL_HOST_FD_SOCKET;
                 }
                 proc_fdvis_reservation_publish(&fdvis, target, kind, metadata.stable_device, metadata.stable_object);
+                bound_path_duplicate(source.fd, result);
             }
         }
         break;
