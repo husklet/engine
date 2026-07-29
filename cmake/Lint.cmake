@@ -225,7 +225,7 @@ if(HL_BUILD_TESTS)
       --skip-clang-tidy
       --skip-custom
       --cppcheck-bin $<TARGET_FILE:hl_lint_fake_analyzer>
-      --include-dir "${CMAKE_SOURCE_DIR}/include"
+      --compile-commands-dir "${CMAKE_BINARY_DIR}"
       --source-file "${CMAKE_SOURCE_DIR}/linter/tests/fixture.c")
   set_tests_properties(lint.cppcheck-argv PROPERTIES
     LABELS "lint"
