@@ -14,6 +14,7 @@ find_program(HL_CLANG_TIDY_EXECUTABLE NAMES clang-tidy)
 find_program(HL_CPPCHECK_EXECUTABLE NAMES cppcheck)
 set(HL_LINT_ALLOW_GETENV_FILES
   src/core/environment.c
+  src/host/windows/process.c
   tests/unit/test_environment.c
   tools/config.c
   tools/config_e2e_runner.c

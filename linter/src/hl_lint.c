@@ -537,6 +537,15 @@ static bool line_has_direct_console_output(const char *line) {
     return false;
 }
 
+static bool line_has_direct_environment_access(const char *line) {
+    static const char *const calls[] = {"getenv",    "secure_getenv",           "__secure_getenv",
+                                        "_dupenv_s", "GetEnvironmentVariableA", "GetEnvironmentVariableW",
+                                        NULL};
+    for (size_t index = 0; calls[index] != NULL; ++index)
+        if (line_has_call(line, calls[index])) return true;
+    return false;
+}
+
 static bool line_has_control_prefix(const char *line) {
     const char *s = skip_space(line);
     static const char *const k_controls[] = {"if",      "else",    "for",    "while",  "switch",       "case",
@@ -658,10 +667,10 @@ static void check_file_custom(const LintConfig *cfg, const char *path, LintStats
             stats->warnings++;
         }
 
-        if (line_has_call(clean, "getenv")) {
+        if (line_has_direct_environment_access(clean)) {
             if (!is_getenv_allowed_in_file(cfg, path)) {
                 emit_diag("error", path, lineno, 1, "api",
-                          "getenv usage is only allowed in explicitly whitelisted files");
+                          "direct environment access is only allowed in explicitly whitelisted files");
                 stats->errors++;
             }
         }
@@ -779,7 +788,7 @@ static void print_usage(const char *prog) {
     fprintf(stdout, "  --skip-clang-tidy         disable clang-tidy stage\n");
     fprintf(stdout, "  --skip-cppcheck           disable cppcheck stage\n");
     fprintf(stdout, "  --skip-custom             disable custom heuristics stage\n");
-    fprintf(stdout, "  --allow-getenv-file PATH  allow getenv() usage in this source file\n");
+    fprintf(stdout, "  --allow-getenv-file PATH  allow direct environment access in this source file\n");
     fprintf(stdout, "  --allow-stdio-file PATH   temporarily allow direct console output in this file\n");
     fprintf(stdout, "  --allow-shell-file PATH   temporarily allow shell execution in this file\n");
     fprintf(stdout, "  --clang-format-check/--clang-format-no-check\n");
