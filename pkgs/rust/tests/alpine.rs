@@ -2,6 +2,8 @@ use hl_engine::network::Namespace;
 use hl_engine::{Config, Engine, Exit, Guest, Stdio};
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -244,6 +246,110 @@ fn production_true_has_empty_stdout_and_stderr() {
         "unexpected stderr: {:?}",
         output.stderr
     );
+}
+
+#[test]
+fn translation_cache_publishes_shell_and_fork_exec_utility_epochs() {
+    let cache =
+        std::env::temp_dir().join(format!("hl-alpine-pcache-fork-exec-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&cache);
+
+    let mut cold_entries = Vec::new();
+    for round in 0..100 {
+        let output = Engine::new()
+            .command(Guest::Aarch64, "/bin/sh")
+            .config(Config::new().root(rootfs()).translation_cache(&cache))
+            .args(["-c", "awk '{print $1}' /proc/self/stat; :"])
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            output.exit,
+            Exit::Code(0),
+            "cached shell fork/exec run {round} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u32>()
+                .is_ok(),
+            "run {round} returned an invalid process id: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        if round == 0 {
+            cold_entries = fs::read_dir(&cache)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let metadata = entry.metadata().unwrap();
+                    (
+                        entry.file_name(),
+                        metadata.len(),
+                        metadata.modified().unwrap(),
+                    )
+                })
+                .collect();
+            cold_entries.sort_by(|left, right| left.0.cmp(&right.0));
+            assert!(
+                cold_entries.len() >= 2,
+                "the cold shell and fork-exec'd utility must each publish a cache, found {cold_entries:?}"
+            );
+        }
+    }
+
+    let mut warm_entries = fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            (
+                entry.file_name(),
+                metadata.len(),
+                metadata.modified().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    warm_entries.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        warm_entries, cold_entries,
+        "warm shell and utility epochs must reuse their identity-keyed caches without republishing"
+    );
+
+    fs::remove_dir_all(cache).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn translation_cache_reuses_a_direct_launch_without_republishing() {
+    let cache =
+        std::env::temp_dir().join(format!("hl-alpine-pcache-direct-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&cache);
+
+    let launch = || {
+        Engine::new()
+            .command(Guest::Aarch64, "/bin/true")
+            .config(Config::new().root(rootfs()).translation_cache(&cache))
+            .output()
+            .unwrap()
+    };
+
+    assert_eq!(launch().exit, Exit::Code(0));
+    let entry = fs::read_dir(&cache).unwrap().next().unwrap().unwrap();
+    assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
+    let inode = entry.metadata().unwrap().ino();
+
+    for _ in 1..100 {
+        assert_eq!(launch().exit, Exit::Code(0));
+        let current = fs::read_dir(&cache).unwrap().next().unwrap().unwrap();
+        assert_eq!(
+            current.metadata().unwrap().ino(),
+            inode,
+            "a warm direct launch unexpectedly republished its cache"
+        );
+    }
+
+    fs::remove_dir_all(cache).unwrap();
 }
 
 #[test]

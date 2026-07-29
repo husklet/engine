@@ -67,7 +67,8 @@
 // PCACHE DISCIPLINE (wave-2: fork children never save): every runner sets the never-save-from-
 // fork-child latch (g_pcache_forked) before running -- its COW arena is the parent's prewarm mix, and
 // persisting it under the request binary's identity would poison the cache. A guest execve inside the
-// runner re-keys + lifts the bar via pcache_exec_reload (aarch64), exactly like any other fork child.
+// runner re-keys persistent-cache lookup; AArch64 keeps the runner barred from publishing while x86
+// applies its own exec-epoch policy.
 // The resident parent never calls pcache_save; prewarm uses the loaded-program path directly.
 //
 // Config model: engine-level HL options and the container rootfs are server
@@ -266,7 +267,7 @@ static void hl_forkserver_runner(int conn, int *fds, int nfd, int argc, char **a
     if (!fsrv_pres_ok) _exit(70);
     // wave-2 discipline: this process is a fork child on a COW copy of the PARENT's arena +
     // recording state -- it must NEVER pcache_save under the request binary's identity. A guest
-    // execve re-keys + lifts the bar (pcache_exec_reload), same as any other fork child.
+    // execve re-keys persistent-cache lookup and applies the frontend's exec-epoch save policy.
     g_pcache_forked = 1;
     g_noexit = 0; // the parent's prewarm shim must not leak in: guest exit_group _exits normally
 
