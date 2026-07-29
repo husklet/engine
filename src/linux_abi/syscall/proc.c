@@ -721,8 +721,6 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         break;
     // exit_group: end the whole process
     case 94:
-        fprintf(stderr, "[HLDBG] exit-group pid=%d code=%d pc=%#llx\n", (int)getpid(), (int)a0,
-                (unsigned long long)G_PC(c));
         HL_LOGF(&g_jit_log, HL_LOG_TAG_NETWORK, "exit_group pid=%d code=%d", (int)getpid(), (int)a0);
         hl_dispatch_profile_report(&g_dispatch_profile, &g_jit_log, translation_log_summary);
         if (0)
@@ -1868,8 +1866,6 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         }
         pid_t pid = fork();
         int fork_error = errno;
-        fprintf(stderr, "[HLDBG] clone host=%d result=%d flags=%#llx share-fs=%d\n",
-                (int)getpid(), (int)pid, (unsigned long long)a0, share_fs);
         if (is_vfork) {
             if (pid == 0) {
                 close(vfork_pipe[0]);
@@ -2019,8 +2015,6 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         /* fall through */
     // execve(path, argv, envp)
     case 221: {
-        fprintf(stderr, "[HLDBG] exec host=%d path=%s\n", (int)getpid(),
-                a0 ? (const char *)a0 : "(null)");
         memf_materialize_all(); // non-CLOEXEC scratch fds survive exec -> flush RAM into the real files
         // Linux comm = last component of the path PASSED to execve, captured BEFORE the /proc magic-link
         // rewrite below and before binfmt_script (execve("/proc/self/exe") -> comm "exe"; "./run.sh"
