@@ -39,8 +39,7 @@ int main(void) {
 
     // sched_getaffinity: cpusetsize is validated first (must be a multiple of sizeof(long) and wide enough
     // for every online CPU), then the mask is copied out -- a NULL mask at a legal size is EFAULT.
-    printf("sched_getaffinity_null_errno=%d\n",
-           ec(syscall(SYS_sched_getaffinity, 0, sizeof(cpu_set_t), (void *)0)));
+    printf("sched_getaffinity_null_errno=%d\n", ec(syscall(SYS_sched_getaffinity, 0, sizeof(cpu_set_t), (void *)0)));
     printf("sched_getaffinity_badsize_errno=%d\n", ec(syscall(SYS_sched_getaffinity, 0, 7, (void *)0)));
 
     // Control: a real buffer still succeeds for both.
@@ -52,15 +51,13 @@ int main(void) {
     // Preserve the native O_LARGEFILE representation across access modes and F_SETFL(O_APPEND).
     int fd = open("/dev/null", O_RDWR);
     int fl = fcntl(fd, F_GETFL);
-    printf("getfl_largefile=%d getfl_accmode=%d\n", ((fl & K_O_LARGEFILE) != 0) == EXPECT_O_LARGEFILE,
-           fl & O_ACCMODE);
+    printf("getfl_largefile=%d getfl_accmode=%d\n", ((fl & K_O_LARGEFILE) != 0) == EXPECT_O_LARGEFILE, fl & O_ACCMODE);
     printf("setfl_append=%d\n", ec(fcntl(fd, F_SETFL, O_APPEND)));
     fl = fcntl(fd, F_GETFL);
     printf("getfl2_largefile=%d getfl2_append=%d getfl2_accmode=%d\n",
            ((fl & K_O_LARGEFILE) != 0) == EXPECT_O_LARGEFILE, (fl & O_APPEND) != 0, fl & O_ACCMODE);
     int rfd = open("/dev/null", O_RDONLY);
-    printf("getfl_rdonly_largefile=%d\n",
-           ((fcntl(rfd, F_GETFL) & K_O_LARGEFILE) != 0) == EXPECT_O_LARGEFILE);
+    printf("getfl_rdonly_largefile=%d\n", ((fcntl(rfd, F_GETFL) & K_O_LARGEFILE) != 0) == EXPECT_O_LARGEFILE);
     close(rfd);
     close(fd);
     return 0;

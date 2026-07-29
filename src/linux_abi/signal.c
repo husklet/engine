@@ -742,8 +742,8 @@ static void maybe_deliver_signal(struct cpu *c) {
 // handler / blocked -> queue the per-instance siginfo + pending bit; otherwise apply the default action.
 // `code`/`value`/`pid`/`uid` are the siginfo to carry (SI_USER + sender pid for a plain kill/raise, or
 // SI_QUEUE + value + sender pid for sigqueue); realtime signals queue every instance FIFO.
-static void raise_guest_signal_info(struct cpu *c, int sig, int error, int code, uint64_t value, int pid,
-                                    int uid, uint64_t address) {
+static void raise_guest_signal_info(struct cpu *c, int sig, int error, int code, uint64_t value, int pid, int uid,
+                                    uint64_t address) {
     if (sig < 1 || sig > 64) return;
     // if this process is traced, a signal it raises on itself (raise/abort/kill-self, incl. the
     // raise(SIGSTOP) tracers' children use) becomes a ptrace signal/group-stop reported to the tracer.

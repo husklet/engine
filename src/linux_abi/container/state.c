@@ -517,9 +517,9 @@ static int g_rgid, g_egid, g_sgid; // real / effective / saved-set gid
 // effective from permitted. setpriv relies on exactly this: it sets KEEPCAPS, does setresuid(1000,...),
 // capset()s to re-raise, then setresgid(1000,...) -- which our euid==0-only gate wrongly rejected (EPERM).
 // apt/gosu drop WITHOUT keepcaps, so permitted->0 and they correctly can never regain root.
-static int g_keepcaps = 0;                    // PR_SET_KEEPCAPS armed (caps survive the all-nonzero uid drop)
-static int g_cap_setid_perm, g_cap_setid_eff; // permitted / effective CAP_SETUID+CAP_SETGID (move together)
-static int g_nnp;                             // sticky PR_SET/GET_NO_NEW_PRIVS state
+static int g_keepcaps = 0;                     // PR_SET_KEEPCAPS armed (caps survive the all-nonzero uid drop)
+static int g_cap_setid_perm, g_cap_setid_eff;  // permitted / effective CAP_SETUID+CAP_SETGID (move together)
+static int g_nnp;                              // sticky PR_SET/GET_NO_NEW_PRIVS state
 static int g_fsuid_ovr = -1, g_fsgid_ovr = -1; // -1 = follow effective identity
 
 static void cred_init(void) {
@@ -597,7 +597,7 @@ static int gid_permitted(int id) {
                                             // net_bind_service,net_raw,sys_chroot,mknod,audit_write,setfcap
 static uint64_t g_cap_eff = HL_CAP_DEFAULT; // process EFFECTIVE cap set (capset(2) may narrow it)
 static uint64_t g_cap_bnd = HL_CAP_DEFAULT; // process BOUNDING cap set (PR_CAPBSET_DROP clears bits)
-static int g_securebits; // PR_SET/GET_SECUREBITS
+static int g_securebits;                    // PR_SET/GET_SECUREBITS
 // The file-mode creation mask. Forwarded to the host on umask(2) so real inode creation honours it, but ALSO
 // tracked here so /proc/self/status `Umask:` reflects the guest's current value (it was hardcoded 0022, so a
 // guest umask(2) changed real file modes yet the status line stayed 0022 -- a syscall-vs-/proc disagreement).

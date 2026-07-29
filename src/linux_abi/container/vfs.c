@@ -92,6 +92,7 @@ static int symlink_idempotent(const char *target, const char *path) {
 
 // ---- rootfs path rewriting (ported from mac_elf.c) ----
 static const char *g_rootfs = NULL;
+
 // Linux CLONE_FS shares cwd and root between processes. Keep the ordinary
 // process-local context inline, then promote it to MAP_SHARED only when a
 // caller requests that contract. A later fork without CLONE_FS detaches in
@@ -107,8 +108,7 @@ static struct guest_fs_context *g_fs = &g_fs_local;
 
 static int guest_fs_share(void) {
     if (g_fs != &g_fs_local) return 0;
-    struct guest_fs_context *shared =
-        mmap(NULL, sizeof *shared, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+    struct guest_fs_context *shared = mmap(NULL, sizeof *shared, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
     if (shared == MAP_FAILED) return -errno;
     memcpy(shared, &g_fs_local, sizeof *shared);
     g_fs = shared;
@@ -120,6 +120,7 @@ static void guest_fs_after_fork(int shared) {
     memcpy(&g_fs_local, g_fs, sizeof g_fs_local);
     g_fs = &g_fs_local;
 }
+
 static uint8_t g_auxv_data[1024];
 // serialized auxv for /proc/self/auxv
 static int g_auxv_len;
@@ -1600,6 +1601,7 @@ struct vol {
                            // point reverts to the underlying rootfs/overlay content (the slot is never compacted --
                            // append-only keeps concurrent path resolves race-free).
 };
+
 #define HL_VOLUME_MAX 256
 
 static struct vol g_vols[HL_VOLUME_MAX];
@@ -1984,8 +1986,7 @@ static int secure_resolve_probe(const char *guest, char *out, size_t n, int nofo
     // here IS that file -- emit it directly; confine_in would append rel ("/") and ENOTDIR on the file.
     int fvi = jail_match(norm);
     int exact_volume = fvi >= 0 && strcmp(norm, g_vols[fvi].guest) == 0;
-    if (fvi >= 0 && g_vols[fvi].isfile &&
-        (!g_vols[fvi].issymlink || (nofollow && exact_volume))) {
+    if (fvi >= 0 && g_vols[fvi].isfile && (!g_vols[fvi].issymlink || (nofollow && exact_volume))) {
         if (isvol) *isvol = 1;
         snprintf(out, n, "%s", g_vols[fvi].hcanon);
         return 1;
@@ -5026,8 +5027,7 @@ static int synth_proc_fd_dir_is(const char *gp) {
     while (q[i] >= '0' && q[i] <= '9')
         i++;
     if (!i) return 0;
-    return !strcmp(q + i, "/fd") || !strcmp(q + i, "/fd/") ||
-           !strcmp(q + i, "/fdinfo") || !strcmp(q + i, "/fdinfo/");
+    return !strcmp(q + i, "/fd") || !strcmp(q + i, "/fd/") || !strcmp(q + i, "/fdinfo") || !strcmp(q + i, "/fdinfo/");
 }
 
 static int synth_misc_dir_open(const char *gp) {

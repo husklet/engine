@@ -559,21 +559,18 @@ static void bound_status_from_metadata(hl_linux_file_status *status, const hl_ho
 
 static void bound_virtualize_namespace(int fd, hl_linux_file_status *status) {
     if (fd < 0 || fd >= HL_NFD || !g_fdpath[fd][0]) return;
-    const hl_provider_node *node =
-        hl_provider_namespace_launch_resolve(g_fdpath[fd], strlen(g_fdpath[fd]));
-    if (node == NULL || node->kind == HL_PROVIDER_NODE_DIRECTORY ||
-        node->kind == HL_PROVIDER_NODE_SYMLINK)
-        return;
+    const hl_provider_node *node = hl_provider_namespace_launch_resolve(g_fdpath[fd], strlen(g_fdpath[fd]));
+    if (node == NULL || node->kind == HL_PROVIDER_NODE_DIRECTORY || node->kind == HL_PROVIDER_NODE_SYMLINK) return;
 
-    uint32_t type = node->kind == HL_PROVIDER_NODE_CHARACTER ? 0020000 :
-                    node->kind == HL_PROVIDER_NODE_BLOCK ? 0060000 : 0100000;
+    uint32_t type = node->kind == HL_PROVIDER_NODE_CHARACTER ? 0020000
+                    : node->kind == HL_PROVIDER_NODE_BLOCK   ? 0060000
+                                                             : 0100000;
     status->mode = type | (node->mode & 07777u);
     status->user = node->uid;
     status->group = node->gid;
-    status->special_device =
-        node->kind == HL_PROVIDER_NODE_CHARACTER || node->kind == HL_PROVIDER_NODE_BLOCK
-            ? hl_linux_device_make(node->major, node->minor)
-            : 0;
+    status->special_device = node->kind == HL_PROVIDER_NODE_CHARACTER || node->kind == HL_PROVIDER_NODE_BLOCK
+                                 ? hl_linux_device_make(node->major, node->minor)
+                                 : 0;
     status->link_count = 1;
 }
 
@@ -3774,8 +3771,7 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 result = -E2BIG;
                 break;
             }
-            unsigned char *provider_argument =
-                argument_size == 0 ? NULL : calloc(argument_size, 1);
+            unsigned char *provider_argument = argument_size == 0 ? NULL : calloc(argument_size, 1);
             if (argument_size != 0 && provider_argument == NULL) {
                 result = -ENOMEM;
                 break;
@@ -3792,12 +3788,10 @@ static int bound_route(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uin
                 break;
             }
             hl_provider_ioctl_result ioctl_result = {0};
-            hl_host_result called = hl_provider_files_ioctl(
-                source.host_handle, request, provider_argument, argument_size,
-                &ioctl_result);
+            hl_host_result called =
+                hl_provider_files_ioctl(source.host_handle, request, provider_argument, argument_size, &ioctl_result);
             if (called.status != HL_STATUS_OK)
-                result = called.detail != 0 ? -(int64_t)called.detail
-                                            : bound_host_error(called.status);
+                result = called.detail != 0 ? -(int64_t)called.detail : bound_host_error(called.status);
             else
                 result = (int64_t)called.value;
             if (result >= 0 && (direction & 2u) != 0 &&

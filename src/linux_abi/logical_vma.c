@@ -1080,8 +1080,7 @@ int hl_logical_vma_visit_exec_aliases(uint64_t guest_first, uint64_t guest_last,
     int overflow = 0;
     int matched = 0;
     (void)pthread_once(&g_logical_vmas_once, global_init);
-    hl_logical_vma_snapshot *snapshot =
-        atomic_load_explicit(&g_logical_vmas.current, memory_order_acquire);
+    hl_logical_vma_snapshot *snapshot = atomic_load_explicit(&g_logical_vmas.current, memory_order_acquire);
     if (snapshot == NULL) return 0;
     size_t source = 0;
     size_t high = snapshot->count;

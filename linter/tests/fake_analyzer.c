@@ -57,6 +57,11 @@ static int check_cppcheck(int argc, char **argv) {
         return 2;
     }
     if (!has_arg(argc, argv, "--std=c11") || !has_arg(argc, argv, "--error-exitcode=1") ||
+        !has_arg(argc, argv, "--suppress=unmatchedSuppression") ||
+        !has_arg(argc, argv, "--suppress=unusedStructMember") || !has_arg(argc, argv, "--suppress=constParameter") ||
+        !has_arg(argc, argv, "--suppress=normalCheckLevelMaxBranches") ||
+        !has_arg(argc, argv, "--suppress=toomanyconfigs") ||
+        !has_arg(argc, argv, "--suppress=preprocessorErrorDirective") ||
         has_arg(argc, argv, "2>&1")) {
         fputs("fake-analyzer: cppcheck argument corruption\n", stderr);
         return 2;
@@ -72,9 +77,7 @@ static int check_cppcheck(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (has_arg(argc, argv, "--quiet") && has_arg(argc, argv, "-p")) { return check_clang_tidy(argc, argv); }
-    if (has_arg(argc, argv, "--enable=warning,performance,style,portability,information")) {
-        return check_cppcheck(argc, argv);
-    }
+    if (has_arg(argc, argv, "--enable=warning,performance,portability")) { return check_cppcheck(argc, argv); }
 
     fputs("fake-analyzer: unknown invocation\n", stderr);
     return 2;

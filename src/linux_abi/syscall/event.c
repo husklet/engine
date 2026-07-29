@@ -503,14 +503,12 @@ static void ep_rearm_from_interest(int ep, int ident, int slot) {
 }
 
 static void ep_rearm_native_watch(const ep_native_watch *watch) {
-    uint16_t flags =
-        (uint16_t)((watch->events & UINT32_C(0x80000000) ? EV_CLEAR : 0) |
-                   (watch->events & UINT32_C(0x40000000) ? EV_ONESHOT : 0));
+    uint16_t flags = (uint16_t)((watch->events & UINT32_C(0x80000000) ? EV_CLEAR : 0) |
+                                (watch->events & UINT32_C(0x40000000) ? EV_ONESHOT : 0));
     struct kevent changes[2];
     int count = 0;
     if (watch->armed & 1u)
-        EV_SET(&changes[count++], watch->descriptor, EVFILT_READ, EV_ADD | flags, 0, 0,
-               (void *)(uintptr_t)watch->data);
+        EV_SET(&changes[count++], watch->descriptor, EVFILT_READ, EV_ADD | flags, 0, 0, (void *)(uintptr_t)watch->data);
     if (watch->armed & 2u)
         EV_SET(&changes[count++], watch->descriptor, EVFILT_WRITE, EV_ADD | flags, 0, 0,
                (void *)(uintptr_t)watch->data);
@@ -709,8 +707,7 @@ static void kqueue_rebuild_after_fork(void) {
         if (__atomic_load_n(&watch->active, __ATOMIC_ACQUIRE) != 1) continue;
         int ep = watch->epoll;
         int fd = watch->descriptor;
-        int drop = ep < 0 || ep >= HL_NFD || !g_epoll[ep] || fcntl(ep, F_GETFD) == -1 ||
-                   fcntl(fd, F_GETFD) == -1;
+        int drop = ep < 0 || ep >= HL_NFD || !g_epoll[ep] || fcntl(ep, F_GETFD) == -1 || fcntl(fd, F_GETFD) == -1;
         if (drop) {
             __atomic_store_n(&watch->active, 0, __ATOMIC_RELEASE);
             continue;

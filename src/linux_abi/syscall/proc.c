@@ -547,8 +547,7 @@ static void rusage_to_linux(uint8_t *d, const struct rusage *ru) {
 
 static void translation_log_summary(void *context, uint64_t translations, uint64_t translation_ns) {
     (void)translation_ns;
-    HL_LOGF((hl_log_context *)context, HL_LOG_TAG_TRANSLATE, "blocks=%llu",
-            (unsigned long long)translations);
+    HL_LOGF((hl_log_context *)context, HL_LOG_TAG_TRANSLATE, "blocks=%llu", (unsigned long long)translations);
 }
 
 static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
@@ -1811,14 +1810,13 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // child remains in the original namespace. Return EINVAL, the kernel
         // contract for unsupported clone flags, so capability probes can use
         // their documented fallback.
-        const uint64_t namespace_flags =
-            0x00020000ull | // CLONE_NEWNS
-            0x02000000ull | // CLONE_NEWCGROUP
-            0x04000000ull | // CLONE_NEWUTS
-            0x08000000ull | // CLONE_NEWIPC
-            0x10000000ull | // CLONE_NEWUSER
-            0x20000000ull | // CLONE_NEWPID
-            0x40000000ull;  // CLONE_NEWNET
+        const uint64_t namespace_flags = 0x00020000ull | // CLONE_NEWNS
+                                         0x02000000ull | // CLONE_NEWCGROUP
+                                         0x04000000ull | // CLONE_NEWUTS
+                                         0x08000000ull | // CLONE_NEWIPC
+                                         0x10000000ull | // CLONE_NEWUSER
+                                         0x20000000ull | // CLONE_NEWPID
+                                         0x40000000ull;  // CLONE_NEWNET
         if (a0 & namespace_flags) {
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;
@@ -2187,7 +2185,7 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
         // when exec commits, before the new image begins executing.
         vfork_release_parent();
         set_guest_comm(comm_src); // comm := basename of the exec'd NAME (captured pre-rewrite above)
-        cred_after_exec(p); // apply set-id ownership, recompute caps, and clear KEEPCAPS
+        cred_after_exec(p);       // apply set-id ownership, recompute caps, and clear KEEPCAPS
 #ifdef PCACHE_SAVE_HOOK
         // the exec below flushes this image's translated arena and RE-KEYS the cache identity for
         // the new image (pcache_exec_reload), so the exit-time save can never again cover this epoch.
@@ -2562,9 +2560,8 @@ static int svc_proc(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64
             break;
         }
         uint64_t flags = ca[0];
-        const uint64_t namespace_flags =
-            0x00020000ull | 0x02000000ull | 0x04000000ull | 0x08000000ull |
-            0x10000000ull | 0x20000000ull | 0x40000000ull;
+        const uint64_t namespace_flags = 0x00020000ull | 0x02000000ull | 0x04000000ull | 0x08000000ull | 0x10000000ull |
+                                         0x20000000ull | 0x40000000ull;
         if (flags & namespace_flags) {
             G_RET(c) = (uint64_t)(int64_t)(-EINVAL);
             break;

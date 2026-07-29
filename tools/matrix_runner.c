@@ -1679,13 +1679,14 @@ static int exit_matches(const capture *result, int expected) {
  */
 static int translation_reuse_matches(const suite_case *item, const char *isa, const capture *result) {
     enum { REUSE_BLOCK_BUDGET = 128 };
+
     const char marker[] = "[cache-reuse] kind=";
     const char blocks[] = "[hl:translate] blocks=";
     char *text, *line, *save = NULL;
     uint64_t parent = 0, noexec_max = 0, exec_max = 0;
     unsigned fork_count = 0, clone_count = 0, exec_count = 0;
     int kind = 0;
-    if (!item->translation_reuse || getenv("HL_MATRIX_TRANSLATION_REUSE") == NULL) return 1;
+    if (!item->translation_reuse || !hl_tool_config_matrix_translation_reuse()) return 1;
     text = malloc(result->error_size + 1u);
     if (text == NULL) return 0;
     memcpy(text, result->error, result->error_size);
@@ -1694,11 +1695,11 @@ static int translation_reuse_matches(const suite_case *item, const char *isa, co
         const char *found = strstr(line, marker);
         if (found != NULL) {
             const char *name = found + sizeof marker - 1u;
-            kind = strcmp(name, "fork") == 0 ? 1
+            kind = strcmp(name, "fork") == 0     ? 1
                    : strcmp(name, "clone3") == 0 ? 2
                    : strcmp(name, "exec") == 0   ? 3
                    : strcmp(name, "parent") == 0 ? 4
-                                                  : 0;
+                                                 : 0;
             continue;
         }
         found = strstr(line, blocks);
@@ -1725,10 +1726,9 @@ static int translation_reuse_matches(const suite_case *item, const char *isa, co
     fprintf(stderr,
             "matrix-runner: %s [%s] translation reuse parent=%llu noexec_max=%llu budget=%u "
             "exec_max=%llu samples=%u/%u/%u\n",
-            item->name, isa, (unsigned long long)parent, (unsigned long long)noexec_max,
-            REUSE_BLOCK_BUDGET, (unsigned long long)exec_max, fork_count, clone_count, exec_count);
-    return parent != 0 && fork_count == 4 && clone_count == 4 && exec_count == 4 &&
-           noexec_max <= REUSE_BLOCK_BUDGET;
+            item->name, isa, (unsigned long long)parent, (unsigned long long)noexec_max, REUSE_BLOCK_BUDGET,
+            (unsigned long long)exec_max, fork_count, clone_count, exec_count);
+    return parent != 0 && fork_count == 4 && clone_count == 4 && exec_count == 4 && noexec_max <= REUSE_BLOCK_BUDGET;
 }
 
 static void diagnostic(const suite_case *item, const char *isa, const char *reason, const capture *result) {
@@ -1830,9 +1830,9 @@ static int run_one(const suite_case *item, const char *bridge, const char *engin
     }
     /* A bare name is resolved through the guest rootfs PATH without bridge-side path translation. */
     char *saved_log = NULL;
-    int measure_reuse = item->translation_reuse && getenv("HL_MATRIX_TRANSLATION_REUSE") != NULL;
+    int measure_reuse = item->translation_reuse && hl_tool_config_matrix_translation_reuse();
     if (measure_reuse) {
-        const char *current = getenv("HL_LOG");
+        const char *current = hl_tool_config_log_selector();
         if (current != NULL) saved_log = strdup(current);
         if (setenv("HL_LOG", "translate", 1) != 0) {
             free(expected);

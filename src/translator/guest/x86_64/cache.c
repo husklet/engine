@@ -58,7 +58,7 @@
 #include "../../persist.h"
 
 #define PC_MAGIC 0x31304350544a4c48ull // "HLJTPC01" (LE)
-#define PC_VERSION 9 // v9 records the translated-code ABI independently from the file layout.
+#define PC_VERSION 9                   // v9 records the translated-code ABI independently from the file layout.
 #define PC_VERSION_EFF PC_VERSION
 #define PC_TRANSLATOR_ABI HL_PCACHE_ABI_X86_64
 // Fixed guest VA bases (high, reliably free above the kernel-chosen heap/stack and below the dyld shared
@@ -157,8 +157,8 @@ static uint64_t pcache_engine_id(void) {
     h *= 1099511628211ull;
     h ^= PC_TRANSLATOR_ABI;
     h *= 1099511628211ull;
-    modes = (uint64_t)(g_fastsys != 0) | ((uint64_t)(g_fastclk != 0) << 1) |
-            ((uint64_t)(g_siginline != 0) << 2) | ((uint64_t)(slimsys_on() != 0) << 3);
+    modes = (uint64_t)(g_fastsys != 0) | ((uint64_t)(g_fastclk != 0) << 1) | ((uint64_t)(g_siginline != 0) << 2) |
+            ((uint64_t)(slimsys_on() != 0) << 3);
     return hl_identity_configuration(h, 2, HL_HOST_CPU_ISA, modes);
 }
 
@@ -356,12 +356,11 @@ static int pcache_load(uint64_t entry_jump) {
         free(image);
         return 0;
     }
-    if (h.magic != PC_MAGIC ||
-        !hl_pcache_compatible(h.version, h.translator_abi, PC_VERSION_EFF, PC_TRANSLATOR_ABI) ||
-        h.cpu_sz != sizeof(struct cpu) || h.map_n != JIT_MAP_N ||
-        h.ibtc_n != IBTC_N || h.img_base != PC_IMG_BASE || h.interp_base != PC_INTERP_BASE || h.bin_id != g_pc_binid ||
-        h.entry_jump != entry_jump || h.arena_used > CACHE_SZ || h.n_mapent > JIT_MAP_N || h.n_pend > (1u << 16) ||
-        h.n_reloc > PC_RELOC_CAP || h.n_lib > PC_LIB_MAX) { // n_reloc bound tracks the g_reloc cap
+    if (h.magic != PC_MAGIC || !hl_pcache_compatible(h.version, h.translator_abi, PC_VERSION_EFF, PC_TRANSLATOR_ABI) ||
+        h.cpu_sz != sizeof(struct cpu) || h.map_n != JIT_MAP_N || h.ibtc_n != IBTC_N || h.img_base != PC_IMG_BASE ||
+        h.interp_base != PC_INTERP_BASE || h.bin_id != g_pc_binid || h.entry_jump != entry_jump ||
+        h.arena_used > CACHE_SZ || h.n_mapent > JIT_MAP_N || h.n_pend > (1u << 16) || h.n_reloc > PC_RELOC_CAP ||
+        h.n_lib > PC_LIB_MAX) { // n_reloc bound tracks the g_reloc cap
         free(image);
         return 0;
     }

@@ -23,8 +23,7 @@ static void capture_emit(void *context, uint32_t event, const char *message, siz
 #if defined(HL_ENABLE_LOGGING) && HL_ENABLE_LOGGING
 static void report_translations(void *context, uint64_t translations, uint64_t translation_ns) {
     (void)translation_ns;
-    HL_LOGF((hl_log_context *)context, HL_LOG_TAG_TRANSLATE, "blocks=%llu",
-            (unsigned long long)translations);
+    HL_LOGF((hl_log_context *)context, HL_LOG_TAG_TRANSLATE, "blocks=%llu", (unsigned long long)translations);
 }
 #endif
 

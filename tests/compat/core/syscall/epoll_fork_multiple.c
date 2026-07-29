@@ -44,7 +44,6 @@ int main(void) {
 
     int status = 0;
     waitpid(child, &status, 0);
-    printf("epoll_fork_multiple child=%d\n",
-           WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    printf("epoll_fork_multiple child=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 6;
 }

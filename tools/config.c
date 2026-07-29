@@ -23,6 +23,10 @@ int hl_tool_config_github_actions(void) {
     return environment_value("GITHUB_ACTIONS") != NULL;
 }
 
+int hl_tool_config_matrix_translation_reuse(void) {
+    return environment_value("HL_MATRIX_TRANSLATION_REUSE") != NULL;
+}
+
 const char *hl_tool_config_log_selector(void) {
     return environment_value("HL_LOG");
 }

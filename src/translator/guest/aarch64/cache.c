@@ -70,7 +70,7 @@
 // interpreter). Opt in via HL_PCACHE=1.
 
 #define PC_MAGIC 0x34414350544a4c48ull // "HLJTPCA4" (LE tag)
-#define PC_VERSION 10 // v10 records the translated-code ABI independently from the file layout.
+#define PC_VERSION 10                  // v10 records the translated-code ABI independently from the file layout.
 #define PC_VERSION_EFF PC_VERSION
 #define PC_TRANSLATOR_ABI HL_PCACHE_ABI_AARCH64
 #define PC_IMG_BASE 0x0000040000000000ull    // 4 TB -- fixed guest image base (probed free on Apple silicon)
@@ -400,10 +400,8 @@ static int pcache_load(uint64_t entry_jump) {
         free(image);
         return 0;
     }
-    if (h.magic != PC_MAGIC ||
-        !hl_pcache_compatible(h.version, h.translator_abi, PC_VERSION_EFF, PC_TRANSLATOR_ABI) ||
-        h.cpu_sz != sizeof(struct cpu) ||
-        h.jit_map_n != JIT_MAP_N || h.ibtc_n != IBTC_N || h.img_base != PC_IMG_BASE ||
+    if (h.magic != PC_MAGIC || !hl_pcache_compatible(h.version, h.translator_abi, PC_VERSION_EFF, PC_TRANSLATOR_ABI) ||
+        h.cpu_sz != sizeof(struct cpu) || h.jit_map_n != JIT_MAP_N || h.ibtc_n != IBTC_N || h.img_base != PC_IMG_BASE ||
         h.interp_base != PC_INTERP_BASE || h.bin_id != g_pc_binid || h.entry_jump != entry_jump ||
         h.arena_used > CACHE_SZ || (h.arena_used & 3) || h.n_reloc > PC_RELOC_CAP || h.n_mapent > JIT_MAP_N ||
         h.n_pend > (1u << 16) || h.n_t2 > T2_MAX || h.n_txpg > TXPG_N || h.n_prov > PC_PROV_CAP) {

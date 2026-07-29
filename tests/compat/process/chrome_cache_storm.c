@@ -21,18 +21,17 @@
  */
 #define LEAF(n)                                                                                                        \
     __attribute__((noinline)) static uint64_t leaf##n(uint64_t value) {                                                \
-        return (value ^ (UINT64_C(0x9e3779b97f4a7c15) + n)) * (UINT64_C(0x100000001b3) + 2 * n);                     \
+        return (value ^ (UINT64_C(0x9e3779b97f4a7c15) + n)) * (UINT64_C(0x100000001b3) + 2 * n);                       \
     }
-LEAF(0) LEAF(1) LEAF(2) LEAF(3) LEAF(4) LEAF(5) LEAF(6) LEAF(7)
-LEAF(8) LEAF(9) LEAF(10) LEAF(11) LEAF(12) LEAF(13) LEAF(14) LEAF(15)
-LEAF(16) LEAF(17) LEAF(18) LEAF(19) LEAF(20) LEAF(21) LEAF(22) LEAF(23)
-LEAF(24) LEAF(25) LEAF(26) LEAF(27) LEAF(28) LEAF(29) LEAF(30) LEAF(31)
-LEAF(32) LEAF(33) LEAF(34) LEAF(35) LEAF(36) LEAF(37) LEAF(38) LEAF(39)
-LEAF(40) LEAF(41) LEAF(42) LEAF(43) LEAF(44) LEAF(45) LEAF(46) LEAF(47)
-LEAF(48) LEAF(49) LEAF(50) LEAF(51) LEAF(52) LEAF(53) LEAF(54) LEAF(55)
-LEAF(56) LEAF(57) LEAF(58) LEAF(59) LEAF(60) LEAF(61) LEAF(62) LEAF(63)
+LEAF(0)
+LEAF(1) LEAF(2) LEAF(3) LEAF(4) LEAF(5) LEAF(6) LEAF(7) LEAF(8) LEAF(9) LEAF(10) LEAF(11) LEAF(12) LEAF(13) LEAF(14)
+    LEAF(15) LEAF(16) LEAF(17) LEAF(18) LEAF(19) LEAF(20) LEAF(21) LEAF(22) LEAF(23) LEAF(24) LEAF(25) LEAF(26) LEAF(27)
+        LEAF(28) LEAF(29) LEAF(30) LEAF(31) LEAF(32) LEAF(33) LEAF(34) LEAF(35) LEAF(36) LEAF(37) LEAF(38) LEAF(39)
+            LEAF(40) LEAF(41) LEAF(42) LEAF(43) LEAF(44) LEAF(45) LEAF(46) LEAF(47) LEAF(48) LEAF(49) LEAF(50) LEAF(51)
+                LEAF(52) LEAF(53) LEAF(54) LEAF(55) LEAF(56) LEAF(57) LEAF(58) LEAF(59) LEAF(60) LEAF(61) LEAF(62)
+                    LEAF(63)
 
-typedef uint64_t (*leaf_fn)(uint64_t);
+                        typedef uint64_t (*leaf_fn)(uint64_t);
 static leaf_fn const leaves[] = {
     leaf0,  leaf1,  leaf2,  leaf3,  leaf4,  leaf5,  leaf6,  leaf7,  leaf8,  leaf9,  leaf10, leaf11, leaf12,
     leaf13, leaf14, leaf15, leaf16, leaf17, leaf18, leaf19, leaf20, leaf21, leaf22, leaf23, leaf24, leaf25,
@@ -55,7 +54,8 @@ static uint64_t corpus(uint64_t value) {
 static void *spinner(void *argument) {
     uint64_t value = (uintptr_t)argument + 1;
     atomic_fetch_add_explicit(&workers_ready, 1, memory_order_release);
-    while (!atomic_load_explicit(&stop_workers, memory_order_acquire)) value = corpus(value);
+    while (!atomic_load_explicit(&stop_workers, memory_order_acquire))
+        value = corpus(value);
     return (void *)(uintptr_t)(value | 1);
 }
 
@@ -68,8 +68,7 @@ static void *blocked_reader(void *unused) {
 
 static int reap(pid_t child, int expected) {
     int status = 0;
-    return child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) &&
-           WEXITSTATUS(status) == expected;
+    return child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == expected;
 }
 
 static int child_value(int round) {
@@ -83,6 +82,7 @@ static void child_done(const char *kind, int value) {
 
 int main(int argc, char **argv) {
     enum { ROUNDS = 12 };
+
     pthread_t workers[3];
     int made[3] = {0}, reaped = 0, checksum_ok = 1, nested_ok = 0, blocked_ok = 0;
 
@@ -96,7 +96,8 @@ int main(int argc, char **argv) {
         pthread_create(&workers[1], NULL, spinner, (void *)2) != 0 ||
         pthread_create(&workers[2], NULL, blocked_reader, NULL) != 0)
         return 2;
-    while (atomic_load_explicit(&workers_ready, memory_order_acquire) != 3) sched_yield();
+    while (atomic_load_explicit(&workers_ready, memory_order_acquire) != 3)
+        sched_yield();
 
     for (int round = 0; round < ROUNDS; ++round) {
         int kind = round % 3;
@@ -148,10 +149,9 @@ int main(int argc, char **argv) {
     close(blocked_pipe[1]);
 
     dprintf(STDERR_FILENO, "[cache-reuse] kind=parent\n");
-    printf("chrome-cache-storm fork=%d clone3=%d exec=%d reaped=%d checksum=%d nested=%d blocked=%d\n",
-           made[0], made[1], made[2], reaped, checksum_ok, nested_ok, blocked_ok);
-    return made[0] == 4 && made[1] == 4 && made[2] == 4 && reaped == ROUNDS && checksum_ok && nested_ok &&
-                   blocked_ok
+    printf("chrome-cache-storm fork=%d clone3=%d exec=%d reaped=%d checksum=%d nested=%d blocked=%d\n", made[0],
+           made[1], made[2], reaped, checksum_ok, nested_ok, blocked_ok);
+    return made[0] == 4 && made[1] == 4 && made[2] == 4 && reaped == ROUNDS && checksum_ok && nested_ok && blocked_ok
                ? 0
                : 3;
 }

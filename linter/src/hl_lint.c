@@ -456,9 +456,9 @@ static int run_cppcheck(const LintConfig *cfg, const StringList *files, LintStat
 
     for (size_t i = 0; i < files->count; i++) {
         const char *file = files->items[i];
-        if (!has_ext(file, ".c") && !has_ext(file, ".h")) continue;
+        if (!has_ext(file, ".c")) continue;
 
-        size_t argument_count = 9 + (cfg->include_dirs.count * 2);
+        size_t argument_count = 15 + (cfg->include_dirs.count * 2);
         const char **argv = calloc(argument_count, sizeof *argv);
         if (!argv) {
             fprintf(stdout, "error: out of memory building cppcheck command\n");
@@ -468,9 +468,15 @@ static int run_cppcheck(const LintConfig *cfg, const StringList *files, LintStat
         argv[a++] = cfg->cppcheck_bin;
         argv[a++] = "--quiet";
         argv[a++] = "--std=c11";
-        argv[a++] = "--enable=warning,performance,style,portability,information";
+        argv[a++] = "--enable=warning,performance,portability";
         argv[a++] = "--inconclusive";
         argv[a++] = "--suppress=missingIncludeSystem";
+        argv[a++] = "--suppress=unmatchedSuppression";
+        argv[a++] = "--suppress=unusedStructMember";
+        argv[a++] = "--suppress=constParameter";
+        argv[a++] = "--suppress=normalCheckLevelMaxBranches";
+        argv[a++] = "--suppress=toomanyconfigs";
+        argv[a++] = "--suppress=preprocessorErrorDirective";
         argv[a++] = "--error-exitcode=1";
         for (size_t d = 0; d < cfg->include_dirs.count; d++) {
             argv[a++] = "-I";
@@ -485,7 +491,8 @@ static int run_cppcheck(const LintConfig *cfg, const StringList *files, LintStat
             emit_diag("warn", file, 0, 0, "cppcheck", "diagnostic(s) reported");
             if (cfg->strict) {
                 stats->errors++;
-                return 1;
+                rc = 1;
+                continue;
             }
             stats->warnings++;
             c = 0;

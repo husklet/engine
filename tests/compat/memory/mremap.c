@@ -23,7 +23,10 @@ int main(void) {
     // shrink back
     char *m3 = grown ? mremap(m2, big, old, 0) : MAP_FAILED;
     int shrunk = m3 != MAP_FAILED;
-    if (shrunk) munmap(m3, old); else if (grown) munmap(m2, big);
+    if (shrunk)
+        munmap(m3, old);
+    else if (grown)
+        munmap(m2, big);
 
     // A grow that fits inside an implementation's reserved tail still changes
     // the guest VMA length. Unmapping the grown length must release the whole
@@ -40,7 +43,7 @@ int main(void) {
     } else if (u != MAP_FAILED) {
         munmap(u, old);
     }
-    printf("mremap grown=%d preserved=%d tail_zero=%d tail_wr=%d shrunk=%d released=%d\n",
-           grown, preserved, tail_zero, tail_wr, shrunk, released);
+    printf("mremap grown=%d preserved=%d tail_zero=%d tail_wr=%d shrunk=%d released=%d\n", grown, preserved, tail_zero,
+           tail_wr, shrunk, released);
     return 0;
 }

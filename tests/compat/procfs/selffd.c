@@ -46,7 +46,10 @@ static int link_of(int fd, char *out, int cap) {
 int main(void) {
     char path[] = "/tmp/selffd_probe.XXXXXX";
     int fd = mkstemp(path);
-    if (fd < 0) { printf("selffd ok=0\n"); return 0; }
+    if (fd < 0) {
+        printf("selffd ok=0\n");
+        return 0;
+    }
     int before = fd_count();
     char link[4096];
     int file_link_ok = link_of(fd, link, sizeof link) && strcmp(link, path) == 0;

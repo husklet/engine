@@ -7,16 +7,7 @@
 #include <unistd.h>
 #include <string.h>
 
-enum {
-    OP_OPEN = 1,
-    OP_READ = 2,
-    OP_WRITE = 3,
-    OP_SEEK = 4,
-    OP_STAT = 5,
-    OP_POLL = 6,
-    OP_CLOSE = 7,
-    OP_IOCTL = 8
-};
+enum { OP_OPEN = 1, OP_READ = 2, OP_WRITE = 3, OP_SEEK = 4, OP_STAT = 5, OP_POLL = 6, OP_CLOSE = 7, OP_IOCTL = 8 };
 
 static const hl_host_file_services *underlying;
 static hl_host_file_services composite;
@@ -179,16 +170,14 @@ void hl_provider_files_ioctl_result_destroy(hl_provider_ioctl_result *result) {
     result->write_count = 0;
 }
 
-hl_host_result hl_provider_files_ioctl(hl_host_handle handle, uint64_t command,
-                                       unsigned char *argument, uint32_t size,
+hl_host_result hl_provider_files_ioctl(hl_host_handle handle, uint64_t command, unsigned char *argument, uint32_t size,
                                        hl_provider_ioctl_result *output) {
     unsigned char *payload;
     hl_provider_reply reply;
     hl_host_result result;
     uint64_t id;
     uint32_t reply_size, write_count, offset, transferred;
-    if (output == NULL || size > 16384 || (size != 0 && argument == NULL))
-        return failure(EINVAL);
+    if (output == NULL || size > 16384 || (size != 0 && argument == NULL)) return failure(EINVAL);
     memset(output, 0, sizeof(*output));
     if (remote(handle, &id) != 0) return failure(EBADF);
     payload = malloc(21u + size);
@@ -225,8 +214,7 @@ hl_host_result hl_provider_files_ioctl(hl_host_handle handle, uint64_t command,
         output->writes[i].address = get64(reply.bytes + offset);
         write_size = get32(reply.bytes + offset + 8);
         offset += 12;
-        if (write_size > 16384u - transferred || reply.size - offset < write_size)
-            goto malformed;
+        if (write_size > 16384u - transferred || reply.size - offset < write_size) goto malformed;
         output->writes[i].bytes = write_size == 0 ? NULL : malloc(write_size);
         if (write_size != 0 && output->writes[i].bytes == NULL) {
             output->write_count = i;
@@ -234,8 +222,7 @@ hl_host_result hl_provider_files_ioctl(hl_host_handle handle, uint64_t command,
             hl_provider_reply_destroy(&reply);
             return failure(ENOMEM);
         }
-        if (write_size != 0)
-            memcpy(output->writes[i].bytes, reply.bytes + offset, write_size);
+        if (write_size != 0) memcpy(output->writes[i].bytes, reply.bytes + offset, write_size);
         output->writes[i].size = write_size;
         output->write_count = i + 1;
         transferred += write_size;

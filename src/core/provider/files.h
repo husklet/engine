@@ -23,8 +23,7 @@ typedef struct hl_provider_ioctl_result {
     uint32_t write_count;
 } hl_provider_ioctl_result;
 
-hl_host_result hl_provider_files_ioctl(hl_host_handle handle, uint64_t command,
-                                       unsigned char *argument, uint32_t size,
+hl_host_result hl_provider_files_ioctl(hl_host_handle handle, uint64_t command, unsigned char *argument, uint32_t size,
                                        hl_provider_ioctl_result *output);
 void hl_provider_files_ioctl_result_destroy(hl_provider_ioctl_result *result);
 uint32_t hl_provider_files_readiness(hl_host_handle handle, uint32_t interests);
