@@ -902,6 +902,15 @@ static const char *scratch_root(void) {
     return root;
 }
 
+static int path_with_suffix(char *path, size_t capacity, const char *base, const char *suffix) {
+    size_t base_size = strlen(base);
+    size_t suffix_size = strlen(suffix);
+    if (base_size >= capacity || suffix_size >= capacity - base_size) return -1;
+    memcpy(path, base, base_size);
+    memcpy(path + base_size, suffix, suffix_size + 1);
+    return 0;
+}
+
 static void scratch_cleanup(void) {
     if (g_scratch_root[0] == '\0') return;
     (void)nftw(g_scratch_root, scratch_remove_entry, 16, FTW_DEPTH | FTW_PHYS);
@@ -1098,9 +1107,12 @@ int main(int argc, char **argv) {
     snprintf(g_scratch_root, sizeof g_scratch_root, "%s", temporary);
     atexit(scratch_cleanup);
     if (getenv("HL_KEEP_CHECKPOINT_FIXTURE")) g_scratch_root[0] = '\0';
-    snprintf(output, sizeof output, "%s/release.output", temporary);
-    snprintf(release, sizeof release, "%s/release", temporary);
-    snprintf(release_error, sizeof release_error, "%s.error", release);
+    if (path_with_suffix(output, sizeof output, temporary, "/release.output") != 0 ||
+        path_with_suffix(release, sizeof release, temporary, "/release") != 0 ||
+        path_with_suffix(release_error, sizeof release_error, release, ".error") != 0) {
+        fprintf(stderr, "checkpoint runner: scratch child path under %s does not fit\n", temporary);
+        return 2;
+    }
 
     if (store_channel_open() != 0) return 2;
     /* Three launches and two captures, none of which fit the single-capture flow below. */
