@@ -4,7 +4,24 @@
 
 #include "../../src/translator/guest/x86_64/address.h"
 
-enum operation { ADDI, SUBI, MOVC, ADDR, LSR, MOVR, MOVZ, UXT, LCPU, LSCALED, LUNSCALED, LOAD, GUARD, BRANCH, PATCH };
+enum operation {
+    ADDI,
+    SUBI,
+    MOVC,
+    ADDR,
+    LSR,
+    MOVR,
+    MOVZ,
+    UXT,
+    LCPU,
+    LSCALED,
+    LUNSCALED,
+    LOAD,
+    RECORD,
+    GUARD,
+    BRANCH,
+    PATCH
+};
 
 typedef struct address_event {
     enum operation operation;
@@ -116,6 +133,12 @@ static void load(void *c, int w, int t, int n) {
     e->c = n;
 }
 
+static void record_guest(void *c, int r, int rip_relative) {
+    address_event *e = record(c, RECORD);
+    e->a = r;
+    e->b = rip_relative;
+}
+
 static void guard(void *c, int r, uint64_t s, uint64_t p) {
     address_event *e = record(c, GUARD);
     e->a = r;
@@ -134,8 +157,8 @@ static void patch(void *c, uintptr_t p, int r) {
     e->a = r;
 }
 
-static const hl_x86_address_emitter emitter = {addi, subi,    movc,      addr, lsr,   movr,   movz, uxt,
-                                               lcpu, lscaled, lunscaled, load, guard, branch, patch};
+static const hl_x86_address_emitter emitter = {addi, subi,    movc,      addr, lsr,          movr,  movz,   uxt,
+                                               lcpu, lscaled, lunscaled, load, record_guest, guard, branch, patch};
 
 static hl_x86_address_state state(address_capture *capture) {
     hl_x86_address_state state = {capture, &emitter, 0, 0, 0, 64, 72, 1, 0};
@@ -190,9 +213,19 @@ int main(void) {
     insn.m_hasbase = 1;
     insn.m_base = 2;
     hl_x86_address_emit(&s, &insn, 100, 1);
-    HL_CHECK(capture.count == 6 && capture.events[1].operation == LSR && capture.events[2].operation == BRANCH &&
-             capture.events[3].operation == MOVC && capture.events[4].operation == ADDR);
-    HL_CHECK(capture.events[5].operation == PATCH);
+    HL_CHECK(capture.count == 7 && capture.events[1].operation == RECORD && capture.events[1].a == 17 &&
+             capture.events[1].b == 0 && capture.events[2].operation == LSR && capture.events[3].operation == BRANCH &&
+             capture.events[4].operation == MOVC && capture.events[5].operation == ADDR);
+    HL_CHECK(capture.events[6].operation == PATCH);
+
+    s = state(&capture);
+    s.nonpie_lo = 0x400000;
+    s.nonpie_hi = 0x500000;
+    s.nonpie_bias = 0x100000000;
+    insn = (hl_x86_insn){.rip_rel = 1, .disp = 8, .len = 5};
+    hl_x86_address_emit(&s, &insn, 100, 1);
+    HL_CHECK(capture.count == 7 && capture.events[1].operation == RECORD && capture.events[1].a == 17 &&
+             capture.events[1].b == 1);
 
     s = state(&capture);
     insn = (hl_x86_insn){.m_hasbase = 1, .m_base = 6, .disp = 32, .len = 5};
