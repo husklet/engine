@@ -62,6 +62,7 @@ int main(void) {
         HL_CHECK((cpu.fptop & HL_X87_ARMED) != 0);
         HL_CHECK(!hl_x87_phys_empty(cpu.fptop, 3));
         HL_CHECK(hl_x87_phys_empty(cpu.fptop, 4));
+        HL_CHECK(hl_x87_abridged_tag(cpu.fptop) == 0x08);
     }
     {
         // The tag bits: FXSAVE's abridged byte is PHYSICAL (bit i = st[i] live) and FXRSTOR brings it back,
