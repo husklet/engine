@@ -1229,6 +1229,13 @@ static int reserve_control_descriptors(int pair[2]) {
     }
     return 0;
 }
+
+#if defined(__APPLE__)
+static int activation_inherit_stream(posix_spawn_file_actions_t *actions, int descriptor) {
+    if (fcntl(descriptor, F_GETFD) >= 0) return posix_spawn_file_actions_addinherit_np(actions, descriptor);
+    return errno == EBADF ? 0 : -1;
+}
+#endif
 #endif /* !_WIN32 */
 
 static void cache_failure(hl_activation_process *process, hl_status status) {
@@ -1474,9 +1481,9 @@ static hl_status activation_start(const char *executable, uint32_t guest_isa, co
      * untouched standard streams; dup2 actions already name redirected ones.
      */
     spawn_flags |= POSIX_SPAWN_CLOEXEC_DEFAULT;
-    if (((stdio == NULL || stdio->input < 0) && posix_spawn_file_actions_addinherit_np(&actions, 0) != 0) ||
-        ((stdio == NULL || stdio->output < 0) && posix_spawn_file_actions_addinherit_np(&actions, 1) != 0) ||
-        ((stdio == NULL || stdio->error < 0) && posix_spawn_file_actions_addinherit_np(&actions, 2) != 0)) {
+    if (((stdio == NULL || stdio->input < 0) && activation_inherit_stream(&actions, STDIN_FILENO) != 0) ||
+        ((stdio == NULL || stdio->output < 0) && activation_inherit_stream(&actions, STDOUT_FILENO) != 0) ||
+        ((stdio == NULL || stdio->error < 0) && activation_inherit_stream(&actions, STDERR_FILENO) != 0)) {
         posix_spawnattr_destroy(&attributes);
         posix_spawn_file_actions_destroy(&actions);
         close(pair[0]);

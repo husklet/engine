@@ -162,11 +162,22 @@ static int reject_without_launch(const char *executable, const char *guest, uint
     hl_engine_exit result = {.abi = HL_ENGINE_ABI, .size = sizeof(result)};
     char config_path[64];
     hl_status status;
+    int config_preserved;
     if (make_config(guest, config_path) != 0) return 1;
     hl_activation_test_mode(mode);
     status = hl_activation_spawn(executable, HL_GUEST_ISA_AARCH64, config_path, &result);
-    if (status != HL_STATUS_CORRUPT || access(config_path, F_OK) != 0) return 1;
-    return unlink(config_path) != 0;
+    config_preserved = access(config_path, F_OK) == 0;
+    if (status != HL_STATUS_CORRUPT || !config_preserved) {
+        fprintf(stderr, "dual backend: rejection mode=%u status=%d config_preserved=%d\n", mode, status,
+                config_preserved);
+        if (config_preserved) (void)unlink(config_path);
+        return 1;
+    }
+    if (unlink(config_path) != 0) {
+        fprintf(stderr, "dual backend: rejection mode=%u cleanup errno=%d\n", mode, errno);
+        return 1;
+    }
+    return 0;
 }
 
 static int closed_stdio_one(const char *executable, const char *guest) {
@@ -191,7 +202,12 @@ static int closed_stdio_one(const char *executable, const char *guest) {
     while (waitpid(child, &waited, 0) < 0) {
         if (errno != EINTR) return 1;
     }
-    return !WIFEXITED(waited) || WEXITSTATUS(waited) != 0;
+    if (!WIFEXITED(waited) || WEXITSTATUS(waited) != 0) {
+        fprintf(stderr, "dual backend: closed stdio child status=%d exited=%d code=%d\n", waited, WIFEXITED(waited),
+                WIFEXITED(waited) ? WEXITSTATUS(waited) : -1);
+        return 1;
+    }
+    return 0;
 }
 
 static int corrupt_wait_one(const char *executable, const char *guest) {
@@ -213,20 +229,39 @@ static int corrupt_wait_one(const char *executable, const char *guest) {
 
 int main(int argc, char **argv) {
     struct sigaction pipe_default = {.sa_handler = SIG_DFL};
+    hl_status status;
     if (argc != 7) {
         fprintf(stderr, "usage: dual-backend-e2e A64_EXIT42 X86_EXIT42 A64_EXIT70 X86_EXIT70 A64_SPIN A64_OUTPUT\n");
         return 64;
     }
     if (!handlers_unchanged()) return 65;
     if (sigemptyset(&pipe_default.sa_mask) != 0 || sigaction(SIGPIPE, &pipe_default, NULL) != 0) return 65;
-    if (reject_without_launch(argv[0], argv[1], 1) || reject_without_launch(argv[0], argv[1], 2) ||
-        reject_without_launch(argv[0], argv[1], 3) || reject_without_launch(argv[0], argv[1], 4) ||
-        hl_activation_spawn(argv[0], HL_GUEST_ISA_AARCH64, argv[1], NULL) != HL_STATUS_INVALID_ARGUMENT)
+    for (uint32_t mode = 1; mode <= 4; ++mode)
+        if (reject_without_launch(argv[0], argv[1], mode)) return 66;
+    status = hl_activation_spawn(argv[0], HL_GUEST_ISA_AARCH64, argv[1], NULL);
+    if (status != HL_STATUS_INVALID_ARGUMENT) {
+        fprintf(stderr, "dual backend: null result status=%d\n", status);
         return 66;
-    if (run_one(argv[0], HL_GUEST_ISA_AARCH64, argv[1], 42) || run_one(argv[0], HL_GUEST_ISA_X86_64, argv[2], 42) ||
-        run_one(argv[0], HL_GUEST_ISA_AARCH64, argv[3], 70) || run_one(argv[0], HL_GUEST_ISA_X86_64, argv[4], 70) ||
-        kill_one(argv[0], argv[5]) || pipe_one(argv[0], argv[6]) || closed_stdio_one(argv[0], argv[1]) ||
-        corrupt_wait_one(argv[0], argv[1]))
+    }
+    if (run_one(argv[0], HL_GUEST_ISA_AARCH64, argv[1], 42)) return 71;
+    if (run_one(argv[0], HL_GUEST_ISA_X86_64, argv[2], 42)) return 71;
+    if (run_one(argv[0], HL_GUEST_ISA_AARCH64, argv[3], 70)) return 71;
+    if (run_one(argv[0], HL_GUEST_ISA_X86_64, argv[4], 70)) return 71;
+    if (kill_one(argv[0], argv[5])) {
+        fprintf(stderr, "dual backend: kill lifecycle failed\n");
         return 71;
+    }
+    if (pipe_one(argv[0], argv[6])) {
+        fprintf(stderr, "dual backend: redirected output failed\n");
+        return 71;
+    }
+    if (closed_stdio_one(argv[0], argv[1])) {
+        fprintf(stderr, "dual backend: closed stdio failed\n");
+        return 71;
+    }
+    if (corrupt_wait_one(argv[0], argv[1])) {
+        fprintf(stderr, "dual backend: corrupt wait failed\n");
+        return 71;
+    }
     return 0;
 }
