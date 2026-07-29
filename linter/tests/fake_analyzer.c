@@ -17,6 +17,14 @@ static const char *value_after(int argc, char **argv, const char *option) {
     return NULL;
 }
 
+static const char *value_with_prefix(int argc, char **argv, const char *prefix) {
+    size_t length = strlen(prefix);
+    for (int i = 1; i < argc; ++i) {
+        if (strncmp(argv[i], prefix, length) == 0) return argv[i] + length;
+    }
+    return NULL;
+}
+
 static bool is_directory(const char *path) {
     struct stat info;
     return path && stat(path, &info) == 0 && S_ISDIR(info.st_mode);
@@ -51,9 +59,9 @@ static int check_clang_tidy(int argc, char **argv) {
 }
 
 static int check_cppcheck(int argc, char **argv) {
-    const char *include_dir = value_after(argc, argv, "-I");
-    if (!is_directory(include_dir)) {
-        fputs("fake-analyzer: cppcheck include directory missing\n", stderr);
+    const char *project = value_with_prefix(argc, argv, "--project=");
+    if (!is_regular_file(project)) {
+        fputs("fake-analyzer: cppcheck compile database missing\n", stderr);
         return 2;
     }
     if (!has_arg(argc, argv, "--std=c11") || !has_arg(argc, argv, "--error-exitcode=1") ||
@@ -61,16 +69,10 @@ static int check_cppcheck(int argc, char **argv) {
         !has_arg(argc, argv, "--suppress=unusedStructMember") || !has_arg(argc, argv, "--suppress=constParameter") ||
         !has_arg(argc, argv, "--suppress=normalCheckLevelMaxBranches") ||
         !has_arg(argc, argv, "--suppress=toomanyconfigs") ||
-        !has_arg(argc, argv, "--suppress=preprocessorErrorDirective") ||
-        has_arg(argc, argv, "2>&1")) {
+        !has_arg(argc, argv, "--suppress=preprocessorErrorDirective") || has_arg(argc, argv, "2>&1")) {
         fputs("fake-analyzer: cppcheck argument corruption\n", stderr);
         return 2;
     }
-    if (argc < 2 || !is_regular_file(argv[argc - 1])) {
-        fputs("fake-analyzer: cppcheck source argument missing\n", stderr);
-        return 2;
-    }
-
     puts("fake-analyzer: cppcheck argv ok");
     return 0;
 }

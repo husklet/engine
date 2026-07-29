@@ -572,8 +572,8 @@ hl_status hl_linux_inotify_export(hl_linux_abi *linux_abi, hl_linux_fd fd, void 
 int64_t hl_linux_inotify_import_at(hl_linux_abi *linux_abi, hl_linux_fd requested,
                                    const hl_linux_inotify_provider_ops *provider, void *provider_context,
                                    uint32_t descriptor_flags, uint32_t status_flags, const void *buffer, size_t size) {
-    const unsigned char *cursor = buffer;
-    const unsigned char *end = cursor + size;
+    const unsigned char *cursor;
+    const unsigned char *end;
     inotify_image_header header;
     inotify_object *object = NULL;
     uint32_t index;
@@ -583,6 +583,8 @@ int64_t hl_linux_inotify_import_at(hl_linux_abi *linux_abi, hl_linux_fd requeste
         provider->wait_handle == NULL || provider->readiness == NULL || provider->clone == NULL ||
         provider->close == NULL)
         goto fail_provider;
+    cursor = buffer;
+    end = cursor + size;
     memcpy(&header, cursor, sizeof(header));
     cursor += sizeof(header);
     if (header.magic != INOTIFY_IMAGE_MAGIC || header.version != INOTIFY_IMAGE_VERSION || header.next_wd <= 0 ||

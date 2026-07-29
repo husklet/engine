@@ -4,10 +4,10 @@
 #include <string.h>
 
 static void uname_field(char destination[65], const char *source) {
-    size_t length = 0;
-    while (length < 64u && source[length] != 0)
-        length++;
+    size_t length = strlen(source);
+    if (length > 64u) length = 64u;
     memcpy(destination, source, length);
+    destination[length] = 0;
 }
 
 int hl_linux_misc_dispatch(hl_linux_misc_context *context, uint64_t number, const uint64_t arguments[6],

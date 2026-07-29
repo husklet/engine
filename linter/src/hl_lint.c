@@ -442,7 +442,7 @@ static int run_clang_tidy(const LintConfig *cfg, const StringList *files, LintSt
 }
 
 static int run_cppcheck(const LintConfig *cfg, const StringList *files, LintStats *stats) {
-    int rc = 0;
+    (void)files;
     if (!cfg->run_cppcheck) return 0;
     if (!cfg->cppcheck_bin) {
         if (cfg->strict) {
@@ -454,52 +454,39 @@ static int run_cppcheck(const LintConfig *cfg, const StringList *files, LintStat
         return 0;
     }
 
-    for (size_t i = 0; i < files->count; i++) {
-        const char *file = files->items[i];
-        if (!has_ext(file, ".c")) continue;
-
-        size_t argument_count = 15 + (cfg->include_dirs.count * 2);
-        const char **argv = calloc(argument_count, sizeof *argv);
-        if (!argv) {
-            fprintf(stdout, "error: out of memory building cppcheck command\n");
-            return 1;
-        }
-        size_t a = 0;
-        argv[a++] = cfg->cppcheck_bin;
-        argv[a++] = "--quiet";
-        argv[a++] = "--std=c11";
-        argv[a++] = "--enable=warning,performance,portability";
-        argv[a++] = "--inconclusive";
-        argv[a++] = "--suppress=missingIncludeSystem";
-        argv[a++] = "--suppress=unmatchedSuppression";
-        argv[a++] = "--suppress=unusedStructMember";
-        argv[a++] = "--suppress=constParameter";
-        argv[a++] = "--suppress=normalCheckLevelMaxBranches";
-        argv[a++] = "--suppress=toomanyconfigs";
-        argv[a++] = "--suppress=preprocessorErrorDirective";
-        argv[a++] = "--error-exitcode=1";
-        for (size_t d = 0; d < cfg->include_dirs.count; d++) {
-            argv[a++] = "-I";
-            argv[a++] = cfg->include_dirs.items[d];
-        }
-        argv[a++] = file;
-        argv[a] = NULL;
-
-        int c = run_command_argv("cppcheck", argv, cfg->strict, stats);
-        free(argv);
-        if (c != 0) {
-            emit_diag("warn", file, 0, 0, "cppcheck", "diagnostic(s) reported");
-            if (cfg->strict) {
-                stats->errors++;
-                rc = 1;
-                continue;
-            }
-            stats->warnings++;
-            c = 0;
-        }
-        rc = (rc != 0) ? rc : c;
+    char *project = cfg->compile_db_dir ? xdup_format("--project=%s/compile_commands.json", cfg->compile_db_dir) : NULL;
+    if (!project) {
+        fprintf(stdout, "error: cppcheck requires a compile commands directory\n");
+        stats->errors++;
+        return 1;
     }
-    return rc;
+    const char *argv[] = {
+        cfg->cppcheck_bin,
+        "--quiet",
+        "--std=c11",
+        "--enable=warning,performance,portability",
+        "--inconclusive",
+        "--suppress=missingIncludeSystem",
+        "--suppress=unmatchedSuppression",
+        "--suppress=unusedStructMember",
+        "--suppress=constParameter",
+        "--suppress=normalCheckLevelMaxBranches",
+        "--suppress=toomanyconfigs",
+        "--suppress=preprocessorErrorDirective",
+        "--error-exitcode=1",
+        project,
+        NULL,
+    };
+    int rc = run_command_argv("cppcheck", argv, cfg->strict, stats);
+    free(project);
+    if (rc == 0) return 0;
+    emit_diag("warn", cfg->compile_db_dir, 0, 0, "cppcheck", "diagnostic(s) reported");
+    if (cfg->strict) {
+        stats->errors++;
+        return 1;
+    }
+    stats->warnings++;
+    return 0;
 }
 
 static bool word_starts_token(const char *line, const char *found, size_t len) {

@@ -263,7 +263,7 @@ static int hl_engine_limits_valid(const char *spec) {
 static int hl_engine_identity_valid(const char *value, size_t maximum) {
     size_t index = 0;
     if (value == NULL) return 1;
-    while (value[index] != 0 && index < maximum) {
+    while (index < maximum && value[index] != 0) {
         unsigned char c = (unsigned char)value[index++];
         if (!hl_engine_name_continue(c) && c != '-' && c != '.') return 0;
     }
