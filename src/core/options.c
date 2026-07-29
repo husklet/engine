@@ -54,6 +54,7 @@ static const hl_option_definition hl_option_definitions[] = {
     HL_LAUNCH_OPTION("HL_PCACHE_DIR", "persistent translated-code cache storage", HL_OPTION_PATH),
     HL_LAUNCH_OPTION("HL_PIDS_MAX", "guest process limit", HL_OPTION_INTEGER),
     HL_LAUNCH_OPTION("HL_PROCESS_DOMAIN", "opaque launch process ownership identity", HL_OPTION_TEXT),
+    HL_LAUNCH_OPTION("HL_LAUNCH_DOMAIN", "activation-private process tree identity", HL_OPTION_TEXT),
     HL_LAUNCH_OPTION("HL_PUBLISH", "guest-to-host port publication rules", HL_OPTION_RECORDS),
     HL_LAUNCH_OPTION("HL_PUBLISH_DAEMON", "host daemon publishes guest ports", HL_OPTION_FLAG),
     HL_LAUNCH_OPTION("HL_RESTORE", "restore the image held by the store channel", HL_OPTION_FLAG),

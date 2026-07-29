@@ -325,6 +325,7 @@ static hl_provider_client activation_provider_client;
 static pthread_mutex_t activation_engine_lock = PTHREAD_MUTEX_INITIALIZER;
 static int activation_signal_pipe[2] = {-1, -1};
 static uint32_t activation_pending_signal;
+static hl_process_domain activation_launch_domain;
 
 /*
  * The activation constructor is the first engine code in the exec'd child.
@@ -534,7 +535,15 @@ static int activation_run_config(const char *rootfs, const char *executable_host
     hl_engine *engine = NULL;
     uint32_t count = 0;
     uint32_t stream;
+    char launch_domain[33];
     (void)result_path;
+    snprintf(launch_domain, sizeof launch_domain, "%016llx%016llx",
+             (unsigned long long)activation_launch_domain.identity[0],
+             (unsigned long long)activation_launch_domain.identity[1]);
+    if (hl_option_set("HL_LAUNCH_DOMAIN", launch_domain, 1) != 0) {
+        activation_status = HL_STATUS_OUT_OF_MEMORY;
+        return 78;
+    }
     for (stream = 0; stream < 3; ++stream) {
         hl_host_result adopted = activation_services->file->standard_stream(activation_services->context, stream);
         uint32_t access;
@@ -708,6 +717,8 @@ static void hl_activation_child(void) {
         if (checkpoint_descriptor >= 0) hl_ckpt_channel_publish(checkpoint_descriptor);
         if (trigger_descriptor >= 0) hl_ckpt_trigger_publish(trigger_descriptor);
     }
+    activation_launch_domain.identity[0] = request.nonce[0];
+    activation_launch_domain.identity[1] = request.nonce[1];
     reply.magic = HL_ACTIVATION_MAGIC;
     reply.abi = HL_ACTIVATION_ABI;
     reply.size = sizeof(reply);
@@ -803,8 +814,10 @@ struct hl_activation_process {
 #endif
     uint64_t nonce[2];
     uint32_t finished;
+    uint32_t kill_requested;
     hl_status final_status;
     hl_engine_exit final_exit;
+    hl_process_domain launch_domain;
 #if defined(_WIN32)
     /* `job` is this activation's kill(-pid, SIGKILL): every descendant of the
      * engine child is in it, including one that changed process group, which a
@@ -1568,6 +1581,8 @@ spawned:
     }
     process->descriptor = pair[0];
     process->pid = child;
+    process->launch_domain.identity[0] = request.nonce[0];
+    process->launch_domain.identity[1] = request.nonce[1];
     memcpy(process->nonce, request.nonce, sizeof(process->nonce));
     if (out_master != NULL) *out_master = master;
     *out_process = process;
@@ -2216,7 +2231,17 @@ hl_status hl_activation_kill(hl_activation_process *process) {
     return TerminateJobObject((HANDLE)process->job, HL_ACTIVATION_WINDOWS_KILL_CODE) ? HL_STATUS_OK
                                                                                      : HL_STATUS_PLATFORM_FAILURE;
 #else
-    return kill(-process->pid, SIGKILL) == 0 ? HL_STATUS_OK : HL_STATUS_PLATFORM_FAILURE;
+    /*
+     * The process group is only the immediate stop mechanism. A guest may
+     * legitimately leave it with setsid(2); every guest fork is also published
+     * in this activation's private launch domain, which is the durable tree
+     * identity across setsid, exec, and reparenting.
+     */
+    if (!process->kill_requested) {
+        if (kill(-process->pid, SIGKILL) != 0 && errno != ESRCH) return HL_STATUS_PLATFORM_FAILURE;
+        process->kill_requested = 1;
+    }
+    return hl_activation_domain_terminate(process->launch_domain);
 #endif
 }
 

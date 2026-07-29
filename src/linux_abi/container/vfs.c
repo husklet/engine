@@ -3611,6 +3611,42 @@ static void proc_reg_key(char *out, size_t n) {
     snprintf(out, n, "/tmp/.hl-pids.s%d", (int)getsid(0));
 }
 
+/*
+ * One activation may share HL_PROCESS_DOMAIN with other launches in the same
+ * container. HL_LAUNCH_DOMAIN is its narrower, activation-owned tree identity.
+ * Membership is a birth record only: /proc presentation continues to use the
+ * container registry, while activation teardown needs only a PID-reuse-safe
+ * list of processes to terminate.
+ */
+static int launch_reg_key(char *out, size_t n) {
+    const char *key = hl_option_get("HL_LAUNCH_DOMAIN");
+    size_t index;
+    if (!key || strlen(key) != 32) return 0;
+    for (index = 0; index < 32; ++index)
+        if (!((key[index] >= '0' && key[index] <= '9') || (key[index] >= 'a' && key[index] <= 'f'))) return 0;
+    snprintf(out, n, "/tmp/.hl-domain.%s", key);
+    return 1;
+}
+
+static char g_launch_reg_birth_file[160];
+
+static void launch_reg_publish(int hostpid, int remember) {
+    char dir[80], birth[32], path[160];
+    hl_host_process_info process;
+    if (hostpid <= 0 || !launch_reg_key(dir, sizeof dir) || !hl_host_process_read(hostpid, &process)) return;
+    hl_compat_mkdir(dir, 0777);
+    int size = snprintf(birth, sizeof birth, "%llu\n", (unsigned long long)process.start_time_ns);
+    snprintf(path, sizeof path, "%s/b%d", dir, hostpid);
+    if (size > 0 && hl_host_file_store(&g_jit_services, path, 0600, birth, (size_t)size) == 0 && remember)
+        snprintf(g_launch_reg_birth_file, sizeof g_launch_reg_birth_file, "%s", path);
+}
+
+static void launch_reg_unlink(void) {
+    if (!g_launch_reg_birth_file[0]) return;
+    (void)hl_host_file_unlink(&g_jit_services, g_launch_reg_birth_file);
+    g_launch_reg_birth_file[0] = 0;
+}
+
 // This process's own registry file (unlinked on exit; the exit_group path calls proc_reg_unlink since
 // _exit bypasses atexit). Stale files from a crash are pruned lazily by the enumerator (dead-pid check).
 static char g_reg_file[128];
@@ -3621,6 +3657,7 @@ static int g_reg_last_len;
 static char g_reg_last_exe[4200];
 
 static void proc_reg_unlink(void) {
+    launch_reg_unlink();
     if (g_reg_file[0]) {
         (void)hl_host_file_unlink(&g_jit_services, g_reg_file);
         g_reg_file[0] = 0;
@@ -3675,6 +3712,7 @@ static void proc_reg_write_files(const char *dir, const char *buf, int len, cons
 // Publish THIS process's guest identity: "<comm>\n" then the full argv NUL-separated. Written to a temp
 // name + renamed for an atomic publish. Called at startup and after each guest execve (comm changes).
 static void proc_reg_publish(const char *exe, int argc, char *const argv[]) {
+    launch_reg_publish((int)getpid(), 1);
     if (!g_init_hostpid) return; // process table is a container feature
     char dir[80];
     proc_reg_key(dir, sizeof dir);
@@ -3717,6 +3755,8 @@ static void proc_reg_publish(const char *exe, int argc, char *const argv[]) {
 }
 
 static void proc_reg_after_fork(void) {
+    g_launch_reg_birth_file[0] = 0;
+    launch_reg_publish((int)getpid(), 1);
     if (!g_init_hostpid) return;
     // A fork child inherits the parent's g_reg_file paths. Clear them before publishing, otherwise the
     // child's exit_group cleanup can unlink the parent's /proc registry entry.
@@ -4375,6 +4415,7 @@ static int container_gpid_member(int gp, int *hostout) {
 // container mode. Closes the fork-window race where a strict membership check would wrongly ESRCH a
 // legitimate just-forked descendant that had not yet run its own publish.
 static void proc_reg_mark_child(int hostpid) {
+    launch_reg_publish(hostpid, 0);
     if (!g_init_hostpid || hostpid <= 0) return;
     char dir[80], path[144];
     proc_reg_key(dir, sizeof dir);
@@ -4398,6 +4439,11 @@ static void proc_reg_mark_child(int hostpid) {
 // cannot be reused until it is reaped, so removing the marker exactly at reap keeps a recycled pid from
 // inheriting stale in-container membership. Idempotent (unlink of an absent path is a no-op).
 static void proc_reg_reap(int hostpid) {
+    char launch_dir[80], launch_path[160];
+    if (hostpid > 0 && launch_reg_key(launch_dir, sizeof launch_dir)) {
+        snprintf(launch_path, sizeof launch_path, "%s/b%d", launch_dir, hostpid);
+        (void)unlink(launch_path);
+    }
     if (!g_init_hostpid || hostpid <= 0) return;
     char dir[80], path[144];
     proc_reg_key(dir, sizeof dir);

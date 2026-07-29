@@ -190,9 +190,22 @@ static int force_stop_descendants(const char *self, const char *guest) {
         close(output[0]);
         return fail(3, "force-stop-descendants", "hl_activation_start_with_stdio did not return HL_STATUS_OK");
     }
+    drained = (struct pollfd){.fd = output[0], .events = POLLIN | POLLHUP};
+    if (poll(&drained, 1, 5000) <= 0 || (drained.revents & POLLIN) == 0 || read(output[0], &byte, 1) != 1 ||
+        byte != 'R') {
+        hl_activation_process_destroy(process);
+        close(output[0]);
+        return fail(4, "force-stop-descendants", "the setsid descendant did not report readiness");
+    }
     if (hl_activation_kill(process) != HL_STATUS_OK) {
         close(output[0]);
-        return fail(4, "force-stop-descendants", "hl_activation_kill did not return HL_STATUS_OK");
+        return fail(5, "force-stop-descendants", "hl_activation_kill did not return HL_STATUS_OK");
+    }
+    status = hl_activation_kill(process);
+    if (status != HL_STATUS_OK) {
+        close(output[0]);
+        fprintf(stderr, "activation-package: force-stop-descendants: repeated kill status=%d\n", status);
+        return fail(6, "force-stop-descendants", "repeated hl_activation_kill was not idempotent");
     }
     for (attempt = 0; attempt < 500; ++attempt) {
         status = hl_activation_try_wait(process, &ready, &result);
@@ -212,7 +225,7 @@ static int force_stop_descendants(const char *self, const char *guest) {
         return 0;
     fprintf(stderr, "activation-package: force-stop-descendants: status=%d ready=%u drained=%d kind=%u guest=%d\n",
             status, ready, attempt, result.kind, result.guest_status);
-    return fail(5, "force-stop-descendants",
+    return fail(7, "force-stop-descendants",
                 "the killed guest and its descendants did not all report SIGKILL and close their output");
 }
 
