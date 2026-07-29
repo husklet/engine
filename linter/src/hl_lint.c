@@ -24,59 +24,9 @@
 #include <sys/stat.h>
 
 #include "analyzers.h"
+#include "cli.h"
 #include "lint.h"
 #include "policy.h"
-
-static void list_init(StringList *list) {
-    list->items = NULL;
-    list->count = 0;
-    list->cap = 0;
-}
-
-static char *string_duplicate(const char *value) {
-    size_t size = strlen(value) + 1;
-    char *copy = malloc(size);
-    if (copy != NULL) memcpy(copy, value, size);
-    return copy;
-}
-
-static bool list_contains(const StringList *list, const char *value) {
-    for (size_t i = 0; i < list->count; i++) {
-        if (strcmp(list->items[i], value) == 0) return true;
-    }
-    return false;
-}
-
-static void list_append(StringList *list, const char *value) {
-    if (list_contains(list, value)) return;
-    if (list->count + 1 > list->cap) {
-        size_t grow = list->cap == 0 ? 64 : list->cap * 2;
-        char **next = realloc(list->items, grow * sizeof(char *));
-        if (!next) {
-            fprintf(stdout, "error: out of memory while collecting paths\n");
-            exit(1);
-        }
-        list->items = next;
-        list->cap = grow;
-    }
-    list->items[list->count] = string_duplicate(value);
-    if (list->items[list->count] == NULL) {
-        fprintf(stdout, "error: out of memory while collecting paths\n");
-        exit(1);
-    }
-    list->count++;
-}
-
-static void list_free(StringList *list) {
-    if (!list || !list->items) return;
-    for (size_t i = 0; i < list->count; i++) {
-        free(list->items[i]);
-    }
-    free(list->items);
-    list->items = NULL;
-    list->count = 0;
-    list->cap = 0;
-}
 
 #ifdef _WIN32
 static char *xdup_format(const char *fmt, ...) {
@@ -184,13 +134,13 @@ static void collect_recursive(const char *root, StringList *files) {
             if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
                 collect_recursive(child, files);
             } else if (is_source_file(child)) {
-                list_append(files, child);
+                hl_lint_list_append(files, child);
             }
             free(child);
         } while (FindNextFileW(search, &entry));
         FindClose(search);
     } else if (is_source_file(root)) {
-        list_append(files, root);
+        hl_lint_list_append(files, root);
     }
     free(wide);
 }
@@ -220,228 +170,34 @@ static void collect_recursive(const char *root, StringList *files) {
             if (S_ISDIR(st.st_mode)) {
                 collect_recursive(child, files);
             } else if (S_ISREG(st.st_mode) && is_source_file(child)) {
-                list_append(files, child);
+                hl_lint_list_append(files, child);
             }
         }
         closedir(dir);
         return;
     }
 
-    if (S_ISREG(st.st_mode) && is_source_file(root)) { list_append(files, root); }
+    if (S_ISREG(st.st_mode) && is_source_file(root)) { hl_lint_list_append(files, root); }
 }
 #endif
 
-static void print_usage(const char *prog) {
-    fprintf(stdout, "usage: %s [options] [--source-dir <path>]... [--source-file <path>]...\n", prog);
-    fprintf(stdout, "options:\n");
-    fprintf(stdout, "  --source-dir PATH         add recursive source directory (default: src)\n");
-    fprintf(stdout, "  --source-file PATH        add explicit source file\n");
-    fprintf(stdout, "  --clang-tidy-source-file PATH analyze a compiled translation unit\n");
-    fprintf(stdout, "  --include-dir PATH        add include directory for cppcheck\n");
-    fprintf(stdout, "  --compile-commands-dir DIR directory containing compile_commands.json for clang-tidy\n");
-    fprintf(stdout, "  --clang-format-bin PATH   clang-format path\n");
-    fprintf(stdout, "  --clang-tidy-bin PATH     clang-tidy path\n");
-    fprintf(stdout, "  --cppcheck-bin PATH       cppcheck path\n");
-    fprintf(stdout,
-            "  --clang-tidy-checks LIST  clang-tidy checks (default: bugprone-*,clang-analyzer-*,performance-*)\n");
-    fprintf(stdout, "  --max-function-lines N    opt in to lexical function-length warnings\n");
-    fprintf(stdout, "  --max-nesting N           opt in to lexical brace-depth warnings\n");
-    fprintf(stdout, "  --max-line-length N       opt in to line-length warnings\n");
-    fprintf(stdout, "  --strict                  fail on warnings as errors\n");
-    fprintf(stdout, "  --skip-clang-format       disable clang-format stage\n");
-    fprintf(stdout, "  --skip-clang-tidy         disable clang-tidy stage\n");
-    fprintf(stdout, "  --skip-cppcheck           disable cppcheck stage\n");
-    fprintf(stdout, "  --skip-custom             disable custom heuristics stage\n");
-    fprintf(stdout, "  --allow-getenv-file PATH  allow direct environment access in this source file\n");
-    fprintf(stdout, "  --allow-stdio-file PATH   temporarily allow direct console output in this file\n");
-    fprintf(stdout, "  --allow-shell-file PATH   temporarily allow shell execution in this file\n");
-    fprintf(stdout, "  --clang-format-check/--clang-format-no-check\n");
-    fprintf(stdout, "  --clang-tidy-check/--clang-tidy-no-check\n");
-    fprintf(stdout, "  --cppcheck-check/--cppcheck-no-check\n");
-    fprintf(stdout, "  --help                    show this help\n");
-}
-
-static int parse_positive_int(const char *value) {
-    char *end = NULL;
-    long parsed = strtol(value, &end, 10);
-    if (!end || *end != '\0' || parsed < 0 || parsed > 1000000) {
-        fprintf(stdout, "error: invalid integer `%s`\n", value);
-        exit(1);
-    }
-    return (int)parsed;
-}
-
 int main(int argc, char **argv) {
-    LintConfig cfg = {
-        .max_function_lines = 0,
-        .max_nesting_depth = 0,
-        .max_line_length = 0,
-        .run_clang_format = true,
-        .run_clang_tidy = true,
-        .run_cppcheck = true,
-        .run_custom = true,
-        .strict = false,
-        .clang_tidy_checks = "clang-analyzer-*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,"
-                             "bugprone-assignment-in-if-condition,bugprone-branch-clone,bugprone-inc-dec-in-conditions,"
-                             "bugprone-infinite-loop,bugprone-not-null-terminated-result,bugprone-posix-return,"
-                             "bugprone-signal-handler,bugprone-sizeof-expression,bugprone-suspicious-memory-comparison,"
-                             "bugprone-suspicious-memset-usage,bugprone-undefined-memory-manipulation",
-    };
-
-    list_init(&cfg.source_files);
-    list_init(&cfg.source_dirs);
-    list_init(&cfg.clang_tidy_files);
-    list_init(&cfg.include_dirs);
-    list_init(&cfg.allow_getenv_files);
-    list_init(&cfg.allow_stdio_files);
-    list_init(&cfg.allow_shell_files);
-
-    for (int i = 1; i < argc; i++) {
-        const char *arg = argv[i];
-        if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
-            print_usage(argv[0]);
-            list_free(&cfg.source_files);
-            list_free(&cfg.source_dirs);
-            list_free(&cfg.clang_tidy_files);
-            list_free(&cfg.include_dirs);
-            list_free(&cfg.allow_getenv_files);
-            list_free(&cfg.allow_stdio_files);
-            list_free(&cfg.allow_shell_files);
-            return 0;
-        } else if (strcmp(arg, "--source-dir") == 0 || strcmp(arg, "--src") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <path>\n", arg);
-                return 2;
-            }
-            list_append(&cfg.source_dirs, argv[++i]);
-        } else if (strcmp(arg, "--source-file") == 0 || strcmp(arg, "--file") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <path>\n", arg);
-                return 2;
-            }
-            list_append(&cfg.source_files, argv[++i]);
-        } else if (strcmp(arg, "--clang-tidy-source-file") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <path>\n", arg);
-                return 2;
-            }
-            list_append(&cfg.clang_tidy_files, argv[++i]);
-        } else if (strcmp(arg, "--include-dir") == 0 || strcmp(arg, "-I") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <path>\n", arg);
-                return 2;
-            }
-            list_append(&cfg.include_dirs, argv[++i]);
-        } else if (strcmp(arg, "--compile-commands-dir") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <path>\n", arg);
-                return 2;
-            }
-            cfg.compile_db_dir = argv[++i];
-        } else if (strcmp(arg, "--clang-format-bin") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <path>\n", arg);
-                return 2;
-            }
-            cfg.clang_format_bin = argv[++i];
-        } else if (strcmp(arg, "--clang-tidy-bin") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <path>\n", arg);
-                return 2;
-            }
-            cfg.clang_tidy_bin = argv[++i];
-        } else if (strcmp(arg, "--cppcheck-bin") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <path>\n", arg);
-                return 2;
-            }
-            cfg.cppcheck_bin = argv[++i];
-        } else if (strcmp(arg, "--clang-tidy-checks") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <checks>\n", arg);
-                return 2;
-            }
-            cfg.clang_tidy_checks = argv[++i];
-        } else if (strcmp(arg, "--max-function-lines") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <value>\n", arg);
-                return 2;
-            }
-            cfg.max_function_lines = parse_positive_int(argv[++i]);
-        } else if (strcmp(arg, "--max-nesting") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <value>\n", arg);
-                return 2;
-            }
-            cfg.max_nesting_depth = parse_positive_int(argv[++i]);
-        } else if (strcmp(arg, "--max-line-length") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <value>\n", arg);
-                return 2;
-            }
-            cfg.max_line_length = parse_positive_int(argv[++i]);
-        } else if (strcmp(arg, "--strict") == 0) {
-            cfg.strict = true;
-        } else if (strcmp(arg, "--skip-clang-format") == 0) {
-            cfg.run_clang_format = false;
-        } else if (strcmp(arg, "--skip-clang-tidy") == 0 || strcmp(arg, "--clang-tidy-no-check") == 0) {
-            cfg.run_clang_tidy = false;
-        } else if (strcmp(arg, "--skip-cppcheck") == 0 || strcmp(arg, "--cppcheck-no-check") == 0) {
-            cfg.run_cppcheck = false;
-        } else if (strcmp(arg, "--skip-custom") == 0) {
-            cfg.run_custom = false;
-        } else if (strcmp(arg, "--allow-getenv-file") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <path>\n", arg);
-                return 2;
-            }
-            list_append(&cfg.allow_getenv_files, argv[++i]);
-        } else if (strcmp(arg, "--allow-stdio-file") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <path>\n", arg);
-                return 2;
-            }
-            list_append(&cfg.allow_stdio_files, argv[++i]);
-        } else if (strcmp(arg, "--allow-shell-file") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stdout, "error: %s expects <path>\n", arg);
-                return 2;
-            }
-            list_append(&cfg.allow_shell_files, argv[++i]);
-        } else if (strcmp(arg, "--clang-format-check") == 0) {
-            cfg.run_clang_format = true;
-        } else if (strcmp(arg, "--clang-format-no-check") == 0) {
-            cfg.run_clang_format = false;
-        } else if (strcmp(arg, "--clang-tidy-check") == 0) {
-            cfg.run_clang_tidy = true;
-        } else if (strcmp(arg, "--clang-tidy-no-check") == 0) {
-            cfg.run_clang_tidy = false;
-        } else if (strcmp(arg, "--cppcheck-check") == 0) {
-            cfg.run_cppcheck = true;
-        } else if (strcmp(arg, "--cppcheck-no-check") == 0) {
-            cfg.run_cppcheck = false;
-        } else {
-            fprintf(stdout, "error: unknown option `%s`\n", arg);
-            print_usage(argv[0]);
-            list_free(&cfg.source_files);
-            list_free(&cfg.source_dirs);
-            list_free(&cfg.clang_tidy_files);
-            list_free(&cfg.include_dirs);
-            list_free(&cfg.allow_getenv_files);
-            list_free(&cfg.allow_stdio_files);
-            list_free(&cfg.allow_shell_files);
-            return 2;
-        }
+    LintConfig cfg;
+    hl_lint_config_init(&cfg);
+    HlLintCliResult cli_result = hl_lint_cli_parse(&cfg, argc, argv);
+    if (cli_result != HL_LINT_CLI_RUN) {
+        hl_lint_config_destroy(&cfg);
+        return cli_result == HL_LINT_CLI_EXIT_SUCCESS ? 0 : 2;
     }
 
     StringList all_files;
-    list_init(&all_files);
+    hl_lint_list_init(&all_files);
 
     if (cfg.source_files.count == 0 && cfg.source_dirs.count == 0) {
         collect_recursive("src", &all_files);
     } else {
         for (size_t i = 0; i < cfg.source_files.count; i++) {
-            list_append(&all_files, cfg.source_files.items[i]);
+            hl_lint_list_append(&all_files, cfg.source_files.items[i]);
         }
         for (size_t i = 0; i < cfg.source_dirs.count; i++) {
             collect_recursive(cfg.source_dirs.items[i], &all_files);
@@ -459,7 +215,7 @@ int main(int argc, char **argv) {
 
     if (cfg.allow_getenv_files.count == 0) {
         // Engine currently centralizes env-var reads in environment.c.
-        list_append(&cfg.allow_getenv_files, "src/core/environment.c");
+        hl_lint_list_append(&cfg.allow_getenv_files, "src/core/environment.c");
     }
 
     const StringList *clang_tidy_files = cfg.clang_tidy_files.count > 0 ? &cfg.clang_tidy_files : &all_files;
@@ -479,13 +235,7 @@ int main(int argc, char **argv) {
 
     if (cfg.strict) { fprintf(stdout, "hl-lint: strict mode enabled\n"); }
 
-    list_free(&all_files);
-    list_free(&cfg.source_files);
-    list_free(&cfg.source_dirs);
-    list_free(&cfg.clang_tidy_files);
-    list_free(&cfg.include_dirs);
-    list_free(&cfg.allow_getenv_files);
-    list_free(&cfg.allow_stdio_files);
-    list_free(&cfg.allow_shell_files);
+    hl_lint_list_destroy(&all_files);
+    hl_lint_config_destroy(&cfg);
     return rc;
 }

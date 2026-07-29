@@ -10,6 +10,7 @@ endif()
 
 add_executable(hl_lint
   src/analyzers.c
+  src/cli.c
   src/hl_lint.c
   src/policy.c
   ${_hl_lint_process_source})
@@ -85,7 +86,7 @@ if(HL_BUILD_TESTS)
 
   foreach(_case IN ITEMS clean warning-nonstrict warning-strict error environment-extended-error
       stdio-error stdio-allowed stdio-extended-error platform-debug-error
-      shell-error shell-allowed usage)
+      shell-error shell-allowed usage missing-value invalid-integer)
     add_test(NAME lint.exit-${_case}
       COMMAND "${CMAKE_COMMAND}"
         -DHL_LINT=$<TARGET_FILE:hl_lint>
