@@ -525,10 +525,12 @@ static bool line_has_call(const char *line, const char *name) {
 
 static bool line_has_direct_console_output(const char *line) {
     if (line_has_call(line, "printf") || line_has_call(line, "vprintf") || line_has_call(line, "puts") ||
-        line_has_call(line, "perror")) {
+        line_has_call(line, "putchar") || line_has_call(line, "perror")) {
         return true;
     }
-    if ((line_has_call(line, "fprintf") || line_has_call(line, "vfprintf") || line_has_call(line, "fputs")) &&
+    if (line_has_call(line, "dprintf") || line_has_call(line, "vdprintf")) return true;
+    if ((line_has_call(line, "fprintf") || line_has_call(line, "vfprintf") || line_has_call(line, "fputs") ||
+         line_has_call(line, "fputc")) &&
         (line_has_word(line, "stderr") || line_has_word(line, "stdout"))) {
         return true;
     }
