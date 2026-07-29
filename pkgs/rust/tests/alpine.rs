@@ -222,11 +222,12 @@ fn production_true_has_empty_stdout_and_stderr() {
 }
 
 #[test]
-fn translation_cache_survives_shell_fork_exec_cold_and_warm_runs() {
+fn translation_cache_publishes_shell_and_fork_exec_utility_epochs() {
     let cache =
         std::env::temp_dir().join(format!("hl-alpine-pcache-fork-exec-{}", std::process::id()));
     let _ = fs::remove_dir_all(&cache);
 
+    let mut cold_entries = Vec::new();
     for round in 0..100 {
         let output = Engine::new()
             .command(Guest::Aarch64, "/bin/sh")
@@ -249,12 +250,43 @@ fn translation_cache_survives_shell_fork_exec_cold_and_warm_runs() {
             "run {round} returned an invalid process id: {:?}",
             String::from_utf8_lossy(&output.stdout)
         );
+        if round == 0 {
+            cold_entries = fs::read_dir(&cache)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let metadata = entry.metadata().unwrap();
+                    (
+                        entry.file_name(),
+                        metadata.len(),
+                        metadata.modified().unwrap(),
+                    )
+                })
+                .collect();
+            cold_entries.sort_by(|left, right| left.0.cmp(&right.0));
+            assert!(
+                cold_entries.len() >= 2,
+                "the cold shell and fork-exec'd utility must each publish a cache, found {cold_entries:?}"
+            );
+        }
     }
 
-    let entries = fs::read_dir(&cache).unwrap().count();
+    let mut warm_entries = fs::read_dir(&cache)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            (
+                entry.file_name(),
+                metadata.len(),
+                metadata.modified().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    warm_entries.sort_by(|left, right| left.0.cmp(&right.0));
     assert_eq!(
-        entries, 1,
-        "a forked exec child must not publish inherited translation state"
+        warm_entries, cold_entries,
+        "warm shell and utility epochs must reuse their identity-keyed caches without republishing"
     );
 
     fs::remove_dir_all(cache).unwrap();

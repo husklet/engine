@@ -790,6 +790,8 @@ static void load_elf(const char *path, struct loaded *out) {
             g_force_base_failed = 1;
             image_mapping = elf_map_checked(NULL, span, HL_HOST_MEMORY_READ | HL_HOST_MEMORY_WRITE,
                                             HL_HOST_MEMORY_PRIVATE, "image base");
+        } else {
+            pcache_note_fixed_img(image_mapping.address, span);
         }
         base = (uint8_t *)(uintptr_t)image_mapping.address;
     } else {
