@@ -142,7 +142,7 @@ static int store_name_compare(const void *left, const void *right) {
 }
 
 static void store_digest(uint64_t *hash, uint64_t *files, uint64_t *bytes) {
-    const char *names[STORE_OBJECT_MAX];
+    const char *names[STORE_OBJECT_MAX] = {0};
     int count = 0;
     for (int index = 0; index < g_object_count; ++index)
         if (store_digested(g_objects[index].name)) names[count++] = g_objects[index].name;

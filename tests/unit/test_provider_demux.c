@@ -78,22 +78,27 @@ typedef struct server_state {
     uint64_t second;
 } server_state;
 
+static void *server_failure(unsigned code) {
+    static unsigned failures[8];
+    return &failures[code - 1];
+}
+
 static void *server(void *opaque) {
     server_state *s = opaque;
     unsigned char p[32];
     uint16_t kind;
     uint64_t id;
-    if (recv_frame(s->fd, &kind, &s->first, p) || kind != REQUEST) return (void *)1;
-    if (recv_frame(s->fd, &kind, &s->second, p) || kind != REQUEST) return (void *)2;
+    if (recv_frame(s->fd, &kind, &s->first, p) || kind != REQUEST) return server_failure(1);
+    if (recv_frame(s->fd, &kind, &s->second, p) || kind != REQUEST) return server_failure(2);
     if (send_frame(s->fd, EVENT, 77, "e1") || send_frame(s->fd, REPLY, s->second, "two") ||
         send_frame(s->fd, EVENT, 77, "e2") || send_frame(s->fd, EVENT, 77, "dropped") ||
         send_frame(s->fd, REPLY, s->first, "one"))
-        return (void *)3;
-    if (recv_frame(s->fd, &kind, &id, p) || kind != REQUEST) return (void *)4;
-    if (recv_frame(s->fd, &kind, &id, p) || kind != CANCEL) return (void *)5;
-    if (send_frame(s->fd, REPLY, id, "late")) return (void *)6;
-    if (recv_frame(s->fd, &kind, &id, p) || kind != REQUEST) return (void *)7;
-    if (recv_frame(s->fd, &kind, &id, p) || kind != CANCEL) return (void *)8;
+        return server_failure(3);
+    if (recv_frame(s->fd, &kind, &id, p) || kind != REQUEST) return server_failure(4);
+    if (recv_frame(s->fd, &kind, &id, p) || kind != CANCEL) return server_failure(5);
+    if (send_frame(s->fd, REPLY, id, "late")) return server_failure(6);
+    if (recv_frame(s->fd, &kind, &id, p) || kind != REQUEST) return server_failure(7);
+    if (recv_frame(s->fd, &kind, &id, p) || kind != CANCEL) return server_failure(8);
     close(s->fd);
     return NULL;
 }
@@ -122,12 +127,12 @@ static void *fork_server(void *opaque) {
     uint16_t kind;
     uint64_t first_id, second_id;
     const char *first_reply, *second_reply;
-    if (recv_frame(fd, &kind, &first_id, first) != 0 || kind != REQUEST) return (void *)1;
-    if (recv_frame(fd, &kind, &second_id, second) != 0 || kind != REQUEST) return (void *)2;
+    if (recv_frame(fd, &kind, &first_id, first) != 0 || kind != REQUEST) return server_failure(1);
+    if (recv_frame(fd, &kind, &second_id, second) != 0 || kind != REQUEST) return server_failure(2);
     first_reply = memcmp(first, "child", 6) == 0 ? "child" : "parent";
     second_reply = memcmp(second, "child", 6) == 0 ? "child" : "parent";
     if (send_frame(fd, REPLY, second_id, second_reply) != 0 || send_frame(fd, REPLY, first_id, first_reply) != 0)
-        return (void *)3;
+        return server_failure(3);
     return NULL;
 }
 
@@ -135,7 +140,8 @@ static int fork_broker(void) {
     int pair[2], status;
     pthread_t peer;
     pid_t child;
-    void *result = (void *)99;
+    char join_pending;
+    void *result = &join_pending;
     hl_provider_demux *demux = NULL;
     hl_provider_ticket ticket;
     hl_provider_reply reply;
@@ -172,8 +178,8 @@ static void *death_server(void *opaque) {
     unsigned char payload[16];
     uint16_t kind;
     uint64_t id;
-    if (recv_frame(fd, &kind, &id, payload) != 0 || kind != REQUEST) return (void *)1;
-    if (recv_frame(fd, &kind, &id, payload) != 0 || kind != REQUEST) return (void *)2;
+    if (recv_frame(fd, &kind, &id, payload) != 0 || kind != REQUEST) return server_failure(1);
+    if (recv_frame(fd, &kind, &id, payload) != 0 || kind != REQUEST) return server_failure(2);
     close(fd);
     return NULL;
 }
@@ -182,7 +188,8 @@ static int fork_peer_death(void) {
     int pair[2], status;
     pthread_t peer;
     pid_t child;
-    void *result = (void *)99;
+    char join_pending;
+    void *result = &join_pending;
     hl_provider_demux *demux = NULL;
     hl_provider_ticket ticket;
     hl_provider_reply reply;
@@ -338,7 +345,8 @@ int main(void) {
     hl_provider_reply reply;
     uint64_t lost;
     _Atomic unsigned wakes = 0;
-    void *result = (void *)99;
+    char join_pending;
+    void *result = &join_pending;
     HL_CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
     state.fd = pair[1];
     HL_CHECK(pthread_create(&peer, NULL, server, &state) == 0);

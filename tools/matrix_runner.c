@@ -1726,7 +1726,7 @@ static int translation_reuse_matches(const suite_case *item, const char *isa, co
     fprintf(stderr,
             "matrix-runner: %s [%s] translation reuse parent=%llu noexec_max=%llu budget=%u "
             "exec_max=%llu samples=%u/%u/%u\n",
-            item->name, isa, (unsigned long long)parent, (unsigned long long)noexec_max, REUSE_BLOCK_BUDGET,
+            item->name, isa, (unsigned long long)parent, (unsigned long long)noexec_max, (unsigned)REUSE_BLOCK_BUDGET,
             (unsigned long long)exec_max, fork_count, clone_count, exec_count);
     return parent != 0 && fork_count == 4 && clone_count == 4 && exec_count == 4 && noexec_max <= REUSE_BLOCK_BUDGET;
 }

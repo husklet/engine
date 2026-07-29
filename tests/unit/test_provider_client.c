@@ -70,22 +70,29 @@ static int send_frame(int fd, uint16_t kind, uint64_t id, const void *payload, u
     return exact(fd, h, sizeof(h), 1) || exact(fd, (void *)(uintptr_t)payload, size, 1);
 }
 
+static void *server_failure(unsigned code) {
+    static unsigned failures[8];
+    return &failures[code - 1];
+}
+
 static void *server(void *opaque) {
     int fd = *(int *)opaque;
     unsigned char first[16], second[16];
     uint16_t kind;
     uint64_t one, two;
     uint32_t n1, n2;
-    if (receive(fd, &kind, &one, first, &n1) != 0 || kind != REQUEST) return (void *)1;
-    if (receive(fd, &kind, &two, second, &n2) != 0 || kind != REQUEST) return (void *)2;
-    if (send_frame(fd, REPLY, two, second, n2) != 0 || send_frame(fd, REPLY, one, first, n1) != 0) return (void *)3;
+    if (receive(fd, &kind, &one, first, &n1) != 0 || kind != REQUEST) return server_failure(1);
+    if (receive(fd, &kind, &two, second, &n2) != 0 || kind != REQUEST) return server_failure(2);
+    if (send_frame(fd, REPLY, two, second, n2) != 0 || send_frame(fd, REPLY, one, first, n1) != 0)
+        return server_failure(3);
     if (receive(fd, &kind, &one, first, &n1) != 0 || kind != SUBSCRIBE || one != 77 || n1 != 4 ||
         memcmp(first, "poll", 4) != 0)
-        return (void *)4;
-    if (send_frame(fd, EVENT, 77, "ready", 5) != 0) return (void *)5;
-    if (receive(fd, &kind, &one, first, &n1) != 0 || kind != UNSUBSCRIBE || one != 77 || n1 != 0) return (void *)6;
-    if (receive(fd, &kind, &one, first, &n1) != 0 || kind != REQUEST) return (void *)7;
-    if (receive(fd, &kind, &two, second, &n2) != 0 || kind != CANCEL || two != one) return (void *)8;
+        return server_failure(4);
+    if (send_frame(fd, EVENT, 77, "ready", 5) != 0) return server_failure(5);
+    if (receive(fd, &kind, &one, first, &n1) != 0 || kind != UNSUBSCRIBE || one != 77 || n1 != 0)
+        return server_failure(6);
+    if (receive(fd, &kind, &one, first, &n1) != 0 || kind != REQUEST) return server_failure(7);
+    if (receive(fd, &kind, &two, second, &n2) != 0 || kind != CANCEL || two != one) return server_failure(8);
     return NULL;
 }
 
@@ -112,7 +119,8 @@ int main(void) {
     pthread_t peer, left, right;
     hl_provider_client client;
     call a, b;
-    void *result = (void *)99;
+    char join_pending;
+    void *result = &join_pending;
     hl_provider_reply event;
     uint64_t lost;
     _Atomic unsigned wakes = 0;

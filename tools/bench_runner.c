@@ -342,7 +342,7 @@ static int docker_reach(const ctx_t *c, char *r, size_t n) {
         return 0;
     }
     invocation_t invocation = {0};
-    hl_process_result_t result;
+    hl_process_result_t result = {0};
     int run_error = docker_prefix(c, &invocation);
     if (run_error == 0) run_error = invocation_append(&invocation, "version");
     if (run_error == 0) run_error = hl_process_run(invocation.argv, NULL, 1, NULL, NULL, &result);

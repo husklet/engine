@@ -84,9 +84,11 @@ static void op_unsubscribe(void *c, void *o, uint64_t t) {
     (void)t;
 }
 
+static char provider_context;
+
 static hl_status op_clone(void *c, void **out) {
     (void)c;
-    *out = (void *)1;
+    *out = &provider_context;
     return HL_STATUS_OK;
 }
 
@@ -157,7 +159,7 @@ int main(void) {
     memcpy(image, &header, sizeof header);
     memcpy(image + sizeof header, record, sizeof record);
 
-    imported = hl_linux_inotify_import_at(&abi, (hl_linux_fd)5, &ops, (void *)1, 0, 0, image, sizeof image);
+    imported = hl_linux_inotify_import_at(&abi, (hl_linux_fd)5, &ops, &provider_context, 0, 0, image, sizeof image);
     fprintf(stderr, "import_at returned %lld (expected: rejection, i.e. negative)\n", (long long)imported);
     if (imported < 0) {
         fprintf(stderr, "OK: malformed queue rejected\n");
