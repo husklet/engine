@@ -50,6 +50,7 @@ set(HL_LINT_ALLOW_STDIO_FILES
   src/translator/guest/x86_64/translate.c)
 set(_hl_lint_cli_stdio_files
   linter/src/hl_lint.c
+  linter/src/policy.c
   tests/unit/test.h
   tests/unit/test_ckptinoq.c
   tests/unit/test_epoll.c
