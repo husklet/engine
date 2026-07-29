@@ -273,6 +273,7 @@ static const hl_guest_memory_ops g_guest_memory_ops = {
 // this file); any other takes interp.c, which decodes x86-64 directly. Both share struct cpu: it is the
 // checkpoint format.
 #if defined(HL_HOST_CPU_AARCH64)
+static int g_address_recorded;
 #include "../../translator/guest/x86_64/emit.c" // x86 engine: arm64 emitters + SSE + x87
 #include "../../translator/guest/x86_64/address.h"
 
@@ -342,6 +343,18 @@ static void address_load(void *context, int width, int rt, int rn) {
     e_load(width, rt, rn);
 }
 
+static void address_record_guest(void *context, int reg, int rip_relative) {
+    (void)context;
+    if (rip_relative) {
+        e_movconst(16, g_nonpie_bias);
+        e_rrr(A_SUB, 16, reg, 16, 1, 0);
+        e_str(16, 28, OFF_SOFT_GUEST_EA);
+    } else {
+        e_str(reg, 28, OFF_SOFT_GUEST_EA);
+    }
+    g_address_recorded = 1;
+}
+
 static void address_bus_guard(void *context, int reg, uint64_t size, uint64_t pc) {
     (void)context;
     emit_bus_guard(reg, size, pc);
@@ -362,14 +375,11 @@ static void address_patch_cbnz(void *context, uintptr_t token, int reg) {
                    (uint32_t)reg;
 }
 
-static const hl_x86_address_emitter address_emitter = {address_addi,          address_subi,
-                                                       address_movconst,      address_addreg,
-                                                       address_lsr,           address_movreg,
-                                                       address_movzero,       address_uxt,
-                                                       address_load_cpu,      address_load_scaled,
-                                                       address_load_unscaled, address_load,
-                                                       address_bus_guard,     address_branch_placeholder,
-                                                       address_patch_cbnz};
+static const hl_x86_address_emitter address_emitter = {
+    address_addi,          address_subi,    address_movconst,     address_addreg,    address_lsr,
+    address_movreg,        address_movzero, address_uxt,          address_load_cpu,  address_load_scaled,
+    address_load_unscaled, address_load,    address_record_guest, address_bus_guard, address_branch_placeholder,
+    address_patch_cbnz};
 
 static hl_x86_address_state address_state(void) {
     return (hl_x86_address_state){NULL,   &address_emitter, g_nonpie_lo, g_nonpie_hi,           g_nonpie_bias,
@@ -569,6 +579,8 @@ static void jit86_smc_commit(struct cpu *cpu) {
 }
 
 #define HL_GUEST_SIGACTION_HAS_RESTORER 1
+#define HL_DISPATCH_FAULT_ADDRESS(c)                                                                                   \
+    ((c)->bus_ea != 0 && (c)->fault_addr == (c)->bus_ea ? (c)->soft_guest_ea : nonpie_unfold((c)->fault_addr))
 #include "../../linux_abi/signal.c" // SHARED: signal delivery driver + translation
 
 static int soft_tlb_miss(struct cpu *c) {
@@ -841,6 +853,7 @@ static void ckpt_poll(struct cpu *c);
         (c)->fastclk_resume = 0;                                                                                       \
         (c)->fault_addr = 0;                                                                                           \
         (c)->bus_ea = 0;                                                                                               \
+        (c)->soft_guest_ea = 0;                                                                                        \
         (c)->bus_filter = 0;                                                                                           \
         (c)->bus_force = 0;                                                                                            \
         memset((c)->bus_scratch, 0, sizeof(c)->bus_scratch);                                                           \

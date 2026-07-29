@@ -1037,6 +1037,8 @@ void emit_memory_guard(int address_register, uint64_t size, uint64_t rip, uint32
      * armed executable-memory generation, before a soft guard can translate
      * address_register to its host backing address.
      */
+    if (!g_address_recorded) e_str(address_register, 28, OFF_SOFT_GUEST_EA);
+    g_address_recorded = 0;
     if (!jit_guest_soft_active() && g_rwx_guest) e_str(address_register, 28, OFF_BUS_EA);
     emit_soft_guard(address_register, size, rip, required);
     if (!jit_guest_bus_active()) return;

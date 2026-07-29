@@ -32,9 +32,10 @@ static void add_displacement(const hl_x86_address_state *state, int64_t displace
     }
 }
 
-static void emit_bias(const hl_x86_address_state *state) {
+static void emit_bias(const hl_x86_address_state *state, int rip_relative) {
     const hl_x86_address_emitter *emit = state->emitter;
     if (!guestfold_on(state)) return;
+    emit->record_guest_address(state->context, 17, rip_relative);
     emit->logical_shift_right(state->context, 16, 17, 32, 1);
     uintptr_t branch = emit->branch_placeholder(state->context);
     emit->move_constant(state->context, 16, state->nonpie_bias);
@@ -88,7 +89,7 @@ void hl_x86_address_emit(const hl_x86_address_state *state, const hl_x86_insn *i
     uint64_t absolute_address = (uint64_t)insn->disp;
     if (apply_bias && !(absolute && guestfold_on(state) &&
                         (absolute_address < state->nonpie_lo || absolute_address >= state->nonpie_hi)))
-        emit_bias(state);
+        emit_bias(state, insn->rip_rel);
 }
 
 int hl_x86_address_fold(const hl_x86_address_state *state, const hl_x86_insn *insn, int width, int *rn, int *offset) {

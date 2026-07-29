@@ -112,6 +112,7 @@ struct cpu {
     /* Synchronous translated-memory SIGBUS handoff; consumed only by dispatcher reason R_BUS. */
     uint64_t fault_addr;
     uint64_t bus_ea;
+    uint64_t soft_guest_ea;
     /* Runtime-owned monotonic BUS page filter; emitted guards read these pointers. */
     uint64_t bus_filter;
     uint64_t bus_force;
@@ -264,6 +265,7 @@ _Static_assert(__builtin_offsetof(struct cpu, mmscratch) == OFF_MM, "OFF_MM drif
     } while (0)
 #define OFF_FAULT_ADDR ((int)__builtin_offsetof(struct cpu, fault_addr))
 #define OFF_BUS_EA ((int)__builtin_offsetof(struct cpu, bus_ea))
+#define OFF_SOFT_GUEST_EA ((int)__builtin_offsetof(struct cpu, soft_guest_ea))
 #define OFF_BUS_FILTER ((int)__builtin_offsetof(struct cpu, bus_filter))
 #define OFF_BUS_FORCE ((int)__builtin_offsetof(struct cpu, bus_force))
 #define OFF_BUS_SCRATCH ((int)__builtin_offsetof(struct cpu, bus_scratch))

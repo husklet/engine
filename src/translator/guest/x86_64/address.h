@@ -18,6 +18,7 @@ typedef struct hl_x86_address_emitter {
     void (*load_scaled)(void *context, int width, int rt, int rn, unsigned offset);
     void (*load_unscaled)(void *context, int width, int rt, int rn, int offset);
     void (*load)(void *context, int width, int rt, int rn);
+    void (*record_guest_address)(void *context, int address_register, int rip_relative);
     void (*bus_guard)(void *context, int address_register, uint64_t size, uint64_t guest_pc);
     uintptr_t (*branch_placeholder)(void *context);
     void (*patch_cbnz)(void *context, uintptr_t placeholder, int reg);

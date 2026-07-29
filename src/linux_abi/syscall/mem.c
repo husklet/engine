@@ -1084,7 +1084,9 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
             uint64_t glo = a0 & ~(uint64_t)0xfff, ghi = (a0 + a1 + 0xfff) & ~(uint64_t)0xfff;
             int logical_protect_prepared = 0;
             int logical_protect_locked = 0;
+            int logical_protect_failed = 0;
             hl_logical_vma_plan *logical_protect_plan = NULL;
+            uint64_t folded_alias_a0 = nonpie_unfold(physical_a0);
             if (jit_guest_soft_active() || physical_a0 != a0) {
                 gbus_mapping_transition_lock();
                 logical_protect_locked = 1;
@@ -1093,19 +1095,29 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                     G_RET(c) = (uint64_t)(int64_t)-ENOMEM;
                     break;
                 }
-                uint64_t logical_a0 = hl_logical_vma_global_overlap(physical_a0, a1) ? physical_a0 : a0;
-                if (hl_logical_vma_global_overlap(logical_a0, a1)) {
-                    gbus_mapping_stw_begin();
-                    logical_protect_prepared = 1;
+                uint64_t logical_ranges[3] = {a0, physical_a0, folded_alias_a0};
+                for (size_t logical_index = 0; logical_index < 3; ++logical_index) {
+                    uint64_t logical_a0 = logical_ranges[logical_index];
+                    int duplicate = 0;
+                    for (size_t earlier = 0; earlier < logical_index; ++earlier)
+                        if (logical_ranges[earlier] == logical_a0) duplicate = 1;
+                    if (duplicate || !hl_logical_vma_global_overlap(logical_a0, a1)) continue;
+                    if (!logical_protect_prepared) {
+                        gbus_mapping_stw_begin();
+                        logical_protect_prepared = 1;
+                    }
                     if (hl_logical_vma_global_prepare_protect(logical_a0, a1, (uint32_t)a2, &logical_protect_plan) !=
                         0) {
                         int saved = errno;
+                        if (logical_protect_plan != NULL) hl_logical_vma_abort_shared(logical_protect_plan);
                         gbus_mapping_stw_end();
                         gbus_mapping_transition_unlock();
                         G_RET(c) = (uint64_t)(int64_t)-saved;
+                        logical_protect_failed = 1;
                         break;
                     }
                 }
+                if (logical_protect_failed) break;
                 if (physical_a0 != a0 && !logical_protect_prepared) {
                     gbus_mapping_stw_begin();
                     logical_protect_prepared = 1;
@@ -1194,11 +1206,21 @@ static int svc_mem(struct cpu *c, uint64_t nr, uint64_t a0, uint64_t a1, uint64_
                 gna_add(glo, ghi);
             else
                 gna_clear(glo, ghi);
+            uint64_t alias_glo = folded_alias_a0 & ~(uint64_t)0xfff;
+            uint64_t alias_ghi = (folded_alias_a0 + a1 + 0xfff) & ~(uint64_t)0xfff;
+            if (alias_glo != glo) {
+                if ((int)a2 == PROT_NONE)
+                    gna_add(alias_glo, alias_ghi);
+                else
+                    gna_clear(alias_glo, alias_ghi);
+            }
             if ((int)a2 != PROT_NONE && !((int)a2 & PROT_WRITE)) {
                 gro_add(glo, ghi);
+                if (alias_glo != glo) gro_add(alias_glo, alias_ghi);
                 filemap_refresh_emulated(physical_a0, physical_a0 + a1);
             } else {
                 gro_clear(glo, ghi);
+                if (alias_glo != glo) gro_clear(alias_glo, alias_ghi);
             }
             if (logical_protect_prepared) {
                 hl_logical_vma_commit_shared(logical_protect_plan);

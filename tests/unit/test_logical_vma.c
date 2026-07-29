@@ -304,6 +304,18 @@ int main(void) {
     hl_logical_vma_snapshot *direct_snapshot =
         atomic_load_explicit(hl_logical_vma_global_snapshot_source(), memory_order_acquire);
     HL_CHECK(direct_snapshot != NULL && direct_snapshot->count == 2);
+    plan = NULL;
+    HL_CHECK(hl_logical_vma_global_prepare_protect(direct, 4096, HL_LOGICAL_VMA_READ | HL_LOGICAL_VMA_WRITE, &plan) ==
+             0);
+    HL_CHECK(hl_logical_vma_global_prepare_protect(direct + 4096, 4096, HL_LOGICAL_VMA_READ, &plan) == 0);
+    hl_logical_vma_commit_shared(plan);
+    hl_logical_vma_global_reclaim_quiescent();
+    HL_CHECK(hl_logical_vma_pin_data(direct, 1, HL_LOGICAL_VMA_WRITE, &direct_pin) == 1);
+    hl_logical_vma_unpin(&direct_pin);
+    HL_CHECK(hl_logical_vma_pin_data(direct + 4096, 1, HL_LOGICAL_VMA_WRITE, &direct_pin) == -1);
+    HL_CHECK(errno == EACCES);
+    /* Export takes the live lock again, proving the one commit released it. */
+    HL_CHECK(hl_logical_vma_global_export(NULL, 0) == 0);
     hl_logical_vma_global_reset_quiescent();
     direct_first[0] = 0x44;
     direct_second[0] = 0x55;

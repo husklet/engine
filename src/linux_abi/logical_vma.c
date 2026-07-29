@@ -794,7 +794,18 @@ int hl_logical_vma_global_protect(uint64_t guest_first, uint64_t length, uint32_
 
 int hl_logical_vma_global_prepare_protect(uint64_t guest_first, uint64_t length, uint32_t protection,
                                           hl_logical_vma_plan **plan) {
+    if (plan == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
     (void)pthread_once(&g_logical_vmas_once, global_init);
+    if (*plan != NULL) {
+        if ((*plan)->live != &g_logical_vmas) {
+            errno = EINVAL;
+            return -1;
+        }
+        return hl_logical_vma_protect(&(*plan)->staged, guest_first, length, protection);
+    }
     return hl_logical_vma_prepare_protect(&g_logical_vmas, guest_first, length, protection, plan);
 }
 

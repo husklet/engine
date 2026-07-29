@@ -2,6 +2,10 @@
 #include "../host/native_context.h"
 #include "shared.h"
 
+#ifndef HL_DISPATCH_FAULT_ADDRESS
+#define HL_DISPATCH_FAULT_ADDRESS(c) nonpie_unfold((c)->fault_addr)
+#endif
+
 // ptrace signal-delivery/group stops. Defined later in the TU (os/linux/syscall/ptrace.c, pulled in
 // via dispatch.c). ptrace_intercept_signal: this process is traced and a signal is about to be delivered
 // -> enter a signal/group ptrace-stop, report it to the tracer, block until CONT/SYSCALL, and (when the
@@ -929,8 +933,8 @@ static int deliver_guest_fault(int hostsig, siginfo_t *si, void *ucv) {
 static int raise_guest_bus(struct cpu *c) {
     if (g_sigact[7].handler <= 1) { guest_group_fatal(c, 7); }
     c->sync_signal = 7;
-    c->sync_address = nonpie_unfold(c->fault_addr); // guest-visible si_addr (see above)
-    c->sync_code = 2;                               /* BUS_ADRERR */
+    c->sync_address = HL_DISPATCH_FAULT_ADDRESS(c);
+    c->sync_code = 2; /* BUS_ADRERR */
     c->sigmask &= ~(1ull << 6);
     c->reason = R_BRANCH;
     /* A synchronous memory fault belongs to the faulting thread.  Process-wide
@@ -946,8 +950,8 @@ static int raise_guest_bus(struct cpu *c) {
 static int raise_guest_fetch_fault(struct cpu *c) {
     if (g_sigact[11].handler <= 1) { guest_group_fatal(c, 11); }
     c->sync_signal = 11;
-    c->sync_address = nonpie_unfold(c->fault_addr); // guest-visible si_addr (see above)
-    c->sync_code = 2;                               /* SEGV_ACCERR */
+    c->sync_address = HL_DISPATCH_FAULT_ADDRESS(c);
+    c->sync_code = 2; /* SEGV_ACCERR */
     c->sigmask &= ~(1ull << 10);
     c->reason = R_BRANCH;
     __atomic_or_fetch(&c->tpending, 1ull << 11, __ATOMIC_SEQ_CST);
@@ -957,8 +961,8 @@ static int raise_guest_fetch_fault(struct cpu *c) {
 static int raise_guest_data_map_fault(struct cpu *c) {
     if (g_sigact[11].handler <= 1) guest_group_fatal(c, 11);
     c->sync_signal = 11;
-    c->sync_address = nonpie_unfold(c->fault_addr); // guest-visible si_addr (see above)
-    c->sync_code = 1;                               /* SEGV_MAPERR */
+    c->sync_address = HL_DISPATCH_FAULT_ADDRESS(c);
+    c->sync_code = 1; /* SEGV_MAPERR */
     c->sigmask &= ~(1ull << 10);
     c->reason = R_BRANCH;
     __atomic_or_fetch(&c->tpending, 1ull << 11, __ATOMIC_SEQ_CST);
