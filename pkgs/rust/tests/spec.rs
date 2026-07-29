@@ -921,7 +921,7 @@ fn host_network_reaches_a_real_host_loopback_listener() {
     let mut spec = MachineSpec::new(Guest::Aarch64, "/bin/sh");
     spec.process.argv.extend([
         "-c".into(),
-        format!("nc 127.0.0.1 {port} | grep -qx host-network-ok").into(),
+        format!("nc 127.0.0.1 {port} </dev/null | grep -qx host-network-ok").into(),
     ]);
     spec.filesystem.root = Some(TreeSource::HostDirectory(rootfs().clone()));
     spec.network.mode = NetworkMode::Host;
