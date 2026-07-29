@@ -3129,6 +3129,11 @@ static unsigned long long self_rss_bytes(void); // defined after hl_get_procinfo
 // /proc is live state on Linux: values may legitimately move between separate
 // reads. Caching the first sample forever made statm claim that a faulted
 // 32 MiB mapping consumed zero pages and that munmap never released anything.
+static _Thread_local unsigned long long g_statm_charge;
+static _Thread_local unsigned long long g_statm_rss;
+static _Thread_local unsigned long long g_statm_vsize;
+static _Thread_local int g_statm_sample;
+
 static void self_vm_bytes(unsigned long long *rss, unsigned long long *vsize) {
     unsigned long long pgsz = (unsigned long long)hl_linux_host_page_size();
     unsigned long long r = (self_rss_bytes() / pgsz) * pgsz;
@@ -3138,6 +3143,25 @@ static void self_vm_bytes(unsigned long long *rss, unsigned long long *vsize) {
     if (v < r) v = r;
     if (rss) *rss = r;
     if (vsize) *vsize = v;
+}
+
+static void self_vm_statm_bytes(unsigned long long *rss, unsigned long long *vsize) {
+    self_vm_bytes(rss, vsize);
+    g_statm_charge = (unsigned long long)atomic_load(&g_mem_charged);
+    g_statm_rss = *rss;
+    g_statm_vsize = *vsize;
+    g_statm_sample = 1;
+}
+
+static void self_vm_status_bytes(unsigned long long *rss, unsigned long long *vsize) {
+    unsigned long long charge = (unsigned long long)atomic_load(&g_mem_charged);
+    if (g_statm_sample && g_statm_charge == charge) {
+        *rss = g_statm_rss;
+        *vsize = g_statm_vsize;
+        g_statm_sample = 0;
+        return;
+    }
+    self_vm_bytes(rss, vsize);
 }
 
 // /proc/[pid]/status Cpus_allowed / Cpus_allowed_list. A default container is allowed to run on ALL of its
@@ -3168,7 +3192,7 @@ static int proc_status_text(char *b, size_t n) {
     int pid = container_pid();
     int ppid = pid == 1 ? 0 : (int)getppid();
     unsigned long long vm_rss, vm_vsize;
-    self_vm_bytes(&vm_rss, &vm_vsize);
+    self_vm_status_bytes(&vm_rss, &vm_vsize);
     unsigned long rss = (unsigned long)(vm_rss / 1024);
     unsigned long vsz = (unsigned long)(vm_vsize / 1024);
     if (vsz < rss) vsz = rss;
@@ -4555,7 +4579,7 @@ static int proc_statm_common(char *b, size_t n, unsigned long size_pg, unsigned 
 static int proc_statm_text(char *b, size_t n) { // our own pid
     unsigned long pgsz = (unsigned long)hl_linux_host_page_size();
     unsigned long long vm_rss, vm_vsize;
-    self_vm_bytes(&vm_rss, &vm_vsize);
+    self_vm_statm_bytes(&vm_rss, &vm_vsize);
     unsigned long rss_pg = (unsigned long)(vm_rss / pgsz);
     unsigned long size_pg = (unsigned long)(vm_vsize / pgsz);
     if (size_pg < rss_pg) size_pg = rss_pg;
