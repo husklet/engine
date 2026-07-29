@@ -1136,19 +1136,36 @@ static void emit_a64_soft_exclusive(uint32_t in) {
     else
         e_movr(16, base);
     emit_a64_bus_guard(16, a64_mem_bytes(in), g_emit_gpc);
-    struct a64_soft_guard soft =
-        emit_a64_soft_guard_begin(16, 17, 18, a64_mem_bytes(in), a64_mem_required(in), g_emit_gpc);
+
+    int mask = gpr_field_mask(in);
+    unsigned used = 0;
+    static const int shifts[4] = {0, 5, 16, 10}, mbits[4] = {1, 2, 4, 8};
+    for (int k = 0; k < 4; ++k)
+        if (mask & mbits[k]) used |= 1u << ((in >> shifts[k]) & 31u);
     if (is_casp(in)) {
-        emit_casp_mangled(in, 16);
+        used |= 1u << ((((in >> 16) & 31u) + 1u) & 31u);
+        used |= 1u << (((in & 31u) + 1u) & 31u);
+    }
+    int ea = 0;
+    while ((used & (1u << ea)) || is_stolen(ea))
+        ++ea;
+    e_str(ea, CPUREG, (int)OFF_MSCRATCH + 32);
+    e_movr(ea, 16);
+    struct a64_soft_guard soft =
+        emit_a64_soft_guard_begin(ea, 17, 18, a64_mem_bytes(in), a64_mem_required(in), g_emit_gpc);
+    a64_soft_guard_restore(&soft, ea, (int)OFF_MSCRATCH + 32);
+    if (is_casp(in)) {
+        emit_casp_mangled(in, ea);
     } else {
-        uint32_t rebased = (in & ~(31u << 5)) | (16u << 5);
-        int mask = gpr_field_mask(in) & ~2; /* x16 is the engine EA, not guest x16 */
+        uint32_t rebased = (in & ~(31u << 5)) | ((uint32_t)ea << 5);
+        mask &= ~2;
         if (uses_x18(in, mask))
             emit_mangled_x18(rebased, mask);
         else
             emit32(rebased);
     }
     emit_a64_soft_guard_end(&soft);
+    e_ldr(ea, CPUREG, (int)OFF_MSCRATCH + 32);
 }
 
 /*
@@ -1635,6 +1652,10 @@ static void emit_fold_advsimd_struct(uint32_t in) {
                 e_ldr(T2, CPUREG, base * 8);
                 emit32(0x8B000000u | ((unsigned)idx << 16) | (T2 << 5) | T2); // add T2, T2, idx
                 e_str(T2, CPUREG, base * 8);
+            } else if (base == 31) {
+                e_mov_from_sp(T2);
+                emit32(0x8B000000u | ((unsigned)idx << 16) | (T2 << 5) | T2);
+                e_mov_sp_from(T2);
             } else
                 emit32(0x8B000000u | ((unsigned)idx << 16) | (base << 5) | base); // add base, base, idx
         }
