@@ -25,7 +25,7 @@ static void test_prefix(void) {
 }
 
 static void test_capture(void) {
-    char *argv[] = {"/bin/echo", "two words", NULL};
+    char *argv[] = {HL_TEST_COMMAND, "-E", "echo", "two words", NULL};
     char *output = NULL;
     size_t output_size = 0;
     hl_process_result_t result;
