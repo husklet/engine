@@ -20,4 +20,26 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     -D_POSIX_C_SOURCE=200809L)
   set_target_properties(nested-engine-gate PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tools)
+
+  add_executable(direct-launch-gate
+    direct_launch_gate.c
+    config.c)
+  target_compile_options(direct-launch-gate PRIVATE
+    -O2 -g -std=gnu11 -Wall -Wextra -Werror
+    -D_POSIX_C_SOURCE=200809L)
+  set_target_properties(direct-launch-gate PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tools)
+
+  add_executable(test-direct-launch-gate
+    ${CMAKE_SOURCE_DIR}/tests/integration/direct_launch_gate.c)
+  target_compile_options(test-direct-launch-gate PRIVATE
+    -O2 -g -std=gnu11 -Wall -Wextra -Werror
+    -D_POSIX_C_SOURCE=200809L)
+  set_target_properties(test-direct-launch-gate PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  add_test(NAME unit.direct-launch-gate
+    COMMAND $<TARGET_FILE:test-direct-launch-gate>
+            $<TARGET_FILE:direct-launch-gate>)
+  set_tests_properties(unit.direct-launch-gate PROPERTIES
+    LABELS unit WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()

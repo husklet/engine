@@ -57,3 +57,8 @@ const char *hl_tool_config_path(void) {
     const char *value = environment_value("PATH");
     return value != NULL ? value : "";
 }
+
+const char *hl_tool_config_tmpdir(void) {
+    const char *value = environment_value("TMPDIR");
+    return value != NULL ? value : "/tmp";
+}

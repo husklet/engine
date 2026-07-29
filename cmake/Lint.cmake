@@ -63,6 +63,7 @@ set(_hl_lint_cli_stdio_files
   tools/bridge_runner.c
   tools/compat_runner.c
   tools/config_e2e_runner.c
+  tools/direct_launch_gate.c
   tools/dual_backend_e2e_runner.c
   tools/e2e_runner.c
   tools/lifecycle_e2e_runner.c
@@ -74,6 +75,7 @@ set(_hl_lint_cli_stdio_files
   tools/pty_binding_e2e_runner.c
   tools/rootfs_e2e_runner.c
   tools/stdio_e2e_runner.c
+  tests/integration/direct_launch_gate.c
   tools/windows/tier0_probe.c
   tools/windows/toolchain_probe.c)
 

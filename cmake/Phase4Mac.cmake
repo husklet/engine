@@ -266,18 +266,15 @@ set_tests_properties(e2e.bridge-jobserver PROPERTIES
 # lane while the old e2e-compat coverage has a selectable replacement.
 foreach(_arch aarch64 x86_64)
   add_test(NAME compat-launch.cli-exit42-${_arch}
-    COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/run_direct_launch.sh
-            cli $<TARGET_FILE:e2e-runner>
+    COMMAND $<TARGET_FILE:direct-launch-gate> cli $<TARGET_FILE:e2e-runner>
             ${CMAKE_BINARY_DIR}/production/hl-engine-linux-${_arch}
             ${_E2E}/guest-exit-${_arch} 42)
   add_test(NAME compat-launch.config-exit42-${_arch}
-    COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/run_direct_launch.sh
-            config $<TARGET_FILE:config-e2e-runner>
+    COMMAND $<TARGET_FILE:direct-launch-gate> config $<TARGET_FILE:config-e2e-runner>
             ${CMAKE_BINARY_DIR}/production/hl-engine-linux-${_arch}
             ${_E2E}/guest-exit-${_arch} 42)
   add_test(NAME compat-launch.config-exit70-${_arch}
-    COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/run_direct_launch.sh
-            config $<TARGET_FILE:config-e2e-runner>
+    COMMAND $<TARGET_FILE:direct-launch-gate> config $<TARGET_FILE:config-e2e-runner>
             ${CMAKE_BINARY_DIR}/production/hl-engine-linux-${_arch}
             ${_E2E}/guest-exit70-${_arch} 70)
 endforeach()

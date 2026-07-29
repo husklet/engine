@@ -13,5 +13,6 @@ const char *hl_tool_config_matrix_x86_64_format_source(void);
 const char *hl_tool_config_docker_command(void);
 const char *hl_tool_config_docker_image(void);
 const char *hl_tool_config_path(void);
+const char *hl_tool_config_tmpdir(void);
 
 #endif
