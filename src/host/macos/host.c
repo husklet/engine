@@ -185,30 +185,35 @@ typedef struct hl_macos_directory {
 } hl_macos_directory;
 
 struct hl_host_macos {
-    pthread_mutex_t lock;
-    pthread_mutex_t fork_gate;
-    pthread_cond_t process_changed;
-    uint32_t destroying;
     hl_host_sync_registry *sync;
     hl_macos_mapping *mappings;
-    uint32_t mapping_capacity;
     hl_macos_file *files;
-    uint32_t file_capacity;
     hl_macos_process *processes;
-    uint32_t process_capacity;
     hl_macos_event *events;
-    uint32_t event_capacity;
     hl_macos_counter *counters;
-    uint32_t counter_capacity;
     hl_macos_counter_subscription **counter_subscriptions;
-    uint32_t counter_subscription_capacity;
     hl_macos_transfer *transfers;
-    uint32_t transfer_capacity;
     hl_macos_directory *directories;
-    uint32_t directory_capacity;
     hl_macos_watch *watches;
+    pthread_cond_t process_changed;
+    pthread_mutex_t lock;
+    pthread_mutex_t fork_gate;
+    uint32_t destroying;
+    uint32_t mapping_capacity;
+    uint32_t file_capacity;
+    uint32_t process_capacity;
+    uint32_t event_capacity;
+    uint32_t counter_capacity;
+    uint32_t counter_subscription_capacity;
+    uint32_t transfer_capacity;
+    uint32_t directory_capacity;
     uint32_t watch_capacity;
 };
+
+static uint32_t hl_macos_grow_capacity(uint32_t current, uint32_t initial, size_t element_size) {
+    uint32_t capacity = current == 0 ? initial : (current <= UINT32_MAX / 2u ? current * 2u : 0);
+    return capacity != 0 && (size_t)capacity <= SIZE_MAX / element_size ? capacity : 0;
+}
 
 uint32_t hl_host_macos_active_mappings(hl_host_macos *host) {
     uint32_t active = 0;
@@ -2293,15 +2298,18 @@ static hl_host_result hl_macos_file_read_directory(void *context, hl_host_handle
     }
     if (entry->directory_shared == NULL) {
         struct stat status;
-        if (fstat(entry->descriptor, &status) != 0 || !S_ISDIR(status.st_mode)) {
-            saved_error = errno != 0 ? errno : ENOTDIR;
+        if (fstat(entry->descriptor, &status) != 0) {
+            saved_error = errno;
+        } else if (!S_ISDIR(status.st_mode)) {
+            saved_error = ENOTDIR;
         } else {
             entry->directory_shared = hl_macos_directory_shared_create();
             if (entry->directory_shared == NULL) saved_error = ENOMEM;
         }
     }
     hl_macos_directory_shared *shared = entry->directory_shared;
-    if (saved_error == 0) pthread_mutex_lock(&shared->lock);
+    if (saved_error == 0 && shared == NULL) saved_error = EIO;
+    if (shared != NULL) pthread_mutex_lock(&shared->lock);
     if (saved_error == 0 && entry->directory == NULL) {
         int duplicate = fcntl(entry->descriptor, F_DUPFD_CLOEXEC, 0);
         if (duplicate < 0) {
@@ -2316,6 +2324,7 @@ static hl_host_result hl_macos_file_read_directory(void *context, hl_host_handle
             }
         }
     }
+    if (saved_error == 0 && entry->directory == NULL) saved_error = EIO;
     if (saved_error == 0 && entry->directory_position != shared->position) {
         rewinddir(entry->directory);
         entry->directory_position = 0;
@@ -2548,7 +2557,7 @@ static hl_host_result hl_macos_file_resolve_beneath(void *context, hl_host_handl
                                                     size_t path_size, uint32_t policy,
                                                     hl_host_file_resolution *output) {
     hl_host_macos *host = context;
-    hl_host_resolved_path resolved;
+    hl_host_resolved_path resolved = {0};
     hl_host_result parent;
     hl_host_result target = {HL_STATUS_OK, 0, HL_HOST_HANDLE_INVALID, 0};
     char local[PATH_MAX];
@@ -2594,7 +2603,7 @@ static hl_host_result hl_macos_file_resolve_beneath(void *context, hl_host_handl
     output->final_size = strlen(resolved.leaf);
     memcpy(output->final, resolved.leaf, output->final_size + 1);
     if (output->target != HL_HOST_HANDLE_INVALID) {
-        hl_host_file_metadata metadata;
+        hl_host_file_metadata metadata = {0};
         if (hl_macos_file_metadata_get(host, output->target, &metadata).status == HL_STATUS_OK)
             output->target_type = metadata.type;
     }
@@ -2605,7 +2614,7 @@ static hl_host_result hl_macos_file_resolve_beneath(void *context, hl_host_handl
 static hl_host_result hl_macos_file_open_beneath(void *context, hl_host_handle root, const char *path, size_t path_size,
                                                  uint32_t access, uint32_t creation, uint32_t permissions,
                                                  uint32_t policy) {
-    hl_host_file_resolution resolved;
+    hl_host_file_resolution resolved = {0};
     hl_host_result result;
     if (path == NULL || path_size == 0 || path[0] == '/' || memchr(path, '\0', path_size) != NULL ||
         (policy & ~(uint32_t)(HL_HOST_RESOLVE_NOFOLLOW_FINAL | HL_HOST_RESOLVE_NO_SYMLINKS)) != 0)
@@ -2787,7 +2796,12 @@ static hl_host_result hl_macos_directory_register(hl_host_macos *host, hl_macos_
         break;
     }
     if (handle == HL_HOST_HANDLE_INVALID) {
-        uint32_t capacity = host->directory_capacity * 2u;
+        uint32_t capacity =
+            hl_macos_grow_capacity(host->directory_capacity, HL_MACOS_DIRECTORY_CAPACITY, sizeof(*host->directories));
+        if (capacity == 0) {
+            pthread_mutex_unlock(&host->lock);
+            return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+        }
         hl_macos_directory *grown = realloc(host->directories, (size_t)capacity * sizeof(*grown));
         if (grown != NULL) {
             memset(grown + host->directory_capacity, 0, (size_t)(capacity - host->directory_capacity) * sizeof(*grown));
@@ -3045,7 +3059,13 @@ static hl_host_result hl_macos_transfer_register(hl_host_macos *host, int descri
         pthread_mutex_unlock(&host->lock);
         return hl_macos_result(HL_STATUS_OK, hl_macos_handle(HL_MACOS_HANDLE_TRANSFER, index, transfer->generation), 0);
     }
-    uint32_t capacity = host->transfer_capacity * 2u;
+    uint32_t capacity =
+        hl_macos_grow_capacity(host->transfer_capacity, HL_MACOS_TRANSFER_CAPACITY, sizeof(*host->transfers));
+    if (capacity == 0) {
+        pthread_mutex_unlock(&host->lock);
+        hl_host_process_fd_private_remove(descriptor);
+        return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+    }
     hl_macos_transfer *grown = realloc(host->transfers, (size_t)capacity * sizeof(*grown));
     if (grown != NULL) {
         memset(grown + host->transfer_capacity, 0, (size_t)(capacity - host->transfer_capacity) * sizeof(*grown));
@@ -3288,7 +3308,17 @@ static hl_host_result hl_macos_counter_register(hl_host_macos *host, hl_macos_co
         break;
     }
     if (handle == HL_HOST_HANDLE_INVALID) {
-        uint32_t capacity = host->counter_capacity * 2u;
+        uint32_t capacity =
+            hl_macos_grow_capacity(host->counter_capacity, HL_MACOS_COUNTER_CAPACITY, sizeof(*host->counters));
+        if (capacity == 0) {
+            pthread_mutex_unlock(&host->lock);
+            if (registered) {
+                hl_host_process_fd_private_remove(object->readable);
+                hl_host_process_fd_private_remove(object->signal);
+                hl_host_process_fd_private_remove(object->backing);
+            }
+            return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+        }
         hl_macos_counter *grown = realloc(host->counters, (size_t)capacity * sizeof(*grown));
         if (grown != NULL) {
             memset(grown + host->counter_capacity, 0, (size_t)(capacity - host->counter_capacity) * sizeof(*grown));
@@ -4070,7 +4100,12 @@ static hl_host_result hl_macos_event_arm_timer(void *context, hl_host_handle pol
             }
     }
     if (timer == NULL) {
-        uint32_t capacity = event->timer_capacity * 2u;
+        uint32_t capacity =
+            hl_macos_grow_capacity(event->timer_capacity, HL_MACOS_TIMER_CAPACITY, sizeof(*event->timers));
+        if (capacity == 0) {
+            pthread_mutex_unlock(&host->lock);
+            return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+        }
         hl_macos_timer *grown = realloc(event->timers, (size_t)capacity * sizeof(*grown));
         if (grown == NULL) {
             pthread_mutex_unlock(&host->lock);
@@ -4281,7 +4316,15 @@ static hl_host_result hl_macos_process_spawn_mode(void *context, hl_host_process
         break;
     }
     if (handle == 0) {
-        uint32_t capacity = host->process_capacity * 2u;
+        uint32_t capacity =
+            hl_macos_grow_capacity(host->process_capacity, HL_MACOS_PROCESS_CAPACITY, sizeof(*host->processes));
+        if (capacity == 0) {
+            pthread_mutex_unlock(&host->lock);
+            int status;
+            kill(pid, SIGKILL);
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            return hl_macos_result(HL_STATUS_RESOURCE_LIMIT, 0, 0);
+        }
         hl_macos_process *grown = realloc(host->processes, (size_t)capacity * sizeof(*grown));
         if (grown != NULL) {
             memset(grown + host->process_capacity, 0, (size_t)(capacity - host->process_capacity) * sizeof(*grown));

@@ -36,12 +36,12 @@ static uint32_t hl_macos_online_cpus(void) {
 }
 
 int hl_host_system_read(hl_host_system_info *info, hl_host_cpu_ticks *cores, size_t core_capacity) {
-    host_cpu_load_info_data_t aggregate;
+    host_cpu_load_info_data_t aggregate = {0};
     mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
     uint64_t memory_size = 0;
     size_t memory_size_size = sizeof memory_size;
     vm_size_t page_size = 4096;
-    vm_statistics64_data_t memory;
+    vm_statistics64_data_t memory = {0};
     mach_msg_type_number_t memory_count = HOST_VM_INFO64_COUNT;
     processor_info_array_t values = NULL;
     mach_msg_type_number_t value_count = 0;
@@ -159,7 +159,7 @@ int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd 
                             size_t path_capacity, size_t *path_size) {
     struct vnode_fdinfowithpath info;
     hl_host_process_fd *entries;
-    size_t count;
+    size_t count, capacity;
     uint32_t kind = HL_HOST_FD_OTHER;
     int found = 0;
     hl_host_process_info process;
@@ -184,12 +184,14 @@ int hl_host_process_fd_read(int64_t pid, int32_t descriptor, hl_host_process_fd 
         return 1;
     }
     if (!hl_host_process_fds(pid, NULL, 0, &count)) return 0;
-    entries = count != 0 ? malloc(count * sizeof *entries) : NULL;
-    if (count != 0 && entries == NULL) return 0;
-    if (!hl_host_process_fds(pid, entries, count, &count)) {
+    capacity = count;
+    entries = capacity != 0 ? malloc(capacity * sizeof *entries) : NULL;
+    if (capacity != 0 && entries == NULL) return 0;
+    if (!hl_host_process_fds(pid, entries, capacity, &count)) {
         free(entries);
         return 0;
     }
+    if (count > capacity) count = capacity;
     for (size_t index = 0; index < count; ++index)
         if (entries[index].descriptor == descriptor) {
             kind = entries[index].kind;

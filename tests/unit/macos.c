@@ -513,6 +513,10 @@ int main(void) {
                                                 strlen(terminal_path), HL_HOST_FILE_READ | HL_HOST_FILE_WRITE,
                                                 HL_HOST_FILE_CREATE | HL_HOST_FILE_TRUNCATE, 0600);
         HL_CHECK(ordinary.status == HL_STATUS_OK);
+        hl_host_file_entry not_directory;
+        HL_CHECK(
+            services.file->read_directory(services.context, ordinary.value, &not_directory, 1, sizeof not_directory)
+                .status == HL_STATUS_NOT_DIRECTORY);
         /* The point of the group: a live, valid, entirely ordinary object that is not a terminal.
          * A file-type field cannot separate these two cases on every host; this can. */
         HL_CHECK(services.terminal->probe(services.context, ordinary.value).status == HL_STATUS_OK &&
@@ -1293,7 +1297,7 @@ int main(void) {
         stream_writer_context first = {&services, pipe.detail, 'A', RECORDS, 0};
         stream_writer_context second = {&services, pipe.detail, 'B', RECORDS, 0};
         pthread_t first_thread, second_thread;
-        unsigned char received[TOTAL];
+        unsigned char received[TOTAL] = {0};
         size_t total = 0;
         HL_CHECK(pipe.status == HL_STATUS_OK);
         HL_CHECK(pthread_create(&first_thread, NULL, stream_writer_thread, &first) == 0);

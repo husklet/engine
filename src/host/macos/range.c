@@ -13,7 +13,7 @@ size_t hl_host_page_size(void) {
 int hl_host_address_mapped(uintptr_t address) {
     mach_vm_address_t region = address;
     mach_vm_size_t size = 0;
-    vm_region_basic_info_data_64_t info;
+    vm_region_basic_info_data_64_t info = {0};
     mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
     mach_port_t object = MACH_PORT_NULL;
     kern_return_t result = mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
@@ -25,7 +25,7 @@ int hl_host_address_mapped(uintptr_t address) {
 int hl_host_region_query(uintptr_t address, hl_host_region *region) {
     mach_vm_address_t start = address;
     mach_vm_size_t size = 0;
-    vm_region_basic_info_data_64_t info;
+    vm_region_basic_info_data_64_t info = {0};
     mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
     mach_port_t object = MACH_PORT_NULL;
     uint32_t protection = 0;
