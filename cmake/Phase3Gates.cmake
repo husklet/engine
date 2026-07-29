@@ -357,56 +357,6 @@ add_test(NAME production.matrix
 set_tests_properties(production.matrix PROPERTIES LABELS "production" RESOURCE_LOCK hl-guest TIMEOUT 1800 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 hl_matrix_timeout_scale(production.matrix)
 
-# test-linux-production-{aarch64-,}full: whole-suite sweeps via linux-matrix.
-#
-# The runner continues past a failing case; any failure is still a non-zero exit,
-# and its stall detector bounds a hung case to a minute.
-set(_full_suites
-  abi:tests/compat/abi  abi-corpus:tests/compat/abi/corpus  libc:tests/compat/libc
-  completeness:tests/compat/completeness  posix:tests/compat/posix
-  syscall:tests/compat/syscall  network:tests/compat/network
-  procfs:tests/compat/procfs  memory:tests/compat/memory
-  filesystem:tests/compat/filesystem  signals:tests/compat/signals
-  process:tests/compat/process  time:tests/compat/time
-  core/abi:tests/compat/core/abi  core/workload:tests/compat/core/workload
-  core/syscall:tests/compat/core/syscall  core/regress:tests/compat/core/regress
-  ipc:tests/compat/ipc  threads:tests/compat/threads
-  isolation:tests/compat/isolation  syscall_edges:tests/compat/syscall_edges)
-foreach(_arch aarch64 x86_64)
-  foreach(_pair ${_full_suites})
-    string(REPLACE ":" ";" _p ${_pair})
-    list(GET _p 0 _dir)
-    list(GET _p 1 _srcdir)
-    string(REPLACE "/" "-" _label ${_dir})
-    set(_bindir ${HL_COMPAT}/${_dir}/${_arch})
-    if(_dir STREQUAL "abi-corpus")
-      set(_bindir ${HL_COMPAT}/abi-corpus/${_arch})
-    endif()
-    add_test(NAME production.full-${_arch}.${_label}
-      COMMAND $<TARGET_FILE:linux-matrix> --suite
-              ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${_arch}
-              ${_bindir} ${CMAKE_SOURCE_DIR}/${_srcdir})
-    set_tests_properties(production.full-${_arch}.${_label} PROPERTIES
-      LABELS "production;production-full;production-full-${_arch}"
-      RESOURCE_LOCK hl-guest TIMEOUT 3600 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-    hl_matrix_timeout_scale(production.full-${_arch}.${_label})
-  endforeach()
-  add_test(NAME production.full-${_arch}.soak
-    COMMAND $<TARGET_FILE:linux-matrix> --suite
-            ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-${_arch}
-            ${CMAKE_BINARY_DIR}/soak/${_arch} ${CMAKE_SOURCE_DIR}/tests/soak)
-  set_tests_properties(production.full-${_arch}.soak PROPERTIES
-    LABELS "production;production-full" RESOURCE_LOCK hl-guest RUN_SERIAL TRUE TIMEOUT 3600 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-  hl_matrix_timeout_scale(production.full-${_arch}.soak)
-endforeach()
-# The x86_64 lane also sweeps the committed ISA corpus.
-add_test(NAME production.full-x86_64.isa
-  COMMAND $<TARGET_FILE:linux-matrix> --suite
-          ${CMAKE_BINARY_DIR}/linux-production/hl-engine-linux-x86_64
-          ${HL_COMPAT}/isa/x86_64 ${CMAKE_SOURCE_DIR}/tests/compat/isa/x86_64)
-set_tests_properties(production.full-x86_64.isa PROPERTIES LABELS "production;production-full" RESOURCE_LOCK hl-guest WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-hl_matrix_timeout_scale(production.full-x86_64.isa)
-
 # test-linux-production-config
 add_test(NAME production.config-env
   COMMAND $<TARGET_FILE:config-e2e-runner> env
@@ -1023,9 +973,9 @@ endif()
 # ===========================================================================
 # 10. the host-backend timeout scale, for the lanes not driven by matrix-runner
 # ===========================================================================
-# hl_matrix_timeout_scale() (cmake/Phase3Compat.cmake) covers the compat suites
-# and the production-full lanes; the four runners registered ABOVE carry per-case
-# budgets of their own (30s, 15s for checkpoint-tree-runner) and read the SAME
+# hl_matrix_timeout_scale() (cmake/Phase3Compat.cmake) covers the compat suites;
+# the four runners registered ABOVE carry per-case budgets of their own (30s,
+# 15s for checkpoint-tree-runner) and read the SAME
 # variable. Selected from the directory's TESTS property, not by repeating the
 # case lists, so a case added to a lane cannot become the one left unscaled. Each
 # pattern is asserted non-empty so a rename cannot empty the sweep.

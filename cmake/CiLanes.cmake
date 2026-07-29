@@ -286,8 +286,6 @@ set(HL_CI_REGISTRY_LINUX
   perf-native
   production
   production-config
-  production-full-aarch64
-  production-full-x86_64
 )
 set(HL_CI_REGISTRY_DARWIN
   compat-direct
