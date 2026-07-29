@@ -856,6 +856,7 @@ fn readlink_follows_intermediate_projected_symlinks() {
     let _ = fs::remove_dir_all(base);
 }
 
+#[cfg(unix)]
 #[test]
 fn setuid_exec_uses_guest_mode_and_ownership() {
     use std::os::unix::fs::PermissionsExt;

@@ -169,8 +169,6 @@ v2:link:/sys/dev/char/226%3A128:/projection/sys/dev/char/226%3A128"
 
 #[test]
 fn filesystem_generation_uses_the_c_abi_offset_and_rejects_nul() {
-    use std::os::unix::ffi::OsStringExt;
-
     let wire = LaunchWire::encode(
         &Config::new().filesystem_generation("/run/hl/filesystem-generation"),
         &[OsString::from("/bin/true")],
@@ -182,7 +180,7 @@ fn filesystem_generation_uses_the_c_abi_offset_and_rejects_nul() {
         Some("/run/hl/filesystem-generation")
     );
 
-    let invalid = std::path::PathBuf::from(OsString::from_vec(b"/run/bad\0path".to_vec()));
+    let invalid = std::path::PathBuf::from(OsString::from("/run/bad\0path"));
     assert!(LaunchWire::encode(
         &Config::new().filesystem_generation(invalid),
         &[OsString::from("/bin/true")],
