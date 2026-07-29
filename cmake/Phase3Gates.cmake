@@ -828,7 +828,7 @@ set(_nest_hello_out ${CMAKE_SOURCE_DIR}/tests/compat/core/abi/expected/hello.out
 function(hl_nested_case name)
   cmake_parse_arguments(N "" "CROSS;BUDGET" "CHAIN" ${ARGN})
   add_test(NAME nested.${name}
-    COMMAND ${HL_BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/nested_engine_gate.sh
+    COMMAND $<TARGET_FILE:nested-engine-gate>
             ${N_CROSS} "${_nest_fix}" ${_nest_hello_out} 42 -- ${N_CHAIN})
   set_tests_properties(nested.${name} PROPERTIES
     LABELS "nested-engine" SKIP_RETURN_CODE 77 RESOURCE_LOCK hl-guest

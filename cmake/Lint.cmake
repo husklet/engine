@@ -69,6 +69,7 @@ set(_hl_lint_cli_stdio_files
   tools/linux_matrix.c
   tools/linux_production_smoke.c
   tools/matrix_runner.c
+  tools/nested_engine_gate.c
   tools/perf_runner.c
   tools/pty_binding_e2e_runner.c
   tools/rootfs_e2e_runner.c
