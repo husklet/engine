@@ -2,8 +2,7 @@
 // guest makes -- flipping the bit without finishing BFDOT would make this case start exercising it and fail
 // loudly, which is the point. BFCVT is exercised unconditionally: both backends implement it, and it is where
 // the subtlety lives. bf16 IS the top half of the binary32 encoding, so the whole instruction is a rounding of
-// the discarded low 16 bits: ties-to-EVEN (never toward zero), and a NaN whose payload sits entirely below bit
-// 16 must come back quiet, not as the infinity its top half spells.
+// the discarded low 16 bits: ties-to-EVEN (never toward zero), and every NaN becomes the default BF16 NaN.
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -32,8 +31,8 @@ __attribute__((target("+bf16"))) static long dot(void) {
 }
 
 static const uint32_t kSource[] = {
-    0x3f808000u, // tie, kept bit even -> stays down
-    0x3f818000u, // tie, kept bit odd  -> rounds up
+    0x3f808000u,              // tie, kept bit even -> stays down
+    0x3f818000u,              // tie, kept bit odd  -> rounds up
     0x3f807fffu, 0x3f808001u, // either side of the tie
     0xbf808000u, 0xbf818000u, // the same two ties, negative: the tie-break is on the bit, not the magnitude
     0x7f800001u,              // signalling NaN whose payload is entirely below bit 16
@@ -56,11 +55,15 @@ __attribute__((target("+bf16"))) static void convert(uint16_t out[]) {
 int main(void) {
     unsigned n = sizeof kSource / sizeof kSource[0];
     uint16_t out[sizeof kSource / sizeof kSource[0]];
+    uint64_t fpsr = 0;
+    __asm__ volatile("msr fpsr, %0" : : "r"(fpsr));
     convert(out);
+    __asm__ volatile("mrs %0, fpsr" : "=r"(fpsr));
     printf("bf16 cvt");
     for (unsigned i = 0; i < n; i++)
         printf(" %04x", out[i]);
     putchar('\n');
+    printf("bf16 fpsr=%lx\n", (unsigned long)fpsr);
     if (getauxval(AT_HWCAP2) & HWCAP2_BF16)
         printf("bf16 dot=%ld\n", dot());
     else

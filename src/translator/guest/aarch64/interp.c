@@ -3421,10 +3421,7 @@ static int interp_exec_fp_scalar(struct cpu *cpu, uint32_t insn) {
                 unsigned cls = interp_fp_class(bits, INTERP_FP_S);
                 uint64_t out;
                 if (cls >= INTERP_FPC_QNAN) {
-                    // A NaN whose whole payload sits below bit 16 truncates to the infinity pattern, so the
-                    // quiet bit must be set on the RESULT, not merely copied.
-                    if (cls == INTERP_FPC_SNAN) interp_fpsr_raise(INTERP_FPSR_IOC);
-                    out = INTERP_FPCR_DN(g_interp_fpcr) ? UINT64_C(0x7FC0) : ((bits >> 16) | 0x40u);
+                    out = UINT64_C(0x7FC0);
                 } else if (cls == INTERP_FPC_INF || cls == INTERP_FPC_ZERO) {
                     out = bits >> 16;
                 } else {

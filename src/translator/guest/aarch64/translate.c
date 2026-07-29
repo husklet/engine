@@ -150,9 +150,8 @@ static int uses_x18(uint32_t in, int mask) {
 // stolen GPR -- reach the verbatim emit at the bottom of the loop and land on silicon that has them. That is
 // the same host assumption the already-advertised FEAT_LSE/AES/SHA2/CRC32 bits make.
 // FEAT_I8MM / FEAT_BF16 are OPTIONAL, and the engine's CPU model does not advertise them, so a guest that
-// uses them is already reaching past the contract. Where the HOST implements them the honest answer is the
-// architectural one: copy the instruction verbatim (same ISA, same silicon, bit-exact and faster). The
-// lowerings below are the fallback for hosts that lack the extension. This matters for BFDOT in particular:
+// uses them is already reaching past the contract. BFCVT is always lowered because hosts disagree on NaN
+// canonicalization; the other instructions pass through when the host supports them. This matters for BFDOT:
 // its architectural definition adds both bf16 products and the addend with a SINGLE rounding and forced
 // FZ/DN, and it raises no FP exceptions -- properties the widen/fmul/pairwise-add decomposition cannot
 // reproduce (the differential ISA fuzzer, tests/fuzz/isa/aarch64, showed 1-ulp results, wrong NaN payloads
@@ -262,7 +261,6 @@ static void emit_i8mm_mmla(uint32_t in) {
    the rounded high half of the IEEE binary32 encoding; BFDOT can be expressed
    exactly with baseline widening, shifts, FP multiply, and pairwise add. */
 static int is_bf16_bfcvt(uint32_t in) {
-    if (g_host_bf16) return 0;
     return (in & ~(0x1Fu | (0x1Fu << 5))) == 0x1E634000u;
 }
 
@@ -285,9 +283,8 @@ static void emit_bf16_bfcvt(uint32_t in) {
     emit32(0x0B000000u | ((uint32_t)17 << 16) | ((uint32_t)16 << 5) | 16u);
     emit32(0x53107C00u | ((uint32_t)16 << 5) | 16u); /* LSR w16,w16,#16 */
 
-    /* A signaling NaN whose payload lies below bit 16 must remain a NaN, not
-       round down to infinity.  Set the quiet bit branchlessly and preserve
-       integer NZCV, which scalar BFCVT does not modify. */
+    /* FPConvertBF returns the one default BF16 NaN. Select it branchlessly and
+       preserve integer NZCV, which scalar BFCVT does not modify. */
     emit32(0x531779F1u);                                     /* UBFX w17,w15,#23,#8 */
     emit32(0x52001E31u);                                     /* EOR w17,w17,#0xff */
     emit32(0x5AC01231u);                                     /* CLZ w17,w17 */
@@ -296,8 +293,12 @@ static void emit_bf16_bfcvt(uint32_t in) {
     emit32(0x5AC011EFu);                                     /* CLZ w15,w15 */
     emit32(0x53057DEFu);                                     /* LSR w15,w15,#5 */
     emit32(0x520001EFu);                                     /* EOR w15,w15,#1: mantissa was nonzero */
-    emit32(0x0A0F0231u);                                     /* AND w17,w17,w15 */
-    emit32(0x2A111A10u);                                     /* ORR w16,w16,w17,LSL #6 */
+    emit32(0x0A0F0231u);                                     /* AND w17,w17,w15: source was NaN */
+    emit32(0x4B1103F1u);                                     /* NEG w17,w17: selection mask */
+    emit32(v3(0x0A200000u, 16, 16, 17));                     /* BIC w16,w16,w17 */
+    emit32(0x528FF80Fu);                                     /* MOV w15,#0x7fc0 */
+    emit32(v3(0x0A000000u, 15, 15, 17));                     /* AND w15,w15,w17 */
+    emit32(v3(0x2A000000u, 16, 16, 15));                     /* ORR w16,w16,w15 */
     emit32(0x1E270000u | ((uint32_t)16 << 5) | (uint32_t)d); /* FMOV sD,w16 */
 
     if (!g_steal1617) e_ldp(16, 17, CPUREG, 16 * 8);
