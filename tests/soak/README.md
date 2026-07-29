@@ -1,3 +1,7 @@
 # Prolonged engine soak suite
 
-These 18 byte-identical legacy `ext_soak` guests are stress/endurance workloads, intentionally separate from compatibility tests. `manifest.tsv` records exact registrations and final deterministic verdicts. The bounded profile uses the shared runner's 30-second per-case deadline and process-group termination; `profiles.tsv` records longer manual endurance budgets without weakening bounded CI.
+These 18 stress workloads remain separate from compatibility tests.
+`manifest.tsv` records their deterministic verdicts. The normal lane runs each
+case once; the extended lane repeats each case ten times. Both allow four
+minutes per case because the `mremap`-heavy realloc workload can take about two
+minutes under translation.

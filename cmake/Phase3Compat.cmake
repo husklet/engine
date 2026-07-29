@@ -709,6 +709,13 @@ foreach(_t compat.core-workload-extended compat.soak-extended)
   set_tests_properties(${_t} PROPERTIES LABELS "compat-extended")
 endforeach()
 
+# reallocchurn performs 1.7 million guest mremap calls. Translation is correct,
+# but registry reconciliation can approach the default deadline under load.
+foreach(_t compat.soak compat.soak-extended)
+  set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT
+    "HL_MATRIX_CASE_TIMEOUT_MS=240000")
+endforeach()
+
 # compat-filesystem asserts four fixtures exist before running (Makefile 2286).
 add_test(NAME compat.filesystem-fixtures-present
   COMMAND ${CMAKE_COMMAND}
